@@ -17,6 +17,7 @@ export * from "./fork-tree";
 export * from "./home-routing";
 export * from "./home-invitation";
 export * from "./management-environment";
+export * from "./placement-policy";
 export * from "./projection-carriage";
 export * from "./remote-control-plane";
 export * from "./workspace-delta";

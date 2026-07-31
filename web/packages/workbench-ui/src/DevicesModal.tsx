@@ -14,18 +14,23 @@
  * (`INV-5`). Per-project hand-off / co-drive live in the project's `EngagementPane`.
  */
 
-import { createResource, createSignal, For, onMount, Show, type JSX } from "solid-js";
-import type {
-    EnrollmentStatus,
-    EnrollmentTicket,
-    FederationPeer,
-    HandoffStatus,
-    IncomingHandoff,
-    InviteAcceptResult,
-    MachineController,
-    MachineControllerInvitation,
-    MachineControllerRequest,
-    PairingTicket,
+import { createResource, createSignal, For, onMount, Show, type Accessor, type JSX } from "solid-js";
+import {
+    localDeploymentPlacement,
+    parseDeploymentPlacement,
+    placementPolicyAdmits,
+    type DeploymentPlacement,
+    type EnrollmentStatus,
+    type EnrollmentTicket,
+    type FederationPeer,
+    type HandoffStatus,
+    type IncomingHandoff,
+    type InviteAcceptResult,
+    type MachineController,
+    type MachineControllerInvitation,
+    type MachineControllerRequest,
+    type PairingTicket,
+    type PlacementPolicy,
 } from "@gaugewright/control-plane-client";
 import { pairingTicket } from "./pairing";
 import { qrSvg } from "./qr-code";
@@ -55,6 +60,9 @@ function machineInvitationLink(invitation: MachineControllerInvitation): string 
 export function DevicesModal(props: {
     api: DevicesModalApi;
     environment?: string;
+    /** Present only in an enrolled enterprise composition. Undefined policy
+     * state is loading/error and therefore refuses engagement admission. */
+    placementPolicy?: Accessor<PlacementPolicy | undefined>;
     /** FED-7: seed the invite paste field from an OS-delivered `gaugewright://invite` deep link,
      *  so the consent preview renders as if the link had been pasted. */
     initialInviteLink?: string;
@@ -73,6 +81,15 @@ export function DevicesModal(props: {
     const [controllerEndpoint, setControllerEndpoint] = createSignal("");
     const [controllerInvitation, setControllerInvitation] =
         createSignal<MachineControllerInvitation | null>(null);
+
+    const managedByPlacementPolicy = () => props.placementPolicy !== undefined;
+    const deploymentAdmitted = (deployment: DeploymentPlacement): boolean => {
+        if (!managedByPlacementPolicy()) return true;
+        const policy = props.placementPolicy?.();
+        return policy !== undefined && placementPolicyAdmits(policy, deployment, false);
+    };
+    const deploymentLabel = (deployment: DeploymentPlacement) =>
+        `${deployment.operator}-operated · ${deployment.attested ? "attested" : "unattested"}`;
 
     // Device-enrollment handshake (ACCT-1). The holder hosts a session, shows the ticket,
     // then compares the 6-char SAS with the new device before confirming; the new device
@@ -275,6 +292,12 @@ export function DevicesModal(props: {
         }
     };
     const acceptIncoming = async (project: string, source: string) => {
+        const offer = (incoming() ?? []).find((item) =>
+            item.project === project && item.source === source);
+        if (!offer || !deploymentAdmitted(offer.deployment)) {
+            setStatus("accept refused locally: this engagement does not satisfy organization policy");
+            return;
+        }
         try {
             const s = await props.api.handoffAccept(project, source);
             setStatus(`accepted ${project} from ${source}: ${s.phase}`);
@@ -293,6 +316,10 @@ export function DevicesModal(props: {
         }
     };
     const acceptAllIncoming = async () => {
+        if (!(incoming() ?? []).every((offer) => deploymentAdmitted(offer.deployment))) {
+            setStatus("accept all refused locally: at least one engagement does not satisfy organization policy");
+            return;
+        }
         try {
             const accepted = await props.api.handoffAcceptAll();
             setStatus(`accepted ${accepted.length} handoff(s): ${accepted.join(", ")}`);
@@ -311,17 +338,29 @@ export function DevicesModal(props: {
             const hex = raw.split("d=").pop() ?? "";
             const bytes = hex.match(/.{1,2}/g)?.map((b) => parseInt(b, 16)) ?? [];
             const json = new TextDecoder().decode(new Uint8Array(bytes));
-            return JSON.parse(json) as {
+            const decoded = JSON.parse(json) as {
                 project_name?: string;
                 ticket?: { authority?: string };
                 confirm_code?: string;
                 manifest?: string[];
+                deployment_mode?: unknown;
+            };
+            return {
+                ...decoded,
+                deployment: decoded.deployment_mode == null
+                    ? localDeploymentPlacement
+                    : parseDeploymentPlacement(decoded.deployment_mode),
             };
         } catch {
             return null;
         }
     };
     const acceptInvite = async () => {
+        const invite = decodedInvite();
+        if (!invite || !deploymentAdmitted(invite.deployment)) {
+            setStatus("accept refused locally: this engagement does not satisfy organization policy");
+            return;
+        }
         try {
             const r = await props.api.inviteAccept(inviteLink().trim());
             if (r.ok) {
@@ -350,11 +389,33 @@ export function DevicesModal(props: {
                     <button type="button" onClick={() => props.onClose()}>close</button>
                 </div>
 
+                <Show when={managedByPlacementPolicy()}>
+                    <div class="status" data-placement-policy>
+                        <Show
+                            when={props.placementPolicy?.()}
+                            fallback={<>Organization placement policy unavailable — engagement acceptance is blocked.</>}
+                        >
+                            {(policy) => (
+                                <>
+                                    Organization placement policy: {policy().require_attested
+                                        ? "attestation required"
+                                        : "unattested placement allowed"}; operators {policy().allowed_operators.length > 0
+                                        ? policy().allowed_operators.join(", ")
+                                        : "not restricted"}.
+                                </>
+                            )}
+                        </Show>
+                    </div>
+                </Show>
+
                 {/* Incoming consent — a separate party wants to set up a project here. */}
                 <Show when={(incoming() ?? []).length > 0}>
                     <p class="status" style={{ margin: "0 0 4px" }}>
                         <strong>A device wants to set up a project here — your consent is required:</strong>
-                        <Show when={(incoming() ?? []).length > 1}>
+                        <Show when={
+                            (incoming() ?? []).length > 1
+                            && (incoming() ?? []).every((offer) => deploymentAdmitted(offer.deployment))
+                        }>
                             {" "}
                             <button type="button" class="tree-action" data-pd-accept-all onClick={() => void acceptAllIncoming()}>
                                 accept all
@@ -369,8 +430,11 @@ export function DevicesModal(props: {
                                         <strong>{h.source}</strong> wants to set up <strong>{h.project}</strong>{" "}
                                         on this device. It runs their agents on data you connect; nothing leaves
                                         without your approval.
+                                        <small data-pd-incoming-deployment={h.project}>
+                                            {" "}{deploymentLabel(h.deployment)}
+                                        </small>
                                     </span>
-                                    <button type="button" class="tree-action" data-pd-accept={h.project} onClick={() => void acceptIncoming(h.project, h.source)}>
+                                    <button type="button" class="tree-action" data-pd-accept={h.project} disabled={!deploymentAdmitted(h.deployment)} onClick={() => void acceptIncoming(h.project, h.source)}>
                                         accept
                                     </button>
                                     <button type="button" class="tree-action" data-pd-decline={h.project} onClick={() => void declineIncoming(h.project, h.source)}>
@@ -627,10 +691,18 @@ export function DevicesModal(props: {
                                 Confirm code: <strong>{d().confirm_code}</strong> — check it matches what they
                                 read you.
                             </p>
+                            <p class="status" data-pd-invite-deployment>
+                                Placement: {deploymentLabel(d().deployment)}
+                            </p>
+                            <Show when={!deploymentAdmitted(d().deployment)}>
+                                <p class="status" data-pd-policy-refusal>
+                                    This engagement does not satisfy your organization&apos;s placement policy.
+                                </p>
+                            </Show>
                         </div>
                     )}
                 </Show>
-                <button type="button" class="tree-action" data-pd-invite-accept onClick={() => void acceptInvite()}>
+                <button type="button" class="tree-action" data-pd-invite-accept disabled={!decodedInvite() || !deploymentAdmitted(decodedInvite()!.deployment)} onClick={() => void acceptInvite()}>
                     Accept &amp; set up
                 </button>
 
@@ -671,7 +743,7 @@ export function DevicesModal(props: {
                                 <span class="fed-peer-grant" title={p.grant_id}>
                                     {p.active ? "paired" : "revoked"}
                                 </span>
-                                <Show when={p.active}>
+                                <Show when={p.active && !managedByPlacementPolicy()}>
                                     <button type="button" class="tree-action" data-pd-preauth={p.authority} title="Auto-accept handoffs from this device" onClick={() => void preauthPeer(p.authority)}>
                                         auto-accept
                                     </button>

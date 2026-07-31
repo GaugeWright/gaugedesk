@@ -1,5 +1,10 @@
 import type { ProjectId } from "./control-plane-domain";
 import type { RouteJson } from "./control-plane-transport";
+import {
+    localDeploymentPlacement,
+    parseDeploymentPlacement,
+    type DeploymentPlacement,
+} from "./placement-policy";
 
 /** A pairing ticket: everything a peer needs to reach + trust this authority. */
 export interface PairingTicket {
@@ -47,6 +52,7 @@ export interface HandoffStatus {
 export interface IncomingHandoff {
     readonly project: ProjectId;
     readonly source: string;
+    readonly deployment: DeploymentPlacement;
 }
 /** The result of an operator placing a co-drive run (FED-7). */
 export interface PlacedRun {
@@ -79,6 +85,7 @@ export interface EngagementInvite {
     readonly invite_url: string;
     readonly confirm_code: string;
     readonly project: ProjectId;
+    readonly deployment: DeploymentPlacement;
 }
 /** The origin's pending-invite status (poll while waiting for the client to accept). */
 export interface InviteStatus {
@@ -214,7 +221,13 @@ function parseHandoffStatus(raw: unknown): HandoffStatus {
 }
 function parseIncomingHandoff(raw: unknown): IncomingHandoff {
     const o = fedObj(raw);
-    return { project: fStr(o, "project") as ProjectId, source: fStr(o, "source") };
+    return {
+        project: fStr(o, "project") as ProjectId,
+        source: fStr(o, "source"),
+        deployment: o.deployment_mode == null
+            ? localDeploymentPlacement
+            : parseDeploymentPlacement(o.deployment_mode),
+    };
 }
 function parsePlacedRun(raw: unknown): PlacedRun {
     const o = fedObj(raw);
@@ -254,6 +267,9 @@ function parseEngagementInvite(raw: unknown): EngagementInvite {
         invite_url: fStr(o, "invite_url"),
         confirm_code: fStr(o, "confirm_code"),
         project: fStr(o, "project") as ProjectId,
+        deployment: o.deployment_mode == null
+            ? localDeploymentPlacement
+            : parseDeploymentPlacement(o.deployment_mode),
     };
 }
 function parseInviteStatus(raw: unknown): InviteStatus {

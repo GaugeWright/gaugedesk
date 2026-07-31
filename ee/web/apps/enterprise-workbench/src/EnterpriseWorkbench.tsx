@@ -3,6 +3,7 @@ import { App } from "@gaugewright/workbench-web";
 import {
     EnterpriseControlPlane,
     type AdminCapabilityDiscovery,
+    type PlacementPolicy,
 } from "@gaugewright/enterprise-client";
 import { AdminEnvironment } from "./AdminEnvironment";
 
@@ -38,6 +39,10 @@ export function EnterpriseWorkbench(): JSX.Element {
             };
         }
     });
+    const [placementPolicy] = createResource(
+        () => ({ tenant: tenant() }),
+        async (): Promise<PlacementPolicy> => api.placementPolicy(),
+    );
     const adminAvailable = () => (discovery()?.capabilities.length ?? 0) > 0;
     const adminVisible = () => requestedMode() === "admin" && adminAvailable();
 
@@ -66,6 +71,7 @@ export function EnterpriseWorkbench(): JSX.Element {
             <div hidden={adminVisible()} data-work-environment>
                 <App
                     onTenantContextChange={setTenant}
+                    placementPolicy={placementPolicy}
                     environmentAction={{
                         label: "Administration",
                         available: adminAvailable,

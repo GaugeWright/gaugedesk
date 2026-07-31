@@ -3069,6 +3069,22 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
     {
         return serde_json::json!({ "ok": false, "reason": "verification failed" });
     }
+    if wire.kind == HandoffMsgKind::Offer {
+        // DEPLOY-4 / ITGOV-3: every offer crosses the placement floor before
+        // *any* admission branch. Standing preauthorization and a combined
+        // invite's one-shot consent reduce human friction; neither is a policy
+        // bypass. No quote travels on this leg, so attested declarations fail
+        // closed until a measurement-bearing transport exists.
+        let placement_policy = crate::org::Org::rebuild(guard.store_ref())
+            .map(|org| org.effective_placement_policy())
+            .unwrap_or_else(|_| gaugewright_core::boundary_lifecycle::PlacementPolicy::open());
+        if !handoff_placement_admitted(&placement_policy, &wire.log, &wire.project) {
+            return serde_json::json!({
+                "ok": false,
+                "reason": "the incoming project's deployment mode is not admitted by this org's placement policy",
+            });
+        }
+    }
     // `registered` = the target imported a relocated project (its library changed).
     let (verdict, registered) = match wire.kind {
         HandoffMsgKind::Offer => {
@@ -3412,6 +3428,8 @@ struct EngagementInvite {
     ticket: PairingTicket,
     project: String,
     project_name: String,
+    #[serde(default = "gaugewright_core::boundary_lifecycle::Placement::local")]
+    deployment_mode: gaugewright_core::boundary_lifecycle::Placement,
     #[serde(default)]
     manifest: Vec<String>,
     confirm_code: String,
@@ -3535,6 +3553,7 @@ pub async fn post_invite(
         let mut guard = wb.lock_unpoisoned();
         let pubkey = guard.governance_public_key();
         let project_name = guard.project_display_name(&req.project);
+        let deployment_mode = guard.project_deployment_mode(&req.project);
         // `mint_ticket` returns an owned ticket, so the `fed` borrow ends here — before
         // `store_mut` below.
         let ticket = match guard.federation_ref() {
@@ -3558,6 +3577,7 @@ pub async fn post_invite(
             ticket,
             project: req.project.clone(),
             project_name,
+            deployment_mode,
             manifest: Vec::new(),
             confirm_code: confirm.clone(),
         }
@@ -3570,6 +3590,7 @@ pub async fn post_invite(
             "invite_url": invite.to_url(),
             "confirm_code": confirm,
             "project": req.project,
+            "deployment_mode": invite.deployment_mode,
         })),
     )
         .into_response()
@@ -3720,6 +3741,23 @@ pub async fn post_invite_accept(
     let Some(invite) = EngagementInvite::from_url(&req.invite) else {
         return (StatusCode::BAD_REQUEST, "malformed invite").into_response();
     };
+    {
+        let guard = wb.lock_unpoisoned();
+        let policy = crate::org::Org::rebuild(guard.store_ref())
+            .map(|org| org.effective_placement_policy())
+            .unwrap_or_else(|_| gaugewright_core::boundary_lifecycle::PlacementPolicy::open());
+        if !gaugewright_core::boundary_lifecycle::pairing_admitted(
+            &policy,
+            &invite.deployment_mode,
+            false,
+        ) {
+            return (
+                StatusCode::FORBIDDEN,
+                "the invited project's deployment mode is not admitted by this org's placement policy",
+            )
+                .into_response();
+        }
+    }
     let origin = AuthorityId::new(invite.ticket.authority.as_str());
     let (broker, pins, accept_wire) = {
         let mut guard = wb.lock_unpoisoned();
@@ -4719,7 +4757,18 @@ pub async fn get_handoff_incoming(State(wb): State<SharedWorkbench>) -> impl Int
     let guard = wb.lock_unpoisoned();
     let incoming: Vec<serde_json::Value> = pending_incoming(guard.store_ref())
         .into_iter()
-        .map(|o| serde_json::json!({ "project": o["project"], "source": o["source"] }))
+        .map(|o| {
+            let project = o["project"].as_str().unwrap_or_default();
+            let log: Vec<HandoffLogRecord> =
+                serde_json::from_value(o["log"].clone()).unwrap_or_default();
+            let deployment_mode = incoming_deployment_mode(&log, project)
+                .unwrap_or_else(gaugewright_core::boundary_lifecycle::Placement::local);
+            serde_json::json!({
+                "project": o["project"],
+                "source": o["source"],
+                "deployment_mode": deployment_mode,
+            })
+        })
         .collect();
     Json(serde_json::json!({ "incoming": incoming }))
 }
@@ -4750,17 +4799,14 @@ fn incoming_deployment_mode(
 /// ITGOV-3(a): does `policy` admit the relocated `project`'s declared deployment mode?
 /// No attestation quote is exchanged over a handoff, so an attested-required policy refuses a
 /// handoff that can't prove it (`pairing_admitted(..., measurement_verified = false)`),
-/// fail-closed. Always `true` (no-op) when `policy` is `open()` — solo / no policy. Shared by
-/// `post_handoff_accept` (single, 403) and `post_handoff_accept_all` (bulk, skip) so the batch
-/// path enforces the same gate.
+/// fail-closed. An open org policy removes no constraint of its own, but an engagement that
+/// itself declares attested placement still needs measurement proof. Shared by explicit,
+/// batch, preauthorized, and one-shot admission so every path enforces the same gate.
 fn handoff_placement_admitted(
     policy: &gaugewright_core::boundary_lifecycle::PlacementPolicy,
     log: &[HandoffLogRecord],
     project: &str,
 ) -> bool {
-    if *policy == gaugewright_core::boundary_lifecycle::PlacementPolicy::open() {
-        return true;
-    }
     let declared = incoming_deployment_mode(log, project)
         .unwrap_or_else(gaugewright_core::boundary_lifecycle::Placement::local);
     gaugewright_core::boundary_lifecycle::pairing_admitted(policy, &declared, false)
@@ -4802,8 +4848,9 @@ pub async fn post_handoff_accept(
         // placement policy before the target admits it — the handoff analog of the
         // boundary-accept gate (`accept_boundary`). No attestation quote is exchanged over the
         // handoff, so an attested-required policy refuses a handoff that cannot prove it
-        // (`pairing_admitted(..., measurement_verified = false)`), fail-closed. No-op when the
-        // org policy is `open` (solo / no policy).
+        // (`pairing_admitted(..., measurement_verified = false)`), fail-closed. An open org
+        // floor admits the local/unattested default but does not fabricate measurement proof
+        // for an engagement that declares attested placement.
         let placement_policy = crate::org::Org::rebuild(guard.store_ref())
             .map(|o| o.effective_placement_policy())
             .unwrap_or_else(|_| gaugewright_core::boundary_lifecycle::PlacementPolicy::open());
@@ -5460,6 +5507,56 @@ mod handoff_routes_tests {
             StatusCode::FORBIDDEN,
             "an attested-required org policy refuses a handoff that can't prove attestation"
         );
+    }
+
+    #[tokio::test]
+    async fn combined_invite_is_refused_before_it_arms_a_policy_bypassing_one_shot() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+
+        let mut wb = crate::Workbench::new(mem_store());
+        wb.store_mut()
+            .append_record(
+                "org",
+                "placement_policy",
+                &serde_json::json!({
+                    "id": "",
+                    "op": "upsert",
+                    "policy": { "require_attested": true, "allowed_operators": [] },
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let invite = EngagementInvite {
+            invite_id: "policy-one-shot".into(),
+            ticket: PairingTicket {
+                authority: "origin".into(),
+                governance_pubkey: "unused-before-policy-gate".into(),
+                cert_fingerprint: hex::encode([7u8; 32]),
+                broker_addr: "ws://127.0.0.1:7900".into(),
+                scope: "bridge:invoke".into(),
+                expiry: 9_999_999_999,
+            },
+            project: "policy-project".into(),
+            project_name: "Policy project".into(),
+            deployment_mode: gaugewright_core::boundary_lifecycle::Placement::local(),
+            manifest: Vec::new(),
+            confirm_code: "1-2-3".into(),
+        };
+        let app = featured_routes(true).with_state(Arc::new(Mutex::new(wb)));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/federation/invite/accept")
+            .header("content-type", "application/json")
+            .header("idempotency-key", "policy-one-shot")
+            .body(Body::from(
+                serde_json::json!({ "invite": invite.to_url() }).to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

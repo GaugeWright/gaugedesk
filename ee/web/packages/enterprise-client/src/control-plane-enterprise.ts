@@ -1,4 +1,10 @@
 import type { RouteJson } from "@gaugewright/control-plane-client";
+import {
+    readPlacementPolicy,
+    type PlacementPolicy,
+} from "@gaugewright/control-plane-client";
+
+export type { PlacementPolicy } from "@gaugewright/control-plane-client";
 
 /** Stable server-derived Administration capabilities (`ADMIN-ENV-2`). */
 export type AdminCapability =
@@ -96,10 +102,6 @@ export interface ArchetypeApprovalPolicy {
 }
 /** Org deployment placement policy (DEPLOY-2): admissible `(operator, attested)` modes for
  *  engagements touching this org's data. Restrict-only; empty `allowed_operators` = all. */
-export interface PlacementPolicy {
-    readonly require_attested: boolean;
-    readonly allowed_operators: ReadonlyArray<"local" | "counterparty" | "neutral">;
-}
 /** Organization client/session compatibility floor (`ITGOV-4`). */
 export interface SoftwarePolicy {
     readonly minimum_version: string;
@@ -258,6 +260,11 @@ export async function adminCapabilities(json: RouteJson): Promise<AdminCapabilit
             tools: Array.isArray(value.agent?.tools) ? value.agent.tools : [],
         },
     };
+}
+
+/** Active-member read consumed by the enrolled workbench before engagement admission. */
+export function placementPolicy(json: RouteJson): Promise<PlacementPolicy> {
+    return readPlacementPolicy(json);
 }
 
 /** One live session in the IT roster (ITGOV-2): the active member's authority + how long

@@ -34,6 +34,7 @@ import {
     type ClientRequestId,
     parseHomeInvitation,
     type HomeInvitationPreview,
+    type PlacementPolicy,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
@@ -172,6 +173,9 @@ export interface WorkbenchAppProps {
         readonly available: Accessor<boolean>;
         readonly open: () => void;
     };
+    /** Enterprise composition's active-member placement floor. Presence means
+     * engagement acceptance fails closed until the authenticated read resolves. */
+    readonly placementPolicy?: Accessor<PlacementPolicy | undefined>;
     /** Hosted higher-band compositions receive the current tenant as routing
      * context only; the Hub remains responsible for membership/capability
      * admission. */
@@ -1508,6 +1512,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 settings menu → Devices, the single device-management modal. */}
             <SettingsMenu
                 api={api}
+                placementPolicy={props.placementPolicy}
                 codexLoginAvailable={codexLoginAvailable}
                 managedInferenceEditable={import.meta.env.VITE_HOME_SPLIT !== "true"}
                 openAccount={accountRequest}

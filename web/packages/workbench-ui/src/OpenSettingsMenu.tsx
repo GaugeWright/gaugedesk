@@ -5,6 +5,7 @@
  */
 
 import { createEffect, createSignal, on, Show, type Accessor, type JSX } from "solid-js";
+import type { PlacementPolicy } from "@gaugewright/control-plane-client";
 import { AccountPanel, type AccountPanelApi } from "./AccountPanel";
 import { DevicesModal, type DevicesModalApi } from "./DevicesModal";
 
@@ -38,6 +39,8 @@ export function SettingsMenu(props: {
     triggerLabel?: string;
     /** A capability-gated Environment action supplied by the app composition. */
     environmentAction?: SettingsEnvironmentAction;
+    /** Authenticated org floor supplied only by an enrolled composition. */
+    placementPolicy?: Accessor<PlacementPolicy | undefined>;
 }): JSX.Element {
     const [menuOpen, setMenuOpen] = createSignal(false);
     const [devicesOpen, setDevicesOpen] = createSignal(false);
@@ -177,6 +180,7 @@ export function SettingsMenu(props: {
                 <DevicesModal
                     api={props.api}
                     environment={props.environment}
+                    placementPolicy={props.placementPolicy}
                     initialInviteLink={inviteSeed()}
                     onClose={() => {
                         setDevicesOpen(false);

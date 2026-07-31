@@ -17,6 +17,7 @@ let advertisedIntegration: {
 } | null = null;
 let downloadedAuditExport = "";
 let desktopSoftwarePolicy: unknown = null;
+let enrolledPlacementPolicy: unknown = null;
 const generatedWrongIdentities = [
     "wrong",
     "wrong:delimiter:tenant",
@@ -30,6 +31,7 @@ async function resetAuthenticatedEnterprise(request: APIRequestContext): Promise
     advertisedIntegration = null;
     downloadedAuditExport = "";
     desktopSoftwarePolicy = null;
+    enrolledPlacementPolicy = null;
     const res = await request.post(`${enterpriseCP}/test/reset`, { headers: mutationHeaders() });
     if (!res.ok()) {
         throw new Error(`enterprise control-plane reset failed: ${res.status()} ${await res.text()}`);
@@ -120,6 +122,30 @@ Given("the authenticated enterprise workbench has a withheld context source", as
         "data-availability",
         "pending",
     );
+});
+
+Given("the enterprise workbench has an attested-only placement policy", async ({ page, request }) => {
+    const reset = await request.post(
+        `${enterpriseCP}/test/reset?attested_placement_policy=true`,
+        { headers: mutationHeaders() },
+    );
+    expect(reset.status()).toBe(200);
+    enrolledPlacementPolicy = null;
+    await page.context().addCookies([{
+        name: "gw_session",
+        value: ownerToken,
+        url: enterpriseCP,
+        httpOnly: true,
+        sameSite: "Lax",
+    }]);
+    const policyResponse = page.waitForResponse((response) =>
+        response.request().method() === "GET"
+        && new URL(response.url()).pathname === "/admin/placement-policy"
+    );
+    await page.goto(`${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}`);
+    const response = await policyResponse;
+    expect(response.status()).toBe(200);
+    enrolledPlacementPolicy = await response.json();
 });
 
 // authority-matrix
@@ -733,6 +759,43 @@ Then("the shipped desktop updater reads the tenant software policy", async () =>
         },
     });
 });
+
+When("I preview an unattested engagement in the shipped Devices UI", async ({ page }) => {
+    await page.locator("[data-settings]").click();
+    await page.locator("[data-settings-devices]").click();
+    const payload = JSON.stringify({
+        invite_id: "policy-client-journey",
+        ticket: { authority: "counterparty" },
+        project: "policy-client-project",
+        project_name: "Policy client project",
+        manifest: [],
+        confirm_code: "1-2-3",
+        deployment_mode: { operator: "local", attested: false },
+    });
+    const hex = Array.from(new TextEncoder().encode(payload), (byte) =>
+        byte.toString(16).padStart(2, "0")).join("");
+    await page.locator("[data-pd-invite-link]").fill(`gaugewright://invite?d=${hex}`);
+});
+
+Then(
+    "the enrolled client reads the placement floor and refuses the engagement locally",
+    async ({ page }) => {
+        expect(enrolledPlacementPolicy).toMatchObject({
+            placement_policy: {
+                require_attested: true,
+                allowed_operators: [],
+            },
+        });
+        await expect(page.locator("[data-placement-policy]")).toContainText(
+            "attestation required",
+        );
+        await expect(page.locator("[data-pd-invite-deployment]")).toContainText(
+            "local-operated · unattested",
+        );
+        await expect(page.locator("[data-pd-policy-refusal]")).toBeVisible();
+        await expect(page.locator("[data-pd-invite-accept]")).toBeDisabled();
+    },
+);
 
 Then("the Admin Environment shows the serving machine as live", async ({ page }) => {
     await page.getByRole("button", { name: "Machines", exact: true }).first().click();

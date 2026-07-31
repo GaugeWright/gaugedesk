@@ -46,6 +46,10 @@ export class EnterpriseControlPlane implements EnterpriseAdminApi {
         return enterprise.adminCapabilities(this.json);
     }
 
+    placementPolicy() {
+        return enterprise.placementPolicy(this.json);
+    }
+
     openAdministration(scope?: { readonly kind: "tenant"; readonly id: string }) {
         return openManagementEnvironment(this.json, "administration", scope);
     }

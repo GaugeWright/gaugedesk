@@ -456,6 +456,72 @@ async fn a_pre_authorized_peer_relocates_and_registers_the_project() {
 }
 
 #[tokio::test]
+async fn placement_policy_blocks_a_pre_authorized_handoff_before_auto_commit() {
+    let (broker, _relay) = start_broker().await;
+    let (alice, alice_wb, _ra) = instance("alice", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    {
+        let mut alice = alice_wb.lock().unwrap();
+        alice
+            .store_mut()
+            .append_record(
+                "library",
+                "project",
+                r#"{"id":"policy-blocked","op":"upsert","name":"Policy blocked","is_default":false,"home_id":"home:alice","network_isolated":false,"deployment_mode":{"operator":"local","attested":false}}"#,
+            )
+            .unwrap();
+        alice.rebuild_library();
+    }
+    {
+        let mut bob = bob_wb.lock().unwrap();
+        bob.store_mut()
+            .append_record(
+                "org",
+                "placement_policy",
+                r#"{"id":"","op":"upsert","policy":{"require_attested":true,"allowed_operators":[]}}"#,
+            )
+            .unwrap();
+    }
+
+    let (preauth, _) = post(
+        &bob,
+        "/federation/handoff/preauth",
+        json!({ "peer": "alice" }),
+    )
+    .await;
+    assert_eq!(preauth, StatusCode::OK);
+
+    let (status, body) = post(
+        &alice,
+        "/federation/handoff/relocate",
+        json!({ "project": "policy-blocked", "peer": "bob" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "policy refusal: {body}");
+    assert_eq!(
+        alice_wb
+            .lock()
+            .unwrap()
+            .project_home_id("policy-blocked")
+            .unwrap()
+            .as_str(),
+        "home:alice",
+        "the origin remains home after the target refuses"
+    );
+    assert!(
+        bob_wb
+            .lock()
+            .unwrap()
+            .project_home_id("policy-blocked")
+            .is_none(),
+        "preauthorization must not import a project that violates policy"
+    );
+}
+
+#[tokio::test]
 async fn relocation_carries_the_project_content_bytes_to_the_peer() {
     // The bytes behind the project's handles travel with the home (STATE_BEFORE_HOME):
     // alice's using-instance holds content; after relocation bob holds it on disk.

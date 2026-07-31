@@ -1170,6 +1170,15 @@ impl Workbench {
         self.library.project_home_id(project_id)
     }
 
+    /// The declared engagement placement, defaulting to the local unattested
+    /// mode for pre-declaration and legacy project records (DEPLOY-1/4).
+    pub fn project_deployment_mode(
+        &self,
+        project_id: &str,
+    ) -> gaugewright_core::boundary_lifecycle::Placement {
+        self.library.deployment_mode_of(project_id)
+    }
+
     pub fn owns_project(&self, project_id: &str) -> bool {
         self.project_home_id(project_id) == Some(self.home_id())
     }

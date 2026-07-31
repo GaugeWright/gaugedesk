@@ -1282,6 +1282,10 @@ pub(crate) struct TestResetQuery {
     /// desktop picker can supply target admission and perform the real crossing.
     #[serde(default)]
     exportable_output: bool,
+    /// Seed an attestation-required org placement floor for the enrolled-client
+    /// production journey. The test-only route remains guard- and build-gated.
+    #[serde(default)]
+    attested_placement_policy: bool,
 }
 
 /// Debug builds only (DR-0054 Phase A): a route that deletes the entire state
@@ -1379,6 +1383,21 @@ pub(crate) async fn post_test_reset(
                         AuthorityAttributes::default(),
                     );
                 fresh.set_identity_provider(Some(Arc::new(idp)));
+            }
+            if query.attested_placement_policy {
+                let record = crate::org::PlacementPolicyRecord {
+                    id: crate::org::ORG_ID.to_owned(),
+                    op: crate::org::RecordOp::Upsert,
+                    policy: gaugewright_core::boundary_lifecycle::PlacementPolicy {
+                        require_attested: true,
+                        allowed_operators: Default::default(),
+                    },
+                };
+                let _ = fresh.store_mut().append_record(
+                    crate::org::ORG_SCOPE,
+                    "placement_policy",
+                    &serde_json::to_string(&record).expect("test placement policy serializes"),
+                );
             }
             if query.assignable_task {
                 let tracker = match fresh.account_tracker() {

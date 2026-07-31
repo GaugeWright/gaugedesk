@@ -126,6 +126,13 @@ Feature: Admin Environment
     When I reload the administered workbench as a desktop client
     Then the shipped desktop updater reads the tenant software policy
 
+  # placement-policy-enrolled-client-production-journey
+  @transport @authenticated
+  Scenario: the enrolled desktop refuses an engagement outside organization placement policy
+    Given the enterprise workbench has an attested-only placement policy
+    When I preview an unattested engagement in the shipped Devices UI
+    Then the enrolled client reads the placement floor and refuses the engagement locally
+
   # admin-sso-production-client-lifecycle
   @transport @authenticated
   Scenario: the guided SSO wizard walks through the steps
