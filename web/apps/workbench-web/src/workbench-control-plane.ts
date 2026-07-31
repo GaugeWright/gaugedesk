@@ -83,6 +83,15 @@ export interface SoftwareUpdatePolicy {
 
 class NoSelectedHomeError extends Error {}
 
+/** The single-Home rollout can expose its private Home origin before a
+ * tenant-owned Home is provisioned. That is an onboarding state, not an
+ * authorization failure: return the ordinary setup surface instead of showing
+ * the raw Home response. */
+function isUnprovisionedHomeError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    return /POST \/home\/admissions: 403 Home has no active owner/.test(message);
+}
+
 /** App-owned control-plane edge for the open workbench shell. */
 export class WorkbenchControlPlane implements ControlPlane {
     private bearer: string | null = null;
@@ -220,7 +229,10 @@ export class WorkbenchControlPlane implements ControlPlane {
             if (!home) throw new NoSelectedHomeError("No reachable Home is selected");
             return { kind: "connected", home };
         } catch (error) {
-            if (!(error instanceof NoSelectedHomeError)) throw error;
+            if (!(error instanceof NoSelectedHomeError) && !isUnprovisionedHomeError(error)) {
+                throw error;
+            }
+            this.homeTransport = null;
             const [state, routes] = await Promise.all([
                 accountClient.accountHomes(this.route),
                 accountClient.accountHomeRoutes(this.route),

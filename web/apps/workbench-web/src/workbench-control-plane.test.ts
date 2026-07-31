@@ -85,6 +85,33 @@ describe("hosted Home bootstrap", () => {
         expect(fetch).not.toHaveBeenCalledWith("https://hub.example/workspace", expect.anything());
     });
 
+    it("treats an unprovisioned managed Home as setup state, not an access error", async () => {
+        const fetch = vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            if (url === "https://hub.example/account/homes") {
+                return new Response(JSON.stringify({
+                    homes: [{ id: "home:cloud", kind: "cloud", endpoint: "https://home.example" }],
+                    selected_home: "home:cloud",
+                }));
+            }
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(JSON.stringify({ routes: [] }));
+            }
+            if (url === "https://home.example/home/admissions") {
+                return new Response(JSON.stringify({ error: "Home has no active owner" }), { status: 403 });
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        });
+        vi.stubGlobal("fetch", fetch);
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+
+        await expect(api.bootstrapHome()).resolves.toMatchObject({
+            kind: "none",
+            homes: [{ id: "home:cloud" }],
+            routes: [],
+        });
+    });
+
     it("routes project credential clients to the admitted Home, never the Hub", async () => {
         const calls: Array<[string, RequestInit | undefined]> = [];
         vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
