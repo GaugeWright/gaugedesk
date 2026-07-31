@@ -27,18 +27,26 @@ export function EnterpriseWorkbench(): JSX.Element {
     const initialMode = requestedWorkbenchMode(window.location.search);
     const [requestedMode, setRequestedMode] = createSignal<WorkbenchMode>(initialMode);
     const [adminMounted, setAdminMounted] = createSignal(false);
-    const [tenant, setTenant] = createSignal<string | null>(null);
+    // Seed from the URL: capability discovery must carry the tenant scope from the
+    // very first request, or a hosted deep link into Administration resolves against
+    // the empty default tenant and is dropped as unavailable.
+    const [tenant, setTenant] = createSignal<string | null>(
+        new URLSearchParams(window.location.search).get("tenant"),
+    );
     const api = new EnterpriseControlPlane(undefined, { tenant });
-    const [discovery] = createResource(async (): Promise<AdminCapabilityDiscovery> => {
-        try {
-            return await api.adminCapabilities();
-        } catch {
-            return {
-                capabilities: [],
-                agent: { message_attachments: false, additional_tools: false, tools: [] },
-            };
-        }
-    });
+    const [discovery] = createResource(
+        () => ({ tenant: tenant() }),
+        async (): Promise<AdminCapabilityDiscovery> => {
+            try {
+                return await api.adminCapabilities();
+            } catch {
+                return {
+                    capabilities: [],
+                    agent: { message_attachments: false, additional_tools: false, tools: [] },
+                };
+            }
+        },
+    );
     const [placementPolicy] = createResource(
         () => ({ tenant: tenant() }),
         async (): Promise<PlacementPolicy> => api.placementPolicy(),
