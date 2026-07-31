@@ -1032,22 +1032,6 @@ export class WorkbenchControlPlane implements ControlPlane {
         return federationClient.revokePeer(this.routeJson(), authority);
     }
 
-    cross(peer: string, handle: string, correlation: string): Promise<boolean> {
-        return federationClient.cross(this.routeJson(), peer, handle, correlation);
-    }
-
-    remoteRun(peer: string, runScope: string, prompt: string): Promise<federationClient.RemoteRunResult> {
-        return federationClient.remoteRun(this.routeJson(), peer, runScope, prompt);
-    }
-
-    federationConsent(owner: string, reviewScope: string): Promise<unknown> {
-        return federationClient.federationConsent(this.routeJson(), owner, reviewScope);
-    }
-
-    federationInbox(): Promise<federationClient.FederatedFact[]> {
-        return federationClient.federationInbox(this.routeJson());
-    }
-
     handoffAbort(project: ProjectId): Promise<federationClient.HandoffStatus> {
         return federationClient.handoffAbort(this.routeJson(), project);
     }

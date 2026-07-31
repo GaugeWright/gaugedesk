@@ -232,6 +232,42 @@ async fn test_only_harness_routes_refuse_without_activation_guard() {
     }
 }
 
+/// DR-0051 retires provisional federation drivers once the shipped Engagement
+/// operations subsume them. They must remain absent instead of silently returning
+/// as undocumented compatibility surface or browser-test shortcuts.
+#[tokio::test]
+async fn dormant_federation_facades_are_unreachable() {
+    let (_dir, app) = control_plane();
+    for (method, path, body) in [
+        ("POST", "/federation/cross", Some(json!({}).to_string())),
+        (
+            "POST",
+            "/federation/remote-run",
+            Some(json!({}).to_string()),
+        ),
+        ("POST", "/federation/consent", Some(json!({}).to_string())),
+        ("GET", "/federation/inbox", None),
+        (
+            "POST",
+            "/federation/revoke-device",
+            Some(json!({}).to_string()),
+        ),
+        (
+            "POST",
+            "/federation/recovery-code",
+            Some(json!({}).to_string()),
+        ),
+        ("POST", "/federation/restore", Some(json!({}).to_string())),
+    ] {
+        let (status, response) = send(&app, method, path, body).await;
+        assert_eq!(status, 404, "{method} {path} unexpectedly remained routed");
+        assert!(
+            response.trim().is_empty(),
+            "{method} {path} reached a handler: {response}",
+        );
+    }
+}
+
 /// A handler nothing routes to is the defect one step before it becomes a 404.
 ///
 /// Both `screen_quarantined_item` and the edge's collection drain existed,

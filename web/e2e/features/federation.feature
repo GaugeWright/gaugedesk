@@ -12,10 +12,6 @@ Feature: Cross-machine federation
   Scenario: pair two machines and collaborate both ways
     Given the two federated workbenches are open
     When the two authorities pair with each other
-    And the owner crosses a handle to the peer
-    Then the handle appears in the peer's federation inbox
-    When the owner places a remote run on the peer
-    Then the owner sees the peer's observations were admitted
     When the owner offers projects for manual handoff consent
     Then the target accepts, declines, and batch-accepts through the shipped UI
     When the owner offers and cancels another handoff through the shipped UI

@@ -176,45 +176,6 @@ When("the two authorities pair with each other", async ({ page }) => {
     await page.waitForTimeout(800);
 });
 
-// The raw "cross a handle" / "remote run" controls were retired from the UI (co-drive
-// is now the per-project Engagement-pane flow, FED-7); the FED-1 endpoints still back
-// them, so these steps exercise the endpoints directly through the control plane.
-let lastRun: { observations_admitted?: number } | null = null;
-
-When("the owner crosses a handle to the peer", async ({ request }) => {
-    const r = await request.post(`${ALICE_CP}/federation/cross`, {
-        headers: mutationHeaders(),
-        data: { peer: "bob", handle: "ctx-method-HANDLE", correlation: `xc-${Date.now()}` },
-    });
-    expect(r.ok(), "cross admitted").toBeTruthy();
-});
-
-Then("the handle appears in the peer's federation inbox", async ({ request }) => {
-    await expect
-        .poll(
-            async () => {
-                const r = await request.get(`${BOB_CP}/federation/inbox`);
-                const j = (await r.json()) as { federated?: unknown[] };
-                return (j.federated ?? []).length;
-            },
-            { timeout: 8_000 },
-        )
-        .toBeGreaterThan(0);
-});
-
-When("the owner places a remote run on the peer", async ({ request }) => {
-    const r = await request.post(`${ALICE_CP}/federation/remote-run`, {
-        headers: mutationHeaders(),
-        data: { peer: "bob", run_scope: `run-${Date.now()}`, prompt: "go" },
-    });
-    expect(r.ok(), "remote run ok").toBeTruthy();
-    lastRun = (await r.json()) as { observations_admitted?: number };
-});
-
-Then("the owner sees the peer's observations were admitted", async () => {
-    expect(lastRun?.observations_admitted ?? 0).toBeGreaterThan(0);
-});
-
 When("the owner offers projects for manual handoff consent", async ({ request }) => {
     for (const project of manualHandoffs) {
         const response = await request.post(`${ALICE_CP}/federation/handoff/relocate`, {

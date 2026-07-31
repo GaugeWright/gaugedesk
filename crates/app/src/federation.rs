@@ -228,18 +228,11 @@ pub(crate) fn routes() -> axum::Router<SharedWorkbench> {
     use axum::routing::{delete, get, post};
 
     axum::Router::new()
-        // Pairing: mint a ticket, accept a peer's ticket (TOFU pin), list peers, drive a crossing.
+        // Pairing: mint a ticket, accept a peer's ticket (TOFU pin), and list peers.
         .route("/federation/pairing-ticket", post(post_pairing_ticket))
         .route("/federation/pair", post(post_pair))
         .route("/federation/peers", get(get_peers))
         .route("/federation/peers/:authority", delete(delete_peer))
-        .route("/federation/cross", post(post_cross))
-        .route("/federation/revoke-device", post(post_revoke_device))
-        .route("/federation/remote-run", post(post_remote_run))
-        .route("/federation/consent", post(post_consent))
-        .route("/federation/recovery-code", post(post_recovery_code))
-        .route("/federation/restore", post(post_restore))
-        .route("/federation/inbox", get(get_inbox))
         // Project handoff / authority relocation (FED-6): the shipped control
         // surface is relocate/consent/abort/status. The reducer's former raw
         // offer -> sync -> commit HTTP steps were retired because no product
@@ -1575,18 +1568,14 @@ pub async fn post_pair(
     (StatusCode::OK, Json(record)).into_response()
 }
 
-/// Park every per-peer receiver leg (crossing / runtime / consent / handoff / revocation)
+/// Park every receiver leg used by the shipped handoff, co-drive, and erasure flows
 /// for a freshly pinned `peer`. Shared by `POST /federation/pair` and the combined-invite
 /// Accept, which pins a peer the same way (ADR 0047).
 fn spawn_peer_receivers(wb: &SharedWorkbench, peer: AuthorityId) {
-    tokio::spawn(run_receiver(wb.clone(), peer.clone()));
-    tokio::spawn(run_runtime_receiver(wb.clone(), peer.clone()));
-    tokio::spawn(run_consent_receiver(wb.clone(), peer.clone()));
     tokio::spawn(run_handoff_receiver(wb.clone(), peer.clone()));
     tokio::spawn(run_place_receiver(wb.clone(), peer.clone()));
     tokio::spawn(run_result_receiver(wb.clone(), peer.clone()));
-    tokio::spawn(run_erasure_receiver(wb.clone(), peer.clone()));
-    tokio::spawn(run_revocation_receiver(wb.clone(), peer));
+    tokio::spawn(run_erasure_receiver(wb.clone(), peer));
 }
 
 /// Re-park the per-peer receiver legs for every **active** peer restored from the durable

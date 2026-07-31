@@ -24,17 +24,6 @@ export interface FederationPeer {
     readonly broker_addr: string;
     readonly active: boolean;
 }
-/** One federated fact (handle + correlation) that crossed in. */
-export interface FederatedFact {
-    readonly correlation: string;
-    readonly source: string;
-    readonly target: string;
-    readonly payload_handle: string;
-}
-export interface RemoteRunResult {
-    readonly observations_admitted: number;
-    readonly assistant_text: string;
-}
 /** The handoff projection: a project's relocation phase + which authority is home.
  *  `project` is the same branded `ProjectId` the command side takes — opaque
  *  foreign tokens (`source`/`authority`/`peer`/`correlation`) stay plain `string`. */
@@ -192,22 +181,6 @@ function parseFederationPeer(raw: unknown): FederationPeer {
         active: fBool(o, "active"),
     };
 }
-function parseFederatedFact(raw: unknown): FederatedFact {
-    const o = fedObj(raw);
-    return {
-        correlation: fStr(o, "correlation"),
-        source: fStr(o, "source"),
-        target: fStr(o, "target"),
-        payload_handle: fStr(o, "payload_handle"),
-    };
-}
-function parseRemoteRunResult(raw: unknown): RemoteRunResult {
-    const o = fedObj(raw);
-    return {
-        observations_admitted: fOptNum(o, "observations_admitted") ?? 0,
-        assistant_text: fOptStr(o, "assistant_text") ?? "",
-    };
-}
 function parseHandoffStatus(raw: unknown): HandoffStatus {
     const o = fedObj(raw);
     return {
@@ -328,44 +301,6 @@ export async function listPeers(json: RouteJson): Promise<FederationPeer[]> {
  *  record, while its grant and transport pin stop authorizing future work. */
 export async function revokePeer(json: RouteJson, authority: string): Promise<void> {
     await json("DELETE", `/federation/peers/${encodeURIComponent(authority)}`);
-}
-
-/** Hand-drive one crossing of a handle to a paired peer; returns admission. */
-export async function cross(
-    json: RouteJson,
-    peer: string,
-    handle: string,
-    correlation: string,
-): Promise<boolean> {
-    const o = fedObj(await json("POST", "/federation/cross", { peer, handle, correlation }));
-    return fBool(o, "admitted");
-}
-
-/** Place a run on a paired peer; returns how many observations were admitted. */
-export async function remoteRun(
-    json: RouteJson,
-    peer: string,
-    runScope: string,
-    prompt: string,
-): Promise<RemoteRunResult> {
-    return parseRemoteRunResult(
-        await json("POST", "/federation/remote-run", { peer, run_scope: runScope, prompt }),
-    );
-}
-
-/** Consent (as a remote stakeholder) to an owner's review, across the network. */
-export async function federationConsent(
-    json: RouteJson,
-    owner: string,
-    reviewScope: string,
-): Promise<unknown> {
-    return json("POST", "/federation/consent", { owner, review_scope: reviewScope });
-}
-
-/** The federated facts (handles) that have crossed into this authority. */
-export async function federationInbox(json: RouteJson): Promise<FederatedFact[]> {
-    const o = fedObj(await json("GET", "/federation/inbox"));
-    return fArr(o, "federated").map(parseFederatedFact);
 }
 
 /** Abort an in-flight handoff; home rolls back to the origin. */
