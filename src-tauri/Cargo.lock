@@ -919,7 +919,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
 dependencies = [
  "generic-array",
- "rand_core",
+ "rand_core 0.6.4",
  "subtle",
  "zeroize",
 ]
@@ -1024,6 +1024,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "data-encoding"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "dbus"
@@ -1324,7 +1330,7 @@ dependencies = [
  "hkdf",
  "pem-rfc7468",
  "pkcs8",
- "rand_core",
+ "rand_core 0.6.4",
  "sec1",
  "subtle",
  "zeroize",
@@ -1469,7 +1475,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
 dependencies = [
- "rand_core",
+ "rand_core 0.6.4",
  "subtle",
 ]
 
@@ -1666,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-desktop"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gaugewright-app",
  "serde_json",
@@ -1681,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-app"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1689,6 +1695,7 @@ dependencies = [
  "futures",
  "gaugewright-boundary",
  "gaugewright-core",
+ "gaugewright-directory-protocol",
  "gaugewright-harness",
  "gaugewright-relay-transport",
  "gaugewright-store",
@@ -1717,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-boundary"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gaugewright-core",
  "serde",
@@ -1726,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-core"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "ciborium",
  "getrandom 0.2.17",
@@ -1737,8 +1744,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gaugewright-directory-protocol"
+version = "0.4.4"
+dependencies = [
+ "gaugewright-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gaugewright-harness"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1748,9 +1764,10 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-relay-transport"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64 0.22.1",
+ "futures-util",
  "getrandom 0.2.17",
  "hex",
  "rcgen",
@@ -1759,11 +1776,12 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
 ]
 
 [[package]]
 name = "gaugewright-store"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gaugewright-core",
  "rusqlite",
@@ -1773,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-tracker"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "serde_json",
  "whipplescript-kernel",
@@ -1782,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-whip-runtime"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64 0.22.1",
  "gaugewright-core",
@@ -1801,7 +1819,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-workspace"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "hex",
  "rusqlite",
@@ -2064,7 +2082,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0f9ef7462f7c099f518d754361858f86d8a07af53ba9af0fe635bbccb151a63"
 dependencies = [
  "ff",
- "rand_core",
+ "rand_core 0.6.4",
  "subtle",
 ]
 
@@ -3682,6 +3700,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
+name = "ppv-lite86"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
+dependencies = [
+ "zerocopy",
+]
+
+[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3799,12 +3826,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "rand"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
+dependencies = [
+ "rand_chacha",
+ "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.9.5",
+]
+
+[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.17",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
+dependencies = [
+ "getrandom 0.3.4",
 ]
 
 [[package]]
@@ -4530,7 +4586,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest 0.10.7",
- "rand_core",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -5344,6 +5400,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "489a59b6730eda1b0171fcfda8b121f4bee2b35cba8645ca35c5f7ba3eb736c1"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5627,6 +5699,25 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tungstenite"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eadc29d668c91fcc564941132e17b28a7ceb2f3ebf0b9dae3e03fd7a6748eb0d"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand",
+ "rustls",
+ "rustls-pki-types",
+ "sha1 0.10.7",
+ "thiserror 2.0.18",
+ "utf-8",
+]
 
 [[package]]
 name = "typed-arena"
@@ -6143,9 +6234,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript"
-version = "0.3.1"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bf17c54d0feab8a81a07b04c52702078a952e63a23f4a9e76dba53e3631b56d"
+checksum = "0a60ed8aa3a2c452aa4e9c465b231f4b36fe41cf5ee4f869445c01d9b09444b6"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -6165,18 +6256,18 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-core"
-version = "0.3.1"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b56f4799b3b4272879b99a8a4078bd349bb63f2f0e0e25d924fad97c0270702"
+checksum = "f348c520e5f0e00f0b22d325d9afd26eca5fbec9c2e07e9f084bd63dfa4e71b5"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "whipplescript-kernel"
-version = "0.3.1"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83e0d4143ed93eed13558555d91b95b37b2fe3a6cb23794865733b1ea3d211c3"
+checksum = "4eb2b7df54fbb0a3d757d919508f2f186f7aa950676e69e3ceb007d3ff1df49f"
 dependencies = [
  "bashkit",
  "chrono",
@@ -6193,9 +6284,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-parser"
-version = "0.3.1"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03d0ca4a3e52b2fd2513290e99a956afeb9c602ad9e4225a143f12287c17a93a"
+checksum = "38156752300b6652b8f6cfb534910ce850788d8d9fed6e9e2af89bf898621343"
 dependencies = [
  "serde_json",
  "sha2 0.10.9",
@@ -6204,9 +6295,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-store"
-version = "0.3.1"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bf630f54dbee32a667ccae3424a3cc7cc3ddb66fa4ef70d1cd13b3c60a634b7"
+checksum = "31b8aa05e16d94f940440dad1f9b1e018eb0e9a856c708179faa1590c36a7b85"
 dependencies = [
  "rusqlite",
  "serde",

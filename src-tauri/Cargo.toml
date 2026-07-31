@@ -3,7 +3,7 @@
 # cargo workspace (which stays self-contained and green).
 [package]
 name = "gaugedesk-desktop"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 authors = ["GaugeWright <support@gaugewright.com>"]
 license = "Apache-2.0"

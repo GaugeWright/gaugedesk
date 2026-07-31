@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-app"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "axum",
  "base64",
@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-boundary"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gaugewright-core",
  "proptest",
@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-core"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "ciborium",
  "getrandom 0.2.17",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-directory-protocol"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gaugewright-core",
  "serde",
@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-ee"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "axum",
  "base64",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-harness"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-pi-bridge"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gaugewright-core",
  "gaugewright-harness",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-relay-transport"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64",
  "futures-util",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-store"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "gaugewright-core",
  "rusqlite",
@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-tracker"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-whip-runtime"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64",
  "gaugewright-core",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-workspace"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "hex",
  "rusqlite",
