@@ -178,7 +178,7 @@ describe("mobile target references", () => {
             parseMobileTargetReference(
                 "https://app.gaugewright.com/link?project=project%3Aone&kind=chat&id=chat%3Aone&pane=chat",
             ),
-        ).toEqual(expected);
+        ).toBeNull();
     });
 
     it("rejects protected notification payload content", () => {

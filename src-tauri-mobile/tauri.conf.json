@@ -47,12 +47,6 @@
           "host": "desk.gaugewright.com",
           "pathPrefix": ["/link", "/invite"],
           "appLink": true
-        },
-        {
-          "scheme": ["https"],
-          "host": "app.gaugewright.com",
-          "pathPrefix": ["/link", "/invite"],
-          "appLink": true
         }
       ]
     }
