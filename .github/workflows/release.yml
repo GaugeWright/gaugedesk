@@ -139,6 +139,7 @@ jobs:
           npm --prefix web ci
           npm --prefix ee/web ci
           npm --prefix ee/web run build
+          node -e "const fs = require('node:fs'); const entry = 'ee/web/dist-enterprise-workbench/index.html'; if (!fs.statSync(entry).isFile()) throw new Error('desktop frontend entry missing: ' + entry)"
 
       - name: verify Apple signing inputs
         if: matrix.os-label == 'macos'

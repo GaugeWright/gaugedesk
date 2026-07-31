@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-desktop"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "gaugewright-app",
  "serde_json",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-app"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-boundary"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "gaugewright-core",
  "serde",
@@ -1733,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-core"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "ciborium",
  "getrandom 0.2.17",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-directory-protocol"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "gaugewright-core",
  "serde",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-harness"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -1764,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-relay-transport"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-store"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "gaugewright-core",
  "rusqlite",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-tracker"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "serde_json",
  "whipplescript-kernel",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-whip-runtime"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "base64 0.22.1",
  "gaugewright-core",
@@ -1819,7 +1819,7 @@ dependencies = [
 
 [[package]]
 name = "gaugewright-workspace"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "hex",
  "rusqlite",
