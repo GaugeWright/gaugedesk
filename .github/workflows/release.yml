@@ -69,7 +69,10 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: verify Azure Artifact Signing inputs
-        if: matrix.os-label == 'windows'
+        # The pre-approval lane intentionally emits unsigned packages. Enable
+        # Azure only after the Public Trust profile and pre-bundle signing hook
+        # both exist; merely provisioning an account must not block rehearsals.
+        if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
         shell: bash
         env:
           AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
@@ -88,7 +91,7 @@ jobs:
           test -n "$SIGNING_ENDPOINT"
 
       - name: authenticate Windows release identity
-        if: matrix.os-label == 'windows'
+        if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
         uses: azure/login@v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
@@ -96,7 +99,7 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: verify Azure Artifact Signing account
-        if: matrix.os-label == 'windows'
+        if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
         shell: bash
         env:
           SIGNING_RESOURCE_GROUP: ${{ vars.AZURE_ARTIFACT_SIGNING_RESOURCE_GROUP }}
@@ -284,7 +287,7 @@ jobs:
           args: --bundles ${{ env.BUNDLES }} --config tauri.bundle.conf.json
 
       - name: verify unsigned Windows package boundary
-        if: matrix.os-label == 'windows'
+        if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
