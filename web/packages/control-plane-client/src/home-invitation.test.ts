@@ -68,7 +68,7 @@ describe("ordinary Home invitations", () => {
         const encoded = invitation();
         const route = vi.fn(async () => ({
             invite: encoded,
-            url: `https://app.gaugewright.com/invite?d=${encoded}`,
+            url: `https://desk.gaugewright.com/invite?d=${encoded}`,
             expires_at: 123,
         }));
         await expect(createHomeInvitation(route, {

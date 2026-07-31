@@ -171,6 +171,11 @@ describe("mobile target references", () => {
         ).toEqual(expected);
         expect(
             parseMobileTargetReference(
+                "https://desk.gaugewright.com/link?project=project%3Aone&kind=chat&id=chat%3Aone&pane=chat",
+            ),
+        ).toEqual(expected);
+        expect(
+            parseMobileTargetReference(
                 "https://app.gaugewright.com/link?project=project%3Aone&kind=chat&id=chat%3Aone&pane=chat",
             ),
         ).toEqual(expected);

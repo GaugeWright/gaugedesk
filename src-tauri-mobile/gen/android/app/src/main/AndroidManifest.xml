@@ -38,6 +38,7 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="https" />
+                <data android:host="desk.gaugewright.com" />
                 <data android:host="app.gaugewright.com" />
                 <data android:pathPrefix="/link" />
                 <data android:pathPrefix="/invite" />

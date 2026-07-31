@@ -154,7 +154,7 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         // cross-origin GET into save/preview requests. Without this exposure
         // the server sends the header but Fetch intentionally hides it.
         .expose_headers([axum::http::HeaderName::from_static("x-workspace-cut")])
-        // The hosted Console is a cross-subdomain browser client (app.gaugewright.com →
+        // The hosted Console is a cross-subdomain browser client (desk.gaugewright.com →
         // auth/api host) that authenticates with the shared `Domain=.gaugewright.com`
         // session cookie (ADR 0077). Credentialed CORS is required for the browser to send
         // that cookie and for SSE `withCredentials`. Safe here: the origin is a **pinned

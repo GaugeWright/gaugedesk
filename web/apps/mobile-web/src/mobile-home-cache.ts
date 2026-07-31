@@ -205,8 +205,11 @@ export function parseMobileTargetReference(raw: string): MobileTargetReference |
                     && (url.pathname === "" || url.pathname === "/"))
                 || opaqueRoute === "open"
             );
+        // desk.gaugewright.com is the canonical web origin (company DR-0055);
+        // app.gaugewright.com stays accepted for links minted before the rename.
         const universal = url.protocol === "https:"
-            && url.hostname === "app.gaugewright.com"
+            && (url.hostname === "desk.gaugewright.com"
+                || url.hostname === "app.gaugewright.com")
             && url.pathname === "/link";
         if (!custom && !universal) return null;
         if (protectedParameters.some((parameter) => url.searchParams.has(parameter))) {

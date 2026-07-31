@@ -105,7 +105,7 @@ fn invitation_url(encoded: &str) -> String {
     let console = std::env::var("GAUGEWRIGHT_CONSOLE_URL")
         .ok()
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| "https://app.gaugewright.com".to_owned());
+        .unwrap_or_else(|| "https://desk.gaugewright.com".to_owned());
     format!("{}/invite?d={encoded}", console.trim_end_matches('/'))
 }
 
