@@ -14,7 +14,13 @@
  */
 
 import { createResource, createSignal, For, Show, type JSX } from "solid-js";
-import { describeFailure, type ProjectId } from "@gaugewright/control-plane-client";
+import {
+    describeFailure,
+    type EngagementId,
+    type ProjectId,
+    type Workspace,
+    type CreatedHomeInvitation,
+} from "@gaugewright/control-plane-client";
 import {
     type EngagementInvite,
     type FederationPeer,
@@ -38,6 +44,7 @@ function homeLabel(s: HandoffStatus | null | undefined): string {
 }
 
 export interface EngagementPaneApi {
+    getWorkspace(): Promise<Workspace>;
     handoffStatus(project: ProjectId): Promise<HandoffStatus>;
     handoffParticipants(project: ProjectId): Promise<Participant[]>;
     handoffData(project: ProjectId): Promise<ConnectedData[]>;
@@ -54,12 +61,18 @@ export interface EngagementPaneApi {
         archetype: string,
         dataHandle: string,
         prompt: string,
+        targetChat?: string,
     ): Promise<PlacedRun>;
     runResult(correlation: string): Promise<RunResult>;
     admitRunOnce(correlation: string): Promise<void>;
     allowRuns(project: ProjectId, operator: string): Promise<void>;
     denyRun(correlation: string): Promise<void>;
     handoffConnectData(project: ProjectId, handle: string, label?: string): Promise<void>;
+    createHomeInvitation(
+        authority: string,
+        project: ProjectId,
+        role?: "member" | "viewer",
+    ): Promise<CreatedHomeInvitation>;
 }
 
 export function EngagementPane(props: {
@@ -78,6 +91,8 @@ export function EngagementPane(props: {
     // picker there — an inline field stands in for the dialog.
     const [folder, setFolder] = createSignal("");
     const [showFolderField, setShowFolderField] = createSignal(false);
+    const [personAuthority, setPersonAuthority] = createSignal("");
+    const [personInvite, setPersonInvite] = createSignal<CreatedHomeInvitation | null>(null);
 
     const [handoff, { refetch: refetchHandoff }] = createResource(
         () => props.project,
@@ -92,6 +107,7 @@ export function EngagementPane(props: {
         (p) => props.api.handoffData(p),
     );
     const [peers] = createResource(() => props.api.listPeers());
+    const [workspace] = createResource(() => props.api.getWorkspace());
     // Co-drive (FED-7): the host's admission queue (pending operator runs for this
     // project), and the operator's place-a-run controls.
     const [queue, { refetch: refetchQueue }] = createResource(
@@ -100,6 +116,7 @@ export function EngagementPane(props: {
     );
     const [runArchetype, setRunArchetype] = createSignal("");
     const [runPrompt, setRunPrompt] = createSignal("");
+    const [runTargetChat, setRunTargetChat] = createSignal("");
 
     const refetchAll = () => {
         void refetchHandoff();
@@ -111,6 +128,19 @@ export function EngagementPane(props: {
     const handedOff = () => phase() === "committed";
     const inFlight = () => phase() === "offered" || phase() === "log_synced";
     const pairedPeers = () => (peers() ?? []).filter((p: FederationPeer) => p.active);
+    const hubChats = (): { id: EngagementId; title: string }[] => {
+        const project = workspace()?.projects.find((item) => item.id === props.project);
+        if (!project) return [];
+        const members = new Set(
+            project.placements.flatMap((placement) =>
+                placement.workstreams.flatMap((workstream) => workstream.members),
+            ),
+        );
+        return project.placements
+            .flatMap((placement) => placement.chats)
+            .filter((chat) => members.has(chat.id))
+            .map((chat) => ({ id: chat.id, title: chat.title }));
+    };
 
     const handOff = async () => {
         const target = peer() || pairedPeers()[0]?.authority;
@@ -151,6 +181,21 @@ export function EngagementPane(props: {
                 if (s.accepted) {
                     setAccepted(true);
                     setStatus(`accepted by ${s.accepted_by ?? "a device"} · confirm code ${s.confirm_code}`);
+                    // Acceptance resolves the pairing invitation before the
+                    // origin's receiver finishes the two-phase relocation. A
+                    // single refetch here can observe `offered` and then freeze
+                    // forever. Follow the durable handoff projection through
+                    // commit, which is the state the pane actually promises.
+                    for (let settle = 0; settle < 60; settle++) {
+                        const handoff = await props.api.handoffStatus(props.project);
+                        if (handoff.phase === "committed") {
+                            await refetchHandoff();
+                            void refetchParticipants();
+                            void refetchData();
+                            return;
+                        }
+                        await new Promise((r) => setTimeout(r, 500));
+                    }
                     refetchAll();
                     return;
                 }
@@ -168,6 +213,30 @@ export function EngagementPane(props: {
             } catch {
                 /* selectable regardless */
             }
+        }
+    };
+    const invitePerson = async () => {
+        const authority = personAuthority().trim();
+        if (!authority) {
+            setStatus("enter the GaugeWright account authority to invite");
+            return;
+        }
+        try {
+            const created = await props.api.createHomeInvitation(authority, props.project);
+            setPersonInvite(created);
+            setStatus("project invitation ready — share this link with that account only");
+        } catch (e) {
+            setStatus(describeFailure("invite the person", e));
+        }
+    };
+    const copyPersonInvite = async () => {
+        const url = personInvite()?.url;
+        if (!url) return;
+        try {
+            await navigator.clipboard?.writeText(url);
+            setStatus("project invitation link copied");
+        } catch {
+            setStatus("select and copy the project invitation link");
         }
     };
     const cancel = async () => {
@@ -195,6 +264,11 @@ export function EngagementPane(props: {
             setStatus("no paired host to place a run on");
             return;
         }
+        const targetChat = runTargetChat() || hubChats()[0]?.id;
+        if (!targetChat) {
+            setStatus("create or join a workstream chat before placing a federated run");
+            return;
+        }
         try {
             const r = await props.api.placeRun(
                 target,
@@ -202,6 +276,7 @@ export function EngagementPane(props: {
                 runArchetype().trim() || "archetype",
                 connected()?.[0]?.handle ?? "data",
                 runPrompt().trim() || "go",
+                targetChat,
             );
             setStatus(
                 r.status === "admitted"
@@ -407,6 +482,49 @@ export function EngagementPane(props: {
                     </Show>
                 </Show>
 
+                {/* Ordinary free-account participation is separate from device pairing
+                    and Home relocation. It grants this project on the current Home. */}
+                <section class="engagement-person-invite" data-person-invite>
+                    <p class="status" style={{ margin: "12px 0 4px" }}>
+                        Invite a person to this project:
+                    </p>
+                    <Show
+                        when={personInvite()}
+                        fallback={<div class="pair-device-actions">
+                            <input
+                                class="fed-paste"
+                                data-person-authority
+                                value={personAuthority()}
+                                placeholder="GaugeWright account authority"
+                                onInput={(event) => setPersonAuthority(event.currentTarget.value)}
+                            />
+                            <button
+                                type="button"
+                                class="tree-action"
+                                data-person-invite-create
+                                onClick={() => void invitePerson()}
+                            >
+                                Create project invitation
+                            </button>
+                        </div>}
+                    >
+                        {(created) => <div class="engagement-invite">
+                            <p class="status">
+                                This link works only for the invited account and grants only this project.
+                            </p>
+                            <code class="pair-ticket" data-person-invite-link>{created().url}</code>
+                            <button
+                                type="button"
+                                class="tree-action"
+                                data-person-invite-copy
+                                onClick={() => void copyPersonInvite()}
+                            >
+                                copy link
+                            </button>
+                        </div>}
+                    </Show>
+                </section>
+
                 {/* Participants & ownership (revoke = licensing, not secrecy). */}
                 <Show when={(participants() ?? []).length > 0}>
                     <p class="status" style={{ margin: "12px 0 4px" }}>People &amp; ownership:</p>
@@ -502,6 +620,18 @@ export function EngagementPane(props: {
                 </Show>
                 <Show when={handedOff()}>
                     <div class="pair-device-actions">
+                        <select
+                            class="fed-paste"
+                            data-engagement-run-target-chat
+                            aria-label="Hub workstream chat"
+                            value={runTargetChat()}
+                            onChange={(e) => setRunTargetChat(e.currentTarget.value)}
+                        >
+                            <option value="">Choose a hub workstream chat</option>
+                            <For each={hubChats()}>
+                                {(chat) => <option value={chat.id}>{chat.title}</option>}
+                            </For>
+                        </select>
                         <input
                             class="fed-paste"
                             data-engagement-run-archetype

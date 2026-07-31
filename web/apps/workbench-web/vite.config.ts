@@ -12,7 +12,7 @@ export default defineConfig({
         emptyOutDir: true,
         rollupOptions: {
             input: {
-                workbench: fileURLToPath(new URL("index.html", import.meta.url)),
+                workbench: fileURLToPath(new URL("../../index.html", import.meta.url)),
             },
         },
     },

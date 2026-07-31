@@ -2,7 +2,10 @@
 
 use axum::Router;
 
-use crate::{account_routes, local_routes, net_http, LockUnpoisoned, SharedWorkbench};
+use crate::{
+    account_routes, command_idempotency, local_routes, mobile_machine_session, net_http,
+    LockUnpoisoned, SharedWorkbench,
+};
 
 pub fn open_control_plane(wb: SharedWorkbench) -> Router {
     let federation_on = {
@@ -12,7 +15,12 @@ pub fn open_control_plane(wb: SharedWorkbench) -> Router {
     Router::new()
         .merge(local_routes::routes(federation_on))
         .merge(account_routes::routes())
+        .merge(mobile_machine_session::routes())
         .layer(net_http::cors_layer())
-        .with_state(wb)
+        .with_state(wb.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            wb,
+            command_idempotency::guard,
+        ))
         .layer(axum::middleware::from_fn(net_http::security_headers))
 }

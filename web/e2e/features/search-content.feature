@@ -9,8 +9,7 @@ Feature: Content search reaches into the chat log and worktree files (SEARCH-1/2
 
   Scenario: a word only in the chat log surfaces the chat with a snippet
     Given the workbench is open
-    When I switch to the "Chats" facet
-    And I start a new chat from All chats
+    When I start a new chat in Personal
     And I task the agent with "review the quarterly numbers"
     And I search the facets for "agent-note"
     Then a chat surfaces with a content snippet
@@ -20,8 +19,7 @@ Feature: Content search reaches into the chat log and worktree files (SEARCH-1/2
   # transcript or any title — so a hit on it exercises the SEARCH-2 file tier.
   Scenario: a word only in a worktree file surfaces the chat with a snippet
     Given the workbench is open
-    When I switch to the "Chats" facet
-    And I start a new chat from All chats
+    When I start a new chat in Personal
     And I task the agent with "review the quarterly numbers"
     And I search the facets for "for task"
     Then a chat surfaces with a content snippet

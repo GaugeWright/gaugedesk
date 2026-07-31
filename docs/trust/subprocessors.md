@@ -1,57 +1,37 @@
-# Subprocessors & data processing
+# Subprocessors and data processing
 
-This page is the **published, maintained subprocessor list** that accompanies our
-Data Processing Agreement (DPA). It names the third parties that may process
-customer data on our behalf, what each one does, and what data it sees — so a
-security or privacy reviewer can assess the chain without a sales call.
+Current as of July 28, 2026.
 
-!!! note "Scope"
-    A *subprocessor* is a third party we engage that may process **customer
-    personal data** in the course of providing the service. Open-source
-    libraries, vendored binaries that run on your own machine (git, the Pi
-    runtime), and tools that never touch customer data are **not** subprocessors.
+These providers can process personal data when GaugeWright supplies the related
+hosted function. A customer-selected identity or model provider can act under
+the customer's configuration and its own agreement.
+
+| Provider | Purpose | Data involved | Processing location |
+| --- | --- | --- | --- |
+| Microsoft Azure | Hosted compute, network, storage, managed secrets, monitoring, and attestation | Hosted customer content, account and audit metadata, encrypted secrets | United States; configured Azure region |
+| Cloudflare | DNS, edge delivery, static hosting, and managed runtime | IP and device request data; deployment content and service metadata where enabled | Global network |
+| GitHub | Source control, build automation, security scanning, release artifacts, and operational alert issues | Source and build metadata; sanitized operating evidence; no intended customer workspace payload | United States and global service |
+| Google | Company email, scheduling, support, and optional identity federation | Business contact and support data; identity claims when selected | United States and global service |
+| Stripe | Payment and subscription processing | Billing contact, transaction, and subscription identifiers; Stripe handles payment credentials | United States and global service |
+| Infisical | Managed Machine-secret storage and delivery | Service credentials and configuration secrets; no intended customer workspace payload | United States |
+| Customer-selected model provider | AI inference requested by an authorized user | Prompts and allowed context | Provider and customer configuration |
+| Customer-selected identity provider | Authentication and group or role claims | Identity, authentication, and authorization claims | Provider and customer configuration |
 
 ## Data Processing Agreement
 
-We offer a **standard DPA** to customers who need one; request it through
-[support](support.md). The DPA incorporates this subprocessor list by reference
-and commits us to the change-notice process below.
+GaugeWright offers a standard DPA. Request it through
+[support](support.md).
 
-## Change notice
+## Changes and objections
 
-We maintain this list and give **advance notice of changes** (GDPR Art. 28(2)
-style): before a new subprocessor begins processing customer data, we update this
-page and notify customers who have subscribed to subprocessor-change notices, so
-you have a window to review or object before it takes effect.
+GaugeWright reviews a new critical subprocessor before customer data reaches
+it. GaugeWright updates the public list and provides the applicable change
+notice.
 
-## Current subprocessors
+Email [Jack@GaugeWright.com](mailto:Jack@GaugeWright.com) with a question or
+documented objection.
 
-The list is **seeded from the infrastructure the product actually uses** and grows
-as vendors are adopted. Status badges reflect whether a dependency is live today
-or tied to a capability that is still rolling out.
-
-| Subprocessor | Purpose | Data it may process | Status |
-|---|---|---|---|
-| **Microsoft Azure** | Hosted data plane, the confidential-VM boundary, and the Key Vault KMS that wraps data-at-rest keys. | Hosted workspace content (behind handles), wrapped encryption keys, operational metadata. | <span class="status planned">Hosted/attested tier</span> |
-| **LLM inference providers** — OpenAI, Anthropic, Azure OpenAI | **Managed** inference when you use a platform-provided model rather than your own linked account. | The prompts and in-scope context sent for a run, in plaintext (see [Where your data goes](../concepts/protection.md#where-your-data-goes)). | <span class="status available">When managed inference is used</span> |
-| **Payment processor** — Stripe | Billing and the consultant↔client settlement rail. | Billing contact + transaction metadata. Card data is entered directly into the processor; **we never see or store it**. | <span class="status planned">With the settlement rail</span> |
-| Operational vendors (email delivery, error/uptime monitoring, etc.) | Running and supporting the service. | Operational metadata; added here **before** they process customer data. | Added as adopted |
-
-## Bring-your-own model accounts reduce the chain
-
-If you link your **own** LLM account (OAuth or API key) instead of using managed
-inference, the inference relationship is **yours, not ours** — that provider is
-*your* subprocessor, not one we interpose. This is a privacy and disclosure win:
-your prompts go to a provider you already have a contract with.
-
-!!! info "Status"
-    Linking a model account is supported for API keys today; the **OAuth
-    link flow** that stores a sealed credential as account state is in progress
-    (it rides the account-model work). Until then, managed inference uses the
-    providers listed above.
-
-## See also
-
-- [Security & trust](../security.md) — the overall model and the reviewer-grade documents.
-- [Where your data goes](../concepts/protection.md#where-your-data-goes) — the plaintext-exposure map.
-- [Support & response targets](support.md) — how to reach us, including the security/abuse contact.
+The public legal pages at
+[gaugewright.com/subprocessors](https://gaugewright.com/subprocessors) and
+[gaugewright.com/dpa](https://gaugewright.com/dpa) contain the current published
+legal text.

@@ -108,6 +108,35 @@ export function archetypeVisible(a: FilterArchetype, query: string, contentHits:
     return hit(a.name, query) || a.chats.some((c) => chatMatches(c, query, contentHits));
 }
 
+/** The compact lineage shown by the read-only Recent lens. Work chats name both
+ * their project and archetype; edit chats name their archetype. A named
+ * workstream is appended, while the implicit Main line stays quiet. */
+export function recentLineage(
+    chat: { kind: "edit" | "work"; archetype: string; placement?: string | null; workstream?: string | null },
+    projects: readonly { name: string; placements: readonly { placementId: string }[] }[],
+    workstreams: readonly { id: string; name: string }[],
+): string {
+    const project = chat.kind === "work"
+        ? projects.find((p) => p.placements.some((pl) => pl.placementId === chat.placement))?.name
+        : undefined;
+    const root = project ? `${project} · ${chat.archetype}` : chat.archetype;
+    const line = chat.workstream
+        ? workstreams.find((ws) => ws.id === chat.workstream)?.name
+        : undefined;
+    return line ? `${root} · ${line}` : root;
+}
+
+/** A Recent row matches its title, its displayed lineage, or a server-projected
+ * content hit. This keeps search useful without reconstructing rooted groups. */
+export function recentVisible(
+    chat: { title: string; id?: string },
+    lineage: string,
+    query: string,
+    contentHits: ReadonlySet<string> = NO_CONTENT,
+): boolean {
+    return hit(chat.title, query) || hit(lineage, query) || (chat.id !== undefined && contentHits.has(chat.id));
+}
+
 /** Group "All chats" by their owning archetype, after dropping rows that match
  *  neither the chat title nor the archetype label (so empty groups disappear).
  *  Preserves first-seen order of both groups and chats within a group. */

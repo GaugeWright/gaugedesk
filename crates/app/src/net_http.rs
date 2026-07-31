@@ -51,10 +51,24 @@ pub fn session_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
     None
 }
 
-/// Liveness/readiness probe handler — a fixed 200 `{"ok":true}` once the router is serving.
+/// Liveness/readiness probe handler — a fixed 200 once the router is serving.
 /// No store access (`INV-5`): it reports the process is up, not any truth.
+///
+/// `migrations: "current"` is the `getHealth` migrations report
+/// (`local-api-contract.md`), and it needs no store read to be honest: the
+/// router only serves after `Store::open` succeeded, and open **applies every
+/// pending migration and fails closed on a schema newer than
+/// [`gaugewright_store::SUPPORTED_SCHEMA_VERSION`]** (DR-0054 Phase B/C) — so a
+/// serving process *implies* the store stands at exactly `schema_version`.
 pub(crate) async fn health() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "migrations": "current",
+            "schema_version": gaugewright_store::SUPPORTED_SCHEMA_VERSION,
+        })),
+    )
 }
 
 /// `ENTSEC-7` (ADR 0065): set HSTS on every response so a browser that ever reaches the control
@@ -76,8 +90,8 @@ pub async fn security_headers(
 
 /// The default CORS origin allowlist (FED-2): the Vite dev server, the built preview, and the
 /// Tauri webview — instead of permissive `*`. Extended by `GAUGEWRIGHT_ALLOWED_ORIGINS`
-/// (comma-separated). Shared by the control-plane CORS and the per-deployment embed CORS (which
-/// allows the deployment's configured origins on top of these).
+/// (comma-separated). Public Embeddable Panels enforce their deployment origin
+/// policy at the edge and do not use this private control-plane CORS layer.
 pub fn default_allowed_origins() -> Vec<String> {
     const DEFAULT_ORIGINS: &[&str] = &[
         "http://localhost:5173",
@@ -114,7 +128,32 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            axum::http::HeaderName::from_static("idempotency-key"),
+            // A selected private Home requires this memory-only credential on
+            // every work request. Browser preflights advertise the header
+            // before carrying it, so omitting it here makes the hosted Console
+            // fail before the Home admission gate can run.
+            axum::http::HeaderName::from_static("x-gaugewright-home-admission"),
+            // ADR 0109: short-lived, device-bound Machine controller session.
+            axum::http::HeaderName::from_static("x-gaugewright-machine-session"),
+            // The Console names its current tenant as routing context for
+            // tenant-scoped account and Administration projections. It never
+            // grants authority; membership/capability gates still decide.
+            axum::http::HeaderName::from_static("x-gaugewright-tenant"),
+            // ITGOV-4: reported client compatibility metadata. These are
+            // admission inputs, never device-attestation claims.
+            axum::http::HeaderName::from_static("x-gaugedesk-client-version"),
+            axum::http::HeaderName::from_static("x-gaugedesk-client-protocol"),
+            axum::http::HeaderName::from_static("x-gaugedesk-client-channel"),
+            axum::http::HeaderName::from_static("x-gaugedesk-client-platform"),
+        ])
+        // Browser editors must be able to carry the exact workspace cut from a
+        // cross-origin GET into save/preview requests. Without this exposure
+        // the server sends the header but Fetch intentionally hides it.
+        .expose_headers([axum::http::HeaderName::from_static("x-workspace-cut")])
         // The hosted Console is a cross-subdomain browser client (app.gaugewright.com →
         // auth/api host) that authenticates with the shared `Domain=.gaugewright.com`
         // session cookie (ADR 0077). Credentialed CORS is required for the browser to send
@@ -168,6 +207,29 @@ impl HttpClient {
                 resp.into_string().unwrap_or_default()
             )),
             Err(ureq::Error::Transport(t)) => Err(format!("transport: {t}")),
+        }
+    }
+
+    /// GET with explicit headers, returning the status and response body. Used
+    /// for metadata-service credentials whose anti-SSRF header is mandatory.
+    pub fn get_string_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<(u16, String), String> {
+        let mut request = self.agent.get(url);
+        for (name, value) in headers {
+            request = request.set(name, value);
+        }
+        match request.call() {
+            Ok(response) => Ok((
+                response.status(),
+                response.into_string().unwrap_or_default(),
+            )),
+            Err(ureq::Error::Status(code, response)) => {
+                Ok((code, response.into_string().unwrap_or_default()))
+            }
+            Err(ureq::Error::Transport(error)) => Err(format!("transport: {error}")),
         }
     }
 
@@ -262,8 +324,10 @@ impl HttpClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{bearer, session_cookie};
-    use axum::http::{header, HeaderMap, HeaderValue};
+    use super::{bearer, cors_layer, default_allowed_origins, session_cookie};
+    use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
+    use axum::{routing::get, Router};
+    use tower::ServiceExt;
 
     fn headers(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -302,5 +366,74 @@ mod tests {
         let h = headers(&[(header::COOKIE, "gw_session=; x=1")]);
         assert_eq!(session_cookie(&h), None);
         assert_eq!(bearer(&h), None);
+    }
+
+    #[test]
+    fn native_webview_origins_are_in_the_private_api_allowlist() {
+        let origins = default_allowed_origins();
+        assert!(origins.iter().any(|origin| origin == "tauri://localhost"));
+        assert!(origins
+            .iter()
+            .any(|origin| origin == "http://tauri.localhost"));
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_home_admission_tenant_and_reported_client_headers() {
+        let app = Router::new()
+            .route("/work", get(|| async { StatusCode::OK }))
+            .layer(cors_layer());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/work")
+                    .header(header::ORIGIN, "http://localhost:5173")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "content-type,x-gaugewright-home-admission,x-gaugewright-tenant,x-gaugedesk-client-version,x-gaugedesk-client-protocol,x-gaugedesk-client-channel,x-gaugedesk-client-platform",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let allowed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(allowed.contains("x-gaugewright-home-admission"));
+        assert!(allowed.contains("x-gaugewright-tenant"));
+        assert!(allowed.contains("x-gaugedesk-client-version"));
+        assert!(allowed.contains("x-gaugedesk-client-protocol"));
+        assert!(allowed.contains("x-gaugedesk-client-channel"));
+        assert!(allowed.contains("x-gaugedesk-client-platform"));
+    }
+
+    #[tokio::test]
+    async fn cors_exposes_the_workspace_cut_to_browser_editors() {
+        let app = Router::new()
+            .route("/file", get(|| async { StatusCode::OK }))
+            .layer(cors_layer());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/file")
+                    .header(header::ORIGIN, "http://localhost:5173")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let exposed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(exposed.contains("x-workspace-cut"));
     }
 }

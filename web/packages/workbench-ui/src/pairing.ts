@@ -35,14 +35,15 @@ import { type BridgeGrantId, type DeviceId } from "@gaugewright/control-plane-cl
 export type TicketSource = "qr" | "code";
 
 /** A parsed pairing ticket: the environment the device is binding to and the
- *  `(device, bridge_grant)` pair the request presents (the typed pair the
- *  boundary's `DeviceBinding` phase pins, MOB-001/MOB-004). The bridge grant is
- *  optional — the loopback flow lets the owner mint it server-side, mirroring
- *  `PairingRequest.bridge_grant`'s `#[serde(default)]`. */
+ *  legacy `(device, bridge_grant)` invitation shape. The browser harness uses
+ *  the ticket device verbatim. A native client owns its device identity and
+ *  substitutes that identity when opening the request; the owner-generated
+ *  device segment remains only until the one-use invitation protocol replaces
+ *  this compatibility wire form. */
 export interface PairingTicket {
     /** The environment (boundary scope) this device is pairing to. */
     readonly environment: ScopeId;
-    /** This device's stable handle, presented in the request body. */
+    /** Browser-harness device handle / legacy native invitation hint. */
     readonly device: DeviceId;
     /** The bridge grant the device pairs under, or `null` to let the owner mint
      *  one (the loopback flow mints both ends). */
@@ -57,10 +58,11 @@ export interface PairingTicket {
  *  A malformed payload returns `null` — the island shows "invalid ticket" rather
  *  than submitting garbage to the owner. Parse is the only place the opaque string
  *  becomes typed; everything downstream consumes the branded ticket. */
-/** Mint the wire ticket the owner hands a device (the inverse of
- *  {@link parseTicket}, MOB-F5): `gaugewright-pair://<environment>/<device>`. The owner
- *  leaves the bridge grant for the loopback flow to mint, so the ticket carries
- *  just the environment + device. Round-trips through `parseTicket`. */
+/** Mint the compatibility wire ticket the owner hands a device (the inverse of
+ *  {@link parseTicket}, MOB-F5): `gaugewright-pair://<environment>/<device>`.
+ *  Native enrollment treats `device` as an invitation hint and presents its own
+ *  keystore-derived id. The v2 ticket must replace this owner-invented segment
+ *  with a one-use invitation capability. Round-trips through `parseTicket`. */
 export function pairingTicket(environment: string, device: string): string {
     return `gaugewright-pair://${environment}/${device}`;
 }

@@ -17,8 +17,10 @@ web/dist-app-mobile-web/
 ee/web/node_modules/
 ee/web/dist-apps-enterprise/
 ee/web/dist-app-admin-console/
+ee/web/dist-enterprise-workbench/
 
 node_modules/
+src-tauri/linux/changelog.gz
 dist/
 dist-types/
 __pycache__/
@@ -33,6 +35,9 @@ web/blob-report/
 # Local control-plane state (git instance + event store)
 .gaugewright/
 gaugewright.db
+# A server launched with a relative local root can materialize its signing key
+# beside the enterprise binary crate. Key material is runtime state, never source.
+/ee/app/keys/
 # Per-boundary whip tracker stores (ADR 0075). Real runs write these under the
 # platform data dir; this guards against a relative-root run leaving them in-tree.
 trackers/
@@ -44,6 +49,8 @@ untie.db
 
 # Tauri build artifacts
 src-tauri/target/
+src-tauri-mobile/target/
+src-tauri-mobile/node_modules/
 
 # Release-staged bundle payload (for example a future portable Git tree), never
 # committed. WhippleScript is linked into the control plane; Pi is not bundled.

@@ -1,6 +1,6 @@
 //! Open library/workspace state helpers for agents, projects, placements, chats, search, and pairing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use gaugewright_core::attestation::{AttestationQuote, CodeMeasurement};
 use gaugewright_core::boundary_lifecycle::{
@@ -10,7 +10,7 @@ use gaugewright_core::ids::{BridgeGrantId, DeviceId};
 use gaugewright_core::instance::{InstanceCommand, InstanceState};
 use gaugewright_core::merge::MergeState;
 use gaugewright_core::run::RunState;
-use gaugewright_core::workstream::WorkstreamState;
+use gaugewright_core::workstream::{WorkstreamPhase, WorkstreamState};
 use gaugewright_harness::HarnessFactory;
 use gaugewright_store::{AdmitError, Store};
 use gaugewright_workspace::{ChatWorkspace, Instance, MergeOutcome, Workspace, WorkspaceError};
@@ -18,8 +18,10 @@ use gaugewright_workspace::{ChatWorkspace, Instance, MergeOutcome, Workspace, Wo
 use crate::attestation_verifier::{LoopbackVerifier, QuoteVerifier, RealQuoteVerifierError};
 use crate::boundary_keeper::{accept_boundary_attested, AcceptError};
 use crate::library::{
-    Admission, AgentRecord, ChatRecord, InstanceKind, InstanceRecord, ProjectRecord, RecordOp,
-    WorkstreamRecord, LIBRARY_SCOPE,
+    Admission, AgentRecord, ArchetypeVersionRecord, ChatRecord, ChatTargetBindingRecord,
+    InstanceKind, InstanceRecord, PlacementTargetsRecord, ProjectRecord, RecordOp,
+    TargetCapabilities, TargetVcsPosture, WorkTargetKind, WorkTargetOwner, WorkTargetRecord,
+    WorkTargetStatus, WorkstreamRecord, WorkstreamRootRecord, LIBRARY_SCOPE,
 };
 use crate::workbench_state::{provider_for, WorkspaceProviders};
 use crate::{
@@ -27,29 +29,81 @@ use crate::{
     DEFAULT_PLACEMENT, DEFAULT_PROJECT,
 };
 
-fn published_package_root(
-    instances_dir: &std::path::Path,
-    instance_id: &str,
+pub(crate) fn published_package_root(
+    targets_dir: &std::path::Path,
+    target_id: &str,
     version: u64,
 ) -> std::path::PathBuf {
-    instances_dir
-        .join(instance_id)
+    targets_dir
+        .join(target_id)
         .join("repo")
         .join(gaugewright_boundary::definition::version_root(version))
 }
 
-fn published_package_ref(
-    instances_dir: &std::path::Path,
-    instance_id: &str,
+pub(crate) fn published_discipline_root(
+    targets_dir: &std::path::Path,
+    target_id: &str,
     version: u64,
-) -> std::io::Result<String> {
-    gaugewright_whip_runtime::AuthoredAgentPackage::load(published_package_root(
-        instances_dir,
-        instance_id,
+) -> std::path::PathBuf {
+    targets_dir
+        .join(target_id)
+        .join("repo")
+        .join(crate::discipline::discipline_version_root(version))
+}
+
+fn published_archetype_version(
+    targets_dir: &std::path::Path,
+    target_id: &str,
+    version: u64,
+) -> std::io::Result<ArchetypeVersionRecord> {
+    let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(published_package_root(
+        targets_dir,
+        target_id,
         version,
     ))
-    .map(|package| package.version_ref().to_owned())
-    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let discipline = crate::discipline::load(
+        &published_discipline_root(targets_dir, target_id, version),
+        package.capabilities().iter().cloned(),
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(ArchetypeVersionRecord {
+        package_ref: package.version_ref().to_owned(),
+        discipline_ref: discipline.reference,
+    })
+}
+
+fn archetype_files(
+    definition: &gaugewright_boundary::definition::AgentDefinition,
+    skills: BTreeSet<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut files = definition.seed_files();
+    let manifest = crate::discipline::manifest(
+        gaugewright_boundary::definition::PackageCapabilities::default()
+            .names()
+            .into_iter()
+            .map(str::to_owned),
+        skills,
+        Vec::new(),
+    );
+    for root in [
+        crate::discipline::DISCIPLINE_DRAFT_ROOT.to_owned(),
+        crate::discipline::discipline_version_root(1),
+    ] {
+        files.push((
+            format!("{root}/{}", crate::discipline::DISCIPLINE_MANIFEST),
+            manifest.clone(),
+        ));
+    }
+    Ok(files)
+}
+
+fn default_archetype_files() -> Vec<(String, String)> {
+    archetype_files(
+        &crate::app_support::default_agent_definition(),
+        BTreeSet::new(),
+    )
+    .expect("the built-in Default archetype is valid")
 }
 
 pub(crate) enum AgentDeleteError {
@@ -77,8 +131,6 @@ pub(crate) enum UpgradePlacementError {
     PlacementNotFound,
     ArchetypeNotFound,
     PackageUnavailable(String),
-    Conflict,
-    Workspace(String),
 }
 
 pub(crate) enum PublishArchetypeError {
@@ -111,6 +163,7 @@ pub(crate) struct ForkedChat {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) forked_from: String,
+    pub(crate) forked_from_entry: Option<i64>,
 }
 
 pub(crate) enum ForkChatError {
@@ -119,6 +172,14 @@ pub(crate) enum ForkChatError {
     InstanceNotOpen,
     Create(String),
     Continuity(String),
+    PointNotForkable,
+}
+
+struct ResolvedForkPoint {
+    entry_id: i64,
+    workspace_cut: String,
+    runtime_position: gaugewright_harness::RuntimePosition,
+    reads: Vec<String>,
 }
 
 pub(crate) struct CreatedPairingRequest {
@@ -149,7 +210,7 @@ pub(crate) enum BoundaryAcceptError {
 
 pub(crate) struct StartupLibraryState {
     pub(crate) library: crate::library::Library,
-    pub(crate) instances: BTreeMap<String, Box<dyn Workspace>>,
+    pub(crate) targets: BTreeMap<String, Box<dyn Workspace>>,
     pub(crate) engagements: BTreeMap<String, Box<dyn ChatWorkspace>>,
     pub(crate) engagement_index: BTreeMap<String, String>,
 }
@@ -160,304 +221,817 @@ pub(crate) fn activate_instance(store: &mut Store, inst_id: &str) {
 
 pub(crate) fn load_startup_library_state(
     store: &mut Store,
-    instances_dir: &std::path::Path,
+    targets_dir: &std::path::Path,
     providers: &WorkspaceProviders,
+    home_id: &gaugewright_core::ids::HomeId,
 ) -> std::io::Result<StartupLibraryState> {
     let mut library = crate::library::Library::rebuild(store).map_err(io)?;
-    if library.is_empty() {
-        seed_default_agent(store, &mut library, instances_dir, providers)?;
+    if migrate_exact_pre_target_defaults(store, &library, home_id)? {
+        library = crate::library::Library::rebuild(store).map_err(io)?;
     }
-    repair_legacy_default_instance(store, &library);
-    ensure_default_project_and_placement(store, &mut library, instances_dir, providers)?;
-    migrate_legacy_agent_packages(store, &mut library, instances_dir, providers)?;
-    let (instances, mut engagements, engagement_index) =
-        open_startup_instances(&library, instances_dir, providers)?;
+    if library.is_empty() {
+        seed_default_agent(store, &mut library, targets_dir, providers, home_id)?;
+    }
+    ensure_builtin_archetypes(store, &mut library, targets_dir, providers, home_id)?;
+    validate_target_cutover(&library)?;
+    if migrate_agent_ability_manifests(store, &library, targets_dir, providers)? {
+        library = crate::library::Library::rebuild(store).map_err(io)?;
+    }
+    validate_archetype_versions(&library, targets_dir)?;
+    let deleted_chats = explicitly_deleted_chats(store)?;
+    let (targets, mut engagements, engagement_index) =
+        open_startup_targets(&library, targets_dir, providers, &deleted_chats)?;
     for engagement in engagements.values_mut() {
         let _ = engagement.sync_from_main();
     }
     Ok(StartupLibraryState {
         library,
-        instances,
+        targets,
         engagements,
         engagement_index,
     })
 }
 
-fn migrate_legacy_agent_packages(
+pub(crate) fn authoring_target_id(archetype_id: &str) -> String {
+    format!("target-archetype-{archetype_id}")
+}
+
+/// The files target a project owns. Public so a caller can locate the
+/// project's gate, which lives in that target's mainline (ADR 0110 §5).
+pub fn managed_project_target_id(project_id: &str) -> String {
+    format!("target-project-{project_id}")
+}
+
+fn append_library_record<T: serde::Serialize>(
     store: &mut Store,
-    library: &mut crate::library::Library,
-    instances_dir: &std::path::Path,
-    providers: &WorkspaceProviders,
+    kind: &str,
+    record: &T,
 ) -> std::io::Result<()> {
-    let agents = library.agents.values().cloned().collect::<Vec<_>>();
-    for mut agent in agents {
-        if agent.package_versions.contains_key(&agent.current_version) {
-            continue;
-        }
-        let workspace = provider_for(providers, &agent.instance_id)
-            .open_at(&instances_dir.join(&agent.instance_id));
-        let migration_id = library::gen_id("package-migration");
-        let engagement = workspace.create_engagement(&migration_id).map_err(io)?;
-        let result = (|| {
-            let legacy_system = engagement
-                .read_file(".pi/SYSTEM.md")
-                .unwrap_or_else(|_| crate::app_support::DEFAULT_AGENT_SYSTEM_MD.to_owned());
-            let legacy_instructions = engagement
-                .read_file("AGENTS.md")
-                .unwrap_or_else(|_| crate::app_support::DEFAULT_AGENT_AGENTS_MD.to_owned());
-            let persona = format!("{}\n\n{}", legacy_system.trim(), legacy_instructions.trim());
-            engagement
-                .write_file(".whipple/legacy-persona.md", &persona)
-                .map_err(io)?;
-            let capabilities = gaugewright_boundary::AgentConfig::from_json(&agent.config)
-                .unwrap_or_default()
-                .package_capabilities();
-            let draft_documents = gaugewright_boundary::definition::package_documents(
-                gaugewright_boundary::definition::DRAFT_ROOT,
-                &persona,
-                capabilities,
-            );
-            for version in 1..=agent.current_version {
-                let root = gaugewright_boundary::definition::version_root(version);
-                for (draft_path, body) in &draft_documents {
-                    let file = std::path::Path::new(draft_path)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .ok_or_else(|| std::io::Error::other("invalid package document path"))?;
-                    engagement
-                        .write_file(&format!("{root}/{file}"), body)
-                        .map_err(io)?;
-                }
-            }
-            for (path, body) in &draft_documents {
-                engagement.write_file(path, body).map_err(io)?;
-            }
-            let package =
-                gaugewright_whip_runtime::AuthoredAgentPackage::load(engagement.path().join(
-                    gaugewright_boundary::definition::version_root(agent.current_version),
-                ))
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            let package_ref = package.version_ref().to_owned();
-            engagement
-                .commit_turn("migrate legacy method to WhippleScript package")
-                .map_err(io)?;
-            if engagement.merge_into_main().map_err(io)? != MergeOutcome::Clean {
-                return Err(std::io::Error::other(
-                    "legacy package migration conflicted with the archetype mainline",
-                ));
-            }
-            Ok(package_ref)
-        })();
-        let _ = workspace.remove_engagement(&migration_id);
-        let package_ref = result?;
-        for version in 1..=agent.current_version {
-            agent.package_versions.insert(version, package_ref.clone());
-        }
-        if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&agent.config) {
-            if let Some(object) = config.as_object_mut() {
-                object.remove("policy");
-                object.remove("tools");
-                agent.config = serde_json::to_string_pretty(object).unwrap_or_else(|_| "{}".into());
-            }
-        }
-        agent.op = RecordOp::Upsert;
-        store
-            .append_record(
-                LIBRARY_SCOPE,
-                "agent",
-                &serde_json::to_string(&agent).unwrap(),
-            )
-            .map_err(io)?;
-        library.apply_agent(agent);
+    store
+        .append_record(
+            LIBRARY_SCOPE,
+            kind,
+            &serde_json::to_string(record).map_err(io)?,
+        )
+        .map(|_| ())
+        .map_err(io)
+}
+
+fn managed_target_record(
+    id: String,
+    name: String,
+    owner: WorkTargetOwner,
+    home_id: &gaugewright_core::ids::HomeId,
+    current_basis: String,
+) -> WorkTargetRecord {
+    WorkTargetRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        locator_handle: format!("managed-target:{id}"),
+        id,
+        op: RecordOp::Upsert,
+        name,
+        owner,
+        kind: WorkTargetKind::Managed,
+        authority: home_id.as_str().to_owned(),
+        parties: vec![home_id.as_str().to_owned()],
+        adapter: "whipplescript".to_owned(),
+        adapter_family: "whipplescript-v1".to_owned(),
+        vcs_posture: TargetVcsPosture::Managed,
+        current_basis: Some(current_basis),
+        path_scope: vec![".".to_owned()],
+        capabilities: TargetCapabilities::managed_default(),
+        status: WorkTargetStatus::Available,
+    }
+}
+
+/// The files every project's files-target is seeded with: its gate.
+///
+/// A project has a gate from the moment it exists, and it is review-by-hand
+/// ([ADR 0117](../../../specs/decisions/0117-the-gate-is-a-queued-service-and-the-only-verdict.md)
+/// §7). That removes the state where material arrives for a project that has no
+/// policy for it — there is always a policy, and the safe one is the default.
+///
+/// It lives in the target's mainline rather than in one chat's worktree because
+/// it is the *project's* program: every chat rooted here sees the same gate, and
+/// changing it is an ordinary diff a human keeps or rejects (ADR 0110 §5).
+fn default_gate_files() -> [(&'static str, &'static str); 2] {
+    let (program, envelope) = crate::gate::GateKind::default().program();
+    [
+        (crate::gate::GATE_PROGRAM_PATH, program),
+        (crate::gate::GATE_ENVELOPE_PATH, envelope),
+    ]
+}
+
+fn init_managed_target(
+    targets_dir: &std::path::Path,
+    providers: &WorkspaceProviders,
+    target_id: &str,
+    files: &[(&str, &str)],
+) -> std::io::Result<String> {
+    let workspace = provider_for(providers, target_id)
+        .init_at(&targets_dir.join(target_id))
+        .map_err(io)?;
+    workspace.seed_main(files).map_err(io)?;
+    let probe_id = library::gen_id("target-basis");
+    let probe = workspace.create_engagement(&probe_id).map_err(io)?;
+    let basis = probe.boundary_cut().map_err(io)?.0;
+    drop(probe);
+    workspace.remove_engagement(&probe_id).map_err(io)?;
+    Ok(basis)
+}
+
+/// ADR 0104's one-time additive migration. This recognizes only the untouched
+/// built-in projection found in production. It retracts obsolete library
+/// declarations without adopting or deleting their placement-owned files; all
+/// non-library scopes and the legacy directories remain intact.
+fn migrate_exact_pre_target_defaults(
+    store: &mut Store,
+    library: &crate::library::Library,
+    home_id: &gaugewright_core::ids::HomeId,
+) -> std::io::Result<bool> {
+    let Some(agent) = library.agents.get(DEFAULT_AGENT) else {
+        return Ok(false);
+    };
+    let Some(project) = library.projects.get(DEFAULT_PROJECT) else {
+        return Ok(false);
+    };
+    let Some(authoring) = library.instances.get(DEFAULT_INSTANCE) else {
+        return Ok(false);
+    };
+    let Some(placement) = library.instances.get(DEFAULT_PLACEMENT) else {
+        return Ok(false);
+    };
+
+    let exact = library.agents.len() == 1
+        && library.projects.len() == 1
+        && library.instances.len() == 2
+        && library.chats.is_empty()
+        && library.workstreams.is_empty()
+        && library.work_targets.is_empty()
+        && library.placement_targets.is_empty()
+        && library.chat_targets.is_empty()
+        && library.workstream_roots.is_empty()
+        && agent.name == "assistant"
+        && agent.instance_id == DEFAULT_INSTANCE
+        && agent.config == "{}"
+        && agent.current_version == 1
+        && agent.versions.is_empty()
+        && !agent.auto_upgrade
+        && agent.forked_from.is_none()
+        && project.name == "Personal"
+        && (project.home_id.as_str().is_empty() || &project.home_id == home_id)
+        && !project.network_isolated
+        && project.run_purpose.is_none()
+        && project.deployment_mode.is_none()
+        && authoring.kind == InstanceKind::Authoring
+        && authoring.agent_id == DEFAULT_AGENT
+        && authoring.project_id.is_none()
+        && authoring.version == 1
+        && authoring.admission == Admission::Active
+        && placement.kind == InstanceKind::Using
+        && placement.agent_id == DEFAULT_AGENT
+        && placement.project_id.as_deref() == Some(DEFAULT_PROJECT)
+        && placement.version == 1
+        && placement.admission == Admission::Active;
+    if !exact {
+        return Ok(false);
     }
 
-    let placements = library
+    let mut agent = agent.clone();
+    agent.op = RecordOp::Tombstone;
+    let mut project = project.clone();
+    project.op = RecordOp::Tombstone;
+    let mut authoring = authoring.clone();
+    authoring.op = RecordOp::Tombstone;
+    let mut placement = placement.clone();
+    placement.op = RecordOp::Tombstone;
+
+    let payloads = [
+        serde_json::to_string(&agent).map_err(io)?,
+        serde_json::to_string(&project).map_err(io)?,
+        serde_json::to_string(&authoring).map_err(io)?,
+        serde_json::to_string(&placement).map_err(io)?,
+    ];
+    store
+        .append_records_atomically(&[
+            (LIBRARY_SCOPE, "agent", payloads[0].as_str()),
+            (LIBRARY_SCOPE, "project", payloads[1].as_str()),
+            (LIBRARY_SCOPE, "instance", payloads[2].as_str()),
+            (LIBRARY_SCOPE, "instance", payloads[3].as_str()),
+        ])
+        .map_err(io)?;
+    Ok(true)
+}
+
+/// ABIL-3's hard cutover persists the new explicit authority ceiling into every
+/// pre-cutover authored package exactly once. This is a state migration, not a
+/// loader fallback: after this commit lands, ordinary package loading remains
+/// strict and a manifest with no `agent_abilities` is invalid.
+fn migrate_agent_ability_manifests(
+    store: &mut Store,
+    library: &crate::library::Library,
+    targets_dir: &std::path::Path,
+    providers: &WorkspaceProviders,
+) -> std::io::Result<bool> {
+    let mut migrated = false;
+    for archetype in library.agents.values() {
+        let target = library.authoring_target_for(&archetype.id).ok_or_else(|| {
+            invalid_data(format!(
+                "archetype {} has no authoring target for agent-ability migration",
+                archetype.id
+            ))
+        })?;
+        if target.kind != WorkTargetKind::Managed {
+            continue;
+        }
+        let workspace = provider_for(providers, &target.id).open_at(&targets_dir.join(&target.id));
+        let engagement_id = library::gen_id("ability-migration");
+        let engagement = workspace.create_engagement(&engagement_id).map_err(io)?;
+        let result = (|| {
+            let mut changed = false;
+            let mut roots = vec![
+                gaugewright_boundary::definition::DRAFT_ROOT.to_owned(),
+                crate::discipline::DISCIPLINE_DRAFT_ROOT.to_owned(),
+            ];
+            for version in archetype.versions.keys() {
+                roots.push(gaugewright_boundary::definition::version_root(*version));
+                roots.push(crate::discipline::discipline_version_root(*version));
+            }
+
+            for package_root in roots.iter().step_by(2) {
+                let manifest_path = format!(
+                    "{package_root}/{}",
+                    gaugewright_boundary::definition::MANIFEST_FILE
+                );
+                let text = engagement.read_file(&manifest_path).map_err(io)?;
+                let mut manifest: serde_json::Value =
+                    serde_json::from_str(&text).map_err(invalid_data)?;
+                if manifest.get("agent_abilities").is_some() {
+                    continue;
+                }
+                let capabilities = manifest
+                    .get_mut("capabilities")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .ok_or_else(|| invalid_data("legacy package has no capability registry"))?;
+                capabilities.retain(|capability| capability.as_str() != Some("human.ask"));
+                let abilities = capabilities.clone();
+                manifest["agent_abilities"] = serde_json::Value::Array(abilities);
+                engagement
+                    .write_file(
+                        &manifest_path,
+                        &format!("{}\n", serde_json::to_string_pretty(&manifest).map_err(io)?),
+                    )
+                    .map_err(io)?;
+
+                let source_path = format!(
+                    "{package_root}/{}",
+                    gaugewright_boundary::definition::SOURCE_FILE
+                );
+                let source = engagement.read_file(&source_path).map_err(io)?;
+                let source = remove_legacy_human_authority(&source);
+                engagement.write_file(&source_path, &source).map_err(io)?;
+                changed = true;
+            }
+
+            for discipline_root in roots.iter().skip(1).step_by(2) {
+                let path = format!(
+                    "{discipline_root}/{}",
+                    crate::discipline::DISCIPLINE_MANIFEST
+                );
+                let text = engagement.read_file(&path).map_err(io)?;
+                let mut manifest: crate::discipline::DisciplineManifest =
+                    serde_json::from_str(&text).map_err(invalid_data)?;
+                if manifest.capabilities.remove("human.ask") {
+                    engagement
+                        .write_file(
+                            &path,
+                            &format!("{}\n", serde_json::to_string_pretty(&manifest).map_err(io)?),
+                        )
+                        .map_err(io)?;
+                    changed = true;
+                }
+            }
+
+            if changed {
+                engagement
+                    .commit_turn("migrate explicit agent ability ceilings")
+                    .map_err(io)?;
+                if engagement.merge_into_main().map_err(io)? != MergeOutcome::Clean {
+                    return Err(invalid_data(
+                        "archetype changed during agent-ability state migration",
+                    ));
+                }
+            }
+            Ok(changed)
+        })();
+        let _ = workspace.remove_engagement(&engagement_id);
+        let changed = result?;
+
+        // Reconcile references even after an interrupted prior run that landed
+        // the workspace commit but had not yet appended the library record.
+        let mut updated = archetype.clone();
+        let mut references_changed = false;
+        for version in archetype.versions.keys() {
+            let resolved = published_archetype_version(targets_dir, &target.id, *version)?;
+            if updated.versions.get(version) != Some(&resolved) {
+                updated.versions.insert(*version, resolved);
+                references_changed = true;
+            }
+        }
+        if references_changed {
+            updated.op = RecordOp::Upsert;
+            append_library_record(store, "agent", &updated)?;
+        }
+        migrated |= changed || references_changed;
+    }
+    Ok(migrated)
+}
+
+fn remove_legacy_human_authority(source: &str) -> String {
+    source
+        .replace(", \"human.ask\"", "")
+        .replace("\"human.ask\", ", "")
+        .replace("\"human.ask\"", "")
+        .replace("\n      with access to human {\n        ask\n      }", "")
+}
+
+fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+}
+
+/// TARGET-1 rejects every pre-target shape not admitted by ADR 0104 instead of
+/// inventing compatibility aliases that would preserve the wrong authority
+/// boundary. Such state requires its own explicit migration decision.
+fn validate_target_cutover(library: &crate::library::Library) -> std::io::Result<()> {
+    let invalid = |message: String| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+
+    for target in library.work_targets.values() {
+        let owner_exists = match &target.owner {
+            WorkTargetOwner::Project { project_id } => library.projects.contains_key(project_id),
+            WorkTargetOwner::Archetype { archetype_id } => {
+                library.agents.contains_key(archetype_id)
+            }
+        };
+        let posture_matches = matches!(
+            (target.kind, target.vcs_posture),
+            (WorkTargetKind::Managed, TargetVcsPosture::Managed)
+                | (WorkTargetKind::ExternalVcs, TargetVcsPosture::ExternalVcs)
+                | (
+                    WorkTargetKind::ExternalFolder,
+                    TargetVcsPosture::Unversioned
+                )
+        );
+        if !owner_exists
+            || !posture_matches
+            || target.name.is_empty()
+            || target.authority.is_empty()
+            || target.locator_handle.is_empty()
+            || target.adapter.is_empty()
+            || target.adapter_family.is_empty()
+            || target.path_scope.is_empty()
+            || !target.capabilities.read
+        {
+            return Err(invalid(format!(
+                "work target {} has an invalid authority, adapter, scope, or VCS posture",
+                target.id
+            )));
+        }
+        if target.status == WorkTargetStatus::Available
+            && target.current_basis.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(invalid(format!(
+                "available work target {} has no exact current basis",
+                target.id
+            )));
+        }
+    }
+
+    for agent in library.agents.values() {
+        let target = library.authoring_target_for(&agent.id).ok_or_else(|| {
+            invalid(format!(
+                "pre-TARGET workspace: archetype {} has no authoring target; reset this pre-release state root",
+                agent.id
+            ))
+        })?;
+        if target.kind != WorkTargetKind::Managed {
+            return Err(invalid(format!(
+                "archetype {} authoring target must be managed",
+                agent.id
+            )));
+        }
+    }
+    for project in library.projects.values() {
+        if project.home_id.as_str().is_empty()
+            || library.targets_for_project(&project.id).is_empty()
+        {
+            return Err(invalid(format!(
+                "pre-TARGET workspace: project {} has no Home-bound target; reset this pre-release state root",
+                project.id
+            )));
+        }
+    }
+    for placement in library
         .instances
         .values()
         .filter(|instance| instance.kind == InstanceKind::Using)
-        .cloned()
-        .collect::<Vec<_>>();
-    for placement in placements {
-        let Some(agent) = library.agents.get(&placement.agent_id) else {
-            continue;
-        };
-        let root = published_package_root(instances_dir, &placement.id, placement.version);
-        if gaugewright_whip_runtime::AuthoredAgentPackage::load(&root).is_ok() {
-            continue;
+    {
+        let project_id = placement
+            .project_id
+            .as_deref()
+            .ok_or_else(|| invalid(format!("placement {} has no project", placement.id)))?;
+        let targets = library
+            .placement_targets
+            .get(&placement.id)
+            .ok_or_else(|| {
+                invalid(format!(
+                "pre-TARGET workspace: placement {} owns files; reset this pre-release state root",
+                placement.id
+            ))
+            })?;
+        if targets.target_ids.is_empty() {
+            return Err(invalid(format!(
+                "placement {} has no eligible target",
+                placement.id
+            )));
         }
-        let workspace =
-            provider_for(providers, &placement.id).open_at(&instances_dir.join(&placement.id));
-        let migration_id = library::gen_id("placement-package-migration");
-        let engagement = workspace.create_engagement(&migration_id).map_err(io)?;
-        let source_root =
-            published_package_root(instances_dir, &agent.instance_id, placement.version);
-        let target_root = gaugewright_boundary::definition::version_root(placement.version);
-        let result = (|| {
-            for file in [
-                gaugewright_boundary::definition::MANIFEST_FILE,
-                gaugewright_boundary::definition::SOURCE_FILE,
-                gaugewright_boundary::definition::PERSONA_FILE,
-            ] {
-                let body = std::fs::read_to_string(source_root.join(file))?;
-                engagement
-                    .write_file(&format!("{target_root}/{file}"), &body)
-                    .map_err(io)?;
+        for target_id in &targets.target_ids {
+            let target = library.work_targets.get(target_id).ok_or_else(|| {
+                invalid(format!(
+                    "placement {} target {target_id} is missing",
+                    placement.id
+                ))
+            })?;
+            if !matches!(&target.owner, WorkTargetOwner::Project { project_id: owner } if owner == project_id)
+            {
+                return Err(invalid(format!(
+                    "placement {} target {target_id} is owned outside project {project_id}",
+                    placement.id
+                )));
             }
-            if let Ok(legacy_persona) = std::fs::read_to_string(
-                instances_dir
-                    .join(&agent.instance_id)
-                    .join("repo/.whipple/legacy-persona.md"),
-            ) {
-                engagement
-                    .write_file(".whipple/legacy-persona.md", &legacy_persona)
-                    .map_err(io)?;
-            }
-            let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(
-                engagement.path().join(&target_root),
-            )
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            let expected = agent
-                .package_versions
-                .get(&placement.version)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "placement version has no package reference",
-                    )
-                })?;
-            if package.version_ref() != expected {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "migrated placement package does not match the published reference",
-                ));
-            }
-            engagement
-                .commit_turn("install migrated WhippleScript package")
-                .map_err(io)?;
-            if engagement.merge_into_main().map_err(io)? != MergeOutcome::Clean {
-                return Err(std::io::Error::other(
-                    "placement package migration conflicted with its mainline",
-                ));
-            }
-            Ok(())
-        })();
-        let _ = workspace.remove_engagement(&migration_id);
-        result?;
+        }
+    }
+    for chat in library.chats.values() {
+        let binding = library.chat_targets.get(&chat.id).ok_or_else(|| {
+            invalid(format!(
+                "pre-TARGET workspace: chat {} has no exact target binding; reset this pre-release state root",
+                chat.id
+            ))
+        })?;
+        let target = library
+            .work_targets
+            .get(&binding.target_id)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "chat {} target {} is missing",
+                    chat.id, binding.target_id
+                ))
+            })?;
+        let root = library.instances.get(&chat.instance_id).ok_or_else(|| {
+            invalid(format!(
+                "chat {} root {} is missing",
+                chat.id, chat.instance_id
+            ))
+        })?;
+        let eligible = match root.kind {
+            InstanceKind::Authoring => matches!(
+                &target.owner,
+                WorkTargetOwner::Archetype { archetype_id } if archetype_id == &root.agent_id
+            ),
+            InstanceKind::Using => library
+                .placement_targets
+                .get(&root.id)
+                .is_some_and(|record| record.target_ids.contains(&binding.target_id)),
+        };
+        let caps_fit = (!binding.capabilities.read || target.capabilities.read)
+            && (!binding.capabilities.propose || target.capabilities.propose)
+            && (!binding.capabilities.apply || target.capabilities.apply)
+            && (!binding.capabilities.publish || target.capabilities.publish)
+            && (!binding.capabilities.release || target.capabilities.release);
+        if !eligible
+            || binding.basis.is_empty()
+            || binding.path_scope.is_empty()
+            || !binding
+                .path_scope
+                .iter()
+                .all(|path| target.path_scope.contains(path))
+            || !caps_fit
+        {
+            return Err(invalid(format!(
+                "chat {} has an invalid target binding",
+                chat.id
+            )));
+        }
+    }
+    for workstream in library.workstreams.values() {
+        let root = library.workstream_roots.get(&workstream.id).ok_or_else(|| {
+            invalid(format!(
+                "pre-TARGET workspace: workstream {} has no target root; reset this pre-release state root",
+                workstream.id
+            ))
+        })?;
+        let target = library.work_targets.get(&root.target_id);
+        let root_eligible = library
+            .placement_targets
+            .get(&root.placement_id)
+            .is_some_and(|record| record.target_ids.contains(&root.target_id));
+        if root.placement_id != workstream.instance_id
+            || !root_eligible
+            || target.is_none_or(|target| target.adapter_family != root.adapter_family)
+        {
+            return Err(invalid(format!(
+                "workstream {} has an invalid target root",
+                workstream.id
+            )));
+        }
     }
     Ok(())
 }
 
-fn repair_legacy_default_instance(store: &mut Store, library: &crate::library::Library) {
-    if library.instances.contains_key(DEFAULT_INSTANCE)
-        && store
-            .fold::<InstanceState>(DEFAULT_INSTANCE)
-            .map(|s| s.pinned_version.is_none())
-            .unwrap_or(false)
-    {
-        activate_instance(store, DEFAULT_INSTANCE);
+fn validate_archetype_versions(
+    library: &crate::library::Library,
+    targets_dir: &std::path::Path,
+) -> std::io::Result<()> {
+    for archetype in library.agents.values() {
+        let target = library.authoring_target_for(&archetype.id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("archetype {} has no authoring target", archetype.id),
+            )
+        })?;
+        archetype.versions.get(&archetype.current_version).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "pre-discipline workspace: archetype {} has no complete current version; reset this pre-release state root",
+                    archetype.id
+                ),
+            )
+        })?;
+        for (version, expected) in &archetype.versions {
+            let resolved = published_archetype_version(targets_dir, &target.id, *version)?;
+            if &resolved != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "archetype {} package or discipline bytes do not match version {}",
+                        archetype.id, version
+                    ),
+                ));
+            }
+        }
     }
+    Ok(())
 }
 
-/// What startup reconciliation yields: open instances, live engagements, and the
-/// chat-id → instance-id engagement index.
-type StartupInstances = (
+/// What startup reconciliation yields: open managed targets, live engagements,
+/// and the chat-id → target-id engagement index.
+type StartupTargets = (
     BTreeMap<String, Box<dyn Workspace>>,
     BTreeMap<String, Box<dyn ChatWorkspace>>,
     BTreeMap<String, String>,
 );
 
-fn open_startup_instances(
-    library: &crate::library::Library,
-    instances_dir: &std::path::Path,
-    providers: &WorkspaceProviders,
-) -> std::io::Result<StartupInstances> {
-    let mut instances = BTreeMap::new();
-    let mut engagements = BTreeMap::new();
-    let mut engagement_index = BTreeMap::new();
-    let track_chats = !library.chats.is_empty();
-    for inst_rec in library.instances.values() {
-        let inst = provider_for(providers, &inst_rec.id).open_at(&instances_dir.join(&inst_rec.id));
-        let existing = inst.reconcile_engagements().map_err(io)?;
-        for (chat_id, eng) in existing {
-            if track_chats && !library.chats.contains_key(&chat_id) {
-                let _ = inst.remove_engagement(&chat_id);
-                continue;
+/// Chat ids whose latest library `chat` record is a tombstone — the only
+/// evidence that the chat was *explicitly deleted*. Folded latest-wins over
+/// the raw record stream (the [`crate::library::Library`] projection drops
+/// tombstoned rows, so it cannot distinguish "deleted" from "never recorded").
+fn explicitly_deleted_chats(store: &Store) -> std::io::Result<BTreeSet<String>> {
+    let mut deleted = BTreeSet::new();
+    for row in store.records(LIBRARY_SCOPE, "chat").map_err(io)? {
+        let record: ChatRecord =
+            serde_json::from_str(&row).map_err(|error| std::io::Error::other(error.to_string()))?;
+        match record.op {
+            RecordOp::Tombstone => {
+                deleted.insert(record.id);
             }
-            engagement_index.insert(chat_id.clone(), inst_rec.id.clone());
-            engagements.insert(chat_id, eng);
+            RecordOp::Upsert => {
+                deleted.remove(&record.id);
+            }
         }
-        instances.insert(inst_rec.id.clone(), inst);
     }
-    Ok((instances, engagements, engagement_index))
+    Ok(deleted)
 }
 
-/// Seed a fresh library (ADR 0035/0036): the default **archetype** + its authoring
-/// repo, plus the hidden default **Personal project** and a default **placement**.
-pub(crate) fn seed_default_agent(
+fn open_startup_targets(
+    library: &crate::library::Library,
+    targets_dir: &std::path::Path,
+    providers: &WorkspaceProviders,
+    deleted_chats: &BTreeSet<String>,
+) -> std::io::Result<StartupTargets> {
+    let mut targets = BTreeMap::new();
+    let mut engagements = BTreeMap::new();
+    let mut engagement_index = BTreeMap::new();
+    for target in library.work_targets.values() {
+        let workspace = match target.kind {
+            WorkTargetKind::Managed => {
+                provider_for(providers, &target.id).open_at(&targets_dir.join(&target.id))
+            }
+            WorkTargetKind::ExternalVcs | WorkTargetKind::ExternalFolder => {
+                crate::target_adapter::open_external_workspace(targets_dir, target)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+            }
+        };
+        let existing = workspace.reconcile_engagements().map_err(io)?;
+        for (chat_id, eng) in existing {
+            // DR-0054 Phase A: an engagement branch is a chat's working copy —
+            // persisted user data. Reconciliation may release it only when the
+            // library shows the chat was explicitly deleted. A missing or
+            // mismatched binding with no delete record can also mean a failed
+            // append or a downgrade, so the branch stays and we say so.
+            match library.chat_targets.get(&chat_id) {
+                Some(binding) if binding.target_id == target.id => {
+                    engagement_index.insert(chat_id.clone(), target.id.clone());
+                    engagements.insert(chat_id, eng);
+                }
+                _ if deleted_chats.contains(&chat_id) => {
+                    // Finishing an explicit, recorded delete is governed removal.
+                    let _ = workspace.remove_engagement(&chat_id);
+                }
+                Some(binding) => {
+                    tracing::warn!(
+                        chat = %chat_id,
+                        target = %target.id,
+                        bound_target = %binding.target_id,
+                        "startup reconcile: engagement branch is bound to another target and the chat was never deleted; leaving it in place",
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        chat = %chat_id,
+                        target = %target.id,
+                        "startup reconcile: engagement branch has no library binding and no delete record; leaving it in place",
+                    );
+                }
+            }
+        }
+        targets.insert(target.id.clone(), workspace);
+    }
+    Ok((targets, engagements, engagement_index))
+}
+
+fn builtin_instance_id(archetype: &crate::app_support::BuiltinArchetype) -> String {
+    if archetype.id == DEFAULT_AGENT {
+        DEFAULT_INSTANCE.to_owned()
+    } else {
+        format!("inst-{}", archetype.id.trim_start_matches("agent-"))
+    }
+}
+
+fn seed_builtin_archetype(
     store: &mut Store,
     library: &mut crate::library::Library,
-    instances_dir: &std::path::Path,
+    targets_dir: &std::path::Path,
     providers: &WorkspaceProviders,
+    home_id: &gaugewright_core::ids::HomeId,
+    archetype: &crate::app_support::BuiltinArchetype,
 ) -> std::io::Result<()> {
-    let seed_repo = |id: &str| -> std::io::Result<()> {
-        let inst = provider_for(providers, id)
-            .init_at(&instances_dir.join(id))
-            .map_err(io)?;
-        let files = crate::app_support::default_agent_definition().seed_files();
-        let files: Vec<(&str, &str)> = files
-            .iter()
-            .map(|(path, content)| (path.as_str(), content.as_str()))
-            .collect();
-        inst.seed_main(&files).map_err(io)?;
-        Ok(())
-    };
-
-    seed_repo(DEFAULT_INSTANCE)?;
-    let package_ref = published_package_ref(instances_dir, DEFAULT_INSTANCE, 1)?;
-    let inst_rec = InstanceRecord {
-        id: DEFAULT_INSTANCE.into(),
+    if library.agents.contains_key(archetype.id) {
+        return Ok(());
+    }
+    let definition = crate::app_support::builtin_agent_definition(archetype);
+    let skills = archetype
+        .official_skills
+        .then(crate::official_skills::office_skill_references)
+        .unwrap_or_default();
+    let authored_files = archetype_files(&definition, skills)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let authored_files = authored_files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect::<Vec<_>>();
+    let authoring_target = authoring_target_id(archetype.id);
+    let authoring_basis =
+        init_managed_target(targets_dir, providers, &authoring_target, &authored_files)?;
+    let version = published_archetype_version(targets_dir, &authoring_target, 1)?;
+    let instance_id = builtin_instance_id(archetype);
+    let instance = InstanceRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        id: instance_id.clone(),
         op: RecordOp::Upsert,
         kind: InstanceKind::Authoring,
-        agent_id: DEFAULT_AGENT.into(),
+        agent_id: archetype.id.to_owned(),
         project_id: None,
         version: 1,
         admission: Admission::Active,
     };
-    store
-        .append_record(
-            LIBRARY_SCOPE,
-            "instance",
-            &serde_json::to_string(&inst_rec).unwrap(),
-        )
-        .map_err(io)?;
-    library.apply_instance(inst_rec);
-    activate_instance(store, DEFAULT_INSTANCE);
-
+    append_library_record(store, "instance", &instance)?;
+    library.apply_instance(instance);
+    activate_instance(store, &instance_id);
     let agent = AgentRecord {
-        id: DEFAULT_AGENT.into(),
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        id: archetype.id.to_owned(),
         op: RecordOp::Upsert,
-        name: "assistant".into(),
-        instance_id: DEFAULT_INSTANCE.into(),
+        name: archetype.name.to_owned(),
+        instance_id,
         config: "{}".into(),
         current_version: 1,
-        package_versions: [(1, package_ref)].into_iter().collect(),
+        versions: [(1, version)].into_iter().collect(),
         auto_upgrade: false,
         forked_from: None,
     };
-    store
-        .append_record(
-            LIBRARY_SCOPE,
-            "agent",
-            &serde_json::to_string(&agent).unwrap(),
-        )
-        .map_err(io)?;
+    append_library_record(store, "agent", &agent)?;
     library.apply_agent(agent);
+    let target = managed_target_record(
+        authoring_target,
+        format!("{} authoring", archetype.name),
+        WorkTargetOwner::Archetype {
+            archetype_id: archetype.id.to_owned(),
+        },
+        home_id,
+        authoring_basis,
+    );
+    append_library_record(store, "work_target", &target)?;
+    library.apply_work_target(target);
+    Ok(())
+}
+
+fn ensure_builtin_placement(
+    store: &mut Store,
+    library: &mut crate::library::Library,
+    archetype: &crate::app_support::BuiltinArchetype,
+) -> std::io::Result<()> {
+    if library.instances.values().any(|instance| {
+        instance.kind == InstanceKind::Using
+            && instance.agent_id == archetype.id
+            && instance.project_id.as_deref() == Some(DEFAULT_PROJECT)
+    }) {
+        return Ok(());
+    }
+    let placement_id = if archetype.id == DEFAULT_AGENT {
+        DEFAULT_PLACEMENT.to_owned()
+    } else {
+        format!("placement-{}", archetype.id.trim_start_matches("agent-"))
+    };
+    let placement = InstanceRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        id: placement_id.clone(),
+        op: RecordOp::Upsert,
+        kind: InstanceKind::Using,
+        agent_id: archetype.id.to_owned(),
+        project_id: Some(DEFAULT_PROJECT.into()),
+        version: 1,
+        admission: Admission::Active,
+    };
+    append_library_record(store, "instance", &placement)?;
+    library.apply_instance(placement);
+    let eligibility = PlacementTargetsRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        placement_id: placement_id.clone(),
+        op: RecordOp::Upsert,
+        target_ids: vec![managed_project_target_id(DEFAULT_PROJECT)],
+    };
+    append_library_record(store, "placement_targets", &eligibility)?;
+    library.apply_placement_targets(eligibility);
+    activate_instance(store, &placement_id);
+    Ok(())
+}
+
+fn ensure_builtin_archetypes(
+    store: &mut Store,
+    library: &mut crate::library::Library,
+    targets_dir: &std::path::Path,
+    providers: &WorkspaceProviders,
+    home_id: &gaugewright_core::ids::HomeId,
+) -> std::io::Result<()> {
+    for archetype in crate::app_support::builtin_archetypes() {
+        seed_builtin_archetype(store, library, targets_dir, providers, home_id, archetype)?;
+    }
+    if library.projects.contains_key(DEFAULT_PROJECT) {
+        for archetype in crate::app_support::builtin_archetypes() {
+            ensure_builtin_placement(store, library, archetype)?;
+        }
+    }
+    Ok(())
+}
+
+/// Seed a fresh library (ADR 0035/0036): the built-in **archetypes** plus the
+/// explicit default **Personal project** and their default **placements**.
+pub(crate) fn seed_default_agent(
+    store: &mut Store,
+    library: &mut crate::library::Library,
+    targets_dir: &std::path::Path,
+    providers: &WorkspaceProviders,
+    home_id: &gaugewright_core::ids::HomeId,
+) -> std::io::Result<()> {
+    let general = crate::app_support::builtin_archetypes()
+        .iter()
+        .find(|archetype| archetype.id == DEFAULT_AGENT)
+        .expect("the Default archetype is built in");
+    seed_builtin_archetype(store, library, targets_dir, providers, home_id, general)?;
 
     let proj = ProjectRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
         id: DEFAULT_PROJECT.into(),
         op: RecordOp::Upsert,
         name: "Personal".into(),
         is_default: true,
+        home_id: home_id.clone(),
         network_isolated: false,
         run_purpose: None,
         deployment_mode: None,
@@ -470,14 +1044,31 @@ pub(crate) fn seed_default_agent(
         )
         .map_err(io)?;
     library.apply_project(proj);
-
-    let source = provider_for(providers, DEFAULT_INSTANCE)
-        .open_at(&instances_dir.join(DEFAULT_INSTANCE))
-        .peer_source();
-    provider_for(providers, DEFAULT_PLACEMENT)
-        .fork_from_at(&instances_dir.join(DEFAULT_PLACEMENT), &source)
-        .map_err(io)?;
+    let project_target = managed_project_target_id(DEFAULT_PROJECT);
+    // Personal is a project like any other, so it is seeded with the same
+    // default gate (ADR 0117 §7). Leaving it out would make the one project
+    // every account starts with the only one that cannot receive inbound
+    // material.
+    let project_basis = init_managed_target(
+        targets_dir,
+        providers,
+        &project_target,
+        &default_gate_files(),
+    )?;
+    let target = managed_target_record(
+        project_target.clone(),
+        "Personal files".to_owned(),
+        WorkTargetOwner::Project {
+            project_id: DEFAULT_PROJECT.to_owned(),
+        },
+        home_id,
+        project_basis,
+    );
+    append_library_record(store, "work_target", &target)?;
+    library.apply_work_target(target);
     let placement = InstanceRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
         id: DEFAULT_PLACEMENT.into(),
         op: RecordOp::Upsert,
         kind: InstanceKind::Using,
@@ -494,95 +1085,67 @@ pub(crate) fn seed_default_agent(
         )
         .map_err(io)?;
     library.apply_instance(placement);
+    let eligibility = PlacementTargetsRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        placement_id: DEFAULT_PLACEMENT.to_owned(),
+        op: RecordOp::Upsert,
+        target_ids: vec![project_target],
+    };
+    append_library_record(store, "placement_targets", &eligibility)?;
+    library.apply_placement_targets(eligibility);
     activate_instance(store, DEFAULT_PLACEMENT);
-    Ok(())
-}
-
-/// Self-heal a store seeded before the ADR 0036 reset, which has the default
-/// archetype but no hidden Personal project / default placement.
-pub(crate) fn ensure_default_project_and_placement(
-    store: &mut Store,
-    library: &mut crate::library::Library,
-    instances_dir: &std::path::Path,
-    providers: &WorkspaceProviders,
-) -> std::io::Result<()> {
-    if !library.projects.contains_key(DEFAULT_PROJECT) {
-        let proj = ProjectRecord {
-            id: DEFAULT_PROJECT.into(),
-            op: RecordOp::Upsert,
-            name: "Personal".into(),
-            is_default: true,
-            network_isolated: false,
-            run_purpose: None,
-            deployment_mode: None,
-        };
-        store
-            .append_record(
-                LIBRARY_SCOPE,
-                "project",
-                &serde_json::to_string(&proj).unwrap(),
-            )
-            .map_err(io)?;
-        library.apply_project(proj);
-    }
-    if !library.instances.contains_key(DEFAULT_PLACEMENT) {
-        let dir = instances_dir.join(DEFAULT_PLACEMENT);
-        let source = provider_for(providers, DEFAULT_INSTANCE)
-            .open_at(&instances_dir.join(DEFAULT_INSTANCE))
-            .peer_source();
-        provider_for(providers, DEFAULT_PLACEMENT)
-            .fork_from_at(&dir, &source)
-            .map_err(io)?;
-        let placement = InstanceRecord {
-            id: DEFAULT_PLACEMENT.into(),
-            op: RecordOp::Upsert,
-            kind: InstanceKind::Using,
-            agent_id: DEFAULT_AGENT.into(),
-            project_id: Some(DEFAULT_PROJECT.into()),
-            version: 1,
-            admission: Admission::Active,
-        };
-        store
-            .append_record(
-                LIBRARY_SCOPE,
-                "instance",
-                &serde_json::to_string(&placement).unwrap(),
-            )
-            .map_err(io)?;
-        library.apply_instance(placement);
-        activate_instance(store, DEFAULT_PLACEMENT);
-    } else if store
-        .fold::<InstanceState>(DEFAULT_PLACEMENT)
-        .map(|s| s.pinned_version.is_none())
-        .unwrap_or(false)
-    {
-        activate_instance(store, DEFAULT_PLACEMENT);
-    }
+    ensure_builtin_archetypes(store, library, targets_dir, providers, home_id)?;
     Ok(())
 }
 
 impl Workbench {
     pub(crate) fn apply_startup_library_state(&mut self, state: StartupLibraryState) {
-        self.instances = state.instances;
+        self.targets = state.targets;
         self.engagements = state.engagements;
         self.engagement_index = state.engagement_index;
         self.library = state.library;
-        self.default_instance = DEFAULT_PLACEMENT.to_string();
+        self.default_instance = DEFAULT_PLACEMENT.to_owned();
     }
 
-    /// A workbench with one registered instance, made the default create target —
-    /// the convenient shape for tests and the back-compat `POST /chats`.
-    pub fn with_instance(inst_id: impl Into<String>, instance: Instance, store: Store) -> Self {
-        let inst_id = inst_id.into();
+    /// A test workbench with one managed target as its default chat root.
+    pub fn with_target(target_id: impl Into<String>, target: Instance, store: Store) -> Self {
+        let target_id = target_id.into();
         let mut wb = Self::new(store);
-        // Anchor the instances root from the one registered instance (instances
-        // live at `<instances-root>/<id>/repo`) — the test-constructor stand-in
-        // for the build path, which records it from `prepare_workbench_root`.
-        if let Some(root) = instance.repo().parent().and_then(|p| p.parent()) {
-            wb.instances_root = root.to_path_buf();
+        // Managed targets live at `<targets-root>/<target-id>/repo`.
+        if let Some(root) = target.repo().parent().and_then(|p| p.parent()) {
+            wb.targets_root = root.to_path_buf();
         }
-        wb.instances.insert(inst_id.clone(), Box::new(instance));
-        wb.default_instance = inst_id;
+        wb.targets.insert(target_id.clone(), Box::new(target));
+        let home_id = wb.home_id().clone();
+        wb.write_work_target_record(managed_target_record(
+            target_id.clone(),
+            "Test target".to_owned(),
+            WorkTargetOwner::Project {
+                project_id: "test-project".to_owned(),
+            },
+            &home_id,
+            "test-basis".to_owned(),
+        ));
+        wb.write_placement_targets_record(PlacementTargetsRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            placement_id: target_id.clone(),
+            op: RecordOp::Upsert,
+            target_ids: vec![target_id.clone()],
+        });
+        wb.write_instance_record(InstanceRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            id: target_id.clone(),
+            op: RecordOp::Upsert,
+            kind: InstanceKind::Using,
+            agent_id: DEFAULT_AGENT.to_owned(),
+            project_id: Some("test-project".to_owned()),
+            version: 1,
+            admission: Admission::Active,
+        });
+        wb.default_instance = target_id;
         wb
     }
 
@@ -603,8 +1166,39 @@ impl Workbench {
             .unwrap_or_else(|| project_id.to_string())
     }
 
+    pub fn project_home_id(&self, project_id: &str) -> Option<&gaugewright_core::ids::HomeId> {
+        self.library.project_home_id(project_id)
+    }
+
+    pub fn owns_project(&self, project_id: &str) -> bool {
+        self.project_home_id(project_id) == Some(self.home_id())
+    }
+
+    pub(crate) fn project_record_for_home_rebind(
+        &self,
+        project_id: &str,
+        home_id: gaugewright_core::ids::HomeId,
+    ) -> Option<ProjectRecord> {
+        let mut project = self.library.projects.get(project_id)?.clone();
+        project.home_id = home_id;
+        Some(project)
+    }
+
+    pub(crate) fn apply_atomic_project_home_rebind(&mut self, project: ProjectRecord) {
+        let id = project.id.clone();
+        self.library.apply_project(project);
+        self.notify_library_changed("project", &id, "upsert");
+    }
+
     pub(crate) fn library_project_of_chat(&self, chat_id: &str) -> Option<String> {
         self.library.project_of_chat(chat_id).map(str::to_string)
+    }
+
+    pub(crate) fn library_placement_of_chat(&self, chat_id: &str) -> Option<String> {
+        self.library
+            .chats
+            .get(chat_id)
+            .map(|chat| chat.instance_id.clone())
     }
 
     pub(crate) fn library_chat_network_isolated(&self, chat_id: &str) -> bool {
@@ -617,6 +1211,58 @@ impl Workbench {
 
     pub(crate) fn library_has_instance_record(&self, id: &str) -> bool {
         self.library.instances.contains_key(id)
+    }
+
+    /// Whether `id` names an active placement, rather than an authoring
+    /// instance. Hosted deployment and migration compositions use this narrow
+    /// query without receiving the library projection itself.
+    pub fn has_placement(&self, id: &str) -> bool {
+        self.library
+            .instances
+            .get(id)
+            .is_some_and(|instance| instance.kind == InstanceKind::Using)
+    }
+
+    /// The project that owns an active placement. Hosted management
+    /// compositions use this exact binding when admitting project-scoped
+    /// automation and deployment commands; a placement selector alone is not
+    /// authority and may not be paired with an arbitrary project id.
+    pub fn placement_project_id(&self, id: &str) -> Option<&str> {
+        let instance = self.library.instances.get(id)?;
+        if instance.kind != InstanceKind::Using {
+            return None;
+        }
+        instance
+            .project_id
+            .as_deref()
+            .filter(|project| !project.is_empty())
+    }
+
+    /// Abilities frozen into the immutable archetype version used by a
+    /// placement. This deliberately does not read the mutable authoring draft.
+    pub(crate) fn placement_abilities(&self, id: &str) -> Result<Vec<String>, String> {
+        let instance = self
+            .library
+            .instances
+            .get(id)
+            .filter(|instance| instance.kind == InstanceKind::Using)
+            .ok_or_else(|| "no such placement".to_owned())?;
+        let archetype = self
+            .library
+            .agents
+            .get(&instance.agent_id)
+            .ok_or_else(|| "placement archetype is unavailable".to_owned())?;
+        let authoring_target = self
+            .library
+            .authoring_target_for(&archetype.id)
+            .ok_or_else(|| "archetype authoring target is unavailable".to_owned())?;
+        let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(published_package_root(
+            &self.targets_dir(),
+            &authoring_target.id,
+            instance.version,
+        ))
+        .map_err(|error| error.to_string())?;
+        Ok(package.agent_abilities().to_vec())
     }
 
     pub(crate) fn library_fork_forest(&self) -> Vec<crate::library::ForkNode> {
@@ -637,19 +1283,41 @@ impl Workbench {
         project: &str,
     ) -> Vec<(String, String, Vec<u8>)> {
         let mut out = Vec::new();
-        for inst_rec in self.library.using_instances_of(project) {
-            match self.instances.get(&inst_rec.id) {
+        let mut target_ids = self
+            .library
+            .targets_for_project(project)
+            .into_iter()
+            .map(|target| target.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for instance in self
+            .library
+            .instances
+            .values()
+            .filter(|instance| instance.project_id.as_deref() == Some(project))
+        {
+            if let Some(target) = self.library.authoring_target_for(&instance.agent_id) {
+                target_ids.insert(target.id.clone());
+            }
+        }
+        for target_id in target_ids {
+            let Some(target) = self.library.work_targets.get(&target_id) else {
+                continue;
+            };
+            if target.kind != WorkTargetKind::Managed {
+                continue;
+            }
+            match self.targets.get(&target.id) {
                 Some(inst) => match inst.export() {
                     Ok(export) => out.push((
-                        inst_rec.id.clone(),
+                        target.id.clone(),
                         inst.export_format().to_string(),
                         export.0,
                     )),
                     Err(e) => {
-                        tracing::warn!("handoff: cannot bundle instance {}: {e}", inst_rec.id)
+                        tracing::warn!("handoff: cannot bundle target {}: {e}", target.id)
                     }
                 },
-                None => tracing::warn!("handoff: no live repo for instance {}", inst_rec.id),
+                None => tracing::warn!("handoff: no live store for target {}", target.id),
             }
         }
         out
@@ -752,6 +1420,150 @@ impl Workbench {
         position
     }
 
+    pub(crate) fn write_work_target_record(&mut self, record: WorkTargetRecord) {
+        let id = record.id.clone();
+        let op = Self::library_op_str(record.op);
+        let _ = self.store_mut().append_record(
+            LIBRARY_SCOPE,
+            "work_target",
+            &serde_json::to_string(&record).unwrap(),
+        );
+        self.library.apply_work_target(record);
+        self.notify_library_changed("work_target", &id, op);
+    }
+
+    pub(crate) fn refresh_work_target_basis_from_chat(&mut self, chat_id: &str) {
+        let Some(target_id) = self.engagement_index.get(chat_id).cloned() else {
+            return;
+        };
+        let Some(basis) = self
+            .engagements
+            .get(chat_id)
+            .and_then(|engagement| engagement.standing_revision().ok())
+            .map(|revision| revision.0)
+        else {
+            return;
+        };
+        let Some(mut target) = self.library.work_targets.get(&target_id).cloned() else {
+            return;
+        };
+        if target.current_basis.as_deref() == Some(&basis) {
+            return;
+        }
+        target.current_basis = Some(basis);
+        self.write_work_target_record(target);
+    }
+
+    pub(crate) fn write_placement_targets_record(&mut self, record: PlacementTargetsRecord) {
+        let id = record.placement_id.clone();
+        let op = Self::library_op_str(record.op);
+        let _ = self.store_mut().append_record(
+            LIBRARY_SCOPE,
+            "placement_targets",
+            &serde_json::to_string(&record).unwrap(),
+        );
+        self.library.apply_placement_targets(record);
+        self.notify_library_changed("placement", &id, op);
+    }
+
+    pub(crate) fn write_chat_target_record(&mut self, record: ChatTargetBindingRecord) {
+        let id = record.chat_id.clone();
+        let op = Self::library_op_str(record.op);
+        let _ = self.store_mut().append_record(
+            LIBRARY_SCOPE,
+            "chat_target",
+            &serde_json::to_string(&record).unwrap(),
+        );
+        self.library.apply_chat_target(record);
+        self.notify_library_changed("chat", &id, op);
+    }
+
+    pub(crate) fn write_workstream_root_record(&mut self, record: WorkstreamRootRecord) {
+        let id = record.workstream_id.clone();
+        let op = Self::library_op_str(record.op);
+        let _ = self.store_mut().append_record(
+            LIBRARY_SCOPE,
+            "workstream_root",
+            &serde_json::to_string(&record).unwrap(),
+        );
+        self.library.apply_workstream_root(record);
+        self.notify_library_changed("workstream", &id, op);
+    }
+
+    /// Create a target-owned managed store. Placements only receive eligibility;
+    /// they never get a fork/copy of this workspace.
+    pub(crate) fn create_managed_project_target(
+        &mut self,
+        project_id: &str,
+        name: String,
+    ) -> Result<String, String> {
+        let target_id = managed_project_target_id(project_id);
+        if self.library.work_targets.contains_key(&target_id) {
+            return Ok(target_id);
+        }
+        let project = self
+            .library
+            .projects
+            .get(project_id)
+            .ok_or_else(|| "no such project".to_owned())?;
+        if &project.home_id != self.home_id() {
+            return Err("project belongs to another Home".to_owned());
+        }
+        let workspace = self
+            .workspace_provider(&target_id)
+            .init_at(&self.targets_dir().join(&target_id))
+            .map_err(|error| error.to_string())?;
+        // Every project has a gate from the moment it exists, and it is
+        // review-by-hand (ADR 0117 §7). Seeding it into the target's mainline
+        // rather than writing it into one chat's worktree is what makes it the
+        // *project's* program: every chat rooted on this target sees the same
+        // gate, and changing it is an ordinary diff a human keeps or rejects
+        // (ADR 0110 §5) instead of an ambient edit.
+        //
+        // Review-by-hand is the only gate that can be seeded unconditionally --
+        // it needs no provider, no key, and no judgement about whether a
+        // classifier suits the material -- so `coerce-screen` is something an
+        // author moves to, never a default.
+        workspace
+            .seed_main(&default_gate_files())
+            .map_err(|error| error.to_string())?;
+        let probe_id = library::gen_id("target-basis");
+        let probe = workspace
+            .create_engagement(&probe_id)
+            .map_err(|error| error.to_string())?;
+        let basis = probe.boundary_cut().map_err(|error| error.to_string())?.0;
+        drop(probe);
+        workspace
+            .remove_engagement(&probe_id)
+            .map_err(|error| error.to_string())?;
+        self.targets.insert(target_id.clone(), workspace);
+        self.write_work_target_record(managed_target_record(
+            target_id.clone(),
+            name,
+            WorkTargetOwner::Project {
+                project_id: project_id.to_owned(),
+            },
+            self.home_id(),
+            basis,
+        ));
+        let placements = self
+            .library
+            .using_instances_of(project_id)
+            .into_iter()
+            .map(|placement| placement.id.clone())
+            .collect::<Vec<_>>();
+        for placement_id in placements {
+            self.write_placement_targets_record(PlacementTargetsRecord {
+                schema: crate::library::LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+                placement_id,
+                op: RecordOp::Upsert,
+                target_ids: vec![target_id.clone()],
+            });
+        }
+        Ok(target_id)
+    }
+
     pub(crate) fn library_restamp_workstream_position(
         &mut self,
         workstream_id: &str,
@@ -777,34 +1589,91 @@ impl Workbench {
         self.library.workstreams.contains_key(workstream_id)
     }
 
-    pub(crate) fn create_instance_workstream_ref(
+    pub(crate) fn library_workstream_root(
         &self,
-        instance_id: &str,
         workstream_id: &str,
-    ) -> std::io::Result<()> {
-        let Some(instance) = self.instances.get(instance_id) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "no such placement",
-            ));
-        };
-        instance.create_workstream(workstream_id).map_err(io)
+    ) -> Option<WorkstreamRootRecord> {
+        self.library.workstream_roots.get(workstream_id).cloned()
     }
 
-    pub(crate) fn promote_instance_workstream_ref_to_main(
+    pub(crate) fn library_chat_target_binding(
         &self,
+        chat_id: &str,
+    ) -> Option<ChatTargetBindingRecord> {
+        self.library.chat_targets.get(chat_id).cloned()
+    }
+
+    pub(crate) fn library_chat_placement(&self, chat_id: &str) -> Option<&str> {
+        self.library
+            .chats
+            .get(chat_id)
+            .map(|chat| chat.instance_id.as_str())
+    }
+
+    pub(crate) fn resolve_placement_target(
+        &self,
+        placement_id: &str,
+        requested: Option<&str>,
+    ) -> Result<WorkTargetRecord, String> {
+        let eligible = self
+            .library
+            .placement_targets
+            .get(placement_id)
+            .map(|record| record.target_ids.as_slice())
+            .unwrap_or_default();
+        let target_id = match requested {
+            Some(target_id) if eligible.iter().any(|id| id == target_id) => target_id,
+            Some(_) => return Err("work target is not eligible for this placement".to_owned()),
+            None if eligible.len() == 1 => &eligible[0],
+            None if eligible.is_empty() => return Err("placement has no work target".to_owned()),
+            None => return Err("select a work target".to_owned()),
+        };
+        let target = self
+            .library
+            .work_targets
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| "work target is unresolved".to_owned())?;
+        if target.status != WorkTargetStatus::Available {
+            return Err("work target is unavailable".to_owned());
+        }
+        Ok(target)
+    }
+
+    pub(crate) fn managed_target_storage_id(&self, target_id: &str) -> Option<&str> {
+        self.library
+            .work_targets
+            .get(target_id)
+            .filter(|target| target.kind == WorkTargetKind::Managed)
+            .map(|target| target.id.as_str())
+    }
+
+    pub(crate) fn create_target_workstream_ref(
+        &self,
+        target_id: &str,
         workstream_id: &str,
-        instance_id: &str,
-    ) -> std::io::Result<MergeOutcome> {
-        let Some(instance) = self.instances.get(instance_id) else {
+    ) -> std::io::Result<()> {
+        let Some(target) = self.targets.get(target_id) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "placement not open",
+                "managed target is not open",
             ));
         };
-        instance
-            .promote_workstream_to_main(workstream_id)
-            .map_err(io)
+        target.create_workstream(workstream_id).map_err(io)
+    }
+
+    pub(crate) fn promote_target_workstream_ref_to_main(
+        &self,
+        workstream_id: &str,
+        target_id: &str,
+    ) -> std::io::Result<MergeOutcome> {
+        let Some(target) = self.targets.get(target_id) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "managed target is not open",
+            ));
+        };
+        target.promote_workstream_to_main(workstream_id).map_err(io)
     }
 
     #[cfg(test)]
@@ -867,16 +1736,16 @@ impl Workbench {
         Ok(())
     }
 
-    pub(crate) fn instances_dir(&self) -> std::path::PathBuf {
-        self.instances_root.clone()
+    pub(crate) fn targets_dir(&self) -> std::path::PathBuf {
+        self.targets_root.clone()
     }
 
     pub(crate) fn destroy_chat(&mut self, chat_id: &str) {
-        if let Some(proc) = self.sessions.remove(chat_id) {
-            let _ = proc.shutdown();
+        if let Some(harness) = self.sessions.remove(chat_id) {
+            crate::workbench_state::shutdown_shared_harness(harness);
         }
         if let Some(inst_id) = self.engagement_index.remove(chat_id) {
-            if let Some(inst) = self.instances.get(&inst_id) {
+            if let Some(inst) = self.targets.get(&inst_id) {
                 let _ = inst.remove_engagement(chat_id);
             }
         }
@@ -888,9 +1757,22 @@ impl Workbench {
                 ..existing
             });
         }
+        if let Some(existing) = self.library.chat_targets.get(chat_id).cloned() {
+            self.write_chat_target_record(ChatTargetBindingRecord {
+                op: RecordOp::Tombstone,
+                ..existing
+            });
+        }
     }
 
     pub(crate) fn destroy_instance(&mut self, inst_id: &str) {
+        let authoring_target = self
+            .library
+            .instances
+            .get(inst_id)
+            .filter(|instance| instance.kind == InstanceKind::Authoring)
+            .and_then(|instance| self.library.authoring_target_for(&instance.agent_id))
+            .map(|target| target.id.clone());
         let chat_ids: Vec<String> = self
             .library
             .chats
@@ -901,38 +1783,147 @@ impl Workbench {
         for chat_id in chat_ids {
             self.destroy_chat(&chat_id);
         }
-        let dir = self.instances_dir().join(inst_id);
-        self.instances.remove(inst_id);
-        let _ = std::fs::remove_dir_all(dir);
         if let Some(existing) = self.library.instances.get(inst_id).cloned() {
             self.write_instance_record(InstanceRecord {
                 op: RecordOp::Tombstone,
                 ..existing
             });
         }
+        if let Some(existing) = self.library.placement_targets.get(inst_id).cloned() {
+            self.write_placement_targets_record(PlacementTargetsRecord {
+                op: RecordOp::Tombstone,
+                ..existing
+            });
+        }
+        if let Some(target_id) = authoring_target {
+            self.targets.remove(&target_id);
+            let _ = std::fs::remove_dir_all(self.targets_dir().join(&target_id));
+            if let Some(existing) = self.library.work_targets.get(&target_id).cloned() {
+                self.write_work_target_record(WorkTargetRecord {
+                    op: RecordOp::Tombstone,
+                    ..existing
+                });
+            }
+        }
     }
 
-    fn merge_agent_config(base: &str, overlay: &str) -> String {
+    /// Overlay a chat-local config onto the archetype base. An unparseable
+    /// side is an error, never coerced to `{}` (DR-0054 Phase A): a corrupt
+    /// config surfaced as empty would be re-persisted empty by the next
+    /// save, permanently destroying a recoverable value.
+    fn merge_agent_config(base: &str, overlay: &str) -> Result<String, String> {
         let base_json = serde_json::from_str::<serde_json::Value>(base)
-            .unwrap_or_else(|_| serde_json::json!({}));
-        let overlay_json = serde_json::from_str::<serde_json::Value>(overlay)
-            .unwrap_or_else(|_| serde_json::json!({}));
+            .map_err(|error| format!("stored agent config is not readable JSON: {error}"))?;
+        let overlay_json = serde_json::from_str::<serde_json::Value>(overlay).map_err(|error| {
+            format!("stored local config overlay is not readable JSON: {error}")
+        })?;
         match (base_json, overlay_json) {
             (serde_json::Value::Object(mut base_map), serde_json::Value::Object(overlay_map)) => {
                 for (key, value) in overlay_map {
                     base_map.insert(key, value);
                 }
                 serde_json::to_string(&serde_json::Value::Object(base_map))
-                    .unwrap_or_else(|_| base.to_string())
+                    .map_err(|error| format!("merged agent config did not serialize: {error}"))
             }
-            _ => base.to_string(),
+            _ => Ok(base.to_string()),
         }
+    }
+
+    /// Runtime selection is control-plane state. It is resolved for a turn and
+    /// never copied into the target candidate. Fails when a stored config is
+    /// unreadable rather than pretending it is empty.
+    pub(crate) fn effective_agent_config_for_chat(&self, chat_id: &str) -> Result<String, String> {
+        let Some(chat) = self.library.chats.get(chat_id) else {
+            return Ok("{}".to_owned());
+        };
+        let Some(instance) = self.library.instances.get(&chat.instance_id) else {
+            return Ok("{}".to_owned());
+        };
+        let base = self
+            .library
+            .agents
+            .get(&instance.agent_id)
+            .map(|agent| agent.config.clone())
+            .unwrap_or_else(|| "{}".to_owned());
+        match self
+            .store_ref()
+            .fold::<InstanceState>(&instance.id)
+            .ok()
+            .and_then(|state| state.local_config)
+            .filter(|overlay| !overlay.trim().is_empty())
+        {
+            Some(overlay) => Self::merge_agent_config(&base, &overlay),
+            None => Ok(base),
+        }
+    }
+
+    /// Recreate the selected immutable discipline as an ephemeral, read-only
+    /// runtime mount. The workspace adapter excludes this root from every cut
+    /// and diff, so archetype bytes cannot become target-owned by accident.
+    pub(crate) fn refresh_chat_discipline_mount(&self, chat_id: &str) -> Result<(), String> {
+        let chat = self
+            .library
+            .chats
+            .get(chat_id)
+            .ok_or_else(|| "no such chat".to_owned())?;
+        let instance = self
+            .library
+            .instances
+            .get(&chat.instance_id)
+            .ok_or_else(|| "chat placement is unavailable".to_owned())?;
+        if instance.kind == InstanceKind::Authoring {
+            return Ok(());
+        }
+        let archetype = self
+            .library
+            .agents
+            .get(&instance.agent_id)
+            .ok_or_else(|| "chat archetype is unavailable".to_owned())?;
+        let authoring_target = self
+            .library
+            .authoring_target_for(&archetype.id)
+            .ok_or_else(|| "archetype authoring target is unavailable".to_owned())?;
+        let package_root =
+            published_package_root(&self.targets_dir(), &authoring_target.id, instance.version);
+        let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(&package_root)
+            .map_err(|error| error.to_string())?;
+        let bundle = crate::discipline::load(
+            &published_discipline_root(&self.targets_dir(), &authoring_target.id, instance.version),
+            package.capabilities().iter().cloned(),
+        )?;
+        let engagement = self
+            .engagements
+            .get(chat_id)
+            .ok_or_else(|| "chat target candidate is unavailable".to_owned())?;
+        let mount = engagement
+            .path()
+            .join(gaugewright_boundary::definition::RUNTIME_MOUNT_ROOT);
+        if mount.exists() {
+            std::fs::remove_dir_all(&mount).map_err(|error| error.to_string())?;
+        }
+        for (path, body) in bundle.files {
+            let destination = mount.join("discipline").join(path);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(destination, body).map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn create_chat_in_instance(
         &mut self,
         inst_id: &str,
         title: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.create_chat_in_instance_on_target(inst_id, title, None)
+    }
+
+    pub(crate) fn create_chat_in_instance_on_target(
+        &mut self,
+        inst_id: &str,
+        title: &str,
+        requested_target_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         let Some(inst_rec) = self.library.instances.get(inst_id).cloned() else {
             return Err("no such instance".into());
@@ -952,43 +1943,44 @@ impl Workbench {
         {
             return Err("instance is not runnable (suspended or torn down)".into());
         }
-        let base_cfg = self
-            .library
-            .agents
-            .get(&inst_rec.agent_id)
-            .map(|a| a.config.clone())
-            .unwrap_or_else(|| "{}".into());
-        let inst_state = self.store_ref().fold::<InstanceState>(inst_id).ok();
-        let cfg = match inst_state
-            .as_ref()
-            .and_then(|s| s.local_config.as_deref())
-            .filter(|c| !c.trim().is_empty())
-        {
-            Some(overlay) => Self::merge_agent_config(&base_cfg, overlay),
-            None => base_cfg,
+        let target = match inst_rec.kind {
+            InstanceKind::Using => self.resolve_placement_target(inst_id, requested_target_id)?,
+            InstanceKind::Authoring => {
+                let target = self
+                    .library
+                    .authoring_target_for(&inst_rec.agent_id)
+                    .cloned()
+                    .ok_or_else(|| "archetype authoring target is unresolved".to_owned())?;
+                if requested_target_id.is_some_and(|requested| requested != target.id) {
+                    return Err("edit chat target does not belong to this archetype".to_owned());
+                }
+                target
+            }
         };
-        let notes = inst_state
-            .as_ref()
-            .and_then(|s| s.notes.clone())
-            .unwrap_or_default();
-        let Some(inst) = self.instances.get(inst_id) else {
-            return Err("instance not open".into());
+        let target_id = target.id.clone();
+        if !target.capabilities.read || !target.capabilities.propose {
+            return Err("work target does not grant read and propose".to_owned());
+        }
+        let Some(inst) = self.targets.get(&target_id) else {
+            return Err("work target storage is not open".into());
         };
         let chat_id = library::gen_id("chat");
         let eng = inst
             .create_engagement(&chat_id)
             .map_err(|e| e.to_string())?;
-        let _ = eng.write_file(gaugewright_boundary::definition::CONFIG_PATH, &cfg);
-        if !notes.trim().is_empty() {
-            let _ = eng.write_file("CLAUDE.md", &notes);
-        }
+        // Pin the exact standing target basis. Runtime config and discipline
+        // are control/materialized state and never mint target cuts.
+        let basis = eng.boundary_cut().map_err(|error| error.to_string())?.0;
         let rec = ChatRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: chat_id.clone(),
             op: RecordOp::Upsert,
             instance_id: inst_id.to_string(),
             title: title.to_string(),
             created_position: 0,
             forked_from: None,
+            forked_from_entry: None,
         };
         let pos = self
             .store_mut()
@@ -1000,22 +1992,172 @@ impl Workbench {
         };
         self.library.apply_chat(rec);
         self.notify_library_changed("chat", &chat_id, "upsert");
-        self.register_engagement(chat_id.clone(), inst_id.to_string(), eng);
-        Ok(serde_json::json!({ "id": chat_id, "title": title, "kind": kind }))
+        let mut standing_target = target.clone();
+        standing_target.current_basis = Some(basis.clone());
+        self.write_work_target_record(standing_target);
+        self.write_chat_target_record(ChatTargetBindingRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            chat_id: chat_id.clone(),
+            op: RecordOp::Upsert,
+            target_id: target_id.clone(),
+            basis: basis.clone(),
+            path_scope: target.path_scope,
+            capabilities: target.capabilities,
+        });
+        self.register_engagement(chat_id.clone(), target_id.clone(), eng);
+        self.refresh_chat_discipline_mount(&chat_id)?;
+        self.record_target_act(
+            Some(&chat_id),
+            &target_id,
+            crate::target_adapter::TargetActKind::Read,
+            None,
+            Vec::new(),
+            None,
+            crate::target_adapter::TargetActStatus::Completed,
+            None,
+        )?;
+        Ok(serde_json::json!({
+            "id": chat_id,
+            "title": title,
+            "kind": kind,
+            "target_id": target_id,
+            "basis": basis,
+        }))
     }
 
     pub(crate) fn agent_record(&self, id: &str) -> Option<AgentRecord> {
         self.library.agents.get(id).cloned()
     }
 
-    // `pub` for the hosted embed plane (`cloud/embed-host`): a public session's
-    // engagement seeds the served placement's archetype config.
-    pub fn agent_config_for_instance(&self, instance_id: &str) -> Option<String> {
-        self.library
-            .instances
-            .get(instance_id)
-            .and_then(|inst_rec| self.library.agents.get(&inst_rec.agent_id))
-            .map(|agent| agent.config.clone())
+    pub(crate) fn archetype_abilities(&self, id: &str) -> Result<Vec<String>, String> {
+        let target_id = self
+            .library
+            .authoring_target_for(id)
+            .map(|target| target.id.clone())
+            .ok_or_else(|| "no such archetype".to_owned())?;
+        let workspace = self
+            .targets
+            .get(&target_id)
+            .ok_or_else(|| "archetype authoring target is not open".to_owned())?;
+        let engagement_id = library::gen_id("abilities-read");
+        let engagement = workspace
+            .create_engagement(&engagement_id)
+            .map_err(|error| error.to_string())?;
+        let result = (|| {
+            let text = engagement
+                .read_file(&format!(
+                    "{}/{}",
+                    gaugewright_boundary::definition::DRAFT_ROOT,
+                    gaugewright_boundary::definition::MANIFEST_FILE
+                ))
+                .map_err(|error| error.to_string())?;
+            let manifest: serde_json::Value =
+                serde_json::from_str(&text).map_err(|error| error.to_string())?;
+            manifest
+                .get("agent_abilities")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "package manifest has no explicit agent_abilities".to_owned())?
+                .iter()
+                .map(|ability| {
+                    ability
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| "agent_abilities must contain strings".to_owned())
+                })
+                .collect()
+        })();
+        let _ = workspace.remove_engagement(&engagement_id);
+        result
+    }
+
+    pub(crate) fn set_archetype_abilities(
+        &mut self,
+        id: &str,
+        mut abilities: Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        abilities.sort();
+        abilities.dedup();
+        let admitted = [
+            Vec::<String>::new(),
+            vec!["workspace.read".to_owned()],
+            vec!["workspace.read".to_owned(), "workspace.write".to_owned()],
+            vec![
+                "command.run".to_owned(),
+                "workspace.read".to_owned(),
+                "workspace.write".to_owned(),
+            ],
+        ];
+        if !admitted.contains(&abilities) {
+            return Err("abilities must match one GaugeDesk ability preset".to_owned());
+        }
+        let target_id = self
+            .library
+            .authoring_target_for(id)
+            .map(|target| target.id.clone())
+            .ok_or_else(|| "no such archetype".to_owned())?;
+        let workspace = self
+            .targets
+            .get(&target_id)
+            .ok_or_else(|| "archetype authoring target is not open".to_owned())?;
+        let engagement_id = library::gen_id("abilities-write");
+        let engagement = workspace
+            .create_engagement(&engagement_id)
+            .map_err(|error| error.to_string())?;
+        let result = (|| {
+            let path = format!(
+                "{}/{}",
+                gaugewright_boundary::definition::DRAFT_ROOT,
+                gaugewright_boundary::definition::MANIFEST_FILE
+            );
+            let text = engagement
+                .read_file(&path)
+                .map_err(|error| error.to_string())?;
+            let mut manifest: serde_json::Value =
+                serde_json::from_str(&text).map_err(|error| error.to_string())?;
+            let capabilities = manifest
+                .get("capabilities")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "package manifest has no capability registry".to_owned())?;
+            for ability in &abilities {
+                if !capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some(ability))
+                {
+                    return Err(format!(
+                        "agent ability `{ability}` is absent from the package capability registry"
+                    ));
+                }
+            }
+            manifest["agent_abilities"] = serde_json::Value::Array(
+                abilities
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+            let body = format!(
+                "{}\n",
+                serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?
+            );
+            engagement
+                .write_file(&path, &body)
+                .map_err(|error| error.to_string())?;
+            engagement
+                .commit_turn("set archetype agent abilities")
+                .map_err(|error| error.to_string())?;
+            match engagement
+                .merge_into_main()
+                .map_err(|error| error.to_string())?
+            {
+                MergeOutcome::Clean => Ok(abilities.clone()),
+                MergeOutcome::Conflict => {
+                    Err("archetype changed while abilities were being saved".to_owned())
+                }
+            }
+        })();
+        let _ = workspace.remove_engagement(&engagement_id);
+        result
     }
 
     pub(crate) fn package_selection_for_chat(&self, chat_id: &str) -> Option<(u64, String)> {
@@ -1023,10 +2165,25 @@ impl Workbench {
         let instance = self.library.instances.get(&chat.instance_id)?;
         let agent = self.library.agents.get(&instance.agent_id)?;
         agent
-            .package_versions
+            .versions
             .get(&instance.version)
-            .cloned()
-            .map(|package_ref| (instance.version, package_ref))
+            .map(|version| (instance.version, version.package_ref.clone()))
+    }
+
+    pub(crate) fn package_root_for_chat(
+        &self,
+        chat_id: &str,
+        version: u64,
+    ) -> Option<std::path::PathBuf> {
+        let chat = self.library.chats.get(chat_id)?;
+        let instance = self.library.instances.get(&chat.instance_id)?;
+        let agent = self.library.agents.get(&instance.agent_id)?;
+        let target = self.library.authoring_target_for(&agent.id)?;
+        Some(published_package_root(
+            &self.targets_dir(),
+            &target.id,
+            version,
+        ))
     }
 
     pub(crate) fn update_agent_record(
@@ -1097,21 +2254,31 @@ impl Workbench {
         let Some(source) = self.library.agents.get(&source_id).cloned() else {
             return Err(PullArchetypeError::SourceMissing);
         };
+        let source_target = self
+            .library
+            .authoring_target_for(&source.id)
+            .map(|target| target.id.clone())
+            .ok_or(PullArchetypeError::SourceNotOpen)?;
         let Some(src) = self
-            .instances
-            .get(&source.instance_id)
+            .targets
+            .get(&source_target)
             .map(|instance| instance.peer_source())
         else {
             return Err(PullArchetypeError::SourceNotOpen);
         };
-        let Some(fork_inst) = self.instances.get(&fork.instance_id) else {
+        let fork_target = self
+            .library
+            .authoring_target_for(&fork.id)
+            .map(|target| target.id.clone())
+            .ok_or(PullArchetypeError::ForkNotOpen)?;
+        let Some(fork_inst) = self.targets.get(&fork_target) else {
             return Err(PullArchetypeError::ForkNotOpen);
         };
         let outcome = fork_inst
             .pull_from(&src)
             .map_err(PullArchetypeError::Workspace)?;
         if matches!(outcome, MergeOutcome::Clean) {
-            self.notify_library_changed("agent", id, "upsert");
+            self.notify_library_changed("archetype", id, "upsert");
         }
         Ok(outcome)
     }
@@ -1208,6 +2375,33 @@ impl Workbench {
         for instance_id in instance_ids {
             self.destroy_instance(&instance_id);
         }
+        let target_ids = self
+            .library
+            .targets_for_project(id)
+            .into_iter()
+            .map(|target| target.id.clone())
+            .collect::<Vec<_>>();
+        for target_id in target_ids {
+            let chats = self
+                .library
+                .chat_targets
+                .values()
+                .filter(|binding| binding.target_id == target_id)
+                .map(|binding| binding.chat_id.clone())
+                .collect::<Vec<_>>();
+            for chat_id in chats {
+                self.destroy_chat(&chat_id);
+            }
+            self.targets.remove(&target_id);
+            let _ = std::fs::remove_dir_all(self.targets_dir().join(&target_id));
+            if let Some(target) = self.library.work_targets.get(&target_id).cloned() {
+                crate::target_adapter::remove_locator(&self.targets_dir(), &target.locator_handle);
+                self.write_work_target_record(WorkTargetRecord {
+                    op: RecordOp::Tombstone,
+                    ..target
+                });
+            }
+        }
         self.write_project_record(ProjectRecord {
             op: RecordOp::Tombstone,
             ..project
@@ -1221,23 +2415,38 @@ impl Workbench {
     ) -> Result<CreatedArchetype, CreateArchetypeError> {
         let agent_id = library::gen_id("agent");
         let inst_id = library::gen_id("inst");
-        let dir = self.instances_dir().join(&inst_id);
-        let provider = self.workspace_provider(&inst_id);
-        let instance = provider
+        let target_id = authoring_target_id(&agent_id);
+        let dir = self.targets_dir().join(&target_id);
+        let provider = self.workspace_provider(&target_id);
+        let workspace = provider
             .init_at(&dir)
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
-        let files = crate::app_support::default_agent_definition().seed_files();
+        let files = default_archetype_files();
         let files = files
             .iter()
             .map(|(path, content)| (path.as_str(), content.as_str()))
             .collect::<Vec<_>>();
-        instance
+        workspace
             .seed_main(&files)
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
-        let package_ref = published_package_ref(&self.instances_dir(), &inst_id, 1)
+        let basis_probe = library::gen_id("target-basis");
+        let probe = workspace
+            .create_engagement(&basis_probe)
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
-        self.instances.insert(inst_id.clone(), instance);
+        let basis = probe
+            .boundary_cut()
+            .map_err(|error| CreateArchetypeError::Create(error.to_string()))?
+            .0;
+        drop(probe);
+        workspace
+            .remove_engagement(&basis_probe)
+            .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
+        let version = published_archetype_version(&self.targets_dir(), &target_id, 1)
+            .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
+        self.targets.insert(target_id.clone(), workspace);
         self.write_instance_record(InstanceRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: inst_id.clone(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Authoring,
@@ -1248,16 +2457,28 @@ impl Workbench {
         });
         activate_instance(self.store_mut(), &inst_id);
         self.write_agent_record(AgentRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: agent_id.clone(),
             op: RecordOp::Upsert,
             name: name.clone(),
-            instance_id: inst_id,
+            instance_id: inst_id.clone(),
             config: "{}".into(),
             current_version: 1,
-            package_versions: [(1, package_ref)].into_iter().collect(),
+            versions: [(1, version)].into_iter().collect(),
             auto_upgrade: false,
             forked_from: None,
         });
+        let home_id = self.home_id().clone();
+        self.write_work_target_record(managed_target_record(
+            target_id,
+            format!("{name} authoring"),
+            WorkTargetOwner::Archetype {
+                archetype_id: agent_id.clone(),
+            },
+            &home_id,
+            basis,
+        ));
         let _ = self.place_archetype_on_project(
             DEFAULT_PROJECT,
             &agent_id,
@@ -1274,22 +2495,42 @@ impl Workbench {
         let Some(src) = self.library.agents.get(id).cloned() else {
             return Err(ForkArchetypeError::NotFound);
         };
+        let source_target_id = self
+            .library
+            .authoring_target_for(&src.id)
+            .map(|target| target.id.clone())
+            .ok_or(ForkArchetypeError::SourceNotOpen)?;
         let Some(src_source) = self
-            .instances
-            .get(&src.instance_id)
+            .targets
+            .get(&source_target_id)
             .map(|instance| instance.peer_source())
         else {
             return Err(ForkArchetypeError::SourceNotOpen);
         };
         let new_agent = library::gen_id("agent");
         let new_inst = library::gen_id("inst");
-        let dir = self.instances_dir().join(&new_inst);
-        let inst = self
-            .workspace_provider(&new_inst)
+        let new_target = authoring_target_id(&new_agent);
+        let dir = self.targets_dir().join(&new_target);
+        let workspace = self
+            .workspace_provider(&new_target)
             .fork_from_at(&dir, &src_source)
             .map_err(|error| ForkArchetypeError::Create(error.to_string()))?;
-        self.instances.insert(new_inst.clone(), inst);
+        let basis_probe = library::gen_id("target-basis");
+        let probe = workspace
+            .create_engagement(&basis_probe)
+            .map_err(|error| ForkArchetypeError::Create(error.to_string()))?;
+        let basis = probe
+            .boundary_cut()
+            .map_err(|error| ForkArchetypeError::Create(error.to_string()))?
+            .0;
+        drop(probe);
+        workspace
+            .remove_engagement(&basis_probe)
+            .map_err(|error| ForkArchetypeError::Create(error.to_string()))?;
+        self.targets.insert(new_target.clone(), workspace);
         self.write_instance_record(InstanceRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: new_inst.clone(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Authoring,
@@ -1301,16 +2542,28 @@ impl Workbench {
         activate_instance(self.store_mut(), &new_inst);
         let name = name.unwrap_or_else(|| format!("{} (fork)", src.name));
         self.write_agent_record(AgentRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: new_agent.clone(),
             op: RecordOp::Upsert,
             name: name.clone(),
-            instance_id: new_inst,
+            instance_id: new_inst.clone(),
             config: src.config.clone(),
             current_version: src.current_version,
-            package_versions: src.package_versions.clone(),
+            versions: src.versions.clone(),
             auto_upgrade: false,
             forked_from: Some(src.id.clone()),
         });
+        let home_id = self.home_id().clone();
+        self.write_work_target_record(managed_target_record(
+            new_target,
+            format!("{name} authoring"),
+            WorkTargetOwner::Archetype {
+                archetype_id: new_agent.clone(),
+            },
+            &home_id,
+            basis,
+        ));
         let _ = self.place_archetype_on_project(
             DEFAULT_PROJECT,
             &new_agent,
@@ -1340,19 +2593,22 @@ impl Workbench {
         admission: Admission,
     ) -> Result<String, String> {
         let inst_id = inst_id.to_string();
-        let dir = self.instances_dir().join(&inst_id);
-        let provider = self.workspace_provider(&inst_id);
-        let source = self
+        if !self.library.projects.contains_key(project_id) {
+            return Err("no such project".to_owned());
+        }
+        if !self.library.agents.contains_key(agent_id) {
+            return Err("no such archetype".to_owned());
+        }
+        let target_ids = self
             .library
-            .agents
-            .get(agent_id)
-            .and_then(|agent| self.instances.get(&agent.instance_id))
-            .map(|instance| instance.peer_source())
-            .ok_or_else(|| "archetype package source is not open".to_owned())?;
-        let instance = provider
-            .fork_from_at(&dir, &source)
-            .map_err(|error| error.to_string())?;
-        self.instances.insert(inst_id.clone(), instance);
+            .targets_for_project(project_id)
+            .into_iter()
+            .filter(|target| target.status == WorkTargetStatus::Available)
+            .map(|target| target.id.clone())
+            .collect::<Vec<_>>();
+        if target_ids.is_empty() {
+            return Err("project has no work target".to_owned());
+        }
         let version = self
             .library
             .agents
@@ -1360,6 +2616,8 @@ impl Workbench {
             .map(|agent| agent.current_version)
             .unwrap_or(1);
         self.write_instance_record(InstanceRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: inst_id.clone(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Using,
@@ -1367,6 +2625,13 @@ impl Workbench {
             project_id: Some(project_id.to_string()),
             version,
             admission,
+        });
+        self.write_placement_targets_record(PlacementTargetsRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            placement_id: inst_id.clone(),
+            op: RecordOp::Upsert,
+            target_ids,
         });
         let _ = self
             .store_mut()
@@ -1421,13 +2686,13 @@ impl Workbench {
 
     fn freeze_archetype_draft(
         &mut self,
-        instance_id: &str,
+        target_id: &str,
         version: u64,
-    ) -> Result<String, PublishArchetypeError> {
+    ) -> Result<ArchetypeVersionRecord, PublishArchetypeError> {
         let snapshot_chat = library::gen_id("package-freeze");
         let instance = self
-            .instances
-            .get(instance_id)
+            .targets
+            .get(target_id)
             .ok_or(PublishArchetypeError::NotFound)?;
         let engagement = instance
             .create_engagement(&snapshot_chat)
@@ -1461,15 +2726,36 @@ impl Workbench {
                 engagement.path().join(&target),
             )
             .map_err(PublishArchetypeError::InvalidPackage)?;
-            let package_ref = package.version_ref().to_owned();
+            let discipline = crate::discipline::load(
+                &engagement
+                    .path()
+                    .join(crate::discipline::DISCIPLINE_DRAFT_ROOT),
+                package.capabilities().iter().cloned(),
+            )
+            .map_err(PublishArchetypeError::InvalidPackage)?;
+            let discipline_target = crate::discipline::discipline_version_root(version);
+            for (path, body) in &discipline.files {
+                engagement
+                    .write_file(&format!("{discipline_target}/{path}"), body)
+                    .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
+            }
+            let frozen_discipline = crate::discipline::load(
+                &engagement.path().join(&discipline_target),
+                package.capabilities().iter().cloned(),
+            )
+            .map_err(PublishArchetypeError::InvalidPackage)?;
+            let version_record = ArchetypeVersionRecord {
+                package_ref: package.version_ref().to_owned(),
+                discipline_ref: frozen_discipline.reference,
+            };
             engagement
-                .commit_turn(&format!("freeze archetype package version {version}"))
+                .commit_turn(&format!("freeze archetype version {version}"))
                 .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
             match engagement
                 .merge_into_main()
                 .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?
             {
-                MergeOutcome::Clean => Ok(package_ref),
+                MergeOutcome::Clean => Ok(version_record),
                 MergeOutcome::Conflict => Err(PublishArchetypeError::Workspace(
                     "archetype draft changed while it was being published".to_owned(),
                 )),
@@ -1491,13 +2777,18 @@ impl Workbench {
             .cloned()
             .ok_or(PublishArchetypeError::NotFound)?;
         let new_version = agent.current_version + 1;
-        let package_ref = self.freeze_archetype_draft(&agent.instance_id, new_version)?;
+        let target_id = self
+            .library
+            .authoring_target_for(id)
+            .map(|target| target.id.clone())
+            .ok_or(PublishArchetypeError::NotFound)?;
+        let version_record = self.freeze_archetype_draft(&target_id, new_version)?;
         if let Some(auto_upgrade) = auto_upgrade {
             agent.auto_upgrade = auto_upgrade;
         }
         agent.op = RecordOp::Upsert;
         agent.current_version = new_version;
-        agent.package_versions.insert(new_version, package_ref);
+        agent.versions.insert(new_version, version_record);
         let owner_auto = agent.auto_upgrade;
         self.write_agent_record(agent);
         let org_allows = crate::org::Org::rebuild(self.store_ref())
@@ -1535,8 +2826,8 @@ impl Workbench {
         let Some(agent) = self.library.agents.get(&placement.agent_id).cloned() else {
             return Err(UpgradePlacementError::ArchetypeNotFound);
         };
-        let expected_ref = agent
-            .package_versions
+        let expected_version = agent
+            .versions
             .get(&agent.current_version)
             .cloned()
             .ok_or_else(|| {
@@ -1545,39 +2836,92 @@ impl Workbench {
                     agent.current_version
                 ))
             })?;
-        let source = self
-            .instances
-            .get(&agent.instance_id)
-            .map(|instance| instance.peer_source())
+        let authoring_target = self
+            .library
+            .authoring_target_for(&agent.id)
             .ok_or(UpgradePlacementError::ArchetypeNotFound)?;
-        let target = self
-            .instances
-            .get(id)
-            .ok_or(UpgradePlacementError::PlacementNotFound)?;
-        match target
-            .pull_from(&source)
-            .map_err(|error| UpgradePlacementError::Workspace(error.to_string()))?
-        {
-            MergeOutcome::Clean => {}
-            MergeOutcome::Conflict => return Err(UpgradePlacementError::Conflict),
-        }
-        let probe_id = library::gen_id("package-probe");
-        let probe = target
-            .create_engagement(&probe_id)
-            .map_err(|error| UpgradePlacementError::Workspace(error.to_string()))?;
-        let root = probe
-            .path()
-            .join(gaugewright_boundary::definition::version_root(
+        let resolved =
+            gaugewright_whip_runtime::AuthoredAgentPackage::load(published_package_root(
+                &self.targets_dir(),
+                &authoring_target.id,
                 agent.current_version,
-            ));
-        let resolved = gaugewright_whip_runtime::AuthoredAgentPackage::load(root)
-            .map_err(UpgradePlacementError::PackageUnavailable);
-        let _ = target.remove_engagement(&probe_id);
-        let resolved = resolved?;
-        if resolved.version_ref() != expected_ref {
+            ))
+            .map_err(UpgradePlacementError::PackageUnavailable)?;
+        if resolved.version_ref() != expected_version.package_ref {
             return Err(UpgradePlacementError::PackageUnavailable(
                 "placement package bytes do not match the published reference".to_owned(),
             ));
+        }
+        let discipline = crate::discipline::load(
+            &published_discipline_root(
+                &self.targets_dir(),
+                &authoring_target.id,
+                agent.current_version,
+            ),
+            resolved.capabilities().iter().cloned(),
+        )
+        .map_err(UpgradePlacementError::PackageUnavailable)?;
+        if discipline.reference != expected_version.discipline_ref {
+            return Err(UpgradePlacementError::PackageUnavailable(
+                "placement discipline bytes do not match the published reference".to_owned(),
+            ));
+        }
+        // An upgrade selects a new immutable discipline but never rewrites a
+        // target. Changed scaffold/managed declarations become ordinary
+        // target proposals with the target's exact standing basis.
+        let old_assets =
+            published_discipline_root(&self.targets_dir(), &authoring_target.id, placement.version);
+        let old_files = crate::discipline::load(
+            &old_assets,
+            gaugewright_whip_runtime::AuthoredAgentPackage::load(published_package_root(
+                &self.targets_dir(),
+                &authoring_target.id,
+                placement.version,
+            ))
+            .map_err(UpgradePlacementError::PackageUnavailable)?
+            .capabilities()
+            .iter()
+            .cloned(),
+        )
+        .map(|bundle| bundle.files.into_iter().collect::<BTreeMap<_, _>>())
+        .unwrap_or_default();
+        let new_files = discipline.files.iter().cloned().collect::<BTreeMap<_, _>>();
+        let proposed_changes = discipline
+            .manifest
+            .assets
+            .iter()
+            .filter(|asset| {
+                matches!(
+                    asset.treatment,
+                    crate::discipline::DisciplineTreatment::Scaffold
+                        | crate::discipline::DisciplineTreatment::Managed
+                ) && old_files.get(&asset.path) != new_files.get(&asset.path)
+            })
+            .map(|asset| format!("{:?}:{}", asset.treatment, asset.path))
+            .collect::<Vec<_>>();
+        if !proposed_changes.is_empty() {
+            let target_ids = self
+                .library
+                .placement_targets
+                .get(id)
+                .map(|record| record.target_ids.clone())
+                .unwrap_or_default();
+            for target_id in target_ids {
+                self.record_target_act(
+                    None,
+                    &target_id,
+                    crate::target_adapter::TargetActKind::Propose,
+                    Some(expected_version.discipline_ref.clone()),
+                    proposed_changes.clone(),
+                    None,
+                    crate::target_adapter::TargetActStatus::Completed,
+                    Some(format!(
+                        "archetype upgrade {} -> {}",
+                        placement.version, agent.current_version
+                    )),
+                )
+                .map_err(UpgradePlacementError::PackageUnavailable)?;
+            }
         }
         placement.op = RecordOp::Upsert;
         placement.version = agent.current_version;
@@ -1635,35 +2979,102 @@ impl Workbench {
     }
 
     pub(crate) fn fork_chat(&mut self, id: &str) -> Result<ForkedChat, ForkChatError> {
+        self.fork_chat_from(id, None)
+    }
+
+    pub(crate) fn fork_chat_at(
+        &mut self,
+        id: &str,
+        entry_id: i64,
+    ) -> Result<ForkedChat, ForkChatError> {
+        let point = self.resolve_fork_point(id, entry_id)?;
+        self.fork_chat_from(id, Some(point))
+    }
+
+    fn resolve_fork_point(
+        &self,
+        id: &str,
+        entry_id: i64,
+    ) -> Result<ResolvedForkPoint, ForkChatError> {
+        let boundaries = self
+            .store
+            .records(id, crate::engine::TURN_BOUNDARY_KIND)
+            .map_err(|error| ForkChatError::Continuity(format!("{error:?}")))?;
+        for payload in boundaries {
+            let boundary: crate::engine::TurnBoundaryRecord = serde_json::from_str(&payload)
+                .map_err(|error| ForkChatError::Continuity(error.to_string()))?;
+            if boundary.user_entry_id == entry_id {
+                return Ok(ResolvedForkPoint {
+                    entry_id,
+                    workspace_cut: boundary.before_workspace_cut,
+                    runtime_position: boundary.runtime_before,
+                    reads: boundary.reads_before,
+                });
+            }
+            if boundary.assistant_entry_id == entry_id {
+                return Ok(ResolvedForkPoint {
+                    entry_id,
+                    workspace_cut: boundary.after_workspace_cut,
+                    runtime_position: boundary.runtime_after,
+                    reads: boundary.reads_after,
+                });
+            }
+        }
+        Err(ForkChatError::PointNotForkable)
+    }
+
+    fn fork_chat_from(
+        &mut self,
+        id: &str,
+        point: Option<ResolvedForkPoint>,
+    ) -> Result<ForkedChat, ForkChatError> {
         let Some(src_chat) = self.library.chats.get(id).cloned() else {
             return Err(ForkChatError::NotFound);
         };
+        let source_binding = self
+            .library
+            .chat_targets
+            .get(id)
+            .cloned()
+            .ok_or(ForkChatError::SourceNotLive)?;
+        let source_target_record = self
+            .library
+            .work_targets
+            .get(&source_binding.target_id)
+            .cloned()
+            .ok_or(ForkChatError::SourceNotLive)?;
+        if source_target_record.kind != WorkTargetKind::Managed {
+            return Err(ForkChatError::InstanceNotOpen);
+        }
+        let storage_target_id = source_target_record.id;
+        let runtime_placement_id = self.library_placement_of_chat(id);
         let inst_id = src_chat.instance_id.clone();
-        let (src_path, files): (std::path::PathBuf, Vec<(String, String)>) = {
+        let (src_path, source_branch, source_target, current_cut) = {
             let Some(src_eng) = self.engagements.get(id) else {
                 return Err(ForkChatError::SourceNotLive);
             };
-            let files = src_eng
-                .tree()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|file| !file.is_dir)
-                .filter_map(|file| src_eng.read_file(&file.path).ok().map(|c| (file.path, c)))
-                .collect();
-            (src_eng.path().to_path_buf(), files)
+            let current_cut = src_eng
+                .boundary_cut()
+                .map_err(|error| ForkChatError::Create(error.to_string()))?;
+            (
+                src_eng.path().to_path_buf(),
+                src_eng.branch().to_owned(),
+                src_eng.target().to_owned(),
+                current_cut.0,
+            )
         };
+        let workspace_cut = point
+            .as_ref()
+            .map(|point| point.workspace_cut.as_str())
+            .unwrap_or(current_cut.as_str());
         let new_id = library::gen_id("chat");
         let (new_eng, new_path, mode) = {
-            let Some(inst) = self.instances.get(&inst_id) else {
+            let Some(inst) = self.targets.get(&storage_target_id) else {
                 return Err(ForkChatError::InstanceNotOpen);
             };
             let eng = inst
-                .create_engagement(&new_id)
+                .fork_engagement_at(&new_id, &source_branch, &source_target, workspace_cut)
                 .map_err(|error| ForkChatError::Create(error.to_string()))?;
-            for (path, content) in &files {
-                let _ = eng.write_file(path, content);
-            }
-            let _ = eng.commit_turn(&format!("forked from {id}"));
             let path = eng.path().to_path_buf();
             let mode = self
                 .library
@@ -1684,25 +3095,31 @@ impl Workbench {
                 .agents
                 .get(&instance.agent_id)
                 .and_then(|agent| {
-                    agent
-                        .package_versions
-                        .get(&instance.version)
-                        .cloned()
-                        .map(|package_ref| (instance.version, package_ref))
+                    let target = self.library.authoring_target_for(&agent.id)?;
+                    agent.versions.get(&instance.version).map(|version| {
+                        (
+                            instance.version,
+                            version.package_ref.clone(),
+                            published_package_root(
+                                &self.targets_dir(),
+                                &target.id,
+                                instance.version,
+                            ),
+                        )
+                    })
                 })
         });
-        let source_package_root = package_selection.as_ref().map(|(version, _)| {
-            src_path.join(gaugewright_boundary::definition::version_root(*version))
-        });
-        let target_package_root = package_selection.as_ref().map(|(version, _)| {
-            new_path.join(gaugewright_boundary::definition::version_root(*version))
-        });
-        let package_version_ref = package_selection.map(|(_, package_ref)| package_ref);
+        let source_package_root = package_selection
+            .as_ref()
+            .map(|(_, _, package_root)| package_root.clone());
+        let target_package_root = source_package_root.clone();
+        let package_version_ref = package_selection.map(|(_, package_ref, _)| package_ref);
         let source_policy = self
             .latest_whipple_policy(id)
             .map_err(ForkChatError::Continuity)?;
         let source_continuity = gaugewright_harness::HarnessContinuitySpec {
             chat_id: id.to_owned(),
+            runtime_placement_id: runtime_placement_id.clone(),
             worktree: src_path,
             mode,
             package_root: source_package_root,
@@ -1710,9 +3127,11 @@ impl Workbench {
             system_prompt: prompt_override.clone(),
             policy_epoch: source_policy.as_ref().map(|(epoch, _)| *epoch),
             signed_policy_envelope: source_policy.as_ref().map(|(_, envelope)| envelope.clone()),
+            source_position: point.as_ref().map(|point| point.runtime_position.clone()),
         };
         let target_continuity = gaugewright_harness::HarnessContinuitySpec {
             chat_id: new_id.clone(),
+            runtime_placement_id,
             worktree: new_path,
             mode,
             package_root: target_package_root,
@@ -1720,26 +3139,60 @@ impl Workbench {
             system_prompt: prompt_override,
             policy_epoch: source_policy.as_ref().map(|(epoch, _)| *epoch),
             signed_policy_envelope: source_policy.map(|(_, envelope)| envelope),
+            source_position: None,
         };
         let continuity = self
             .whip_harness_factory()
             .and_then(|factory| factory.clone_continuity(&source_continuity, &target_continuity));
         if let Err(error) = continuity {
             drop(new_eng);
-            if let Some(inst) = self.instances.get(&inst_id) {
+            if let Some(inst) = self.targets.get(&storage_target_id) {
                 let _ = inst.remove_engagement(&new_id);
             }
             return Err(ForkChatError::Continuity(error.to_string()));
         }
-        self.register_engagement(new_id.clone(), inst_id.clone(), new_eng);
+        let source_events = self
+            .store
+            .events(id)
+            .map_err(|error| ForkChatError::Continuity(format!("{error:?}")))?;
+        let through = point
+            .as_ref()
+            .map(|point| point.entry_id)
+            .unwrap_or(i64::MAX);
+        for (_, kind, payload) in source_events
+            .iter()
+            .filter(|(position, kind, _)| *position <= through && kind == "resource")
+        {
+            self.store
+                .append_record(&new_id, kind, payload)
+                .map_err(|error| ForkChatError::Continuity(format!("{error:?}")))?;
+        }
+        let reads = match &point {
+            Some(point) => point.reads.clone(),
+            None => crate::resource_store::engagement_reads(&self.store, id)
+                .map_err(|error| ForkChatError::Continuity(format!("{error:?}")))?
+                .items()
+                .iter()
+                .cloned()
+                .collect(),
+        };
+        for read in reads {
+            self.store
+                .append_record(&new_id, "read", &read)
+                .map_err(|error| ForkChatError::Continuity(format!("{error:?}")))?;
+        }
+        self.register_engagement(new_id.clone(), storage_target_id, new_eng);
         let title = format!("{} (fork)", src_chat.title);
         let rec = ChatRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: new_id.clone(),
             op: RecordOp::Upsert,
             instance_id: inst_id,
             title: title.clone(),
             created_position: 0,
             forked_from: Some(id.to_string()),
+            forked_from_entry: point.as_ref().map(|point| point.entry_id),
         };
         let pos = self
             .store
@@ -1749,11 +3202,24 @@ impl Workbench {
             created_position: pos,
             ..rec
         });
+        self.write_chat_target_record(ChatTargetBindingRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            chat_id: new_id.clone(),
+            op: RecordOp::Upsert,
+            target_id: source_binding.target_id,
+            basis: workspace_cut.to_owned(),
+            path_scope: source_binding.path_scope,
+            capabilities: source_binding.capabilities,
+        });
+        self.refresh_chat_discipline_mount(&new_id)
+            .map_err(ForkChatError::Create)?;
         self.notify_library_changed("chat", &new_id, "upsert");
         Ok(ForkedChat {
             id: new_id,
             title,
             forked_from: id.to_string(),
+            forked_from_entry: point.map(|point| point.entry_id),
         })
     }
 
@@ -1769,7 +3235,7 @@ impl Workbench {
         // SECAUD-6: erase the workspace payload too — `destroy_chat` removed
         // the engagement branch, so its unique objects are now unreachable; prune them so the
         // deleted chat's workspace content is unrecoverable, matching the store crypto-erasure.
-        if let Some(inst) = inst_id.and_then(|iid| self.instances.get(&iid)) {
+        if let Some(inst) = inst_id.and_then(|iid| self.targets.get(&iid)) {
             let _ = inst.purge_unreachable_objects();
         }
         true
@@ -1794,17 +3260,26 @@ impl Workbench {
         if !self.engagement_index.contains_key(chat_id) {
             return (false, false);
         }
-        let phase = self
+        let merge = self
             .store_ref()
             .fold::<MergeState>(chat_id)
-            .map(|merge| merge.phase)
-            .unwrap_or(gaugewright_core::merge::MergePhase::Idle);
+            .unwrap_or_default();
         (
-            phase == gaugewright_core::merge::MergePhase::Clean
+            merge.phase == gaugewright_core::merge::MergePhase::Clean
+                && merge.review_requested
                 && rules.attention(Signal::Changes) != Attention::Mute,
-            phase == gaugewright_core::merge::MergePhase::Repairing
+            ((merge.phase == gaugewright_core::merge::MergePhase::Rejected
+                && merge.workspace_outcome == gaugewright_core::merge::WorkspaceOutcome::Conflict)
+                || merge.phase == gaugewright_core::merge::MergePhase::Repairing)
                 && rules.attention(Signal::Conflict) != Attention::Mute,
         )
+    }
+
+    /// Whether moving this chat would discard or transplant workspace state. This is
+    /// derived from the provider's actual chat→target diff rather than a UI lifecycle
+    /// hint, so manual file edits and interrupted turns fail closed too.
+    fn library_chat_rehome_blocked(&self, chat_id: &str) -> bool {
+        self.engagement_rehome_blocked(chat_id)
     }
 
     fn library_chat_json(
@@ -1820,15 +3295,76 @@ impl Workbench {
             .map(|instance| instance.kind.chat_kind())
             .unwrap_or("work");
         let (changes, conflict) = self.library_chat_status(&chat.id, rules);
+        let rehome_blocked = self.library_chat_rehome_blocked(&chat.id);
+        let binding = self
+            .library
+            .chat_targets
+            .get(&chat.id)
+            .expect("validated chat has a target binding");
+        let target = self
+            .library
+            .work_targets
+            .get(&binding.target_id)
+            .expect("validated chat binding names a target");
+        let workspace_root = format!(
+            "{}::{}::{}",
+            chat.instance_id, binding.target_id, target.adapter_family
+        );
+        let candidate_revision = self
+            .engagements
+            .get(&chat.id)
+            .and_then(|engagement| engagement.current_cut().ok())
+            .flatten()
+            .unwrap_or_else(|| binding.basis.clone());
+        let available_acts = self.available_target_acts(&chat.id);
         serde_json::json!({
             "id": chat.id,
             "title": chat.title,
             "kind": kind,
             "forked_from": chat.forked_from,
             "placement": chat.instance_id,
+            "workspace_root": workspace_root,
+            "target_id": binding.target_id,
+            "target_basis": binding.basis,
+            "target_kind": target.kind,
+            "target_adapter": target.adapter,
+            "target_path_scope": binding.path_scope,
+            "target_capabilities": binding.capabilities,
+            "candidate_revision": candidate_revision,
+            "available_acts": available_acts,
             "workstream": chat_ws.get(&chat.id),
             "changes": changes,
             "conflict": conflict,
+            "rehome_blocked": rehome_blocked,
+        })
+    }
+
+    pub(crate) fn work_target_json(target: &WorkTargetRecord) -> serde_json::Value {
+        let (owner_kind, owner_id) = match &target.owner {
+            WorkTargetOwner::Project { project_id } => ("project", project_id.as_str()),
+            WorkTargetOwner::Archetype { archetype_id } => ("archetype", archetype_id.as_str()),
+        };
+        let concurrency = match target.kind {
+            WorkTargetKind::Managed => "serialized",
+            WorkTargetKind::ExternalVcs => "native-vcs",
+            WorkTargetKind::ExternalFolder => "compare-before-write-weak",
+        };
+        serde_json::json!({
+            "id": target.id,
+            "name": target.name,
+            "owner_kind": owner_kind,
+            "owner_id": owner_id,
+            "authority": target.authority,
+            "parties": target.parties,
+            "kind": target.kind,
+            "adapter": target.adapter,
+            "adapter_family": target.adapter_family,
+            "vcs_posture": target.vcs_posture,
+            "current_basis": target.current_basis,
+            "path_scope": target.path_scope,
+            "capabilities": target.capabilities,
+            "status": target.status,
+            "concurrency": concurrency,
         })
     }
 
@@ -1845,6 +3381,9 @@ impl Workbench {
         let mut chat_ws: std::collections::BTreeMap<String, String> = Default::default();
         for workstream in lib.workstreams.values() {
             if let Ok(state) = self.store_ref().fold::<WorkstreamState>(&workstream.id) {
+                if state.phase != WorkstreamPhase::Active {
+                    continue;
+                }
                 for member in state.members {
                     chat_ws.insert(member, workstream.id.clone());
                 }
@@ -1859,6 +3398,7 @@ impl Workbench {
                     "id": agent.id,
                     "name": agent.name,
                     "instance_id": agent.instance_id,
+                    "authoring_target_id": lib.authoring_target_for(&agent.id).expect("validated archetype has an authoring target").id,
                     "is_default": agent.id == DEFAULT_AGENT,
                     "forked_from": agent.forked_from,
                     "forked_from_name": agent.forked_from.as_ref().and_then(|src| lib.agents.get(src).map(|source| source.name.clone())),
@@ -1868,10 +3408,10 @@ impl Workbench {
             })
             .collect();
 
-        let projects: Vec<_> = lib
+        let mut projects: Vec<_> = lib
             .projects
             .values()
-            .filter(|project| !project.is_default)
+            .filter(|project| project.home_id == self.home_id)
             .map(|project| {
                 let placements: Vec<_> = lib
                     .using_instances_of(&project.id)
@@ -1919,6 +3459,7 @@ impl Workbench {
                             // APPROVE-1 (ADR 0064): a pending placement is approved-but-not-yet-accepted
                             // under an approval-required policy — the nav flags it so the owner can accept.
                             "pending": instance.admission == Admission::Pending,
+                            "target_ids": lib.placement_targets.get(&instance.id).expect("validated placement has target eligibility").target_ids,
                             "chats": lib.chats_in(&instance.id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules)).collect::<Vec<_>>(),
                             "workstreams": lib.workstreams_in(&instance.id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
                         })
@@ -1927,13 +3468,26 @@ impl Workbench {
                 serde_json::json!({
                     "id": project.id,
                     "name": project.name,
+                    "is_personal": project.is_default,
+                    "home_id": project.home_id.as_str(),
                     "network_isolated": project.network_isolated,
+                    "targets": lib.targets_for_project(&project.id).into_iter().map(Self::work_target_json).collect::<Vec<_>>(),
                     "placements": placements,
                 })
             })
             .collect();
+        projects.sort_by_key(|project| {
+            !project
+                .get("is_personal")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        });
 
         let mut recent: Vec<&ChatRecord> = lib.chats.values().collect();
+        recent.retain(|chat| {
+            lib.project_of_chat(&chat.id)
+                .is_none_or(|project| self.owns_project(project))
+        });
         recent.sort_by_key(|chat| std::cmp::Reverse(chat.created_position));
         let recent: Vec<_> = recent
             .into_iter()
@@ -1947,6 +3501,24 @@ impl Workbench {
                     .map(|instance| instance.kind.chat_kind())
                     .unwrap_or("work");
                 let (changes, conflict) = self.library_chat_status(&chat.id, &rules);
+                let binding = lib
+                    .chat_targets
+                    .get(&chat.id)
+                    .expect("validated chat has a target binding");
+                let target = lib
+                    .work_targets
+                    .get(&binding.target_id)
+                    .expect("validated chat binding names a target");
+                let workspace_root = format!(
+                    "{}::{}::{}",
+                    chat.instance_id, binding.target_id, target.adapter_family
+                );
+                let candidate_revision = self
+                    .engagements
+                    .get(&chat.id)
+                    .and_then(|engagement| engagement.current_cut().ok())
+                    .flatten()
+                    .unwrap_or_else(|| binding.basis.clone());
                 serde_json::json!({
                     "id": chat.id,
                     "title": chat.title,
@@ -1954,9 +3526,17 @@ impl Workbench {
                     "kind": kind,
                     "forked_from": chat.forked_from,
                     "placement": chat.instance_id,
+                    "workspace_root": workspace_root,
+                    "target_id": binding.target_id,
+                    "target_basis": binding.basis,
+                    "target_kind": target.kind,
+                    "target_adapter": target.adapter,
+                    "candidate_revision": candidate_revision,
+                    "available_acts": self.available_target_acts(&chat.id),
                     "workstream": chat_ws.get(&chat.id),
                     "changes": changes,
                     "conflict": conflict,
+                    "rehome_blocked": self.library_chat_rehome_blocked(&chat.id),
                 })
             })
             .collect();
@@ -1972,6 +3552,7 @@ impl Workbench {
             "projects": projects,
             "recent": recent,
             "workstreams": workstreams,
+            "work_targets": lib.work_targets.values().map(Self::work_target_json).collect::<Vec<_>>(),
             "personal_placement": DEFAULT_PLACEMENT,
         })
     }
@@ -2117,13 +3698,18 @@ impl Workbench {
     /// The unified task-bar projection (ADR 0075 §3/§5): onboarding checklist
     /// `issue` tasks from the account-global whip tracker, followed by the
     /// existing clean-merge `review` tasks. It owns no truth — it joins the whip
-    /// issue (content) with the acting authority (the v1 assignee). Every task
-    /// carries `kind` ∈ {`issue`, `review`} and an `assignee` authority.
+    /// issue (content) with its admitted assignment. Every tracker task carries
+    /// its boundary because an item id is only meaningful inside that tracker;
+    /// the client must send both back when it assigns the item.
     pub(crate) fn task_queue_value(&self) -> serde_json::Value {
-        // Solo v1: everything is assigned to the boundary owner (the acting
-        // authority). A future multi-user pass assigns per-authority and filters
-        // (ADR 0075 §4, deferred).
+        // The acting authority remains the default assignee for chat-derived
+        // tasks below. Tracker issues instead project their durable assignment;
+        // unassigned is a meaningful "whoever has access" state (GATE-3f).
         let assignee = self.authority.as_str();
+
+        // Chats with an unanswered agent question (ADR 0113). The question is a
+        // GaugeDesk record in the chat's own scope, so this is read per chat
+        // below rather than from one tracker query.
 
         // Onboarding issues first — the active first-run guidance. `list_items`
         // returns them in filing order (WS-1, WS-2, …), which is checklist order.
@@ -2140,7 +3726,8 @@ impl Workbench {
                             "title": item.title,
                             "agent": "",
                             "kind": "issue",
-                            "assignee": assignee,
+                            "assignee": item.assigned_to,
+                            "boundary": crate::workbench_state::ACCOUNT_GLOBAL_BOUNDARY,
                         }));
                     }
                 }
@@ -2148,6 +3735,59 @@ impl Workbench {
                     tracing::warn!(error = %err, "task queue: could not list onboarding items");
                 }
             }
+        }
+
+        // Inbound items waiting on a person (ADR 0110 §7, ADR 0117 §5). Project-
+        // scoped, which makes this the first task source that is not a chat's
+        // own signal — the count belongs to the project, and the chat it names
+        // is only where a reviewer goes to look.
+        //
+        // The count is the gate's parked questions, not every `Pending`
+        // quarantine row: an item still being screened awaits the *gate*, and
+        // showing it as work for a person would ask them to do something they
+        // cannot yet do. General across inbound sources by construction — it
+        // counts what the gate parked, never where the material came from.
+        for project in self.library.projects.values() {
+            if project.home_id != self.home_id {
+                continue;
+            }
+            let state_dir = crate::gate_service::gate_state_dir(&self.root_path(), &project.id);
+            let waiting = match gaugewright_whip_runtime::gate_runner::reviews_awaiting_a_person(
+                &state_dir,
+            ) {
+                Ok(waiting) => waiting,
+                Err(error) => {
+                    tracing::warn!(
+                        project = %project.id,
+                        error = %error,
+                        "task queue: could not read the project's parked reviews",
+                    );
+                    continue;
+                }
+            };
+            if waiting == 0 {
+                continue;
+            }
+            // The door needs somewhere to open. A project with no chat has
+            // nowhere to show the index, so the count waits rather than
+            // rendering a pill that goes nowhere.
+            let Some(chat) = self
+                .library
+                .project_chats(&project.id)
+                .first()
+                .map(|c| c.id.clone())
+            else {
+                continue;
+            };
+            tasks.push(serde_json::json!({
+                "id": chat,
+                "title": project.name,
+                "agent": "",
+                "kind": "screen",
+                "assignee": assignee,
+                "project": project.id,
+                "waiting": waiting,
+            }));
         }
 
         // Ask-typed chat tasks (ADR 0082 §2–3), current-first. Each chat raises
@@ -2173,33 +3813,57 @@ impl Workbench {
                 .map(|run| run.phase)
                 .ok();
             let merge = self.store.fold::<MergeState>(&chat.id).ok();
+            // ATTN-1: settle-time facts are appended by the engine while it
+            // owns the workspace/runtime context. This projection only folds
+            // the newest record. `run_phase` remains the compatibility source
+            // for pre-ATTN-1 stores and the lifecycle-owned merge signals.
+            let turn_summary = crate::turn_summary::latest(&self.store, &chat.id)
+                .ok()
+                .flatten();
             let raised = |signal: crate::attention::Signal| -> bool {
                 use crate::attention::Signal;
                 match signal {
+                    // ADR 0111: an agent's question is a tracker item, not a
+                    // parked run phase. The chat raises `question` while it has
+                    // an unanswered one.
                     Signal::Question => {
-                        run_phase == Some(gaugewright_core::run::RunPhase::AwaitingHuman)
+                        !crate::agent_question::open_questions(&self.store, &chat.id)
+                            .unwrap_or_default()
+                            .is_empty()
                     }
                     Signal::Conflict => matches!(&merge, Some(m)
                         if m.phase == gaugewright_core::merge::MergePhase::Rejected
                             && m.workspace_outcome
                                 == gaugewright_core::merge::WorkspaceOutcome::Conflict),
                     Signal::Changes => matches!(&merge, Some(m)
-                        if m.phase == gaugewright_core::merge::MergePhase::Clean),
-                    // "Settled and the human hasn't spoken since": the next user
-                    // message re-enters the run, clearing this by construction.
+                        if m.phase == gaugewright_core::merge::MergePhase::Clean
+                            && m.review_requested),
+                    // A newer attempt appends a newer summary, so reply clears
+                    // by construction when the human speaks/runs again.
                     Signal::TurnSettled => {
-                        run_phase == Some(gaugewright_core::run::RunPhase::Completed)
+                        turn_summary.as_ref().is_some_and(|summary| {
+                            matches!(
+                                summary.receipt_status,
+                                crate::turn_summary::ReceiptStatus::Completed
+                                    | crate::turn_summary::ReceiptStatus::Failed
+                            )
+                        }) || (turn_summary.is_none()
+                            && run_phase == Some(gaugewright_core::run::RunPhase::Completed))
                     }
                 }
             };
-            let ask = crate::attention::Signal::ALL
-                .into_iter()
-                .find_map(|signal| {
-                    (raised(signal)
-                        && rules.attention(signal) == crate::attention::Attention::Queue)
-                        .then(|| signal.ask())
-                });
-            let Some(ask) = ask else { continue };
+            let raised_signal = crate::attention::Signal::ALL.into_iter().find(|&signal| {
+                raised(signal) && rules.attention(signal) == crate::attention::Attention::Queue
+            });
+            let Some(raised_signal) = raised_signal else {
+                continue;
+            };
+            let ask = raised_signal.ask();
+            // ADR 0113 §3: the agent declared it cannot usefully proceed. This drives a
+            // stronger presentation and suppresses *automatic* continuation — it is
+            // never a lock on the person's own chat, who may always type.
+            let blocking = raised_signal == crate::attention::Signal::Question
+                && crate::agent_question::is_blocked(&self.store, &chat.id);
             let agent = self
                 .library
                 .instances
@@ -2215,6 +3879,7 @@ impl Workbench {
                     "agent": agent,
                     "kind": ask,
                     "assignee": assignee,
+                    "blocking": blocking,
                 }),
             ));
         }
@@ -2415,5 +4080,119 @@ impl Workbench {
         };
 
         Ok(Self::boundary_accept_value(&state, &participant, released))
+    }
+}
+
+#[cfg(test)]
+mod agent_config_merge_tests {
+    /// DR-0054 Phase A: a corrupt stored config is an error, never `{}` — the
+    /// old coercion let the emptied merge be read back and re-persisted,
+    /// permanently destroying a recoverable value.
+    #[test]
+    fn an_unparseable_config_side_is_an_error_not_empty() {
+        assert!(super::Workbench::merge_agent_config("{not json", "{}").is_err());
+        assert!(super::Workbench::merge_agent_config("{}", "{not json").is_err());
+        assert_eq!(
+            super::Workbench::merge_agent_config(r#"{"model":"a"}"#, r#"{"model":"b"}"#)
+                .expect("clean merge"),
+            r#"{"model":"b"}"#
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_reconcile_tests {
+    use super::*;
+    use crate::workbench_state::default_workspace_providers;
+
+    fn managed_library_with_target(target_id: &str) -> crate::library::Library {
+        let mut library = crate::library::Library::default();
+        library.apply_work_target(managed_target_record(
+            target_id.to_owned(),
+            "reconcile fixture".to_owned(),
+            WorkTargetOwner::Project {
+                project_id: "proj-fixture".to_owned(),
+            },
+            &gaugewright_core::ids::HomeId::new("home:fixture"),
+            String::new(),
+        ));
+        library
+    }
+
+    /// DR-0054 Phase A: a missing binding is not evidence of deletion — it can
+    /// be a failed append or a downgrade. The engagement branch must survive
+    /// startup reconciliation (skipped, not discarded).
+    #[test]
+    fn an_engagement_with_no_library_binding_survives_startup_reconciliation() {
+        let targets_dir = tempfile::tempdir().expect("targets dir");
+        let providers = default_workspace_providers();
+        let library = managed_library_with_target("target-x");
+
+        let workspace =
+            provider_for(&providers, "target-x").open_at(&targets_dir.path().join("target-x"));
+        let chat = workspace
+            .create_engagement("chat-unbound")
+            .expect("engagement");
+        chat.write_file("draft.txt", "working branch bytes")
+            .expect("write");
+        chat.commit_turn("draft").expect("cut");
+        drop(chat);
+        drop(workspace);
+
+        let (targets, engagements, _index) =
+            open_startup_targets(&library, targets_dir.path(), &providers, &BTreeSet::new())
+                .expect("startup targets");
+
+        assert!(
+            !engagements.contains_key("chat-unbound"),
+            "an unbound engagement is not registered live"
+        );
+        let survivors = targets
+            .get("target-x")
+            .expect("target opened")
+            .reconcile_engagements()
+            .expect("reconcile");
+        let survivor = survivors
+            .iter()
+            .find(|(id, _)| id == "chat-unbound")
+            .map(|(_, eng)| eng)
+            .expect("the working branch was not discarded");
+        assert_eq!(
+            survivor.read_file("draft.txt").expect("branch content"),
+            "working branch bytes"
+        );
+    }
+
+    /// The one legitimate removal: the library's record stream shows the chat
+    /// was explicitly deleted (a tombstone), so reconciliation finishes it.
+    #[test]
+    fn a_tombstoned_chats_engagement_is_removed_at_startup() {
+        let targets_dir = tempfile::tempdir().expect("targets dir");
+        let providers = default_workspace_providers();
+        let library = managed_library_with_target("target-x");
+
+        let workspace =
+            provider_for(&providers, "target-x").open_at(&targets_dir.path().join("target-x"));
+        workspace
+            .create_engagement("chat-deleted")
+            .expect("engagement");
+        drop(workspace);
+
+        let deleted = BTreeSet::from(["chat-deleted".to_owned()]);
+        let (targets, engagements, _index) =
+            open_startup_targets(&library, targets_dir.path(), &providers, &deleted)
+                .expect("startup targets");
+
+        assert!(!engagements.contains_key("chat-deleted"));
+        assert!(
+            targets
+                .get("target-x")
+                .expect("target opened")
+                .reconcile_engagements()
+                .expect("reconcile")
+                .iter()
+                .all(|(id, _)| id != "chat-deleted"),
+            "an explicitly deleted chat's branch is released"
+        );
     }
 }

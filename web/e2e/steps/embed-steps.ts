@@ -1,8 +1,9 @@
 /**
  * Steps for the embedded panels (EMBED-2). The embed example page mounts the
  * `<gw-session>` + `<gw-chat>`/`<gw-viewer>`/`<gw-files>` custom elements against a
- * scoped control plane; it self-creates a fresh work chat when none is given, so
- * the page is self-contained. The panels render in **open** shadow roots, which
+ * browser fixture Session. Production pages pass a hosted deployment through
+ * `?host=`; the hermetic fixture isolates component rendering from cloud state.
+ * The panels render in **open** shadow roots, which
  * Playwright's selectors pierce automatically. The control-plane reset Before-hook
  * is shared from `steps.ts` (one global hook), so this scenario also starts clean.
  */
@@ -12,15 +13,39 @@ import { createBdd } from "playwright-bdd";
 const { Given, When, Then } = createBdd();
 
 Given("the embed example page is open", async ({ page }) => {
-    await page.goto("/embed-example.html");
+    await page.goto("/embed-example.html?fixture=1");
     // The composer appears once <gw-session> built the remote Session and <gw-chat>
     // rendered into its shadow root — proof the panel mounted against a non-desktop
     // session (the createEngagement quick-start + bind round-trip).
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
 });
 
+Given("the chat-only embed Environment is open", async ({ page }) => {
+    await page.goto("/embed-example.html?fixture=1&panels=chat");
+    await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
+});
+
 Then("the embedded chat shows a composer", async ({ page }) => {
     await expect(page.locator("[data-embed-send]")).toBeVisible();
+});
+
+Then("the embedded chat uses the shared docked composer", async ({ page }) => {
+    await expect(page.locator("gw-chat [data-chat-composer]")).toBeVisible();
+    const panel = await page.locator("gw-chat").boundingBox();
+    const composer = await page.locator("gw-chat [data-chat-composer]").boundingBox();
+    expect(panel).not.toBeNull();
+    expect(composer).not.toBeNull();
+    // The only content below the shared dock is the compact attribution line.
+    expect(panel!.y + panel!.height - (composer!.y + composer!.height)).toBeLessThan(40);
+});
+
+Then("the embedded panel set owns one attribution mark", async ({ page }) => {
+    await expect(page.locator("[data-embed-powered-by]")).toHaveCount(1);
+});
+
+Then("the unselected files and viewer panels are not composed", async ({ page }) => {
+    await expect(page.locator("gw-files")).toHaveCount(0);
+    await expect(page.locator("gw-viewer")).toHaveCount(0);
 });
 
 When("I send {string} in the embedded chat", async ({ page }, msg: string) => {

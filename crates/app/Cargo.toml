@@ -27,6 +27,8 @@ gaugewright-tracker = { path = "../tracker" }
 # Permanent GaugeDesk↔WhippleScript policy/runtime boundary (ADR 0080). This is
 # distinct from the transitional Harness/EgressGate adapter.
 gaugewright-whip-runtime = { path = "../whip-runtime" }
+gaugewright-relay-transport = { path = "../relay-transport" }
+gaugewright-directory-protocol = { path = "../directory-protocol" }
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }
@@ -34,6 +36,8 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
+base64 = "0.22"
 getrandom = "0.2"
 sha2 = "0.10"
 hex = "0.4"
@@ -64,12 +68,19 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 # clients queue across the rebuild instead of being refused. A no-op for a plain
 # run (no FD passed ⇒ normal bind). Dev ergonomics only; no production behaviour.
 listenfd = "1"
+tempfile = "3"
 
 [dev-dependencies]
 gaugewright-pi-bridge = { path = "../pi-bridge" }
+gaugewright-relay-transport = { path = "../relay-transport", features = ["test-relay"] }
+# Compiles the shipped gate program in tests. A gate we ship but never parse is
+# the same class of bug as a sealing construction nobody cross-checked: it looks
+# fine until it runs. Dev-only — nothing at runtime depends on the parser.
+whipplescript-kernel = { version = "0.4.1" }
+whipplescript-store = { version = "0.4.1" }
+whipplescript-parser = { version = "0.4.1" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-tempfile = "3"
 proptest = "1"
 
 [[test]]

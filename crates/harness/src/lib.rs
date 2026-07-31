@@ -81,9 +81,11 @@ pub struct TurnOutcome {
     pub observations: Vec<Observation>,
     pub mediated_tool_calls: Vec<String>,
     pub pending_approvals: Vec<String>,
-    /// A labeled human question whose exact admitted turn remains suspended.
-    /// The admission shell authenticates the respondent before resumption.
-    pub pending_human: Option<HumanPrompt>,
+    /// Questions the agent asked this turn (ADR 0113). Collected here rather
+    /// than written during the turn because the engine holds the store across
+    /// `run_turn`; the same reason `pending_approvals` rides the outcome. The
+    /// engine persists them once the turn settles.
+    pub asked_questions: Vec<AskedQuestion>,
     /// Serialized values from the runtime's own published pointer schema.
     /// These name authoritative evidence; they never contain evidence bodies.
     pub runtime_evidence_pointers: Vec<String>,
@@ -95,7 +97,31 @@ pub struct TurnOutcome {
     /// report (WhippleScript DR-0036 §2). Empty for adapters that publish no
     /// report — consumers fall back to host-local truth (ADR 0082 §5).
     pub guarantee_outcomes: Vec<GuaranteeOutcome>,
+    /// Exact WhippleScript event coordinates bracketing this turn. Governed
+    /// adapters populate these so a transcript point can reproduce runtime
+    /// continuity rather than merely cloning the latest thread state.
+    pub runtime_start_position: Option<RuntimePosition>,
+    pub runtime_terminal_position: Option<RuntimePosition>,
+    /// A narrow product-metering projection published by the governed runtime.
+    /// `usage_ref` points back to the runtime-owned evidence body.
+    pub managed_usage: Option<ModelUsage>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub usage_ref: String,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Adapter-neutral representation of a governed runtime event coordinate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuntimePosition {
+    pub instance_ref: String,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,17 +167,18 @@ impl GuaranteeOutcome {
     }
 }
 
-/// Placement-neutral projection of a runtime-owned human interaction. It keeps
-/// the stable ask/evidence labels needed for audit while leaving authentication
-/// and user identity to the product shell.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HumanPrompt {
-    pub ask_ref: String,
+/// One question an agent asked during a turn, before the engine files it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedQuestion {
     pub question: String,
+    #[serde(default)]
     pub choices: Vec<String>,
-    pub freeform_allowed: bool,
-    pub label_ref: String,
-    pub evidence_ref: String,
+    /// Who should answer. `None` means the chat owner.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// The agent declaring it cannot usefully proceed without an answer.
+    #[serde(default)]
+    pub blocking: bool,
 }
 
 /// The fixed `"image"` tag on an image content block. A one-variant enum so the
@@ -218,6 +245,11 @@ pub trait Harness: Send {
     /// Adapters may use this only for attribution; authentication stays in the
     /// product shell. The default is a no-op for runtimes without human input.
     fn bind_authenticated_actor(&mut self, _actor_ref: &str) {}
+
+    /// Bind a caller-admitted durable command identity to the next turn. Hosted
+    /// schedulers use this so crash/retry addresses the same WhippleScript
+    /// command and receipt instead of minting a second effect.
+    fn bind_runtime_command_id(&mut self, _command_id: Option<&str>) {}
 
     /// Deliver `prompt` (+ any native `images` for this turn), mediate every tool
     /// call through `gate`, stream each [`Observation`] to `sink`, and return the
@@ -295,11 +327,20 @@ pub struct HarnessSpec {
     pub provider_binding_ref: Option<String>,
     pub credential_ref: Option<String>,
     pub placement_ceiling_ref: Option<String>,
+    /// Product placement identity used only to address a remote host. This is
+    /// distinct from the governed placement-ceiling handle above.
+    pub runtime_placement_id: Option<String>,
     /// Resolved by the shell (env ▸ config ▸ default). `None` leaves the
     /// adapter's own default resolution in force (the federation peer path
     /// deliberately keeps provider/model unset).
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// The OpenAI-compatible endpoint base URL for an **endpoint-configurable**
+    /// provider (`openai-generic`, ADR 0083), resolved from the linked
+    /// credential. `None` leaves the provider's fixed compile-time endpoint in
+    /// force (every other provider). The runtime derives the admitted egress
+    /// host from this and fixes the request URL to it (ADR 0080).
+    pub base_url: Option<String>,
     pub thinking: Option<String>,
     /// `Some` in edit mode (the built-in editor package persona). Work chats
     /// leave this unset because persona is immutable package content.
@@ -314,6 +355,12 @@ pub struct HarnessSpec {
     /// surface in use mode, provider hosts, egress ack); the adapter EXTENDS it
     /// with adapter-private needs (e.g. Pi's session dir + `~/.pi`).
     pub sandbox: sandbox::SandboxPolicy,
+    /// Who this agent may name, as `(authority, who they are)` (`GATE-3f`).
+    /// Offered on the `ask` tool so the choice of a person is made from a list
+    /// rather than guessed; the host still resolves and may still refuse, since a
+    /// roster can change between a turn being prepared and the call arriving.
+    /// Empty is valid — an environment with no directory offers no choice.
+    pub roster: Vec<(String, String)>,
 }
 
 /// Runtime continuity identity at a chat fork. This intentionally carries only
@@ -322,6 +369,10 @@ pub struct HarnessSpec {
 #[derive(Clone, Debug)]
 pub struct HarnessContinuitySpec {
     pub chat_id: String,
+    /// Product placement identity used to address a hosted runtime. Native
+    /// adapters ignore it; cross-placement hosts must bind source and target to
+    /// the same admitted placement before transferring continuity.
+    pub runtime_placement_id: Option<String>,
     pub worktree: PathBuf,
     pub mode: ChatMode,
     pub package_root: Option<PathBuf>,
@@ -332,6 +383,9 @@ pub struct HarnessContinuitySpec {
     /// turn; the fork itself remains attributable to this immutable source cut.
     pub policy_epoch: Option<u64>,
     pub signed_policy_envelope: Option<String>,
+    /// When present, fork this exact source event rather than the source
+    /// instance's current head.
+    pub source_position: Option<RuntimePosition>,
 }
 
 /// An adapter's answer to "is the runtime's own credential state ready for this

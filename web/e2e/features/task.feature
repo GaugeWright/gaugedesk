@@ -5,10 +5,11 @@ Feature: Tasking the agent
 
   Scenario: the agent works in a worktree, streams, and the diff is kept
     Given a new engagement
-    When I task the agent with "make a change"
+    When I request review for the next change
+    And I task the agent with "make a change"
     Then the run phase is "Completed"
     And a mediated tool line is shown
-    And the transcript shows "run → Completed"
+    And the chat log does not show "Finished this turn"
     When I click the tool target "agent-note.txt"
     Then the content viewer shows "agent-note.txt"
     When I open the "diff" tab

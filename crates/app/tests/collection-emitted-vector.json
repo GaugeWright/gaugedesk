@@ -1,0 +1,25 @@
+{
+  "note": "Produced by emitCollection in the Durable Object under workerd; regenerate with `npm run capture:collection-vector` in crates/whipplescript-host-do/worker. Rust must open it.",
+  "admission_scope": "theory-a-test",
+  "recipient_private_seed_hex": "624b847dff874876d18980a7d12c116f4848421302e09569efb3fa62cca47b85",
+  "recipient_public_key_hex": "04e98c4b5e749038c87fb11e238ea748e0e7b3c952d91e909dbf22084afe86fc4d28dbedee9b3449323fdf6ebaa02810666ed917e4a6dc0b70725bcbff0438d1a0",
+  "expected_plaintext": "{\"envelope\":{\"schema_ref\":\"survey.v1\",\"session_id\":\"session-collection\",\"release_id\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":1,\"produced_at_unix_ms\":1785345989832},\"workspace\":{\"responses.json\":\"{\\\"q1\\\":\\\"collected\\\"}\"}}",
+  "sealed": {
+    "envelope": {
+      "schema_ref": "survey.v1",
+      "session_id": "session-collection",
+      "release_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "revision": 1,
+      "produced_at_unix_ms": 1785345989832
+    },
+    "ciphertext": "9e04381a50e08a7838f3728b377aa75817e358b1f2ca3634aeb441fd7a3b382000f88c1d89f23c8ab374473a64bb4b6b3c93f3063773d1a778bc461b96d02072ae2aefa194ea1c16b9f294b31e69d0c6ccb9908793add0ad2758ceddf7c4ae43e488c04e104d91f882366213f841eef89666a3ced5915b6a3edd0062f2455d6bcde30f22440c68d8ce4ec2eeeb3e4a688031d022e3873943c33a9c4f0a07983ba128b28a6119415dad654597e7ac5eb21a0440eef3113e760c33286903c656a458dd9855d3c7f7bcb472b70cdb35c416fa8307f2b2b94d0e38eeb5bb75119bd76e34dabe2277c4730f2ac93e0c769b2cce571173f0577d1c83ebdb78d65e7b117043bd63bc30b131b8fb60a0233a18de24b44c10f4a151c6cea3aef4ecf90aedb89a208274",
+    "wraps": [
+      {
+        "recipient_public_key": "04e98c4b5e749038c87fb11e238ea748e0e7b3c952d91e909dbf22084afe86fc4d28dbedee9b3449323fdf6ebaa02810666ed917e4a6dc0b70725bcbff0438d1a0",
+        "ephemeral_public_key": "045e08c3ed1c889f57fdd2ac8ba96ea6eb0c755286991737584e25f836a05e1f7179e56c23ffde3b0fe8ab29a045a4fa7ed4fbc4d94eb622968e33e7633a43b6fc",
+        "wrapped_key": "e8387720ad79af6ba8459705fe253627fcf2816801e4eaebbce5b0ea929f3db8e5ae2670af4586d8a054ec2292e3de22cbcf0e0090b82bcad1265d36"
+      }
+    ],
+    "byte_len": 265
+  }
+}

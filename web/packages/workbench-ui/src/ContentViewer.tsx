@@ -13,11 +13,13 @@
  * **rejects** (isolate); a conflict surfaces with repair/retry.
  */
 
-import { createEffect, createMemo, createResource, createSignal, lazy, on, onCleanup, Show, Suspense } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, lazy, on, onCleanup, Show, Suspense, type JSX } from "solid-js";
 import { useSession } from "./session-context";
 import { changedUserFiles, diffHasFiles } from "./changed-files";
 import { defaultContentMode, isSettledPhase, phaseLabel as phaseLabelFor, shouldShowViewOnSelect } from "./content-view";
 import { readPolicyDiff } from "./policy-diff";
+import { EnvironmentDocumentView, type EnvironmentViewRegistry } from "./EnvironmentDocumentView";
+import { manifestDocumentForPath } from "./environment-view";
 
 // The diff viewer pulls in @git-diff-view (+ highlight.js/lowlight, ~350 KB).
 // Load that chunk only when the Diff tab is first opened, not on app boot.
@@ -33,7 +35,24 @@ const ConflictFold = lazy(() => import("./ConflictFold").then((m) => ({ default:
 
 type Mode = "view" | "edit" | "diff";
 
-export function ContentViewer() {
+export interface SpecialFileRenderer {
+    readonly id: string;
+    readonly matches: (path: string) => boolean;
+    readonly render: (file: { readonly path: string; readonly content: string }) => JSX.Element;
+}
+
+export interface ContentViewerProps {
+    /** Ordered special-file renderers. The first matching renderer owns View;
+     * Edit remains the literal file source, so a rendered dashboard and its
+     * canonical document are two views of one selected Workspace file. */
+    readonly renderers?: readonly SpecialFileRenderer[];
+    /** ADR 0107 manifest-linked, schema-validated constrained document Views. */
+    readonly environmentView?: EnvironmentViewRegistry;
+    /** Optional Environment-owned revision for virtual/canonical file sources. */
+    readonly refreshKey?: () => unknown;
+}
+
+export function ContentViewer(props: ContentViewerProps = {}) {
     const session = useSession();
     // Local accessors over the injected Session (EMBED-1, ADR 0051 §3): the panel
     // reads its addressing + projections here, never from a desktop global — so the
@@ -62,7 +81,8 @@ export function ContentViewer() {
         () => {
             const i = id();
             const f = file();
-            return i && f ? ([i, f] as const) : null;
+            const revision = props.refreshKey?.();
+            return i && f ? ([i, f, revision] as const) : null;
         },
         async ([i, f]) => {
             if (session.api.getFileWithCut) {
@@ -77,6 +97,16 @@ export function ContentViewer() {
     const [draft, setDraft] = createSignal<string | null>(null);
     const [msg, setMsg] = createSignal("");
     const text = () => draft() ?? content() ?? "";
+    const specialRenderer = () => {
+        const path = file();
+        return path ? props.renderers?.find((renderer) => renderer.matches(path)) : undefined;
+    };
+    const environmentDocument = () => {
+        const path = file();
+        return path && props.environmentView
+            ? manifestDocumentForPath(props.environmentView.manifest, path)
+            : undefined;
+    };
     // Unsaved work exists only when the buffer actually differs from the file —
     // typing something and undoing it back leaves nothing to save. Save/discard
     // key off this, so the controls are honest about whether anything changed.
@@ -223,7 +253,13 @@ export function ContentViewer() {
     const fileEditable = () => {
         const path = file();
         if (!path || path === ".agent-config.json" || path.startsWith(".whipple/versions/")) return false;
-        if (path.startsWith(".whipple/")) return chatKind() === "edit" && path.startsWith(".whipple/draft/");
+        if (path.startsWith(".whipple/")) {
+            return chatKind() === "edit" && (
+                path.startsWith(".whipple/draft/") ||
+                path.startsWith(".whipple/discipline/draft/")
+            );
+        }
+        if (session.canEditFile) return session.canEditFile(path);
         return true;
     };
 
@@ -408,15 +444,36 @@ export function ContentViewer() {
                             </Show>
                         </div>
                     </Show>
-                    {/* Markdown renders as a document (the raw source is one tab
-                        away, under Edit); everything else stays literal text. */}
-                    <Show
-                        when={isMarkdownPath(file() ?? "")}
-                        fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}
-                    >
-                        <Suspense fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
-                            <MarkdownView text={content() ?? ""} />
-                        </Suspense>
+                    <Show when={!content.loading} fallback={<div class="status">loading…</div>}>
+                        {/* Manifest-linked Environment Views take precedence. They
+                            resolve exact document ids and schemas, never suffixes. */}
+                        <Show
+                            when={environmentDocument()}
+                            fallback={
+                                <Show
+                                    when={specialRenderer()}
+                                    fallback={
+                                        <Show
+                                            when={isMarkdownPath(file() ?? "")}
+                                            fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}
+                                        >
+                                            <Suspense fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
+                                                <MarkdownView text={content() ?? ""} />
+                                            </Suspense>
+                                        </Show>
+                                    }
+                                >
+                                    {(renderer) => renderer().render({ path: file()!, content: content() ?? "" })}
+                                </Show>
+                            }
+                        >
+                            <EnvironmentDocumentView
+                                registry={props.environmentView!}
+                                path={file()!}
+                                content={content() ?? ""}
+                                onSelectFile={(path) => session.selectFile(path)}
+                            />
+                        </Show>
                     </Show>
                 </Show>
             </Show>
@@ -425,7 +482,7 @@ export function ContentViewer() {
                 <Show when={file()} fallback={<div class="status">Pick a file from the Files panel on the right to edit it.</div>}>
                     <Show
                         when={fileEditable()}
-                        fallback={<div class="status" data-file-readonly>This file is read-only here. Edit only the package draft in an edit chat; change runtime selection through Settings.</div>}
+                        fallback={<div class="status" data-file-readonly>{session.readOnlyFileReason?.(file() ?? "") ?? "This file is read-only here. Edit only the package draft in an edit chat; change runtime selection through Settings."}</div>}
                     >
                       <Show
                         when={!conflict()}

@@ -6,9 +6,10 @@
     "packages/enterprise-client/src/enterprise-control-plane.ts",
     "../../web/packages/control-plane-client/src/browser-route-json.ts",
     "../../web/packages/control-plane-client/src/control-plane-transport.ts",
-    "apps/admin-console/src/main.tsx",
-    "apps/admin-console/src/AdminConsole.tsx",
-    "apps/admin-console/src/SsoWizard.tsx",
+    "apps/enterprise-workbench/src/main.tsx",
+    "apps/enterprise-workbench/src/EnterpriseWorkbench.tsx",
+    "apps/enterprise-workbench/src/AdminEnvironment.tsx",
+    "apps/enterprise-workbench/src/SsoWizard.tsx",
     "../../web/packages/control-plane-client/src/auth-session.ts"
   ]
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { empty, fromSnapshot, reduce, type StreamEvent } from "./transcript";
+import { empty, fromSnapshot, pendingUserAfterSnapshot, reduce, type StreamEvent } from "./transcript";
 
 describe("transcript reduction", () => {
     it("coalesces streamed text deltas into one operational line", () => {
@@ -62,6 +62,23 @@ describe("transcript reduction", () => {
         expect(t.lines[0]).toMatchObject({ kind: "error", code: "no_credential" });
     });
 
+    it("preserves durable point-fork coordinates on user and assistant lines", () => {
+        const user = reduce(empty, {
+            type: "user",
+            text: "revise it",
+            entry_id: 41,
+            forkable: true,
+        });
+        const assistant = reduce(user, {
+            type: "assistant",
+            text: "done",
+            entry_id: 52,
+            forkable: true,
+        });
+        expect(assistant.lines[0]).toMatchObject({ entryId: 41, forkable: true });
+        expect(assistant.lines[1]).toMatchObject({ entryId: 52, forkable: true });
+    });
+
     it("is repairable: replaying a snapshot from empty yields the same transcript", () => {
         const events: StreamEvent[] = [
             { type: "text", delta: "a" },
@@ -72,5 +89,18 @@ describe("transcript reduction", () => {
         const live = events.reduce(reduce, empty);
         const repaired = fromSnapshot(events);
         expect(repaired).toEqual(live);
+    });
+
+    it("keeps a pending user line across a lagging snapshot repair without duplicating admission", () => {
+        const before = fromSnapshot([{ type: "user", text: "same words" }]);
+
+        expect(pendingUserAfterSnapshot(before, "same words", before.lines.length).lines)
+            .toMatchObject([{ kind: "user", text: "same words" }]);
+
+        const admitted = fromSnapshot([
+            { type: "user", text: "same words" },
+            { type: "user", text: "same words" },
+        ]);
+        expect(pendingUserAfterSnapshot(admitted, "same words", before.lines.length)).toEqual(empty);
     });
 });

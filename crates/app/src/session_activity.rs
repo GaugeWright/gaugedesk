@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::client_admission::{ClientAdmission, ClientAdmissionStatus, ClientBuild};
+
 /// Why a session was refused (`SEC-2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionExpiry {
@@ -40,12 +42,25 @@ pub struct SessionInfo {
     pub authority: String,
     pub age_ms: u64,
     pub idle_ms: u64,
+    /// Compatibility evidence reported by the client; never device attestation.
+    pub client: ClientBuild,
+    pub software_status: ClientAdmissionStatus,
+    pub software_reason: String,
+}
+
+#[derive(Clone)]
+struct SessionEntry {
+    authority: String,
+    first_seen_ms: u64,
+    last_seen_ms: u64,
+    client: ClientBuild,
+    admission: ClientAdmission,
 }
 
 /// The activity ledger: `key(bearer-hash) -> (authority, first_seen_ms, last_seen_ms)`.
 pub struct SessionActivity {
     epoch: Instant,
-    inner: Mutex<BTreeMap<String, (String, u64, u64)>>,
+    inner: Mutex<BTreeMap<String, SessionEntry>>,
 }
 
 impl Default for SessionActivity {
@@ -81,10 +96,38 @@ impl SessionActivity {
         lifetime_ms: u64,
         idle_ms: u64,
     ) -> Result<(), SessionExpiry> {
+        self.check_and_touch_client(
+            key,
+            authority,
+            now_ms,
+            lifetime_ms,
+            idle_ms,
+            ClientBuild::default(),
+            ClientAdmission {
+                status: ClientAdmissionStatus::Unmanaged,
+                reason: "no organization software policy".to_string(),
+            },
+        )
+    }
+
+    /// The session-timeout check plus `ITGOV-4`'s reported build/status update.
+    /// A software-blocked attempt is deliberately recorded before the caller refuses
+    /// the request, so IT can see the session that needs repair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_and_touch_client(
+        &self,
+        key: &str,
+        authority: &str,
+        now_ms: u64,
+        lifetime_ms: u64,
+        idle_ms: u64,
+        client: ClientBuild,
+        admission: ClientAdmission,
+    ) -> Result<(), SessionExpiry> {
         let mut m = self.inner.lock().expect("session-activity mutex");
         let (first, last) = m
             .get(key)
-            .map(|(_, f, l)| (*f, *l))
+            .map(|entry| (entry.first_seen_ms, entry.last_seen_ms))
             .unwrap_or((now_ms, now_ms));
         if lifetime_ms > 0 && now_ms.saturating_sub(first) > lifetime_ms {
             return Err(SessionExpiry::Lifetime);
@@ -92,7 +135,16 @@ impl SessionActivity {
         if idle_ms > 0 && now_ms.saturating_sub(last) > idle_ms {
             return Err(SessionExpiry::Idle);
         }
-        m.insert(key.to_string(), (authority.to_string(), first, now_ms));
+        m.insert(
+            key.to_string(),
+            SessionEntry {
+                authority: authority.to_string(),
+                first_seen_ms: first,
+                last_seen_ms: now_ms,
+                client,
+                admission,
+            },
+        );
         Ok(())
     }
 
@@ -102,10 +154,13 @@ impl SessionActivity {
         let m = self.inner.lock().expect("session-activity mutex");
         let mut out: Vec<SessionInfo> = m
             .values()
-            .map(|(authority, first, last)| SessionInfo {
-                authority: authority.clone(),
-                age_ms: now_ms.saturating_sub(*first),
-                idle_ms: now_ms.saturating_sub(*last),
+            .map(|entry| SessionInfo {
+                authority: entry.authority.clone(),
+                age_ms: now_ms.saturating_sub(entry.first_seen_ms),
+                idle_ms: now_ms.saturating_sub(entry.last_seen_ms),
+                client: entry.client.clone(),
+                software_status: entry.admission.status,
+                software_reason: entry.admission.reason.clone(),
             })
             .collect();
         out.sort_by_key(|s| s.idle_ms);

@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
@@ -71,26 +71,41 @@ impl TlsIdentity {
     }
 
     /// Load the identity persisted under `dir` (a `tls.crt` + `tls.key` DER pair),
-    /// generating + persisting a fresh one on first use — so a peer's pin stays
-    /// valid across restarts. Mirrors [`crate::key_store::FileKeyStore`]'s
-    /// derive-then-persist contract.
+    /// generating + persisting a fresh one **only when both files are genuinely
+    /// absent** (a first run) — so a peer's pin stays valid across restarts. Any
+    /// other outcome — one file present without the other, or an unreadable
+    /// file — fails closed rather than silently regenerating and breaking every
+    /// established pairing (DR-0054; same contract as relay-transport's
+    /// `TlsIdentity::load_or_generate` fixed in Phase A).
     pub fn load_or_generate(dir: &Path) -> std::io::Result<Self> {
         let cert_path = dir.join("tls.crt");
         let key_path = dir.join("tls.key");
-        if let (Ok(cert), Ok(key)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
-            let cert_der = CertificateDer::from(cert);
-            let fingerprint = fingerprint_of(&cert_der);
-            return Ok(Self {
-                cert_der,
-                key_der: key,
-                fingerprint,
-            });
+        match (std::fs::read(&cert_path), std::fs::read(&key_path)) {
+            (Ok(cert), Ok(key)) => {
+                let cert_der = CertificateDer::from(cert);
+                let fingerprint = fingerprint_of(&cert_der);
+                Ok(Self {
+                    cert_der,
+                    key_der: key,
+                    fingerprint,
+                })
+            }
+            (Err(cert_error), Err(key_error))
+                if cert_error.kind() == std::io::ErrorKind::NotFound
+                    && key_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let identity = Self::generate()?;
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(&cert_path, identity.cert_der.as_ref())?;
+                std::fs::write(&key_path, &identity.key_der)?;
+                Ok(identity)
+            }
+            (Err(error), _) | (_, Err(error)) => Err(std::io::Error::other(format!(
+                "TLS identity in {} is unreadable ({error}); refusing to regenerate \
+                 over an identity that peers may have pinned",
+                dir.display()
+            ))),
         }
-        let identity = Self::generate()?;
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(&cert_path, identity.cert_der.as_ref())?;
-        std::fs::write(&key_path, &identity.key_der)?;
-        Ok(identity)
     }
 
     /// The fingerprint a peer pins (published in this authority's pairing ticket).
@@ -195,11 +210,14 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
 /// `pins`. Returns the encrypted stream the frame protocol then runs over. A
 /// presented certificate that does not match the pin fails the handshake
 /// (fail-closed) — the connection never carries application bytes.
-pub async fn tls_connect(
-    tcp: TcpStream,
+pub async fn tls_connect<S>(
+    tcp: S,
     authority: &AuthorityId,
     pins: Arc<PinnedTlsClientConfig>,
-) -> std::io::Result<client::TlsStream<TcpStream>> {
+) -> std::io::Result<client::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
     let verifier = Arc::new(PinnedServerCertVerifier {
         pins,
@@ -223,10 +241,10 @@ pub async fn tls_connect(
 /// stream in a TLS server session presenting `identity`'s certificate. The client
 /// pins this certificate's fingerprint; the server does not authenticate the
 /// client at the TLS layer (the governance-key handshake does that on top).
-pub async fn tls_accept(
-    tcp: TcpStream,
-    identity: &TlsIdentity,
-) -> std::io::Result<server::TlsStream<TcpStream>> {
+pub async fn tls_accept<S>(tcp: S, identity: &TlsIdentity) -> std::io::Result<server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let config = identity.server_config()?;
     TlsAcceptor::from(Arc::new(config)).accept(tcp).await
 }
@@ -235,6 +253,7 @@ pub async fn tls_accept(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     /// A generated identity has a stable 32-byte (SHA-256) fingerprint, and a
     /// reload from disk yields the *same* fingerprint (a peer's pin survives a
@@ -248,6 +267,32 @@ mod tests {
         assert_eq!(first.fingerprint(), reloaded.fingerprint());
         assert_eq!(first.fingerprint().as_bytes().len(), 32);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DR-0054 (Phase A residual): a half-present identity — one of
+    /// `tls.crt`/`tls.key` missing or unreadable — must fail closed, never be
+    /// silently regenerated: peers pinned this certificate's fingerprint, and a
+    /// regeneration would break every established pairing. The surviving half
+    /// stays on disk untouched, so the identity remains recoverable.
+    #[test]
+    fn a_half_present_identity_fails_closed_instead_of_regenerating() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = TlsIdentity::load_or_generate(dir.path()).unwrap();
+        let cert_bytes = std::fs::read(dir.path().join("tls.crt")).unwrap();
+        std::fs::remove_file(dir.path().join("tls.key")).unwrap();
+
+        let error = TlsIdentity::load_or_generate(dir.path())
+            .expect_err("a half-present identity must never be silently regenerated");
+        assert!(
+            error.to_string().contains("refusing to regenerate"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("tls.crt")).unwrap(),
+            cert_bytes,
+            "the surviving certificate is untouched, so the fingerprint {:x?} peers pinned stays recoverable",
+            first.fingerprint().as_bytes(),
+        );
     }
 
     /// End-to-end over a real loopback socket pair: the server presents its
@@ -289,8 +334,8 @@ mod tests {
     /// A recording splice with the broker's exact semantics (`copy_bidirectional`
     /// over two legs) but which **captures every byte it forwards**, so a test can
     /// assert the broker carried only ciphertext. The real
-    /// [`crate::fed_harness::broker_accept_loop`] is even blinder (it keeps only a
-    /// byte count); this stand-in is a strictly stronger observer.
+    /// The managed WSS object is even blinder (it retains no carried bytes);
+    /// this stand-in is a strictly stronger observer.
     async fn recording_splice(
         a: TcpStream,
         b: TcpStream,

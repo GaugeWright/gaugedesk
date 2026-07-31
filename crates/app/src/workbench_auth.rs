@@ -123,6 +123,55 @@ impl Workbench {
         self.idp.is_some()
     }
 
+    /// Discover the current actor's administration capabilities in one tenant
+    /// scope (`ADMIN-ENV-2`). This is presentation admission only; every route
+    /// still gates its own action independently through [`Self::authorize`].
+    ///
+    /// Unlike the historical client-side `?cp=` heuristic, this derives from the
+    /// active membership and the same fixed capability matrix as route admission.
+    /// An unprovisioned directory has no Administration environment. In a local
+    /// enterprise composition without an IdP, the workbench authority must itself
+    /// be an active member; hosted deployments still fail closed without an IdP.
+    pub fn admin_capabilities(
+        &self,
+        bearer: Option<&str>,
+        org_scope: &str,
+    ) -> Result<Vec<gaugewright_core::rbac::Capability>, (StatusCode, &'static str)> {
+        let org = org::Org::rebuild_in(self.store_ref(), org_scope)
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
+        let provisioned = org
+            .members
+            .values()
+            .any(|member| member.status == org::MembershipStatus::Active);
+        if !provisioned {
+            return Ok(Vec::new());
+        }
+
+        let authority = if let Some(idp) = &self.idp {
+            bearer
+                .and_then(|token| idp.authenticate(token))
+                .ok_or((StatusCode::UNAUTHORIZED, "authenticate to administer"))?
+                .as_str()
+                .to_string()
+        } else {
+            if self.hosted_home_mode() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Home identity provider unavailable",
+                ));
+            }
+            self.authority().as_str().to_string()
+        };
+
+        let Some(role) = org.role_of(&authority) else {
+            return Ok(Vec::new());
+        };
+        Ok(gaugewright_core::rbac::Capability::ALL
+            .into_iter()
+            .filter(|&capability| gaugewright_core::rbac::role_can(&role, capability))
+            .collect())
+    }
+
     /// Authorize an `/admin/*` request (`RBAC-5`). The gate:
     ///
     /// - **No IdP** (single-user local) ⇒ always `Ok` — the existing open behavior;
@@ -140,6 +189,12 @@ impl Workbench {
         cap: Option<gaugewright_core::rbac::Capability>,
     ) -> Result<(), (StatusCode, &'static str)> {
         let Some(idp) = &self.idp else {
+            if self.hosted_home_mode() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Home identity provider unavailable",
+                ));
+            }
             return Ok(()); // single-user local: ungated
         };
         let org = org::Org::rebuild(self.store_ref())
@@ -148,7 +203,7 @@ impl Workbench {
             .members
             .values()
             .any(|m| m.status == org::MembershipStatus::Active);
-        if !provisioned {
+        if !provisioned && !self.hosted_home_mode() {
             return Ok(()); // bootstrap: directory not yet provisioned
         }
         let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
@@ -219,11 +274,38 @@ impl Workbench {
         bearer: Option<&str>,
         project: Option<&str>,
     ) -> Result<String, (StatusCode, &'static str)> {
+        self.admit_data_request_with_client(
+            bearer,
+            project,
+            org::ORG_SCOPE,
+            crate::client_admission::ClientBuild::default(),
+            false,
+        )
+    }
+
+    /// Enterprise admission with `ITGOV-4` client compatibility evidence. The
+    /// `org_scope` is the same tenant scope the route handlers use. `enforce_software`
+    /// is false only for authenticated recovery surfaces such as the software-policy
+    /// document itself; the session is still recorded with its real status.
+    pub fn admit_data_request_with_client(
+        &self,
+        bearer: Option<&str>,
+        project: Option<&str>,
+        org_scope: &str,
+        client: crate::client_admission::ClientBuild,
+        enforce_software: bool,
+    ) -> Result<String, (StatusCode, &'static str)> {
         let Some(idp) = &self.idp else {
+            if self.hosted_home_mode() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Home identity provider unavailable",
+                ));
+            }
             // single-user local / loopback: the operator's own channel.
             return Ok(self.authority().as_str().to_string());
         };
-        let org = org::Org::rebuild(self.store_ref())
+        let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let authority = bearer.and_then(|t| idp.authenticate(t));
         // Hosted web account (ADR 0077): the session — a verified id-token (header or the
@@ -233,7 +315,7 @@ impl Workbench {
         // would otherwise leave `/account/*` open to anonymous callers). Fail-closed (`INV-20`).
         // The authenticated authority IS the person; per-person account-scope isolation is layered
         // by the routes on top of this gate.
-        if web_account_mode() {
+        if web_account_mode() && !self.hosted_home_mode() {
             return authority.map(|a| a.as_str().to_string()).ok_or((
                 StatusCode::UNAUTHORIZED,
                 "authenticate to access your account",
@@ -243,6 +325,9 @@ impl Workbench {
             .members
             .values()
             .any(|m| m.status == org::MembershipStatus::Active);
+        if !provisioned && self.hosted_home_mode() {
+            return Err((StatusCode::FORBIDDEN, "Home has no active owner"));
+        }
         if !provisioned {
             // bootstrap: directory not yet provisioned — actor resolved best-effort.
             return Ok(authority
@@ -268,14 +353,33 @@ impl Workbench {
         let (lifetime_ms, idle_ms) = org.session_bounds_ms();
         let key = org::sha256_hex(bearer.unwrap_or_default());
         let now = self.session_activity.now_ms();
-        if let Err(expiry) = self.session_activity.check_and_touch(
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let software = crate::client_admission::evaluate_client(
+            org.software_policy.as_ref(),
+            &client,
+            now_unix_ms,
+        );
+        if let Err(expiry) = self.session_activity.check_and_touch_client(
             &key,
             authority.as_str(),
             now,
             lifetime_ms,
             idle_ms,
+            client,
+            software.clone(),
         ) {
             return Err((StatusCode::UNAUTHORIZED, expiry.reason()));
+        }
+        if enforce_software
+            && software.status == crate::client_admission::ClientAdmissionStatus::Blocked
+        {
+            return Err((
+                StatusCode::UPGRADE_REQUIRED,
+                "GaugeDesk client does not satisfy organization software policy",
+            ));
         }
         if let Some(project) = project {
             if !org.can_access_project(authority.as_str(), project) {
@@ -283,6 +387,28 @@ impl Workbench {
             }
         }
         Ok(authority.as_str().to_string())
+    }
+
+    /// Authenticate a bearer to its durable authority without granting Home
+    /// membership. Invitation acceptance uses this narrower seam: it must know
+    /// who is accepting before it can atomically activate that exact member.
+    pub fn authenticate_identity(
+        &self,
+        bearer: Option<&str>,
+    ) -> Result<gaugewright_core::ids::AuthorityId, (StatusCode, &'static str)> {
+        let Some(idp) = &self.idp else {
+            if self.hosted_home_mode() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Home identity provider unavailable",
+                ));
+            }
+            return Ok(self.authority().clone());
+        };
+        bearer.and_then(|token| idp.authenticate(token)).ok_or((
+            StatusCode::UNAUTHORIZED,
+            "authenticate to accept this invitation",
+        ))
     }
 
     /// **ENTSEC-2** ([ADR 0065]): the set of projects a request's caller may **see** in the
@@ -295,6 +421,9 @@ impl Workbench {
     /// projection can never leak project existence to someone the gate would reject.
     pub fn project_visibility(&self, bearer: Option<&str>) -> ProjectVisibility {
         let Some(idp) = &self.idp else {
+            if self.hosted_home_mode() {
+                return ProjectVisibility::Only(BTreeSet::new());
+            }
             return ProjectVisibility::All; // solo / loopback: the operator's own channel
         };
         let Ok(org) = org::Org::rebuild(self.store_ref()) else {
@@ -304,6 +433,9 @@ impl Workbench {
             .members
             .values()
             .any(|m| m.status == org::MembershipStatus::Active);
+        if !provisioned && self.hosted_home_mode() {
+            return ProjectVisibility::Only(BTreeSet::new());
+        }
         if !provisioned {
             return ProjectVisibility::All; // bootstrap: nothing to scope against yet
         }
@@ -355,6 +487,12 @@ impl Workbench {
                 .library
                 .project_of_instance(segs.next()?)
                 .map(str::to_string),
+            "workstreams" => self
+                .library_workstream(segs.next()?)
+                .and_then(|workstream| {
+                    self.placement_project_id(&workstream.instance_id)
+                        .map(str::to_string)
+                }),
             "projects" => {
                 let id = segs.next()?;
                 (!id.is_empty()).then(|| id.to_string())
@@ -413,8 +551,20 @@ impl Workbench {
     /// session before the account routes run, so the resolved actor here is the authenticated
     /// person. The account routes pass this to the `*_in(scope)` account methods.
     pub fn account_scope_for(&self, bearer: Option<&str>) -> String {
-        if web_account_mode() {
+        if self.hosted_home_mode || web_account_mode() {
             crate::account::account_scope(&self.actor(bearer))
+        } else {
+            crate::account::ACCOUNT_SCOPE.to_string()
+        }
+    }
+
+    /// Account scope for an actor that has already crossed the request/runtime
+    /// authentication boundary. Hosted Home turns use this after binding the
+    /// authenticated actor into the turn; desktop keeps the collapsed account
+    /// scope. This avoids re-parsing a bearer after admission.
+    pub(crate) fn account_scope_for_actor(&self, actor: &str) -> String {
+        if self.hosted_home_mode || web_account_mode() {
+            crate::account::account_scope(actor)
         } else {
             crate::account::ACCOUNT_SCOPE.to_string()
         }

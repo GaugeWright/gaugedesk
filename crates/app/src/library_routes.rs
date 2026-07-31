@@ -1,7 +1,7 @@
 //! The library surface (ADR 0027): agents, projects, bindings, chats — and the
 //! `/workspace` facet tree the nav renders. CRUD here writes durable records
 //! (latest-wins / tombstone) and mutates the in-memory [`Library`] projection;
-//! creating a chat creates a worktree in the right instance and seeds its
+//! creating a chat creates a candidate workspace in the selected target and seeds its
 //! `.agent-config.json` from the agent's config.
 //!
 //! Delete is a **cascade** with one hard ordering rule: retire a chat's runtime
@@ -36,22 +36,22 @@ use gaugewright_workspace::MergeOutcome;
 fn write_project(wb: &mut Workbench, r: ProjectRecord) {
     wb.write_project_record(r);
 }
-/// Create a chat (engagement) in `inst_id`, seeding `.agent-config.json` from the
-/// bound agent's config. Returns the created chat's id + title JSON, or an error.
+/// Create a chat under a logical placement/archetype root and exact target.
 fn create_chat_in(
     wb: &mut Workbench,
     inst_id: &str,
     title: &str,
+    target_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    wb.create_chat_in_instance(inst_id, title)
+    wb.create_chat_in_instance_on_target(inst_id, title, target_id)
 }
 
 // ---- GET /workspace ------------------------------------------------------
 
 /// The nav facet tree (ADR 0035/0036), project-first vocabulary:
 /// - `archetypes` — the reusable methods (each → its edit chats);
-/// - `projects` — trust boundaries (each → its `placements` → work chats); the
-///   hidden default "Personal" project is omitted;
+/// - `projects` — trust boundaries (each → its `placements` → work chats), including
+///   the explicit default "Personal" project;
 /// - `recent` — a flat current-first chat list.
 ///
 /// Each chat carries a derived `kind` (`"edit"` | `"work"`), never a stored mode.
@@ -105,6 +105,146 @@ pub fn workspace_value(wb: &Workbench) -> serde_json::Value {
     wb.workspace_value()
 }
 
+/// Resolve one workspace-change reference into the smallest self-contained slice
+/// of the workspace projection that can repair a client tree. The event stream
+/// carries only `(record, id, op)` (INV-10); this resolver returns current
+/// projection nodes, never mutable library records. Clients remove the referenced
+/// record everywhere, then upsert these replacements and restore server order.
+///
+/// Parent nodes are intentionally complete: a chat or workstream is denormalized
+/// into its rooted archetype/project tree and recent/search projection, so replacing
+/// its current parents is both smaller and safer than teaching the client every
+/// nested wire location.
+pub fn workspace_delta_value(
+    workspace: &serde_json::Value,
+    record: &str,
+    id: &str,
+) -> Option<serde_json::Value> {
+    if !matches!(
+        record,
+        "archetype" | "project" | "placement" | "chat" | "workstream" | "work_target"
+    ) {
+        return None;
+    }
+
+    let array = |key: &str| {
+        workspace
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let archetypes = array("archetypes");
+    let projects = array("projects");
+    let recent = array("recent");
+    let workstreams = array("workstreams");
+    let work_targets = array("work_targets");
+    let has_id = |value: &serde_json::Value| value.get("id").and_then(|v| v.as_str()) == Some(id);
+    let nested_has = |value: &serde_json::Value, collection: &str| {
+        value
+            .get(collection)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.iter().any(&has_id))
+    };
+    let project_has = |project: &serde_json::Value| {
+        if record == "work_target"
+            && project
+                .get("targets")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|targets| targets.iter().any(&has_id))
+        {
+            return true;
+        }
+        project
+            .get("placements")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|placements| {
+                placements.iter().any(|placement| match record {
+                    "archetype" => {
+                        placement.get("archetype_id").and_then(|v| v.as_str()) == Some(id)
+                    }
+                    "placement" => {
+                        placement.get("placement_id").and_then(|v| v.as_str()) == Some(id)
+                    }
+                    "chat" => nested_has(placement, "chats"),
+                    "workstream" => nested_has(placement, "workstreams"),
+                    _ => false,
+                })
+            })
+    };
+
+    let selected_archetypes: Vec<_> = archetypes
+        .iter()
+        .filter(|value| match record {
+            "archetype" => has_id(value),
+            "chat" => nested_has(value, "chats"),
+            "workstream" => nested_has(value, "workstreams"),
+            "work_target" => value.get("authoring_target_id").and_then(|v| v.as_str()) == Some(id),
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    let selected_projects: Vec<_> = projects
+        .iter()
+        .filter(|value| (record == "project" && has_id(value)) || project_has(value))
+        .cloned()
+        .collect();
+    let selected_recent: Vec<_> = recent
+        .iter()
+        .filter(|value| match record {
+            "chat" => has_id(value),
+            "placement" => value.get("placement").and_then(|v| v.as_str()) == Some(id),
+            "workstream" => value.get("workstream").and_then(|v| v.as_str()) == Some(id),
+            "work_target" => value.get("target_id").and_then(|v| v.as_str()) == Some(id),
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    let selected_workstreams: Vec<_> = workstreams
+        .iter()
+        .filter(|value| {
+            (record == "workstream" && has_id(value))
+                || (record == "work_target"
+                    && value.get("target_id").and_then(|v| v.as_str()) == Some(id))
+                || (record == "chat"
+                    && value
+                        .get("members")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|members| {
+                            members.iter().any(|member| member.as_str() == Some(id))
+                        }))
+        })
+        .cloned()
+        .collect();
+    let selected_work_targets: Vec<_> = work_targets
+        .iter()
+        .filter(|value| record == "work_target" && has_id(value))
+        .cloned()
+        .collect();
+    let ids = |values: &[serde_json::Value], key: &str| {
+        values
+            .iter()
+            .filter_map(|value| value.get(key).and_then(|v| v.as_str()).map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+
+    Some(json!({
+        "archetypes": selected_archetypes,
+        "projects": selected_projects,
+        "recent": selected_recent,
+        "workstreams": selected_workstreams,
+        "work_targets": selected_work_targets,
+        "personal_placement": workspace.get("personal_placement").cloned().unwrap_or(serde_json::Value::Null),
+        "order": {
+            "archetypes": ids(&archetypes, "id"),
+            "projects": ids(&projects, "id"),
+            "recent": ids(&recent, "id"),
+            "workstreams": ids(&workstreams, "id"),
+            "work_targets": ids(&work_targets, "id"),
+        },
+    }))
+}
+
 // ---- GET /search : content search across chat log + worktree files (SEARCH-1/2) ----
 
 #[derive(Deserialize)]
@@ -141,6 +281,58 @@ pub async fn search(
 pub async fn get_tasks(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
     Json(wb.task_queue_value()).into_response()
+}
+
+/// Who exists and may be given work (`GATE-3f`).
+///
+/// A read-only projection of `Active` memberships (`INV-5`, `INV-20`): the same
+/// list the `ask` tool offers an agent and the same one an assignment resolves
+/// against, so no surface can believe in a person another does not.
+pub async fn get_roster(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    Json(serde_json::json!({ "people": wb.roster() })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct AssignWorkItem {
+    /// The tracker boundary the item lives in.
+    pub boundary_id: String,
+    /// An authority or display name from the roster. Absent or null clears the
+    /// assignment, which means "whoever has access".
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+/// Direct an open issue at someone, or clear it.
+///
+/// Advisory by design (see [`crate::roster`]): it records who *should* act and
+/// never restricts who may claim. An assignee who is away must not be able to
+/// strand work in a queue whose premise is that anyone with access can pick it
+/// up — exclusivity is what `claim` provides, and it is earned by taking the
+/// work rather than granted by being named.
+pub async fn assign_work_item(
+    State(wb): State<SharedWorkbench>,
+    Path(item_id): Path<String>,
+    Json(request): Json<AssignWorkItem>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.assign_work_item(&request.boundary_id, &item_id, request.to.as_deref()) {
+        Ok(assignee) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "item": item_id, "assigned_to": assignee })),
+        )
+            .into_response(),
+        Err(error @ crate::roster::AssignError::NotOnRoster { .. }) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 // ---- agents --------------------------------------------------------------
@@ -277,6 +469,54 @@ pub async fn get_agent(
     }
 }
 
+pub async fn get_archetype_abilities(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    match wb.archetype_abilities(&id) {
+        Ok(abilities) => Json(json!({ "abilities": abilities })).into_response(),
+        Err(error) if error == "no such archetype" => {
+            (StatusCode::NOT_FOUND, Json(json!({ "error": error }))).into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpdateArchetypeAbilities {
+    pub abilities: Vec<String>,
+}
+
+pub async fn put_archetype_abilities(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateArchetypeAbilities>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.set_archetype_abilities(&id, body.abilities) {
+        Ok(abilities) => Json(json!({ "abilities": abilities })).into_response(),
+        Err(error) if error == "no such archetype" => {
+            (StatusCode::NOT_FOUND, Json(json!({ "error": error }))).into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response(),
+    }
+}
+
+pub async fn get_placement_abilities(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    match wb.placement_abilities(&id) {
+        Ok(abilities) => Json(json!({ "abilities": abilities })).into_response(),
+        Err(error) if error == "no such placement" => {
+            (StatusCode::NOT_FOUND, Json(json!({ "error": error }))).into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct UpdateAgent {
     pub name: Option<String>,
@@ -346,6 +586,11 @@ pub async fn delete_agent(
 #[derive(Deserialize)]
 pub struct CreateProject {
     pub name: String,
+    /// The Home selected by the client. Omitting it means the Home receiving
+    /// this command; asserting another Home fails closed rather than creating a
+    /// locally stored project with a remote ownership label.
+    #[serde(default)]
+    pub home_id: Option<gaugewright_core::ids::HomeId>,
 }
 
 /// `GET /projects/:id/home` — the **project-home rollup** (`UX-2`, `mvp-workbench.md` "Project
@@ -378,23 +623,49 @@ pub async fn project_home(
 pub async fn create_project(
     State(wb): State<SharedWorkbench>,
     Json(body): Json<CreateProject>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let mut wb = wb.lock_unpoisoned();
+    let home_id = body.home_id.unwrap_or_else(|| wb.home_id().clone());
+    if &home_id != wb.home_id() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "create the project through its selected Home",
+                "selected_home": home_id.as_str(),
+                "serving_home": wb.home_id().as_str(),
+            })),
+        )
+            .into_response();
+    }
     let id = gen_id("proj");
     write_project(
         &mut wb,
         ProjectRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: id.clone(),
             op: RecordOp::Upsert,
             name: body.name.clone(),
             is_default: false,
+            home_id: home_id.clone(),
             network_isolated: false,
             run_purpose: None,
             deployment_mode: None,
         },
     );
+    let target_id = match wb.create_managed_project_target(&id, format!("{} files", body.name)) {
+        Ok(target_id) => target_id,
+        Err(error) => {
+            wb.delete_project_cascade(&id);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response();
+        }
+    };
     // Every project gets a built-in general placement at creation — the default
-    // archetype installed on it under a deterministic id, mirroring the hidden Personal
+    // archetype installed on it under a deterministic id, mirroring the Personal
     // project. A project is therefore a real placement home the moment it exists: it
     // hosts plain work chats and workstreams with no manual "place an archetype" step,
     // and the nav shows those chats directly under the project (the general placement is
@@ -407,7 +678,13 @@ pub async fn create_project(
     wb.advance_onboarding("project", &json!({ "project": id }).to_string());
     (
         StatusCode::CREATED,
-        Json(json!({ "id": id, "name": body.name, "placement": placement })),
+        Json(json!({
+            "id": id,
+            "name": body.name,
+            "home_id": home_id.as_str(),
+            "placement": placement,
+            "target_id": target_id,
+        })),
     )
         .into_response()
 }
@@ -497,12 +774,11 @@ pub struct BindAgent {
     pub agent_id: String,
 }
 
-/// Bind a library agent into a project: create a *using* instance (its own repo).
 /// Create a **placement** (a Using instance) of `agent_id` on `project_id`, returning
 /// the new instance id. Shared by explicit binding (a named project, [`bind_agent`])
 /// and the **eager Personal placement** minted when an archetype is created
 /// ([`create_agent`]/[`fork_archetype`]) so every archetype is immediately usable in
-/// the hidden Personal project with no placement ceremony (ADR 0045/0036).
+/// the explicit Personal project with no placement ceremony (ADR 0045/0036/0096).
 /// The stable id of a project's **built-in general placement** — the auto-created
 /// default-archetype placement every project gets (primitives/project.md). Deterministic
 /// from the project id so the projection can flag it (and the nav hide it) without a
@@ -589,7 +865,7 @@ pub async fn post_publish_archetype(
             .into_response(),
         Err(PublishArchetypeError::InvalidPackage(error)) => (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": format!("invalid WhippleScript package: {error}") })),
+            Json(json!({ "error": format!("invalid archetype version: {error}") })),
         )
             .into_response(),
         Err(PublishArchetypeError::Workspace(error)) => {
@@ -599,8 +875,8 @@ pub async fn post_publish_archetype(
 }
 
 /// Upgrade a placement to its archetype's current published version (`UX-9`, manual default).
-/// Idempotent — a placement already current stays put. (Content reconciliation on a diverged
-/// placement is a follow-on per [ADR 0063]; this re-points the version pointer.)
+/// Idempotent — a placement already current stays put. Diverged content is reconciled through
+/// the workspace pull before the version pointer moves; conflicts fail closed.
 /// Accept a pending placement (`APPROVE-1`, ADR 0064): the project owner's second
 /// explicit act, flipping it `Pending → Active` so it can host work chats. Idempotent on
 /// an already-active placement; 404 on an unknown one.
@@ -645,25 +921,22 @@ pub async fn post_upgrade_placement(
             Json(json!({ "error": error })),
         )
             .into_response(),
-        Err(UpgradePlacementError::Conflict) => (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "the placement conflicts with this package upgrade" })),
-        )
-            .into_response(),
-        Err(UpgradePlacementError::Workspace(error)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error })),
-        )
-            .into_response(),
     }
 }
 
 /// Unbind: tear down a using instance (and its chats).
 pub async fn unbind_agent(
     State(wb): State<SharedWorkbench>,
-    Path((_pid, iid)): Path<(String, String)>,
+    Path((pid, iid)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if wb.placement_project_id(&iid) != Some(pid.as_str()) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such placement in project" })),
+        )
+            .into_response();
+    }
     if wb.unbind_instance(&iid) {
         (StatusCode::OK, Json(json!({ "unbound": iid }))).into_response()
     } else {
@@ -681,6 +954,11 @@ pub async fn unbind_agent(
 pub struct CreateChat {
     #[serde(default = "default_title")]
     pub title: String,
+    /// Work chats may select any target explicitly eligible for the placement.
+    /// Edit chats ignore this only when absent and use their archetype-owned
+    /// managed authoring target.
+    #[serde(default)]
+    pub target_id: Option<String>,
 }
 fn default_title() -> String {
     "new chat".into()
@@ -711,22 +989,41 @@ pub async fn create_chat_under_agent(
 /// New chat under a project's using-instance.
 pub async fn create_chat_under_instance(
     State(wb): State<SharedWorkbench>,
-    Path((_pid, iid)): Path<(String, String)>,
+    Path((pid, iid)): Path<(String, String)>,
     Json(body): Json<CreateChat>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    match create_chat_in(&mut wb, &iid, &body.title) {
-        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
+    if wb.placement_project_id(&iid) != Some(pid.as_str()) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such placement in project" })),
         )
-            .into_response(),
+            .into_response();
+    }
+    let Some(target_id) = body.target_id.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "target_id is required" })),
+        )
+            .into_response();
+    };
+    match create_chat_in(&mut wb, &iid, &body.title, Some(target_id)) {
+        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Err(e) => {
+            let status = if e == "no such instance" {
+                StatusCode::NOT_FOUND
+            } else if e == "work target storage is not open" {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(json!({ "error": e }))).into_response()
+        }
     }
 }
 
 /// **Use** an archetype with no placement ceremony (ADR 0045/0036): open a *work*
-/// chat rooted on the archetype's placement in the hidden Personal project. The
+/// chat rooted on the archetype's placement in the explicit Personal project. The
 /// placement is minted eagerly at creation; this finds it (and lazily creates it
 /// for archetypes that predate eager placement), then roots a chat on it.
 pub async fn use_archetype(
@@ -762,7 +1059,7 @@ pub async fn fork_chat(
     match wb.fork_chat(&id) {
         Ok(forked) => (
             StatusCode::CREATED,
-            Json(json!({ "id": forked.id, "title": forked.title, "forked_from": forked.forked_from })),
+            Json(json!({ "id": forked.id, "title": forked.title, "forked_from": forked.forked_from, "forked_from_entry": forked.forked_from_entry })),
         )
             .into_response(),
         Err(ForkChatError::NotFound) => (
@@ -790,6 +1087,60 @@ pub async fn fork_chat(
             Json(json!({ "error": e })),
         )
             .into_response(),
+        Err(ForkChatError::PointNotForkable) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "transcript entry is not a durable fork point" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Fork immediately before a durable user entry or immediately after a
+/// durable assistant entry (ADR 0073).
+pub async fn fork_chat_at(
+    State(wb): State<SharedWorkbench>,
+    Path((id, entry_id)): Path<(String, i64)>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.fork_chat_at(&id, entry_id) {
+        Ok(forked) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "id": forked.id,
+                "title": forked.title,
+                "forked_from": forked.forked_from,
+                "forked_from_entry": forked.forked_from_entry,
+            })),
+        )
+            .into_response(),
+        Err(ForkChatError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such chat" })),
+        )
+            .into_response(),
+        Err(ForkChatError::PointNotForkable) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "transcript entry is not a durable fork point" })),
+        )
+            .into_response(),
+        Err(ForkChatError::SourceNotLive) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "source chat not live" })),
+        )
+            .into_response(),
+        Err(ForkChatError::InstanceNotOpen) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "instance not open" })),
+        )
+            .into_response(),
+        Err(ForkChatError::Create(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+            .into_response(),
+        Err(ForkChatError::Continuity(error)) => {
+            (StatusCode::CONFLICT, Json(json!({ "error": error }))).into_response()
+        }
     }
 }
 
@@ -1098,7 +1449,10 @@ mod tests {
     use gaugewright_core::boundary_lifecycle::{Operator, Placement};
     use http_body_util::BodyExt;
     use std::collections::BTreeSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    };
     use tower::ServiceExt;
 
     const BID: &str = "boundary-chat-1";
@@ -1184,10 +1538,15 @@ mod tests {
     }
 
     async fn post(app: &Router, uri: &str, body: &str) -> (StatusCode, String) {
+        static KEY: AtomicU64 = AtomicU64::new(1);
         let req = Request::builder()
             .method("POST")
             .uri(uri)
             .header("content-type", "application/json")
+            .header(
+                "idempotency-key",
+                format!("library-route-test-{}", KEY.fetch_add(1, Ordering::Relaxed)),
+            )
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -1305,7 +1664,8 @@ mod tests {
             let mut b = Request::builder()
                 .method("POST")
                 .uri("/boundaries/boundary-chat-1/accept")
-                .header("content-type", "application/json");
+                .header("content-type", "application/json")
+                .header("idempotency-key", "enterprise-boundary-accept");
             if let Some(t) = bearer {
                 b = b.header("authorization", format!("Bearer {t}"));
             }
@@ -1663,12 +2023,15 @@ mod search_tests {
 
     fn chat(id: &str, title: &str, pos: i64) -> ChatRecord {
         ChatRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: id.into(),
             op: Default::default(),
             instance_id: "i1".into(),
             title: title.into(),
             created_position: pos,
             forked_from: None,
+            forked_from_entry: None,
         }
     }
 
@@ -1736,7 +2099,7 @@ mod search_tests {
         let dir = tempfile::tempdir().unwrap();
         let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let store = Store::open_in_memory().unwrap();
-        let mut wb = Workbench::with_instance("inst-test", instance, store);
+        let mut wb = Workbench::with_target("inst-test", instance, store);
         wb.create_default_engagement("chat-f".into(), "files chat".into())
             .unwrap_or_else(|_| panic!("create default engagement"));
         {
@@ -1835,7 +2198,7 @@ mod search_tests {
         let dir = tempfile::tempdir().unwrap();
         let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let store = Store::open_in_memory().unwrap();
-        let mut wb = Workbench::with_instance("inst-test", instance, store);
+        let mut wb = Workbench::with_target("inst-test", instance, store);
         wb.create_default_engagement("chat-both".into(), "both tiers".into())
             .unwrap_or_else(|_| panic!("create default engagement"));
         wb.engagements

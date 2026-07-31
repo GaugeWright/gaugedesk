@@ -9,6 +9,7 @@ import {
     modelOptions,
     parseEnabledModels,
     pickableModels,
+    providerTakesCustomModel,
     serializeEnabledModels,
     thinkingLevelsFor,
 } from "./model-picker";
@@ -127,6 +128,28 @@ describe("model-picker", () => {
         expect(keys.has(modelKey({ id: "gpt-5.5", provider: "openai-codex" }))).toBe(true);
         expect(keys.has(modelKey({ id: "claude-opus-4-6", provider: "anthropic" }))).toBe(true);
         expect(keys.has(modelKey({ id: "gpt-4o", provider: "openai-codex" }))).toBe(false);
+    });
+});
+
+describe("openai-generic custom model (ADR 0083)", () => {
+    it("marks openai-generic as a free-text-model provider", () => {
+        expect(providerTakesCustomModel("openai-generic")).toBe(true);
+        expect(providerTakesCustomModel("openai")).toBe(false);
+        expect(providerTakesCustomModel("anthropic")).toBe(false);
+    });
+
+    it("keeps an openai-generic pin visible though it has no catalog entry", () => {
+        const opts = modelOptions(
+            ["openai-generic"],
+            null,
+            { id: "llama-3.3-70b", provider: "openai-generic" },
+            CAT,
+        );
+        // No catalog rows for openai-generic, but the pinned custom model survives so the
+        // <select> reflects the chat's real config (label = the raw id).
+        expect(opts.map((o) => o.label)).toEqual(["Default", "llama-3.3-70b"]);
+        const pinned = opts.find((o) => o.provider === "openai-generic");
+        expect(pinned).toMatchObject({ id: "llama-3.3-70b", provider: "openai-generic" });
     });
 });
 

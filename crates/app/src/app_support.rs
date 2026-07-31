@@ -38,39 +38,86 @@ impl<T> LockUnpoisoned<T> for Mutex<T> {
 
 /// The stable id of the seeded default archetype's repo.
 pub const DEFAULT_INSTANCE: &str = "inst-default";
-/// The stable id of the seeded default archetype (ADR 0035).
+/// The stable id of the seeded Default archetype (ADR 0035).
 pub const DEFAULT_AGENT: &str = "agent-default";
+pub const SOFTWARE_ENGINEER_AGENT: &str = "agent-software-engineer";
+pub const OFFICE_WORKER_AGENT: &str = "agent-office-worker";
 /// The hidden default "Personal" project (ADR 0036).
 pub const DEFAULT_PROJECT: &str = "proj-default";
 /// The default archetype placement on the default "Personal" project.
 pub const DEFAULT_PLACEMENT: &str = "inst-placement-default";
 
-/// Starter method definition for the default agent (ADR 0029).
-pub(crate) const DEFAULT_AGENT_SYSTEM_MD: &str = "\
-You are **assistant**, a general-purpose agent built and run inside gaugewright.
+pub struct BuiltinArchetype {
+    pub id: &'static str,
+    pub name: &'static str,
+    system: &'static str,
+    instructions: &'static str,
+    pub official_skills: bool,
+}
 
-Be concise and direct. Use the workspace's own files and conventions; do the task
-you are given. To change *how you behave* — your instructions, tools, or policy —
-the user opens an **edit** chat; in a normal (use) chat your own definition is
-read-only.
+/// Starter method definitions for the built-in library archetypes.
+pub(crate) const DEFAULT_AGENT_SYSTEM_MD: &str = "\
+You are a general-purpose assistant. Work carefully and directly on the task.
+";
+
+pub(crate) const SOFTWARE_ENGINEER_SYSTEM_MD: &str = "\
+You are a software engineer. Understand the codebase, make focused changes, and verify them.
+";
+
+pub(crate) const OFFICE_WORKER_SYSTEM_MD: &str = "\
+You are an office worker. For document work, read the applicable guide in .gaugedesk-runtime/discipline/official-skills/.
 ";
 
 pub(crate) const DEFAULT_AGENT_AGENTS_MD: &str = "\
 # Agent conventions
 
-Working notes and conventions for this agent. Edit this file (in an edit chat) to
-teach the agent project-specific commands, safety rules, and preferences.
+Use the workspace's own files and conventions. Your definition is read-only in
+a work chat; edit it only in an edit chat.
 ";
+
+const BUILTIN_ARCHETYPES: [BuiltinArchetype; 3] = [
+    BuiltinArchetype {
+        id: DEFAULT_AGENT,
+        name: "Default",
+        system: DEFAULT_AGENT_SYSTEM_MD,
+        instructions: DEFAULT_AGENT_AGENTS_MD,
+        official_skills: false,
+    },
+    BuiltinArchetype {
+        id: SOFTWARE_ENGINEER_AGENT,
+        name: "Software engineer",
+        system: SOFTWARE_ENGINEER_SYSTEM_MD,
+        instructions: DEFAULT_AGENT_AGENTS_MD,
+        official_skills: false,
+    },
+    BuiltinArchetype {
+        id: OFFICE_WORKER_AGENT,
+        name: "Office worker",
+        system: OFFICE_WORKER_SYSTEM_MD,
+        instructions: DEFAULT_AGENT_AGENTS_MD,
+        official_skills: true,
+    },
+];
+
+pub(crate) fn builtin_archetypes() -> &'static [BuiltinArchetype] {
+    &BUILTIN_ARCHETYPES
+}
+
+pub(crate) fn builtin_agent_definition(
+    archetype: &BuiltinArchetype,
+) -> gaugewright_boundary::definition::AgentDefinition {
+    gaugewright_boundary::definition::AgentDefinition {
+        system: archetype.system.into(),
+        instructions: archetype.instructions.into(),
+        config: None,
+    }
+}
 
 /// The seeded default agent as the neutral definition (ADR 0029/0035): the one
 /// constructor both seeding paths materialize via
 /// [`AgentDefinition::seed_files`](gaugewright_boundary::definition::AgentDefinition::seed_files).
 pub(crate) fn default_agent_definition() -> gaugewright_boundary::definition::AgentDefinition {
-    gaugewright_boundary::definition::AgentDefinition {
-        system: DEFAULT_AGENT_SYSTEM_MD.into(),
-        instructions: DEFAULT_AGENT_AGENTS_MD.into(),
-        config: None,
-    }
+    builtin_agent_definition(&BUILTIN_ARCHETYPES[0])
 }
 
 /// The single local user authority — the owner of context opened in the
@@ -118,23 +165,78 @@ pub(crate) fn io<E: std::fmt::Debug>(e: E) -> std::io::Error {
 pub(crate) fn prepare_workbench_root(root: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(root)?;
     let root = root.canonicalize()?;
-    let instances_dir = root.join("instances");
-    std::fs::create_dir_all(&instances_dir)?;
-    Ok((root, instances_dir))
+    let targets_dir = root.join("targets");
+    std::fs::create_dir_all(&targets_dir)?;
+    Ok((root, targets_dir))
 }
 
 impl Workbench {
-    pub(crate) fn whip_harness_factory(
+    /// Immutable package identity and declared WhippleScript effects for a
+    /// work chat. Managed execution uses this before acknowledging a command so
+    /// the selected profile and its outer grant cannot drift from the package
+    /// the shared engine later opens.
+    pub fn runtime_package_descriptor_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> std::io::Result<Option<RuntimePackageDescriptor>> {
+        let Some((version, expected_ref)) = self.package_selection_for_chat(chat_id) else {
+            return Ok(None);
+        };
+        let root = self
+            .package_root_for_chat(chat_id, version)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "selected WhippleScript package is unavailable",
+                )
+            })?;
+        let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(&root)
+            .map_err(std::io::Error::other)?;
+        if package.version_ref() != expected_ref {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "selected WhippleScript package bytes do not match their pinned reference",
+            ));
+        }
+        Ok(Some(RuntimePackageDescriptor {
+            package_ref: expected_ref,
+            capabilities: package.capabilities().to_vec(),
+        }))
+    }
+
+    pub fn whip_harness_factory(
         &self,
     ) -> std::io::Result<gaugewright_whip_runtime::WhipHarnessFactory> {
         let signing_key =
             gaugewright_core::signature::SigningKey::from_seed(&self.governance_seed())
                 .map_err(|error| std::io::Error::other(error.reason))?;
-        Ok(gaugewright_whip_runtime::WhipHarnessFactory::new(
+        let factory = gaugewright_whip_runtime::WhipHarnessFactory::new(
             self.authority().clone(),
             signing_key,
             self.root_path().join("whip-runtimes"),
-        ))
+        );
+        match std::env::var("GAUGEWRIGHT_DO_HOST_URL") {
+            Ok(url) if !url.trim().is_empty() => {
+                let token = std::env::var("GAUGEWRIGHT_DO_HOST_TOKEN").map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "GAUGEWRIGHT_DO_HOST_TOKEN is required with GAUGEWRIGHT_DO_HOST_URL",
+                    )
+                })?;
+                let tenant = std::env::var("GAUGEWRIGHT_DO_TENANT").map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "GAUGEWRIGHT_DO_TENANT is required with GAUGEWRIGHT_DO_HOST_URL",
+                    )
+                })?;
+                Ok(
+                    factory.with_do_host(gaugewright_whip_runtime::DoHostConfig::new(
+                        url, token, tenant,
+                    )?),
+                )
+            }
+            _ => Ok(factory),
+        }
     }
 
     /// Set how attested acceptance verifies quotes (C-3). Production reads
@@ -202,4 +304,10 @@ impl Workbench {
     pub(crate) fn store_mut_and_sealed_keys(&mut self) -> (&mut Store, &LoopbackKeyReleaseService) {
         (&mut self.store, &self.sealed_keys)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimePackageDescriptor {
+    pub package_ref: String,
+    pub capabilities: Vec<String>,
 }

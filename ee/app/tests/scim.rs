@@ -3,26 +3,69 @@
 //! deprovision via DELETE — asserting the offboarding marks the member
 //! deprovisioned and SCIM-managed.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tower::ServiceExt;
 
+use gaugewright_app::org::{tenant_scope, MembershipRecord, MembershipStatus, RecordOp, ORG_ID};
 use gaugewright_app::Workbench;
 use gaugewright_ee::org_routes::enterprise_control_plane;
 use gaugewright_store::Store;
 use gaugewright_workspace::Instance;
 
+mod support;
+use support::{administration_command, administration_document};
+
 fn workbench() -> (tempfile::TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();
     let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
-    let store = Store::open_in_memory().unwrap();
-    let wb = Workbench::with_instance("inst-test", instance, store);
+    let mut store = Store::open_in_memory().unwrap();
+    for tenant in ["", "acme", "globex"] {
+        store
+            .append_record(
+                &tenant_scope(tenant),
+                "membership",
+                &serde_json::to_string(&MembershipRecord {
+                    id: "local-user".into(),
+                    op: RecordOp::Upsert,
+                    org_id: ORG_ID.into(),
+                    authority: "local-user".into(),
+                    email: "owner@example.test".into(),
+                    role: "owner".into(),
+                    status: MembershipStatus::Active,
+                    managed_by_scim: false,
+                    team: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    let wb = Workbench::with_target("inst-test", instance, store);
     (dir, enterprise_control_plane(Arc::new(Mutex::new(wb))))
+}
+
+async fn rotate_token(app: &Router, tenant: Option<&str>) -> (StatusCode, Value) {
+    administration_command(
+        app,
+        tenant,
+        None,
+        "administration.identity",
+        "scim-token.rotate",
+        json!({}),
+    )
+    .await
+}
+
+async fn access_document(app: &Router) -> (StatusCode, Value) {
+    let (status, response) =
+        administration_document(app, None, None, "administration.access").await;
+    (status, response["document"]["content"].clone())
 }
 
 async fn send(
@@ -33,6 +76,13 @@ async fn send(
     token: Option<&str>,
 ) -> (StatusCode, Value) {
     let mut b = Request::builder().method(method).uri(uri);
+    static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+    if method != "GET" && method != "HEAD" && method != "OPTIONS" {
+        b = b.header(
+            "idempotency-key",
+            format!("scim-test-{}", NEXT_KEY.fetch_add(1, Ordering::Relaxed)),
+        );
+    }
     if let Some(t) = token {
         b = b.header("authorization", format!("Bearer {t}"));
     }
@@ -65,6 +115,16 @@ async fn send_t(
         .method(method)
         .uri(uri)
         .header("x-gaugewright-tenant", tenant);
+    static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+    if method != "GET" && method != "HEAD" && method != "OPTIONS" {
+        b = b.header(
+            "idempotency-key",
+            format!(
+                "scim-tenant-test-{}",
+                NEXT_KEY.fetch_add(1, Ordering::Relaxed)
+            ),
+        );
+    }
     if let Some(t) = token {
         b = b.header("authorization", format!("Bearer {t}"));
     }
@@ -121,15 +181,11 @@ async fn scim_tokens_are_tenant_isolated() {
     // DEPLOY-6 tail: a SCIM token issued for one tenant must NOT authenticate for another,
     // and provisioning lands in the issuing tenant's directory.
     let (_dir, app) = workbench();
-    let token_a = send_t(&app, "POST", "/admin/scim/token", "acme", None, None)
-        .await
-        .1["token"]
+    let token_a = rotate_token(&app, Some("acme")).await.1["result"]["token"]
         .as_str()
         .unwrap()
         .to_string();
-    let token_g = send_t(&app, "POST", "/admin/scim/token", "globex", None, None)
-        .await
-        .1["token"]
+    let token_g = rotate_token(&app, Some("globex")).await.1["result"]["token"]
         .as_str()
         .unwrap()
         .to_string();
@@ -174,10 +230,13 @@ async fn scim_tokens_are_tenant_isolated() {
 async fn scim_provision_and_deprovision() {
     let (_dir, app) = workbench();
 
-    // Admin issues a SCIM token (ungated in single-user mode); plaintext returned once.
-    let (s, body) = send(&app, "POST", "/admin/scim/token", None, None).await;
+    // Administration issues a SCIM token after human review; plaintext returns once.
+    let (s, body) = rotate_token(&app, None).await;
     assert_eq!(s, StatusCode::OK);
-    let token = body["token"].as_str().expect("token issued").to_string();
+    let token = body["result"]["token"]
+        .as_str()
+        .expect("token issued")
+        .to_string();
     assert!(!token.is_empty());
 
     // A bad token cannot provision.
@@ -216,7 +275,7 @@ async fn scim_provision_and_deprovision() {
     assert_eq!(body["active"], true);
 
     // It shows up in the directory, SCIM-managed and active.
-    let (s, body) = send(&app, "GET", "/admin/members", None, None).await;
+    let (s, body) = access_document(&app).await;
     assert_eq!(s, StatusCode::OK);
     let members = body["members"].as_array().unwrap();
     let alice = members
@@ -238,7 +297,7 @@ async fn scim_provision_and_deprovision() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["active"], false);
 
-    let (_s, body) = send(&app, "GET", "/admin/members", None, None).await;
+    let (_s, body) = access_document(&app).await;
     let alice = body["members"]
         .as_array()
         .unwrap()
@@ -253,18 +312,19 @@ async fn scim_provision_and_deprovision() {
 async fn scim_groups_map_to_roles() {
     let (_dir, app) = workbench();
     // Admin configures a group → role/team mapping (ungated single-user).
-    let (s, _) = send(
+    let (s, _) = administration_command(
         &app,
-        "POST",
-        "/admin/scim/group-mapping",
-        Some(r#"{"group":"Engineering","role":"admin","team":"eng"}"#),
         None,
+        None,
+        "administration.identity",
+        "group-mapping.set",
+        json!({"group":"Engineering","role":"admin","team":"eng"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
 
-    let (_s, body) = send(&app, "POST", "/admin/scim/token", None, None).await;
-    let token = body["token"].as_str().unwrap().to_string();
+    let (_s, body) = rotate_token(&app, None).await;
+    let token = body["result"]["token"].as_str().unwrap().to_string();
 
     // A user provisioned with that group takes the mapped role/team.
     let (s, _) = send(
@@ -277,7 +337,7 @@ async fn scim_groups_map_to_roles() {
     .await;
     assert_eq!(s, StatusCode::CREATED);
 
-    let (_s, body) = send(&app, "GET", "/admin/members", None, None).await;
+    let (_s, body) = access_document(&app).await;
     let m = body["members"]
         .as_array()
         .unwrap()
@@ -297,7 +357,7 @@ async fn scim_groups_map_to_roles() {
         Some(&token),
     )
     .await;
-    let (_s, body) = send(&app, "GET", "/admin/members", None, None).await;
+    let (_s, body) = access_document(&app).await;
     let x = body["members"]
         .as_array()
         .unwrap()
@@ -311,10 +371,10 @@ async fn scim_groups_map_to_roles() {
 #[tokio::test]
 async fn rotating_the_token_invalidates_the_old_one() {
     let (_dir, app) = workbench();
-    let (_s, body) = send(&app, "POST", "/admin/scim/token", None, None).await;
-    let first = body["token"].as_str().unwrap().to_string();
-    let (_s, body) = send(&app, "POST", "/admin/scim/token", None, None).await;
-    let second = body["token"].as_str().unwrap().to_string();
+    let (_s, body) = rotate_token(&app, None).await;
+    let first = body["result"]["token"].as_str().unwrap().to_string();
+    let (_s, body) = rotate_token(&app, None).await;
+    let second = body["result"]["token"].as_str().unwrap().to_string();
     assert_ne!(first, second);
 
     // The old token no longer authenticates; the new one does.
@@ -344,8 +404,8 @@ async fn rotating_the_token_invalidates_the_old_one() {
 #[tokio::test]
 async fn scim_patchop_envelope_deprovisions() {
     let (_dir, app) = workbench();
-    let (_, body) = send(&app, "POST", "/admin/scim/token", None, None).await;
-    let token = body["token"].as_str().unwrap().to_string();
+    let (_, body) = rotate_token(&app, None).await;
+    let token = body["result"]["token"].as_str().unwrap().to_string();
 
     // Provision an active member.
     let (s, _) = send(
@@ -373,7 +433,7 @@ async fn scim_patchop_envelope_deprovisions() {
     assert_eq!(body["active"], false);
 
     // The directory reflects the deprovision (standing revoked).
-    let (_, body) = send(&app, "GET", "/admin/members", None, None).await;
+    let (_, body) = access_document(&app).await;
     let bob = body["members"]
         .as_array()
         .unwrap()

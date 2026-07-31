@@ -17,11 +17,13 @@
 
 import { createSignal, onCleanup, Show, type JSX } from "solid-js";
 import { waitForCodexLink } from "./codex-link-poll";
+import type { CodexLoginStart, CodexStatus } from "@gaugewright/control-plane-client";
 
 /** The slice of the control-plane API this flow needs. */
 export interface FirstRunApi {
-    codexLoginStart(): Promise<{ url: string }>;
-    codexStatus(): Promise<{ linked: boolean; expired: boolean }>;
+    codexLoginStart(): Promise<CodexLoginStart>;
+    codexLoginCancel(): Promise<void>;
+    codexStatus(): Promise<CodexStatus>;
     accountLinkCredential(provider: string, token: string): Promise<void>;
 }
 
@@ -35,7 +37,7 @@ export function FirstRunOverlay(props: {
     api: FirstRunApi;
     /** Product name to greet with (e.g. "GaugeDesk"). */
     productName: string;
-    /** Whether this runtime can complete the local Codex OAuth helper flow. */
+    /** Whether this runtime offers an OpenAI authorization flow. */
     codexLoginAvailable?: boolean;
     /** A credential was just linked — the host refetches status, which dismisses us. */
     onConnected: () => void;
@@ -47,6 +49,7 @@ export function FirstRunOverlay(props: {
     const [busy, setBusy] = createSignal(false);
     const [status, setStatus] = createSignal("");
     const [authUrl, setAuthUrl] = createSignal("");
+    const [deviceCode, setDeviceCode] = createSignal("");
 
     const linkKey = async (e: Event) => {
         e.preventDefault();
@@ -91,16 +94,32 @@ export function FirstRunOverlay(props: {
         setBusy(true);
         setStatus("starting OpenAI sign-in…");
         setAuthUrl("");
+        setDeviceCode("");
         try {
-            const { url } = await props.api.codexLoginStart();
+            const login = await props.api.codexLoginStart();
+            const url = login.mode === "browser" ? login.url : login.login.verificationUrl;
             setAuthUrl(url);
+            if (login.mode === "device") setDeviceCode(login.login.userCode);
             window.open(url, "_blank", "noopener,noreferrer");
-            setStatus("finish signing in in the new tab — this screen continues by itself");
+            setStatus(login.mode === "device"
+                ? `enter code ${login.login.userCode} on the OpenAI page — this screen continues by itself`
+                : "finish signing in in the new tab — this screen continues by itself");
             void watchForLink();
         } catch (err) {
             setStatus(`couldn't start sign-in — ${String(err)}`);
         } finally {
             setBusy(false);
+        }
+    };
+
+    const cancelCodex = async () => {
+        try {
+            await props.api.codexLoginCancel();
+            setAuthUrl("");
+            setDeviceCode("");
+            setStatus("OpenAI sign-in cancelled");
+        } catch (err) {
+            setStatus(`couldn't cancel sign-in — ${String(err)}`);
         }
     };
 
@@ -165,6 +184,9 @@ export function FirstRunOverlay(props: {
                     </button>
                     <Show when={authUrl()}>
                         <div class="firstrun-codex-follow">
+                            <Show when={deviceCode()}>
+                                <span>Code: <code data-firstrun-codex-device-code>{deviceCode()}</code></span>
+                            </Show>
                             <a href={authUrl()} target="_blank" rel="noopener noreferrer">
                                 Open the sign-in page
                             </a>
@@ -176,8 +198,24 @@ export function FirstRunOverlay(props: {
                             >
                                 Continue
                             </button>
+                            <Show when={deviceCode()}>
+                                <button
+                                    class="firstrun-codex-continue"
+                                    data-firstrun-codex-cancel
+                                    type="button"
+                                    onClick={cancelCodex}
+                                >
+                                    Cancel
+                                </button>
+                            </Show>
                         </div>
                     </Show>
+                </Show>
+                <Show when={!(props.codexLoginAvailable ?? true)}>
+                    <p class="firstrun-note" data-codex-oauth-unavailable>
+                        GaugeWright sign-in and OpenAI authorization are separate. Connect an API
+                        key here, or enable OpenAI account sign-in for this runtime.
+                    </p>
                 </Show>
 
                 <Show when={status()}>

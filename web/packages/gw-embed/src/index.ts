@@ -10,9 +10,16 @@ registerEmbedElements();
 
 export { registerEmbedElements } from "./elements";
 export { GwSessionElement, GwChatElement, GwViewerElement, GwFilesElement, GwChatsElement } from "./elements";
-export { EmbedControlPlane, controlPlaneBase } from "./embed-control-plane";
-export type { EmbedSessionApi } from "./embed-control-plane";
-export { createRemoteSession } from "./remote-session";
-export type { RemoteSessionOptions } from "./remote-session";
+export { EdgeSessionApi } from "./edge-session";
+export type { EdgeUsage, EmbedSessionApi } from "./session-api";
+export { LATENCY_EVENT } from "./latency";
+export type {
+    BrowserLatencyObservation,
+    BrowserLatencyPhase,
+    LatencyObservation,
+    LatencyObserver,
+    ServerLatencyObservation,
+    ServerLatencyPhase,
+} from "./latency";
 export { SessionProvider, useSession } from "@gaugewright/workbench-ui/session-context";
 export type { Session } from "@gaugewright/workbench-ui/session-context";

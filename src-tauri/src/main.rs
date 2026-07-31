@@ -11,8 +11,16 @@
 use tauri::Manager;
 use tauri_plugin_deep_link::DeepLinkExt;
 
+/// The signed updater installs files but deliberately does not decide when to
+/// restart. The workbench invokes this only after an admitted update finishes.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    app.restart();
+}
+
 fn main() {
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![restart_app])
         // FED-7: a `gaugewright://` invite link should reach the RUNNING app, not spawn a
         // duplicate. single-instance MUST be registered first; on Linux/Windows a deep link
         // launches a second instance whose argv carries the URL — focus the existing window and
@@ -28,11 +36,9 @@ fn main() {
         // Native OS folder picker for "add files" (the webview opens a real
         // folder browser; the chosen absolute path is ingested over HTTP).
         .plugin(tauri_plugin_dialog::init())
-        // Self-update (SELFHOST-1 / D-RELEASE-LANES, v0.2.1): checks the GitHub
-        // Release `latest.json` against the pubkey in tauri.conf.json
-        // (plugins.updater); the release lane signs update artifacts with the
-        // matching TAURI_SIGNING_PRIVATE_KEY. The startup check/prompt/apply runs
-        // in `check_for_update`, spawned from the setup hook below.
+        // The signed updater verifies GitHub Release artifacts against the public
+        // key in tauri.conf.json. The workbench owns discovery and consent so it
+        // can also apply an organization's allowed release channels.
         .plugin(tauri_plugin_updater::Builder::new().build())
         // FED-7: register the `gaugewright://` scheme (schemes declared in tauri.conf.json
         // `plugins.deep-link`), so the OS routes invite links to this app.
@@ -77,36 +83,30 @@ fn main() {
                 }
                 None => {
                     // Enterprise: no co-resident control plane; the webview talks to the
-                    // enrolled org control plane. **Seed** that endpoint into the webview at
-                    // launch (DEPLOY-5) — the client's `resolveControlPlaneBase` reads the
-                    // persisted `gw.cp` key, so seeding it here means a fresh enterprise install
-                    // connects to the org CP without first having to run a manual enrollment
-                    // that persisted it. (First-load timing — vs. a refresh — would want an
-                    // initialization script; that needs a windowed run to verify.)
+                    // enrolled org control plane. Its endpoint is injected below as a
+                    // document-start script before the first page parses (DEPLOY-5).
                     eprintln!("enterprise mode: connecting to the enrolled org control plane");
-                    if let Some(script) =
-                        webview_org_cp_script(std::env::var("GAUGEWRIGHT_ORG_CP").ok().as_deref())
-                    {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.eval(&script);
-                        }
-                    }
                 }
             }
 
-            // Self-update (v0.2.1): in a packaged release build, check the signed
-            // GitHub Release `latest.json` on startup and, if a newer version is
-            // available, offer to download + install + relaunch. Best-effort — any
-            // failure degrades to a logged no-op, so a broken or unreachable update
-            // never blocks launch. `tauri dev` (debug) skips it; opt out of a real
-            // build with GAUGEWRIGHT_NO_AUTOUPDATE (e.g. centrally-managed installs).
-            #[cfg(not(debug_assertions))]
-            if std::env::var_os("GAUGEWRIGHT_NO_AUTOUPDATE").is_none() {
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    check_for_update(handle).await;
-                });
+            // DEPLOY-5 first-load correctness: `tauri.conf.json` marks the main window
+            // `create: false`, so setup owns its construction. Add the enterprise endpoint
+            // seed as a Tauri initialization script: it runs after the JS global exists but
+            // before the HTML document is parsed, so the web app's first
+            // `resolveControlPlaneBase` call observes `gw.cp` without a refresh. Solo builds
+            // add no script and retain the configured co-resident default.
+            let window_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|window| window.label == "main")
+                .ok_or("tauri.conf.json is missing the main window")?;
+            let mut window = tauri::WebviewWindowBuilder::from_config(app, window_config)?;
+            if let Some(script) = webview_org_cp_script(org_cp.as_deref()) {
+                window = window.initialization_script(script);
             }
+            window.build()?;
 
             // FED-7: an OS-delivered `gaugewright://` link arrives here — on cold start (the link
             // launched the app) on every OS, and on the running app on macOS. Hand each URL to the
@@ -125,60 +125,6 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running gaugewright desktop");
-}
-
-/// Startup self-update (v0.2.1). Compare the running version against the signed
-/// GitHub Release `latest.json` (endpoint + pubkey in `tauri.conf.json`); on a
-/// newer version, prompt, and if accepted, download + install and relaunch into
-/// it. Every failure path is a logged no-op so a broken or unreachable update
-/// never blocks launch. Release-only (`tauri dev` builds are unsigned and skip
-/// this via the `cfg` at the call site).
-#[cfg(not(debug_assertions))]
-async fn check_for_update(app: tauri::AppHandle) {
-    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
-    use tauri_plugin_updater::UpdaterExt;
-
-    let updater = match app.updater() {
-        Ok(updater) => updater,
-        Err(e) => {
-            eprintln!("[gaugewright] updater unavailable: {e}");
-            return;
-        }
-    };
-    let update = match updater.check().await {
-        Ok(Some(update)) => update,
-        Ok(None) => return, // already on the latest version
-        Err(e) => {
-            eprintln!("[gaugewright] update check failed: {e}");
-            return;
-        }
-    };
-
-    let accepted = app
-        .dialog()
-        .message(format!(
-            "GaugeDesk {} is available (you have {}). Download it and restart to update?",
-            update.version, update.current_version
-        ))
-        .title("Update available")
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "Update".to_string(),
-            "Later".to_string(),
-        ))
-        .blocking_show();
-    if !accepted {
-        return; // "Later" — check again next launch
-    }
-
-    if let Err(e) = update
-        .download_and_install(|_chunk, _total| {}, || {})
-        .await
-    {
-        eprintln!("[gaugewright] update download/install failed: {e}");
-        return;
-    }
-    // Installed — relaunch into the new version.
-    app.restart();
 }
 
 fn open_control_plane_root() -> std::path::PathBuf {

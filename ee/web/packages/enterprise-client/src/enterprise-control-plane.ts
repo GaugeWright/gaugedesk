@@ -1,17 +1,25 @@
 import {
     bearer,
     browserRouteJson,
+    browserRouteRequest,
     controlPlaneBase,
+    listManagementChanges,
+    listManagementAgentMessages,
+    openManagementEnvironment,
+    proposeManagementDocumentChange,
+    readManagementDocument,
+    reviewManagementChange,
+    sendManagementAgentMessage,
+    submitManagementCommand,
+    type ManagementCommandEnvelope,
+    type ManagementEnvironmentSession,
     type RouteJson,
+    type RouteRequest,
 } from "@gaugewright/control-plane-client";
 import * as enterprise from "./control-plane-enterprise";
 import type {
-    ArchetypeApprovalPolicy,
-    Billing,
+    AuditExportFormat,
     EnterpriseAdminApi,
-    OrgSettings,
-    PlacementPolicy,
-    SecurityPolicy,
     SsoConnection,
 } from "./control-plane-enterprise";
 
@@ -19,100 +27,98 @@ export { controlPlaneBase };
 
 export class EnterpriseControlPlane implements EnterpriseAdminApi {
     private readonly json: RouteJson;
+    private readonly request: RouteRequest;
 
-    constructor(base = controlPlaneBase()) {
-        this.json = browserRouteJson(base, { bearer });
+    constructor(
+        base = controlPlaneBase(),
+        options: { readonly tenant?: () => string | null } = {},
+    ) {
+        const normalizedBase = base.replace(/\/+$/, "");
+        const requestOptions = {
+            bearer,
+            tenant: options.tenant,
+        };
+        this.json = browserRouteJson(normalizedBase, requestOptions);
+        this.request = browserRouteRequest(normalizedBase, requestOptions);
     }
 
-    adminGetOrg() {
-        return enterprise.adminGetOrg(this.json);
+    adminCapabilities() {
+        return enterprise.adminCapabilities(this.json);
     }
 
-    adminSetOrg(settings: OrgSettings) {
-        return enterprise.adminSetOrg(this.json, settings);
+    openAdministration(scope?: { readonly kind: "tenant"; readonly id: string }) {
+        return openManagementEnvironment(this.json, "administration", scope);
     }
 
-    adminDomainVerifyToken(domain: string) {
-        return enterprise.adminDomainVerifyToken(this.json, domain);
+    readAdministrationDocument(session: ManagementEnvironmentSession, documentId: string) {
+        return readManagementDocument(this.json, session, documentId);
     }
 
-    adminDomainVerify(domain: string) {
-        return enterprise.adminDomainVerify(this.json, domain);
+    administrationDomainChallenge(session: ManagementEnvironmentSession, domain: string) {
+        const query = new URLSearchParams({ session: session.id, scope: session.scope.id, domain });
+        return this.json("GET", `/environments/administration/domain-verification?${query}`) as Promise<{
+            readonly domain: string;
+            readonly record_name: string;
+            readonly record_type: "TXT";
+            readonly value: string;
+        }>;
     }
 
-    adminGetMembers() {
-        return enterprise.adminGetMembers(this.json);
+    submitAdministrationCommand(envelope: ManagementCommandEnvelope, idempotencyKey: string) {
+        return submitManagementCommand(this.json, envelope, idempotencyKey);
     }
 
-    adminGetSessions() {
-        return enterprise.adminGetSessions(this.json);
+    proposeAdministrationDocumentChange(
+        input: { readonly session: ManagementEnvironmentSession; readonly documentId: string; readonly baseRevision: string; readonly content: unknown; readonly client: "browser" | "edit" | "agent" | "cli" },
+        idempotencyKey: string,
+    ) {
+        return proposeManagementDocumentChange(this.json, input, idempotencyKey);
     }
 
-    adminInvite(member: { authority: string; email?: string; role: string }) {
-        return enterprise.adminInvite(this.json, member);
+    administrationChanges(session: ManagementEnvironmentSession) {
+        return listManagementChanges(this.json, session);
     }
 
-    adminSetRole(id: string, role: string) {
-        return enterprise.adminSetRole(this.json, id, role);
+    reviewAdministrationChange(session: ManagementEnvironmentSession, changeId: string, decision: "accept" | "reject", idempotencyKey: string) {
+        return reviewManagementChange(this.json, session, changeId, decision, idempotencyKey);
     }
 
-    adminDeactivate(id: string) {
-        return enterprise.adminDeactivate(this.json, id);
+    sendAdministrationAgentMessage(session: ManagementEnvironmentSession, message: string) {
+        return sendManagementAgentMessage(this.json, session, message);
+    }
+
+    administrationAgentMessages(session: ManagementEnvironmentSession) {
+        return listManagementAgentMessages(this.json, session);
     }
 
     adminIntegration() {
         return enterprise.adminIntegration(this.json);
     }
 
-    adminGetSso() {
-        return enterprise.adminGetSso(this.json);
-    }
-
-    adminSetSso(connection: SsoConnection) {
-        return enterprise.adminSetSso(this.json, connection);
-    }
-
     adminTestSso(connection: SsoConnection) {
         return enterprise.adminTestSso(this.json, connection);
     }
 
-    adminGetSecurity() {
-        return enterprise.adminGetSecurity(this.json);
+    async exportAdministrationAudit(
+        format: AuditExportFormat,
+        filters: { readonly actor?: string; readonly action?: string } = {},
+    ) {
+        const query = new URLSearchParams({ format });
+        if (filters.actor?.trim()) query.set("actor", filters.actor.trim());
+        if (filters.action?.trim()) query.set("action", filters.action.trim());
+        const response = await this.request(`/admin/audit?${query}`, {
+            headers: { accept: format === "csv" ? "text/csv" : "application/json" },
+        });
+        if (!response.ok) {
+            throw new Error(`GET /admin/audit: ${response.status}`);
+        }
+        return {
+            format,
+            body: await response.text(),
+            contentType: response.headers.get("content-type") ??
+                (format === "csv" ? "text/csv" : "application/json"),
+            filename: `gaugewright-audit.${format}`,
+        } as const;
     }
 
-    adminSetSecurity(policy: SecurityPolicy) {
-        return enterprise.adminSetSecurity(this.json, policy);
-    }
-
-    adminGetArchetypeApproval() {
-        return enterprise.adminGetArchetypeApproval(this.json);
-    }
-
-    adminSetArchetypeApproval(policy: ArchetypeApprovalPolicy) {
-        return enterprise.adminSetArchetypeApproval(this.json, policy);
-    }
-
-    adminGetPlacementPolicy() {
-        return enterprise.adminGetPlacementPolicy(this.json);
-    }
-
-    adminSetPlacementPolicy(policy: PlacementPolicy) {
-        return enterprise.adminSetPlacementPolicy(this.json, policy);
-    }
-
-    adminGetBilling() {
-        return enterprise.adminGetBilling(this.json);
-    }
-
-    adminSetBilling(billing: Billing) {
-        return enterprise.adminSetBilling(this.json, billing);
-    }
-
-    adminGetAudit() {
-        return enterprise.adminGetAudit(this.json);
-    }
-
-    adminIssueScimToken() {
-        return enterprise.adminIssueScimToken(this.json);
-    }
 }

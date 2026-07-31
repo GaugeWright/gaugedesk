@@ -5,7 +5,30 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { plainConfigError, readFormConfig, writeFormConfig } from "./AgentSettings";
+import {
+    AGENT_ABILITY_PRESETS,
+    plainConfigError,
+    readFormConfig,
+    writeFormConfig,
+} from "./AgentSettings";
+
+describe("agent ability presets", () => {
+    it("exposes the four ordered ceilings without ask_human", () => {
+        expect(AGENT_ABILITY_PRESETS.map(({ name, value }) => ({ name, value }))).toEqual([
+            { name: "Chat only", value: [] },
+            { name: "Read workspace", value: ["workspace.read"] },
+            {
+                name: "Create artifacts",
+                value: ["workspace.read", "workspace.write"],
+            },
+            {
+                name: "Run workspace commands",
+                value: ["workspace.read", "workspace.write", "command.run"],
+            },
+        ]);
+        expect(JSON.stringify(AGENT_ABILITY_PRESETS)).not.toContain("ask_human");
+    });
+});
 
 describe("readFormConfig", () => {
     it("falls back to the host default on an empty config", () => {

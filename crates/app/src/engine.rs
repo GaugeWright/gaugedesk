@@ -12,8 +12,11 @@
 //! only sequences them; it owns no protection logic of its own.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::workbench_state::SharedHarness;
 
 /// Test-only **conflict injection** (`UX-7`): when set, a completing turn's merge probe is
 /// forced to `Conflict`, driving the engagement into the isolated/repair-context path
@@ -47,11 +50,13 @@ pub(crate) fn clear_running_turn(id: &str) {
 }
 
 /// The interrupt handle for a running turn, if any.
-pub(crate) fn running_turn_interrupt(id: &str) -> Option<InterruptHandle> {
+pub fn running_turn_interrupt(id: &str) -> Option<InterruptHandle> {
     running_turns().lock_unpoisoned().get(id).cloned()
 }
 
-/// Clear all running-turn interrupt handles, used by the test reset route.
+/// Clear all running-turn interrupt handles, used by the test reset route
+/// (which, like this helper, exists only in debug builds — DR-0054 Phase A).
+#[cfg(debug_assertions)]
 pub(crate) fn clear_running_turns() {
     running_turns().lock_unpoisoned().clear();
 }
@@ -76,6 +81,33 @@ use crate::stream::ServerEvent;
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
 
 impl Workbench {
+    fn record_completed_target_apply(&mut self, id: &str) {
+        self.refresh_work_target_basis_from_chat(id);
+        let Some(binding) = self.library_chat_target_binding(id) else {
+            return;
+        };
+        let candidate = self
+            .engagements
+            .get(id)
+            .and_then(|engagement| engagement.current_cut().ok())
+            .flatten();
+        let resulting_revision = self
+            .library
+            .work_targets
+            .get(&binding.target_id)
+            .and_then(|target| target.current_basis.clone());
+        let _ = self.record_target_act(
+            Some(id),
+            &binding.target_id,
+            crate::target_adapter::TargetActKind::Apply,
+            candidate,
+            Vec::new(),
+            resulting_revision,
+            crate::target_adapter::TargetActStatus::Completed,
+            None,
+        );
+    }
+
     /// Place a chat's runtime in a *different* trust authority: register its
     /// **remote** harness alongside the local sessions (`WORKBENCH-REMOTE-1`). A
     /// chat is local or remote, never both, so an existing local session under the
@@ -88,7 +120,7 @@ impl Workbench {
     ) {
         let chat_id = chat_id.into();
         if let Some(local) = self.sessions.remove(&chat_id) {
-            let _ = local.shutdown();
+            crate::workbench_state::shutdown_shared_harness(local);
         }
         self.remote_sessions.insert(chat_id, harness);
     }
@@ -105,7 +137,8 @@ impl Workbench {
         chat_id: impl Into<String>,
         harness: Box<dyn gaugewright_harness::Harness>,
     ) {
-        self.sessions.insert(chat_id.into(), harness);
+        self.sessions
+            .insert(chat_id.into(), Arc::new(Mutex::new(harness)));
     }
 
     #[cfg(test)]
@@ -128,10 +161,12 @@ impl Workbench {
     }
 
     /// Stop and forget all in-memory local/remote agent sessions before the
-    /// test-only reset swaps the durable workbench state.
+    /// test-only reset swaps the durable workbench state. Debug builds only,
+    /// like the reset route that calls it (DR-0054 Phase A).
+    #[cfg(debug_assertions)]
     pub(crate) fn shutdown_sessions_for_reset(&mut self) {
         for (_, session) in std::mem::take(&mut self.sessions) {
-            let _ = session.shutdown();
+            crate::workbench_state::shutdown_shared_harness(session);
         }
         self.remote_sessions.clear();
     }
@@ -149,7 +184,68 @@ Do not perform end-user tasks in edit mode — refine the agent itself.";
 /// Append a durable transcript record (admitted run evidence) to the engagement's
 /// log — the snapshot the client reduces on load (`app-stack.md`: repairable).
 fn record_transcript(store: &mut Store, scope: &str, event: &ServerEvent) {
-    let _ = store.append_record(scope, "transcript", &event.to_json());
+    let _ = append_transcript(store, scope, event);
+}
+
+fn append_transcript(
+    store: &mut Store,
+    scope: &str,
+    event: &ServerEvent,
+) -> Result<i64, gaugewright_store::AdmitError> {
+    store.append_record(scope, "transcript", &event.to_json())
+}
+
+fn turn_reads(
+    store: &Store,
+    scope: &str,
+    signature: &[gaugewright_harness::OutputFieldFlow],
+) -> Result<Vec<gaugewright_core::resource::ResourceId>, AdmitError> {
+    if signature.is_empty() {
+        // Legacy/test adapters publish no signature. Preserve the existing
+        // conservative rule: every granted context may have flowed.
+        crate::resource_store::granted_context(store, scope)
+    } else {
+        crate::resource_store::certified_output_reads(store, scope, signature)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_turn_summary(
+    store: &mut Store,
+    scope: &str,
+    user_entry_id: i64,
+    receipt_status: crate::turn_summary::ReceiptStatus,
+    error: Option<String>,
+    diff: &str,
+    reads: &[gaugewright_core::resource::ResourceId],
+) -> Result<(), AdmitError> {
+    let changed_paths = crate::advancement::TurnFacts::changed_paths_of(diff);
+    let summary = crate::turn_summary::TurnSummary {
+        user_entry_id,
+        receipt_status,
+        error,
+        changed_count: changed_paths.len(),
+        changed_paths,
+        policy_diff_direction: crate::turn_summary::policy_diff_direction(diff),
+        certified_reads: crate::turn_summary::join_certified_reads(store, scope, reads)?,
+    };
+    crate::turn_summary::append(store, scope, &summary)?;
+    Ok(())
+}
+
+pub(crate) const TURN_BOUNDARY_KIND: &str = "turn_boundary";
+
+/// Exact coordinates needed to fork either side of one completed turn.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TurnBoundaryRecord {
+    pub(crate) user_entry_id: i64,
+    pub(crate) assistant_entry_id: i64,
+    pub(crate) before_workspace_cut: String,
+    pub(crate) after_workspace_cut: String,
+    pub(crate) runtime_before: gaugewright_harness::RuntimePosition,
+    pub(crate) runtime_after: gaugewright_harness::RuntimePosition,
+    pub(crate) reads_before: Vec<String>,
+    pub(crate) reads_after: Vec<String>,
 }
 
 const RUNTIME_EVIDENCE_POINTER_KIND: &str = "runtime_evidence_pointer";
@@ -204,8 +300,8 @@ fn admit_runtime_evidence_pointers(
 use gaugewright_core::merge::{MergeCommand, MergePhase, MergeState};
 use gaugewright_core::run::{RunCommand, RunPhase, RunState};
 use gaugewright_harness::{
-    CredentialProbe, EgressGate, GateDecision, Harness, HarnessFactory, HarnessSpec, HumanPrompt,
-    ImageContent, InterruptHandle, Observation, TurnOutcome,
+    CredentialProbe, EgressGate, GateDecision, Harness, HarnessFactory, HarnessSpec, ImageContent,
+    InterruptHandle, Observation, TurnOutcome,
 };
 use gaugewright_store::{AdmitError, Store};
 use gaugewright_workspace::{ChatWorkspace, MergeOutcome};
@@ -274,10 +370,9 @@ fn default_external_tools() -> BTreeSet<String> {
 /// conservative per provider; it is the allowlist the per-host egress proxy will
 /// enforce once that routing lands (until then it records intent and flips the
 /// posture to allow). An unknown provider falls back to the OpenAI/codex set.
-/// Resolve a turn's provider: a non-empty **host override** (`GAUGEWRIGHT_MODEL_PROVIDER`, set
-/// only by a SERVE-2 deployment image to force its egress membrane) wins over the chat's
-/// `.agent-config.json` provider, which wins over the codex OAuth default. Pure (the env is read
-/// at the call site) so the precedence is unit-testable.
+/// Resolve a private turn's provider: a non-empty managed-Home override wins
+/// over the chat's `.agent-config.json` provider, which wins over the Codex
+/// OAuth default. Public releases do not execute through this engine.
 pub(crate) fn resolve_turn_provider(
     host_override: Option<String>,
     config_provider: Option<String>,
@@ -302,9 +397,8 @@ pub(crate) fn resolve_turn_model(
 
 fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
     let hosts: &[&str] = match provider.unwrap_or("openai-codex") {
-        // Host-managed providers (SERVE-2 hosted embed): the sandbox egresses only to
-        // the host-managed gateway endpoint; provider-token details live in the private
-        // managed-service host, not in the open engine.
+        // Managed-Home providers egress only to their gateway endpoint;
+        // provider-token details live in the private managed-service host.
         p if p.contains("cloudflare") => &["gateway.ai.cloudflare.com", "api.cloudflare.com"],
         p if p.starts_with("openai") || p.contains("codex") => {
             &["api.openai.com", "chatgpt.com", "auth.openai.com"]
@@ -359,12 +453,26 @@ fn method_surface_readonly_roots(worktree: &Path, mode: ChatMode) -> Vec<std::pa
         .collect()
 }
 
+fn target_writable_roots(worktree: &Path, path_scope: &[String]) -> Vec<std::path::PathBuf> {
+    path_scope
+        .iter()
+        .map(|scope| {
+            if scope == "." {
+                worktree.to_path_buf()
+            } else {
+                worktree.join(scope)
+            }
+        })
+        .collect()
+}
+
 /// The result of one tasked turn.
 #[derive(Debug, serde::Serialize)]
 pub struct TaskResult {
     pub run_phase: RunPhase,
     pub assistant_text: String,
-    /// The engagement-branch-vs-`main` diff a reviewer sees.
+    /// The diff produced by this turn. It remains useful as settled-turn evidence
+    /// even when default auto-sync has already made the branch-vs-line diff empty.
     pub diff: String,
     /// The turn's opaque WhippleScript cut id, if the turn changed anything.
     pub commit: Option<String>,
@@ -375,8 +483,11 @@ pub struct TaskResult {
     /// Effects the membrane blocked (the out-of-policy path).
     pub blocked_effects: Vec<String>,
     pub pending_approvals: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_human: Option<HumanPrompt>,
+    /// Questions the agent asked this turn, not yet filed. Persisted by the
+    /// workbench-holding caller, which is the layer that can resolve a recipient
+    /// against the roster (ADR 0113 §4).
+    #[serde(skip)]
+    pub asked_questions: Vec<gaugewright_harness::AskedQuestion>,
     /// The runtime/model error that failed this turn, if any — lets the client show
     /// an honest status immediately (the same text is also a durable transcript line).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -386,6 +497,11 @@ pub struct TaskResult {
     /// runtime published no report — the local-truth path decides.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub guarantee_outcomes: Vec<gaugewright_harness::GuaranteeOutcome>,
+    /// Runtime-owned usage evidence projected for an in-process funding ledger.
+    /// It is admitted durably below and deliberately omitted from the public
+    /// task response; callers receive only their normal turn projection.
+    #[serde(skip)]
+    pub usage_observation: Option<gaugewright_harness::ModelUsage>,
 }
 
 #[derive(Debug)]
@@ -458,6 +574,27 @@ pub fn run_task_streaming<G: EgressGate>(
     images: &[ImageContent],
     sink: &mut dyn FnMut(&Observation),
 ) -> Result<TaskResult, EngineError> {
+    run_task_streaming_billed(
+        store, engagement, scope, harness, gate, task, images, sink, None, None, "",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_task_streaming_billed<G: EgressGate>(
+    store: &mut Store,
+    engagement: &dyn ChatWorkspace,
+    scope: &str,
+    harness: &mut dyn Harness,
+    gate: &G,
+    task: &str,
+    images: &[ImageContent],
+    sink: &mut dyn FnMut(&Observation),
+    managed_billing_scope: Option<&str>,
+    managed_funding_ref: Option<&str>,
+    // Context the model sees ahead of the task but the transcript does not record
+    // as user text — currently answers to questions this agent asked (ADR 0113).
+    prompt_prefix: &str,
+) -> Result<TaskResult, EngineError> {
     // Observability span (RF-A8): scope + task size only — never the task text or
     // any content (those are protected; the span is operational metadata). The
     // span covers the whole turn; a completion event records the outcome below.
@@ -467,7 +604,6 @@ pub fn run_task_streaming<G: EgressGate>(
     //    re-enters from the prior run's terminal state (retryRun). Either way the
     //    run must be re-admitted before it can start (INV-11).
     let initial_phase = store.fold::<RunState>(scope)?.phase;
-    let resuming_human = initial_phase == RunPhase::AwaitingHuman;
     match initial_phase {
         RunPhase::Init => {
             store.admit::<RunState>(scope, RunCommand::RequestRun)?;
@@ -482,9 +618,6 @@ pub fn run_task_streaming<G: EgressGate>(
             store.admit::<RunState>(scope, RunCommand::StartRun)?;
         }
         RunPhase::Running => {}
-        // Delay the product transition until WhippleScript has admitted the
-        // correlated answer. A malformed/refused answer leaves the run waiting.
-        RunPhase::AwaitingHuman => {}
         RunPhase::Completed | RunPhase::Failed | RunPhase::Canceled => {
             store.admit::<RunState>(scope, RunCommand::RetryRun)?;
             store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
@@ -492,87 +625,100 @@ pub fn run_task_streaming<G: EgressGate>(
         }
     }
 
+    let before_workspace_cut = engagement.boundary_cut()?;
+    let reads_before = crate::resource_store::engagement_reads(store, scope)?
+        .items()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+
     // Admit the user message as durable transcript evidence (turn-boundary). The
     // transcript records the **raw** task; mode framing is invisible context the
     // model receives, not something the user typed.
-    record_transcript(
+    let user_entry_id = append_transcript(
         store,
         scope,
         &ServerEvent::User {
             text: task.to_string(),
         },
+    )?;
+    debug_assert_eq!(
+        managed_billing_scope.is_some(),
+        managed_funding_ref.is_some()
     );
+    let managed_reservation_id = managed_billing_scope
+        .zip(managed_funding_ref)
+        .map(|(billing_scope, funding_ref)| {
+            let reservation_id = format!("managed:{scope}:{user_entry_id}");
+            crate::managed_inference::reserve_turn(
+                store,
+                scope,
+                billing_scope,
+                funding_ref,
+                &reservation_id,
+            )?;
+            Ok::<_, EngineError>(reservation_id)
+        })
+        .transpose()?;
 
     // 2. Drive one turn through the **harness** (ADR 0031) over the membrane. The
     //    harness owns its protocol + session; the prompt is the raw task. Persona
     //    comes from the selected authored package or separate editor package.
-    let outcome: TurnOutcome = harness
-        .run_turn(gate, task, images, sink)
-        .map_err(EngineError::Harness)?;
-
-    if resuming_human {
-        store.admit::<RunState>(scope, RunCommand::ResumeRun)?;
-    }
+    // The transcript above recorded the raw task. The model additionally receives
+    // any answers that arrived since its last turn — invisible context it was
+    // promised when `ask` returned, not something the user typed.
+    let prompt = if prompt_prefix.is_empty() {
+        task.to_string()
+    } else {
+        format!("{prompt_prefix}{task}")
+    };
+    let outcome: TurnOutcome = match harness.run_turn(gate, &prompt, images, sink) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // A transport death is still a settled attempt. Keep the run and
+            // task projections repairable instead of stranding `Running` with
+            // no durable failure fact.
+            store.admit::<RunState>(scope, RunCommand::FailRun)?;
+            let reason = error.to_string();
+            record_transcript(
+                store,
+                scope,
+                &ServerEvent::Error {
+                    reason: reason.clone(),
+                    code: None,
+                },
+            );
+            let diff = engagement.diff_against_main().unwrap_or_default();
+            admit_turn_summary(
+                store,
+                scope,
+                user_entry_id,
+                crate::turn_summary::ReceiptStatus::Failed,
+                Some(reason),
+                &diff,
+                &[],
+            )?;
+            if let (Some(reservation_id), Some(billing_scope)) =
+                (&managed_reservation_id, managed_billing_scope)
+            {
+                crate::managed_inference::settle_reservation(
+                    store,
+                    scope,
+                    billing_scope,
+                    reservation_id,
+                    None,
+                    "model_transport_failed_without_usage",
+                )?;
+            }
+            return Err(EngineError::Harness(error));
+        }
+    };
 
     // 3a. Admit the runtime's execution evidence into the run (INV-4): each tool
     //     decision the membrane ruled on is an observation that becomes standing
     //     run state only by this admission, while the run is still `running`.
     for _ in &outcome.observations {
         store.admit::<RunState>(scope, RunCommand::RecordObservation)?;
-    }
-
-    if outcome.pending_human.is_some() {
-        admit_runtime_evidence_pointers(store, scope, &outcome.runtime_evidence_pointers, None)?;
-        store.admit::<RunState>(scope, RunCommand::AwaitHuman)?;
-        for obs in &outcome.observations {
-            if matches!(
-                obs.kind,
-                "egress" | "egress_staged" | "tool_result" | "egress_blocked"
-            ) {
-                record_transcript(store, scope, &ServerEvent::from_observation(obs));
-            }
-        }
-        record_transcript(
-            store,
-            scope,
-            &ServerEvent::Assistant {
-                text: outcome.assistant_text.clone(),
-            },
-        );
-        record_transcript(
-            store,
-            scope,
-            &ServerEvent::Admitted {
-                kind: "run".into(),
-                text: "run → AwaitingHuman".into(),
-            },
-        );
-        let merge_phase = store.fold::<MergeState>(scope)?.phase;
-        tracing::info!(
-            run_phase = ?RunPhase::AwaitingHuman,
-            ?merge_phase,
-            observations = outcome.observations.len(),
-            "engine.turn awaiting authenticated human"
-        );
-        return Ok(TaskResult {
-            run_phase: RunPhase::AwaitingHuman,
-            assistant_text: outcome.assistant_text,
-            diff: engagement.diff_against_main()?,
-            commit: None,
-            merge_phase,
-            mediated_tool_calls: outcome.mediated_tool_calls,
-            blocked_effects: outcome
-                .observations
-                .iter()
-                .filter(|observation| observation.kind == "egress_blocked")
-                .map(|observation| observation.detail.clone())
-                .collect(),
-            pending_approvals: outcome.pending_approvals,
-            pending_human: outcome.pending_human,
-            error: None,
-            // A suspended turn has no terminal receipt yet, hence no report.
-            guarantee_outcomes: Vec::new(),
-        });
     }
 
     // 3b. Auto-commit the worktree (per-turn), then capture the reviewer's diff.
@@ -594,6 +740,29 @@ pub fn run_task_streaming<G: EgressGate>(
         store.admit::<RunState>(scope, RunCommand::FailRun)?;
         RunPhase::Failed
     };
+    if let Some(usage) = &outcome.managed_usage {
+        crate::managed_inference::append_usage(
+            store,
+            scope,
+            managed_billing_scope.unwrap_or(scope),
+            usage,
+        )?;
+    }
+    if let (Some(reservation_id), Some(billing_scope)) =
+        (&managed_reservation_id, managed_billing_scope)
+    {
+        crate::managed_inference::settle_reservation(
+            store,
+            scope,
+            billing_scope,
+            reservation_id,
+            outcome
+                .managed_usage
+                .as_ref()
+                .map(|usage| usage.usage_ref.as_str()),
+            "turn_finished_without_usage",
+        )?;
+    }
 
     // 5. Drive the merge lifecycle's start: re-enter + probe the branch-vs-`main`
     //    merge (no mutation). The human gates the advance later via the merge API.
@@ -617,14 +786,8 @@ pub fn run_task_streaming<G: EgressGate>(
     //    owners of everything the engagement has read across turns — sound even after
     //    a read context is later revoked or tombstoned — so a later export/review
     //    gates on persisted handles, not a loose stakeholder set.
-    let output_reads = if outcome.output_flow_signature.is_empty() {
-        crate::resource_store::granted_context(store, scope)
-    } else {
-        crate::resource_store::certified_output_reads(store, scope, &outcome.output_flow_signature)
-    };
-    if let Ok(reads) = output_reads {
-        let _ = crate::resource_store::record_reads(store, scope, &reads);
-    }
+    let output_reads = turn_reads(store, scope, &outcome.output_flow_signature)?;
+    crate::resource_store::record_reads(store, scope, &output_reads)?;
     // The output is owned by the scope's authenticated owning authority
     // (`determine_scope_authority`, the SCOPE-AUTH-1 seam), not the hardcoded
     // local constant (MINT-1). In the single-user collapse a bare engagement
@@ -660,13 +823,37 @@ pub fn run_task_streaming<G: EgressGate>(
             _ => {} // streamed text is operational-only; not durable evidence
         }
     }
-    record_transcript(
+    let assistant_entry_id = append_transcript(
         store,
         scope,
         &ServerEvent::Assistant {
             text: outcome.assistant_text.clone(),
         },
-    );
+    )?;
+    if let (Some(runtime_before), Some(runtime_after), Some(after_workspace_cut)) = (
+        outcome.runtime_start_position.clone(),
+        outcome.runtime_terminal_position.clone(),
+        commit.as_ref(),
+    ) {
+        let reads_after = crate::resource_store::engagement_reads(store, scope)?
+            .items()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let boundary = TurnBoundaryRecord {
+            user_entry_id,
+            assistant_entry_id,
+            before_workspace_cut: before_workspace_cut.0,
+            after_workspace_cut: after_workspace_cut.0.clone(),
+            runtime_before,
+            runtime_after,
+            reads_before,
+            reads_after,
+        };
+        let payload =
+            serde_json::to_string(&boundary).map_err(gaugewright_store::AdmitError::Json)?;
+        store.append_record(scope, TURN_BOUNDARY_KIND, &payload)?;
+    }
     // A failed turn records *why* as durable evidence, so the user sees the reason
     // (e.g. a model rejecting an image) on the next snapshot — not just a generic
     // "didn't finish". The reason is diagnostic text, never protected content.
@@ -689,6 +876,20 @@ pub fn run_task_streaming<G: EgressGate>(
         },
     );
 
+    admit_turn_summary(
+        store,
+        scope,
+        user_entry_id,
+        if run_phase == RunPhase::Completed {
+            crate::turn_summary::ReceiptStatus::Completed
+        } else {
+            crate::turn_summary::ReceiptStatus::Failed
+        },
+        outcome.error.clone(),
+        &diff,
+        &output_reads,
+    )?;
+
     // Turn outcome as operational metadata only (counts + phases, no content).
     tracing::info!(
         ?run_phase,
@@ -704,12 +905,13 @@ pub fn run_task_streaming<G: EgressGate>(
         assistant_text: outcome.assistant_text,
         diff,
         guarantee_outcomes: outcome.guarantee_outcomes,
+        usage_observation: outcome.managed_usage,
         commit: commit.map(|c| c.0),
         merge_phase: merge.phase,
         mediated_tool_calls: outcome.mediated_tool_calls,
         blocked_effects,
         pending_approvals: outcome.pending_approvals,
-        pending_human: None,
+        asked_questions: Vec::new(),
         error: outcome.error,
     })
 }
@@ -762,13 +964,13 @@ pub fn run_task_remote(
     store.admit::<RunState>(scope, begin)?;
     store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
     store.admit::<RunState>(scope, RunCommand::StartRun)?;
-    record_transcript(
+    let user_entry_id = append_transcript(
         store,
         scope,
         &ServerEvent::User {
             text: task.to_string(),
         },
-    );
+    )?;
 
     let remote_address = harness.address().to_string();
 
@@ -787,6 +989,24 @@ pub fn run_task_remote(
             }
             Err(crate::remote_runtime::RemoteRuntimeError::Turn(e)) => {
                 store.admit::<RunState>(scope, RunCommand::FailRun)?;
+                let reason = e.to_string();
+                record_transcript(
+                    store,
+                    scope,
+                    &ServerEvent::Error {
+                        reason: reason.clone(),
+                        code: None,
+                    },
+                );
+                admit_turn_summary(
+                    store,
+                    scope,
+                    user_entry_id,
+                    crate::turn_summary::ReceiptStatus::Failed,
+                    Some(reason),
+                    "",
+                    &[],
+                )?;
                 return Err(EngineError::Harness(e));
             }
         };
@@ -795,9 +1015,8 @@ pub fn run_task_remote(
     //    scope's owning authority (MINT-1) — the work is owned by, and governed by,
     //    the right keyset even though it ran in a different authority. There is no
     //    local commit, so the output's locator carries no commit hash.
-    if let Ok(reads) = crate::resource_store::granted_context(store, scope) {
-        let _ = crate::resource_store::record_reads(store, scope, &reads);
-    }
+    let reads = crate::resource_store::granted_context(store, scope)?;
+    crate::resource_store::record_reads(store, scope, &reads)?;
     let owner = gaugewright_core::determine_scope_authority(scope);
     let _ = crate::resource_store::mint_output(store, scope, owner.as_str(), "");
 
@@ -810,6 +1029,15 @@ pub fn run_task_remote(
             text: format!("run → {run_phase:?}"),
         },
     );
+    admit_turn_summary(
+        store,
+        scope,
+        user_entry_id,
+        crate::turn_summary::ReceiptStatus::Completed,
+        None,
+        "",
+        &reads,
+    )?;
 
     Ok(RemoteTaskResult {
         run_phase,
@@ -845,8 +1073,8 @@ fn llm_credential_status(
         };
     }
     match provider {
-        // Host-managed providers (SERVE-2 hosted embed, ADR 0064): the concrete gateway
-        // secret names and provider routing live in the private managed-service host. The
+        // Managed-Home providers: concrete gateway secrets and routing live in
+        // the private managed-service host. The
         // open engine only requires a neutral readiness signal from that host.
         "cloudflare-ai-gateway" | "cloudflare-workers-ai" => {
             let get = |k: &str| std::env::var(k).ok();
@@ -860,8 +1088,12 @@ fn llm_credential_status(
     }
 }
 
-/// Fail-closed check for host-managed model providers (SERVE-2 hosted embed, ADR
-/// 0064): the private host validates and injects provider-specific config, then
+fn is_host_managed_provider(provider: &str) -> bool {
+    matches!(provider, "cloudflare-ai-gateway" | "cloudflare-workers-ai")
+}
+
+/// Fail-closed check for managed-Home model providers: the private host
+/// validates and injects provider-specific config, then
 /// reports a generic readiness flag to the open engine. Pure (takes a `get`
 /// resolver) so it is unit-testable without process env or private secret names.
 fn host_managed_model_status(
@@ -898,46 +1130,6 @@ fn record_precheck_failure(
     reason: String,
     code: &str,
 ) -> Result<TaskResult, String> {
-    let current = store
-        .fold::<RunState>(scope)
-        .map_err(|e| format!("{e:?}"))?
-        .phase;
-    if current == RunPhase::AwaitingHuman {
-        // Credential availability is product policy, not an answer to the
-        // suspended ask. Keep the exact epoch live so the authenticated user can
-        // retry after fixing credentials; do not convert suspension into failure.
-        record_transcript(
-            store,
-            scope,
-            &ServerEvent::User {
-                text: task.to_string(),
-            },
-        );
-        record_transcript(
-            store,
-            scope,
-            &ServerEvent::Error {
-                reason: reason.clone(),
-                code: Some(code.to_string()),
-            },
-        );
-        return Ok(TaskResult {
-            run_phase: RunPhase::AwaitingHuman,
-            assistant_text: String::new(),
-            diff: String::new(),
-            commit: None,
-            merge_phase: store
-                .fold::<MergeState>(scope)
-                .map_err(|e| format!("{e:?}"))?
-                .phase,
-            mediated_tool_calls: Vec::new(),
-            blocked_effects: Vec::new(),
-            pending_approvals: Vec::new(),
-            pending_human: None,
-            error: Some(reason),
-            guarantee_outcomes: Vec::new(),
-        });
-    }
     // The run starts then immediately fails on the gate — the same lifecycle a turn
     // that reaches the harness and errors admits (RequestRun→AdmitRun→StartRun→FailRun),
     // minus the observations no turn produced.
@@ -959,13 +1151,14 @@ fn record_precheck_failure(
             .admit::<RunState>(scope, cmd)
             .map_err(|e| format!("{e:?}"))?;
     }
-    record_transcript(
+    let user_entry_id = append_transcript(
         store,
         scope,
         &ServerEvent::User {
             text: task.to_string(),
         },
-    );
+    )
+    .map_err(|error| format!("{error:?}"))?;
     record_transcript(
         store,
         scope,
@@ -974,6 +1167,16 @@ fn record_precheck_failure(
             code: Some(code.to_string()),
         },
     );
+    admit_turn_summary(
+        store,
+        scope,
+        user_entry_id,
+        crate::turn_summary::ReceiptStatus::Failed,
+        Some(reason.clone()),
+        "",
+        &[],
+    )
+    .map_err(|error| format!("{error:?}"))?;
     Ok(TaskResult {
         run_phase: RunPhase::Failed,
         assistant_text: String::new(),
@@ -983,9 +1186,10 @@ fn record_precheck_failure(
         mediated_tool_calls: Vec::new(),
         blocked_effects: Vec::new(),
         pending_approvals: Vec::new(),
-        pending_human: None,
+        asked_questions: Vec::new(),
         error: Some(reason),
         guarantee_outcomes: Vec::new(),
+        usage_observation: None,
     })
 }
 
@@ -1005,6 +1209,99 @@ pub struct EngagementTurnInput<'a> {
     pub images: &'a [ImageContent],
     pub mode: ChatMode,
     pub authenticated_actor: Option<&'a gaugewright_core::ids::AuthorityId>,
+    /// Authority that drove this turn for workstream contribution attribution.
+    /// This is distinct from the runtime actor: a verified federated crossing may
+    /// drive a hub-resident chat while the hub still owns runtime execution.
+    pub contribution_by: Option<&'a str>,
+    /// Scope of the authenticated person's account subscription.
+    pub account_scope: &'a str,
+    /// Scope of the current tenant's organization-funded subscription.
+    pub tenant_scope: &'a str,
+    /// Stable Home-admitted command identity for unattended execution. A retry
+    /// reuses this exact WhippleScript command/receipt. Foreground turns omit it.
+    pub runtime_command_id: Option<&'a str>,
+    /// An admitted execution shell may supply the same WhippleScript factory
+    /// with a command-scoped transport (for example a Home-signed private
+    /// Durable workflow). Foreground turns use the workbench default.
+    pub harness_factory: Option<Arc<dyn HarnessFactory>>,
+    /// Explicit per-change review hold. False is the shared-line auto-sync default.
+    pub review_requested: bool,
+}
+
+/// Non-secret, immutable inputs a managed Isolated-workspace scheduler must
+/// bind before acknowledging a background turn. The actual credential remains
+/// behind the Home's exact-reference capability and final-fetch boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IsolatedTurnDescriptor {
+    pub package_root: PathBuf,
+    pub package_version_ref: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub endpoint_url: String,
+    pub credential_ref: String,
+}
+
+pub fn isolated_turn_descriptor(
+    wb: &SharedWorkbench,
+    chat_id: &str,
+    actor: &str,
+) -> Result<IsolatedTurnDescriptor, String> {
+    let guard = wb.lock_unpoisoned();
+    let config = AgentConfig::from_json(&guard.effective_agent_config_for_chat(chat_id)?)
+        .unwrap_or_default();
+    let provider = resolve_turn_provider(
+        std::env::var("GAUGEWRIGHT_MODEL_PROVIDER").ok(),
+        config.provider,
+    );
+    let model = resolve_turn_model(std::env::var("GAUGEWRIGHT_MODEL").ok(), config.model);
+    let class = guard.model_execution_class();
+    let base_url_override = if provider == "openai-generic" {
+        guard.credential_base_url_for_chat_in_class(chat_id, &provider, actor, class)
+    } else {
+        None
+    };
+    let provider_descriptor = gaugewright_whip_runtime::native_provider_descriptor(
+        &provider,
+        model.as_deref(),
+        base_url_override.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let (version, package_version_ref) = guard
+        .package_selection_for_chat(chat_id)
+        .ok_or_else(|| "chat has no immutable WhippleScript package".to_owned())?;
+    let package_root = guard
+        .package_root_for_chat(chat_id, version)
+        .ok_or_else(|| "chat package root is unavailable".to_owned())?;
+    let credential_ref = guard.credential_ref_for_chat_in_class(chat_id, &provider, actor, class);
+    let endpoint_url = match provider.as_str() {
+        "openai-codex" => format!(
+            "{}/backend-api/codex/responses",
+            provider_descriptor.base_url.trim_end_matches('/')
+        ),
+        "openai-generic" => format!(
+            "{}/chat/completions",
+            provider_descriptor.base_url.trim_end_matches('/')
+        ),
+        "openai" => format!(
+            "{}/v1/responses",
+            provider_descriptor.base_url.trim_end_matches('/')
+        ),
+        "anthropic" => format!(
+            "{}/v1/messages",
+            provider_descriptor.base_url.trim_end_matches('/')
+        ),
+        _ => return Err(format!("unsupported Isolated provider `{provider}`")),
+    };
+    Ok(IsolatedTurnDescriptor {
+        package_root,
+        package_version_ref,
+        provider,
+        model: provider_descriptor.model,
+        base_url: provider_descriptor.base_url,
+        endpoint_url,
+        credential_ref,
+    })
 }
 
 pub fn run_engagement_turn(
@@ -1019,37 +1316,48 @@ pub fn run_engagement_turn(
         images,
         mode,
         authenticated_actor,
+        contribution_by,
+        account_scope,
+        tenant_scope,
+        runtime_command_id,
+        harness_factory,
+        review_requested,
     } = input;
-    let config =
-        AgentConfig::from_file(&worktree.join(definition::CONFIG_PATH)).unwrap_or_default();
+    let config = {
+        let g = wb.lock_unpoisoned();
+        AgentConfig::from_json(&g.effective_agent_config_for_chat(id)?).unwrap_or_default()
+    };
     let gate = MembraneGate::new(&config, default_external_tools()).with_mode(mode);
 
     // GaugeDesk keeps credential custody. The selected provider material is
     // resolved later into one exact-reference in-memory capability; the turn no
     // longer receives an ambient environment-shaped secret vector.
-    let (whip_factory, actor, package_selection) = {
+    let (whip_factory, actor, package_selection, selected_package_root) = {
         let g = wb.lock_unpoisoned();
+        if g.package_selection_for_chat(id).is_some() {
+            g.refresh_chat_discipline_mount(id)?;
+        }
         let factory = g
             .whip_harness_factory()
             .map_err(|error| error.to_string())?;
+        let package_selection = g.package_selection_for_chat(id);
+        let selected_package_root = package_selection
+            .as_ref()
+            .and_then(|(version, _)| g.package_root_for_chat(id, *version));
         (
             factory,
             authenticated_actor
                 .cloned()
                 .unwrap_or_else(|| g.authority().clone()),
-            g.package_selection_for_chat(id),
+            package_selection,
+            selected_package_root,
         )
     };
 
     let (package_root, package_version_ref) = match mode {
         ChatMode::Edit => (None, None),
         ChatMode::Use => package_selection
-            .map(|(version, package_ref)| {
-                (
-                    Some(worktree.join(gaugewright_boundary::definition::version_root(version))),
-                    Some(package_ref),
-                )
-            })
+            .map(|(_, package_ref)| (selected_package_root, Some(package_ref)))
             .unwrap_or((None, None)),
     };
 
@@ -1064,7 +1372,8 @@ pub fn run_engagement_turn(
     // The one harness decision point (SUB-0): which adapter drives this turn.
     // Consulted per turn — tests flip `GAUGEWRIGHT_FAKE_AGENT` against a live
     // workbench, so the selection must never be cached at startup.
-    let factory = crate::harness_select::factory_for_turn(whip_factory);
+    let factory =
+        harness_factory.unwrap_or_else(|| crate::harness_select::factory_for_turn(whip_factory));
 
     // Mock-LLM mode: no WhippleScript runtime, no model call. The scripted fake drives the
     // exact same turn loop (membrane + reducers unchanged); its pre-turn side
@@ -1087,13 +1396,18 @@ pub fn run_engagement_turn(
             provider_binding_ref: None,
             credential_ref: None,
             placement_ceiling_ref: None,
+            runtime_placement_id: None,
             provider: None,
             model: None,
+            base_url: None,
             thinking: None,
             system_prompt,
             credential_capability: None,
             credentials: Vec::new(),
             sandbox: gaugewright_harness::sandbox::SandboxPolicy::new(vec![worktree.to_path_buf()]),
+            // The fake seam offers no people: this path never reaches a model, so
+            // there is no tool schema for a roster to appear on.
+            roster: Vec::new(),
         };
         drive_persistent_turn(
             wb,
@@ -1105,23 +1419,51 @@ pub fn run_engagement_turn(
             factory.as_ref(),
             &spec,
             actor.as_str(),
+            None,
+            None,
+            runtime_command_id,
         )?
     } else {
-        // Resolve the turn's provider/model. A **deployment host** (SERVE-2 hosted embed)
-        // forces every turn through its egress membrane by setting `GAUGEWRIGHT_MODEL_PROVIDER`
-        // (+ `GAUGEWRIGHT_MODEL`) in the image — that OVERRIDES the archetype's authored
-        // provider so a method published with `openai-codex` still routes via the Cloudflare AI
-        // Gateway in the sandbox (ADR 0064 membrane; provider-token details remain in the
-        // private managed-service host). Unset on the desktop, so the chat's
-        // `.agent-config.json` provider (or the codex default)
-        // wins there. Pure resolvers so the precedence is unit-testable.
+        // The private composition may override the authored provider/model. Public
+        // releases do not execute through this GaugeDesk engine.
         let provider = resolve_turn_provider(
             std::env::var("GAUGEWRIGHT_MODEL_PROVIDER").ok(),
             config.provider.clone(),
         );
-        let credential_ref = wb.lock_unpoisoned().credential_ref_for_chat(id, &provider);
+        let effective_execution_class = wb.lock_unpoisoned().model_execution_class();
+        if provider == "openai-codex"
+            && effective_execution_class == crate::account::ModelExecutionClass::LocalInteractive
+        {
+            if let Err(reason) = crate::codex_oauth::ensure_local_credential_record(wb) {
+                let _ = sender.send(ServerEvent::Error {
+                    reason: reason.clone(),
+                    code: Some("credential_migration_failed".into()),
+                });
+                let mut workbench = wb.lock_unpoisoned();
+                return record_precheck_failure(
+                    &mut workbench.store,
+                    id,
+                    task,
+                    reason,
+                    "credential_migration_failed",
+                );
+            }
+        }
+        let credential_ref = {
+            let g = wb.lock_unpoisoned();
+            g.credential_ref_for_chat_in_class(
+                id,
+                &provider,
+                actor.as_str(),
+                effective_execution_class,
+            )
+        };
         let credential_capability = if provider == "openai-codex" {
-            match crate::codex_oauth::resolve_runtime_credential(wb) {
+            match crate::codex_oauth::resolve_turn_credential(
+                wb,
+                actor.as_str(),
+                effective_execution_class,
+            ) {
                 Ok(Some(credential)) => Some(crate::account::resolved_credential_capability(
                     credential_ref.clone(),
                     credential.access,
@@ -1144,16 +1486,38 @@ pub fn run_engagement_turn(
                 }
             }
         } else {
-            wb.lock_unpoisoned()
-                .credential_capability_for_chat(id, &provider)
+            let g = wb.lock_unpoisoned();
+            g.credential_capability_for_chat_in_class(
+                id,
+                &provider,
+                actor.as_str(),
+                effective_execution_class,
+            )
         };
         let model = resolve_turn_model(
             std::env::var("GAUGEWRIGHT_MODEL").ok(),
             config.model.clone(),
         );
-        let provider_descriptor =
-            gaugewright_whip_runtime::native_provider_descriptor(&provider, model.as_deref())
-                .map_err(|error| error.to_string())?;
+        // openai-generic (ADR 0083) carries its endpoint with the linked credential;
+        // resolve it nearest-scope-wins so the descriptor derives the admitted host
+        // from the same base_url the request will use. Other providers ignore it.
+        let base_url_override = if provider == "openai-generic" {
+            let g = wb.lock_unpoisoned();
+            g.credential_base_url_for_chat_in_class(
+                id,
+                &provider,
+                actor.as_str(),
+                effective_execution_class,
+            )
+        } else {
+            None
+        };
+        let provider_descriptor = gaugewright_whip_runtime::native_provider_descriptor(
+            &provider,
+            model.as_deref(),
+            base_url_override.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
         // Fail closed (LLM-1, ADR 0062): refuse a real run when no model credential resolves for
         // the resolved provider. Record it as a durable, coded failure turn so the chat log
         // shows *why* with an actionable "open settings" affordance — not just a status line —
@@ -1170,6 +1534,62 @@ pub fn run_engagement_turn(
             let mut g = wb.lock_unpoisoned();
             return record_precheck_failure(&mut g.store, id, task, reason, "no_credential");
         }
+        let mut resolved_funding_ref = credential_ref.clone();
+        let managed_billing_scope = if is_host_managed_provider(&provider) {
+            let resolved = {
+                let g = wb.lock_unpoisoned();
+                crate::managed_inference::resolve_plan(g.store_ref(), account_scope, tenant_scope)
+                    .map_err(|error| format!("{error:?}"))?
+            };
+            let Some((plan, scope)) = resolved else {
+                let reason = "Managed inference needs an active account or organization plan. Open Account settings or ask a billing admin to choose a plan.".to_owned();
+                let _ = sender.send(ServerEvent::Error {
+                    reason: reason.clone(),
+                    code: Some("managed_plan_required".into()),
+                });
+                let mut g = wb.lock_unpoisoned();
+                return record_precheck_failure(
+                    &mut g.store,
+                    id,
+                    task,
+                    reason,
+                    "managed_plan_required",
+                );
+            };
+            if !plan.admits_future_run() {
+                let reason = format!(
+                    "Managed inference plan `{}` is {:?}; future model runs are suspended, while prior usage and history remain unchanged.",
+                    plan.plan, plan.status
+                );
+                let _ = sender.send(ServerEvent::Error {
+                    reason: reason.clone(),
+                    code: Some("managed_plan_suspended".into()),
+                });
+                let mut g = wb.lock_unpoisoned();
+                return record_precheck_failure(
+                    &mut g.store,
+                    id,
+                    task,
+                    reason,
+                    "managed_plan_suspended",
+                );
+            }
+            resolved_funding_ref = crate::managed_inference::funding_ref(&scope, &plan);
+            Some(scope)
+        } else {
+            None
+        };
+
+        // Who this agent may name (`GATE-3f`), read while the workbench is in hand.
+        // Offered on the `ask` tool so the choice of a person is made from a list;
+        // the host still resolves the answer, because a roster can change between
+        // here and the call arriving.
+        let roster_for_spec: Vec<(String, String)> = wb
+            .lock_unpoisoned()
+            .roster()
+            .into_iter()
+            .map(|person| (person.authority, person.display))
+            .collect();
 
         // GaugeDesk's workspace and egress policy for this turn (ADR 0030): the
         // worktree is writable, while use mode marks the method definition
@@ -1178,7 +1598,12 @@ pub fn run_engagement_turn(
         // subtrees fail before filesystem execution (INV-24).
         let sandbox_policy = {
             use gaugewright_harness::sandbox::Network;
-            let writable = vec![worktree.to_path_buf()];
+            let path_scope = wb
+                .lock_unpoisoned()
+                .library_chat_target_binding(id)
+                .map(|binding| binding.path_scope)
+                .ok_or_else(|| "chat target binding is unavailable".to_owned())?;
+            let writable = target_writable_roots(worktree, &path_scope);
             // Network egress posture (RF-B3, CORE-5) is a **per-project** choice. A
             // non-isolated project reaches ONLY the model endpoints (Filtered, enforced
             // by the host-filtering egress proxy) **where the host can enforce that**;
@@ -1191,7 +1616,14 @@ pub fn run_engagement_turn(
             // isolated project denies network entirely. A `Filtered` request the host
             // can't enforce is failed closed to `Deny` by the harness — never silently
             // to `Allow` — which is exactly why the engine only requests it when enforceable.
-            let egress_hosts = model_endpoint_hosts(Some(&provider));
+            // openai-generic's endpoint is user-configured (ADR 0083): admit ONLY the
+            // host derived from the credential's base_url — the same host the request
+            // resolves to — so the exact-match allowlist (RF-B3) stays load-bearing.
+            let egress_hosts = if provider == "openai-generic" {
+                vec![provider_descriptor.endpoint_host.clone()]
+            } else {
+                model_endpoint_hosts(Some(&provider))
+            };
             let project_isolated = wb.lock_unpoisoned().chat_network_isolated(id);
             let forced_unfiltered =
                 std::env::var("GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS").as_deref() == Ok("1");
@@ -1241,8 +1673,10 @@ pub fn run_engagement_turn(
             ChatMode::Edit => gaugewright_whip_runtime::editor_package_capabilities()
                 .map_err(|error| error.to_string())?,
         };
+        let runtime_placement_id;
         let policy_epoch = {
             let mut g = wb.lock_unpoisoned();
+            runtime_placement_id = g.library_placement_of_chat(id);
             let project_id = g.library_project_of_chat(id);
             let turn_purpose = g.library_chat_run_purpose(id);
             let granted = crate::resource_store::granted_context(&g.store, id)
@@ -1252,8 +1686,8 @@ pub fn run_engagement_turn(
             let mut resources =
                 crate::resource_store::list(&g.store, id).map_err(|error| format!("{error:?}"))?;
             resources.retain(|record| granted.contains(&record.resource.id));
-            let org =
-                crate::org::Org::rebuild(g.store_ref()).map_err(|error| format!("{error:?}"))?;
+            let org = crate::org::Org::rebuild_in(g.store_ref(), tenant_scope)
+                .map_err(|error| format!("{error:?}"))?;
             // The operator's auto-keep scopes (ATTN-3) become an envelope
             // guarantee declaration the runtime evaluates per turn (ADR 0082
             // §5). A scope change re-canonicalizes the policy → new epoch.
@@ -1298,7 +1732,11 @@ pub fn run_engagement_turn(
                 model: provider_descriptor.model.clone(),
                 base_url: provider_descriptor.base_url.clone(),
                 credential_ref,
-                placement_kind: "local".to_owned(),
+                placement_kind: if factory.kind() == "whip-do" {
+                    "do".to_owned()
+                } else {
+                    "local".to_owned()
+                },
                 command_network: sandbox_policy.network
                     != gaugewright_harness::sandbox::Network::Deny,
                 resources,
@@ -1316,11 +1754,15 @@ pub fn run_engagement_turn(
             provider_binding_ref: Some(policy_epoch.provider_binding_ref),
             credential_ref: Some(policy_epoch.credential_ref),
             placement_ceiling_ref: Some(policy_epoch.placement_ceiling_ref),
+            runtime_placement_id,
             // Pin the codex endpoint by default (the authed OAuth provider) so a bare
             // model name can't silently resolve to an unauthenticated provider. Resolved
             // once above for the fail-closed credential check.
             provider: Some(provider),
             model: Some(provider_descriptor.model),
+            // openai-generic's configured endpoint (ADR 0083); None for fixed-host
+            // providers, which resolve their compile-time endpoint in the runtime.
+            base_url: base_url_override,
             // Per-chat reasoning effort (LLM-1, ADR 0062): unset → the provider default.
             thinking: config.thinking.clone(),
             // Only the editor package receives host-supplied editor framing.
@@ -1331,6 +1773,10 @@ pub fn run_engagement_turn(
             // nearest-scope-wins (LLM-2, ADR 0062).
             credentials: Vec::new(),
             sandbox: sandbox_policy,
+            // Who this turn's agent may name (`GATE-3f`). Read here, where the
+            // workbench is in hand, rather than inside the turn: resolving a person
+            // needs the directory, and the turn deliberately holds no lock.
+            roster: roster_for_spec,
         };
         drive_persistent_turn(
             wb,
@@ -1342,20 +1788,62 @@ pub fn run_engagement_turn(
             factory.as_ref(),
             &spec,
             actor.as_str(),
+            managed_billing_scope.as_deref(),
+            managed_billing_scope
+                .as_ref()
+                .map(|_| resolved_funding_ref.as_str()),
+            runtime_command_id,
         )?
     };
 
-    // WS-D: if this chat is homed to a workstream, greedily auto-sync its clean turn
-    // into the stream main and let siblings pick it up — the low-friction collaboration
-    // hop. A non-member chat (target `main`) is untouched: its merge stays Clean for the
-    // human's review, exactly as before.
-    greedy_autosync(wb, id, sender);
+    // A completed candidate is a `propose` act, independent from any later
+    // apply/publish/release authority. Record its exact basis, candidate cut,
+    // and certified checks before an auto-advance policy can settle it.
+    {
+        let mut g = wb.lock_unpoisoned();
+        if let Some(binding) = g.library_chat_target_binding(id) {
+            let checks = result
+                .guarantee_outcomes
+                .iter()
+                .map(|check| format!("{}={}", check.name, check.outcome))
+                .collect();
+            g.record_target_act(
+                Some(id),
+                &binding.target_id,
+                crate::target_adapter::TargetActKind::Propose,
+                result.commit.clone(),
+                checks,
+                None,
+                crate::target_adapter::TargetActStatus::Completed,
+                None,
+            )?;
+        }
+    }
 
-    // ADR 0082 §4: the shipped no-op rule (ATTN-1 — a turn that changed nothing
-    // has no review surface) and the operator's fail-closed advancement rules
-    // (ATTN-3) both evaluate here; anything not explicitly advanced holds.
-    // The turn's certified guarantee outcomes (when the runtime published a
-    // report) take precedence over local workspace truth (ADR 0082 §5).
+    // Every chat targets one shared line: implicit Main or a named workstream. A clean
+    // completion greedily advances that target and reconciles its siblings; named lines
+    // additionally record membership attribution. Review is an explicit hold, never the
+    // default behavior of Main (ADR 0096).
+    if review_requested {
+        let mut g = wb.lock_unpoisoned();
+        if g.store_mut()
+            .admit::<MergeState>(id, MergeCommand::RequestReview)
+            .is_ok()
+        {
+            let event = ServerEvent::Admitted {
+                kind: "review".into(),
+                text: "held this change for review".into(),
+            };
+            record_transcript(g.store_mut(), id, &event);
+            let _ = sender.send(event);
+        }
+    } else {
+        greedy_autosync(wb, id, sender, contribution_by);
+    }
+
+    // Legacy advancement rules are evaluated only if a future/older path leaves a
+    // non-held clean candidate behind. The shared-line path above normally settles
+    // every clean turn, while an explicit review request always wins (ADR 0096).
     auto_advance_turn(wb, id, sender, &result.guarantee_outcomes);
 
     let _ = sender.send(ServerEvent::Admitted {
@@ -1363,61 +1851,6 @@ pub fn run_engagement_turn(
         text: format!("run → {:?}", result.run_phase),
     });
     Ok(result)
-}
-
-/// Drive one **visitor turn** for a public session (SERVE-1 hosted embed). This is the embed
-/// plane's turn entrypoint: it bridges the public-session lifecycle to the same turn engine the
-/// desktop uses, with two embed-specific rules.
-///
-/// 1. **Fail-closed on lifecycle phase** (`INV-20`): a turn runs ONLY when the session is
-///    `Active`. A not-yet-activated, expiring, or torn-down session is refused — never run.
-/// 2. **Always Use mode** — the audience *uses* the deployed archetype and never edits the
-///    method (embed spec: end-users drive work through chat, not file edits; the method surface
-///    stays read-only, `INV-24`).
-///
-/// The session's turns run in a Workbench engagement of the **same id** (`session_id ==
-/// engagement id`) in the deployment's workspace, so `run_engagement_turn` finds the worktree
-/// and folds the run into that scope. The model provider is the host-forced one
-/// ([`resolve_turn_provider`] in a SERVE-2 image), with provider-token details
-/// owned by the private managed-service host (ADR 0064 membrane).
-#[allow(clippy::too_many_arguments)]
-pub fn run_public_turn(
-    wb: &SharedWorkbench,
-    session_phase: gaugewright_core::public_session::Phase,
-    session_id: &str,
-    worktree: &Path,
-    sender: &broadcast::Sender<ServerEvent>,
-    task: &str,
-    images: &[ImageContent],
-) -> Result<TaskResult, String> {
-    public_turn_allowed(session_phase)?;
-    run_engagement_turn(
-        wb,
-        session_id,
-        worktree,
-        sender,
-        EngagementTurnInput {
-            task,
-            images,
-            mode: ChatMode::Use,
-            authenticated_actor: None,
-        },
-    )
-}
-
-/// Fail-closed gate for a public-session turn (`INV-20`): only an `Active` session may run a
-/// turn. Pure, so the policy is unit-testable independently of the engine. Returns an actionable
-/// reason naming the phase so the embed surface can show "temporarily unavailable" rather than a
-/// crash.
-fn public_turn_allowed(phase: gaugewright_core::public_session::Phase) -> Result<(), String> {
-    use gaugewright_core::public_session::Phase;
-    if phase == Phase::Active {
-        Ok(())
-    } else {
-        Err(format!(
-            "public session is not active (phase {phase:?}); refusing the turn (fail-closed)"
-        ))
-    }
 }
 
 /// The greedy auto-sync hop (`WS-D`). When the just-finished turn's chat is a member of
@@ -1432,9 +1865,14 @@ fn public_turn_allowed(phase: gaugewright_core::public_session::Phase) -> Result
 ///
 /// A conflict at any step leaves that contribution isolated for the existing merge repair
 /// flow — the shared ref only ever advances on a clean merge.
-fn greedy_autosync(wb: &SharedWorkbench, id: &str, sender: &broadcast::Sender<ServerEvent>) {
+fn greedy_autosync(
+    wb: &SharedWorkbench,
+    id: &str,
+    sender: &broadcast::Sender<ServerEvent>,
+    contribution_by: Option<&str>,
+) {
     let mut g = wb.lock_unpoisoned();
-    g.greedy_autosync(id, sender);
+    g.greedy_autosync(id, sender, contribution_by);
 }
 
 /// The settle-time auto-advance (ADR 0082 §4): a settled turn on a **mainline**
@@ -1468,48 +1906,67 @@ fn diff_names_no_files(diff: &str) -> bool {
 }
 
 impl Workbench {
-    // Membership is encoded in the worktree target: `main` ⇒ not a member, nothing to do.
-    fn greedy_autosync(&mut self, id: &str, sender: &broadcast::Sender<ServerEvent>) {
+    // Membership is encoded in the worktree target. Main is the implicit shared line;
+    // named lines additionally need the workstream reducer's contribution admission.
+    fn greedy_autosync(
+        &mut self,
+        id: &str,
+        sender: &broadcast::Sender<ServerEvent>,
+        contribution_by: Option<&str>,
+    ) {
         use gaugewright_core::workstream::{WorkstreamCommand, WorkstreamState};
+        if !self
+            .library_chat_target_binding(id)
+            .and_then(|binding| self.library.work_targets.get(&binding.target_id))
+            .is_some_and(|target| target.kind == crate::library::WorkTargetKind::Managed)
+        {
+            return;
+        }
         let Some(target) = self.engagements.get(id).map(|e| e.target().to_string()) else {
             return;
         };
         // The owning workspace impl parses the ref token — the engine holds no
         // ref-format knowledge (W7).
-        let Some(ws_id) = self
+        let ws_id = self
             .engagement_index
             .get(id)
-            .and_then(|iid| self.instances.get(iid))
-            .and_then(|inst| inst.workstream_id_of(&target))
-        else {
-            return;
-        };
+            .and_then(|iid| self.targets.get(iid))
+            .and_then(|inst| inst.workstream_id_of(&target));
         let store = &mut self.store;
         let engagements = &mut self.engagements;
 
         // Only a clean turn advances the stream; a conflict stays isolated (the merge
         // reducer already moved it to Rejected/Repairing) for repair.
-        if store.fold::<MergeState>(id).map(|m| m.phase).ok() != Some(MergePhase::Clean) {
-            return;
-        }
-        // The membership gate + attribution. A rejection (non-member / archived) means this
-        // chat may not advance the stream — leave the merge Clean for the human instead. The
-        // contribution is attributed to the scope's authority (WS-G): the local hub authority
-        // for a local turn, the crossing authority for a remote-driven one.
-        let by = gaugewright_core::determine_scope_authority(id)
-            .as_str()
-            .to_string();
         if store
-            .admit::<WorkstreamState>(
-                &ws_id,
-                WorkstreamCommand::Contribute {
-                    chat: id.to_string(),
-                    by,
-                },
-            )
-            .is_err()
+            .fold::<MergeState>(id)
+            .map(|m| m.phase != MergePhase::Clean || m.review_requested)
+            .unwrap_or(true)
         {
             return;
+        }
+        if let Some(ref ws_id) = ws_id {
+            // Named-line membership + attribution. Main is implicit and therefore has
+            // no duplicate membership record to admit.
+            let by = contribution_by
+                .filter(|authority| !authority.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    gaugewright_core::determine_scope_authority(id)
+                        .as_str()
+                        .to_string()
+                });
+            if store
+                .admit::<WorkstreamState>(
+                    ws_id,
+                    WorkstreamCommand::Contribute {
+                        chat: id.to_string(),
+                        by,
+                    },
+                )
+                .is_err()
+            {
+                return;
+            }
         }
         // Auto-admit the clean merge into the stream main.
         if store
@@ -1522,20 +1979,37 @@ impl Workbench {
             Some(Ok(MergeOutcome::Clean)) => {
                 let _ = store.admit::<MergeState>(id, MergeCommand::AdvanceStandingRef);
             }
-            // Raced with another writer — leave it for the review surface rather than forcing.
-            _ => return,
+            Some(Ok(MergeOutcome::Conflict)) => {
+                // The line advanced after the clean probe. Make that race a first-class
+                // incoming conflict with this chat as repair owner; never strand it as
+                // a policy-admitted Clean candidate.
+                let _ = store.admit::<MergeState>(id, MergeCommand::StartMerge);
+                let _ = store.admit::<MergeState>(id, MergeCommand::WorkspaceConflict);
+                return;
+            }
+            Some(Err(_)) | None => return,
         }
         record_transcript(
             store,
             id,
             &ServerEvent::Admitted {
                 kind: "merge".into(),
-                text: "synced into the workstream".into(),
+                text: if ws_id.is_some() {
+                    "synced into the workstream"
+                } else {
+                    "synced into Main"
+                }
+                .into(),
             },
         );
         let _ = sender.send(ServerEvent::Admitted {
             kind: "merge".into(),
-            text: "synced into the workstream".into(),
+            text: if ws_id.is_some() {
+                "synced into the workstream"
+            } else {
+                "synced into Main"
+            }
+            .into(),
         });
 
         // Sibling auto-pull: every other member of the same stream picks the work up. A
@@ -1551,17 +2025,24 @@ impl Workbench {
                 let _ = se.sync_from_main();
             }
         }
+        self.record_completed_target_apply(id);
     }
 
-    // See [`auto_advance_turn`]. Split from `greedy_autosync` because the two
-    // advance different refs under different gates: the stream hop is membership-
-    // gated (Contribute), the mainline hop is emptiness/rule-gated.
+    // Legacy mainline-only advancement rules remain a no-op after the shared-line
+    // auto-sync path above has advanced a clean candidate.
     fn auto_advance_turn(
         &mut self,
         id: &str,
         sender: &broadcast::Sender<ServerEvent>,
         guarantee_outcomes: &[gaugewright_harness::GuaranteeOutcome],
     ) {
+        if !self
+            .library_chat_target_binding(id)
+            .and_then(|binding| self.library.work_targets.get(&binding.target_id))
+            .is_some_and(|target| target.kind == crate::library::WorkTargetKind::Managed)
+        {
+            return;
+        }
         let Some(target) = self.engagements.get(id).map(|e| e.target().to_string()) else {
             return;
         };
@@ -1569,13 +2050,18 @@ impl Workbench {
         let is_member = self
             .engagement_index
             .get(id)
-            .and_then(|iid| self.instances.get(iid))
+            .and_then(|iid| self.targets.get(iid))
             .and_then(|inst| inst.workstream_id_of(&target))
             .is_some();
         if is_member {
             return;
         }
-        if self.store.fold::<MergeState>(id).map(|m| m.phase).ok() != Some(MergePhase::Clean) {
+        if self
+            .store
+            .fold::<MergeState>(id)
+            .map(|m| m.phase != MergePhase::Clean || m.review_requested)
+            .unwrap_or(true)
+        {
             return;
         }
         let Some(diff) = self
@@ -1672,6 +2158,7 @@ impl Workbench {
             record_transcript(store, id, &advanced);
             let _ = sender.send(advanced);
         }
+        self.record_completed_target_apply(id);
     }
 }
 
@@ -1693,6 +2180,14 @@ fn live_sink(sender: &broadcast::Sender<ServerEvent>) -> impl FnMut(&Observation
 /// that errors retires the (likely dead) harness so the next turn recreates a
 /// fresh thread. A non-caching adapter (the scripted fake) gets a fresh harness
 /// every turn.
+///
+/// **The turn does not hold the workbench lock.** It checks out its three
+/// resources under a brief lock — its own store connection, an owned copy of the
+/// chat workspace, and the chat's independently-locked harness — and then runs
+/// holding none of the workbench. Holding it across a model call serialized every
+/// other chat behind this one, which is the opposite of what a multi-agent
+/// workbench is for. Per-scope serialization is the store's own job (immediate
+/// transactions + WAL + `busy_timeout`), not a process-wide lock's.
 #[allow(clippy::too_many_arguments)]
 fn drive_persistent_turn(
     wb: &SharedWorkbench,
@@ -1704,10 +2199,119 @@ fn drive_persistent_turn(
     factory: &dyn HarnessFactory,
     spec: &HarnessSpec,
     actor_ref: &str,
+    managed_billing_scope: Option<&str>,
+    managed_funding_ref: Option<&str>,
+    runtime_command_id: Option<&str>,
 ) -> Result<TaskResult, String> {
+    // 1. Check out this turn's resources under a brief lock, then drop it.
+    let (mut store, engagement, harness, persistent, answers) = {
+        let mut g = wb.lock_unpoisoned();
+        let engagement = g
+            .engagements
+            .get(id)
+            .ok_or_else(|| "engagement gone".to_string())?
+            .boxed_clone();
+        let store = g
+            .store
+            .sibling()
+            .map_err(|e| format!("open a turn store connection: {e}"))?;
+        // A non-caching adapter never enters the session map: a fresh harness
+        // per turn (the scripted fake's one-shot transport — caching it would
+        // fail turn 2 with "stream ended"), dropped when the turn ends.
+        let persistent = factory.reuse_across_turns();
+        let harness = if persistent {
+            match g.sessions.get(id) {
+                Some(existing) => Arc::clone(existing),
+                None => {
+                    let harness = factory
+                        .create(spec)
+                        .map_err(|e| format!("spawn {}: {e}", factory.kind()))?;
+                    let harness: SharedHarness = Arc::new(Mutex::new(harness));
+                    g.sessions.insert(id.to_string(), Arc::clone(&harness));
+                    harness
+                }
+            }
+        } else {
+            let harness = factory
+                .create(spec)
+                .map_err(|e| format!("spawn {}: {e}", factory.kind()))?;
+            Arc::new(Mutex::new(harness))
+        };
+        // Answers that arrived since this chat's last turn ride this turn's prompt
+        // (ADR 0113 §1). Taken under the same brief lock, and marked delivered as
+        // they are taken, so the agent is told each answer exactly once.
+        let answers = crate::agent_question::answers_context(&g.take_undelivered_answers(id));
+        (store, engagement, harness, persistent, answers)
+    };
+
+    // 2. Run the turn holding only this chat's harness. A second turn on the same
+    //    chat waits here; a turn on any *other* chat is unaffected.
+    let result = {
+        let mut guard = harness.lock_unpoisoned();
+        let harness: &mut dyn Harness = guard.as_mut();
+        // Refresh on every request: a persistent chat may be answered by a
+        // different authenticated member than the one who created its harness.
+        harness.bind_authenticated_actor(actor_ref);
+        harness.bind_runtime_command_id(runtime_command_id);
+        // Publish this turn's interrupt handle so a concurrent Stop can terminate it
+        // out-of-band (unblocking `recv`). A harness with nothing to interrupt
+        // registers nothing.
+        if let Some(interrupt) = harness.interrupt_handle() {
+            register_running_turn(id, interrupt);
+        }
+        let mut sink = live_sink(sender);
+        let result = run_task_streaming_billed(
+            &mut store,
+            engagement.as_ref(),
+            id,
+            harness,
+            gate,
+            task,
+            images,
+            &mut sink,
+            managed_billing_scope,
+            managed_funding_ref,
+            &answers,
+        )
+        .map_err(|e| e.to_string());
+        clear_running_turn(id);
+        result
+    };
+
+    // 3. Re-take the lock for the bookkeeping that genuinely needs the workbench.
     let mut g = wb.lock_unpoisoned();
-    let result =
-        g.drive_persistent_local_turn(id, gate, task, images, sender, factory, spec, actor_ref);
+
+    // A turn that errored (or was Stop-killed: its `recv` hit EOF and reported a
+    // stream error) retires the now-dead process so the next turn respawns. A
+    // Stop-killed turn reports `outcome.error`, so retire that too.
+    let stream_died = result
+        .as_ref()
+        .map(|r| r.run_phase == RunPhase::Failed)
+        .unwrap_or(true);
+    if persistent && stream_died {
+        if let Some(dead) = g.sessions.remove(id) {
+            drop(harness);
+            crate::workbench_state::shutdown_shared_harness(dead);
+        }
+    }
+
+    // File any question the agent asked (ADR 0113). Here rather than inside the
+    // turn because resolving a recipient needs the roster.
+    if let Ok(settled) = &result {
+        for asked in &settled.asked_questions {
+            if let Err(error) = g.ask_question(
+                id,
+                &asked.question,
+                &asked.choices,
+                asked.to.as_deref(),
+                asked.blocking,
+            ) {
+                // A question that could not be filed must not fail the turn that
+                // asked it; the agent sees the refusal on its next turn instead.
+                tracing::warn!(error = %error, chat = %id, "could not file agent question");
+            }
+        }
+    }
     // Advance the onboarding checklist on a completed turn (ADR 0075 Phase 2).
     // Idempotent: once the "first_turn" item is closed, later turns match nothing.
     // Best-effort, under the lock we already hold; never affects the turn result.
@@ -1715,96 +2319,6 @@ fn drive_persistent_turn(
         g.advance_onboarding("first_turn", &serde_json::json!({ "chat": id }).to_string());
     }
     result
-}
-
-impl Workbench {
-    #[allow(clippy::too_many_arguments)]
-    fn drive_persistent_local_turn(
-        &mut self,
-        id: &str,
-        gate: &MembraneGate,
-        task: &str,
-        images: &[ImageContent],
-        sender: &broadcast::Sender<ServerEvent>,
-        factory: &dyn HarnessFactory,
-        spec: &HarnessSpec,
-        actor_ref: &str,
-    ) -> Result<TaskResult, String> {
-        let store = &mut self.store;
-        let engagements = &self.engagements;
-        let sessions = &mut self.sessions;
-        let eng = engagements
-            .get(id)
-            .ok_or_else(|| "engagement gone".to_string())?;
-
-        // A non-caching adapter never enters the session map: a fresh harness
-        // per turn (the scripted fake's one-shot transport — caching it would
-        // fail turn 2 with "stream ended"), dropped when the turn ends.
-        if !factory.reuse_across_turns() {
-            let mut harness = factory
-                .create(spec)
-                .map_err(|e| format!("spawn {}: {e}", factory.kind()))?;
-            harness.bind_authenticated_actor(actor_ref);
-            let mut sink = live_sink(sender);
-            return run_task_streaming(
-                store,
-                id,
-                eng.as_ref(),
-                harness.as_mut(),
-                gate,
-                task,
-                images,
-                &mut sink,
-            )
-            .map_err(|e| e.to_string());
-        }
-
-        if !sessions.contains_key(id) {
-            let harness = factory
-                .create(spec)
-                .map_err(|e| format!("spawn {}: {e}", factory.kind()))?;
-            sessions.insert(id.to_string(), harness);
-        }
-        let harness: &mut dyn Harness =
-            sessions.get_mut(id).expect("session just ensured").as_mut();
-        // Refresh on every request: a persistent chat may be answered by a
-        // different authenticated member than the one who created its harness.
-        harness.bind_authenticated_actor(actor_ref);
-        // Publish this turn's interrupt handle so a concurrent Stop can terminate it
-        // out-of-band (unblocking `recv`) — the registry is outside the workbench lock
-        // this turn holds. A harness with nothing to interrupt registers nothing.
-        if let Some(interrupt) = harness.interrupt_handle() {
-            register_running_turn(id, interrupt);
-        }
-
-        let mut sink = live_sink(sender);
-        let result = run_task_streaming(
-            store,
-            id,
-            eng.as_ref(),
-            harness,
-            gate,
-            task,
-            images,
-            &mut sink,
-        )
-        .map_err(|e| e.to_string());
-        clear_running_turn(id);
-
-        // A turn that errored (or was Stop-killed: its `recv` hit EOF and reported a
-        // stream error) retires the now-dead process so the next turn respawns. A
-        // Stop-killed turn reports `outcome.error`, so retire that too.
-        let stream_died = result
-            .as_ref()
-            .map(|r| r.run_phase == RunPhase::Failed)
-            .unwrap_or(true);
-        if stream_died {
-            if let Some(dead) = sessions.remove(id) {
-                let _ = dead.shutdown();
-            }
-        }
-        result
-    }
 }
 
 /// Drive one turn over an engagement's **remote** session — a runtime placed in a
@@ -1852,6 +2366,152 @@ mod tests {
 
     #[derive(Debug)]
     struct PresentCredential;
+
+    struct PositionedHarness {
+        worktree: std::path::PathBuf,
+    }
+
+    struct SummaryHarness {
+        worktree: std::path::PathBuf,
+        resource_handle: String,
+    }
+
+    impl gaugewright_harness::Harness for PositionedHarness {
+        fn run_turn(
+            &mut self,
+            _gate: &dyn gaugewright_harness::EgressGate,
+            _prompt: &str,
+            _images: &[gaugewright_harness::ImageContent],
+            _sink: &mut dyn FnMut(&gaugewright_harness::Observation),
+        ) -> io::Result<TurnOutcome> {
+            std::fs::write(self.worktree.join("point.txt"), "after").unwrap();
+            Ok(TurnOutcome {
+                assistant_text: "done".into(),
+                runtime_start_position: Some(gaugewright_harness::RuntimePosition {
+                    instance_ref: "whip:source".into(),
+                    sequence: 4,
+                }),
+                runtime_terminal_position: Some(gaugewright_harness::RuntimePosition {
+                    instance_ref: "whip:source".into(),
+                    sequence: 9,
+                }),
+                ..TurnOutcome::default()
+            })
+        }
+    }
+
+    impl gaugewright_harness::Harness for SummaryHarness {
+        fn run_turn(
+            &mut self,
+            _gate: &dyn gaugewright_harness::EgressGate,
+            _prompt: &str,
+            _images: &[gaugewright_harness::ImageContent],
+            _sink: &mut dyn FnMut(&gaugewright_harness::Observation),
+        ) -> io::Result<TurnOutcome> {
+            std::fs::write(
+                self.worktree.join(".agent-config.json"),
+                r#"{"allow_tools":["bash"]}"#,
+            )
+            .unwrap();
+            Ok(TurnOutcome {
+                assistant_text: "configured".into(),
+                output_flow_signature: vec![gaugewright_harness::OutputFieldFlow {
+                    field: "assistant_text".into(),
+                    read_handles: vec![format!("resource:{}", self.resource_handle)],
+                }],
+                ..TurnOutcome::default()
+            })
+        }
+    }
+
+    #[test]
+    fn settle_admits_diff_policy_and_certified_read_facts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("summary-chat").unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let resource = crate::resource_store::mint_context(
+            &mut store,
+            "summary-chat",
+            "context-owner",
+            "/context",
+            "base",
+        )
+        .unwrap();
+        let mut harness = SummaryHarness {
+            worktree: eng.path().to_path_buf(),
+            resource_handle: resource.resource.id.as_str().to_string(),
+        };
+
+        run_task(
+            &mut store,
+            "summary-chat",
+            &eng,
+            &mut harness,
+            &gaugewright_harness::AllowAllGate,
+            "configure it",
+            &[],
+        )
+        .unwrap();
+
+        let summaries = store
+            .records("summary-chat", crate::turn_summary::TURN_SUMMARY_KIND)
+            .unwrap();
+        assert_eq!(summaries.len(), 1, "one summary per settled attempt");
+        let summary: crate::turn_summary::TurnSummary =
+            serde_json::from_str(&summaries[0]).unwrap();
+        assert_eq!(
+            summary.receipt_status,
+            crate::turn_summary::ReceiptStatus::Completed
+        );
+        assert_eq!(summary.changed_paths, vec![".agent-config.json"]);
+        assert_eq!(summary.changed_count, 1);
+        assert_eq!(
+            summary.policy_diff_direction,
+            crate::turn_summary::PolicyDiffDirection::Loosens
+        );
+        assert_eq!(summary.certified_reads.len(), 1);
+        assert_eq!(
+            summary.certified_reads[0].stakeholders,
+            vec!["context-owner"]
+        );
+    }
+
+    #[test]
+    fn completed_turn_records_exact_point_fork_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("chat-1").unwrap();
+        let mut harness = PositionedHarness {
+            worktree: eng.path().to_path_buf(),
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        run_task(
+            &mut store,
+            "chat-1",
+            &eng,
+            &mut harness,
+            &gaugewright_harness::AllowAllGate,
+            "change it",
+            &[],
+        )
+        .unwrap();
+
+        let boundary: TurnBoundaryRecord =
+            serde_json::from_str(&store.records("chat-1", TURN_BOUNDARY_KIND).unwrap()[0]).unwrap();
+        assert_ne!(boundary.before_workspace_cut, boundary.after_workspace_cut);
+        assert_eq!(boundary.runtime_before.sequence, 4);
+        assert_eq!(boundary.runtime_after.sequence, 9);
+        let transcript_positions = store
+            .events("chat-1")
+            .unwrap()
+            .into_iter()
+            .filter(|(_, kind, _)| kind == "transcript")
+            .map(|(position, _, _)| position)
+            .collect::<Vec<_>>();
+        assert!(transcript_positions.contains(&boundary.user_entry_id));
+        assert!(transcript_positions.contains(&boundary.assistant_entry_id));
+    }
 
     impl gaugewright_harness::CredentialCapability for PresentCredential {
         fn credential_ref(&self) -> &str {
@@ -1914,8 +2574,8 @@ mod tests {
         );
     }
 
-    // Host-managed provider (SERVE-2 hosted embed, ADR 0064): the fail-closed
-    // check trusts only a neutral readiness signal from the private host, keeping
+    // A managed-Home provider's fail-closed check trusts only a neutral
+    // readiness signal from the private host, keeping
     // provider-specific secret names out of the open engine.
     #[test]
     fn host_managed_provider_requires_host_readiness() {
@@ -1974,59 +2634,6 @@ mod tests {
             Some("gpt-x")
         );
         assert_eq!(resolve_turn_model(Some(String::new()), None), None);
-    }
-
-    // A public-session turn is fail-closed on the lifecycle phase (INV-20): only Active runs.
-    #[test]
-    fn public_turn_only_runs_when_active() {
-        use gaugewright_core::public_session::Phase;
-        assert!(public_turn_allowed(Phase::Active).is_ok());
-        for p in [Phase::Init, Phase::Opened, Phase::Expiring, Phase::TornDown] {
-            let err = public_turn_allowed(p).unwrap_err();
-            assert!(
-                err.contains("not active"),
-                "actionable refusal for {p:?}: {err}"
-            );
-        }
-    }
-
-    // The hosted turn path end-to-end (fake agent): an Active public session drives a real turn
-    // in its same-id engagement; a non-active session is refused before any work runs.
-    #[test]
-    fn run_public_turn_drives_an_active_session_and_refuses_otherwise() {
-        use gaugewright_core::public_session::Phase;
-        use std::sync::{Arc, Mutex};
-        use tokio::sync::broadcast;
-
-        let dir = tempfile::tempdir().unwrap();
-        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
-        let eng = inst.create_engagement("sess-1").unwrap();
-        let worktree = eng.path().to_path_buf();
-        let store = Store::open_in_memory().unwrap();
-        let wb = Arc::new(Mutex::new(crate::Workbench::with_instance(
-            "inst-test",
-            inst,
-            store,
-        )));
-        wb.lock()
-            .unwrap()
-            .register_engagement("sess-1", "inst-test", Box::new(eng));
-        let (tx, _rx) = broadcast::channel(16);
-
-        // Not active ⇒ refused, no turn, no worktree mutation.
-        let refused = run_public_turn(&wb, Phase::Opened, "sess-1", &worktree, &tx, "hi", &[]);
-        assert!(refused.unwrap_err().contains("not active"));
-        assert!(
-            !worktree.join("agent-note.txt").exists(),
-            "no turn ran for an inactive session"
-        );
-
-        // Active ⇒ a real turn runs (Use mode), producing a diff.
-        let _fake_agent = fake_agent_env();
-        let ok =
-            run_public_turn(&wb, Phase::Active, "sess-1", &worktree, &tx, "do it", &[]).unwrap();
-        assert_eq!(ok.run_phase, RunPhase::Completed);
-        assert!(ok.diff.contains("agent-note.txt"), "real diff: {}", ok.diff);
     }
 
     // The egress allowlist routes Cloudflare providers to Cloudflare's hosts only — the upstream
@@ -2146,16 +2753,29 @@ mod tests {
         let wt = dir.path();
         std::fs::create_dir_all(wt.join(".whipple/versions/1")).unwrap();
         std::fs::create_dir_all(wt.join(".whipple/draft")).unwrap();
-        std::fs::write(wt.join(".agent-config.json"), "{}").unwrap();
+        std::fs::create_dir_all(wt.join(".gaugedesk-runtime/discipline")).unwrap();
 
         let ro = method_surface_readonly_roots(wt, ChatMode::Use);
         assert!(ro.contains(&wt.join(".whipple")));
-        assert!(ro.contains(&wt.join(".agent-config.json")));
+        assert!(ro.contains(&wt.join(".gaugedesk-runtime")));
 
         let edit_ro = method_surface_readonly_roots(wt, ChatMode::Edit);
         assert!(edit_ro.contains(&wt.join(".whipple/versions")));
-        assert!(edit_ro.contains(&wt.join(".agent-config.json")));
+        assert!(edit_ro.contains(&wt.join(".gaugedesk-runtime")));
         assert!(!edit_ro.contains(&wt.join(".whipple/draft")));
+    }
+
+    #[test]
+    fn target_path_scope_becomes_the_only_writable_sandbox_roots() {
+        let worktree = Path::new("/target/candidate");
+        assert_eq!(
+            target_writable_roots(worktree, &["src".to_owned(), "docs/api".to_owned()]),
+            vec![worktree.join("src"), worktree.join("docs/api")]
+        );
+        assert_eq!(
+            target_writable_roots(worktree, &[".".to_owned()]),
+            vec![worktree.to_path_buf()]
+        );
     }
 
     /// The Phase-2 gate, end-to-end and headless: a default agent works in a
@@ -2304,6 +2924,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_harness_transport_death_terminalizes_and_summarizes_the_attempt() {
+        struct DeadHarness;
+        impl Harness for DeadHarness {
+            fn run_turn(
+                &mut self,
+                _gate: &dyn EgressGate,
+                _prompt: &str,
+                _images: &[ImageContent],
+                _sink: &mut dyn FnMut(&Observation),
+            ) -> io::Result<TurnOutcome> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "runtime died"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("e1").unwrap();
+        let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
+        let mut transport = DeadHarness;
+        let mut store = Store::open_in_memory().unwrap();
+
+        let error = run_task(
+            &mut store,
+            "eng-transport",
+            &eng,
+            &mut transport,
+            &gate,
+            "go",
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, EngineError::Harness(_)));
+        assert_eq!(
+            store.fold::<RunState>("eng-transport").unwrap().phase,
+            RunPhase::Failed,
+            "a dead harness must not strand a durable Running state"
+        );
+        let summary = crate::turn_summary::latest(&store, "eng-transport")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            summary.receipt_status,
+            crate::turn_summary::ReceiptStatus::Failed
+        );
+        assert!(summary.error.is_some());
+    }
+
     /// A fail-closed pre-flight refusal (no model credential) is a durable, coded
     /// failure turn — the user message plus a `code:"no_credential"` error line — so the
     /// chat log shows it and the client can render an "open settings" action (LLM-1).
@@ -2338,34 +3007,6 @@ mod tests {
         assert!(
             joined.contains(r#""type":"error""#) && joined.contains(r#""code":"no_credential""#),
             "the error line carries the machine-readable code: {joined}"
-        );
-    }
-
-    #[test]
-    fn precheck_failure_does_not_terminalize_a_suspended_epoch() {
-        let mut store = Store::open_in_memory().unwrap();
-        for command in [
-            RunCommand::RequestRun,
-            RunCommand::AdmitRun,
-            RunCommand::StartRun,
-            RunCommand::AwaitHuman,
-        ] {
-            store.admit::<RunState>("eng-wait", command).unwrap();
-        }
-
-        let result = record_precheck_failure(
-            &mut store,
-            "eng-wait",
-            "blue",
-            "Reconnect the model credential.".to_owned(),
-            "no_credential",
-        )
-        .unwrap();
-
-        assert_eq!(result.run_phase, RunPhase::AwaitingHuman);
-        assert_eq!(
-            store.fold::<RunState>("eng-wait").unwrap().phase,
-            RunPhase::AwaitingHuman
         );
     }
 
@@ -2405,77 +3046,76 @@ mod tests {
     }
 
     #[test]
-    fn human_question_suspends_without_commit_then_resumes_same_run() {
+    fn managed_usage_is_admitted_to_run_and_billing_scopes() {
         use gaugewright_harness::testing::ScriptedHarness;
 
         let dir = tempfile::tempdir().unwrap();
         let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let eng = inst.create_engagement("e1").unwrap();
         let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
-        let ask = HumanPrompt {
-            ask_ref: "ask-1".to_owned(),
-            question: "Which color?".to_owned(),
-            choices: vec!["blue".to_owned(), "green".to_owned()],
-            freeform_allowed: false,
-            label_ref: "label-1".to_owned(),
-            evidence_ref: "evidence-1".to_owned(),
-        };
-        let mut harness = ScriptedHarness::new(vec![
-            TurnOutcome {
-                assistant_text: ask.question.clone(),
-                observations: vec![Observation {
-                    kind: "human_ask",
-                    detail: ask.question.clone(),
-                    tool: None,
-                }],
-                pending_human: Some(ask.clone()),
-                ..TurnOutcome::default()
-            },
-            TurnOutcome {
-                assistant_text: "Blue it is.".to_owned(),
-                ..TurnOutcome::default()
-            },
-        ]);
+        let mut harness = ScriptedHarness::new(vec![TurnOutcome {
+            assistant_text: "done".into(),
+            managed_usage: Some(gaugewright_harness::ModelUsage {
+                usage_ref: "whip:evidence:usage:1".into(),
+                provider: "cloudflare-workers-ai".into(),
+                model: "@cf/model".into(),
+                input_tokens: 8,
+                output_tokens: 3,
+            }),
+            ..TurnOutcome::default()
+        }]);
         let mut store = Store::open_in_memory().unwrap();
-        let mut sink = |_: &Observation| {};
-
-        let suspended = run_task_streaming(
+        run_task_streaming_billed(
             &mut store,
-            "e1",
             &eng,
+            "e1",
             &mut harness,
             &gate,
-            "ask if needed",
+            "go",
             &[],
-            &mut sink,
+            &mut |_| {},
+            Some(crate::account::ACCOUNT_SCOPE),
+            Some("gaugedesk:managed-plan:v1:test"),
+            "",
         )
         .unwrap();
-        assert_eq!(suspended.run_phase, RunPhase::AwaitingHuman);
-        assert_eq!(suspended.pending_human, Some(ask));
-        assert!(suspended.pending_approvals.is_empty());
-        assert!(suspended.commit.is_none());
-        assert_eq!(
-            store.fold::<RunState>("e1").unwrap().phase,
-            RunPhase::AwaitingHuman
-        );
 
-        let completed = run_task_streaming(
-            &mut store,
-            "e1",
-            &eng,
-            &mut harness,
-            &gate,
-            "blue",
-            &[],
-            &mut sink,
-        )
-        .unwrap();
-        assert_eq!(completed.run_phase, RunPhase::Completed);
-        assert!(completed.pending_human.is_none());
+        let run_usage = crate::managed_inference::fold_usage(&store, "e1", 0).unwrap();
+        let billed =
+            crate::managed_inference::fold_usage(&store, crate::account::ACCOUNT_SCOPE, 10)
+                .unwrap();
+        assert_eq!(run_usage.total_tokens, 11);
+        assert_eq!(billed.runs, 1);
+        assert_eq!(billed.overage_tokens, 1);
         assert_eq!(
-            store.fold::<RunState>("e1").unwrap().phase,
-            RunPhase::Completed
+            crate::managed_inference::fold_reservations(&store, crate::account::ACCOUNT_SCOPE)
+                .unwrap(),
+            crate::managed_inference::ManagedReservationSummary {
+                reserved: 1,
+                settled: 1,
+                released: 0,
+                outstanding: 0,
+            }
         );
+        let kinds = store
+            .events(crate::account::ACCOUNT_SCOPE)
+            .unwrap()
+            .into_iter()
+            .map(|(_, kind, _)| kind)
+            .collect::<Vec<_>>();
+        let reservation = kinds
+            .iter()
+            .position(|kind| kind == crate::managed_inference::MANAGED_RESERVATION_KIND)
+            .unwrap();
+        let usage = kinds
+            .iter()
+            .position(|kind| kind == crate::managed_inference::MANAGED_USAGE_KIND)
+            .unwrap();
+        let settlement = kinds
+            .iter()
+            .position(|kind| kind == crate::managed_inference::MANAGED_SETTLEMENT_KIND)
+            .unwrap();
+        assert!(reservation < usage && usage < settlement);
     }
 
     /// The prompt sent to the model is the **raw task** — no framing prefix.
@@ -2537,7 +3177,7 @@ mod tests {
         let eng = inst.create_engagement("e1").unwrap();
         let worktree = eng.path().to_path_buf();
         let store = Store::open_in_memory().unwrap();
-        let wb = Arc::new(Mutex::new(crate::Workbench::with_instance(
+        let wb = Arc::new(Mutex::new(crate::Workbench::with_target(
             "inst-test",
             inst,
             store,
@@ -2558,6 +3198,12 @@ mod tests {
                 images: &[],
                 mode: ChatMode::Use,
                 authenticated_actor: None,
+                contribution_by: None,
+                account_scope: crate::account::ACCOUNT_SCOPE,
+                tenant_scope: crate::org::ORG_SCOPE,
+                runtime_command_id: None,
+                harness_factory: None,
+                review_requested: false,
             },
         )
         .unwrap();
@@ -2577,12 +3223,16 @@ mod tests {
         // INV-4: the turn's execution evidence was admitted into the run.
         let obs = wb.lock().unwrap().run_state("e1").unwrap().observations;
         assert!(obs > 0, "run recorded admitted observations: {obs}");
+        let transcript = wb.lock().unwrap().engagement_transcript_json("e1").unwrap();
+        assert!(
+            transcript.contains(r#""forkable":true"#),
+            "the controlled provider simulator must expose real point-fork coordinates: {transcript}"
+        );
     }
 
-    /// With a policy that blocks `bash`, the membrane stops it (the safety claim),
-    /// while the in-policy `write` still goes through.
+    /// A target-local file cannot override control-plane runtime policy.
     #[test]
-    fn fake_agent_membrane_blocks_out_of_policy_tool() {
+    fn fake_agent_ignores_target_local_runtime_config() {
         use std::sync::{Arc, Mutex};
         use tokio::sync::broadcast;
 
@@ -2590,14 +3240,15 @@ mod tests {
         let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let eng = inst.create_engagement("e1").unwrap();
         let worktree = eng.path().to_path_buf();
-        // policy blocks bash
+        // A file with the retired name is ordinary target content and has no
+        // authority to change the runtime membrane.
         std::fs::write(
             worktree.join(".agent-config.json"),
             r#"{"policy":{"block_tools":["bash"]}}"#,
         )
         .unwrap();
         let store = Store::open_in_memory().unwrap();
-        let wb = Arc::new(Mutex::new(crate::Workbench::with_instance(
+        let wb = Arc::new(Mutex::new(crate::Workbench::with_target(
             "inst-test",
             inst,
             store,
@@ -2618,20 +3269,21 @@ mod tests {
                 images: &[],
                 mode: ChatMode::Use,
                 authenticated_actor: None,
+                contribution_by: None,
+                account_scope: crate::account::ACCOUNT_SCOPE,
+                tenant_scope: crate::org::ORG_SCOPE,
+                runtime_command_id: None,
+                harness_factory: None,
+                review_requested: false,
             },
         )
         .unwrap();
 
         assert_eq!(
             result.mediated_tool_calls,
-            vec!["write".to_string()],
-            "bash not mediated"
+            vec!["write".to_string(), "bash".to_string()]
         );
-        assert!(
-            result.blocked_effects.iter().any(|b| b.contains("bash")),
-            "the membrane blocked bash: {:?}",
-            result.blocked_effects
-        );
+        assert!(result.blocked_effects.is_empty());
     }
 
     /// MINT-1: a turn's derived output is minted under the scope's owning
@@ -2766,7 +3418,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let store = Store::open_in_memory().unwrap();
-        let wb = Arc::new(Mutex::new(crate::Workbench::with_instance(
+        let wb = Arc::new(Mutex::new(crate::Workbench::with_target(
             "inst-test",
             inst,
             store,
@@ -3010,6 +3662,49 @@ mod tests {
         );
     }
 
+    /// The per-chat serialization unit is the **harness**, not the workbench.
+    ///
+    /// A turn needs exclusive access to one chat's agent for as long as the model
+    /// call takes. It used to take that by holding the workbench mutex, which
+    /// serialized every other chat — and every unrelated read — behind it. Now it
+    /// holds only the chat's own harness, so the workbench stays lockable while a
+    /// turn is in flight, and a second turn on the *same* chat still waits.
+    #[test]
+    fn a_turn_holds_its_own_harness_not_the_workbench() {
+        use crate::app_support::LockUnpoisoned;
+        use gaugewright_workspace::Instance;
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut wb = crate::Workbench::with_target("inst-test", inst, store);
+        wb.seed_local_session_for_test(
+            "c1",
+            Box::new(ScriptedTransport::new(Vec::<String>::new())),
+        );
+        let harness = wb.sessions.get("c1").cloned().expect("the seeded session");
+        let wb = Arc::new(Mutex::new(wb));
+
+        // Stand in for a turn in flight: the harness is checked out and held.
+        let turn = harness.lock_unpoisoned();
+
+        assert!(
+            wb.try_lock().is_ok(),
+            "the workbench must stay lockable while a turn holds its harness"
+        );
+        assert!(
+            harness.try_lock().is_err(),
+            "a second turn on the same chat must still wait for the harness"
+        );
+
+        drop(turn);
+        assert!(
+            harness.try_lock().is_ok(),
+            "the harness frees when the turn finishes"
+        );
+    }
+
     /// WORKBENCH-REMOTE-1: a chat is local *or* remote, never both. Placing a remote
     /// session retires any local one under the same id, so the two maps stay disjoint.
     #[test]
@@ -3021,7 +3716,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let store = Store::open_in_memory().unwrap();
-        let mut wb = crate::Workbench::with_instance("inst-test", inst, store);
+        let mut wb = crate::Workbench::with_target("inst-test", inst, store);
 
         // Seed a local session under the chat id, then place it remotely.
         wb.seed_local_session_for_test(

@@ -3,7 +3,7 @@
 //! reducer [`gaugewright_core::device_enrollment`]. A new device joins an existing account
 //! **root** (the "this is also me" act, distinct from federation's `INV-13` crossing).
 //!
-//! The three-message handshake ([ADR 0055]) over the relay (`infra/relay/`, broker `:7900`):
+//! The three-message handshake ([ADR 0055]) over the shared binary-WSS relay:
 //! 1. **Request** — the new device mints a subkey and opens a rendezvous session, presenting
 //!    `(session, subkey)`. No authority — a claim awaiting proof.
 //! 2. **Challenge + SAS** — a device holding the root picks up the request. Both ends derive a

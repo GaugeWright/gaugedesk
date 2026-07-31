@@ -207,6 +207,19 @@ pub struct PlacementPolicyRecord {
     pub policy: PlacementPolicy,
 }
 
+/// The org's enterprise client compatibility floor (`ITGOV-4`, ADR 0095).
+/// This is session admission policy, not endpoint attestation. The reported build
+/// is evaluated by the Home on every enterprise request.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SoftwarePolicyRecord {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    #[serde(flatten)]
+    pub policy: crate::client_admission::SoftwarePolicy,
+}
+
 /// The org's SCIM provisioning token (B13). Only the **hash** is stored — the
 /// plaintext is shown once at issuance and never persisted (`SEC-5`: no secret at
 /// rest in plaintext). Rotating issues a new token and overwrites the hash, so the
@@ -294,6 +307,11 @@ pub struct BillingRecord {
     /// Purchased seat entitlement.
     #[serde(default)]
     pub seats: u64,
+    /// Optional organization-funded managed-inference subscription (LLM-3).
+    /// Operational only: suspension gates future model calls and never rewrites
+    /// historical usage or authority.
+    #[serde(default)]
+    pub managed_inference: Option<crate::managed_inference::ManagedInferencePlan>,
 }
 
 /// A mapping from an IdP **group** to a workspace role (and optional team) (B13 /
@@ -348,6 +366,7 @@ pub struct Org {
     pub group_mappings: BTreeMap<String, GroupMappingRecord>,
     pub policy: Option<Policy>,
     pub placement_policy: Option<PlacementPolicy>,
+    pub software_policy: Option<crate::client_admission::SoftwarePolicy>,
     pub sso: Option<SsoConnectionRecord>,
     pub scim_token_sha256: Option<String>,
     pub security: Option<SecurityPolicyRecord>,
@@ -410,6 +429,13 @@ impl Org {
             match r.op {
                 RecordOp::Tombstone => org.placement_policy = None,
                 RecordOp::Upsert => org.placement_policy = Some(r.policy),
+            }
+        }
+        for row in store.records(scope, "software_policy")? {
+            let r: SoftwarePolicyRecord = serde_json::from_str(&row)?;
+            match r.op {
+                RecordOp::Tombstone => org.software_policy = None,
+                RecordOp::Upsert => org.software_policy = Some(r.policy),
             }
         }
         for row in store.records(scope, "sso")? {

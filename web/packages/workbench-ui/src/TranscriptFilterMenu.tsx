@@ -179,7 +179,7 @@ export function TranscriptFilterMenu(props: {
                             type="button"
                             class="filter-reset"
                             data-filter-reset
-                            title="Show everything again (this session)"
+                            title="Restore the product defaults (this session)"
                             onClick={() => change(defaultPrefs)}
                         >
                             Reset

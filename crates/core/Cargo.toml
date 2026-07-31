@@ -10,6 +10,12 @@ serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
 p256 = { version = "0.13", features = ["ecdsa"] }
 hex = "0.4"
+sha2 = "0.10"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Keep the shared authority/lifecycle core usable from browser projections.
+# Native Machine and Android adapters still use their platform RNGs.
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 proptest = "1"

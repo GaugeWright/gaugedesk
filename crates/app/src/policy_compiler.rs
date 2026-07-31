@@ -184,7 +184,10 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
                 resource: record.attributes.clone(),
                 action: Action::Run,
                 context: Context {
-                    ceiling_attested: input.placement_kind != "local",
+                    // A remote host is not automatically an attested host.
+                    // Cloudflare DO is hosted/unattested; only the explicit
+                    // confidential-compute placement may raise this ceiling.
+                    ceiling_attested: input.placement_kind == "attested",
                 },
             },
         ) {

@@ -1,0 +1,42 @@
+{
+  "name": "@gaugewright/enterprise-workbench",
+  "version": "0.0.0",
+  "private": true,
+  "license": "BUSL-1.1",
+  "type": "module",
+  "description": "Capability-gated enterprise composition of the GaugeDesk workbench.",
+  "dependencies": {
+    "@gaugewright/control-plane-client": "0.0.0",
+    "@gaugewright/enterprise-client": "0.0.0",
+    "@gaugewright/workbench-web": "0.0.0",
+    "@gaugewright/workbench-ui": "0.0.0",
+    "solid-js": "^1.9.0"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./AdminEnvironment": "./src/AdminEnvironment.tsx",
+    "./SsoWizard": "./src/SsoWizard.tsx",
+    "./main": "./src/main.tsx"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ../../tsconfig.enterprise-ui.json",
+    "build": "vite build --config vite.config.ts"
+  },
+  "gaugewright": {
+    "artifactKind": "app",
+    "ciTarget": "npm run typecheck:enterprise-ui",
+    "dependencyPolicy": {
+      "mayDependOn": [
+        "open-source",
+        "source-available-enterprise"
+      ],
+      "mustNotDependOn": [
+        "private-managed-services"
+      ]
+    },
+    "extractionPhase": "monorepo-transitional",
+    "licenseTarget": "BUSL-1.1",
+    "repoTarget": "source-available-enterprise",
+    "sourcePosture": "source-available-enterprise"
+  }
+}

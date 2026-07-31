@@ -83,6 +83,17 @@ impl SigningKey {
         PublicKey::new(hex::encode(sec1))
     }
 
+    /// The matching public point in uncompressed SEC1 form (`04 || x || y`).
+    /// Protocol adapters that must publish JWK coordinates can use this without
+    /// gaining access to private key material.
+    pub fn public_key_uncompressed_bytes(&self) -> [u8; 65] {
+        let encoded = self.0.verifying_key().to_encoded_point(false);
+        encoded
+            .as_bytes()
+            .try_into()
+            .expect("a P-256 uncompressed point is always 65 bytes")
+    }
+
     /// Sign `msg` (real P-256 ECDSA over SHA-256, deterministic).
     pub fn sign(&self, msg: &[u8]) -> Signature {
         let sig: P256Sig = self.0.sign(msg);
@@ -152,6 +163,9 @@ mod tests {
         let sig = sk.sign(b"hello");
         assert_eq!(sig.len(), P256_SIG_LEN);
         assert_eq!(verify_signature(b"hello", &sig, &pk), Ok(true));
+        let uncompressed = sk.public_key_uncompressed_bytes();
+        assert_eq!(uncompressed.len(), 65);
+        assert_eq!(uncompressed[0], 4);
     }
 
     /// The same signature over a *different* message does not verify (INV-21).

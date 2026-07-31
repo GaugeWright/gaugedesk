@@ -187,8 +187,26 @@ impl WhipTrackerHandle {
     }
 
     /// Atomically claim an issue for `holder` (CAS; the store is the arbiter).
-    pub fn claim_item(&mut self, item_id: &str, holder: &str) -> TrackerResult<ClaimOutcome> {
-        Ok(self.items.claim_item(item_id, holder)?)
+    ///
+    /// `expires` bounds the claim (WhippleScript 0.2.2). `None` is unbounded,
+    /// which is right for a person holding a task — someone who steps away has
+    /// not abandoned it. An automated holder should pass a bound so a dead
+    /// worker does not hold an issue forever.
+    pub fn claim_item(
+        &mut self,
+        item_id: &str,
+        holder: &str,
+        expires: Option<&str>,
+    ) -> TrackerResult<ClaimOutcome> {
+        Ok(self.items.claim_item(item_id, holder, expires)?)
+    }
+
+    /// Direct an open issue at `assignee`, or clear it with `None` (0.2.2).
+    ///
+    /// Advisory: it records who *should* answer and does not stop anyone else
+    /// claiming (ADR 0111 §4). Unassigned means "whoever has access".
+    pub fn assign_item(&mut self, item_id: &str, assignee: Option<&str>) -> TrackerResult<bool> {
+        Ok(self.items.assign_item(item_id, assignee)?)
     }
 
     /// Close an issue (open/in_progress → closed). Returns whether a row moved.

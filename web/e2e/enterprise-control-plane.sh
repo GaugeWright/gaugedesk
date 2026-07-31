@@ -23,6 +23,8 @@ ln -sfn "$REPO/plugin" "$STATE/plugin"
 # is its own machine: pin its data root to its isolated state dir (see
 # fed-control-plane.sh for why — a shared OS app-data root would collide).
 export GAUGEWRIGHT_TEST_RESET=1
+export GAUGEWRIGHT_TEST_IDENTITY_TOKEN="${GAUGEWRIGHT_TEST_IDENTITY_TOKEN:-gw-e2e-owner-token}"
+export GAUGEWRIGHT_TEST_MEMBER_TOKEN="${GAUGEWRIGHT_TEST_MEMBER_TOKEN:-gw-e2e-member-token}"
 export GAUGEWRIGHT_ADDR="127.0.0.1:${PORT}"
 export GAUGEWRIGHT_ROOT="$STATE"
 exec "$BIN"

@@ -1,0 +1,18 @@
+{
+  "name": "@gaugewright/mobile-shell",
+  "version": "0.4.3",
+  "private": true,
+  "description": "GaugeDesk native mobile shell build tooling.",
+  "scripts": {
+    "tauri": "tauri",
+    "android:init": "tauri android init --ci",
+    "android:dev": "tauri android dev",
+    "android:build": "tauri android build",
+    "ios:init": "tauri ios init --ci",
+    "ios:dev": "tauri ios dev",
+    "ios:build": "tauri ios build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  }
+}

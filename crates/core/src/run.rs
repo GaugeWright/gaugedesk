@@ -13,7 +13,6 @@ pub enum RunPhase {
     Requested,
     Admitted,
     Running,
-    AwaitingHuman,
     Completed,
     Failed,
     Canceled,
@@ -50,9 +49,7 @@ pub enum RunCommand {
     /// Admit one execution-evidence record from the runtime (`INV-4`).
     RecordObservation,
     /// Pause the current admitted attempt at a labeled runtime question.
-    AwaitHuman,
     /// Resume the same admitted attempt after GaugeDesk authenticates the respondent.
-    ResumeRun,
     /// Record one optimistic client command, tagged with its [`ClientRequestId`],
     /// while the run is running (MOB-003).
     RecordPending(ClientRequestId),
@@ -71,8 +68,6 @@ pub enum RunEvent {
     RunAdmitted,
     RunStarted,
     ObservationRecorded,
-    RunAwaitingHuman,
-    RunResumed,
     /// An optimistic client command was recorded as pending (MOB-003).
     PendingRecorded(ClientRequestId),
     /// A pending optimistic command was reconciled away (MOB-003).
@@ -115,14 +110,6 @@ pub fn decide(state: &RunState, command: RunCommand) -> Result<Vec<RunEvent>, Re
             Running => Ok(vec![E::ObservationRecorded]),
             _ => reject("recordObservation: run is not running (INV-4)"),
         },
-        C::AwaitHuman => match state.phase {
-            Running => Ok(vec![E::RunAwaitingHuman]),
-            _ => reject("awaitHuman: run is not running"),
-        },
-        C::ResumeRun => match state.phase {
-            AwaitingHuman => Ok(vec![E::RunResumed]),
-            _ => reject("resumeRun: run is not awaiting a human"),
-        },
         // MOB-003: an optimistic command may only be recorded while running, and
         // its id must be fresh so two distinct optimistic commands never collapse.
         C::RecordPending(rid) => match state.phase {
@@ -147,7 +134,7 @@ pub fn decide(state: &RunState, command: RunCommand) -> Result<Vec<RunEvent>, Re
             _ => reject("failRun: not running"),
         },
         C::CancelRun => match state.phase {
-            Requested | Admitted | Running | AwaitingHuman => Ok(vec![E::RunCanceled]),
+            Requested | Admitted | Running => Ok(vec![E::RunCanceled]),
             _ => reject("cancelRun: already terminal"),
         },
         // Re-entry from any terminal state: failed/canceled is a retry; completed
@@ -189,17 +176,6 @@ pub fn evolve(state: &RunState, event: RunEvent) -> RunState {
         // INV-4: an admitted observation updates run evidence without a phase change.
         ObservationRecorded => RunState {
             observations: state.observations + 1,
-            ..state.clone()
-        },
-        // A stable pending ask has settled any optimistic UI command, but keeps
-        // the execution attempt and its prior admission alive.
-        RunAwaitingHuman => RunState {
-            phase: P::AwaitingHuman,
-            pending_commands: Vec::new(),
-            ..state.clone()
-        },
-        RunResumed => RunState {
-            phase: P::Running,
             ..state.clone()
         },
         // MOB-003: append the optimistic command to the pending ledger.
@@ -323,27 +299,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn human_suspension_resumes_the_same_admitted_attempt() {
-        use RunCommand::*;
-        let waiting = drive(&[RequestRun, AdmitRun, StartRun, AwaitHuman]);
-        assert_eq!(waiting.phase, RunPhase::AwaitingHuman);
-        assert!(waiting.admitted_once);
-        assert!(decide(&waiting, CompleteRun).is_err());
-
-        let resumed = apply(&waiting, ResumeRun);
-        assert_eq!(resumed.phase, RunPhase::Running);
-        assert!(resumed.admitted_once);
-    }
-
-    #[test]
-    fn awaiting_human_can_be_canceled_but_not_retried() {
-        use RunCommand::*;
-        let waiting = drive(&[RequestRun, AdmitRun, StartRun, AwaitHuman]);
-        assert!(decide(&waiting, RetryRun).is_err());
-        assert_eq!(apply(&waiting, CancelRun).phase, RunPhase::Canceled);
-    }
-
     // MOB-003: a run with a pending optimistic command and not running is the
     // bug `PENDING_ONLY_WHILE_RUNNING` forbids; a `terminal`/`retry` evolve that
     // forgot to clear `pending_commands` would let the proptest below trip.
@@ -397,8 +352,6 @@ mod tests {
             Just(AdmitRun),
             Just(StartRun),
             Just(RecordObservation),
-            Just(AwaitHuman),
-            Just(ResumeRun),
             rid.clone().prop_map(RecordPending),
             rid.prop_map(Reconcile),
             Just(CompleteRun),
@@ -420,7 +373,7 @@ mod tests {
             let mut s = RunState::default();
             for c in &commands {
                 s = apply(&s, c.clone());
-                if matches!(s.phase, RunPhase::Running | RunPhase::AwaitingHuman) {
+                if matches!(s.phase, RunPhase::Running) {
                     prop_assert!(s.admitted_once, "INV-11 violated: running without admission");
                 }
                 // INV-4: evidence only enters via admission while running.

@@ -25,11 +25,11 @@ Feature: Mobile projection client — pair, navigate, send (offline + online)
   Scenario: a chat started on the device shows up on the desktop
     # The device and desktop are two clients of one control plane: a chat started on
     # the device must be the same kind the desktop's quick-start makes (a WORK chat,
-    # not an edit chat) and appear in the desktop's Chats facet — the cross-surface
+    # not an edit chat) and appear in the desktop's Personal project — the cross-surface
     # flow that was silently broken (the device made edit chats the desktop hid).
     Given I have paired with the ticket "gaugewright-pair://demo-env/device:web-harness"
     When I start a new chat on the device
-    Then it shows up as a work chat in the desktop's Chats facet
+    Then it shows up as a work chat in the desktop's Personal project
 
   Scenario: send is refused offline and restored online
     Given I have paired with the ticket "gaugewright-pair://demo-env/device:web-harness"
@@ -48,6 +48,7 @@ Feature: Mobile projection client — pair, navigate, send (offline + online)
     # tap jumps to that task's chat. Previously the phone surfaced no tasks at all.
     Given I have paired with the ticket "gaugewright-pair://demo-env/device:web-harness"
     When I start a new chat on the device
+    And I request review for the next mobile change
     And I can send "make a change"
     Then the task queue badge appears
     When I open the task queue

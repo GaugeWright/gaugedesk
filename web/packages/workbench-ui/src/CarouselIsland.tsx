@@ -22,8 +22,6 @@
 import { createMemo, type JSX } from "solid-js";
 import { reduce, select as reselect } from "./carousel";
 import {
-    gutterGesture,
-    peekNeighbours,
     PANE_LABEL,
     tapGesture,
     toggleSegments,
@@ -49,6 +47,8 @@ export interface CarouselProps {
     /** The pane bodies, keyed by pane. Supplied by the host so the island stays
      *  agnostic of each projection (files/content/chat/nav components). */
     readonly panes: Record<PaneKind, JSX.Element>;
+    /** Optional environment-specific subset, preserving broad-to-deep order. */
+    readonly paneOrder?: readonly PaneKind[];
     /** Optional: start a new chat. When supplied, the **Chat** toggle is always
      *  actionable — if a chat is open it navigates there as usual, but with none
      *  open yet it starts one (same as the nav's "+ new chat") instead of sitting
@@ -60,8 +60,20 @@ export function Carousel(props: CarouselProps): JSX.Element {
     // Route a gesture through the pure reducer; the host owns the resulting truth.
     const apply = (gesture: CarouselGesture) => props.onState(reduce(props.state, gesture));
 
-    const segments = createMemo(() => toggleSegments(props.state));
-    const peek = createMemo(() => peekNeighbours(props.state));
+    const segments = createMemo(() => {
+        const admitted = new Set(props.paneOrder ?? ["nav", "chat", "files", "content"]);
+        return toggleSegments(props.state).filter((segment) => admitted.has(segment.pane));
+    });
+    const peek = createMemo(() => {
+        const visible = segments();
+        const current = visible.findIndex((segment) => segment.current);
+        return {
+            broader: current > 0 ? visible[current - 1]!.pane : null,
+            deeper: current >= 0 && visible[current + 1]?.reachable
+                ? visible[current + 1]!.pane
+                : null,
+        };
+    });
 
     return (
         <div class="carousel" data-pane={props.state.current}>
@@ -92,9 +104,17 @@ export function Carousel(props: CarouselProps): JSX.Element {
             </div>
 
             <div class="carousel-stage">
-                <EdgeGutter edge="left" peek={peek().broader} onPull={apply} />
+                <EdgeGutter
+                    edge="left"
+                    peek={peek().broader}
+                    onPull={() => peek().broader && apply(tapGesture(peek().broader!))}
+                />
                 <div class="carousel-pane">{props.panes[props.state.current]}</div>
-                <EdgeGutter edge="right" peek={peek().deeper} onPull={apply} />
+                <EdgeGutter
+                    edge="right"
+                    peek={peek().deeper}
+                    onPull={() => peek().deeper && apply(tapGesture(peek().deeper!))}
+                />
             </div>
         </div>
     );
@@ -108,7 +128,7 @@ export function Carousel(props: CarouselProps): JSX.Element {
 function EdgeGutter(props: {
     readonly edge: GutterEdge;
     readonly peek: PaneKind | null;
-    readonly onPull: (gesture: CarouselGesture) => void;
+    readonly onPull: () => void;
 }): JSX.Element {
     const chevron = props.edge === "left" ? "‹" : "›";
     // Name the destination pane ("Go to Files") rather than a bare direction
@@ -129,7 +149,7 @@ function EdgeGutter(props: {
             aria-label={label()}
             aria-hidden={props.peek === null}
             tabindex={props.peek === null ? -1 : 0}
-            onClick={() => props.peek !== null && props.onPull(gutterGesture(props.edge))}
+        onClick={() => props.peek !== null && props.onPull()}
         >
             {props.peek !== null ? chevron : ""}
         </button>

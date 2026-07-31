@@ -89,15 +89,21 @@ When("I start a new chat on the device", async ({ page }) => {
     await expect(page.locator("[data-composer-draft]")).toBeVisible();
 });
 
-Then("it shows up as a work chat in the desktop's Chats facet", async ({ page }) => {
+Then("it shows up as a work chat in the desktop's Personal project", async ({ page }) => {
     // Open the desktop workbench (same control plane) in a sibling page and confirm
     // the chat the device just started is listed under Chats — and is a WORK chat
     // (an edit chat, the old bug, would not match `data-kind="work"`).
     const desktop = await page.context().newPage();
     await desktop.goto("/");
-    await desktop.locator('[data-facet="all-chats"]').click();
-    await expect(desktop.locator('[data-chat][data-kind="work"]').first()).toBeVisible();
+    await desktop.locator('[data-facet="projects"]').click();
+    await expect(desktop.locator('[data-project]', { hasText: "Personal" }).locator('[data-chat][data-kind="work"]').first()).toBeVisible();
     await desktop.close();
+});
+
+When("I request review for the next mobile change", async ({ page }) => {
+    const review = page.locator("[data-review-next]");
+    await review.click();
+    await expect(review).toHaveAttribute("aria-pressed", "true");
 });
 
 // ---- offline / online send gate ---------------------------------------------

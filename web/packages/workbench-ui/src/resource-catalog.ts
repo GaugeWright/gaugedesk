@@ -144,19 +144,3 @@ export function outputProtectionLabel(
 ): string {
     return exportPhaseLabel(exp) ?? reviewPhaseLabel(review) ?? "not yet reviewed";
 }
-
-// ----- Per-resource lifecycle scopes (mirror resource_store scope formats) ----
-
-/** The per-resource **review** scope id (`{engagement}-review-{rid}`), driven
- *  through the generic `/scopes/:scope/review` route. Mirrors
- *  `resource_store::review_scope`. */
-export function resourceReviewScope(engagementId: string, resourceId: string): string {
-    return `${engagementId}-review-${resourceId}`;
-}
-
-/** The per-resource **export** scope id (`{engagement}-export-{rid}`), driven
- *  through the generic `/scopes/:scope/export` route. Mirrors
- *  `resource_store::export_scope`. */
-export function resourceExportScope(engagementId: string, resourceId: string): string {
-    return `${engagementId}-export-${resourceId}`;
-}

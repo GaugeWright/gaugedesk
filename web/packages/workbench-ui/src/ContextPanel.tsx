@@ -12,7 +12,7 @@
  * (`INV-10`). Mounted near the "add files" affordance in the chat header.
  */
 
-import { createResource, For, Show } from "solid-js";
+import { createResource, createSignal, For, Show } from "solid-js";
 import type { EngagementId, ResourceView } from "@gaugewright/control-plane-client";
 import {
     availabilityLabel,
@@ -25,6 +25,8 @@ import { LoadError } from "./LoadError";
 
 export interface ContextResourceApi {
     getResources(id: EngagementId): Promise<ResourceView[]>;
+    requestResourceAccess(id: EngagementId, resource: string): Promise<unknown>;
+    approveResourceAccess(id: EngagementId, resource: string): Promise<unknown>;
 }
 
 export function ContextPanel(props: {
@@ -39,6 +41,24 @@ export function ContextPanel(props: {
         ([id]) => props.api.getResources(id),
     );
     const sources = () => contextSources(resources() ?? []);
+    const [acting, setActing] = createSignal<string | null>(null);
+    const [actionError, setActionError] = createSignal("");
+    const act = async (resource: ResourceView, action: "request" | "approve") => {
+        setActing(resource.id);
+        setActionError("");
+        try {
+            if (action === "request") {
+                await props.api.requestResourceAccess(props.id, resource.id);
+            } else {
+                await props.api.approveResourceAccess(props.id, resource.id);
+            }
+            await refetch();
+        } catch (error) {
+            setActionError(error instanceof Error ? error.message : "resource access failed");
+        } finally {
+            setActing(null);
+        }
+    };
 
     return (
         <div class="drawer-overlay" data-context-overlay onClick={props.onClose}>
@@ -78,6 +98,24 @@ export function ContextPanel(props: {
                                             >
                                                 {availabilityLabel(avail)}
                                             </span>
+                                            <Show when={r.access === "Init" || r.access === "Revoked"}>
+                                                <button
+                                                    type="button"
+                                                    class="link-btn"
+                                                    data-resource-access-request={r.id}
+                                                    disabled={acting() === r.id}
+                                                    onClick={() => void act(r, "request")}
+                                                >request access</button>
+                                            </Show>
+                                            <Show when={r.access === "Requested"}>
+                                                <button
+                                                    type="button"
+                                                    class="link-btn"
+                                                    data-resource-access-approve={r.id}
+                                                    disabled={acting() === r.id}
+                                                    onClick={() => void act(r, "approve")}
+                                                >approve access</button>
+                                            </Show>
                                             <Show when={r.tombstoned}>
                                                 <span class="resource-tombstone" data-tombstoned title="payload erased">
                                                     erased
@@ -88,6 +126,9 @@ export function ContextPanel(props: {
                                 }}
                             </For>
                         </div>
+                    </Show>
+                    <Show when={actionError()}>
+                        <div class="status error" data-resource-access-error>{actionError()}</div>
                     </Show>
                 </Show>
                 </Show>

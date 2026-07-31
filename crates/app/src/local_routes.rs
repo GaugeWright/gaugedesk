@@ -5,20 +5,25 @@ use axum::{
 
 use crate::{
     engagement_routes as er, federation, library_routes as lr, lifecycle_routes as life, net_http,
-    package_routes as pkg, project_credential_routes, resource_store as rs,
-    workstream_routes as wr, SharedWorkbench,
+    project_credential_routes, resource_store as rs, workstream_routes as wr, SharedWorkbench,
 };
 
 /// Open-source local workbench route surface: health, workspace/library,
 /// project/chat/resource lifecycles, package primitives, projections, test reset
-/// hooks, and the parked self-operated federation route surface when its open
-/// operator gate is enabled.
+/// hooks (debug builds only), and the parked self-operated federation route
+/// surface when its open operator gate is enabled.
 pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
-    Router::new()
+    let routes = Router::new()
         .route("/health", get(net_http::health))
+        .route(
+            "/console/review-count",
+            get(crate::console_routes::get_review_count),
+        )
         .route("/workspace", get(lr::get_workspace))
         .route("/workspace/events", get(er::workspace_events))
         .route("/tasks", get(lr::get_tasks))
+        .route("/roster", get(lr::get_roster))
+        .route("/work-items/:item_id/assign", post(lr::assign_work_item))
         .route("/search", get(lr::search))
         .route("/archetypes", post(lr::create_agent))
         .route(
@@ -26,6 +31,10 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             get(lr::get_agent)
                 .put(lr::update_agent)
                 .delete(lr::delete_agent),
+        )
+        .route(
+            "/archetypes/:id/abilities",
+            get(lr::get_archetype_abilities).put(lr::put_archetype_abilities),
         )
         .route("/archetypes/:id/chats", post(lr::create_chat_under_agent))
         .route("/archetypes/:id/use", post(lr::use_archetype))
@@ -35,9 +44,78 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             post(lr::post_pull_from_source),
         )
         .route("/archetypes/:id/publish", post(lr::post_publish_archetype))
+        .route(
+            "/placements/:id/abilities",
+            get(lr::get_placement_abilities),
+        )
         .route("/placements/:id/upgrade", post(lr::post_upgrade_placement))
         .route("/placements/:id/accept", post(lr::post_accept_placement))
+        .route(
+            "/public-deployments",
+            post(crate::publisher_routes::publish_deployment),
+        )
+        .route(
+            "/public-deployments/inspect",
+            post(crate::publisher_routes::inspect_deployment),
+        )
+        .route(
+            "/public-deployments/control",
+            post(crate::publisher_routes::control_deployment),
+        )
+        .route(
+            "/public-deployments/erase-session",
+            post(crate::publisher_routes::erase_session),
+        )
+        .route(
+            "/public-deployments/credentials/list",
+            post(crate::publisher_routes::list_credentials),
+        )
+        .route(
+            "/public-deployments/credentials/provision",
+            post(crate::publisher_routes::provision_credential),
+        )
+        .route(
+            "/public-deployments/credentials/revoke",
+            post(crate::publisher_routes::revoke_credential),
+        )
+        .route(
+            "/public-deployments/collect",
+            post(crate::publisher_routes::collect_into_project),
+        )
+        .route(
+            "/collection-recipients",
+            get(crate::publisher_routes::list_collection_recipients)
+                .post(crate::publisher_routes::ensure_collection_recipient),
+        )
         .route("/projects", post(lr::create_project))
+        .route(
+            "/projects/:id/quarantine",
+            get(crate::publisher_routes::list_project_quarantine),
+        )
+        .route(
+            "/projects/:id/quarantine/:item",
+            get(crate::publisher_routes::get_quarantined_item),
+        )
+        .route(
+            "/projects/:id/quarantine/:item/screen",
+            post(crate::publisher_routes::screen_quarantined_item),
+        )
+        .route(
+            "/projects/:id/quarantine/:item/review",
+            post(crate::publisher_routes::review_quarantined_item),
+        )
+        .route(
+            "/projects/:id/targets",
+            post(crate::target_adapter::attach_target),
+        )
+        .route(
+            "/targets/:id/acts",
+            get(crate::target_adapter::list_target_acts),
+        )
+        .route(
+            "/chats/:id/target-acts/:act",
+            post(crate::target_adapter::request_terminal_target_act),
+        )
         .route(
             "/projects/:id",
             put(lr::update_project).delete(lr::delete_project),
@@ -68,7 +146,6 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         )
         .route("/placements/:id", get(life::get_instance))
         .route("/placements/:id/command", post(life::post_instance_command))
-        .route("/chats/:id/boundary", get(life::get_boundary))
         .route(
             "/boundaries/:bid/challenge",
             post(lr::issue_boundary_challenge),
@@ -78,6 +155,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route("/pairing-status/:id", get(lr::get_pairing_status))
         .merge(federation::featured_routes(federation_on))
         .route("/chats/:id/fork", post(lr::fork_chat))
+        .route("/chats/:id/fork/:entry_id", post(lr::fork_chat_at))
         .route("/chats/:id/sync", post(er::post_sync))
         .route("/chats/:id/stop", post(er::post_stop))
         .route("/chats/:id", delete(lr::delete_chat))
@@ -112,7 +190,11 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         )
         .route(
             "/chats/:id/resources/:rid/export",
-            post(rs::post_resource_export),
+            get(rs::get_resource_export).post(rs::post_resource_export),
+        )
+        .route(
+            "/chats/:id/resources/:rid/export/command",
+            post(rs::post_resource_export_command),
         )
         .route(
             "/chats/:id/resources/:rid/export-to-disk",
@@ -120,7 +202,11 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         )
         .route(
             "/chats/:id/resources/:rid/review",
-            post(rs::post_resource_review),
+            get(rs::get_resource_review).post(rs::post_resource_review),
+        )
+        .route(
+            "/chats/:id/resources/:rid/review/command",
+            post(rs::post_resource_review_command),
         )
         .route(
             "/chats/:id/resources/:rid/access",
@@ -138,28 +224,23 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             "/chats/:id/resources/:rid/access/revoke",
             post(rs::post_resource_access_revoke),
         )
-        .route(
-            "/packages",
-            post(pkg::post_package_publish).get(pkg::get_packages),
-        )
-        .route("/packages/:id/withdraw", post(pkg::post_package_withdraw))
-        .route("/packages/:id/install", post(pkg::post_package_install))
-        .route("/packages/:id/entitle", post(pkg::post_package_entitle))
-        .route("/packages/:id/readiness", get(pkg::get_package_readiness))
         .route("/scopes/:scope/run", get(life::get_run))
         .route("/scopes/:scope/run/command", post(life::post_run_command))
-        .route("/scopes/:scope/review", get(life::get_review))
-        .route(
-            "/scopes/:scope/review/command",
-            post(life::post_review_command),
-        )
-        .route("/scopes/:scope/export", get(life::get_export))
-        .route(
-            "/scopes/:scope/export/command",
-            post(life::post_export_command),
-        )
         .route("/scopes/:scope/audit", get(life::get_audit))
-        .route("/projections/:scope/:kind", get(life::get_projection))
+        .route(
+            "/projections/library/workspace/:record/:id",
+            get(life::get_workspace_delta),
+        )
+        .route("/projections/:scope/:kind", get(life::get_projection));
+    // The destructive BDD-only surface (state-root reset, conflict injection)
+    // compiles only into debug builds, so no released artifact carries a route
+    // that can delete persisted user data (DR-0054 Phase A). The debug/test
+    // harness binaries that need it are always debug builds (`web/e2e/*.sh`,
+    // `scripts/dev.sh`), and the `GAUGEWRIGHT_TEST_RESET` process guard stays
+    // in force as defense in depth where the routes do exist.
+    #[cfg(debug_assertions)]
+    let routes = routes
         .route("/test/reset", post(er::post_test_reset))
-        .route("/test/force-conflict", post(er::post_test_force_conflict))
+        .route("/test/force-conflict", post(er::post_test_force_conflict));
+    routes
 }

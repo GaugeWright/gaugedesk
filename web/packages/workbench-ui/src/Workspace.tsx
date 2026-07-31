@@ -14,7 +14,10 @@ import { LoadError } from "./LoadError";
 // is visible there even though it lives under `.whipple`.
 const isInternal = (path: string, editChat: boolean) =>
     path.split("/").some((seg) => seg.startsWith("."))
-    && !(editChat && path.startsWith(".whipple/draft/"));
+    && !(editChat && (
+        path.startsWith(".whipple/draft/") ||
+        path.startsWith(".whipple/discipline/draft/")
+    ));
 
 export function Workspace() {
     const session = useSession();

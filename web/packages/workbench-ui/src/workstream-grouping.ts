@@ -6,9 +6,10 @@
  *
  * Given a chat list and the candidate workstreams (a root's workstreams in the Projects/
  * Library facets, or the flat all-workstreams list in the Chats facet), it returns one
- * group per **active** workstream (shown even when empty, so it can still be joined /
- * promoted / archived) plus the ungrouped tail (chats homed to the mainline, or to an
- * archived/foreign workstream).
+ * group per **active** named workstream (shown even when empty, so it can still be
+ * joined / promoted / archived) plus the ungrouped tail (chats homed to the mainline,
+ * or to an archived/foreign workstream). When named workstreams are active, the tail
+ * is also surfaced as the implicit `Main` group so the renderer can place it first.
  */
 
 import type { WorkstreamId, WorkstreamNode } from "@gaugewright/control-plane-client";
@@ -25,6 +26,9 @@ export interface WorkstreamGroup<T extends ChatLike> {
 export interface GroupedChats<T extends ChatLike> {
     /** One per active workstream (in the candidates' order), each with its member chats. */
     readonly groups: WorkstreamGroup<T>[];
+    /** The implicit placement mainline when named active workstreams make it useful to
+     * expose. `null` keeps the ordinary single-line case free of redundant chrome. */
+    readonly main: readonly T[] | null;
     /** Chats not in any active candidate workstream — the mainline tail. */
     readonly ungrouped: T[];
 }
@@ -42,7 +46,7 @@ export function groupChatsByWorkstream<T extends ChatLike>(
         if (gi !== undefined) groups[gi].chats.push(c);
         else ungrouped.push(c);
     }
-    return { groups, ungrouped };
+    return { groups, main: groups.length > 0 ? ungrouped : null, ungrouped };
 }
 
 /** Whether grouping is worth rendering at all: there is at least one active workstream. */

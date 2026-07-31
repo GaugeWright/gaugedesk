@@ -7,7 +7,7 @@ Feature: The archetype & project library
   Scenario: a fresh workbench seeds a default archetype
     Given the workbench is open
     When I switch to the "Library" facet
-    Then I see the archetype "assistant"
+    Then I see the archetype "Default"
 
   Scenario: create an archetype and open an edit chat under it
     Given the workbench is open
@@ -32,7 +32,7 @@ Feature: The archetype & project library
     And I place an archetype on the project "beta-site"
     Then the project "alpha-site" shows its placements
     And the project "beta-site" shows its placements
-    And the Library lists 1 archetype
+    And the Library lists 3 archetype
 
   Scenario: delete an archetype via its context menu
     Given the workbench is open
@@ -41,13 +41,13 @@ Feature: The archetype & project library
     When I delete the archetype "scratch"
     Then the archetype "scratch" is gone
 
-  # WS-H: a workstream can be started from any chat row, in the Chats facet, with no
+  # A workstream can be started from a chat in its explicit project, with no
   # root-picking — the placement resolves to the chat's own home and the chat joins
   # immediately, so the new shared line is a visible, non-empty group from the start.
-  Scenario: create a workstream from a chat in the Chats facet
+  Scenario: create a workstream from a chat in Personal
     Given the workbench is open
-    When I start a new chat from All chats
-    Then I see a chat in All chats
+    When I start a new chat in Personal
+    Then I see a chat in Personal
     When I create a workstream named "sprint" from that chat
     Then the chat is on the workstream "sprint"
 
@@ -55,7 +55,7 @@ Feature: The archetype & project library
   # joinable) with an empty member list, no hint message (WS-H).
   Scenario: leaving a workstream empties it but keeps it visible with a hint
     Given the workbench is open
-    When I start a new chat from All chats
+    When I start a new chat in Personal
     And I create a workstream named "sprint" from that chat
     Then the chat is on the workstream "sprint"
     When I remove that chat from its workstream
@@ -65,33 +65,58 @@ Feature: The archetype & project library
   # group chats) and its chat returns to the mainline list (WS-F INV-23 rehoming).
   Scenario: archiving a workstream removes the line and frees its chat
     Given the workbench is open
-    When I start a new chat from All chats
+    When I start a new chat in Personal
     And I create a workstream named "sprint" from that chat
     Then the chat is on the workstream "sprint"
     When I archive the workstream "sprint"
     Then there is no workstream "sprint"
-    And I see a chat in All chats
+    And I see a chat in Personal
 
-  # Promote brings the line's settled work into the placement mainline (explicit);
-  # the line itself survives the promote (it is not archived) and keeps its chat.
-  Scenario: promoting a workstream lands its work and keeps the line
+  # A clean promoted line lands its work on Main, then retires and re-homes its chat.
+  Scenario: promoting a workstream lands its work and retires the line
     Given the workbench is open
-    When I start a new chat from All chats
+    When I start a new chat in Personal
     And I create a workstream named "sprint" from that chat
     Then the chat is on the workstream "sprint"
     When I promote the workstream "sprint"
-    Then the chat is on the workstream "sprint"
+    Then there is no workstream "sprint"
+    And I see a chat in Personal
 
-  # A second chat in the same placement joins the existing line — from the Chats facet,
-  # which now offers co-located lines as join targets (WS-H).
-  Scenario: a second chat joins an existing workstream from the Chats facet
+  # A second chat in the same placement joins the existing line; only its co-rooted
+  # lines are offered as targets.
+  Scenario: a second Personal chat joins an existing workstream
     Given the workbench is open
-    When I start a new chat from All chats
+    When I start a new chat in Personal
     And I create a workstream named "sprint" from that chat
     Then the chat is on the workstream "sprint"
-    When I start a new chat from All chats
+    When I start a new chat in Personal
     And I add the latest chat to the workstream "sprint"
     Then the workstream "sprint" has 2 chats
+
+  Scenario: dragging a chat transfers it between workstreams
+    Given the workbench is open
+    When I start a new chat in Personal
+    And I create a workstream named "first" from that chat
+    And I start a new chat in Personal
+    And I create a workstream named "second" from that chat
+    When I drag a chat from workstream "first" onto workstream "second"
+    Then the workstream "first" shows it has no chats yet
+    And the workstream "second" has 2 chats
+
+  Scenario: dragging a chat onto Main leaves its workstream
+    Given the workbench is open
+    When I start a new chat in Personal
+    And I create a workstream named "sprint" from that chat
+    And I drag a chat from workstream "sprint" onto Main
+    Then the workstream "sprint" shows it has no chats yet
+
+  Scenario: clicking away cancels an armed workstream merge
+    Given the workbench is open
+    When I start a new chat in Personal
+    And I create a workstream named "sprint" from that chat
+    And I arm merge for workstream "sprint"
+    And I click away from the workstream merge
+    Then workstream "sprint" merge is not armed
 
   # Per-placement config-only customization (placement.md): tweak a method for one
   # project/client without forking — a config overlay + notes on the placement, applied

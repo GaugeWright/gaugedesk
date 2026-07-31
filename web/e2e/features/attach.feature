@@ -19,7 +19,16 @@ Feature: Message attachments
     Then the run phase is "Completed"
     And the composer has no pending attachments
 
-  Scenario: PDF and Office files are not supported yet
+  Scenario: extract an Office document in the browser
     Given a new engagement
-    When I attach an unsupported file "report.pdf" of type "application/pdf"
-    Then the composer has no pending attachments
+    When I attach a DOCX document "sample.docx"
+    And I task the agent with "summarize the Word document"
+    Then the transcript echoes my message "hello from Word"
+    And the composer has no pending attachments
+
+  Scenario: extract a PDF in the browser
+    Given a new engagement
+    When I attach the PDF document "report.pdf" containing "hello from PDF"
+    And I task the agent with "summarize the PDF"
+    Then the transcript echoes my message "hello from PDF"
+    And the composer has no pending attachments

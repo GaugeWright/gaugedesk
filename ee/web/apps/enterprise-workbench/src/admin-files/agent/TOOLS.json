@@ -1,0 +1,31 @@
+{
+  "schema": "gaugedesk.admin-agent-tools.v1",
+  "additional_tools": false,
+  "tools": [
+    {
+      "id": "environment.files.list",
+      "effect": "read",
+      "description": "List the secret-free Administration files admitted for the current actor."
+    },
+    {
+      "id": "environment.files.read",
+      "effect": "read",
+      "description": "Read one admitted Administration configuration, help, or agent-definition file."
+    },
+    {
+      "id": "environment.projections.query",
+      "effect": "read",
+      "description": "Refresh target-admitted Home management projections without inferring unavailable inventory."
+    },
+    {
+      "id": "environment.changes.propose",
+      "effect": "proposal",
+      "description": "Prepare a typed patch against a writable Administration JSON document for explicit human review."
+    },
+    {
+      "id": "question.ask",
+      "effect": "human",
+      "description": "File one attributable question for a person; the turn settles and the later answer grants no authority."
+    }
+  ]
+}

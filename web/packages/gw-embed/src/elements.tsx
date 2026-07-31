@@ -5,8 +5,8 @@
  * panels EMBED-1 built.
  *
  * Architecture:
- *  - `<gw-session>` holds a **scoped** control plane + a {@link createRemoteSession}
- *    bound to one engagement, exposed as the element's `.session` property. It is a
+ *  - `<gw-session>` holds one EDGE-5 session client adapted to the shared workbench
+ *    Session contract and exposed as the element's `.session` property. It is a
  *    logical provider (light DOM) — its panel children find it by DOM ancestry.
  *  - each panel element finds its Session (the ancestor `<gw-session>`'s `.session`,
  *    or its own `.session` set directly — the JS-handle escape hatch for detached
@@ -17,14 +17,26 @@
  * shared Session into its own tree via {@link SessionProvider} — the panel code is
  * unchanged (`useSession()` works exactly as on the desktop).
  */
-import { createResource, createSignal, For, Show, type JSX } from "solid-js";
+import { createResource, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
-import { type EngagementId } from "@gaugewright/control-plane-client";
-import { EmbedControlPlane, controlPlaneBase } from "./embed-control-plane";
+import { type ControlPlane, type EngagementId } from "@gaugewright/control-plane-client";
+import { EdgeSessionApi } from "./edge-session";
+import {
+    LATENCY_EVENT,
+    observeBrowserLatency,
+    relayServerLatency,
+    type LatencyObservation,
+} from "./latency";
 import { createRemoteSession } from "./remote-session";
+import { ChatPanel } from "@gaugewright/workbench-ui/ChatPanel";
+import { AudienceChats } from "@gaugewright/workbench-ui/AudienceChats";
 import { ContentViewer } from "@gaugewright/workbench-ui/ContentViewer";
+import {
+    Environment,
+    panelManifest,
+    type PanelId,
+} from "@gaugewright/workbench-ui/environment";
 import { SessionProvider, type Session } from "@gaugewright/workbench-ui/session-context";
-import { TranscriptView } from "@gaugewright/workbench-ui/TranscriptView";
 import { Workspace } from "@gaugewright/workbench-ui/Workspace";
 import appCss from "@gaugewright/workbench-ui/styles.css?inline";
 
@@ -55,9 +67,7 @@ const EMBED_THEME_CSS = `
   color: var(--ink);
   font-family: var(--ui);
 }
-/* Powered-by attribution (EMBED-7): a quiet mark on every embedded panel. It is
-   unconditional today; white-label *removal* is a gated follow-on that reads a
-   deployment config flag delivered through the session bootstrap. */
+/* Powered-by attribution (EMBED-7): a quiet mark on every embedded panel. */
 .gw-powered-by {
   display: block;
   flex: 0 0 auto;
@@ -69,76 +79,324 @@ const EMBED_THEME_CSS = `
   text-decoration: none;
 }
 .gw-powered-by:hover { color: var(--accent); }
+.gw-embed-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.gw-embed-panel > :first-child {
+  flex: 1 1 auto;
+  min-height: 0;
+}
 `;
+
+/** Fail-safe branding: the mark is visible while config loads or if the read fails, and is
+ * suppressed only by an explicit deployment `white_label: true`. */
+function PoweredBy(props: { session: Session }) {
+    const [config] = createResource(() =>
+        props.session.api.embedGetConfig?.() ?? Promise.resolve({ white_label: false }),
+    );
+    return (
+        <Show when={config()?.white_label !== true}>
+            <a
+                class="gw-powered-by"
+                data-embed-powered-by
+                href="https://gaugewright.com"
+                target="_blank"
+                rel="noreferrer"
+            >
+                Powered by GaugeDesk
+            </a>
+        </Show>
+    );
+}
 
 /** `<gw-session cp="…" engagement="…">`: builds + owns the scoped remote Session. */
 export class GwSessionElement extends HTMLElement {
     /** The Session its panel children render against (also settable directly). */
     session?: Session;
+    /** The first-class producer that binds identity, placement transport, and
+     * the panel manifest (ADR 0076). */
+    environment?: Environment;
     private _teardown?: () => void;
+    private _base: string | null = null;
+    private _audienceAssertion: string | null = null;
+    private readonly _latencyObserver = (
+        observation: LatencyObservation,
+    ) => {
+        this.dispatchEvent(
+            new CustomEvent(LATENCY_EVENT, {
+                bubbles: true,
+                composed: true,
+                detail: observation,
+            }),
+        );
+    };
+
+    private observeLatency(
+        phase: Parameters<typeof observeBrowserLatency>[1],
+        fields?: Parameters<typeof observeBrowserLatency>[2],
+    ): void {
+        observeBrowserLatency(this._latencyObserver, phase, fields);
+    }
 
     connectedCallback() {
         if (this.session || this._teardown) return; // already built, or injected via handle
-        const engagement = this.getAttribute("engagement");
-        const key = this.getAttribute("key");
-        if (engagement) {
-            // Direct binding: the consultant (or the in-desktop preview) supplies the
-            // control-plane base + the engagement id.
-            const base = this.getAttribute("cp") ?? this.getAttribute("base") ?? controlPlaneBase();
-            this.bindSession(base, engagement, key, false);
-        } else {
-            // Snippet bootstrap (EMBED-3): `<gw-session host="…" key="pk_…">` — the only thing a
-            // consultant drops on their page. Activate a hosted visitor session and bind to the
-            // returned { cp, engagement }.
-            const host = this.getAttribute("host");
-            if (host && key) void this.bootstrap(host, key);
-        }
+        const host = this.getAttribute("host");
+        if (host) void this.bootstrap(host);
     }
 
-    /** Activate a hosted visitor session via the host's `POST /sessions` bootstrap (EMBED-3), then
-     *  bind to the returned per-visitor control plane. Fail-closed: a non-admitted key/origin or an
-     *  unreachable host leaves the panel unbound (no broken pane, `INV-20`). */
-    private async bootstrap(host: string, key: string) {
+    /** Admit or resume one hosted visitor engagement during page load, then
+     * bind all child panels to its one Session DO connection. */
+    private async bootstrap(host: string) {
+        const traceId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+        this.observeLatency("bootstrap_start", { trace_id: traceId });
         try {
             const base = /^https?:\/\//.test(host) ? host.replace(/\/$/, "") : `https://${host}`;
-            const res = await fetch(`${base}/sessions`, {
-                method: "POST",
-                headers: { "x-gw-publishable-key": key },
-            });
+            this._base = base;
+            const resumeStorageKey = `gaugewright:resume:${base}`;
+            const claimStorageKey = `gaugewright:claim:${base}`;
+            const audienceAssertion = this.getAttribute("token")?.trim() || null;
+            this._audienceAssertion = audienceAssertion;
+            let resumeCapability = localStorage.getItem(resumeStorageKey);
+            const activate = (resume: string | null) =>
+                fetch(`${base}/bootstrap`, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    credentials: "omit",
+                    body: JSON.stringify(
+                        {
+                            ...(resume ? { resume_capability: resume } : {}),
+                            ...(audienceAssertion
+                                ? { audience_assertion: audienceAssertion }
+                                : {}),
+                            ...(audienceAssertion && localStorage.getItem(claimStorageKey)
+                                ? {
+                                      claim_capability:
+                                          localStorage.getItem(claimStorageKey),
+                                  }
+                                : {}),
+                            trace_id: traceId,
+                        },
+                    ),
+                });
+            let res = await activate(resumeCapability);
+            if (res.status === 410) {
+                localStorage.removeItem(resumeStorageKey);
+                resumeCapability = null;
+                res = await activate(null);
+            }
+            this.observeLatency("bootstrap_response", { trace_id: traceId });
             if (!res.ok) return;
-            const { cp, engagement } = (await res.json()) as { cp?: string; engagement?: string };
-            if (!cp || !engagement) return;
-            if (this.session || this._teardown || !this.isConnected) return; // disconnected meanwhile
-            this.bindSession(cp, engagement, key, true);
+            await this.adoptBootstrap(
+                base,
+                audienceAssertion,
+                await res.json(),
+                claimStorageKey,
+            );
         } catch {
             /* host unreachable → fail-closed (no session) */
         }
     }
 
-    /** Build the scoped control plane + remote session and bind the panel children. */
-    private bindSession(base: string, engagement: string, key: string | null, publicEmbed: boolean) {
-        const api = new EmbedControlPlane(base);
-        if (key) api.setPublishableKey(key);
-        // Authenticated mode: carry the audience session token (EMBED-4) so the embed
-        // calls (e.g. my-chats) are scoped to this end-user.
-        const token = this.getAttribute("token");
-        if (token) api.setBearer(token);
-        const { session, dispose } = createRemoteSession({
-            api,
-            engagementId: engagement as EngagementId,
-            publicEmbed,
+    private async adoptBootstrap(
+        base: string,
+        audienceAssertion: string | null,
+        value: unknown,
+        claimStorageKey = `gaugewright:claim:${base}`,
+    ): Promise<void> {
+        const payload = value as {
+            session_id?: string;
+            panels?: string[];
+            white_label?: boolean;
+            resume_capability?: string;
+            connection_capability?: string;
+            connection_expires_at_unix_ms?: number;
+            claim_capability?: string;
+            latency?: unknown[];
+        };
+        for (const observation of payload.latency ?? []) {
+            if (
+                observation &&
+                typeof observation === "object" &&
+                !Array.isArray(observation)
+            ) {
+                relayServerLatency(
+                    this._latencyObserver,
+                    observation as Record<string, unknown>,
+                );
+            }
+        }
+        if (
+            !payload.session_id ||
+            !payload.resume_capability ||
+            !payload.connection_capability ||
+            !Number.isSafeInteger(payload.connection_expires_at_unix_ms)
+        ) {
+            throw new Error("hosted session bootstrap was incomplete");
+        }
+        localStorage.setItem(
+            `gaugewright:resume:${base}`,
+            payload.resume_capability,
+        );
+        if (payload.claim_capability) {
+            localStorage.setItem(claimStorageKey, payload.claim_capability);
+        } else if (audienceAssertion) {
+            localStorage.removeItem(claimStorageKey);
+        }
+        const granted = (payload.panels ?? []).map(
+            (panel) => panel.replace(/^gw-/, "") as PanelId,
+        );
+        const api = new EdgeSessionApi(
+            base,
+            payload.session_id as EngagementId,
+            payload.resume_capability,
+            payload.connection_capability,
+            Number(payload.connection_expires_at_unix_ms),
+            audienceAssertion,
+            payload.white_label === true,
+            this._latencyObserver,
+            audienceAssertion
+                ? {
+                      open: (chat) =>
+                          this.activateAudience({ requested_session_id: chat }),
+                      create: () => this.activateAudience({ new_session: true }),
+                      erase: (chat) => this.eraseAudienceChat(chat),
+                  }
+                : undefined,
+        );
+        await api.ready();
+        if (!this.isConnected) {
+            api.dispose();
+            return;
+        }
+        this._teardown?.();
+        this._teardown = undefined;
+        this.session = undefined;
+        this.environment = undefined;
+        this.querySelectorAll<GwPanelElement>(
+            "gw-chat, gw-viewer, gw-files, gw-chats",
+        ).forEach((panel) => panel.resetBinding());
+        this.bindSession(payload.session_id, granted, api);
+    }
+
+    private async activateAudience(
+        selection: { requested_session_id: string } | { new_session: true },
+    ): Promise<void> {
+        const base = this._base;
+        const audienceAssertion = this._audienceAssertion;
+        if (!base || !audienceAssertion) {
+            throw new Error("authenticated audience is required");
+        }
+        const traceId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+        this.observeLatency("bootstrap_start", { trace_id: traceId });
+        const response = await fetch(`${base}/bootstrap`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            credentials: "omit",
+            body: JSON.stringify({
+                audience_assertion: audienceAssertion,
+                ...selection,
+                trace_id: traceId,
+            }),
         });
-        this.session = session;
-        this._teardown = dispose;
+        this.observeLatency("bootstrap_response", { trace_id: traceId });
+        if (!response.ok) {
+            throw new Error(`audience chat activation: ${response.status}`);
+        }
+        await this.adoptBootstrap(
+            base,
+            audienceAssertion,
+            await response.json(),
+        );
+    }
+
+    private async eraseAudienceChat(chat: string): Promise<void> {
+        const base = this._base;
+        const audienceAssertion = this._audienceAssertion;
+        if (!base || !audienceAssertion) {
+            throw new Error("authenticated audience is required");
+        }
+        const response = await fetch(
+            `${base}/audience/sessions/${encodeURIComponent(chat)}`,
+            {
+                method: "DELETE",
+                headers: { "content-type": "application/json" },
+                credentials: "omit",
+                body: JSON.stringify({
+                    audience_assertion: audienceAssertion,
+                }),
+            },
+        );
+        if (!response.ok) throw new Error(`erase chat: ${response.status}`);
+        if (this.session?.engagementId() !== chat) return;
+        const list = await fetch(`${base}/audience/sessions`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            credentials: "omit",
+            body: JSON.stringify({ audience_assertion: audienceAssertion }),
+        });
+        if (!list.ok) throw new Error(`my chats: ${list.status}`);
+        const value = (await list.json()) as {
+            sessions?: { session_id: string }[];
+        };
+        const next = value.sessions?.[0]?.session_id;
+        await this.activateAudience(
+            next ? { requested_session_id: next } : { new_session: true },
+        );
+    }
+
+    /** Build the scoped edge session and bind the panel children. */
+    private bindSession(
+        engagement: string,
+        panelCeiling: readonly PanelId[],
+        api: EdgeSessionApi,
+    ) {
+        const token = this.getAttribute("token");
+        const explicitPanels = this.getAttribute("panels");
+        const childPanels = [...this.querySelectorAll("gw-chat, gw-viewer, gw-files, gw-chats")]
+            .map((element) => element.tagName.toLowerCase().replace(/^gw-/, "") as PanelId);
+        const requested = panelManifest(
+            explicitPanels ?? (childPanels.length ? childPanels : ["chat"]),
+        ).panels;
+        const granted = requested.filter((panel) => panelCeiling.includes(panel));
+        // A public deployment with no matching granted panel renders nothing. Do not construct a
+        // broader Environment and rely on visual hiding: composition itself is the scope.
+        if (granted.length === 0) return;
+        const manifest = panelManifest(granted);
+        this.environment = new Environment({
+            identity: token
+                ? {
+                      kind: "authenticated",
+                      subject: this.getAttribute("subject")?.trim() || "authenticated-audience",
+                  }
+                : { kind: "anonymous", subject: `anonymous:${engagement}` },
+            controlPlane: api as unknown as ControlPlane,
+            manifest,
+            sessionFactory: (_controlPlane, engagementId) =>
+                createRemoteSession({ api, engagementId }),
+        });
+        const binding = this.environment.openSession(engagement as EngagementId);
+        this.session = binding.session;
+        this._teardown = () => {
+            binding.dispose();
+            api.dispose();
+        };
         // Nudge any panel children that connected before us (DOM normally connects
         // us first, but be order-independent).
-        this.querySelectorAll<GwPanelElement>("gw-chat, gw-viewer, gw-files").forEach((p) => p.bind?.());
+        this.querySelectorAll<GwPanelElement>("gw-chat, gw-viewer, gw-files, gw-chats").forEach((p) => p.bind?.());
+        this.observeLatency("panels_bound");
     }
 
     disconnectedCallback() {
         this._teardown?.();
         this._teardown = undefined;
         this.session = undefined;
+        this.environment = undefined;
+        this._base = null;
+        this._audienceAssertion = null;
     }
 }
 
@@ -147,6 +405,7 @@ abstract class GwPanelElement extends HTMLElement {
     /** The JS-handle escape hatch: set this to mount detached from a `<gw-session>`. */
     session?: Session;
     private _disposeRender?: () => void;
+    protected abstract readonly panelId: PanelId;
 
     /** The Solid view this element renders against the resolved Session. */
     protected abstract view(session: Session): JSX.Element;
@@ -161,8 +420,13 @@ abstract class GwPanelElement extends HTMLElement {
      *  after setting `.session` directly. */
     bind() {
         if (this._disposeRender) return;
-        const session = this.session ?? this.closest<GwSessionElement>("gw-session")?.session;
+        const host = this.closest<GwSessionElement>("gw-session");
+        if (!this.session && host?.environment && !host.environment.includes(this.panelId)) return;
+        const session = this.session ?? host?.session;
         if (!session) return;
+        const attributionOwner =
+            !host ||
+            host.querySelector("gw-chat, gw-viewer, gw-files, gw-chats") === this;
         const root = this.shadowRoot ?? this.attachShadow({ mode: "open" });
         // Theme bridge first (defines the palette on :host), then the workbench
         // stylesheet (consumes it via var(--bg)… — its own :root block is inert here).
@@ -172,7 +436,26 @@ abstract class GwPanelElement extends HTMLElement {
         const style = document.createElement("style");
         style.textContent = appCss;
         root.appendChild(style);
-        this._disposeRender = render(() => <SessionProvider value={session}>{this.view(session)}</SessionProvider>, root);
+        this._disposeRender = render(
+            () => (
+                <SessionProvider value={session}>
+                    <div class="gw-embed-panel">
+                        {this.view(session)}
+                        <Show when={attributionOwner}>
+                            <PoweredBy session={session} />
+                        </Show>
+                    </div>
+                </SessionProvider>
+            ),
+            root,
+        );
+    }
+
+    resetBinding() {
+        this._disposeRender?.();
+        this._disposeRender = undefined;
+        this.session = undefined;
+        this.shadowRoot?.replaceChildren();
     }
 
     disconnectedCallback() {
@@ -181,106 +464,35 @@ abstract class GwPanelElement extends HTMLElement {
     }
 }
 
-/** The embedded chat: the shared transcript renderer + a minimal composer over the
- *  Session's `transcript`/`send`/`selectFile`. The desktop's queue/steer/gate are
- *  owner affordances and intentionally absent here. */
-function EmbeddedChat(props: { session: Session }) {
-    const [draft, setDraft] = createSignal("");
-    // White-label (EMBED-7): a deployment can suppress the attribution mark via its embed
-    // config. Fail toward branded — a missing endpoint (direct/preview binding) or any error
-    // leaves the mark shown, so attribution is the default and never depends on a live fetch.
-    const [embedConfig] = createResource(() =>
-        props.session.api.embedGetConfig?.().catch(() => ({ white_label: false })) ??
-        Promise.resolve({ white_label: false }),
-    );
-    const submit = () => {
-        const text = draft().trim();
-        if (!text) return;
-        setDraft("");
-        props.session.send(text);
-    };
-    return (
-        <div class="embed-chat" data-embed-chat>
-            <div class="transcript" data-embed-transcript>
-                <TranscriptView lines={props.session.transcript().lines} onOpen={props.session.selectFile} />
-            </div>
-            <form
-                class="composer embed-composer"
-                onSubmit={(e) => {
-                    e.preventDefault();
-                    submit();
-                }}
-            >
-                <input
-                    data-embed-composer
-                    value={draft()}
-                    onInput={(e) => setDraft(e.currentTarget.value)}
-                    placeholder="Type a message…"
-                    aria-label="Message"
-                />
-                <button type="submit" data-embed-send>Send</button>
-            </form>
-            {/* Attribution (EMBED-7): shown unless the deployment is white-labeled. */}
-            <Show when={!embedConfig()?.white_label}>
-                <a
-                    class="gw-powered-by"
-                    data-embed-powered-by
-                    href="https://gaugewright.com"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                >
-                    Powered by GaugeDesk
-                </a>
-            </Show>
-        </div>
-    );
-}
-
 export class GwChatElement extends GwPanelElement {
+    protected readonly panelId = "chat" as const;
+
     protected view(session: Session): JSX.Element {
-        return <EmbeddedChat session={session} />;
+        return <ChatPanel session={session} audience />;
     }
 }
 
 export class GwViewerElement extends GwPanelElement {
+    protected readonly panelId = "viewer" as const;
+
     protected view(): JSX.Element {
         return <ContentViewer />;
     }
 }
 
 export class GwFilesElement extends GwPanelElement {
+    protected readonly panelId = "files" as const;
+
     protected view(): JSX.Element {
         return <Workspace />;
     }
 }
 
-/** The signed-in end-user's saved chats (EMBED-5): a fail-closed, audience-scoped
- *  listing over `GET /embed/my-chats` (the bearer set on `<gw-session token=…>`). */
-function MyChatsList(props: { session: Session }) {
-    const [chats] = createResource(() => props.session.api.embedMyChats());
-    return (
-        <div class="embed-mychats" data-embed-mychats>
-            <Show when={chats()} fallback={<div class="status">loading…</div>}>
-                <Show
-                    when={chats()!.length}
-                    fallback={<div class="status" data-mychats-empty>No saved chats yet.</div>}
-                >
-                    <For each={chats()}>
-                        {(c) => (
-                            <div class="my-chat" data-my-chat>
-                                {c.title}
-                            </div>
-                        )}
-                    </For>
-                </Show>
-            </Show>
-        </div>
-    );
-}
-
 export class GwChatsElement extends GwPanelElement {
+    protected readonly panelId = "chats" as const;
+
     protected view(session: Session): JSX.Element {
-        return <MyChatsList session={session} />;
+        return <AudienceChats session={session} standalone />;
     }
 }
 

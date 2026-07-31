@@ -148,23 +148,61 @@ impl KeyWrap for LoopbackKeyWrap {
 /// Build the local persisted loopback content-key wrapper used by open/local
 /// workbench startup when content encryption is enabled.
 pub(crate) fn local_content_keywrap(root: &std::path::Path) -> std::io::Result<Box<dyn KeyWrap>> {
-    Ok(Box::new(LoopbackKeyWrap::new(local_content_kek(root))))
+    Ok(Box::new(LoopbackKeyWrap::new(local_content_kek(root)?)))
 }
 
-fn local_content_kek(root: &std::path::Path) -> [u8; 32] {
-    let path = root.join("keys").join("content-kek");
-    if let Ok(bytes) = std::fs::read(&path) {
-        if let Ok(kek) = <[u8; 32]>::try_from(bytes.as_slice()) {
-            return kek;
+/// Load the persisted content KEK, minting one only when the file is genuinely
+/// absent. Any other read outcome — a permission error, a truncated or
+/// wrong-length file — fails closed (DR-0054 Phase A): silently minting a
+/// replacement here would overwrite the only key that can unwrap every
+/// persisted `content-keys/*.dek`, permanently orphaning the encrypted
+/// content. Mirrors the fail-loud contract of
+/// [`crate::key_store::FileKeyStore`].
+fn local_content_kek(root: &std::path::Path) -> std::io::Result<[u8; 32]> {
+    let dir = root.join("keys");
+    let path = dir.join("content-kek");
+    match std::fs::read(&path) {
+        Ok(bytes) => <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "content KEK at {} has invalid length {} (expected 32 bytes); \
+                     refusing to regenerate over key material that still wraps stored content",
+                    path.display(),
+                    bytes.len()
+                ),
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut kek = [0u8; 32];
+            SystemRandom::new()
+                .fill(&mut kek)
+                .map_err(|_| std::io::Error::other("OS CSPRNG for the content KEK"))?;
+            std::fs::create_dir_all(&dir)?;
+            // Persist durably: stage in the same directory, fsync, then rename
+            // into place, so a crash never leaves a partial KEK on disk.
+            let staged = dir.join(format!("content-kek.tmp-{}", std::process::id()));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let written = options.open(&staged).and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(&kek)?;
+                file.sync_all()
+            });
+            if let Err(error) = written {
+                let _ = std::fs::remove_file(&staged);
+                return Err(error);
+            }
+            std::fs::rename(&staged, &path)?;
+            Ok(kek)
         }
+        Err(error) => Err(error),
     }
-    let mut kek = [0u8; 32];
-    SystemRandom::new()
-        .fill(&mut kek)
-        .expect("OS CSPRNG for the content KEK");
-    let _ = std::fs::create_dir_all(root.join("keys"));
-    let _ = std::fs::write(&path, kek);
-    kek
 }
 
 /// Envelope encryption (`SEC-4`): data is sealed under a random per-instance **DEK**, and
@@ -319,6 +357,42 @@ mod tests {
         assert_eq!(
             EnvelopeEncryptor::open(wrapped, &kek).err(),
             Some(AtRestError::Decrypt)
+        );
+    }
+
+    #[test]
+    fn content_kek_mints_once_and_reloads_the_same_key() {
+        let root = tempfile::tempdir().unwrap();
+        let first = local_content_kek(root.path()).unwrap();
+        let second = local_content_kek(root.path()).unwrap();
+        assert_eq!(first, second, "restart reloads the persisted KEK");
+        assert_eq!(
+            std::fs::read(root.path().join("keys").join("content-kek")).unwrap(),
+            first,
+            "the persisted bytes are the key itself"
+        );
+    }
+
+    #[test]
+    fn a_truncated_content_kek_fails_closed_and_is_left_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("keys");
+        let path = dir.join("content-kek");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A truncated key file — e.g. a crash mid-write or disk corruption.
+        std::fs::write(&path, [7u8; 5]).unwrap();
+
+        let error = local_content_kek(root.path())
+            .expect_err("an unreadable KEK must never be silently replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            [7u8; 5],
+            "the original file bytes survive for recovery"
+        );
+        assert!(
+            local_content_keywrap(root.path()).is_err(),
+            "the keywrap seam propagates the failure to startup"
         );
     }
 }

@@ -10,7 +10,7 @@
 # See specs/implementation/backend-stack.md and mvp-plan.md.
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/tracker", "crates/whip-runtime", "crates/app", "ee/app"]
+members = ["crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/tracker", "crates/whip-runtime", "crates/relay-transport", "crates/directory-protocol", "crates/app", "ee/app"]
 # The Tauri desktop shell is its own workspace (needs system webkit/CLI to build);
 # excluded so `cargo test` over the backend stays self-contained.
 exclude = ["src-tauri"]
@@ -21,3 +21,9 @@ version = "0.4.3"
 # The platform default (ADR 0069 / SPLIT-5). Crates that are not Apache
 # override explicitly: ee/app is BUSL-1.1.
 license = "Apache-2.0"
+
+# Dependencies are built without debug info. They dominate target/debug/deps,
+# and debug info measured ~78% of binary size (whipplescript, 2026-07-25).
+# Local crates keep full debuggability: panics and the debugger still work here.
+[profile.dev.package."*"]
+debug = false

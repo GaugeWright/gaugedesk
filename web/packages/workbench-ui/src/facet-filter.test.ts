@@ -9,6 +9,8 @@ import {
     markMatch,
     placementVisible,
     projectVisible,
+    recentLineage,
+    recentVisible,
     searching,
 } from "./facet-filter";
 
@@ -118,6 +120,37 @@ describe("archetypeVisible", () => {
     });
     it("hides when nothing matches", () => {
         expect(archetypeVisible(archetype, "zzz")).toBe(false);
+    });
+});
+
+describe("Recent lineage", () => {
+    const projects = [
+        { name: "Personal", placements: [{ placementId: "personal-general" }] },
+        { name: "Peach", placements: [{ placementId: "peach-pricing" }] },
+    ];
+    const workstreams = [{ id: "ws-1", name: "bid-day" }];
+
+    it("names the project and archetype for a work chat but keeps Main quiet", () => {
+        expect(recentLineage({ kind: "work", archetype: "assistant", placement: "personal-general" }, projects, workstreams))
+            .toBe("Personal · assistant");
+    });
+
+    it("appends a named workstream", () => {
+        expect(recentLineage({ kind: "work", archetype: "pricing", placement: "peach-pricing", workstream: "ws-1" }, projects, workstreams))
+            .toBe("Peach · pricing · bid-day");
+    });
+
+    it("names only the archetype root for an edit chat", () => {
+        expect(recentLineage({ kind: "edit", archetype: "pricing", placement: "authoring", workstream: null }, projects, workstreams))
+            .toBe("pricing");
+    });
+
+    it("filters on title, displayed lineage, or projected content", () => {
+        const chat = { id: "chat-1", title: "compare alternates" };
+        expect(recentVisible(chat, "Peach · pricing · bid-day", "alternate")).toBe(true);
+        expect(recentVisible(chat, "Peach · pricing · bid-day", "bid-day")).toBe(true);
+        expect(recentVisible(chat, "Peach · pricing · bid-day", "deadline", new Set(["chat-1"]))).toBe(true);
+        expect(recentVisible(chat, "Peach · pricing · bid-day", "missing")).toBe(false);
     });
 });
 

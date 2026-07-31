@@ -17,6 +17,10 @@ Feature: Round 7 — a layout that fits, a pinned composer, and immediate feedba
     And I task the agent with "add a closing line"
     Then the send button is fully on screen
 
+  Scenario: a long message wraps and grows without taking over the Chat panel
+    Given a new engagement
+    Then the message field wraps, grows, and stops at half the Chat panel
+
   Scenario: View auto-opens the file a turn just changed
     Given a new engagement
     When I task the agent with "draft a tagline for spring"

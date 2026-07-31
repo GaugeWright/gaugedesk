@@ -17,3 +17,11 @@ Feature: Context sources panel (O-1)
     Given a new engagement
     When I open the context sources panel
     Then the context sources panel shows no context sources
+
+  # resource-access-production-client
+  @transport
+  Scenario: a resource owner requests and approves withheld context through the shipped client
+    Given a withheld context source
+    When I request access to the withheld context source
+    And I approve access to the withheld context source
+    Then the withheld context source is available

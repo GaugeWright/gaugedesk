@@ -1,16 +1,15 @@
-# UNSIGNED packaging lane (D-RELEASE-LANES item 2, Band 1). On tag push the per-OS
-# Tauri build matrix produces **unsigned** installable bundles — .deb + .AppImage on
-# Linux, .dmg on macOS, .msi on Windows — and uploads them as workflow artifacts for
-# dogfooding. Signing / notarization stay clearly-commented placeholders (they need
-# certs/keys this repo does not hold — Band 3). See DEFERRED.md (D-RELEASE-LANES) and
-# specs/implementation/test-and-release-infra.md (Tier 4 "packaging & self-contained
-# distribution" + the Release lane in "CI lane structure").
+# Packaging lane (D-RELEASE-LANES item 2, Tier 4). On tag push the per-OS Tauri
+# build matrix produces .deb + .AppImage on Linux, .dmg on macOS, and .msi on
+# Windows. macOS signing/notarization is mandatory and verified in the production
+# lane; Windows Artifact Signing remains blocked
+# on Azure organization validation and a Public Trust certificate profile.
+# See DEFERRED.md (D-RELEASE-LANES) and specs/implementation/test-and-release-infra.md.
 #
 # VALIDATED-BY-SYNTAX-HERE, RUNS-ON-CI: this environment has no webkit/Tauri
 # toolchain, so a Tauri build canNOT run locally. This file is validated only by YAML
 # syntax here (python3 -c "import yaml; yaml.safe_load(...)"); the actual bundle build
-# runs on GitHub's per-OS runners. The web build (web/) runs first because the bundle
-# embeds web/dist (frontendDist: ../web/dist).
+# runs on GitHub's per-OS runners. The enterprise workbench build runs first because
+# the desktop bundle embeds that one Work + Administration composition.
 #
 # Tier-4 self-contained runtime (SELFHOST-1):
 #   * WhippleScript is linked into the Rust control plane. Pi and its membrane
@@ -29,6 +28,16 @@ on:
         description: "tag or ref to build"
         required: false
         default: ""
+      platform:
+        description: "desktop package to build"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - linux
+          - macos
+          - windows
 
 concurrency:
   group: release-${{ github.ref }}
@@ -36,34 +45,72 @@ concurrency:
 
 permissions:
   contents: write # create the GitHub Release + upload bundle assets
+  id-token: write # Azure Artifact Signing uses a release-environment OIDC identity
+  attestations: write # persist provenance for the signed release bundles
 
 jobs:
   bundle:
     name: tauri bundle (${{ matrix.os-label }})
+    environment: production
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Linux -> .deb + .AppImage (unsigned)
-          - os-label: linux
-            runner: ubuntu-latest
-            bundles: deb,appimage
-          # macOS (Apple Silicon) -> .app.tar.gz (updater) + .dmg (download).
-          # The `app` target is REQUIRED for the self-update artifact: the updater
-          # bundle is a tar.gz of the .app, and `dmg` alone produces no .app.tar.gz,
-          # so v0.1.0's latest.json had no darwin-aarch64 entry. (unsigned — no notarization)
-          - os-label: macos
-            runner: macos-latest
-            bundles: app,dmg
-          # Windows -> .msi (unsigned — no Authenticode)
-          - os-label: windows
-            runner: windows-latest
-            bundles: msi
-    runs-on: ${{ matrix.runner }}
+        os-label: ${{ fromJSON((inputs.platform == '' || inputs.platform == 'all') && '["linux","macos","windows"]' || format('["{0}"]', inputs.platform)) }}
+    # Linux builds on the oldest supported base so a moving runner does not
+    # silently raise glibc. macOS is Apple Silicon; Windows remains unsigned
+    # until Microsoft approves the Public Trust profile.
+    runs-on: ${{ matrix.os-label == 'linux' && 'ubuntu-22.04' || matrix.os-label == 'macos' && 'macos-latest' || 'windows-latest' }}
+    timeout-minutes: 90
+    env:
+      BUNDLES: ${{ matrix.os-label == 'linux' && 'deb,appimage' || matrix.os-label == 'macos' && 'app,dmg' || 'msi' }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: verify Azure Artifact Signing inputs
+        if: matrix.os-label == 'windows'
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          SIGNING_RESOURCE_GROUP: ${{ vars.AZURE_ARTIFACT_SIGNING_RESOURCE_GROUP }}
+          SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          test -n "$AZURE_CLIENT_ID"
+          test -n "$AZURE_TENANT_ID"
+          test -n "$AZURE_SUBSCRIPTION_ID"
+          test -n "$SIGNING_RESOURCE_GROUP"
+          test -n "$SIGNING_ACCOUNT"
+          test -n "$SIGNING_ENDPOINT"
+
+      - name: authenticate Windows release identity
+        if: matrix.os-label == 'windows'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: verify Azure Artifact Signing account
+        if: matrix.os-label == 'windows'
+        shell: bash
+        env:
+          SIGNING_RESOURCE_GROUP: ${{ vars.AZURE_ARTIFACT_SIGNING_RESOURCE_GROUP }}
+          SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          state="$(az resource show \
+            --resource-group "$SIGNING_RESOURCE_GROUP" \
+            --name "$SIGNING_ACCOUNT" \
+            --resource-type Microsoft.CodeSigning/codeSigningAccounts \
+            --api-version 2025-10-13 \
+            --query properties.provisioningState \
+            --output tsv)"
+          test "$state" = "Succeeded"
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -71,7 +118,9 @@ jobs:
         with:
           node-version-file: .node-version
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            web/package-lock.json
+            ee/web/package-lock.json
 
       - name: linux bundle deps
         # NEEDS-INFRA: Tauri's Linux bundling needs gtk/webkit2gtk + appindicator.
@@ -80,13 +129,47 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev patchelf
+            librsvg2-dev patchelf lintian
 
-      - name: build web bundle
-        working-directory: web
+      - name: build enterprise workbench bundle
         run: |
-          npm ci
-          npm run build
+          npm --prefix web ci
+          npm --prefix ee/web ci
+          npm --prefix ee/web run build
+
+      - name: verify Apple signing inputs
+        if: matrix.os-label == 'macos'
+        shell: bash
+        env:
+          APPLE_DEVELOPMENT_TEAM: ${{ vars.APPLE_DEVELOPMENT_TEAM }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_DEVELOPMENT_TEAM"
+          test -n "$APPLE_CERTIFICATE"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_SIGNING_IDENTITY"
+          test -n "$APPLE_API_ISSUER"
+          test -n "$APPLE_API_KEY"
+          test -n "$APPLE_API_PRIVATE_KEY"
+
+      - name: prepare App Store Connect notarization key
+        if: matrix.os-label == 'macos'
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" | base64 --decode > "$key_path"
+          chmod 600 "$key_path"
+          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
       # -----------------------------------------------------------------------
       # SIGNING STATUS:
@@ -96,39 +179,76 @@ jobs:
       #     are the repo secrets TAURI_SIGNING_PRIVATE_KEY / *_PASSWORD. This signs
       #     the update payload (latest.json + the per-OS update bundles), so the
       #     installed app can verify and self-update.
-      #   * OS-level code signing / notarization is STILL UNSIGNED — those need
-      #     certs this repo does not hold (Band 3). Uncomment per-OS and wire the
-      #     named secrets when a signing identity exists:
-      #       macOS:   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
-      #                APPLE_SIGNING_IDENTITY (Developer ID cert, for codesign) +
-      #                APPLE_API_ISSUER / APPLE_API_KEY / APPLE_API_KEY_PATH
-      #                (App Store Connect API key, for notarization — no 2FA at build)
-      #       Windows: WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD
+      #   * macOS uses a Developer ID Application certificate and App Store Connect
+      #     notarization key from the protected production environment. The lane
+      #     fails closed when any signing input is absent.
+      #   * Windows will use Azure Artifact Signing with the production OIDC identity.
+      #     The account exists, but Microsoft identity validation and a Public Trust
+      #     certificate profile must exist before adding a Tauri pre-bundle sign
+      #     command; signing after Tauri creates updater payloads would invalidate
+      #     their Tauri signatures.
       # -----------------------------------------------------------------------
 
       - name: pin bundle version to the release tag
         # Single source of version truth = the git tag. On a tag push, rewrite the
         # tauri.conf.json version to the tag (`vX.Y.Z` -> `X.Y.Z`) so the bundle names
-        # (.dmg/.msi/.deb/.AppImage) AND the updater latest.json version equal the
-        # release tag, never the hard-coded in-repo dev default (Tauri reads the bundle
-        # version from here). Non-tag workflow_dispatch dry-runs keep the in-repo
-        # default. jq ships on all three GitHub runner images.
-        if: startsWith(github.ref, 'refs/tags/v')
+        # (.dmg/.msi/.deb/.AppImage) and updater metadata derive from the release
+        # tag, never the hard-coded in-repo dev default (Tauri reads the bundle
+        # version from here). WiX only accepts a single numeric prerelease identifier,
+        # so Windows maps alpha.N/beta.N/rc.N to ordered numeric bands while retaining
+        # SemVer prerelease ordering. A workflow_dispatch tag ref is normalized
+        # identically without creating a GitHub Release; non-tag dry-runs keep the
+        # in-repo default. jq ships on all three GitHub runner images.
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.ref, 'v') || startsWith(inputs.ref, 'refs/tags/v')
         shell: bash
+        env:
+          PLATFORM: ${{ matrix.os-label }}
+          RELEASE_REF: ${{ inputs.ref || github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "Pinning bundle version to $VERSION (tag $GITHUB_REF_NAME)"
+          RELEASE_NAME="${RELEASE_REF#refs/tags/}"
+          VERSION="${RELEASE_NAME#v}"
+
+          if [[ "$PLATFORM" == "windows" && "$VERSION" == *-* ]]; then
+            base="${VERSION%%-*}"
+            prerelease="${VERSION#*-}"
+            IFS='.' read -r channel sequence extra <<<"$prerelease"
+            if [[ -n "${extra:-}" || ! "${sequence:-}" =~ ^[0-9]+$ ]]; then
+              echo "Windows release tags must use alpha.N, beta.N, or rc.N" >&2
+              exit 1
+            fi
+            case "$channel" in
+              alpha) offset=10000 ;;
+              beta) offset=20000 ;;
+              rc) offset=30000 ;;
+              *)
+                echo "unsupported Windows prerelease channel: $channel" >&2
+                exit 1
+                ;;
+            esac
+            sequence_value=$((10#$sequence))
+            if (( sequence_value > 9999 )); then
+              echo "Windows prerelease sequence cannot exceed 9999" >&2
+              exit 1
+            fi
+            VERSION="${base}-$((offset + sequence_value))"
+          fi
+
+          echo "Pinning bundle version to $VERSION (tag $RELEASE_NAME)"
           tmp="$(mktemp)"
           jq --arg v "$VERSION" '.version = $v' src-tauri/tauri.conf.json > "$tmp"
           mv "$tmp" src-tauri/tauri.conf.json
           echo "bundle version now: $(jq -r .version src-tauri/tauri.conf.json)"
 
-      - name: tauri build (OS-unsigned, signed updater, ${{ matrix.bundles }})
-        # Bundles are NOT OS-code-signed (no Apple/Windows certs); UPDATE artifacts
-        # ARE signed via the TAURI_SIGNING_* env below. `--config tauri.bundle.conf.json`
-        # (in args) merges the release-only overlay that enables
-        # createUpdaterArtifacts. Runtime assets need no Pi/plugin resource bundle:
+      - name: prepare deterministic Debian metadata
+        if: matrix.os-label == 'linux'
+        run: scripts/prepare-deb-metadata.sh
+
+      - name: tauri build (signed updater, ${{ env.BUNDLES }})
+        # UPDATE artifacts are signed via TAURI_SIGNING_* below. The macOS runner
+        # additionally signs/notarizes when its protected Apple credentials exist.
+        # `--config tauri.bundle.conf.json` merges the release-only overlay that
+        # enables createUpdaterArtifacts. Runtime assets need no Pi/plugin bundle:
         # WhippleScript is linked into the control plane.
         uses: tauri-apps/tauri-action@v0
         env:
@@ -137,49 +257,158 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Pin frontend detection: the CLI otherwise globs for a package.json from
           # its own cwd (which on CI is the checkout root, not src-tauri), making
-          # relative paths like beforeBuildCommand's `../web` resolve wrongly. The
-          # overlay also nulls out beforeBuildCommand — the `build web bundle` step
-          # above already produced web/dist, so the release build must not rebuild it.
-          TAURI_FRONTEND_PATH: ${{ github.workspace }}/web
+          # relative paths like beforeBuildCommand's `../ee/web` resolve wrongly.
+          # The overlay also nulls out beforeBuildCommand — the enterprise workbench
+          # step above already produced its dist, so the release build must not rebuild it.
+          TAURI_FRONTEND_PATH: ${{ github.workspace }}/ee/web
           # Tauri updater signing (matches plugins.updater.pubkey in tauri.conf.json):
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # # ── macOS signing + notarization (Band 3 / D-RELEASE-LANES; still
-          # #    GATED — this repo holds no Apple certs). ENABLE = add the secrets
-          # #    below, then uncomment these lines. Notarization uses an App Store
-          # #    Connect API key (.p8), NOT an Apple-ID app-specific password, so CI
-          # #    needs no interactive 2FA at build time. Steps:
-          # #      1. Enrol in the Apple Developer Program (needs 2FA on the account).
-          # #      2. Create a "Developer ID Application" cert → export .p12 → base64
-          # #         → secret APPLE_CERTIFICATE (+ APPLE_CERTIFICATE_PASSWORD); the
-          # #         identity string ("Developer ID Application: Name (TEAMID)") →
-          # #         APPLE_SIGNING_IDENTITY. These sign the .app/.dmg.
-          # #      3. App Store Connect → Users and Access → Integrations → API key:
-          # #         Issuer ID → APPLE_API_ISSUER, Key ID → APPLE_API_KEY, the .p8 →
-          # #         APPLE_API_KEY_PATH (add a step to write the secret to a file).
-          # #         These notarize the signed bundle.
-          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          # APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          # APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
-          # # Windows Authenticode:
-          # WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          # WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          # macOS Developer ID signing + notarization. The certificate and .p8
+          # private key remain production-environment secrets; only the p8 path
+          # exists on the ephemeral runner.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_DEVELOPMENT_TEAM: ${{ vars.APPLE_DEVELOPMENT_TEAM }}
+          APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
         with:
           projectPath: src-tauri
-          # Draft a single GitHub Release that all three matrix legs upload into.
-          tagName: ${{ github.ref_name }}
-          releaseName: "GaugeDesk ${{ github.ref_name }}"
+          # Tag pushes draft a release. Manual runs are artifact-only signing
+          # rehearsals and must not create a synthetic release named "main".
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('GaugeDesk {0}', github.ref_name) || '' }}
           releaseDraft: true
-          args: --bundles ${{ matrix.bundles }} --config tauri.bundle.conf.json
+          args: --bundles ${{ env.BUNDLES }} --config tauri.bundle.conf.json
 
-      - name: upload unsigned bundles (workflow artifact)
-        # The unsigned .deb/.AppImage/.dmg/.msi for this OS, kept as a workflow
-        # artifact for dogfooding (and so a dry-run via workflow_dispatch without a
-        # tag still yields inspectable output). `error` so a build that produced no
-        # bundle fails loudly rather than silently uploading nothing.
+      - name: verify unsigned Windows package boundary
+        if: matrix.os-label == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $executables = @(Get-ChildItem `
+            'src-tauri/target/release/gaugedesk-desktop.exe')
+          $installers = @(Get-ChildItem `
+            'src-tauri/target/release/bundle/msi/*.msi')
+          if ($executables.Count -ne 1) {
+            throw "expected exactly one Windows executable"
+          }
+          if ($installers.Count -ne 1) {
+            throw "expected exactly one Windows MSI"
+          }
+
+          foreach ($artifact in @($executables[0], $installers[0])) {
+            if ($artifact.Length -eq 0) {
+              throw "empty Windows artifact: $($artifact.FullName)"
+            }
+            $signature = Get-AuthenticodeSignature $artifact.FullName
+            if ($signature.Status -ne 'NotSigned') {
+              throw "expected unsigned pre-approval artifact, got $($signature.Status): $($artifact.FullName)"
+            }
+            $digest = Get-FileHash -Algorithm SHA256 $artifact.FullName
+            Write-Output "$($artifact.Name) SHA256 $($digest.Hash)"
+          }
+
+      - name: verify macOS Developer ID signature and notarization
+        if: matrix.os-label == 'macos'
+        shell: bash
+        env:
+          APPLE_DEVELOPMENT_TEAM: ${{ vars.APPLE_DEVELOPMENT_TEAM }}
+          APPLE_DEVELOPER_ID_CERT_SHA256: ${{ vars.APPLE_DEVELOPER_ID_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(src-tauri/target/release/bundle/macos/*.app)
+          dmgs=(src-tauri/target/release/bundle/dmg/*.dmg)
+          if [ "${#apps[@]}" -ne 1 ] || [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "expected exactly one macOS app and one DMG" >&2
+            exit 1
+          fi
+
+          app="${apps[0]}"
+          dmg="${dmgs[0]}"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          signature="$(codesign --display --verbose=4 "$app" 2>&1)"
+          grep -F "Authority=Developer ID Application:" <<<"$signature"
+          grep -F "TeamIdentifier=$APPLE_DEVELOPMENT_TEAM" <<<"$signature"
+          codesign --display \
+            --extract-certificates="$RUNNER_TEMP/gaugedesk-cert-" "$app"
+          leaf_fingerprint="$(openssl x509 -inform DER \
+            -in "$RUNNER_TEMP/gaugedesk-cert-0" -noout -fingerprint -sha256 |
+            cut -d= -f2)"
+          test "$leaf_fingerprint" = "$APPLE_DEVELOPER_ID_CERT_SHA256"
+
+          entitlements="$RUNNER_TEMP/gaugedesk-macos-entitlements.plist"
+          if codesign --display --entitlements :- "$app" >"$entitlements" \
+            2>/dev/null && plutil -lint "$entitlements" >/dev/null; then
+            if [ "$(plutil -extract com.apple.security.get-task-allow raw \
+              -expect bool "$entitlements" 2>/dev/null || true)" = "true" ]; then
+              echo "release app includes the forbidden get-task-allow entitlement" >&2
+              exit 1
+            fi
+          fi
+
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+
+          mountpoint="$RUNNER_TEMP/gaugedesk-dmg"
+          mkdir -p "$mountpoint"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mountpoint" "$dmg"
+          trap 'hdiutil detach "$mountpoint"' EXIT
+          mounted_apps=("$mountpoint"/*.app)
+          if [ "${#mounted_apps[@]}" -ne 1 ]; then
+            echo "expected exactly one app in the macOS DMG" >&2
+            exit 1
+          fi
+          mounted_app="${mounted_apps[0]}"
+          codesign --verify --deep --strict --verbose=2 "$mounted_app"
+          xcrun stapler validate "$mounted_app"
+          spctl --assess --type execute --verbose=4 "$mounted_app"
+          hdiutil detach "$mountpoint"
+          trap - EXIT
+
+      - name: validate Debian package metadata (APT-1)
+        if: matrix.os-label == 'linux'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          debs=(src-tauri/target/release/bundle/deb/*.deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "expected exactly one Debian package, found ${#debs[@]}" >&2
+            exit 1
+          fi
+          scripts/check-deb-package.sh "${debs[0]}"
+
+      - name: generate release SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          path: src-tauri/target/release/bundle
+          format: spdx-json
+          output-file: src-tauri/target/release/bundle/gaugedesk-${{ matrix.os-label }}.spdx.json
+          upload-artifact: false
+
+      - name: attest release bundles
+        # Artifact attestations are not available to private organization
+        # repositories on every GitHub plan. Preserve provenance when the
+        # service is enabled, but never discard signed/notarized bundles and
+        # their SBOM merely because GitHub refuses to persist an attestation.
+        continue-on-error: true
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45
+        with:
+          subject-path: src-tauri/target/release/bundle/**
+
+      - name: attach SBOM to tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" "src-tauri/target/release/bundle/gaugedesk-${{ matrix.os-label }}.spdx.json" --clobber
+
+      - name: upload bundles (workflow artifact)
+        # Keep each platform's bundles inspectable after the run. `error` makes a
+        # missing output fail loudly instead of silently publishing an empty artifact.
         uses: actions/upload-artifact@v4
         with:
           name: gaugedesk-bundles-${{ matrix.os-label }}

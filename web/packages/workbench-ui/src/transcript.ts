@@ -24,6 +24,9 @@ export interface TranscriptLine {
     /** Machine-readable failure code (e.g. `"no_credential"`) on a `kind: "error"`
      *  line, so the view can render an action (link into settings) rather than text. */
     readonly code?: string;
+    /** Stable durable-store entry backing a reproducible user/assistant fork. */
+    readonly entryId?: number;
+    readonly forkable?: boolean;
     /** Tool-line metadata (B4): target opens the content viewer; args/result expand. */
     readonly tool?: ToolLine;
 }
@@ -52,11 +55,17 @@ export function reduce(t: Transcript, ev: StreamEvent): Transcript {
     const seq = t.lines.length;
     switch (ev.type) {
         case "user": {
-            const line: TranscriptLine = { seq, tier: "admitted", kind: "user", text: ev.text };
+            const line: TranscriptLine = {
+                seq, tier: "admitted", kind: "user", text: ev.text,
+                entryId: ev.entry_id, forkable: ev.forkable,
+            };
             return { lines: [...t.lines, line], openText: null };
         }
         case "assistant": {
-            const line: TranscriptLine = { seq, tier: "admitted", kind: "assistant", text: ev.text };
+            const line: TranscriptLine = {
+                seq, tier: "admitted", kind: "assistant", text: ev.text,
+                entryId: ev.entry_id, forkable: ev.forkable,
+            };
             return { lines: [...t.lines, line], openText: null };
         }
         case "text": {
@@ -123,6 +132,23 @@ export function reduce(t: Transcript, ev: StreamEvent): Transcript {
 /** Rebuild a transcript from a snapshot of events (connection repair). */
 export function fromSnapshot(events: readonly StreamEvent[]): Transcript {
     return events.reduce(reduce, empty);
+}
+
+/** Rebuild the live optimistic tier after snapshot repair while a user command is
+ * still pending. A just-settled run can return before its admitted user event is
+ * visible through the transcript projection; clearing `live` in that window makes
+ * the message disappear even though the command is running. `baselineLines` is the
+ * durable snapshot length when the command began, so an identical older message
+ * cannot be mistaken for this command's admission. */
+export function pendingUserAfterSnapshot(
+    repaired: Transcript,
+    text: string,
+    baselineLines: number,
+): Transcript {
+    const admitted = repaired.lines
+        .slice(Math.max(0, baselineLines))
+        .some((line) => line.kind === "user" && line.text === text);
+    return admitted ? empty : reduce(empty, { type: "user", text });
 }
 
 /** A presentation segment: a run of agent-produced lines folded into one

@@ -18,7 +18,6 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::account::seal_token;
 use crate::{err_response, LockUnpoisoned, SharedWorkbench};
 
 /// `GET /projects/:id/credentials` — the providers this project pins (names + linked
@@ -40,6 +39,12 @@ pub async fn get_project_credentials(
 pub struct LinkBody {
     provider: String,
     token: String,
+    /// OpenAI-compatible endpoint base URL — required for `openai-generic`,
+    /// ignored otherwise (ADR 0083). Non-secret.
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    execution_classes: Option<std::collections::BTreeSet<crate::account::ModelExecutionClass>>,
 }
 
 /// `POST /projects/:id/credentials` — pin a provider for this project: seal the token
@@ -56,17 +61,34 @@ pub async fn post_project_credential(
         )
             .into_response();
     }
+    let provider = body.provider;
+    let base_url = match crate::account::link_base_url_for(&provider, body.base_url.as_deref()) {
+        Ok(base_url) => base_url,
+        Err(reason) => return (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response(),
+    };
     let mut wb = wb.lock_unpoisoned();
-    let Some(sealed) = seal_token(wb.account_key(), &body.token) else {
+    let Some(sealed) = wb.seal_project_secret(&project, &body.token) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "seal failed").into_response();
     };
-    let provider = body.provider;
-    if let Err(e) = wb.upsert_project_credential(&project, provider.clone(), sealed) {
+    let execution_classes = body
+        .execution_classes
+        .unwrap_or_else(|| wb.default_model_execution_classes());
+    if let Err(e) = wb.upsert_project_credential_with_policy(
+        &project,
+        provider.clone(),
+        sealed,
+        base_url,
+        execution_classes.clone(),
+    ) {
         return err_response(e);
     }
     (
         StatusCode::OK,
-        Json(json!({ "provider": provider, "linked": true })),
+        Json(json!({
+            "provider": provider,
+            "linked": true,
+            "execution_classes": execution_classes,
+        })),
     )
         .into_response()
 }

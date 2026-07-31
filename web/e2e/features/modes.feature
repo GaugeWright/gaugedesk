@@ -7,7 +7,7 @@ Feature: Edit vs work chats (chat rooting)
 
   Scenario: an edit chat is marked edit and the pane shows the edit kind
     Given the workbench is open
-    When I create an edit chat under the archetype "assistant"
+    When I create an edit chat under the archetype "Default"
     Then the chat pane kind is "edit"
     And an edit chat is marked in the nav
 

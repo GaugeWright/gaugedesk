@@ -1,0 +1,15 @@
+/* Admin-specific styling is intentionally confined to the navigator. Every other
+   pane is the shared desktop chat, ContentViewer, or Workspace. */
+.admin-navigator { min-height: 100%; padding-top: 3px; }
+.admin-navigator nav { display: grid; gap: 2px; padding: 10px 0; }
+.admin-navigator nav button { border: 0; background: transparent; color: var(--muted); padding: 7px 6px; text-align: left; font: inherit; font-size: 12px; }
+.admin-navigator nav button:hover, .admin-navigator nav button.active { color: var(--ink); background: var(--edge); }
+.admin-home-tree { margin-top: 8px; padding: 10px 6px; border-top: 1px solid var(--edge); color: var(--muted); font-size: 10px; }
+.admin-home-tree > span { color: var(--ink); text-transform: uppercase; letter-spacing: .06em; }
+.admin-home-tree > button { width: 100%; display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; align-items: center; gap: 5px; border: 0; background: transparent; padding: 5px 0; text-align: left; }
+.admin-home-tree b { width: 6px; height: 6px; border-radius: 50%; background: #5dbb9d; }
+.admin-home-tree b.caveat { background: var(--warn); }
+.admin-home-tree code { overflow: hidden; text-overflow: ellipsis; }
+.admin-home-tree small { color: var(--muted); }
+.admin-nav-footer { display: flex; align-items: center; gap: 7px; border-top: 1px solid var(--edge); padding: 7px 3px 0; color: var(--muted); font-size: 10px; }
+.admin-nav-footer button { margin-left: auto; border: 0; background: transparent; color: var(--muted); }

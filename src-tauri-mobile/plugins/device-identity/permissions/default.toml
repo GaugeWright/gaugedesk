@@ -1,0 +1,15 @@
+[default]
+description = "Use the native device identity, launch URL, and Machine credential vault."
+permissions = [
+  "allow-get-identity",
+  "allow-get-launch-url",
+  "allow-sign-challenge",
+  "allow-store-machine-credential",
+  "allow-get-machine-credential",
+  "allow-clear-machine-credential",
+  "allow-list-machine-credentials",
+  "allow-remove-machine-credential",
+  "allow-store-account-session",
+  "allow-get-account-session",
+  "allow-clear-account-session",
+]

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -39,14 +39,17 @@ use gaugewright_core::resource::{
 };
 use gaugewright_core::resource_access::{AccessCommand, AccessPhase, AccessState};
 use gaugewright_core::resource_export::{ExportCommand, ExportPhase, ExportState};
-use gaugewright_core::review::{ReviewCommand, ReviewState};
+use gaugewright_core::review::{ReviewCommand, ReviewPhase, ReviewState};
 use gaugewright_core::taint::EngagementReads;
 use gaugewright_store::{AdmitError, Store};
 use serde::Deserialize;
 
 use crate::boundary_keeper::SealedKeyReleaseService;
 use crate::stream::ServerEvent;
-use crate::{err_response, net_http, LockUnpoisoned, SharedWorkbench, Workbench};
+use crate::{
+    command_idempotency::caller_idempotency_key, err_response, library::Library, net_http,
+    LockUnpoisoned, SharedWorkbench, Workbench,
+};
 
 /// The record kind under which resource metadata is stored in an engagement scope.
 const RESOURCE_KIND: &str = "resource";
@@ -57,6 +60,7 @@ const READ_KIND: &str = "read";
 /// (engagement-scoped, ATTEST-6): the audit fact that a sealed key was released to
 /// an attested host, never the key bytes themselves.
 const KEY_RELEASE_KIND: &str = "key-release-grant";
+const ATTESTED_RUN_METER_KIND: &str = "attested-run-meter";
 
 /// The deterministic, **URL-safe** handle for a context folder: re-ingesting the
 /// same folder updates the same resource (latest-wins) rather than minting a
@@ -82,17 +86,49 @@ pub fn erasure_scope(engagement: &str, id: &ResourceId) -> String {
     format!("{engagement}::erasure::{}", id.as_str())
 }
 
-/// The per-resource scope holding that resource's [[resource-export]] lifecycle.
-/// URL-safe (no `::`) — it is driven through the generic `/scopes/:scope/export`
-/// route, unlike the internal access/erasure scopes.
+/// The internal per-resource scope holding that resource's
+/// [[resource-export]] lifecycle. Product callers address the resource, never
+/// this coordinator-owned scope id.
 pub fn export_scope(engagement: &str, id: &ResourceId) -> String {
     format!("{engagement}-export-{}", id.as_str())
 }
 
-/// The per-resource scope holding that resource's [[review]] lifecycle. URL-safe —
-/// driven through the generic `/scopes/:scope/review` route.
+/// The internal per-resource scope holding that resource's [[review]] lifecycle.
 pub fn review_scope(engagement: &str, id: &ResourceId) -> String {
     format!("{engagement}-review-{}", id.as_str())
+}
+
+/// Caller-selectable review decisions on a concrete resource. Identity is
+/// deliberately absent: the admission shell materializes it from the request.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResourceReviewAction {
+    Consent,
+    Reject,
+    Revoke,
+    Release,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResourceReviewCommandBody {
+    action: ResourceReviewAction,
+}
+
+/// Caller-selectable source decisions on a concrete resource export. Target
+/// admission and the final `Export` fact belong to the actual egress handler.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResourceExportAction {
+    Consent,
+    Reject,
+    Revoke,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResourceExportCommandBody {
+    action: ResourceExportAction,
 }
 
 /// The engagement's derived **output** resource handle (one per engagement,
@@ -419,6 +455,33 @@ pub fn tombstone(store: &mut Store, engagement: &str, id: &ResourceId) -> Result
 }
 
 impl Workbench {
+    /// Count pending output reviews for one authority without returning any
+    /// engagement, resource, review, or content metadata. The Console uses this
+    /// only after target-Home admission, then discards that admission.
+    pub(crate) fn review_notification_count(
+        &self,
+        actor: &gaugewright_core::ids::AuthorityId,
+    ) -> Result<usize, AdmitError> {
+        let actor = Authority::from(actor.as_str());
+        let library = Library::rebuild(self.store_ref())?;
+        let mut count = 0;
+        for chat_id in library.chats.keys() {
+            for (record, _) in self.list_resource_contexts(chat_id)? {
+                if record.tombstoned || record.resource.kind != ResourceKind::output() {
+                    continue;
+                }
+                let review = self.review_state(&review_scope(chat_id, &record.resource.id))?;
+                if review.phase == ReviewPhase::Proposed
+                    && review.required.contains(&actor)
+                    && !review.consented.contains(&actor)
+                {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
     /// Mint/refresh a context resource inside this workbench's durable store.
     pub fn mint_resource_context(
         &mut self,
@@ -479,9 +542,12 @@ impl Workbench {
         &mut self,
         chat_id: &str,
         resource_id: &ResourceId,
-        required: std::collections::BTreeSet<Authority>,
-    ) -> Result<AccessPhase, AdmitError> {
-        request_access(self.store_mut(), chat_id, resource_id, required)
+    ) -> Result<Option<AccessPhase>, AdmitError> {
+        let Some(record) = self.resource_context(chat_id, resource_id)? else {
+            return Ok(None);
+        };
+        let required = record.stakeholders;
+        request_access(self.store_mut(), chat_id, resource_id, required).map(Some)
     }
 
     /// Approve a pending resource-access request.
@@ -836,53 +902,49 @@ pub(crate) async fn get_resource_access(
     }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct AccessRequestBody {
-    /// The authorities that must each approve before access is granted.
-    #[serde(default)]
-    required: Vec<String>,
-}
-
-/// Explicitly request access to a resource (`CORE-3`), naming the authorities who must approve.
+/// Explicitly request access to a resource (`CORE-3`). The immutable resource
+/// record, not caller input, supplies the required stakeholder set (`INV-13`).
 pub(crate) async fn post_resource_access_request(
     State(wb): State<SharedWorkbench>,
     Path((id, rid)): Path<(String, String)>,
-    Json(body): Json<AccessRequestBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
     let res_id = ResourceId::new(rid);
-    let required: BTreeSet<Authority> = body.required.into_iter().map(Authority::from).collect();
-    match wb.request_resource_access(&id, &res_id, required) {
-        Ok(phase) => (StatusCode::OK, Json(serde_json::json!({ "phase": phase }))).into_response(),
+    match wb.request_resource_access(&id, &res_id) {
+        Ok(Some(phase)) => {
+            (StatusCode::OK, Json(serde_json::json!({ "phase": phase }))).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "no such resource").into_response(),
+        Err(AdmitError::Rejected(rejection)) => {
+            (StatusCode::CONFLICT, rejection.reason).into_response()
+        }
         Err(e) => err_response(e),
     }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct AccessApproveBody {
-    /// The approving authority (one of the request's `required` set).
-    approver: String,
-}
-
-/// Approve a pending access request as `approver` (`CORE-3`); grants once all required approve.
+/// Approve a pending access request as the authenticated actor (`CORE-3`);
+/// grants once all required stakeholders have approved. Caller-supplied identity
+/// is deliberately absent: a bearer must never consent as somebody else.
 pub(crate) async fn post_resource_access_approve(
     State(wb): State<SharedWorkbench>,
     Path((id, rid)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<AccessApproveBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
     let res_id = ResourceId::new(rid);
     // CORE-6: the resource-attribute ABAC floor gates the grant — a pii/regulated resource at
     // an unattested ceiling is refused access even where the consent reducer would allow it
     // (restrict-only, fail-closed). No-op in solo / no-policy.
-    if let Err((code, msg)) = wb.authorize_resource_access(net_http::bearer(&headers), &id, &res_id)
-    {
+    let bearer = net_http::bearer(&headers);
+    if let Err((code, msg)) = wb.authorize_resource_access(bearer, &id, &res_id) {
         return (code, msg).into_response();
     }
-    let approver = Authority::from(body.approver);
+    let approver = Authority::from(wb.actor(bearer));
     match wb.approve_resource_access(&id, &res_id, approver) {
         Ok(phase) => (StatusCode::OK, Json(serde_json::json!({ "phase": phase }))).into_response(),
+        Err(AdmitError::Rejected(rejection)) => {
+            (StatusCode::FORBIDDEN, rejection.reason).into_response()
+        }
         Err(e) => err_response(e),
     }
 }
@@ -938,6 +1000,77 @@ pub(crate) async fn post_resource_export(
     }
 }
 
+/// Read one resource's export lifecycle through the resource that owns it. This
+/// replaces the raw scope projection so a caller cannot probe an unrelated
+/// lifecycle by guessing its scope id.
+pub(crate) async fn get_resource_export(
+    State(wb): State<SharedWorkbench>,
+    Path((id, rid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    let res_id = ResourceId::new(rid);
+    match wb.resource_context(&id, &res_id) {
+        Ok(Some(_)) => match wb.resource_export_state(&id, &res_id) {
+            Ok(state) => (StatusCode::OK, Json(state)).into_response(),
+            Err(error) => err_response(error),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "no such resource").into_response(),
+        Err(error) => err_response(error),
+    }
+}
+
+/// Admit a source-stakeholder decision for one concrete resource export. The
+/// body carries only the action; the authority is resolved from the production
+/// bearer and checked against the resource's authoritative stakeholders.
+pub(crate) async fn post_resource_export_command(
+    State(wb): State<SharedWorkbench>,
+    Path((id, rid)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<ResourceExportCommandBody>,
+) -> impl IntoResponse {
+    let key = match caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let bearer = net_http::bearer(&headers);
+    let mut wb = wb.lock_unpoisoned();
+    let res_id = ResourceId::new(rid);
+    let record = match wb.resource_context(&id, &res_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such resource").into_response(),
+        Err(error) => return err_response(error),
+    };
+    if let Err((code, message)) = wb.authorize_resource_export(bearer, &id, &res_id) {
+        return (code, message).into_response();
+    }
+    let actor = match wb.authenticate_identity(bearer) {
+        Ok(actor) => Authority::from(actor.as_str()),
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    if !record.stakeholders.contains(&actor) {
+        return (
+            StatusCode::FORBIDDEN,
+            "only a resource stakeholder may decide source export consent",
+        )
+            .into_response();
+    }
+    let command = match body.action {
+        ResourceExportAction::Consent => ExportCommand::SourceConsent(actor),
+        ResourceExportAction::Reject => ExportCommand::Reject(actor),
+        ResourceExportAction::Revoke => ExportCommand::Revoke(actor),
+    };
+    let scope = export_scope(&id, &res_id);
+    match wb.admit_export_command(&scope, &key, command) {
+        Ok(admission) => (StatusCode::OK, Json(admission.state)).into_response(),
+        Err(AdmitError::Rejected(rejection)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "rejected": rejection.reason })),
+        )
+            .into_response(),
+        Err(error) => err_response(error),
+    }
+}
+
 /// The destination of an export-to-disk: the directory bytes leave to.
 #[derive(Deserialize)]
 pub(crate) struct ExportToDiskBody {
@@ -976,20 +1109,27 @@ pub(crate) async fn post_resource_export_to_disk(
         return (StatusCode::GONE, "resource payload tombstoned").into_response();
     }
 
-    match wb.resource_export_state(&id, &res_id) {
-        Ok(s) if s.phase == ExportPhase::Exported => {}
-        Ok(s) => {
+    let needs_target_admission = match wb.resource_export_state(&id, &res_id) {
+        Ok(state)
+            if state.phase == ExportPhase::Requested
+                && state.source_required == state.source_consented
+                && !state.target_admitted =>
+        {
+            true
+        }
+        Ok(state) if state.phase == ExportPhase::Cleared => false,
+        Ok(state) => {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
-                    "error": "export not cleared for egress",
-                    "phase": format!("{:?}", s.phase),
+                    "error": "export still needs source consent before target admission",
+                    "phase": format!("{:?}", state.phase),
                 })),
             )
                 .into_response()
         }
         Err(e) => return err_response(e),
-    }
+    };
 
     let dest = std::path::PathBuf::from(&body.dest);
     if !dest.is_absolute() {
@@ -1017,6 +1157,19 @@ pub(crate) async fn post_resource_export_to_disk(
             }
         },
     };
+    if needs_target_admission {
+        // A valid, user-selected local directory is the target's admission.
+        // Keep that fact adjacent to actual egress instead of exposing a raw
+        // command that any authenticated source could self-assert.
+        let scope = export_scope(&id, &res_id);
+        if let Err(error) = wb.admit_export_command(
+            &scope,
+            "resource-export-to-disk-target",
+            ExportCommand::TargetAdmit,
+        ) {
+            return err_response(error);
+        }
+    }
     let mut written = Vec::new();
     for rel in &files {
         let content = match wb.read_engagement_file(&id, rel) {
@@ -1054,6 +1207,14 @@ pub(crate) async fn post_resource_export_to_disk(
     if let Err(e) = wb.record_resource_export_to_disk(&id, &egress) {
         return err_response(e);
     }
+    let scope = export_scope(&id, &res_id);
+    if let Err(error) = wb.admit_export_command(
+        &scope,
+        "resource-export-to-disk-crossed",
+        ExportCommand::Export,
+    ) {
+        return err_response(error);
+    }
     wb.publish(
         &id,
         ServerEvent::Admitted {
@@ -1073,9 +1234,15 @@ pub(crate) async fn post_resource_export_to_disk(
 pub(crate) async fn post_resource_review(
     State(wb): State<SharedWorkbench>,
     Path((id, rid)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
     let res_id = ResourceId::new(rid);
+    if let Err((code, message)) =
+        wb.authorize_resource_export(net_http::bearer(&headers), &id, &res_id)
+    {
+        return (code, message).into_response();
+    }
     match wb.admit_resource_review(&id, &res_id) {
         Ok(Some((scope, state))) => {
             wb.publish(
@@ -1098,6 +1265,76 @@ pub(crate) async fn post_resource_review(
         )
             .into_response(),
         Err(e) => err_response(e),
+    }
+}
+
+/// Read one resource's declassification lifecycle without exposing its raw
+/// coordinator scope as a product route.
+pub(crate) async fn get_resource_review(
+    State(wb): State<SharedWorkbench>,
+    Path((id, rid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    let res_id = ResourceId::new(rid);
+    match wb.resource_context(&id, &res_id) {
+        Ok(Some(_)) => match wb.review_state(&review_scope(&id, &res_id)) {
+            Ok(state) => (StatusCode::OK, Json(state)).into_response(),
+            Err(error) => err_response(error),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "no such resource").into_response(),
+        Err(error) => err_response(error),
+    }
+}
+
+/// Admit an authenticated stakeholder's review decision for a concrete output.
+/// The request cannot supply either a scope or an authority.
+pub(crate) async fn post_resource_review_command(
+    State(wb): State<SharedWorkbench>,
+    Path((id, rid)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<ResourceReviewCommandBody>,
+) -> impl IntoResponse {
+    let key = match caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let bearer = net_http::bearer(&headers);
+    let mut wb = wb.lock_unpoisoned();
+    let res_id = ResourceId::new(rid);
+    let record = match wb.resource_context(&id, &res_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such resource").into_response(),
+        Err(error) => return err_response(error),
+    };
+    if let Err((code, message)) = wb.authorize_resource_export(bearer, &id, &res_id) {
+        return (code, message).into_response();
+    }
+    let actor = match wb.authenticate_identity(bearer) {
+        Ok(actor) => Authority::from(actor.as_str()),
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    if !record.stakeholders.contains(&actor) {
+        return (
+            StatusCode::FORBIDDEN,
+            "only a resource stakeholder may decide its review",
+        )
+            .into_response();
+    }
+    let command = match body.action {
+        ResourceReviewAction::Consent => ReviewCommand::Consent(actor),
+        ResourceReviewAction::Reject => ReviewCommand::Reject(actor),
+        ResourceReviewAction::Revoke => ReviewCommand::Revoke(actor),
+        ResourceReviewAction::Release => ReviewCommand::Release,
+    };
+    let scope = review_scope(&id, &res_id);
+    match wb.admit_review_command(&scope, &key, command) {
+        Ok(admission) => (StatusCode::OK, Json(admission.state)).into_response(),
+        Err(AdmitError::Rejected(rejection)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "rejected": rejection.reason })),
+        )
+            .into_response(),
+        Err(error) => err_response(error),
     }
 }
 
@@ -1171,6 +1408,18 @@ pub struct KeyReleaseGrant {
     pub participant: String,
 }
 
+/// One billable attested run: a trustworthy, entitled key-release batch that
+/// released at least one sealed key. This is deliberately distinct from the
+/// per-key [`KeyReleaseGrant`] audit facts — one run may receive many keys but is
+/// still one metered run (ADR 0048).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AttestedRunMeterRecord {
+    measurement: CodeMeasurement,
+    boundary: String,
+    participant: String,
+    released_keys: usize,
+}
+
 impl KeyReleaseGrant {
     /// Record that `sealed_key_id` (sealed to `measurement`) was released to
     /// `participant` under `boundary`.
@@ -1223,6 +1472,7 @@ pub fn release_sealed_keys(
     keys: &dyn SealedKeyReleaseService,
 ) -> Result<Vec<(String, KeyReleaseDecision)>, AdmitError> {
     let mut out = Vec::new();
+    let mut released_keys = 0;
     // Only a trustworthy verdict yields a measurement to release against; untrusted
     // evidence releases nothing (and `decide` would deny each request anyway).
     let Some(measurement) = evidence.result.verified_measurement().cloned() else {
@@ -1235,12 +1485,26 @@ pub fn release_sealed_keys(
             EntitlementProof::new(engagement, entitlement),
         ));
         if decision.is_released() {
+            released_keys += 1;
             let grant =
                 KeyReleaseGrant::new(id.clone(), measurement.clone(), boundary, participant);
             let payload = serde_json::to_string(&grant)?;
             store.append_record(engagement, KEY_RELEASE_KIND, &payload)?;
         }
         out.push((id, decision));
+    }
+    if released_keys > 0 {
+        let meter = AttestedRunMeterRecord {
+            measurement,
+            boundary: boundary.to_string(),
+            participant: participant.to_string(),
+            released_keys,
+        };
+        store.append_record(
+            engagement,
+            ATTESTED_RUN_METER_KIND,
+            &serde_json::to_string(&meter)?,
+        )?;
     }
     Ok(out)
 }
@@ -1266,14 +1530,14 @@ pub fn sealed_keys_for_measurement(
 }
 
 /// The metered usage of attested key releases for an engagement (ADR 0048) — the
-/// **billing signal**. Each [`KeyReleaseGrant`] is the durable, unforgeable receipt of
-/// one sealed-key release into an attested run; the monetization model meters attested
-/// compute, and attested-run release volume is its proxy. This rolls the grant records
-/// up into the counts an operator bills against, without ever touching key bytes.
+/// **billing signal**. A run is counted once per successful entitled release batch,
+/// while the per-key grants remain available as audit detail. This prevents a run
+/// receiving multiple sealed keys from being over-counted.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AttestedRunUsage {
-    /// Total release events — one per recorded grant (a re-release of the same key
-    /// counts again, since it is a fresh metered release). The headline usage number.
+    /// Billable attested runs — one per successful entitled key-release batch.
+    pub attested_runs: u64,
+    /// Total per-key release events. Audit detail, not the billing multiplier.
     pub release_events: usize,
     /// Distinct sealed keys released (folded latest-wins by id).
     pub distinct_keys: usize,
@@ -1284,6 +1548,12 @@ pub struct AttestedRunUsage {
 /// Roll up an engagement's attested key-release grants into [`AttestedRunUsage`] — the
 /// metered-compute reading the billing rail consumes (ADR 0048).
 pub fn attested_run_usage(store: &Store, engagement: &str) -> Result<AttestedRunUsage, AdmitError> {
+    let attested_runs = store
+        .records(engagement, ATTESTED_RUN_METER_KIND)?
+        .into_iter()
+        .map(|row| serde_json::from_str::<AttestedRunMeterRecord>(&row))
+        .collect::<Result<Vec<_>, _>>()?
+        .len() as u64;
     let mut release_events = 0usize;
     let mut keys = BTreeSet::new();
     let mut measurements = BTreeSet::new();
@@ -1294,6 +1564,7 @@ pub fn attested_run_usage(store: &Store, engagement: &str) -> Result<AttestedRun
         measurements.insert(grant.measurement.digest_hex().to_string());
     }
     Ok(AttestedRunUsage {
+        attested_runs,
         release_events,
         distinct_keys: keys.len(),
         measurements: measurements.into_iter().collect(),
@@ -1718,6 +1989,11 @@ mod tests {
             assert!(sealed_keys_for_measurement(&store, eng, &measurement())
                 .unwrap()
                 .is_empty());
+            assert_eq!(
+                attested_run_usage(&store, eng).unwrap(),
+                AttestedRunUsage::default(),
+                "a denied release batch is never billable"
+            );
         }
 
         /// Trustworthy evidence releases exactly the keys sealed to its measurement,
@@ -1769,10 +2045,9 @@ mod tests {
             );
         }
 
-        /// ADR 0048 metering: the release grants roll up into the engagement's usage —
-        /// the billing signal. Two keys released to one measurement ⇒ 2 release events,
-        /// 2 distinct keys, 1 measurement; a re-release counts again (a fresh metered
-        /// release); an engagement with no releases reads zero.
+        /// ADR 0048 metering: one successful entitled release batch is one billable
+        /// attested run even when it releases multiple keys. Per-key release events
+        /// remain audit detail; a later release batch counts as another run.
         #[test]
         fn usage_rolls_up_the_release_grants() {
             let mut store = Store::open_in_memory().unwrap();
@@ -1795,9 +2070,10 @@ mod tests {
             .unwrap();
 
             let usage = attested_run_usage(&store, eng).unwrap();
+            assert_eq!(usage.attested_runs, 1, "one release batch = one run");
             assert_eq!(
                 usage.release_events, 2,
-                "two keys released = two metered events"
+                "the two released keys remain visible as audit events"
             );
             assert_eq!(usage.distinct_keys, 2);
             assert_eq!(
@@ -1818,6 +2094,7 @@ mod tests {
             )
             .unwrap();
             let usage = attested_run_usage(&store, eng).unwrap();
+            assert_eq!(usage.attested_runs, 2, "a later batch is another run");
             assert_eq!(usage.release_events, 4, "re-release counts again");
             assert_eq!(usage.distinct_keys, 2, "still the same two keys");
 
@@ -1854,6 +2131,10 @@ mod tests {
             assert!(sealed_keys_for_measurement(&store, eng, &measurement())
                 .unwrap()
                 .is_empty());
+            assert_eq!(
+                attested_run_usage(&store, eng).unwrap(),
+                AttestedRunUsage::default()
+            );
         }
 
         /// Trustworthy evidence whose measurement matches no held key releases nothing
@@ -1881,6 +2162,10 @@ mod tests {
             assert!(sealed_keys_for_measurement(&store, eng, &measurement())
                 .unwrap()
                 .is_empty());
+            assert_eq!(
+                attested_run_usage(&store, eng).unwrap(),
+                AttestedRunUsage::default()
+            );
         }
 
         /// Release and grant stay in lock-step with the pure decision: a key sealed to a

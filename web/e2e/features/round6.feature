@@ -25,7 +25,8 @@ Feature: Round 6 — plain-language history, a keep guard, and consistent archet
 
   Scenario: keeping work from the task bar requires a confirming second click
     Given a new engagement
-    When I task the agent with "make a change"
+    When I request review for the next change
+    And I task the agent with "make a change"
     Then the task bar shows a review
     When I click keep on the task bar review
     Then the task bar keep is armed for confirmation
@@ -33,14 +34,14 @@ Feature: Round 6 — plain-language history, a keep guard, and consistent archet
     When I click keep on the task bar review
     Then the review is cleared from the task bar
 
-  Scenario: the internal settings file is folded out of the review by default
+  Scenario: runtime settings never enter the target review
     Given a new engagement
-    When I task the agent with "make a change"
+    When I request review for the next change
+    And I task the agent with "make a change"
     Then the run phase is "Completed"
     When I open the "diff" tab
     Then the changed-files review hides the internal settings file
-    When I reveal the internal settings file in the review
-    Then the diff shows ".agent-config.json"
+    And the review offers no internal-file toggle
 
   Scenario: the chat header shows the chat's own name
     Given a new engagement

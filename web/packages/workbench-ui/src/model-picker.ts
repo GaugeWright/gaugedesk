@@ -34,6 +34,10 @@ const ACCOUNT_SOURCES: Record<string, AccountSource> = {
     "openai-codex": { pin: "openai-codex", primary: ["openai-codex"], secondary: ["openai"] },
     openai: { pin: "openai", primary: ["openai"], secondary: [] },
     anthropic: { pin: "anthropic", primary: ["anthropic"], secondary: [] },
+    // openai-generic (ADR 0083) points at a user-configured endpoint whose model set
+    // GaugeDesk cannot enumerate — there is no catalog, so no primary/secondary. Its
+    // models come from a free-text entry the user types (see `providerTakesCustomModel`).
+    "openai-generic": { pin: "openai-generic", primary: [], secondary: [] },
 };
 
 /** A friendly provider name for the `(provider)` disambiguator suffix. */
@@ -41,7 +45,15 @@ const PROVIDER_LABEL: Record<string, string> = {
     "openai-codex": "Codex",
     openai: "OpenAI",
     anthropic: "Anthropic",
+    "openai-generic": "OpenAI-compatible",
 };
+
+/** Providers whose model id is entered free-text rather than picked from the catalog
+ *  (the endpoint-configurable `openai-generic`, ADR 0083 — GaugeDesk cannot list its
+ *  models). The composer offers a text field for these instead of catalog rows. */
+export function providerTakesCustomModel(provider: string): boolean {
+    return provider === "openai-generic";
+}
 
 /** A model reachable through the linked accounts. `provider` is the config pin; `primary`
  *  marks the account's native set (shown by default vs. settings-only). */
@@ -178,6 +190,19 @@ export function modelOptions(
     if (pinned?.id && !visible.some((m) => m.id === pinned.id && m.provider === pinned.provider)) {
         const found = all.find((m) => m.id === pinned.id && m.provider === pinned.provider);
         if (found) visible.push(found);
+        else if (providerTakesCustomModel(pinned.provider)) {
+            // A custom openai-generic model has no catalog entry; keep the pin visible so
+            // the `<select>` reflects the chat's real config rather than snapping away.
+            visible.push({
+                id: pinned.id,
+                provider: pinned.provider,
+                name: pinned.id,
+                label: pinned.id,
+                thinking: ["off"],
+                reasoning: false,
+                primary: true,
+            });
+        }
     }
 
     return [

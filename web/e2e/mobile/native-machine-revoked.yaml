@@ -1,0 +1,8 @@
+appId: ${APP_ID}
+name: Revoked native Machine controller fails closed
+---
+- launchApp
+- extendedWaitUntil:
+    visible: "This Machine no longer trusts this device. Pair it again."
+    timeout: 30000
+- assertNotVisible: "paired: .*"

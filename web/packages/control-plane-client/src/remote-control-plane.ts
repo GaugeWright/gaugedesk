@@ -1,14 +1,21 @@
 import {
+    browserRouteEventStream,
     browserRouteJson,
+    browserRouteRequest,
     type BrowserRouteJsonOptions,
+    type RouteEventStream,
+    type RouteRequest,
 } from "./browser-route-json";
 import type {
     Engagement,
     EngagementId,
     FileEntry,
+    MergeAction,
+    MergeState,
     StreamEvent,
+    Workspace,
 } from "./control-plane-domain";
-import type { RouteJson } from "./control-plane-transport";
+import { newIdempotencyKey, type RouteJson } from "./control-plane-transport";
 import * as workbench from "./control-plane-workbench";
 
 /** The placement-neutral product transport shared by desktop, managed web,
@@ -28,8 +35,15 @@ export interface ControlPlane {
         id: EngagementId,
         prompt: string,
         images?: { data: string; mimeType: string }[],
+        review?: boolean,
     ): Promise<unknown>;
     stopTurn(id: EngagementId): Promise<{ stopped: boolean }>;
+    engagementDiff(id: EngagementId): Promise<string>;
+    getMerge(id: EngagementId): Promise<MergeState>;
+    mergeCommand(
+        id: EngagementId,
+        action: MergeAction,
+    ): Promise<MergeState>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
     getFile(id: EngagementId, path: string): Promise<string>;
     /** `getFile` plus the cut the read serves (SUB-6 §12) — the base a
@@ -62,6 +76,7 @@ export interface ControlPlane {
 
 export interface RemoteControlPlaneOptions {
     readonly bearer?: string | null | (() => string | null);
+    readonly homeAdmission?: string | null | (() => string | null);
     /** Test/server injection. Production uses credentialed browser fetch. */
     readonly route?: RouteJson;
 }
@@ -72,7 +87,11 @@ export interface RemoteControlPlaneOptions {
 export class RemoteControlPlane implements ControlPlane {
     private bearer: string | null;
     private readonly bearerProvider?: () => string | null;
+    private homeAdmission: string | null;
+    private readonly homeAdmissionProvider?: () => string | null;
     private readonly route: RouteJson;
+    private readonly request: RouteRequest;
+    private readonly events: RouteEventStream;
 
     constructor(
         private readonly base: string,
@@ -82,16 +101,72 @@ export class RemoteControlPlane implements ControlPlane {
         this.bearerProvider =
             typeof options.bearer === "function" ? options.bearer : undefined;
         this.bearer = typeof options.bearer === "string" ? options.bearer : null;
-        const auth: BrowserRouteJsonOptions = { bearer: () => this.currentBearer() };
+        this.homeAdmissionProvider =
+            typeof options.homeAdmission === "function" ? options.homeAdmission : undefined;
+        this.homeAdmission =
+            typeof options.homeAdmission === "string" ? options.homeAdmission : null;
+        const auth: BrowserRouteJsonOptions = {
+            bearer: () => this.currentBearer(),
+            homeAdmission: () => this.currentHomeAdmission(),
+        };
         this.route = options.route ?? browserRouteJson(this.base, auth);
+        this.request = browserRouteRequest(this.base, auth);
+        this.events = browserRouteEventStream(this.base, auth);
     }
 
     setBearer(token: string | null): void {
         this.bearer = token;
     }
 
+    setHomeAdmission(token: string | null): void {
+        this.homeAdmission = token;
+    }
+
+    /** Authenticate to the target Home after ordinary account login. The
+     * credential remains memory-only and is never placed in a URL/storage. */
+    async admitHome(): Promise<string> {
+        const result = (await this.route("POST", "/home/admissions")) as {
+            home?: unknown;
+            admission?: unknown;
+        };
+        if (typeof result.home !== "string" || typeof result.admission !== "string") {
+            throw new Error("Home admission response is malformed");
+        }
+        this.homeAdmission = result.admission;
+        return result.home;
+    }
+
+    async revokeHomeAdmission(): Promise<void> {
+        if (!this.currentHomeAdmission()) return;
+        try {
+            await this.route("DELETE", "/home/admissions");
+        } finally {
+            this.homeAdmission = null;
+        }
+    }
+
+    /** The admitted Home's project/navigation projection. Callers must perform
+     * admission first; this never turns a directory pointer into access. */
+    getWorkspace(): Promise<Workspace> {
+        return workbench.getWorkspace(this.transport());
+    }
+
+    /** A Home-local, count-only notification projection. The caller must admit
+     * the Home first; no review/resource/project identifiers leave the Home. */
+    async reviewNotificationCount(): Promise<number> {
+        const result = await this.route("GET", "/console/review-count") as { review_count?: unknown };
+        if (typeof result.review_count !== "number" || !Number.isSafeInteger(result.review_count) || result.review_count < 0) {
+            throw new Error("Review notification response is malformed");
+        }
+        return result.review_count;
+    }
+
     private currentBearer(): string | null {
         return this.bearerProvider?.() ?? this.bearer;
+    }
+
+    private currentHomeAdmission(): string | null {
+        return this.homeAdmissionProvider?.() ?? this.homeAdmission;
     }
 
     protected routeJson(): RouteJson {
@@ -99,7 +174,12 @@ export class RemoteControlPlane implements ControlPlane {
     }
 
     protected transport(): workbench.WorkbenchTransport {
-        return { base: this.base, json: this.route };
+        return {
+            base: this.base,
+            json: this.route,
+            request: this.request,
+            events: this.events,
+        };
     }
 
     private async raw(
@@ -109,15 +189,14 @@ export class RemoteControlPlane implements ControlPlane {
         contentType?: string,
         allowStatuses: number[] = [],
     ): Promise<Response> {
-        const response = await fetch(this.base + path, {
+        const response = await this.request(path, {
             method,
             headers: {
-                ...(this.currentBearer()
-                    ? { authorization: `Bearer ${this.currentBearer()}` }
-                    : {}),
                 ...(contentType ? { "content-type": contentType } : {}),
+                ...(method !== "GET" && method !== "HEAD" && method !== "OPTIONS"
+                    ? { "idempotency-key": newIdempotencyKey() }
+                    : {}),
             },
-            credentials: "include",
             body,
         });
         if (!response.ok && !allowStatuses.includes(response.status)) {
@@ -154,12 +233,25 @@ export class RemoteControlPlane implements ControlPlane {
         id: EngagementId,
         prompt: string,
         images: { data: string; mimeType: string }[] = [],
+        review = false,
     ) {
-        return workbench.runTask(this.transport(), id, prompt, images);
+        return workbench.runTask(this.transport(), id, prompt, images, review);
     }
 
     stopTurn(id: EngagementId) {
         return workbench.stopTurn(this.transport(), id);
+    }
+
+    engagementDiff(id: EngagementId) {
+        return workbench.engagementDiff(this.transport(), id);
+    }
+
+    getMerge(id: EngagementId) {
+        return workbench.getMerge(this.transport(), id);
+    }
+
+    mergeCommand(id: EngagementId, action: MergeAction) {
+        return workbench.mergeCommand(this.transport(), id, action);
     }
 
     getTree(id: EngagementId) {

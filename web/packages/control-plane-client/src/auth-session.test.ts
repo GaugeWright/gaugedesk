@@ -1,5 +1,17 @@
-import { describe, expect, it } from "vitest";
-import { bearer, decodeSubject, parseCallbackFragment, setBearer, signedIn } from "./auth-session";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+    bearer,
+    decodeSubject,
+    endSession,
+    exchangeMobileAccountHandoff,
+    parseCallbackFragment,
+    refreshHostedAccountSession,
+    refreshMobileAccountToken,
+    setBearer,
+    signedIn,
+} from "./auth-session";
+
+afterEach(() => vi.unstubAllGlobals());
 
 /** Build an unsigned JWT-shaped string with the given payload (base64url, no padding) —
  *  enough to exercise the display-only `sub` decode (the client never verifies). */
@@ -69,5 +81,105 @@ describe("bearer is in-memory only (ENTSEC-6)", () => {
             g.localStorage = prevLocal;
             g.sessionStorage = prevSession;
         }
+    });
+});
+
+describe("endSession", () => {
+    it("expires the hosted cookie before clearing the in-memory bearer", async () => {
+        setBearer("header.payload.sig");
+        const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+            new Response(null, { status: 204 }));
+        vi.stubGlobal("fetch", fetch);
+
+        await endSession("https://auth.example/");
+
+        expect(fetch).toHaveBeenCalledOnce();
+        expect(fetch.mock.calls[0]?.[0]).toBe("https://auth.example/auth/logout");
+        expect(fetch.mock.calls[0]?.[1]).toMatchObject({ method: "POST", credentials: "include" });
+        expect(new Headers(fetch.mock.calls[0]?.[1]?.headers).get("idempotency-key")).toBeTruthy();
+        expect(bearer()).toBeNull();
+    });
+
+    it("keeps local auth state when the server could not clear its cookie", async () => {
+        setBearer("header.payload.sig");
+        vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 502 })));
+
+        await expect(endSession("https://auth.example")).rejects.toThrow("Sign out failed (502)");
+        expect(bearer()).toBe("header.payload.sig");
+        setBearer(null);
+    });
+});
+
+describe("native account session transport", () => {
+    it("exchanges the device-bound handoff through the shared request owner", async () => {
+        const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+            new Response(JSON.stringify({ id_token: "header.payload.signature" }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            }));
+        vi.stubGlobal("fetch", fetch);
+
+        await expect(exchangeMobileAccountHandoff(
+            "https://auth.example/",
+            "handoff-code",
+            "device-verifier",
+        )).resolves.toBe("header.payload.signature");
+
+        expect(fetch.mock.calls[0]?.[0]).toBe("https://auth.example/auth/mobile/exchange");
+        const init = fetch.mock.calls[0]?.[1];
+        expect(JSON.parse(String(init?.body))).toEqual({
+            code: "handoff-code",
+            verifier: "device-verifier",
+        });
+        expect(new Headers(init?.headers).get("idempotency-key")).toBeTruthy();
+        expect(init?.credentials).toBe("include");
+    });
+
+    it("refreshes with the exact current bearer and rejects malformed success", async () => {
+        const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+            new Response(JSON.stringify({ id_token: "replacement" }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            }));
+        vi.stubGlobal("fetch", fetch);
+
+        await expect(refreshMobileAccountToken(
+            "https://auth.example",
+            "current-token",
+        )).resolves.toBe("replacement");
+
+        const init = fetch.mock.calls[0]?.[1];
+        expect(new Headers(init?.headers).get("authorization")).toBe("Bearer current-token");
+        expect(new Headers(init?.headers).get("idempotency-key")).toBeTruthy();
+
+        vi.stubGlobal("fetch", vi.fn(async () =>
+            new Response(JSON.stringify({ refreshed: true }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            })));
+        await expect(refreshMobileAccountToken(
+            "https://auth.example",
+            "current-token",
+        )).rejects.toThrow("response is malformed");
+    });
+});
+
+describe("hosted account session refresh", () => {
+    it("uses the credentialed production refresh route without exposing a token", async () => {
+        const fetch = vi.fn(async () =>
+            new Response(JSON.stringify({ refreshed: true, person: "person:one" }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            }));
+        vi.stubGlobal("fetch", fetch);
+
+        await expect(refreshHostedAccountSession("https://auth.example/")).resolves.toBe(true);
+        expect(fetch).toHaveBeenCalledWith("https://auth.example/auth/refresh", {
+            method: "GET",
+            credentials: "include",
+        });
+
+        fetch.mockResolvedValueOnce(new Response(null, { status: 401 }));
+        await expect(refreshHostedAccountSession("https://auth.example")).resolves.toBe(false);
     });
 });

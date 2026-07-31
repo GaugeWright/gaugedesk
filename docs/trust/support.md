@@ -1,40 +1,40 @@
-# Support & response targets
+# Support
 
-How to reach us, and what response you can expect. The model is deliberately
-**lean and honest**: email support with published targets, raised as we staff up
-— no SLA we can't keep.
+## Contact
 
-## Channels
+Email [Jack@GaugeWright.com](mailto:Jack@GaugeWright.com) for:
 
-- **Email is the baseline** for all support, questions, and bug reports.
-- A **shared Slack Connect / Microsoft Teams channel** is available to
-  **high-volume consultant accounts on request** — offered by relationship and
-  volume, not sold as a tier.
-- A dedicated **security & abuse contact** for vulnerability reports and misuse
-  (see below).
+- product support;
+- privacy requests;
+- security reports;
+- abuse reports; and
+- DPA requests.
 
-## Response-time targets
+Do not send credentials, private keys, recovery codes, or unnecessary customer
+content.
 
-These are the targets we publish and hold ourselves to; they are not a contractual
-24/7 SLA (we'll commit to tighter numbers as the team grows).
+## Response targets
+
+These are operating targets, not a contractual 24-hour SLA.
 
 | Request | Target first response |
-|---|---|
-| Standard support (questions, non-urgent bugs) | **1 business day** |
-| Urgent (production-impacting) | **Same business day** |
-| Security / abuse reports | **Same business day**, prioritized |
+| --- | --- |
+| Standard support | One business day |
+| Production-impacting issue | Same business day |
+| Security or abuse report | Same business day |
+| Privacy request | Acknowledgment within one business day; completion follows applicable law and contract |
 
-## Security & abuse
+## Security report
 
-Report a suspected vulnerability or abuse to the **security contact** rather than a
-public channel, so we can triage and fix before disclosure. We aim to acknowledge
-security reports the **same business day**. Please include reproduction steps and
-the affected version; do not include third-party personal data in the report.
+Include:
 
-This pairs with our [vulnerability-disclosure posture](../security.md) and the
-[subprocessor list](subprocessors.md) for a complete trust picture.
+- affected product and release;
+- a short impact statement;
+- reproduction steps;
+- relevant event or request identifiers; and
+- a safe contact method.
 
-!!! note "Getting the address"
-    The current support and security email addresses are provided at sign-up and
-    on your account page (kept out of the docs so they can change without a docs
-    release). If you don't have them yet, ask your point of contact.
+Do not open a public issue before GaugeWright can triage the report.
+
+See [Incident response](incident-response.md) and
+[Security and trust](../security.md).

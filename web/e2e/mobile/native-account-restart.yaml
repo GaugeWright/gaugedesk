@@ -1,0 +1,40 @@
+appId: ${APP_ID}
+name: Restart isolates offline Home cache, resolves links, and signs out
+---
+- launchApp
+- extendedWaitUntil:
+    visible: "Alpha · offline"
+    timeout: 60000
+- assertVisible: "Beta"
+- assertNotVisible: "Beta · offline"
+- tapOn: "Beta"
+- extendedWaitUntil:
+    visible: "home:two"
+    timeout: 30000
+- tapOn: "projects"
+- openLink:
+    link: ${INVALID_TARGET}
+    autoVerify: true
+- tapOn:
+    text: "Open"
+    optional: true
+    label: "Accept the invalid custom link handoff if shown"
+- assertVisible: "Projects"
+- openLink:
+    link: ${VALID_TARGET}
+    autoVerify: true
+- tapOn:
+    text: "Open"
+    optional: true
+    label: "Accept the valid custom link handoff if shown"
+- extendedWaitUntil:
+    visible: "home:two"
+    timeout: 30000
+- tapOn: "sign out"
+- extendedWaitUntil:
+    visible: "Sign in to open your projects.*"
+    timeout: 30000
+- launchApp
+- extendedWaitUntil:
+    visible: "Sign in to open your projects.*"
+    timeout: 30000

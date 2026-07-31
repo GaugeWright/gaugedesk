@@ -1,6 +1,6 @@
 //! The agent/project library — the ADR-0027 data model as durable **records**.
 //!
-//! Agents, projects, instances, and chats are not lifecycle state; they are
+//! Archetypes, projects, placements, work targets, and chats are not lifecycle state; they are
 //! durable *declarations* whose current value is the source of truth
 //! (`data.md`). We store them as append-only records in one reserved scope
 //! (`"library"`) and fold them **latest-wins by id** into a [`Library`]
@@ -10,18 +10,53 @@
 //! `agent-version` facet later (M1).
 //!
 //! - **agent** = a library-level reusable definition (its own authoring instance).
-//! - **instance** = `(bound agent, workspace repo)` — the repo-owning unit.
-//! - **project** = a grouping of *using* instances (agents bound into the project).
-//! - **chat** = an engagement: a worktree off an instance's `main`.
+//! - **instance** = an archetype authoring root or a placement declaration.
+//! - **work target** = the independently-authoritative files a chat changes.
+//! - **project** = a grouping of placements and ordinary work targets.
+//! - **chat** = an engagement binding a placement/archetype to a target and exact basis.
 
 use std::collections::BTreeMap;
 
 use gaugewright_core::boundary_lifecycle::{BoundaryPhase, BoundaryState, Operator, Placement};
+use gaugewright_core::ids::HomeId;
 use gaugewright_store::{AdmitError, Store};
 use serde::{Deserialize, Serialize};
 
 /// The reserved store scope holding every library record.
 pub const LIBRARY_SCOPE: &str = "library";
+
+/// The record-shape schema version this build **writes** and the newest it
+/// **reads** (DR-0054 Phase B, `specs/systems.md` Persistent State
+/// Compatibility). Every persisted library record is stamped with it; records
+/// written before the stamp read as version 1 (their implicit shape). A record
+/// declaring a *newer* version fails the read closed (see
+/// [`guard_record_schema`]) instead of being silently misread, and each
+/// record's `extra` map round-trips fields this build does not recognize so an
+/// older build's rewrite never drops a newer build's data. Bump only for a
+/// non-additive shape change.
+pub const LIBRARY_RECORD_SCHEMA: u32 = 1;
+
+/// Serde default for [`LIBRARY_RECORD_SCHEMA`]-stamped records written before
+/// the stamp existed: they are version 1, the implicit original shape.
+fn record_schema_v1() -> u32 {
+    1
+}
+
+/// Fail closed on a record stamped by a newer build (DR-0054 Phase B): reading
+/// it with this build's shape would silently drop whatever the newer version
+/// added or reinterpreted, so the reader errors diagnosably instead — naming
+/// the record, both versions, and the remediation (a newer build, never a
+/// state-root reset).
+fn guard_record_schema(kind: &str, id: &str, schema: u32) -> Result<(), AdmitError> {
+    if schema > LIBRARY_RECORD_SCHEMA {
+        return Err(AdmitError::UnsupportedSchema(format!(
+            "library {kind} record {id} declares schema version {schema}, but this build reads \
+             at most {LIBRARY_RECORD_SCHEMA}: a newer GaugeDesk wrote it. Refusing to load it — \
+             run that newer build against this state root (do not reset it)."
+        )));
+    }
+    Ok(())
+}
 
 /// A record either declares the current value (`Upsert`) or retracts the id
 /// (`Tombstone`). Folded latest-wins, so the last write per id wins.
@@ -82,13 +117,19 @@ impl InstanceKind {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ArchetypeVersionRecord {
+    pub package_ref: String,
+    pub discipline_ref: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AgentRecord {
     pub id: String,
     #[serde(default)]
     pub op: RecordOp,
     pub name: String,
-    /// The agent's own authoring instance (its repo).
+    /// The logical authoring root. Its files live in the archetype-owned target.
     pub instance_id: String,
     /// The raw `.agent-config.json` seeded into each chat's worktree. Stored
     /// verbatim (validated on write); empty config is `"{}"`.
@@ -99,11 +140,10 @@ pub struct AgentRecord {
     /// available. Older records default to `1`.
     #[serde(default = "one")]
     pub current_version: u64,
-    /// Content-addressed WhippleScript package reference for every immutable
-    /// published version. The monotonic display version selects one exact ref;
-    /// mutable draft bytes never appear here.
+    /// Every numeric version atomically binds the executable WhippleScript
+    /// package and workspace-discipline content references.
     #[serde(default)]
-    pub package_versions: BTreeMap<u64, String>,
+    pub versions: BTreeMap<u64, ArchetypeVersionRecord>,
     /// The **owner's** auto-upgrade preference (`UX-9`, [ADR 0063]): when set, placements of
     /// this archetype move to a newly-published version automatically — *but only where the
     /// hosting org also allows auto-updates* (`Org::allow_auto_upgrade`), else it falls back
@@ -115,6 +155,16 @@ pub struct AgentRecord {
     /// improvements (ADR 0038). Older records default to `None`.
     #[serde(default)]
     pub forked_from: Option<String>,
+    /// The record-shape schema version that wrote this record (DR-0054 Phase
+    /// B). Absent on records predating the stamp = version 1, the implicit
+    /// original shape. Readers fail closed on a version newer than
+    /// [`LIBRARY_RECORD_SCHEMA`].
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    /// Fields written by a build newer than this one, preserved verbatim so a
+    /// read-modify-write here never drops them (DR-0054 Phase B).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn empty_config() -> String {
@@ -133,11 +183,16 @@ pub struct ProjectRecord {
     #[serde(default)]
     pub op: RecordOp,
     pub name: String,
-    /// The hidden default "Personal" project (ADR 0036): a single trust boundary
-    /// the solo "just start chatting" path roots its default placement on. Hidden
-    /// from the project nav. Defaults to `false` for older records.
+    /// The default "Personal" project (ADR 0036 / ADR 0097): the explicit trust
+    /// boundary the solo "just start chatting" path roots its default placement on.
+    /// Defaults to `false` for older records.
     #[serde(default)]
     pub is_default: bool,
+    /// The exactly-one authoritative Home that owns this project's GaugeDesk
+    /// log, content, grants, and commands (`HOME-2`). Missing legacy values are
+    /// migrated durably to the opening workbench's Home before it serves.
+    #[serde(default = "unbound_home")]
+    pub home_id: HomeId,
     /// The project's network egress posture (RF-B3). The app ships **open** —
     /// chats in this project may reach the model (and, with no per-host proxy yet,
     /// any host) — and the operator *opts into* isolation per project. `true`
@@ -157,6 +212,20 @@ pub struct ProjectRecord {
     /// (`Placement::local`). Defaults to `None` for older records.
     #[serde(default)]
     pub deployment_mode: Option<Placement>,
+    /// The record-shape schema version that wrote this record (DR-0054 Phase
+    /// B). Absent on records predating the stamp = version 1, the implicit
+    /// original shape. Readers fail closed on a version newer than
+    /// [`LIBRARY_RECORD_SCHEMA`].
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    /// Fields written by a build newer than this one, preserved verbatim so a
+    /// read-modify-write here never drops them (DR-0054 Phase B).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+fn unbound_home() -> HomeId {
+    HomeId::new("")
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -182,6 +251,16 @@ pub struct InstanceRecord {
     /// records and the frictionless default read as `Active`.
     #[serde(default)]
     pub admission: Admission,
+    /// The record-shape schema version that wrote this record (DR-0054 Phase
+    /// B). Absent on records predating the stamp = version 1, the implicit
+    /// original shape. Readers fail closed on a version newer than
+    /// [`LIBRARY_RECORD_SCHEMA`].
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    /// Fields written by a build newer than this one, preserved verbatim so a
+    /// read-modify-write here never drops them (DR-0054 Phase B).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -198,6 +277,179 @@ pub struct ChatRecord {
     /// tree. `None` for an original chat.
     #[serde(default)]
     pub forked_from: Option<String>,
+    /// Stable transcript entry selected for a point fork (ADR 0073). Absent
+    /// for original chats and legacy whole-thread forks.
+    #[serde(default)]
+    pub forked_from_entry: Option<i64>,
+    /// The record-shape schema version that wrote this record (DR-0054 Phase
+    /// B). Absent on records predating the stamp = version 1, the implicit
+    /// original shape. Readers fail closed on a version newer than
+    /// [`LIBRARY_RECORD_SCHEMA`].
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    /// Fields written by a build newer than this one, preserved verbatim so a
+    /// read-modify-write here never drops them (DR-0054 Phase B).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// The authority scope that owns a work target (ADR 0100 / TARGET-1).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkTargetOwner {
+    Project { project_id: String },
+    Archetype { archetype_id: String },
+}
+
+/// The target adapter family. `Managed` is authoritative WhippleScript VCS;
+/// external targets retain their own VCS/folder authority.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkTargetKind {
+    Managed,
+    ExternalVcs,
+    ExternalFolder,
+}
+
+/// Which version-control authority owns the target's settled history. This is
+/// deliberately separate from the adapter implementation: an adapter can use
+/// WhippleScript as non-authoritative shadow history for an external folder
+/// without changing that folder's `Unversioned` posture.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TargetVcsPosture {
+    #[default]
+    Managed,
+    ExternalVcs,
+    Unversioned,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkTargetStatus {
+    #[default]
+    Available,
+    Unavailable,
+    Retired,
+}
+
+/// Separating these acts prevents a visible path or readable checkout from
+/// silently granting mutation/publication authority (ADR 0100 §1/§2).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct TargetCapabilities {
+    pub read: bool,
+    pub propose: bool,
+    pub apply: bool,
+    pub publish: bool,
+    pub release: bool,
+}
+
+impl TargetCapabilities {
+    pub fn managed_default() -> Self {
+        Self {
+            read: true,
+            propose: true,
+            apply: true,
+            publish: false,
+            release: false,
+        }
+    }
+}
+
+/// Durable declaration of one repository/folder/managed body of files. The
+/// `locator_handle` is opaque to runtimes and clients. Managed target storage is
+/// keyed directly by the target id; placements never receive a storage alias.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WorkTargetRecord {
+    pub id: String,
+    pub op: RecordOp,
+    pub name: String,
+    pub owner: WorkTargetOwner,
+    pub kind: WorkTargetKind,
+    /// Authority and stakeholder identities only. Protected target bytes and
+    /// credentials remain behind the locator handle.
+    pub authority: String,
+    pub parties: Vec<String>,
+    pub locator_handle: String,
+    pub adapter: String,
+    pub adapter_family: String,
+    pub vcs_posture: TargetVcsPosture,
+    /// The adapter's last resolved exact standing basis. Chat bindings always
+    /// retain their own immutable basis even after this hint advances.
+    pub current_basis: Option<String>,
+    pub path_scope: Vec<String>,
+    pub capabilities: TargetCapabilities,
+    pub status: WorkTargetStatus,
+    /// The record-shape schema version that wrote this record (DR-0054 Phase
+    /// B). Absent on records predating the stamp = version 1, the implicit
+    /// original shape. Readers fail closed on a version newer than
+    /// [`LIBRARY_RECORD_SCHEMA`].
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    /// Fields written by a build newer than this one, preserved verbatim so a
+    /// read-modify-write here never drops them (DR-0054 Phase B).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Placement eligibility is independent from the target's own grants.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PlacementTargetsRecord {
+    pub placement_id: String,
+    pub op: RecordOp,
+    pub target_ids: Vec<String>,
+    /// The record-shape schema version that wrote this record (DR-0054 Phase
+    /// B). Absent on records predating the stamp = version 1, the implicit
+    /// original shape. Readers fail closed on a version newer than
+    /// [`LIBRARY_RECORD_SCHEMA`].
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    /// Fields written by a build newer than this one, preserved verbatim so a
+    /// read-modify-write here never drops them (DR-0054 Phase B).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// The durable chat-specific binding. `basis` is always an exact native cut,
+/// VCS revision, or folder fingerprint—not a mutable branch/path.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChatTargetBindingRecord {
+    pub chat_id: String,
+    pub op: RecordOp,
+    pub target_id: String,
+    pub basis: String,
+    pub path_scope: Vec<String>,
+    pub capabilities: TargetCapabilities,
+    /// The record-shape schema version that wrote this record (DR-0054 Phase
+    /// B). Absent on records predating the stamp = version 1, the implicit
+    /// original shape. Readers fail closed on a version newer than
+    /// [`LIBRARY_RECORD_SCHEMA`].
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    /// Fields written by a build newer than this one, preserved verbatim so a
+    /// read-modify-write here never drops them (DR-0054 Phase B).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Target-scoped root for a named workstream.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WorkstreamRootRecord {
+    pub workstream_id: String,
+    pub op: RecordOp,
+    pub placement_id: String,
+    pub target_id: String,
+    pub adapter_family: String,
+    /// The record-shape schema version that wrote this record (DR-0054 Phase
+    /// B). Absent on records predating the stamp = version 1, the implicit
+    /// original shape. Readers fail closed on a version newer than
+    /// [`LIBRARY_RECORD_SCHEMA`].
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    /// Fields written by a build newer than this one, preserved verbatim so a
+    /// read-modify-write here never drops them (DR-0054 Phase B).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// One node in the **fork forest** (`UX-8`): a chat plus its fork children, nested. A
@@ -228,6 +480,16 @@ pub struct WorkstreamRecord {
     /// The library-scope position at creation — drives stable nav ordering.
     #[serde(default)]
     pub created_position: i64,
+    /// The record-shape schema version that wrote this record (DR-0054 Phase
+    /// B). Absent on records predating the stamp = version 1, the implicit
+    /// original shape. Readers fail closed on a version newer than
+    /// [`LIBRARY_RECORD_SCHEMA`].
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    /// Fields written by a build newer than this one, preserved verbatim so a
+    /// read-modify-write here never drops them (DR-0054 Phase B).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// The current value of every library record id, folded latest-wins. Held in
@@ -240,6 +502,10 @@ pub struct Library {
     pub instances: BTreeMap<String, InstanceRecord>,
     pub chats: BTreeMap<String, ChatRecord>,
     pub workstreams: BTreeMap<String, WorkstreamRecord>,
+    pub work_targets: BTreeMap<String, WorkTargetRecord>,
+    pub placement_targets: BTreeMap<String, PlacementTargetsRecord>,
+    pub chat_targets: BTreeMap<String, ChatTargetBindingRecord>,
+    pub workstream_roots: BTreeMap<String, WorkstreamRootRecord>,
 }
 
 /// Apply one record to its map: `Tombstone` removes the id, `Upsert` sets it.
@@ -260,23 +526,48 @@ impl Library {
         let mut lib = Library::default();
         for row in store.records(LIBRARY_SCOPE, "agent")? {
             let r: AgentRecord = serde_json::from_str(&row)?;
+            guard_record_schema("agent", &r.id, r.schema)?;
             fold_one(&mut lib.agents, &r.id.clone(), r.op, r);
         }
         for row in store.records(LIBRARY_SCOPE, "project")? {
             let r: ProjectRecord = serde_json::from_str(&row)?;
+            guard_record_schema("project", &r.id, r.schema)?;
             fold_one(&mut lib.projects, &r.id.clone(), r.op, r);
         }
         for row in store.records(LIBRARY_SCOPE, "instance")? {
             let r: InstanceRecord = serde_json::from_str(&row)?;
+            guard_record_schema("instance", &r.id, r.schema)?;
             fold_one(&mut lib.instances, &r.id.clone(), r.op, r);
         }
         for row in store.records(LIBRARY_SCOPE, "chat")? {
             let r: ChatRecord = serde_json::from_str(&row)?;
+            guard_record_schema("chat", &r.id, r.schema)?;
             fold_one(&mut lib.chats, &r.id.clone(), r.op, r);
         }
         for row in store.records(LIBRARY_SCOPE, "workstream")? {
             let r: WorkstreamRecord = serde_json::from_str(&row)?;
+            guard_record_schema("workstream", &r.id, r.schema)?;
             fold_one(&mut lib.workstreams, &r.id.clone(), r.op, r);
+        }
+        for row in store.records(LIBRARY_SCOPE, "work_target")? {
+            let r: WorkTargetRecord = serde_json::from_str(&row)?;
+            guard_record_schema("work_target", &r.id, r.schema)?;
+            fold_one(&mut lib.work_targets, &r.id.clone(), r.op, r);
+        }
+        for row in store.records(LIBRARY_SCOPE, "placement_targets")? {
+            let r: PlacementTargetsRecord = serde_json::from_str(&row)?;
+            guard_record_schema("placement_targets", &r.placement_id, r.schema)?;
+            fold_one(&mut lib.placement_targets, &r.placement_id.clone(), r.op, r);
+        }
+        for row in store.records(LIBRARY_SCOPE, "chat_target")? {
+            let r: ChatTargetBindingRecord = serde_json::from_str(&row)?;
+            guard_record_schema("chat_target", &r.chat_id, r.schema)?;
+            fold_one(&mut lib.chat_targets, &r.chat_id.clone(), r.op, r);
+        }
+        for row in store.records(LIBRARY_SCOPE, "workstream_root")? {
+            let r: WorkstreamRootRecord = serde_json::from_str(&row)?;
+            guard_record_schema("workstream_root", &r.workstream_id, r.schema)?;
+            fold_one(&mut lib.workstream_roots, &r.workstream_id.clone(), r.op, r);
         }
         Ok(lib)
     }
@@ -294,6 +585,12 @@ impl Library {
     pub fn apply_project(&mut self, r: ProjectRecord) {
         fold_one(&mut self.projects, &r.id.clone(), r.op, r);
     }
+
+    pub fn project_home_id(&self, project_id: &str) -> Option<&HomeId> {
+        self.projects
+            .get(project_id)
+            .map(|project| &project.home_id)
+    }
     pub fn apply_instance(&mut self, r: InstanceRecord) {
         fold_one(&mut self.instances, &r.id.clone(), r.op, r);
     }
@@ -302,6 +599,55 @@ impl Library {
     }
     pub fn apply_workstream(&mut self, r: WorkstreamRecord) {
         fold_one(&mut self.workstreams, &r.id.clone(), r.op, r);
+    }
+    pub fn apply_work_target(&mut self, r: WorkTargetRecord) {
+        fold_one(&mut self.work_targets, &r.id.clone(), r.op, r);
+    }
+    pub fn apply_placement_targets(&mut self, r: PlacementTargetsRecord) {
+        fold_one(
+            &mut self.placement_targets,
+            &r.placement_id.clone(),
+            r.op,
+            r,
+        );
+    }
+    pub fn apply_chat_target(&mut self, r: ChatTargetBindingRecord) {
+        fold_one(&mut self.chat_targets, &r.chat_id.clone(), r.op, r);
+    }
+    pub fn apply_workstream_root(&mut self, r: WorkstreamRootRecord) {
+        fold_one(
+            &mut self.workstream_roots,
+            &r.workstream_id.clone(),
+            r.op,
+            r,
+        );
+    }
+
+    pub fn target_for_chat(&self, chat_id: &str) -> Option<&WorkTargetRecord> {
+        self.chat_targets
+            .get(chat_id)
+            .and_then(|binding| self.work_targets.get(&binding.target_id))
+    }
+
+    pub fn targets_for_project(&self, project_id: &str) -> Vec<&WorkTargetRecord> {
+        self.work_targets
+            .values()
+            .filter(|target| {
+                matches!(
+                    &target.owner,
+                    WorkTargetOwner::Project { project_id: owner } if owner == project_id
+                )
+            })
+            .collect()
+    }
+
+    pub fn authoring_target_for(&self, archetype_id: &str) -> Option<&WorkTargetRecord> {
+        self.work_targets.values().find(|target| {
+            matches!(
+                &target.owner,
+                WorkTargetOwner::Archetype { archetype_id: owner } if owner == archetype_id
+            )
+        })
     }
 
     /// The deployment mode (`DEPLOY-1`) the consultant declared for `project_id` — the
@@ -411,8 +757,8 @@ impl Library {
 
     /// The network egress posture for a chat, resolved through its placement to
     /// its project (chat → instance → `project_id` → project). Defaults to **open**
-    /// (`false`) when any hop is missing — an authoring/edit chat with no project,
-    /// the hidden Personal default, or an unknown id — so the app's open-by-default
+    /// (`false`) when any hop is missing — an authoring/edit chat with no project or
+    /// an unknown id — so the app's open-by-default
     /// posture holds and only an explicit per-project opt-in isolates.
     pub fn chat_network_isolated(&self, chat_id: &str) -> bool {
         self.chats
@@ -444,7 +790,7 @@ impl Library {
     }
 
     /// The project a using-instance (placement) is bound into (`ENTSEC-2`): its `project_id`.
-    /// `None` for an authoring instance (an archetype's own repo) or an unknown id.
+    /// `None` for an archetype authoring root or an unknown id.
     pub fn project_of_instance(&self, instance_id: &str) -> Option<&str> {
         self.instances
             .get(instance_id)
@@ -577,15 +923,104 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_reads_records_written_before_version_bindings() {
+        let record: AgentRecord =
+            serde_json::from_str(r#"{"id":"a1","name":"Legacy","instance_id":"inst-a1"}"#).unwrap();
+        assert_eq!(record.current_version, 1);
+        assert!(record.versions.is_empty());
+        assert_eq!(record.schema, 1, "a pre-stamp record reads as version 1");
+        assert!(record.extra.is_empty());
+    }
+
+    /// DR-0054 Phase B: a record stamped by a newer build (schema ahead of this
+    /// one) must fail the rebuild closed with a diagnosable error — not be
+    /// skipped, misread, or answered with a reset instruction.
+    #[test]
+    fn a_newer_schema_record_fails_rebuild_with_a_diagnosable_error() {
+        let mut store = Store::open_in_memory().unwrap();
+        agent(&mut store, "a-ok", RecordOp::Upsert, "fine");
+        store
+            .append_record(
+                LIBRARY_SCOPE,
+                "agent",
+                r#"{"id":"a-future","name":"From the future","instance_id":"inst","schema":999}"#,
+            )
+            .unwrap();
+        let error = match Library::rebuild(&store) {
+            Ok(_) => panic!("a newer-schema record must fail the rebuild closed"),
+            Err(error) => error,
+        };
+        match error {
+            AdmitError::UnsupportedSchema(message) => {
+                assert!(
+                    message.contains("a-future") && message.contains("999"),
+                    "the error names the record and its version: {message}"
+                );
+                assert!(
+                    message.contains("do not reset"),
+                    "the remediation is a newer build, never a reset: {message}"
+                );
+            }
+            other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+    }
+
+    /// DR-0054 Phase B: fields this build does not recognize round-trip through
+    /// a load-modify-save cycle via `extra` instead of being silently dropped —
+    /// an older build's rewrite no longer destroys a newer build's data.
+    #[test]
+    fn unknown_fields_survive_a_load_modify_save_cycle() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .append_record(
+                LIBRARY_SCOPE,
+                "agent",
+                r#"{"id":"a1","name":"original","instance_id":"inst",
+                    "future_field":{"nested":true},"schema":1}"#,
+            )
+            .unwrap();
+        let lib = Library::rebuild(&store).unwrap();
+        let mut record = lib.agents.get("a1").unwrap().clone();
+        assert_eq!(
+            record.extra.get("future_field"),
+            Some(&serde_json::json!({"nested": true})),
+            "the unrecognized field was captured, not dropped"
+        );
+
+        // The read-modify-write an older build performs: rename, save back.
+        record.name = "renamed".into();
+        let rewritten = serde_json::to_string(&record).unwrap();
+        store
+            .append_record(LIBRARY_SCOPE, "agent", &rewritten)
+            .unwrap();
+
+        let lib = Library::rebuild(&store).unwrap();
+        let record = lib.agents.get("a1").unwrap();
+        assert_eq!(record.name, "renamed");
+        assert_eq!(record.schema, 1, "the write carries its schema stamp");
+        assert_eq!(
+            record.extra.get("future_field"),
+            Some(&serde_json::json!({"nested": true})),
+            "the unrecognized field survived the rewrite"
+        );
+        // And the persisted JSON itself still carries both.
+        let value: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(value["schema"], 1);
+        assert_eq!(value["future_field"], serde_json::json!({"nested": true}));
+    }
+
     fn agent(store: &mut Store, id: &str, op: RecordOp, name: &str) {
         let r = AgentRecord {
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: id.into(),
             op,
             name: name.into(),
             instance_id: format!("inst-{id}"),
             config: "{}".into(),
             current_version: 1,
-            package_versions: BTreeMap::new(),
+            versions: BTreeMap::new(),
             auto_upgrade: false,
             forked_from: None,
         };
@@ -600,25 +1035,33 @@ mod tests {
         // explicit per-project opt-in isolates. Build the projection by hand.
         let mut lib = Library::default();
         lib.apply_project(ProjectRecord {
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: "p-iso".into(),
             op: RecordOp::Upsert,
             name: "Locked".into(),
             is_default: false,
+            home_id: HomeId::new("home:local-user"),
             network_isolated: true,
             run_purpose: None,
             deployment_mode: None,
         });
         lib.apply_project(ProjectRecord {
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: "p-open".into(),
             op: RecordOp::Upsert,
             name: "Open".into(),
             is_default: false,
+            home_id: HomeId::new("home:local-user"),
             network_isolated: false,
             run_purpose: Some("support".to_owned()),
             deployment_mode: None,
         });
         let bind = |lib: &mut Library, inst: &str, project: Option<&str>| {
             lib.apply_instance(InstanceRecord {
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
                 id: inst.into(),
                 op: RecordOp::Upsert,
                 kind: InstanceKind::Using,
@@ -630,12 +1073,15 @@ mod tests {
         };
         let chat = |lib: &mut Library, id: &str, inst: &str| {
             lib.apply_chat(ChatRecord {
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
                 id: id.into(),
                 op: RecordOp::Upsert,
                 instance_id: inst.into(),
                 title: id.into(),
                 created_position: 0,
                 forked_from: None,
+                forked_from_entry: None,
             });
         };
         bind(&mut lib, "i-iso", Some("p-iso"));
@@ -671,6 +1117,8 @@ mod tests {
         // ENTSEC-2: chat → instance → project; None for an authoring chat / unknown id.
         let mut lib = Library::default();
         lib.apply_instance(InstanceRecord {
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: "i-using".into(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Using,
@@ -680,6 +1128,8 @@ mod tests {
             admission: Admission::Active,
         });
         lib.apply_instance(InstanceRecord {
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: "i-authoring".into(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Authoring,
@@ -690,12 +1140,15 @@ mod tests {
         });
         let chat = |lib: &mut Library, id: &str, inst: &str| {
             lib.apply_chat(ChatRecord {
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
                 id: id.into(),
                 op: RecordOp::Upsert,
                 instance_id: inst.into(),
                 title: id.into(),
                 created_position: 0,
                 forked_from: None,
+                forked_from_entry: None,
             });
         };
         chat(&mut lib, "c-work", "i-using");
@@ -713,12 +1166,15 @@ mod tests {
     fn fork_forest_nests_chats_by_forked_from() {
         let mut lib = Library::default();
         let chat = |id: &str, pos: i64, from: Option<&str>| ChatRecord {
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: id.into(),
             op: RecordOp::Upsert,
             instance_id: "p1".into(),
             title: format!("title {id}"),
             created_position: pos,
             forked_from: from.map(str::to_string),
+            forked_from_entry: None,
         };
         // c1 (root) → c2 → c3 ; c4 (root) ; c5 forked from a missing parent ⇒ surfaces as root.
         lib.apply_chat(chat("c1", 1, None));
@@ -747,10 +1203,13 @@ mod tests {
         let mut lib = Library::default();
         // Unset ⇒ the local default (least-privileged placement).
         lib.apply_project(ProjectRecord {
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: "p-default".into(),
             op: RecordOp::Upsert,
             name: "Default".into(),
             is_default: false,
+            home_id: HomeId::new("home:local-user"),
             network_isolated: false,
             run_purpose: None,
             deployment_mode: None,
@@ -764,10 +1223,13 @@ mod tests {
             attested: true,
         };
         lib.apply_project(ProjectRecord {
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: "p-attested".into(),
             op: RecordOp::Upsert,
             name: "Attested".into(),
             is_default: false,
+            home_id: HomeId::new("home:local-user"),
             network_isolated: false,
             run_purpose: None,
             deployment_mode: Some(mode),
@@ -795,12 +1257,15 @@ mod tests {
         let mut lib = Library::default();
         for (id, pos) in [("chat-b", 5), ("chat-a", 2)] {
             let c = ChatRecord {
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
                 id: id.into(),
                 op: RecordOp::Upsert,
                 instance_id: "inst-1".into(),
                 title: id.into(),
                 created_position: pos,
                 forked_from: None,
+                forked_from_entry: None,
             };
             store
                 .append_record(LIBRARY_SCOPE, "chat", &serde_json::to_string(&c).unwrap())
@@ -819,6 +1284,8 @@ mod tests {
         );
 
         lib.apply_instance(InstanceRecord {
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: "inst-u".into(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Using,
@@ -842,6 +1309,8 @@ mod tests {
             ("inst-z", "proj-2"),
         ] {
             lib.apply_instance(InstanceRecord {
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
                 id: iid.into(),
                 op: RecordOp::Upsert,
                 kind: InstanceKind::Using,
@@ -858,12 +1327,15 @@ mod tests {
             ("chat-other", "inst-z", 7), // proj-2 — must not appear in proj-1's rollup
         ] {
             lib.apply_chat(ChatRecord {
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
                 id: id.into(),
                 op: RecordOp::Upsert,
                 instance_id: iid.into(),
                 title: id.into(),
                 created_position: pos,
                 forked_from: None,
+                forked_from_entry: None,
             });
         }
         let ids: Vec<&str> = lib

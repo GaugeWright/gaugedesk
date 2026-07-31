@@ -16,6 +16,8 @@
 //! integration under test. A forged crossing (signed under the wrong key) is
 //! denied even though it crosses the broker fine.
 
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -27,13 +29,17 @@ use tower::ServiceExt;
 
 use gaugewright_app::federation::Federation;
 use gaugewright_app::open_control_plane;
-use gaugewright_app::Workbench;
+use gaugewright_app::{resource_store, LockUnpoisoned, SharedWorkbench, Workbench};
+use gaugewright_core::abac::ResourceAttributes;
+use gaugewright_core::boundary::Authority;
 use gaugewright_core::ids::AuthorityId;
+use gaugewright_core::resource::{ContentLocator, Resource, ResourceId, ResourceRecord};
 use gaugewright_store::Store;
+use gaugewright_workspace::Instance;
 
 /// Build a mounted control plane for `authority`, federating through `broker`, with
 /// its key/TLS material persisted under a fresh temp root.
-fn instance(authority: &str, broker: &str) -> (Router, tempfile::TempDir) {
+fn instance(authority: &str, broker: &str) -> (Router, tempfile::TempDir, SharedWorkbench) {
     let root = tempfile::tempdir().unwrap();
     let fed =
         Federation::open(AuthorityId::new(authority), root.path(), broker.to_string()).unwrap();
@@ -41,14 +47,41 @@ fn instance(authority: &str, broker: &str) -> (Router, tempfile::TempDir) {
         .with_authority(AuthorityId::new(authority))
         .with_root(root.path())
         .with_federation(fed);
-    (open_control_plane(Arc::new(Mutex::new(wb))), root)
+    let shared = Arc::new(Mutex::new(wb));
+    (open_control_plane(Arc::clone(&shared)), root, shared)
+}
+
+/// A federated control plane with a real work target for lifecycle tests that
+/// need to create and address a concrete chat resource.
+fn workspace_instance(
+    authority: &str,
+    broker: &str,
+) -> (Router, tempfile::TempDir, SharedWorkbench) {
+    let root = tempfile::tempdir().unwrap();
+    let target = Instance::init(root.path().join("repo"), root.path().join("wt")).unwrap();
+    let fed =
+        Federation::open(AuthorityId::new(authority), root.path(), broker.to_string()).unwrap();
+    let wb = Workbench::with_target("inst-test", target, Store::open_in_memory().unwrap())
+        .with_authority(AuthorityId::new(authority))
+        .with_root(root.path())
+        .with_federation(fed);
+    let shared = Arc::new(Mutex::new(wb));
+    (open_control_plane(Arc::clone(&shared)), root, shared)
 }
 
 async fn post(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
     let req = Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/json")
+        .header(
+            "idempotency-key",
+            format!(
+                "federation-test-{}",
+                NEXT_KEY.fetch_add(1, Ordering::Relaxed)
+            ),
+        )
         .body(Body::from(body.to_string()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -75,12 +108,42 @@ async fn get(app: &Router, uri: &str) -> (StatusCode, Value) {
     )
 }
 
-/// Start a rendezvous broker on an ephemeral port; return its address.
-async fn start_broker() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    tokio::spawn(gaugewright_app::fed_harness::broker_accept_loop(listener));
-    addr
+async fn delete(app: &Router, uri: &str) -> (StatusCode, Value) {
+    static NEXT_KEY: AtomicU64 = AtomicU64::new(10_000);
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header(
+            "idempotency-key",
+            format!(
+                "federation-delete-test-{}",
+                NEXT_KEY.fetch_add(1, Ordering::Relaxed)
+            ),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Start a hermetic WSS relay on an ephemeral port, or use the explicit live
+/// endpoint. The guard keeps the local listener alive for the test.
+async fn start_broker() -> (
+    String,
+    Option<gaugewright_relay_transport::test_relay::TestRelay>,
+) {
+    if let Ok(endpoint) = std::env::var("GAUGEWRIGHT_LIVE_RELAY_ENDPOINT") {
+        return (endpoint, None);
+    }
+    let relay = gaugewright_relay_transport::test_relay::TestRelay::bind()
+        .await
+        .unwrap();
+    (relay.endpoint().to_owned(), Some(relay))
 }
 
 /// Pair two instances both ways (each accepts the other's ticket). Returns nothing
@@ -95,10 +158,44 @@ async fn pair(a: &Router, b: &Router) {
 }
 
 #[tokio::test]
+async fn revoking_a_peer_over_http_blocks_future_work_and_keeps_the_audit_record() {
+    let (broker, _relay) = start_broker().await;
+    let (alice, _ra, _alice_wb) = instance("alice", &broker);
+    let (bob, _rb, _bob_wb) = instance("bob", &broker);
+    pair(&alice, &bob).await;
+
+    let (status, body) = delete(&alice, "/federation/peers/bob").await;
+    assert_eq!(status, StatusCode::OK, "revoke response: {body}");
+    assert_eq!(body["authority"], "bob");
+    assert_eq!(body["active"], false);
+
+    let (_, peers) = get(&alice, "/federation/peers").await;
+    assert_eq!(peers["peers"][0]["authority"], "bob");
+    assert_eq!(peers["peers"][0]["active"], false);
+
+    let (refused, refusal) = post(
+        &alice,
+        "/federation/run/place",
+        json!({
+            "peer": "bob",
+            "project": "p1",
+            "archetype": "analyst",
+            "data_handle": "data-1",
+            "prompt": "must not run"
+        }),
+    )
+    .await;
+    assert_eq!(refused, StatusCode::BAD_REQUEST, "refusal: {refusal}");
+
+    let (missing, _) = delete(&alice, "/federation/peers/unknown").await;
+    assert_eq!(missing, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn two_authorities_pair_and_a_handle_crosses_and_admits_on_the_peer() {
-    let broker = start_broker().await;
-    let (alice, _ra) = instance("alice", &broker);
-    let (bob, _rb) = instance("bob", &broker);
+    let (broker, _relay) = start_broker().await;
+    let (alice, _ra, _alice_wb) = instance("alice", &broker);
+    let (bob, _rb, _bob_wb) = instance("bob", &broker);
 
     pair(&alice, &bob).await;
 
@@ -142,9 +239,9 @@ async fn owner_places_a_remote_run_and_admits_the_peers_observations() {
     // The peer runs a real WhippleScript turn unless told to mock (FED-4); this
     // hermetic test uses the mock-LLM path (no model/OAuth), like the e2e suite.
     std::env::set_var("GAUGEWRIGHT_FAKE_AGENT", "1");
-    let broker = start_broker().await;
-    let (alice, _ra) = instance("alice", &broker);
-    let (bob, _rb) = instance("bob", &broker);
+    let (broker, _relay) = start_broker().await;
+    let (alice, _ra, _alice_wb) = instance("alice", &broker);
+    let (bob, _rb, _bob_wb) = instance("bob", &broker);
 
     pair(&alice, &bob).await;
     // Let bob's runtime receiver park on the broker for alice→bob.
@@ -173,29 +270,47 @@ async fn owner_places_a_remote_run_and_admits_the_peers_observations() {
 
 #[tokio::test]
 async fn shared_output_releases_only_after_the_remote_stakeholder_consents() {
-    let broker = start_broker().await;
-    let (alice, _ra) = instance("alice", &broker);
-    let (bob, _rb) = instance("bob", &broker);
+    let (broker, _relay) = start_broker().await;
+    let (alice, _ra, alice_wb) = workspace_instance("alice", &broker);
+    let (bob, _rb, _bob_wb) = instance("bob", &broker);
 
     pair(&alice, &bob).await;
     // Let alice's consent receiver park on the broker for bob→alice.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // alice hosts a review of an output owned by {alice, bob}: both must consent.
-    let scope = "review-out-1";
-    let (st, _) = post(
-        &alice,
-        &format!("/scopes/{scope}/review/command"),
-        json!({ "Propose": { "required": ["alice", "bob"] } }),
-    )
-    .await;
+    let (created, response) = post(&alice, "/chats", json!({ "id": "shared" })).await;
+    assert_eq!(
+        created,
+        StatusCode::CREATED,
+        "create chat response: {response}"
+    );
+
+    // Alice hosts a concrete output owned by {alice, bob}; the product proposal
+    // route derives both required consenters from that authoritative resource.
+    {
+        let mut guard = alice_wb.lock_unpoisoned();
+        let id = ResourceId::new("out-1");
+        let record = ResourceRecord {
+            resource: Resource::derived(id.clone(), Authority::from("alice"), BTreeSet::new()),
+            stakeholders: BTreeSet::from([Authority::from("alice"), Authority::from("bob")]),
+            locator: ContentLocator::Workspace {
+                path: "shared.txt".into(),
+                commit: "fixture".into(),
+            },
+            tombstoned: false,
+            attributes: ResourceAttributes::default(),
+        };
+        resource_store::put(guard.store_mut(), "shared", &record).unwrap();
+    }
+    let scope = resource_store::review_scope("shared", &ResourceId::new("out-1"));
+    let (st, _) = post(&alice, "/chats/shared/resources/out-1/review", json!({})).await;
     assert_eq!(st, StatusCode::OK);
 
     // alice consents locally.
     let (_, after_alice) = post(
         &alice,
-        &format!("/scopes/{scope}/review/command"),
-        json!({ "Consent": "alice" }),
+        "/chats/shared/resources/out-1/review/command",
+        json!({ "action": "consent" }),
     )
     .await;
     assert_eq!(
@@ -206,8 +321,8 @@ async fn shared_output_releases_only_after_the_remote_stakeholder_consents() {
     // alice cannot release alone — conjunctive consent blocks it (INV-16).
     let (blocked, _) = post(
         &alice,
-        &format!("/scopes/{scope}/review/command"),
-        json!("Release"),
+        "/chats/shared/resources/out-1/review/command",
+        json!({ "action": "release" }),
     )
     .await;
     assert_eq!(
@@ -236,8 +351,8 @@ async fn shared_output_releases_only_after_the_remote_stakeholder_consents() {
     // Now alice can release.
     let (released, rel) = post(
         &alice,
-        &format!("/scopes/{scope}/review/command"),
-        json!("Release"),
+        "/chats/shared/resources/out-1/review/command",
+        json!({ "action": "release" }),
     )
     .await;
     assert_eq!(released, StatusCode::OK);
@@ -246,9 +361,9 @@ async fn shared_output_releases_only_after_the_remote_stakeholder_consents() {
 
 #[tokio::test]
 async fn a_revoked_device_subkey_can_no_longer_cross() {
-    let broker = start_broker().await;
-    let (alice, _ra) = instance("alice", &broker);
-    let (bob, _rb) = instance("bob", &broker);
+    let (broker, _relay) = start_broker().await;
+    let (alice, _ra, _alice_wb) = instance("alice", &broker);
+    let (bob, _rb, _bob_wb) = instance("bob", &broker);
 
     pair(&alice, &bob).await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -296,9 +411,9 @@ async fn a_revoked_device_subkey_can_no_longer_cross() {
 
 #[tokio::test]
 async fn a_recovery_code_restores_the_root_identity() {
-    let broker = start_broker().await;
-    let (alice, _ra) = instance("alice", &broker);
-    let (bob, _rb) = instance("bob", &broker);
+    let (broker, _relay) = start_broker().await;
+    let (alice, _ra, _alice_wb) = instance("alice", &broker);
+    let (bob, _rb, _bob_wb) = instance("bob", &broker);
 
     // bob's recovery code + bob's original governance pubkey.
     let (_, bob_code) = post(&bob, "/federation/recovery-code", json!({})).await;
@@ -339,8 +454,8 @@ async fn a_recovery_code_restores_the_root_identity() {
 
 #[tokio::test]
 async fn crossing_to_an_unpaired_peer_is_refused() {
-    let broker = start_broker().await;
-    let (alice, _ra) = instance("alice", &broker);
+    let (broker, _relay) = start_broker().await;
+    let (alice, _ra, _alice_wb) = instance("alice", &broker);
     // No pairing performed: alice has no grant/cert for "bob".
     let (status, _) = post(
         &alice,

@@ -9,3 +9,10 @@ Feature: Your account (ACCT-1)
     When I open my account
     And I link the "openai" account with token "sk-test-secret"
     Then "openai" shows as a linked account
+
+  @transport @authenticated
+  Scenario: configure the local managed-inference plan through the shipped Account client
+    Given the workbench is open
+    When I open my account
+    And I configure managed inference plan "wiring-managed" as "active" with 250000 included tokens
+    Then the managed inference plan "wiring-managed" is durably "active" with 250000 included tokens

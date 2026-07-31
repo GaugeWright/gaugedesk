@@ -13,7 +13,8 @@ Feature: Round 10 — honest improve-chat vocabulary, a legible status, clearer 
 
   Scenario: an improve chat's keep button speaks method terms, not project terms
     Given the workbench is open
-    When I create an edit chat under the archetype "assistant"
+    When I create an edit chat under the archetype "Default"
+    And I request review for the next change
     And I task the agent with "make a change"
     And I open the "diff" tab
     Then I see the button "save to the archetype"
@@ -21,7 +22,8 @@ Feature: Round 10 — honest improve-chat vocabulary, a legible status, clearer 
 
   Scenario: a work chat's keep button still reads "keep this work"
     Given a new engagement
-    When I task the agent with "make a change"
+    When I request review for the next change
+    And I task the agent with "make a change"
     And I open the "diff" tab
     Then I see the button "keep this work"
 
@@ -30,10 +32,10 @@ Feature: Round 10 — honest improve-chat vocabulary, a legible status, clearer 
     Then the chat status badge reads "Ready"
     And the status badge text is at least 12px
 
-  Scenario: the changes header disambiguates the hidden-config disclosure
+  Scenario: the changes header has no hidden runtime-config disclosure
     Given a new engagement
-    When I task the agent with "make a change"
+    When I request review for the next change
+    And I task the agent with "make a change"
     Then the run phase is "Completed"
     When I open the "diff" tab
-    Then the internal-file toggle does not read like a changed-file count
-    And the internal-file toggle reveals the hidden config files
+    Then the review offers no internal-file toggle

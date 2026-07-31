@@ -25,7 +25,7 @@ pub mod protocol;
 /// The seam types live in `gaugewright-harness` (SUB-0); re-exported here at
 /// their pre-extraction paths so existing callers keep compiling unchanged.
 pub use gaugewright_harness::{
-    sandbox, AllowAllGate, EgressGate, GateDecision, Harness, HumanPrompt, Observation,
+    sandbox, AllowAllGate, EgressGate, GateDecision, Harness, ModelUsage, Observation,
     RemoteHarness, ToolInfo, TurnOutcome,
 };
 use gaugewright_harness::{
@@ -1356,8 +1356,10 @@ mod tests {
                 provider_binding_ref: None,
                 credential_ref: None,
                 placement_ceiling_ref: None,
+                runtime_placement_id: None,
                 provider: Some("openai-codex".into()),
                 model: Some("gpt-5.5".into()),
+                base_url: None,
                 thinking: Some("low".into()),
                 system_prompt: None,
                 credential_capability: None,
@@ -1370,6 +1372,8 @@ mod tests {
                         "auth.openai.com".into(),
                     ])
                     .allow_unfiltered_egress(true),
+                // The Pi adapter carries no `ask` tool, so it offers no roster.
+                roster: Vec::new(),
             };
             let pc = pi_config_from(
                 &spec,
@@ -1458,15 +1462,18 @@ mod tests {
                 provider_binding_ref: None,
                 credential_ref: None,
                 placement_ceiling_ref: None,
+                runtime_placement_id: None,
                 // AM-9: the federation peer path keeps provider/model unset so
                 // Pi's own default resolution (the authed OAuth provider) holds.
                 provider: None,
                 model: None,
+                base_url: None,
                 thinking: None,
                 system_prompt: Some("EDITOR PERSONA".into()),
                 credential_capability: None,
                 credentials: vec![],
                 sandbox: sandbox::SandboxPolicy::new(vec![wt.clone()]),
+                roster: Vec::new(),
             };
             let pc = pi_config_from(&spec, None, None, None);
 

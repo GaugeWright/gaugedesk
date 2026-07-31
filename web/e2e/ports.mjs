@@ -3,7 +3,7 @@
  *
  * Every port the suite uses — the two open control planes, the enterprise control plane,
  * the rendezvous broker, and the Vite previews the browser loads (the workbench plus the
- * standalone admin-console app) — is read from the environment so that
+ * enterprise workbench composition) — is read from the environment so that
  * **two runs never collide**
  * (a second worktree / a parallel agent picks a disjoint set). `e2e/run.mjs` resolves a free
  * set once per run and exports these vars to every child (vite build, bddgen, playwright);
@@ -13,6 +13,13 @@
  * Derived values (CP base URLs, the preview origin, per-run state dirs) live here too, so the
  * playwright config, the step files, and vite all agree by construction.
  */
+
+// State dirs go under the OS temp dir, not a hardcoded /tmp: on some
+// machines /tmp is a RAM-backed tmpfs, and these dirs are keyed by a
+// per-run port, so every run mints new ones and they accumulate (530 had
+// piled up before this). Honoring TMPDIR lets them land on disk, where
+// ordinary temp reaping can reclaim them.
+import os from "node:os";
 
 const num = (name, dflt) => {
     const v = process.env[name];
@@ -26,22 +33,22 @@ export const ports = {
     broker: num("GW_E2E_BROKER", 7900),
     preview: num("GW_E2E_PREVIEW", 4173),
     // The self-hosted enterprise composition (`gaugewright-enterprise-server`, ee/):
-    // the /admin/* + SSO surface WITHOUT the managed planes — what the standalone
-    // admin-console app drives (enterprise coverage must not require private code).
+    // the /admin/* + SSO surface WITHOUT the managed planes — what the combined
+    // enterprise workbench drives (enterprise coverage must not require private code).
     enterprise: num("GW_E2E_ENTERPRISE", 7882),
-    // Static preview of the standalone enterprise admin-console bundle (ee/web).
-    adminApp: num("GW_E2E_ADMIN_APP", 4174),
+    // Static preview of the combined enterprise workbench bundle (ee/web).
+    enterpriseApp: num("GW_E2E_ENTERPRISE_APP", 4174),
 };
 
 export const aliceCP = `http://127.0.0.1:${ports.alice}`;
 export const bobCP = `http://127.0.0.1:${ports.bob}`;
-export const brokerAddr = `127.0.0.1:${ports.broker}`;
+export const brokerAddr = `ws://127.0.0.1:${ports.broker}`;
 export const previewURL = `http://127.0.0.1:${ports.preview}`;
 export const enterpriseCP = `http://127.0.0.1:${ports.enterprise}`;
-/** The standalone enterprise admin-console app (ee/web's built bundle, served whole-dist). */
-export const adminAppURL = `http://127.0.0.1:${ports.adminApp}/apps/admin-console/`;
+/** The combined enterprise workbench (ee/web's built bundle, served whole-dist). */
+export const enterpriseAppURL = `http://127.0.0.1:${ports.enterpriseApp}/apps/enterprise-workbench/`;
 
 /** Per-run control-plane state dirs (keyed by port so concurrent runs don't share state). */
-export const aliceState = `/tmp/gw-e2e-state-${ports.alice}`;
-export const bobState = `/tmp/gw-e2e-state-${ports.bob}`;
-export const enterpriseState = `/tmp/gw-e2e-state-${ports.enterprise}`;
+export const aliceState = `${os.tmpdir()}/gw-e2e-state-${ports.alice}`;
+export const bobState = `${os.tmpdir()}/gw-e2e-state-${ports.bob}`;
+export const enterpriseState = `${os.tmpdir()}/gw-e2e-state-${ports.enterprise}`;

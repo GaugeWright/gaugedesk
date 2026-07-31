@@ -1,15 +1,13 @@
-//! The organization admin surface (`ORG-1`, B10/B11): org settings + the member
-//! directory. CRUD here writes durable `org`-scope records (latest-wins / tombstone)
-//! and pushes a workspace-change reference so connected clients refresh live — the
-//! same record discipline as [`library_routes`](gaugewright_app::library_routes). The org/membership
-//! projection is folded **on demand** from the log per request (`INV-5`); the
-//! directory is small and these routes are low-frequency, so no hot-path projection
-//! is held on the `Workbench`.
+//! Enterprise governance projections and external protocol routes (`ORG-1`,
+//! B10/B11). Administration reads fold the tenant's records on demand (`INV-5`).
+//! Durable human management writes are deliberately absent from `/admin/*`: they
+//! enter through [`crate::environment_routes`], which binds the authenticated actor,
+//! exact tenant scope, capability, document base, idempotency key, and review.
+//! SCIM remains a separate external-actor protocol. Verified-domain JIT admission
+//! happens inside the authenticated OIDC callback and has no public mutation route.
 //!
-//! These routes are **ungated** today (like the rest of the single-authority app);
-//! `RBAC-5` wires the actor's role gate (owner/admin may administer) onto them.
-//! The one invariant enforced here regardless is structural: an org always retains
-//! at least one active `owner` (the break-glass account, `ID-5`).
+//! All projections are capability-gated. The structural break-glass invariant still
+//! requires at least one active owner (`ID-5`).
 
 use axum::routing::{get, patch, post};
 use axum::{
@@ -27,7 +25,7 @@ use gaugewright_core::rbac::Capability;
 use gaugewright_app::org::{
     is_valid_role, ArchetypeApprovalPolicyRecord, BillingRecord, GroupMappingRecord,
     MemberGrantRecord, MembershipRecord, MembershipStatus, Org, OrgRecord, PolicyRecord, RecordOp,
-    SecurityPolicyRecord, SsoConnectionRecord, ORG_ID,
+    SecurityPolicyRecord, SoftwarePolicyRecord, SsoConnectionRecord, ORG_ID,
 };
 use gaugewright_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 
@@ -53,14 +51,25 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
     };
     Router::new()
         .merge(gaugewright_app::local_routes::routes(federation_on))
+        .merge(gaugewright_app::home_routes::routes())
         .merge(routes())
         .merge(gaugewright_app::account_routes::routes())
+        .merge(gaugewright_app::facility_routes::routes())
+        .merge(gaugewright_app::mobile_machine_session::routes())
+        // Materialize non-environment mutation idempotency inside the
+        // enterprise identity boundary. An anonymous mutation must fail as
+        // unauthenticated before request-shape or idempotency diagnostics reveal
+        // anything about an admitted route.
+        .layer(axum::middleware::from_fn_with_state(
+            wb.clone(),
+            gaugewright_app::command_idempotency::guard,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_wb,
             enterprise_auth,
         ))
         .layer(gaugewright_app::net_http::cors_layer())
-        .with_state(wb)
+        .with_state(wb.clone())
         .layer(axum::middleware::from_fn(
             gaugewright_app::net_http::security_headers,
         ))
@@ -77,78 +86,49 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
 pub fn routes() -> Router<SharedWorkbench> {
     let enterprise_auth_state = crate::auth_oidc::EnterpriseAuthState::new();
     Router::new()
+        .merge(crate::environment_routes::routes())
+        // Capability-gated entry to the Administration Environment (`ADMIN-ENV-2`).
+        // This read is available to every authenticated active member; an incapable
+        // role receives an empty list rather than access to another Admin surface.
+        .route("/admin/capabilities", get(get_capabilities))
         // SP integration details (M3 ONB-1): the values an admin pastes into their IdP
         // (`/admin/integration`, console-gated) + the public SP metadata descriptor.
         .route("/admin/integration", get(get_integration))
         .route("/saml/metadata", get(get_saml_metadata))
         // SSO test-connection (M3 ONB-3): live OIDC discovery + JWKS reachability check.
         .route("/admin/sso/test", post(post_sso_test))
-        // DNS-TXT domain verification (M3 ONB-5): the proof behind auto-join/JIT.
-        .route(
-            "/admin/domains/verify-token",
-            post(post_domain_verify_token),
-        )
-        .route("/admin/domains/verify", post(post_domain_verify))
-        // Organization admin surface (M3 ORG-1, B10/B11): org settings + the member
-        // directory. Ungated today; RBAC-5 adds the role gate.
-        .route("/admin/org", get(get_org).post(post_org))
-        .route("/admin/members", get(get_members).post(post_member))
-        .route("/admin/sessions", get(get_sessions))
         // Per-actor audit timeline (M3 B14 / AUD-1, AUD-2): filterable + CSV export.
         .route("/admin/audit", get(get_audit_log))
-        .route("/admin/audit/verify", get(get_audit_verify))
-        // Domain-capture auto-join (M3 ID-6): verified-domain email -> active member.
-        .route("/admin/members/auto-join", post(post_auto_join))
-        // Member->project scope grants (ENTSEC-2 / ADR 0065): how a scoped member (a consultant)
-        // is given access to their engagement's project. ManageMembers to write; console-read to
-        // list. Owner/admin bypass scoping, so they need no grant.
-        .route(
-            "/admin/grants",
-            get(get_grants).post(post_grant).delete(delete_grant),
-        )
-        .route("/admin/members/:id/role", post(post_member_role))
-        .route(
-            "/admin/members/:id/deactivate",
-            post(post_member_deactivate),
-        )
-        // Org resource-floor policy (M3 RBAC-6, B15): the per-org Policy the export
-        // gate reads. Read needs console access; write needs ConfigureSecurity.
-        .route("/admin/policy", get(get_policy).post(post_policy))
-        // Placement policy (DEPLOY-2): admissible (operator, attested) deployment modes for
-        // engagements touching this org's data. Read needs console access; write needs
-        // ConfigureSecurity. The pairing gate (DEPLOY-3) consults it at the client's accept.
-        .route(
-            "/admin/placement-policy",
-            get(get_placement_policy).post(post_placement_policy),
-        )
-        // SSO connection (M3 B12 / ID-5): which IdP, and the enforce-SSO flag.
-        .route("/admin/sso", get(get_sso).post(post_sso))
+        // Client/session compatibility floor (`ITGOV-4`). This exact route is
+        // an authenticated recovery surface when the caller itself is blocked.
+        .route("/admin/software-policy", get(get_software_policy))
+        // Enrolled members must evaluate the tenant placement floor before pairing.
+        // This is not an Administration projection: it is a client enforcement input.
+        .route("/admin/placement-policy", get(get_placement_policy))
         // OIDC auth-code + PKCE login shell (M3 ID-3): `/auth/login` redirects the
         // browser to the configured IdP; `/auth/callback` redeems the code and hands
         // back the verified id-token (the bearer the admin routes accept).
         .route("/auth/login", get(crate::auth_oidc::get_login))
         .route("/auth/callback", get(crate::auth_oidc::get_callback))
+        // Safe current-session projection for the Account menu. This is not a
+        // linked-method or recovery/custody declaration.
+        .route("/auth/session", get(crate::auth_oidc::get_session))
         // Session refresh (ADR 0077): a still-valid session mints a fresh id-token cookie from the
         // stored refresh token, so a hosted session outlives the ~1h id-token without re-login.
         .route("/auth/refresh", get(crate::auth_oidc::get_refresh))
-        // Security policy (M3 B15 / SEC-1/2/3): MFA, session, residency default.
-        .route("/admin/security", get(get_security).post(post_security))
-        // Archetype-approval policy (ADR 0063): the org default for whether adding an
-        // archetype to a project requires owner approval (pending) or is frictionless.
         .route(
-            "/admin/archetype-approval",
-            get(get_archetype_approval).post(post_archetype_approval),
+            "/auth/mobile/refresh",
+            post(crate::auth_oidc::post_mobile_refresh),
         )
-        // Billing & seats (M3 B16 / BILL-1/3): operational only, never authority.
-        .route("/admin/billing", get(get_billing).post(post_billing))
-        // SCIM provisioning (M3 B13): admin issues/rotates the SCIM token; the IdP
-        // drives the token-authenticated SCIM Users endpoints.
         .route(
-            "/admin/scim/token",
-            post(crate::scim_routes::post_scim_token),
+            "/auth/mobile/exchange",
+            post(crate::auth_oidc::post_mobile_exchange),
         )
-        // SCIM group -> role/team mapping (M3 SCIM-3).
-        .route("/admin/scim/group-mapping", post(post_group_mapping))
+        // Sign-out expires the shared HttpOnly account cookie. It remains reachable with an
+        // expired/absent session so logout is always a successful, idempotent cleanup.
+        .route("/auth/logout", post(crate::auth_oidc::post_logout))
+        // SCIM provisioning is an external protocol actor. Administration issues
+        // its token and group mappings only through the shared Environment command path.
         .route("/scim/v2/Users", post(crate::scim_routes::post_scim_user))
         .route(
             "/scim/v2/Users/:id",
@@ -163,6 +143,51 @@ fn op_str(op: RecordOp) -> &'static str {
     match op {
         RecordOp::Upsert => "upsert",
         RecordOp::Tombstone => "tombstone",
+    }
+}
+
+async fn get_capabilities(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let result = wb
+        .lock_unpoisoned()
+        .admin_capabilities(bearer(&headers), &req_scope(&headers));
+    match result {
+        Ok(capabilities) => {
+            let capabilities = capabilities
+                .into_iter()
+                .map(Capability::as_str)
+                .collect::<Vec<_>>();
+            let mut agent_tools = Vec::new();
+            if !capabilities.is_empty() {
+                agent_tools.extend([
+                    "admin.files.list",
+                    "admin.files.read",
+                    "admin.changes.propose",
+                    "question.ask",
+                ]);
+                if capabilities
+                    .iter()
+                    .any(|capability| *capability != Capability::ManageBilling.as_str())
+                {
+                    agent_tools.insert(2, "admin.homes.query");
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "capabilities": capabilities,
+                    "agent": {
+                        "message_attachments": false,
+                        "additional_tools": false,
+                        "tools": agent_tools
+                    }
+                })),
+            )
+                .into_response()
+        }
+        Err((status, message)) => (status, Json(json!({ "error": message }))).into_response(),
     }
 }
 
@@ -191,6 +216,23 @@ fn entsec_exempt(path: &str) -> bool {
         || path.starts_with("/scim/")
         || path.starts_with("/saml/")
         || path.starts_with("/federation/")
+        // Ordinary Home invitation acceptance authenticates the account itself,
+        // then atomically creates membership. It cannot require that membership
+        // in this outer layer before its own authority-bound capability check.
+        || path == "/home/invitations/accept"
+        // Tenant invitations are account-owned metadata pointers. Their own
+        // handlers authenticate the current person then atomically activate an
+        // exact matching membership; requiring active membership here would make
+        // an invitation impossible to accept.
+        || path == "/account/invitations"
+        || path.starts_with("/account/invitations/")
+        // ADR 0109 pre-auth controller ceremony. Each route owns a one-use
+        // invitation/challenge/credential proof and grants no account/admin API.
+        || path == "/mobile/enrollment/claim"
+        || path == "/mobile/enrollment/prove"
+        || path == "/mobile/enrollment/status"
+        || path == "/mobile/sessions/challenge"
+        || path == "/mobile/sessions"
         || path.starts_with("/test/")
 }
 
@@ -207,9 +249,41 @@ pub async fn enterprise_auth(
     if req.method() == axum::http::Method::OPTIONS || entsec_exempt(req.uri().path()) {
         return next.run(req).await;
     }
+    let request_path = req.uri().path();
+    if !request_path.starts_with("/admin/")
+        && !request_path.starts_with("/account/")
+        && !request_path.starts_with("/auth/")
+        && !request_path.starts_with("/mobile/")
+    {
+        if let Some(session) = gaugewright_app::mobile_machine_session::session_token(req.headers())
+        {
+            let grant = {
+                let mut guard = wb.lock_unpoisoned();
+                gaugewright_app::mobile_machine_session::authorize_session(&mut guard, session)
+            };
+            if let Some(grant) = grant {
+                req.extensions_mut()
+                    .insert(gaugewright_app::identity::AuthenticatedActor(
+                        gaugewright_core::ids::AuthorityId::new(grant.device.as_str()),
+                    ));
+                return next.run(req).await;
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Machine controller session is expired or revoked" })),
+            )
+                .into_response();
+        }
+    }
     let bearer = bearer(req.headers());
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+    let client = gaugewright_app::client_admission::ClientBuild::from_headers(req.headers());
+    let org_scope = req_scope(req.headers());
+    // Every active member must retain this authenticated recovery path so the
+    // desktop updater can discover the policy that blocked its current build.
+    // Tenant membership admission above is the complete authority check.
+    let enforce_software = path != "/admin/software-policy";
     {
         let mut guard = wb.lock_unpoisoned();
         // ENTSEC-1 + ENTSEC-2 + SECAUD-7: one fold-once admission — authenticate the bearer,
@@ -218,7 +292,13 @@ pub async fn enterprise_auth(
         // resolved actor so the audit record below reuses it (no re-authenticate). Folding the
         // org twice opened a TOCTOU window between membership and scope (CC6.1).
         let project = guard.scope_project_of_path(&path);
-        let actor = match guard.admit_data_request(bearer, project.as_deref()) {
+        let actor = match guard.admit_data_request_with_client(
+            bearer,
+            project.as_deref(),
+            &org_scope,
+            client,
+            enforce_software,
+        ) {
             Ok(actor) => actor,
             Err((code, msg)) => return (code, Json(json!({ "error": msg }))).into_response(),
         };
@@ -233,7 +313,13 @@ pub async fn enterprise_auth(
         let mutating = method != axum::http::Method::GET;
         let sensitive_read = !mutating && project.is_some() && guard.audits_reads();
         if guard.has_idp() && !is_admin && (mutating || sensitive_read) {
-            gaugewright_app::audit::record(&mut guard, &actor, &format!("{method} {path}"), &path);
+            gaugewright_app::audit::record_in(
+                &mut guard,
+                &org_scope,
+                &actor,
+                &format!("{method} {path}"),
+                &path,
+            );
         }
         req.extensions_mut()
             .insert(gaugewright_app::identity::AuthenticatedActor(actor.into()));
@@ -574,10 +660,10 @@ pub async fn delete_grant(
 
 #[derive(Deserialize)]
 pub struct GroupMappingBody {
-    group: String,
-    role: String,
+    pub(crate) group: String,
+    pub(crate) role: String,
     #[serde(default)]
-    team: Option<String>,
+    pub(crate) team: Option<String>,
 }
 
 /// Configure an IdP-group → workspace-role (and optional team) mapping (`SCIM-3`).
@@ -636,8 +722,9 @@ pub async fn get_audit_log(
     if let Some(resp) = deny(&wb, &headers, Some(Capability::ViewAudit)) {
         return resp;
     }
+    let store_scope = req_scope(&headers);
     let entries: Vec<gaugewright_app::audit::AuditEntry> =
-        gaugewright_app::audit::list(wb.store_ref())
+        gaugewright_app::audit::list_in(wb.store_ref(), &store_scope)
             .into_iter()
             .filter(|e| q.actor.as_ref().is_none_or(|a| &e.actor == a))
             .filter(|e| q.action.as_ref().is_none_or(|a| &e.action == a))
@@ -652,7 +739,7 @@ pub async fn get_audit_log(
     } else {
         // AUD-3: publish the minimum-retention guarantee alongside the timeline. The log is
         // append-only/forever (`INV-6`); this is the contractual floor surfaced to the buyer.
-        let retention_min_days = Org::rebuild_in(wb.store_ref(), &req_scope(&headers))
+        let retention_min_days = Org::rebuild_in(wb.store_ref(), &store_scope)
             .map(|o| o.audit_retention_min_days())
             .unwrap_or(gaugewright_app::org::DEFAULT_AUDIT_RETENTION_MIN_DAYS);
         (
@@ -681,8 +768,9 @@ pub async fn get_audit_verify(
     let pubkey = wb.governance_public_key();
     (
         StatusCode::OK,
-        Json(gaugewright_app::audit::verify(
+        Json(gaugewright_app::audit::verify_in(
             wb.store_ref(),
+            &req_scope(&headers),
             Some(&pubkey),
         )),
     )
@@ -794,9 +882,9 @@ pub async fn get_placement_policy(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    if let Some(resp) = deny(&wb, &headers, None) {
-        return resp;
-    }
+    // The composed enterprise layer has already admitted an active tenant
+    // member. This read is intentionally not console-only: the enrolled client
+    // must fetch the tenant floor before it accepts a pairing (DEPLOY-4).
     match Org::rebuild_in(wb.store_ref(), &req_scope(&headers)) {
         Ok(org) => (
             StatusCode::OK,
@@ -836,6 +924,74 @@ pub async fn post_placement_policy(
         .into_response()
 }
 
+// ---- client software admission (ITGOV-4 / ADR 0095) ---------------------
+
+fn write_software_policy(wb: &mut Workbench, scope: &str, r: &SoftwarePolicyRecord) {
+    let op = op_str(r.op);
+    let _ =
+        wb.store_mut()
+            .append_record(scope, "software_policy", &serde_json::to_string(r).unwrap());
+    wb.notify_library_changed("software_policy", &r.id, op);
+}
+
+pub async fn get_software_policy(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    // The composed enterprise layer has already admitted an active member and
+    // deliberately skipped compatibility blocking for this recovery route. Do
+    // not reclassify the read as console-only here: ordinary members need it to
+    // discover the release channel that repairs their blocked client.
+    match Org::rebuild_in(wb.store_ref(), &req_scope(&headers)) {
+        Ok(org) => (
+            StatusCode::OK,
+            Json(json!({ "software_policy": org.software_policy.unwrap_or_default() })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
+    }
+}
+
+pub async fn post_software_policy(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Json(mut policy): Json<gaugewright_app::client_admission::SoftwarePolicy>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    if let Some(resp) = deny(&wb, &headers, Some(Capability::ConfigureSecurity)) {
+        return resp;
+    }
+    policy.minimum_version = policy.minimum_version.trim().to_string();
+    policy.allowed_channels = policy
+        .allowed_channels
+        .into_iter()
+        .map(|channel| channel.trim().to_ascii_lowercase())
+        .filter(|channel| !channel.is_empty())
+        .collect();
+    policy.allowed_channels.sort();
+    policy.allowed_channels.dedup();
+    if policy.grace_until_unix_ms == Some(0) {
+        policy.grace_until_unix_ms = None;
+    }
+    if let Err(message) = policy.validate() {
+        return unprocessable(&message);
+    }
+    let record = SoftwarePolicyRecord {
+        id: ORG_ID.to_string(),
+        op: RecordOp::Upsert,
+        policy,
+    };
+    write_software_policy(&mut wb, &req_scope(&headers), &record);
+    let actor = wb.actor(bearer(&headers));
+    gaugewright_app::audit::record(&mut wb, &actor, "software_policy.update", "software_policy");
+    (
+        StatusCode::OK,
+        Json(json!({ "software_policy": record.policy })),
+    )
+        .into_response()
+}
+
 // ---- billing & seats (B16 / BILL-1, BILL-3) ------------------------------
 
 fn write_billing(wb: &mut Workbench, scope: &str, r: &BillingRecord) {
@@ -855,11 +1011,26 @@ pub async fn get_billing(
         return resp;
     }
     match Org::rebuild_in(wb.store_ref(), &req_scope(&headers)) {
-        Ok(org) => (
-            StatusCode::OK,
-            Json(json!({ "billing": org.billing, "seats_used": org.seats_used() })),
-        )
-            .into_response(),
+        Ok(org) => {
+            let scope = req_scope(&headers);
+            let included = org
+                .billing
+                .as_ref()
+                .and_then(|billing| billing.managed_inference.as_ref())
+                .map_or(0, |plan| plan.included_tokens);
+            match gaugewright_app::managed_inference::fold_usage(wb.store_ref(), &scope, included) {
+                Ok(usage) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "billing": org.billing,
+                        "seats_used": org.seats_used(),
+                        "managed_usage": usage,
+                    })),
+                )
+                    .into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
+            }
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
     }
 }
@@ -1024,40 +1195,13 @@ pub async fn post_sso(
     // issuer) is "saved, not activated" and the existing verifier is left **untouched**
     // — so a bad runtime edit can't lock admins out. (Startup differs: it attaches a
     // cold verifier to fail closed + self-heal, since no operator is in the loop.)
-    let sso = record.clone();
-    let built =
-        tokio::task::spawn_blocking(move || crate::auth_oidc::build_oidc_idp(Some(&sso))).await;
-    let (oidc_active, activation_error) = match built {
-        // A non-OIDC / cleared connection ⇒ deactivate OIDC verification.
-        Ok(None) => {
-            wb.lock_unpoisoned().set_identity_provider(None);
-            (false, None)
-        }
-        // A reachable OIDC connection ⇒ activate it.
-        Ok(Some((idp, true))) => {
-            wb.lock_unpoisoned().set_identity_provider(Some(idp));
-            (true, None)
-        }
-        // A cold OIDC connection ⇒ keep the existing verifier; tell the operator why.
-        Ok(Some((_idp, false))) => (
-            wb.lock_unpoisoned().has_idp(),
-            Some(
-                "OIDC discovery failed (issuer unreachable?); connection saved but not activated — \
-                 the existing verifier is unchanged"
-                    .to_string(),
-            ),
-        ),
-        Err(_) => (
-            wb.lock_unpoisoned().has_idp(),
-            Some("activation task panicked".to_string()),
-        ),
-    };
+    let activation = crate::auth_oidc::activate_updated_idp(&wb, record.clone()).await;
     (
         StatusCode::OK,
         Json(json!({
             "sso": record,
-            "oidc_active": oidc_active,
-            "activation_error": activation_error,
+            "oidc_active": activation.oidc_active,
+            "activation_error": activation.activation_error,
         })),
     )
         .into_response()
@@ -1223,7 +1367,7 @@ fn domain_challenge_token(domain: &str) -> String {
 }
 
 /// The full TXT value to publish (`gaugewright-domain-verification=<token>`).
-fn expected_txt(domain: &str) -> String {
+pub(crate) fn expected_txt(domain: &str) -> String {
     format!(
         "gaugewright-domain-verification={}",
         domain_challenge_token(domain)
@@ -1259,6 +1403,17 @@ fn doh_txt(name: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Recheck the hosted DNS proof off the async runtime immediately before an
+/// admitted domain-verification command applies.
+pub(crate) async fn domain_proof_matches(domain: &str) -> bool {
+    let domain = domain.trim().to_ascii_lowercase();
+    let name = format!("_gaugewright-challenge.{domain}");
+    let values = tokio::task::spawn_blocking(move || doh_txt(&name))
+        .await
+        .unwrap_or_default();
+    txt_matches(&values, &domain)
 }
 
 #[derive(Deserialize)]
@@ -1396,7 +1551,7 @@ mod authenticated_actor_tests {
     use gaugewright_store::Store;
     use gaugewright_workspace::Instance;
 
-    use super::{enterprise_auth, write_membership, RecordOp};
+    use super::{enterprise_auth, entsec_exempt, write_membership, RecordOp};
 
     async fn who_am_i(Extension(actor): Extension<AuthenticatedActor>) -> String {
         actor.0.as_str().to_owned()
@@ -1412,7 +1567,7 @@ mod authenticated_actor_tests {
             AuthorityAttributes::default(),
         );
         let mut workbench =
-            Workbench::with_instance("inst-test", instance, Store::open_in_memory().unwrap())
+            Workbench::with_target("inst-test", instance, Store::open_in_memory().unwrap())
                 .with_identity_provider(Arc::new(idp));
         write_membership(
             &mut workbench,
@@ -1450,5 +1605,15 @@ mod authenticated_actor_tests {
         assert!(response.status().is_success());
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"authority:alice");
+    }
+
+    #[test]
+    fn pending_tenant_invitation_routes_bypass_membership_gate_only_for_acceptance() {
+        assert!(entsec_exempt("/account/invitations"));
+        assert!(entsec_exempt(
+            "/account/invitations/organization%3Aacme/accept"
+        ));
+        assert!(!entsec_exempt("/account/tenants"));
+        assert!(!entsec_exempt("/account/invitations-extra"));
     }
 }

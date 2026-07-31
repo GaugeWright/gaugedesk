@@ -10,14 +10,20 @@
  * back — the panel lists provider names + a linked flag, never the secret.
  */
 
-import { createResource, createSignal, For, type JSX } from "solid-js";
+import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import type { LinkedProvider } from "@gaugewright/control-plane-client";
+import { providerTakesCustomModel } from "./model-picker";
 
-const PROVIDERS = ["openai", "anthropic"];
+const PROVIDERS = ["openai", "anthropic", "openai-generic"];
 
 export interface ProjectModelAccessApi {
     projectCredentials(project: string): Promise<LinkedProvider[]>;
-    linkProjectCredential(project: string, provider: string, token: string): Promise<void>;
+    linkProjectCredential(
+        project: string,
+        provider: string,
+        token: string,
+        baseUrl?: string,
+    ): Promise<void>;
     unlinkProjectCredential(project: string, provider: string): Promise<void>;
 }
 
@@ -34,6 +40,9 @@ export function ProjectModelAccessPanel(props: {
 
     const [provider, setProvider] = createSignal("openai");
     const [token, setToken] = createSignal("");
+    // The OpenAI-compatible endpoint, shown + required only for openai-generic (ADR 0083).
+    const [endpoint, setEndpoint] = createSignal("");
+    const needsEndpoint = () => providerTakesCustomModel(provider());
     const isLinked = (p: string) => (credentials() ?? []).some((c) => c.provider === p && c.linked);
 
     const link = async () => {
@@ -41,9 +50,19 @@ export function ProjectModelAccessPanel(props: {
             setStatus("paste a token first");
             return;
         }
+        if (needsEndpoint() && !endpoint().trim()) {
+            setStatus("enter the endpoint URL first");
+            return;
+        }
         try {
-            await props.api.linkProjectCredential(props.project, provider(), token());
+            await props.api.linkProjectCredential(
+                props.project,
+                provider(),
+                token(),
+                needsEndpoint() ? endpoint().trim() : undefined,
+            );
             setToken("");
+            setEndpoint("");
             setStatus(`pinned ${provider()} for this project ✓`);
             refresh();
         } catch (e) {
@@ -114,6 +133,15 @@ export function ProjectModelAccessPanel(props: {
                                 )}
                             </For>
                         </select>
+                        <Show when={needsEndpoint()}>
+                            <input
+                                data-project-credential-endpoint
+                                type="url"
+                                value={endpoint()}
+                                onInput={(e) => setEndpoint(e.currentTarget.value)}
+                                placeholder="endpoint URL (e.g. https://api.together.xyz/v1)"
+                            />
+                        </Show>
                         <input
                             data-project-credential-token
                             type="password"

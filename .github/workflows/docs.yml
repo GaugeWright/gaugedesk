@@ -2,9 +2,10 @@
 # Runs only when the docs change; gates on `mkdocs build --strict` (broken
 # links/nav fail), then deploys to the Cloudflare Pages project `gaugewright-docs`.
 #
-# Requires two repo secrets (Settings → Secrets and variables → Actions):
+# Requires one repo secret and one ordinary repo variable
+# (Settings → Secrets and variables → Actions):
 #   CLOUDFLARE_API_TOKEN   — scoped token with Account › Cloudflare Pages › Edit
-#   CLOUDFLARE_ACCOUNT_ID  — (repo secret)
+#   CLOUDFLARE_ACCOUNT_ID  — public account identifier (repo variable)
 name: Deploy docs
 
 on:
@@ -41,5 +42,5 @@ jobs:
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           command: pages deploy site --project-name=gaugewright-docs --branch=main

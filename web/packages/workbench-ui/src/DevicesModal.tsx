@@ -22,6 +22,9 @@ import type {
     HandoffStatus,
     IncomingHandoff,
     InviteAcceptResult,
+    MachineController,
+    MachineControllerInvitation,
+    MachineControllerRequest,
     PairingTicket,
 } from "@gaugewright/control-plane-client";
 import { pairingTicket } from "./pairing";
@@ -36,6 +39,17 @@ function freshDeviceId(): string {
     crypto.getRandomValues(bytes);
     const rand = Array.from(bytes, (b) => b.toString(36).padStart(2, "0")).join("").slice(0, 6);
     return `device:${rand}`;
+}
+
+function machineInvitationLink(invitation: MachineControllerInvitation): string {
+    const bytes = new TextEncoder().encode(JSON.stringify(invitation));
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    const encoded = btoa(binary)
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/, "");
+    return `gaugewright://machine-enroll?d=${encoded}`;
 }
 
 export function DevicesModal(props: {
@@ -53,8 +67,12 @@ export function DevicesModal(props: {
     // Separate-party pairing ticket (a peer authority).
     const [peerTicket, setPeerTicket] = createSignal("");
     const [peerCopied, setPeerCopied] = createSignal(false);
+    const [confirmPeerRevoke, setConfirmPeerRevoke] = createSignal("");
     const [pasted, setPasted] = createSignal("");
     const [inviteLink, setInviteLink] = createSignal(props.initialInviteLink ?? "");
+    const [controllerEndpoint, setControllerEndpoint] = createSignal("");
+    const [controllerInvitation, setControllerInvitation] =
+        createSignal<MachineControllerInvitation | null>(null);
 
     // Device-enrollment handshake (ACCT-1). The holder hosts a session, shows the ticket,
     // then compares the 6-char SAS with the new device before confirming; the new device
@@ -140,6 +158,55 @@ export function DevicesModal(props: {
     const [incoming, { refetch: refetchIncoming }] = createResource(() =>
         props.api.handoffIncoming(),
     );
+    const [controllerRequests, { refetch: refetchControllerRequests }] = createResource(
+        () => props.api.listMachineControllerRequests(),
+    );
+    const [controllers, { refetch: refetchControllers }] = createResource(
+        () => props.api.listMachineControllers(),
+    );
+
+    const mintControllerInvitation = async () => {
+        try {
+            const invitation = await props.api.mintMachineControllerInvitation(
+                controllerEndpoint(),
+            );
+            setControllerInvitation(invitation);
+            setStatus("Machine invitation ready — scan it with GaugeDesk Mobile");
+        } catch (error) {
+            setStatus(`Machine invitation failed: ${error}`);
+        }
+    };
+
+    const approveController = async (requestId: string) => {
+        try {
+            await props.api.approveMachineController(requestId);
+            setStatus("Phone approved");
+            void refetchControllerRequests();
+            void refetchControllers();
+        } catch (error) {
+            setStatus(`Phone approval failed: ${error}`);
+        }
+    };
+
+    const rejectController = async (requestId: string) => {
+        try {
+            await props.api.rejectMachineController(requestId);
+            setStatus("Phone rejected");
+            void refetchControllerRequests();
+        } catch (error) {
+            setStatus(`Phone rejection failed: ${error}`);
+        }
+    };
+
+    const revokeController = async (controllerId: string) => {
+        try {
+            await props.api.revokeMachineController(controllerId);
+            setStatus("Phone access revoked");
+            void refetchControllers();
+        } catch (error) {
+            setStatus(`Phone revocation failed: ${error}`);
+        }
+    };
 
     const newDeviceCode = () => {
         setDeviceTicket(pairingTicket(props.environment ?? "local", freshDeviceId()));
@@ -190,6 +257,21 @@ export function DevicesModal(props: {
             setStatus(`auto-accept handoffs from ${peer}: on`);
         } catch (e) {
             setStatus(`preauth failed: ${e}`);
+        }
+    };
+    const revokePeer = async (peer: string) => {
+        if (confirmPeerRevoke() !== peer) {
+            setConfirmPeerRevoke(peer);
+            setStatus(`Disconnect ${peer}? Click disconnect again to confirm.`);
+            return;
+        }
+        try {
+            await props.api.revokePeer(peer);
+            setConfirmPeerRevoke("");
+            setStatus(`disconnected ${peer}; future work from this pairing is blocked`);
+            await refetchPeers();
+        } catch (e) {
+            setStatus(`disconnect failed: ${e}`);
         }
     };
     const acceptIncoming = async (project: string, source: string) => {
@@ -319,6 +401,101 @@ export function DevicesModal(props: {
 
                 {/* Secure enrollment handshake (ACCT-1): the holder shows a ticket + compares
                     the SAS before authorizing; the account key is transferred sealed. */}
+                <h4 style={{ "margin-top": "16px" }}>Control this Machine from mobile</h4>
+                <p class="status" style={{ margin: "0 0 8px" }}>
+                    Create a one-use invitation for this Machine. The phone proves its
+                    hardware-backed key, then waits here for your approval.
+                </p>
+                <div class="pair-device-actions">
+                    <input
+                        type="url"
+                        inputmode="url"
+                        autocomplete="url"
+                        value={controllerEndpoint()}
+                        onInput={(event) => setControllerEndpoint(event.currentTarget.value)}
+                        placeholder="https://machine.example.com"
+                        aria-label="Reachable Machine HTTPS endpoint"
+                        data-controller-endpoint
+                    />
+                    <button
+                        type="button"
+                        class="tree-action"
+                        data-controller-invite
+                        onClick={() => void mintControllerInvitation()}
+                    >
+                        create invitation
+                    </button>
+                    <button
+                        type="button"
+                        class="tree-action"
+                        data-controller-refresh
+                        onClick={() => {
+                            void refetchControllerRequests();
+                            void refetchControllers();
+                        }}
+                    >
+                        refresh
+                    </button>
+                </div>
+                <Show when={controllerInvitation()}>
+                    {(invitation) => (
+                        <div data-controller-invitation>
+                            <div
+                                class="pd-qr"
+                                innerHTML={qrSvg(machineInvitationLink(invitation()))}
+                            />
+                            <code class="pair-ticket">
+                                {machineInvitationLink(invitation())}
+                            </code>
+                        </div>
+                    )}
+                </Show>
+                <For each={controllerRequests() ?? []}>
+                    {(request) => (
+                        <div class="fed-incoming-item" data-controller-request={request.requestId}>
+                            <span>
+                                <strong>{request.label || request.device}</strong>
+                                {" "}proved its device key and wants to control this Machine.
+                            </span>
+                            <button
+                                type="button"
+                                class="tree-action"
+                                onClick={() => void approveController(request.requestId)}
+                            >
+                                approve
+                            </button>
+                            <button
+                                type="button"
+                                class="tree-action"
+                                onClick={() => void rejectController(request.requestId)}
+                            >
+                                reject
+                            </button>
+                        </div>
+                    )}
+                </For>
+                <ul class="fed-peers" data-machine-controllers>
+                    <For each={controllers() ?? []}>
+                        {(controller) => (
+                            <li>
+                                <span>
+                                    <strong>{controller.label || controller.device}</strong>
+                                    {" · "}{controller.status}
+                                </span>
+                                <Show when={controller.status === "active"}>
+                                    <button
+                                        type="button"
+                                        class="tree-action"
+                                        onClick={() => void revokeController(controller.id)}
+                                    >
+                                        revoke
+                                    </button>
+                                </Show>
+                            </li>
+                        )}
+                    </For>
+                </ul>
+
                 <h4 style={{ "margin-top": "16px" }}>Add a device securely</h4>
                 <p class="status" style={{ margin: "0 0 8px" }}>
                     Enroll a new device into this account. Show it this ticket, then compare the
@@ -484,8 +661,8 @@ export function DevicesModal(props: {
                     pair
                 </button>
 
-                {/* Connected — paired separate parties + standing auto-accept. */}
-                <p class="status" style={{ margin: "12px 0 4px" }}>Connected:</p>
+                {/* Connections — active peers plus revoked audit records. */}
+                <p class="status" style={{ margin: "12px 0 4px" }}>Connections:</p>
                 <ul class="fed-peers" data-pd-peers>
                     <For each={peers() ?? []} fallback={<li class="status">No device paired yet.</li>}>
                         {(p) => (
@@ -494,9 +671,20 @@ export function DevicesModal(props: {
                                 <span class="fed-peer-grant" title={p.grant_id}>
                                     {p.active ? "paired" : "revoked"}
                                 </span>
-                                <button type="button" class="tree-action" data-pd-preauth={p.authority} title="Auto-accept handoffs from this device" onClick={() => void preauthPeer(p.authority)}>
-                                    auto-accept
-                                </button>
+                                <Show when={p.active}>
+                                    <button type="button" class="tree-action" data-pd-preauth={p.authority} title="Auto-accept handoffs from this device" onClick={() => void preauthPeer(p.authority)}>
+                                        auto-accept
+                                    </button>
+                                    <button
+                                        type="button"
+                                        class="tree-action danger"
+                                        data-pd-revoke={p.authority}
+                                        title="Revoke this pairing and block future work"
+                                        onClick={() => void revokePeer(p.authority)}
+                                    >
+                                        {confirmPeerRevoke() === p.authority ? "confirm disconnect" : "disconnect"}
+                                    </button>
+                                </Show>
                             </li>
                         )}
                     </For>
@@ -516,7 +704,14 @@ export interface DevicesModalApi {
     enrollAuthorize(session: string): Promise<void>;
     enrollJoin(ticket: EnrollmentTicket): Promise<string>;
     enrollJoinStatus(session: string): Promise<EnrollmentStatus>;
+    mintMachineControllerInvitation(endpoint: string): Promise<MachineControllerInvitation>;
+    listMachineControllerRequests(): Promise<MachineControllerRequest[]>;
+    approveMachineController(requestId: string): Promise<void>;
+    rejectMachineController(requestId: string): Promise<void>;
+    listMachineControllers(): Promise<MachineController[]>;
+    revokeMachineController(controllerId: string): Promise<void>;
     listPeers(): Promise<FederationPeer[]>;
+    revokePeer(authority: string): Promise<void>;
     handoffIncoming(): Promise<IncomingHandoff[]>;
     mintPairingTicket(): Promise<PairingTicket>;
     pair(ticket: PairingTicket): Promise<FederationPeer>;

@@ -4,6 +4,7 @@
 //! `member` token is forbidden, an unauthenticated/garbage token is unauthorized.
 //! Single-user local mode (no IdP) stays ungated — covered by `org_admin.rs`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -15,19 +16,73 @@ use tower::ServiceExt;
 
 use gaugewright_app::identity::LoopbackIdentityProvider;
 use gaugewright_app::library::{
-    Admission, ChatRecord, InstanceKind, InstanceRecord, ProjectRecord, RecordOp, LIBRARY_SCOPE,
+    Admission, ChatRecord, ChatTargetBindingRecord, InstanceKind, InstanceRecord,
+    PlacementTargetsRecord, ProjectRecord, RecordOp, TargetCapabilities, LIBRARY_SCOPE,
 };
-use gaugewright_app::Workbench;
+use gaugewright_app::org::{
+    MembershipRecord, MembershipStatus, RecordOp as OrgRecordOp, ORG_ID, ORG_SCOPE,
+};
+use gaugewright_app::{resource_store, Workbench};
 use gaugewright_core::abac::AuthorityAttributes;
+use gaugewright_core::boundary::Authority;
 use gaugewright_core::ids::AuthorityId;
+use gaugewright_core::resource::{
+    ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
+};
 use gaugewright_ee::org_routes::enterprise_control_plane;
 use gaugewright_store::Store;
 use gaugewright_workspace::Instance;
 
+mod support;
+use support::{administration_command, administration_document};
+
+fn active_member(authority: &str, role: &str, team: Option<&str>) -> MembershipRecord {
+    MembershipRecord {
+        id: authority.into(),
+        op: OrgRecordOp::Upsert,
+        org_id: ORG_ID.into(),
+        authority: authority.into(),
+        email: format!("{authority}@example.test"),
+        role: role.into(),
+        status: MembershipStatus::Active,
+        managed_by_scim: false,
+        team: team.map(str::to_owned),
+    }
+}
+
+fn seed_members(store: &mut Store, members: &[(&str, &str, Option<&str>)]) {
+    for (authority, role, team) in members {
+        store
+            .append_record(
+                ORG_SCOPE,
+                "membership",
+                &serde_json::to_string(&active_member(authority, role, *team)).unwrap(),
+            )
+            .unwrap();
+    }
+}
+
 fn workbench_with_idp() -> (tempfile::TempDir, Router) {
+    let (dir, app, _workbench) = workbench_with_idp_shared();
+    (dir, app)
+}
+
+fn workbench_with_idp_shared() -> (tempfile::TempDir, Router, Arc<Mutex<Workbench>>) {
     let dir = tempfile::tempdir().unwrap();
     let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
-    let store = Store::open_in_memory().unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    seed_members(
+        &mut store,
+        &[
+            ("owner-auth", "owner", None),
+            ("member-auth", "member", None),
+            ("viewer-auth", "viewer", None),
+            ("admin-a", "admin", Some("A")),
+            ("billing-auth", "billing", None),
+            ("alice", "member", Some("A")),
+            ("bob", "member", Some("B")),
+        ],
+    );
     // The IdP only authenticates a token → authority; the *role* is read from the
     // directory (Org::role_of), so default attributes are fine here.
     let idp = LoopbackIdentityProvider::new()
@@ -50,10 +105,21 @@ fn workbench_with_idp() -> (tempfile::TempDir, Router) {
             "admin-a-token",
             AuthorityId::new("admin-a"),
             AuthorityAttributes::default(),
+        )
+        .enroll(
+            "billing-token",
+            AuthorityId::new("billing-auth"),
+            AuthorityAttributes::default(),
+        )
+        .enroll(
+            "outsider-token",
+            AuthorityId::new("outsider-auth"),
+            AuthorityAttributes::default(),
         );
-    let wb = Workbench::with_instance("inst-test", instance, store)
-        .with_identity_provider(Arc::new(idp));
-    (dir, enterprise_control_plane(Arc::new(Mutex::new(wb))))
+    let wb =
+        Workbench::with_target("inst-test", instance, store).with_identity_provider(Arc::new(idp));
+    let shared = Arc::new(Mutex::new(wb));
+    (dir, enterprise_control_plane(Arc::clone(&shared)), shared)
 }
 
 /// A workbench (enterprise mode) whose library already holds a project `proj-acme` with a
@@ -70,17 +136,30 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
     let dir = tempfile::tempdir().unwrap();
     let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
     let mut store = Store::open_in_memory().unwrap();
+    seed_members(
+        &mut store,
+        &[
+            ("owner-auth", "owner", None),
+            ("consultant-a", "member", None),
+            ("consultant-b", "member", None),
+        ],
+    );
     // Seed the library: a project, a using-instance bound into it, and a chat on that instance.
     let project = ProjectRecord {
+        schema: gaugewright_app::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
         id: "proj-acme".into(),
         op: RecordOp::Upsert,
         name: "Acme".into(),
         is_default: false,
+        home_id: gaugewright_core::ids::HomeId::new("home:local-user"),
         network_isolated: false,
         run_purpose: None,
         deployment_mode: None,
     };
     let placement = InstanceRecord {
+        schema: gaugewright_app::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
         id: "i-acme".into(),
         op: RecordOp::Upsert,
         kind: InstanceKind::Using,
@@ -90,12 +169,15 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
         admission: Admission::Active,
     };
     let chat = ChatRecord {
+        schema: gaugewright_app::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
         id: "chat-acme".into(),
         op: RecordOp::Upsert,
         instance_id: "i-acme".into(),
         title: "Acme work".into(),
         created_position: 1,
         forked_from: None,
+        forked_from_entry: None,
     };
     store
         .append_record(
@@ -118,6 +200,37 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
             &serde_json::to_string(&chat).unwrap(),
         )
         .unwrap();
+    store
+        .append_record(
+            LIBRARY_SCOPE,
+            "placement_targets",
+            &serde_json::to_string(&PlacementTargetsRecord {
+                schema: gaugewright_app::library::LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+                placement_id: "i-acme".into(),
+                op: RecordOp::Upsert,
+                target_ids: vec!["inst-test".into()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    store
+        .append_record(
+            LIBRARY_SCOPE,
+            "chat_target",
+            &serde_json::to_string(&ChatTargetBindingRecord {
+                schema: gaugewright_app::library::LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+                chat_id: "chat-acme".into(),
+                op: RecordOp::Upsert,
+                target_id: "inst-test".into(),
+                basis: "test-basis".into(),
+                path_scope: vec![".".into()],
+                capabilities: TargetCapabilities::managed_default(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
     let idp = LoopbackIdentityProvider::new()
         .enroll(
             "owner-token",
@@ -134,7 +247,7 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
             AuthorityId::new("consultant-b"),
             AuthorityAttributes::default(),
         );
-    let mut wb = Workbench::with_instance("inst-test", instance, store)
+    let mut wb = Workbench::with_target("inst-test", instance, store)
         .with_identity_provider(Arc::new(idp))
         .with_audit_reads(audit_reads);
     wb.rebuild_library(); // fold the seeded library records into the projection
@@ -148,9 +261,34 @@ async fn send(
     body: Option<&str>,
     token: Option<&str>,
 ) -> (StatusCode, Value) {
+    send_client(app, method, uri, body, token, None).await
+}
+
+async fn send_client(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<&str>,
+    token: Option<&str>,
+    client: Option<(&str, u32, &str, &str)>,
+) -> (StatusCode, Value) {
     let mut b = Request::builder().method(method).uri(uri);
+    static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+    if method != "GET" && method != "HEAD" && method != "OPTIONS" {
+        b = b.header(
+            "idempotency-key",
+            format!("rbac-test-{}", NEXT_KEY.fetch_add(1, Ordering::Relaxed)),
+        );
+    }
     if let Some(t) = token {
         b = b.header("authorization", format!("Bearer {t}"));
+    }
+    if let Some((version, protocol, channel, platform)) = client {
+        b = b
+            .header("x-gaugedesk-client-version", version)
+            .header("x-gaugedesk-client-protocol", protocol)
+            .header("x-gaugedesk-client-channel", channel)
+            .header("x-gaugedesk-client-platform", platform);
     }
     let req = match body {
         Some(body) => b
@@ -168,51 +306,119 @@ async fn send(
     )
 }
 
+async fn admin(
+    app: &Router,
+    token: Option<&str>,
+    document: &str,
+    command: &str,
+    payload: Value,
+) -> (StatusCode, Value) {
+    administration_command(app, None, token, document, command, payload).await
+}
+
+async fn admin_document(app: &Router, token: &str, document_id: &str) -> (StatusCode, Value) {
+    let (status, response) = administration_document(app, None, Some(token), document_id).await;
+    (status, response["document"]["content"].clone())
+}
+
+async fn admin_document_for_client(
+    app: &Router,
+    token: &str,
+    document_id: &str,
+    client: (&str, u32, &str, &str),
+) -> (StatusCode, Value) {
+    let (status, opened) = send_client(
+        app,
+        "POST",
+        "/environments/administration/sessions",
+        Some("{}"),
+        Some(token),
+        Some(client),
+    )
+    .await;
+    if status != StatusCode::OK {
+        return (status, opened);
+    }
+    let session = &opened["session"];
+    let uri = format!(
+        "/environments/administration/documents/{document_id}?session={}&scope={}",
+        session["id"].as_str().unwrap(),
+        session["scope"]["id"].as_str().unwrap(),
+    );
+    let (status, response) = send_client(app, "GET", &uri, None, Some(token), Some(client)).await;
+    (status, response["document"]["content"].clone())
+}
+
+async fn update_security(app: &Router, token: &str, patch: Value) -> (StatusCode, Value) {
+    let (status, document) =
+        administration_document(app, None, Some(token), "administration.policy").await;
+    if status != StatusCode::OK {
+        return (status, document);
+    }
+    let mut content = document["document"]["content"].clone();
+    if !content["security"].is_object() {
+        content["security"] = serde_json::json!({});
+    }
+    for (key, value) in patch.as_object().unwrap() {
+        content["security"][key] = value.clone();
+    }
+    admin(
+        app,
+        Some(token),
+        "administration.policy",
+        "policy.update",
+        content,
+    )
+    .await
+}
+
 #[tokio::test]
 async fn enterprise_mode_gates_admin_routes_by_role() {
     let (_dir, app) = workbench_with_idp();
 
-    // Bootstrap: an empty directory is seedable without a token (there is nobody to
-    // authorize against yet) — seed the first active owner.
-    let (s, _) = send(
+    // An enrolled ordinary member reads the placement floor before local
+    // pairing admission; this recovery/enforcement read is not console RBAC.
+    let (s, policy) = send(
         &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
+        "GET",
+        "/admin/placement-policy",
         None,
+        Some("member-token"),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "bootstrap seeding the first owner");
+    assert_eq!(s, StatusCode::OK, "member reads placement floor: {policy}");
+    assert_eq!(policy["placement_policy"]["require_attested"], false);
 
-    // Now provisioned. The owner token may add a member.
-    let (s, _) = send(
+    // The account/tenant provisioner seeded the owner. The owner token may propose
+    // and approve a new member invitation through Administration.
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"member-auth","role":"member","status":"active"}"#),
         Some("owner-token"),
+        "administration.access",
+        "member.invite",
+        serde_json::json!({"authority":"new-member","role":"member"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "owner manages members");
 
     // A member token lacks ManageMembers → 403.
-    let (s, _) = send(
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"q","role":"member"}"#),
         Some("member-token"),
+        "administration.access",
+        "member.invite",
+        serde_json::json!({"authority":"q","role":"member"}),
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "member cannot manage members");
 
     // No credential → 401.
-    let (s, _) = send(
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"q","role":"member"}"#),
         None,
+        "administration.access",
+        "member.invite",
+        serde_json::json!({"authority":"q","role":"member"}),
     )
     .await;
     assert_eq!(
@@ -222,90 +428,132 @@ async fn enterprise_mode_gates_admin_routes_by_role() {
     );
 
     // Unrecognized credential → 401 (authentication fails).
-    let (s, _) = send(
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"q","role":"member"}"#),
         Some("bogus-token"),
+        "administration.access",
+        "member.invite",
+        serde_json::json!({"authority":"q","role":"member"}),
     )
     .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "garbage token is unauthorized");
 
-    // Reads need console access: a member sees no console (403), the owner reads (200).
-    let (s, _) = send(&app, "GET", "/admin/members", None, Some("member-token")).await;
+    // Reads need Environment admission: a member sees no Administration document
+    // (403), while the owner reads the canonical access projection (200).
+    let (s, _) =
+        administration_document(&app, None, Some("member-token"), "administration.access").await;
     assert_eq!(s, StatusCode::FORBIDDEN, "member has no console");
-    let (s, body) = send(&app, "GET", "/admin/members", None, Some("owner-token")).await;
+    let (s, body) = admin_document(&app, "owner-token", "administration.access").await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(body["members"].as_array().unwrap().len(), 2);
+    assert!(body["members"].as_array().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn capability_discovery_is_tenant_scoped_and_role_derived() {
+    let (_dir, app) = workbench_with_idp();
+
+    // The tenant provisioner has already established its owner. Anonymous discovery
+    // cannot infer Administration from the route or manifest.
+    let (status, body) = send(&app, "GET", "/admin/capabilities", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, owner) = send(
+        &app,
+        "GET",
+        "/admin/capabilities",
+        None,
+        Some("owner-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(owner["capabilities"].as_array().unwrap().len(), 7);
+    assert_eq!(owner["agent"]["message_attachments"], false);
+    assert_eq!(owner["agent"]["additional_tools"], false);
+    assert_eq!(
+        owner["agent"]["tools"],
+        serde_json::json!([
+            "admin.files.list",
+            "admin.files.read",
+            "admin.homes.query",
+            "admin.changes.propose",
+            "question.ask"
+        ])
+    );
+
+    let (status, member) = send(
+        &app,
+        "GET",
+        "/admin/capabilities",
+        None,
+        Some("member-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(member["capabilities"], serde_json::json!([]));
+    assert_eq!(member["agent"]["tools"], serde_json::json!([]));
+
+    let (status, billing) = send(
+        &app,
+        "GET",
+        "/admin/capabilities",
+        None,
+        Some("billing-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        billing["capabilities"],
+        serde_json::json!(["manage_billing"])
+    );
+    assert_eq!(billing["agent"]["message_attachments"], false);
+    assert_eq!(
+        billing["agent"]["tools"],
+        serde_json::json!([
+            "admin.files.list",
+            "admin.files.read",
+            "admin.changes.propose",
+            "question.ask"
+        ])
+    );
+
+    let (status, _) = send(&app, "GET", "/admin/capabilities", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn team_scoped_admin_cannot_administer_another_team() {
     let (_dir, app) = workbench_with_idp();
-    // Bootstrap an owner, then (as owner) an admin scoped to team A and two members.
-    send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"admin-a","role":"admin","status":"active","team":"A"}"#),
-        Some("owner-token"),
-    )
-    .await;
-    send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"id":"alice","authority":"alice","role":"member","status":"active","team":"A"}"#),
-        Some("owner-token"),
-    )
-    .await;
-    send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"id":"bob","authority":"bob","role":"member","status":"active","team":"B"}"#),
-        Some("owner-token"),
-    )
-    .await;
+    // The tenant provisioner seeded an admin scoped to team A and two members.
 
     // The team-A admin may change a team-A member's role…
-    let (s, _) = send(
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/members/alice/role",
-        Some(r#"{"role":"viewer"}"#),
         Some("admin-a-token"),
+        "administration.access",
+        "member.role.set",
+        serde_json::json!({"id":"alice","role":"viewer"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "admin administers own team");
 
     // …but not a team-B member's (outside scope → 403).
-    let (s, _) = send(
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/members/bob/role",
-        Some(r#"{"role":"viewer"}"#),
         Some("admin-a-token"),
+        "administration.access",
+        "member.role.set",
+        serde_json::json!({"id":"bob","role":"viewer"}),
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "admin cannot cross teams");
 
     // The owner is org-wide — may administer team B.
-    let (s, _) = send(
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/members/bob/role",
-        Some(r#"{"role":"viewer"}"#),
         Some("owner-token"),
+        "administration.access",
+        "member.role.set",
+        serde_json::json!({"id":"bob","role":"viewer"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "owner is org-wide");
@@ -315,33 +563,39 @@ async fn team_scoped_admin_cannot_administer_another_team() {
 async fn export_is_gated_by_role_policy() {
     // RBAC-6 / RBAC-5 export half: the org policy's `viewer ⇒ no export` rule is
     // enforced at the live export route.
-    let (_dir, app) = workbench_with_idp();
-    // bootstrap owner, then add an active viewer.
-    send(
+    let (_dir, app, workbench) = workbench_with_idp_shared();
+    let (created, _) = send(
         &app,
         "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"viewer-auth","role":"viewer","status":"active"}"#),
+        "/chats",
+        Some(r#"{"id":"eng-1"}"#),
         Some("owner-token"),
     )
     .await;
-
-    let body = r#"{"ProposeExport":{"source_required":[]}}"#;
+    assert_eq!(created, StatusCode::CREATED);
+    {
+        let mut workbench = workbench.lock().unwrap();
+        let output = ResourceRecord::new(
+            Resource::input(
+                ResourceId::new("out-1"),
+                ResourceKind::output(),
+                Authority::from("owner-auth"),
+            ),
+            ContentLocator::Workspace {
+                path: "deliverable.txt".into(),
+                commit: "fixture".into(),
+            },
+            |_| Authority::from("owner-auth"),
+        );
+        resource_store::put(workbench.store_mut(), "eng-1", &output).unwrap();
+    }
 
     // A viewer is denied export by the policy → 403 (the gate fires before admit).
     let (s, _) = send(
         &app,
         "POST",
-        "/scopes/eng-1/export/command",
-        Some(body),
+        "/chats/eng-1/resources/out-1/export",
+        Some("{}"),
         Some("viewer-token"),
     )
     .await;
@@ -351,12 +605,12 @@ async fn export_is_gated_by_role_policy() {
     let (s, _) = send(
         &app,
         "POST",
-        "/scopes/eng-1/export/command",
-        Some(body),
+        "/chats/eng-1/resources/out-1/export",
+        Some("{}"),
         Some("owner-token"),
     )
     .await;
-    assert_ne!(s, StatusCode::FORBIDDEN, "owner passes the export gate");
+    assert_eq!(s, StatusCode::OK, "owner passes the export gate");
 }
 
 #[tokio::test]
@@ -370,27 +624,7 @@ async fn enterprise_mode_gates_data_routes_for_active_members() {
     let (s, _) = send(&app, "GET", "/health", None, None).await;
     assert_eq!(s, StatusCode::OK, "health is always open");
 
-    // Bootstrap-seed the first owner, then add a plain member.
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"member-auth","role":"member","status":"active"}"#),
-        Some("owner-token"),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-
-    // Now provisioned: GET /workspace (a data route) is gated.
+    // The provisioned tenant gates GET /workspace (a data route).
     let (s, _) = send(&app, "GET", "/workspace", None, None).await;
     assert_eq!(
         s,
@@ -407,7 +641,7 @@ async fn enterprise_mode_gates_data_routes_for_active_members() {
 
     // An authenticated authority that is NOT an active member → 403 (enrolled in the IdP but
     // never provisioned into the directory).
-    let (s, _) = send(&app, "GET", "/workspace", None, Some("viewer-token")).await;
+    let (s, _) = send(&app, "GET", "/workspace", None, Some("outsider-token")).await;
     assert_eq!(
         s,
         StatusCode::FORBIDDEN,
@@ -422,8 +656,9 @@ async fn enterprise_mode_gates_data_routes_for_active_members() {
     let (s, _) = send(&app, "GET", "/health", None, None).await;
     assert_eq!(s, StatusCode::OK, "health stays exempt");
 
-    // The /admin capability gate is unchanged: a member still has no console access.
-    let (s, _) = send(&app, "GET", "/admin/members", None, Some("member-token")).await;
+    // Administration admission is unchanged: a member still has no console access.
+    let (s, _) =
+        administration_document(&app, None, Some("member-token"), "administration.access").await;
     assert_eq!(
         s,
         StatusCode::FORBIDDEN,
@@ -437,43 +672,19 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
     // bypass; a non-granted member is forbidden the project's data routes, fail-closed.
     let (_dir, app) = workbench_with_scoped_project();
 
-    // Bootstrap an owner, then two plain members (consultants).
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    for who in ["consultant-a", "consultant-b"] {
-        let (s, _) = send(
-            &app,
-            "POST",
-            "/admin/members",
-            Some(&format!(
-                r#"{{"authority":"{who}","role":"member","status":"active"}}"#
-            )),
-            Some("owner-token"),
-        )
-        .await;
-        assert_eq!(s, StatusCode::OK);
-    }
-
     // Grant consultant-a access to proj-acme (owner administers grants).
-    let (s, _) = send(
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/grants",
-        Some(r#"{"authority":"consultant-a","project_id":"proj-acme"}"#),
         Some("owner-token"),
+        "administration.access",
+        "grant.add",
+        serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "owner grants a member a project");
 
-    // The grant shows up in the admin list.
-    let (s, grants) = send(&app, "GET", "/admin/grants", None, Some("owner-token")).await;
+    // The grant shows up in the canonical access document.
+    let (s, grants) = admin_document(&app, "owner-token", "administration.access").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(grants["grants"].as_array().unwrap().len(), 1);
 
@@ -550,12 +761,12 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
     );
 
     // Revoke consultant-a's grant → access is withdrawn (INV-18 future-only revocation).
-    let (s, _) = send(
+    let (s, _) = admin(
         &app,
-        "DELETE",
-        "/admin/grants",
-        Some(r#"{"authority":"consultant-a","project_id":"proj-acme"}"#),
         Some("owner-token"),
+        "administration.access",
+        "grant.revoke",
+        serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -576,30 +787,12 @@ async fn secaud4_audits_sensitive_reads_when_enabled() {
     // data is recorded in the org audit trail ("who read this client's data"); the
     // workspace nav (not project-scoped) is not. The default harness (off) records no read.
     let (_dir, app) = workbench_with_scoped_project_cfg(true);
-    let (s, _) = send(
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"consultant-a","role":"member","status":"active"}"#),
         Some("owner-token"),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/grants",
-        Some(r#"{"authority":"consultant-a","project_id":"proj-acme"}"#),
-        Some("owner-token"),
+        "administration.access",
+        "grant.add",
+        serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -647,30 +840,12 @@ async fn secaud4_reads_are_not_audited_by_default() {
     // SECAUD-4: with read-auditing OFF (the default), a member's sensitive GET leaves no
     // audit entry — the opt-in is genuinely off unless the deployment enables it.
     let (_dir, app) = workbench_with_scoped_project(); // audit_reads = false
-    let (s, _) = send(
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"consultant-a","role":"member","status":"active"}"#),
         Some("owner-token"),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/grants",
-        Some(r#"{"authority":"consultant-a","project_id":"proj-acme"}"#),
-        Some("owner-token"),
+        "administration.access",
+        "grant.add",
+        serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -705,25 +880,6 @@ async fn secaud4_reads_are_not_audited_by_default() {
 async fn entsec_blocks_export_to_disk_and_audits_member_actions() {
     // ENTSEC-5 + ENTSEC-4 (ADR 0065).
     let (_dir, app) = workbench_with_idp();
-    // Provision an owner (bootstrap, no token) + a plain member.
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"member-auth","role":"member","status":"active"}"#),
-        Some("owner-token"),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
 
     // ENTSEC-5: export-to-disk would write client data to the consultant's endpoint — refused in
     // enterprise mode (the guard fires before any resource resolution).
@@ -783,35 +939,13 @@ async fn entsec_blocks_export_to_disk_and_audits_member_actions() {
 async fn entsec2_scopes_the_workspace_nav_content() {
     let (_dir, app) = workbench_with_scoped_project();
 
-    // Bootstrap an owner, then two plain members; grant only consultant-a → proj-acme.
-    let (s, _) = send(
+    // The provisioner seeded both consultants; grant only consultant-a → proj-acme.
+    let (s, _) = admin(
         &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    for who in ["consultant-a", "consultant-b"] {
-        let (s, _) = send(
-            &app,
-            "POST",
-            "/admin/members",
-            Some(&format!(
-                r#"{{"authority":"{who}","role":"member","status":"active"}}"#
-            )),
-            Some("owner-token"),
-        )
-        .await;
-        assert_eq!(s, StatusCode::OK);
-    }
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/grants",
-        Some(r#"{"authority":"consultant-a","project_id":"proj-acme"}"#),
         Some("owner-token"),
+        "administration.access",
+        "grant.add",
+        serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -887,24 +1021,11 @@ async fn entsec2_scopes_the_workspace_nav_content() {
 async fn sec2_idle_timeout_expires_a_session_on_data_routes() {
     let (_dir, app) = workbench_with_idp();
 
-    // Bootstrap an owner (provisions the directory).
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-
     // Set a 1-second idle timeout (owner has ConfigureSecurity).
-    let (s, _) = send(
+    let (s, _) = update_security(
         &app,
-        "POST",
-        "/admin/security",
-        Some(r#"{"idle_timeout_secs":1}"#),
-        Some("owner-token"),
+        "owner-token",
+        serde_json::json!({"idle_timeout_secs":1}),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "owner sets the session policy");
@@ -930,17 +1051,6 @@ async fn sec2_idle_timeout_expires_a_session_on_data_routes() {
 #[tokio::test]
 async fn entsec5_path_context_ingest_disabled_in_enterprise() {
     let (_dir, app) = workbench_with_scoped_project();
-    // Bootstrap an owner so the directory is provisioned and the owner token authenticates.
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-
     let (s, _) = send(
         &app,
         "POST",
@@ -956,34 +1066,13 @@ async fn entsec5_path_context_ingest_disabled_in_enterprise() {
     );
 }
 
-/// ITGOV-2: the IT session roster (GET /admin/sessions) lists members active on the data
-/// routes — populated by the admission shell, console-read gated, and it never exposes a
-/// bearer (only the authority).
+/// ITGOV-2: the Administration clients document lists members active on the data
+/// routes, is Environment-admission gated, and never exposes a bearer.
 #[tokio::test]
 async fn itgov2_session_roster_lists_active_members() {
     let (_dir, app) = workbench_with_idp();
-    // Bootstrap an owner + a plain member.
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"owner-auth","role":"owner","status":"active"}"#),
-        None,
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/admin/members",
-        Some(r#"{"authority":"member-auth","role":"member","status":"active"}"#),
-        Some("owner-token"),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-
     // The member is not on the roster yet (no data-route activity from them).
-    let (s, roster) = send(&app, "GET", "/admin/sessions", None, Some("owner-token")).await;
+    let (s, roster) = admin_document(&app, "owner-token", "administration.clients").await;
     assert_eq!(s, StatusCode::OK);
     assert!(
         !roster["sessions"]
@@ -997,7 +1086,7 @@ async fn itgov2_session_roster_lists_active_members() {
     // The member makes an authenticated data request → they appear in the roster.
     let (s, _) = send(&app, "GET", "/workspace", None, Some("member-token")).await;
     assert_eq!(s, StatusCode::OK);
-    let (s, roster) = send(&app, "GET", "/admin/sessions", None, Some("owner-token")).await;
+    let (s, roster) = admin_document(&app, "owner-token", "administration.clients").await;
     assert_eq!(s, StatusCode::OK, "{roster}");
     let sessions = roster["sessions"].as_array().unwrap();
     assert!(
@@ -1013,10 +1102,119 @@ async fn itgov2_session_roster_lists_active_members() {
     );
 
     // A plain member has no console access → the roster read is forbidden.
-    let (s, _) = send(&app, "GET", "/admin/sessions", None, Some("member-token")).await;
+    let (s, _) =
+        administration_document(&app, None, Some("member-token"), "administration.clients").await;
     assert_eq!(
         s,
         StatusCode::FORBIDDEN,
         "member cannot read the IT console"
     );
+}
+
+/// ITGOV-4: a Home evaluates reported client compatibility before serving org data. A
+/// nonconforming build warns during grace, is blocked after grace, and remains visible to IT.
+/// The exact software-policy route remains an authenticated member recovery surface so a
+/// blocked desktop updater can discover the policy that it must satisfy.
+#[tokio::test]
+async fn itgov4_home_enforces_software_policy_and_preserves_recovery() {
+    let (_dir, app) = workbench_with_idp();
+    let current = ("2.1.0", 2, "stable", "desktop");
+    let old = Some(("1.9.0", 1, "stable", "desktop"));
+
+    let grace_policy = serde_json::json!({
+        "minimum_version": "2.0.0",
+        "minimum_protocol": 2,
+        "allowed_channels": ["stable"],
+        "grace_until_unix_ms": 4_102_444_800_000_u64
+    });
+    let (s, body) = admin(
+        &app,
+        Some("owner-token"),
+        "administration.software-policy",
+        "software-policy.update",
+        grace_policy,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    let (s, _) = send_client(&app, "GET", "/workspace", None, Some("member-token"), old).await;
+    assert_eq!(s, StatusCode::OK, "grace warns instead of refusing");
+    let (s, roster) =
+        admin_document_for_client(&app, "owner-token", "administration.clients", current).await;
+    assert_eq!(s, StatusCode::OK, "{roster}");
+    let member = roster["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["authority"] == "member-auth")
+        .unwrap();
+    assert_eq!(member["software_status"], "warning", "{roster}");
+    assert_eq!(member["client"]["version"], "1.9.0", "{roster}");
+    assert_eq!(member["client"]["platform"], "desktop", "{roster}");
+
+    let enforced_policy = serde_json::json!({
+        "minimum_version": "2.0.0",
+        "minimum_protocol": 2,
+        "allowed_channels": ["stable"],
+        "grace_until_unix_ms": null
+    });
+    let (s, _) = admin(
+        &app,
+        Some("owner-token"),
+        "administration.software-policy",
+        "software-policy.update",
+        enforced_policy,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, body) = send_client(&app, "GET", "/workspace", None, Some("member-token"), old).await;
+    assert_eq!(s, StatusCode::UPGRADE_REQUIRED, "{body}");
+    assert_eq!(
+        body["error"],
+        "GaugeDesk client does not satisfy organization software policy"
+    );
+
+    let (s, policy) = send_client(
+        &app,
+        "GET",
+        "/admin/software-policy",
+        None,
+        Some("owner-token"),
+        old,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "repair route must survive: {policy}");
+    assert_eq!(policy["software_policy"]["minimum_version"], "2.0.0");
+
+    let (s, policy) = send_client(
+        &app,
+        "GET",
+        "/admin/software-policy",
+        None,
+        Some("member-token"),
+        old,
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "a blocked ordinary member must retain the updater recovery route: {policy}"
+    );
+    assert_eq!(policy["software_policy"]["minimum_version"], "2.0.0");
+
+    let (s, roster) =
+        admin_document_for_client(&app, "owner-token", "administration.clients", current).await;
+    assert_eq!(s, StatusCode::OK, "{roster}");
+    let member = roster["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["authority"] == "member-auth")
+        .unwrap();
+    assert_eq!(member["software_status"], "blocked", "{roster}");
+    assert!(member["software_reason"]
+        .as_str()
+        .unwrap()
+        .contains("2.0.0"));
 }

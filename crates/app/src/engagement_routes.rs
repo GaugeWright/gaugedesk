@@ -1,21 +1,22 @@
 //! Local chat/engagement route handlers.
 //!
-//! This is the open workbench compatibility surface for the original `/chats/*`
-//! APIs: worktree reads/writes, transcript/events, merge/revert/sync, task
+//! This is the local workbench surface for `/chats/*` APIs: target candidate
+//! reads/writes, transcript/events, merge/revert/sync, task
 //! turns, and e2e reset hooks.
 
 use std::convert::Infallible;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
     response::IntoResponse,
     Json,
 };
 use futures::Stream;
-use gaugewright_boundary::definition::CONFIG_PATH;
+use gaugewright_core::instance::{InstanceCommand, InstanceState};
 use gaugewright_core::merge::{MergeCommand, MergeState};
+#[cfg(debug_assertions)]
 use gaugewright_store::Store;
 use gaugewright_workspace::{
     ChatWorkspace, FileEntry, MergeOutcome, MergePreview, RegionResolution, SaveBase,
@@ -26,9 +27,11 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
+#[cfg(debug_assertions)]
+use crate::build_workbench;
 use crate::{
-    build_workbench, engine, err_response,
-    library::{ChatMode, ChatRecord, RecordOp, LIBRARY_SCOPE},
+    engine, err_response,
+    library::{ChatMode, ChatRecord, ChatTargetBindingRecord, RecordOp, LIBRARY_SCOPE},
     LockUnpoisoned, ServerEvent, SharedWorkbench, Workbench,
 };
 
@@ -54,35 +57,17 @@ pub(crate) struct CreatedEngagement {
     pub path: String,
 }
 
-pub(crate) struct EngagementTaskContext {
+pub struct EngagementTaskContext {
+    /// Project-scoped chats carry their owning project. Archetype edit chats
+    /// deliberately do not, but still use this context for immediate turns.
+    pub project_id: Option<String>,
+    pub work_target_basis: String,
     pub worktree: std::path::PathBuf,
     pub sender: broadcast::Sender<ServerEvent>,
     pub mode: ChatMode,
 }
 
 impl Workbench {
-    // `pub` for the hosted embed plane (`cloud/embed-host`): activating a public
-    // session materializes its same-id engagement under the served placement.
-    pub fn materialize_engagement_in_instance(
-        &mut self,
-        chat_id: &str,
-        instance_id: &str,
-        config_json: &str,
-    ) -> Result<std::path::PathBuf, String> {
-        if let Some(eng) = self.engagements.get(chat_id) {
-            return Ok(eng.path().to_path_buf());
-        }
-        let inst = self
-            .instances
-            .get(instance_id)
-            .ok_or_else(|| format!("deployment instance '{instance_id}' not open"))?;
-        let eng = inst.create_engagement(chat_id).map_err(|e| e.to_string())?;
-        let worktree = eng.path().to_path_buf();
-        let _ = eng.write_file(CONFIG_PATH, config_json);
-        self.register_engagement(chat_id, instance_id, eng);
-        Ok(worktree)
-    }
-
     pub(crate) fn create_default_engagement(
         &mut self,
         id: String,
@@ -91,25 +76,44 @@ impl Workbench {
         if self.engagements.contains_key(&id) {
             return Err(EngagementCreateError::Exists);
         }
-        let inst_id = self.default_instance.clone();
-        let Some(inst) = self.instances.get(&inst_id) else {
+        let root_id = self.default_instance.clone();
+        let target = self
+            .resolve_placement_target(&root_id, None)
+            .map_err(EngagementCreateError::Git)?;
+        let Some(workspace) = self.targets.get(&target.id) else {
             return Err(EngagementCreateError::NoDefaultInstance);
         };
-        let eng = inst
+        let eng = workspace
             .create_engagement(&id)
             .map_err(|e| EngagementCreateError::Git(e.to_string()))?;
+        let basis = eng
+            .boundary_cut()
+            .map_err(|e| EngagementCreateError::Git(e.to_string()))?
+            .0;
         let branch = eng.branch().to_string();
         let path = eng.path().to_string_lossy().to_string();
-        let rec = ChatRecord {
+        self.write_created_chat_record(ChatRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: id.clone(),
             op: RecordOp::Upsert,
-            instance_id: inst_id.clone(),
+            instance_id: root_id,
             title,
             created_position: 0,
             forked_from: None,
-        };
-        self.write_created_chat_record(rec);
-        self.register_engagement(id.clone(), inst_id, eng);
+            forked_from_entry: None,
+        });
+        self.write_chat_target_record(ChatTargetBindingRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            chat_id: id.clone(),
+            op: RecordOp::Upsert,
+            target_id: target.id.clone(),
+            basis,
+            path_scope: target.path_scope,
+            capabilities: target.capabilities,
+        });
+        self.register_engagement(id.clone(), target.id, eng);
         Ok(CreatedEngagement { id, branch, path })
     }
 
@@ -138,7 +142,7 @@ impl Workbench {
         }
     }
 
-    pub(crate) fn live_engagement_instance_id(&self, chat_id: &str) -> Option<&str> {
+    pub(crate) fn live_engagement_target_id(&self, chat_id: &str) -> Option<&str> {
         self.engagement_index.get(chat_id).map(String::as_str)
     }
 
@@ -150,12 +154,9 @@ impl Workbench {
         self.engagements.get(id).map(|eng| eng.diff_against_main())
     }
 
-    pub(crate) fn engagement_config_json(&self, id: &str) -> Option<String> {
-        let eng = self.engagements.get(id)?;
-        Some(
-            eng.read_file(CONFIG_PATH)
-                .unwrap_or_else(|_| "{}".to_string()),
-        )
+    pub(crate) fn engagement_config_json(&self, id: &str) -> Option<Result<String, String>> {
+        self.engagements.get(id)?;
+        Some(self.effective_agent_config_for_chat(id))
     }
 
     pub(crate) fn write_engagement_config(
@@ -163,10 +164,27 @@ impl Workbench {
         id: &str,
         body: &str,
     ) -> Option<Result<(), WorkspaceError>> {
-        let eng = self.engagements.get(id)?;
-        // The facet's io failure carries the bare io message, so the 500 body
-        // stays the raw io text it has always been.
-        let written = eng.write_file(CONFIG_PATH, body);
+        self.engagements.get(id)?;
+        let instance_id = self.library.chats.get(id)?.instance_id.clone();
+        let notes = self
+            .store_ref()
+            .fold::<InstanceState>(&instance_id)
+            .ok()
+            .and_then(|state| state.notes)
+            .unwrap_or_default();
+        let written = self
+            .store_mut()
+            .admit::<InstanceState>(
+                &instance_id,
+                InstanceCommand::SetLocalConfig {
+                    config: body.to_owned(),
+                    notes,
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| WorkspaceError {
+                message: format!("{error:?}"),
+            });
         Some(written.map(|()| {
             self.publish(
                 id,
@@ -182,9 +200,29 @@ impl Workbench {
         &self,
         id: &str,
     ) -> Result<String, gaugewright_store::AdmitError> {
-        self.store_ref()
-            .records(id, "transcript")
-            .map(|rows| format!("[{}]", rows.join(",")))
+        let events = self.store_ref().events(id)?;
+        let forkable: std::collections::BTreeSet<i64> = events
+            .iter()
+            .filter(|(_, kind, _)| kind == crate::engine::TURN_BOUNDARY_KIND)
+            .filter_map(|(_, _, payload)| {
+                serde_json::from_str::<crate::engine::TurnBoundaryRecord>(payload).ok()
+            })
+            .flat_map(|boundary| [boundary.user_entry_id, boundary.assistant_entry_id])
+            .collect();
+        let rows = events
+            .into_iter()
+            .filter(|(_, kind, _)| kind == "transcript")
+            .filter_map(|(position, _, payload)| {
+                let mut event = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
+                let object = event.as_object_mut()?;
+                object.insert("entry_id".into(), position.into());
+                if forkable.contains(&position) {
+                    object.insert("forkable".into(), true.into());
+                }
+                Some(event)
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&rows).map_err(Into::into)
     }
 
     /// The engagement's governance audit records (ADR 0082 §4: every
@@ -373,8 +411,10 @@ impl Workbench {
         }
         if normalized.starts_with(".whipple/versions/")
             || normalized.contains("/.whipple/versions/")
+            || normalized.starts_with(".whipple/discipline/versions/")
+            || normalized.contains("/.whipple/discipline/versions/")
         {
-            return Err("published WhippleScript package versions are immutable");
+            return Err("published archetype versions are immutable");
         }
         if gaugewright_boundary::is_method_surface_path(normalized) {
             let chat = self
@@ -391,7 +431,38 @@ impl Workbench {
                 return Err("work chats cannot edit their installed WhippleScript package");
             }
         }
+        let binding = self
+            .library_chat_target_binding(chat_id)
+            .ok_or("chat target binding is unavailable")?;
+        if !path_is_in_scope(normalized, &binding.path_scope) {
+            return Err("path is outside the chat's admitted target scope");
+        }
         Ok(())
+    }
+
+    fn candidate_within_target_scope(&self, chat_id: &str) -> Result<(), String> {
+        let Some(binding) = self.library_chat_target_binding(chat_id) else {
+            // Low-level in-memory workspace tests do not construct the durable
+            // library. Production startup rejects every unbound chat.
+            return Ok(());
+        };
+        let diff = self
+            .engagements
+            .get(chat_id)
+            .ok_or_else(|| "chat candidate is unavailable".to_owned())?
+            .diff_against_main()
+            .map_err(|error| error.to_string())?;
+        let escaped = diff
+            .lines()
+            .filter_map(|line| line.strip_prefix("diff --git a/"))
+            .filter_map(|line| line.split_once(" b/").map(|(path, _)| path))
+            .find(|path| !path_is_in_scope(path, &binding.path_scope));
+        match escaped {
+            Some(path) => Err(format!(
+                "candidate path `{path}` is outside the admitted target scope"
+            )),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn engagement_merge_state(
@@ -442,14 +513,68 @@ impl Workbench {
                 self.admit_merge_command(id, MergeCommand::SubmitRepair)
             }
             EngagementMergeAction::Admit => self
-                .admit_merge_command(id, MergeCommand::PolicyAdmit)
+                .candidate_within_target_scope(id)
+                .and_then(|_| self.admit_merge_command(id, MergeCommand::PolicyAdmit))
                 .and_then(
                     |_| match self.engagements.get(id).unwrap().merge_into_main() {
                         Ok(MergeOutcome::Clean) => {
-                            self.admit_merge_command(id, MergeCommand::AdvanceStandingRef)
+                            let state =
+                                self.admit_merge_command(id, MergeCommand::AdvanceStandingRef)?;
+                            self.refresh_work_target_basis_from_chat(id);
+                            if let Some(binding) = self.library_chat_target_binding(id) {
+                                let candidate = self
+                                    .engagements
+                                    .get(id)
+                                    .and_then(|engagement| engagement.current_cut().ok())
+                                    .flatten();
+                                let resulting_revision = self
+                                    .library
+                                    .work_targets
+                                    .get(&binding.target_id)
+                                    .and_then(|target| target.current_basis.clone());
+                                self.record_target_act(
+                                    Some(id),
+                                    &binding.target_id,
+                                    crate::target_adapter::TargetActKind::Apply,
+                                    candidate,
+                                    Vec::new(),
+                                    resulting_revision,
+                                    crate::target_adapter::TargetActStatus::Completed,
+                                    None,
+                                )?;
+                            }
+                            let target = self.engagements.get(id).unwrap().target().to_string();
+                            let target_id = self.engagement_index.get(id).cloned();
+                            for (sibling_id, sibling) in &self.engagements {
+                                if sibling_id != id
+                                    && sibling.target() == target
+                                    && self.engagement_index.get(sibling_id) == target_id.as_ref()
+                                {
+                                    let _ = sibling.sync_from_main();
+                                }
+                            }
+                            Ok(state)
                         }
+                        // The line moved after review. Re-probe this candidate into the
+                        // conflict state immediately so the incoming chat owns a durable
+                        // repair task instead of returning an unmodeled 409 (ADR 0096).
                         Ok(MergeOutcome::Conflict) => {
-                            Err("main changed since review — re-review the diff".into())
+                            if let Some(binding) = self.library_chat_target_binding(id) {
+                                self.record_target_act(
+                                    Some(id),
+                                    &binding.target_id,
+                                    crate::target_adapter::TargetActKind::Apply,
+                                    None,
+                                    Vec::new(),
+                                    None,
+                                    crate::target_adapter::TargetActStatus::Refused,
+                                    Some("target basis changed before apply".to_owned()),
+                                )?;
+                            }
+                            self.admit_merge_command(id, MergeCommand::StartMerge)
+                                .and_then(|_| {
+                                    self.admit_merge_command(id, MergeCommand::WorkspaceConflict)
+                                })
                         }
                         Err(e) => Err(e.to_string()),
                     },
@@ -465,10 +590,14 @@ impl Workbench {
                             .fold::<MergeState>(id)
                             .map(|s| s.retry_keys_used.len())
                             .unwrap_or(0);
-                        self.admit_merge_command(
+                        let state = self.admit_merge_command(
                             id,
                             MergeCommand::RetryRepair(format!("retry-{n}")),
-                        )
+                        );
+                        if state.is_ok() {
+                            self.refresh_work_target_basis_from_chat(id);
+                        }
+                        state
                     }
                     Ok(MergeOutcome::Conflict) => {
                         Err("still conflicting — resolve in the editor".into())
@@ -491,12 +620,16 @@ impl Workbench {
         Some(result)
     }
 
-    pub(crate) fn engagement_task_context(&mut self, id: &str) -> Option<EngagementTaskContext> {
+    pub fn engagement_task_context(&mut self, id: &str) -> Option<EngagementTaskContext> {
         let eng = self.engagements.get(id)?;
+        let work_target_basis = eng.boundary_cut().ok()?.0;
         let worktree = eng.path().to_path_buf();
+        let project_id = self.library_project_of_chat(id);
         let mode = self.library_chat_mode(id);
         let sender = self.sender(id);
         Some(EngagementTaskContext {
+            project_id,
+            work_target_basis,
             worktree,
             sender,
             mode,
@@ -527,26 +660,31 @@ impl Workbench {
     }
 }
 
+fn path_is_in_scope(path: &str, scopes: &[String]) -> bool {
+    let path = path.trim_start_matches("./");
+    scopes.iter().any(|scope| {
+        let scope = scope.trim().trim_start_matches("./").trim_end_matches('/');
+        scope.is_empty() || scope == "." || path == scope || path.starts_with(&format!("{scope}/"))
+    })
+}
+
 #[derive(Deserialize)]
 pub(crate) struct CreateEngagement {
     /// Optional. When absent, the server mints one (`gen_id("chat")`) — the path the
-    /// All-chats "+ new chat" quick-start uses, since the UI never mints ids. Tests
-    /// and scripts may still pin an explicit id (back-compat).
+    /// All-chats "+ new chat" quick-start uses, since the UI never mints ids. An
+    /// embedding host may supply its already-authorized durable chat id.
     #[serde(default)]
     id: Option<String>,
 }
 
-/// Open a new engagement on the **default** instance — the hidden Personal default
-/// placement (ADR 0036), so this is a **work** chat (ADR 0035). The All-chats
-/// "+ new chat" affordance and back-compat tests/scripts both land here. A worktree
-/// off that instance's `main`, recorded as a chat so it shows in `/workspace` and
-/// survives a restart.
+/// Quick-start a work chat under Personal's default placement and its exact managed
+/// target. The placement owns context; the selected target owns the candidate files.
 pub(crate) async fn create_engagement(
     State(wb): State<SharedWorkbench>,
     Json(body): Json<CreateEngagement>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    // An explicit id keeps its raw value as the title (back-compat); a minted id gets
+    // An explicit embedding id keeps its raw value as the title; a minted id gets
     // the "new chat" placeholder so the nav renders it as "Untitled" until the first
     // message auto-titles it (state/chat-title) — never the raw `chat-…` token.
     let (id, title) = match body.id {
@@ -622,6 +760,12 @@ pub(crate) async fn get_config(
     let wb = wb.lock_unpoisoned();
     let Some(body) = wb.engagement_config_json(&id) else {
         return (StatusCode::NOT_FOUND, "no such engagement").into_response();
+    };
+    // A corrupt stored config is an error, not `{}` — answering `{}` here
+    // would let the next save persist the emptied config (DR-0054 Phase A).
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -988,6 +1132,10 @@ pub(crate) async fn workspace_events(
 #[derive(Deserialize)]
 pub(crate) struct TaskBody {
     prompt: String,
+    /// Opt this one candidate into human review. Default shared-line behavior is
+    /// automatic settlement; this flag never becomes a sticky chat preference.
+    #[serde(default)]
+    review: bool,
     /// Native image content blocks attached to this message (UX-14). Resolved by
     /// WhippleScript as message-scoped model input; never recorded in the durable
     /// transcript. Absent ⇒ a text turn.
@@ -1000,6 +1148,7 @@ pub(crate) struct TaskBody {
 pub(crate) async fn post_task(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
     Json(body): Json<TaskBody>,
 ) -> impl IntoResponse {
@@ -1012,9 +1161,17 @@ pub(crate) async fn post_task(
         (context.worktree, context.sender, context.mode)
     };
 
+    let (account_scope, tenant_scope) = {
+        let g = wb.lock_unpoisoned();
+        (
+            g.account_scope_for(crate::net_http::bearer(&headers)),
+            crate::workbench_auth::req_scope(&headers),
+        )
+    };
     let wb2 = wb.clone();
     let task = body.prompt;
     let images = body.images;
+    let review_requested = body.review;
     let actor = actor.map(|axum::extract::Extension(actor)| actor.0);
     let id2 = id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1028,6 +1185,12 @@ pub(crate) async fn post_task(
                 images: &images,
                 mode,
                 authenticated_actor: actor.as_ref(),
+                contribution_by: None,
+                account_scope: &account_scope,
+                tenant_scope: &tenant_scope,
+                runtime_command_id: None,
+                harness_factory: None,
+                review_requested,
             },
         )
     })
@@ -1103,7 +1266,33 @@ pub(crate) async fn post_stop(
 /// off-screen menus on a tall tree). This hands each scenario a clean slate: stop
 /// every live agent process, wipe the on-disk state, and rebuild the seeded
 /// workbench in place behind the shared mutex.
-pub(crate) async fn post_test_reset(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+#[cfg(debug_assertions)]
+#[derive(Default, serde::Deserialize)]
+pub(crate) struct TestResetQuery {
+    /// Seed one real tracker item after the reset so browser tests can exercise
+    /// the production roster/assignment client. This remains behind the same
+    /// test-only process guard as the reset itself.
+    #[serde(default)]
+    assignable_task: bool,
+    /// Seed a real project chat with one context handle whose payload access is
+    /// still Init, for production-client request/approval journeys.
+    #[serde(default)]
+    withheld_resource: bool,
+    /// Seed a local chat whose export has all required source consent, so the
+    /// desktop picker can supply target admission and perform the real crossing.
+    #[serde(default)]
+    exportable_output: bool,
+}
+
+/// Debug builds only (DR-0054 Phase A): a route that deletes the entire state
+/// root must not exist in a release artifact, so the handler and its mounting
+/// are both compiled out. The `GAUGEWRIGHT_TEST_RESET` process guard below
+/// remains as defense in depth where the route does exist.
+#[cfg(debug_assertions)]
+pub(crate) async fn post_test_reset(
+    State(wb): State<SharedWorkbench>,
+    Query(query): Query<TestResetQuery>,
+) -> impl IntoResponse {
     if std::env::var("GAUGEWRIGHT_TEST_RESET").is_err() {
         return (StatusCode::FORBIDDEN, "reset is disabled").into_response();
     }
@@ -1130,7 +1319,195 @@ pub(crate) async fn post_test_reset(State(wb): State<SharedWorkbench>) -> impl I
     // Clear any armed test-only conflict injection (UX-7) so it can't leak across scenarios.
     engine::set_force_merge_conflict(false);
     match build_workbench(&root) {
-        Ok(fresh) => {
+        Ok(mut fresh) => {
+            // The enterprise browser composition uses the same reset hook. Seed
+            // its controlled identities and memberships here, behind the
+            // test-only gate, rather than retaining a production `/admin/*`
+            // write bypass solely for test setup. When the launcher supplies
+            // credentials, the production enterprise middleware and cookie /
+            // bearer parser remain active; absence and invalid credentials fail
+            // closed exactly as they do outside the harness.
+            let owner = crate::org::MembershipRecord {
+                id: "local-user".to_owned(),
+                op: crate::org::RecordOp::Upsert,
+                org_id: crate::org::ORG_ID.to_owned(),
+                authority: "local-user".to_owned(),
+                email: String::new(),
+                role: "owner".to_owned(),
+                status: crate::org::MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            };
+            let _ = fresh.store_mut().append_record(
+                crate::org::ORG_SCOPE,
+                "membership",
+                &serde_json::to_string(&owner).expect("test owner serializes"),
+            );
+            if let Ok(owner_token) = std::env::var("GAUGEWRIGHT_TEST_IDENTITY_TOKEN") {
+                use std::sync::Arc;
+
+                use gaugewright_core::abac::AuthorityAttributes;
+                use gaugewright_core::ids::AuthorityId;
+
+                let member_token = std::env::var("GAUGEWRIGHT_TEST_MEMBER_TOKEN")
+                    .unwrap_or_else(|_| "gw-e2e-member-token".to_owned());
+                let member = crate::org::MembershipRecord {
+                    id: "e2e-member".to_owned(),
+                    op: crate::org::RecordOp::Upsert,
+                    org_id: crate::org::ORG_ID.to_owned(),
+                    authority: "e2e-member".to_owned(),
+                    email: String::new(),
+                    role: "member".to_owned(),
+                    status: crate::org::MembershipStatus::Active,
+                    managed_by_scim: false,
+                    team: None,
+                };
+                let _ = fresh.store_mut().append_record(
+                    crate::org::ORG_SCOPE,
+                    "membership",
+                    &serde_json::to_string(&member).expect("test member serializes"),
+                );
+                let idp = crate::identity::LoopbackIdentityProvider::new()
+                    .enroll(
+                        owner_token,
+                        AuthorityId::new("local-user"),
+                        AuthorityAttributes::default(),
+                    )
+                    .enroll(
+                        member_token,
+                        AuthorityId::new("e2e-member"),
+                        AuthorityAttributes::default(),
+                    );
+                fresh.set_identity_provider(Some(Arc::new(idp)));
+            }
+            if query.assignable_task {
+                let tracker = match fresh.account_tracker() {
+                    Ok(tracker) => tracker,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("test tracker: {error}"),
+                        )
+                            .into_response()
+                    }
+                };
+                if let Err(error) = tracker.file_item(
+                    crate::onboarding::ONBOARDING_QUEUE,
+                    "Assign this onboarding step",
+                    "Browser fixture for the production roster and assignment path.",
+                    &[],
+                    &serde_json::json!({ "step": "assignment-contract" }),
+                    Some("test-system"),
+                ) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("test tracker seed: {error}"),
+                    )
+                        .into_response();
+                }
+            }
+            if query.withheld_resource {
+                use gaugewright_core::boundary::Authority;
+                use gaugewright_core::resource::{
+                    ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
+                };
+
+                let chat = "access-contract";
+                if fresh
+                    .create_default_engagement(chat.to_owned(), "Access contract".to_owned())
+                    .is_err()
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "test access chat could not be created",
+                    )
+                        .into_response();
+                }
+                let owner = Authority::from(fresh.authority().as_str());
+                let record = ResourceRecord::new(
+                    Resource::input(
+                        ResourceId::new("withheld-context"),
+                        ResourceKind::context(),
+                        owner.clone(),
+                    ),
+                    ContentLocator::Workspace {
+                        path: "withheld.txt".to_owned(),
+                        commit: "test-fixture".to_owned(),
+                    },
+                    |_| owner.clone(),
+                );
+                if let Err(error) = crate::resource_store::put(fresh.store_mut(), chat, &record) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("test access resource: {error:?}"),
+                    )
+                        .into_response();
+                }
+            }
+            if query.exportable_output {
+                let chat = "export-contract";
+                if fresh
+                    .create_default_engagement(chat.to_owned(), "Export contract".to_owned())
+                    .is_err()
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "test export chat could not be created",
+                    )
+                        .into_response();
+                }
+                match fresh.write_engagement_file(chat, "deliverable.txt", "desktop export proof\n")
+                {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("test export file: {error}"),
+                        )
+                            .into_response()
+                    }
+                    None => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "test export engagement disappeared",
+                        )
+                            .into_response()
+                    }
+                }
+                let authority = fresh.authority().as_str().to_owned();
+                let output = match crate::resource_store::mint_output(
+                    fresh.store_mut(),
+                    chat,
+                    &authority,
+                    "test-fixture",
+                ) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("test output resource: {error:?}"),
+                        )
+                            .into_response()
+                    }
+                };
+                match fresh.admit_resource_export(chat, &output.resource.id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "test output resource disappeared",
+                        )
+                            .into_response()
+                    }
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("test output export proposal: {error:?}"),
+                        )
+                            .into_response()
+                    }
+                }
+            }
             *guard = fresh;
             (StatusCode::OK, Json(serde_json::json!({ "reset": true }))).into_response()
         }
@@ -1138,6 +1515,7 @@ pub(crate) async fn post_test_reset(State(wb): State<SharedWorkbench>) -> impl I
     }
 }
 
+#[cfg(debug_assertions)]
 #[derive(serde::Deserialize)]
 pub(crate) struct ForceConflictBody {
     #[serde(default)]
@@ -1146,7 +1524,9 @@ pub(crate) struct ForceConflictBody {
 
 /// Test-only (`UX-7`): arm/disarm merge-conflict injection so a browser BDD can drive the
 /// `INV-24` conflict-repair path. Inert unless `GAUGEWRIGHT_TEST_RESET` is set, like
-/// [`post_test_reset`]; `POST /test/reset` also clears it.
+/// [`post_test_reset`]; `POST /test/reset` also clears it. Debug builds only
+/// (DR-0054 Phase A), like the reset route it accompanies.
+#[cfg(debug_assertions)]
 pub(crate) async fn post_test_force_conflict(
     Json(body): Json<ForceConflictBody>,
 ) -> impl IntoResponse {

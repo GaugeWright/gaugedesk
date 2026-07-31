@@ -3,14 +3,16 @@
   "include": [],
   "files": [
     "packages/control-plane-client/src/auth-session.ts",
+    "packages/control-plane-client/src/background.ts",
     "packages/control-plane-client/src/browser-route-json.ts",
     "packages/control-plane-client/src/bridge.ts",
+    "packages/control-plane-client/src/cloud-home.ts",
     "packages/control-plane-client/src/control-plane-account.ts",
     "packages/control-plane-client/src/control-plane-domain.ts",
-    "packages/control-plane-client/src/control-plane-embed.ts",
     "packages/control-plane-client/src/control-plane-federation.ts",
     "packages/control-plane-client/src/control-plane-transport.ts",
     "packages/control-plane-client/src/control-plane-workbench.ts",
+    "packages/control-plane-client/src/management-environment.ts",
     "packages/control-plane-client/src/project-home.ts",
     "packages/control-plane-client/src/projection-carriage.ts",
     "packages/control-plane-client/src/remote-control-plane.ts"

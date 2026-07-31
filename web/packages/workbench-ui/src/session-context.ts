@@ -21,6 +21,7 @@ import {
     type MergeAction,
     type MergePhase,
     type MergePreviewResult,
+    type QuarantineIndex,
     type RegionResolution,
     type SaveBase,
     type SaveFileResult,
@@ -29,6 +30,20 @@ import { type Transcript } from "./transcript";
 
 export interface SessionApi {
     getFile(id: EngagementId, path: string): Promise<string>;
+    /** The project's quarantine index — provenance only, never payload
+     *  (ADR 0110 §7). Optional: only a session that can review inbound material
+     *  serves it. */
+    listQuarantine?(project: string): Promise<QuarantineIndex>;
+    /** One quarantined item's bytes, for a person to read. */
+    readQuarantinedItem?(project: string, item: string): Promise<string>;
+    /** Carry a reviewer's verdict to the project's gate, which is what rules
+     *  (ADR 0117 §1). `chat` is the chat the review is acted from. */
+    reviewQuarantinedItem?(
+        project: string,
+        item: string,
+        chat: EngagementId,
+        verdict: "keep" | "flag",
+    ): Promise<{ workspacePath: string | null }>;
     /** `getFile` plus the cut the read serves (SUB-6 §12) — the base a
      *  cut-carrying save sends back. Optional: sessions without it fall
      *  back to content-based bases. */
@@ -56,7 +71,15 @@ export interface SessionApi {
         baseCut: string,
     ): Promise<MergePreviewResult>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
-    embedMyChats(): Promise<{ chat: string; title: string }[]>;
+    /** Audience chat index, present only on a public/audience control plane. */
+    embedMyChats?(): Promise<{ chat: string; title: string }[]>;
+    /** Whether this scoped public session has an authenticated audience. */
+    readonly embedAudience?: boolean;
+    /** Audience-scoped chat lifecycle commands. The environment swaps the
+     * Session binding; the shared panels remain transport-agnostic. */
+    embedOpenChat?(chat: string): Promise<void>;
+    embedNewChat?(): Promise<void>;
+    embedEraseChat?(chat: string): Promise<void>;
     /** The deployment's public embed config (EMBED-7 white-label). Optional: only a
      *  scoped embed session serves `/embed/config`; desktop sessions omit it. */
     embedGetConfig?(): Promise<{ white_label: boolean }>;
@@ -74,6 +97,26 @@ export interface Session {
     /** Cross-panel file selection within this session (the content-viewer target). */
     readonly selectedFile: Accessor<string | null>;
     readonly selectFile: (path: string | null) => void;
+    /** Optional Environment-owned edit ceiling for virtual/special files. When
+     *  present it narrows the shared editor; it never makes a normally protected
+     *  package/control path writable. */
+    readonly canEditFile?: (path: string) => boolean;
+    /** Environment-specific explanation for a file refused by `canEditFile`. */
+    readonly readOnlyFileReason?: (path: string) => string;
+
+    /** Optional: the project whose quarantine index the content viewer shows,
+     *  and the setter the top bar's inbound pill drives (ADR 0110 §7, GATE-6).
+     *
+     *  Deliberately *not* modelled as a `selectedFile` path. Quarantine is a path
+     *  boundary no agent file store resolves into (ADR 0110 §1), and giving it a
+     *  file-shaped address — even a virtual one — would put it in the same
+     *  namespace the protection is stated over. It is its own surface because it
+     *  is its own kind of thing: the reviewer's, never an agent's.
+     *
+     *  Absent in sessions with nothing to review: an embed reviews no inbound
+     *  material, so the panel simply never shows the surface. */
+    readonly reviewingProject?: Accessor<string | null>;
+    readonly reviewProject?: (project: string | null) => void;
 
     // Engagement-scoped read projections (`INV-5`). The desktop exposes its existing
     // resources here; an embed exposes the same shapes over its scoped session.
@@ -94,7 +137,9 @@ export interface Session {
      *  records concatenated with the live SSE reduction of the in-progress turn
      *  (`transcript.ts`). A view, not truth (`INV-5`). */
     readonly transcript: Accessor<Transcript>;
-
+    /** Whether this session is waiting on an admitted turn. Environments that
+     *  can observe it expose the same shared working/composer presentation. */
+    readonly busy?: Accessor<boolean>;
     // Scoped commands + refetch (the panel issues; the session admits/refetches).
     /** Drive the merge lifecycle for this engagement (keep / discard / …). */
     readonly merge: (action: MergeAction) => void;
@@ -103,6 +148,11 @@ export interface Session {
     /** Send a message — start a turn on this engagement. The primitive a composer
      *  rides; the desktop layers its draft/queue/steer controls on top. */
     readonly send: (text: string) => void;
+    /** Cooperatively cancel the current durable turn. */
+    readonly stop?: () => Promise<void>;
+    /** Fork at an exact durable user/assistant boundary. Owner environments
+     *  supply this; audience sessions intentionally omit it. */
+    readonly forkAt?: (entryId: number) => void;
 }
 
 const SessionContext = createContext<Session>();

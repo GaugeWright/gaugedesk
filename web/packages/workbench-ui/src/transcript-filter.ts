@@ -94,7 +94,7 @@ const MESSAGE_IDS: readonly MessageCategory[] = ["user", "agent", "blocked", "sy
 export const TOOL_IDS: readonly ToolId[] = ["bash", "write", "edit", "read", "ls", "grep", "find", "other"];
 
 export const defaultPrefs: FilterPrefs = {
-    messages: { user: true, agent: true, blocked: true, system: true, error: true },
+    messages: { user: true, agent: true, blocked: true, system: false, error: true },
     tools: {
         bash: { visible: true, expanded: false },
         write: { visible: true, expanded: false },
@@ -124,12 +124,17 @@ export function lineToolGroup(line: TranscriptLine): ToolGroup | null {
     return line.kind === "tool" && line.tool ? toolGroup(toolId(line.tool.name)) : null;
 }
 
-/** True when anything is hidden — drives the funnel's "filtering is on" state. */
+/** True when the reader hides anything that is visible in the product defaults.
+ *  System notes start hidden, so that baseline alone does not light the funnel. */
 export function isFiltering(prefs: FilterPrefs): boolean {
-    return MESSAGE_IDS.some((m) => !prefs.messages[m]) || TOOL_IDS.some((t) => !prefs.tools[t].visible);
+    return (
+        MESSAGE_IDS.some((m) => defaultPrefs.messages[m] && !prefs.messages[m]) ||
+        TOOL_IDS.some((t) => !prefs.tools[t].visible)
+    );
 }
 
 const STORAGE_KEY = "ui.transcript-filter";
+const STORAGE_VERSION = 2;
 
 /** Load prefs from storage, each field merged over the defaults so a message
  *  category or tool added after the blob was written is always present
@@ -139,11 +144,16 @@ export function loadPrefs(storage: Pick<Storage, "getItem"> | null): FilterPrefs
         const raw = storage?.getItem(STORAGE_KEY);
         if (!raw) return defaultPrefs;
         const saved = JSON.parse(raw) as {
+            version?: number;
             messages?: Partial<Record<MessageCategory, boolean>>;
             tools?: Partial<Record<ToolId, Partial<ToolPref>>>;
         };
         const messages = { ...defaultPrefs.messages };
         for (const id of MESSAGE_IDS) {
+            // Version 1 wrote every checkbox, so it cannot distinguish the old
+            // system:true factory value from an intentional choice. Migrate that
+            // category to the quieter baseline; subsequent explicit saves are v2.
+            if (id === "system" && saved.version !== STORAGE_VERSION) continue;
             if (typeof saved.messages?.[id] === "boolean") messages[id] = saved.messages[id] as boolean;
         }
         const tools = {} as Record<ToolId, ToolPref>;
@@ -160,7 +170,7 @@ export function loadPrefs(storage: Pick<Storage, "getItem"> | null): FilterPrefs
  *  are session-only this run, acceptable for view state. */
 export function savePrefs(storage: Pick<Storage, "setItem"> | null, prefs: FilterPrefs): void {
     try {
-        storage?.setItem(STORAGE_KEY, JSON.stringify(prefs));
+        storage?.setItem(STORAGE_KEY, JSON.stringify({ version: STORAGE_VERSION, ...prefs }));
     } catch {
         // storage unavailable → prefs are session-only this run
     }

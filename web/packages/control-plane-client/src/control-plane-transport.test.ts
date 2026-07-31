@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-    isProvisionedTenant,
     isSecureControlPlaneEndpoint,
     resolveControlPlaneBase,
     SOLO_CONTROL_PLANE,
@@ -29,19 +28,6 @@ describe("resolveControlPlaneBase - solo vs enterprise control plane (DEPLOY-5)"
     it("tolerates null storage when no enterprise endpoint is available", () => {
         expect(resolveControlPlaneBase("", null)).toBe(SOLO_CONTROL_PLANE);
         expect(resolveControlPlaneBase("?cp=https://x", null)).toBe("https://x");
-    });
-});
-
-describe("isProvisionedTenant - org admin console gate (DEPLOY-7, ADR 0059)", () => {
-    it("solo collapse is not a provisioned tenant", () => {
-        expect(isProvisionedTenant("", store(null))).toBe(false);
-        expect(isProvisionedTenant("?foo=1", store(null))).toBe(false);
-        expect(isProvisionedTenant("", null)).toBe(false);
-    });
-
-    it("a persisted enterprise endpoint or cp query override is a provisioned tenant", () => {
-        expect(isProvisionedTenant("", store("https://cp.acme.example"))).toBe(true);
-        expect(isProvisionedTenant("?cp=http://127.0.0.1:7878", store(null))).toBe(true);
     });
 });
 

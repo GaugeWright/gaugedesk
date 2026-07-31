@@ -6,13 +6,20 @@ export type EngagementId = Brand<string, "EngagementId">;
 /** An **archetype** — the reusable method (ADR 0035; the old "agent definition"). */
 export type ArchetypeId = Brand<string, "ArchetypeId">;
 export type ProjectId = Brand<string, "ProjectId">;
+export type HomeId = Brand<string, "HomeId">;
 /** A **placement** — an archetype installed on a project (ADR 0035; the old
  *  "using instance"). Identity is `archetype · project`. */
 export type PlacementId = Brand<string, "PlacementId">;
+/** Immutable workspace identity shared by a chat and every line it may join. For a
+ * work chat this is its placement instance; for an edit chat it is the archetype's
+ * authoring instance. */
+export type WorkspaceRootId = Brand<string, "WorkspaceRootId">;
 /** A **workstream** — a named shared auto-sync line within a placement (WS-F). The
  *  UI keys and compares on this id (membership, join/leave), so it is branded like
  *  the other domain ids rather than left a bare `string`. */
 export type WorkstreamId = Brand<string, "WorkstreamId">;
+/** The independently-authoritative repository/folder/managed body a chat changes. */
+export type WorkTargetId = Brand<string, "WorkTargetId">;
 
 export function scopeId(raw: string): ScopeId {
     if (!raw) throw new Error("empty ScopeId");
@@ -26,6 +33,10 @@ export function workstreamId(raw: string): WorkstreamId {
     if (!raw) throw new Error("empty WorkstreamId");
     return raw as WorkstreamId;
 }
+export function workTargetId(raw: string): WorkTargetId {
+    if (!raw) throw new Error("empty WorkTargetId");
+    return raw as WorkTargetId;
+}
 
 // ----- The library facet tree (ADR 0035/0036 data model) -----
 
@@ -33,6 +44,39 @@ export function workstreamId(raw: string): WorkstreamId {
  *  rooted on an archetype ⇒ `edit` (improve the method); rooted on a placement ⇒
  *  `work` (do the job). This replaces the old `use`/`edit` ChatMode toggle. */
 export type ChatKind = "edit" | "work";
+export type WorkTargetKind = "managed" | "external-vcs" | "external-folder";
+export type TargetVcsPosture = "managed" | "external-vcs" | "unversioned";
+export type WorkTargetStatus = "available" | "unavailable" | "retired";
+export type TargetActKind = "read" | "propose" | "apply" | "publish" | "release";
+export type TargetConcurrency = "serialized" | "native-vcs" | "compare-before-write-weak";
+
+export interface TargetCapabilities {
+    readonly read: boolean;
+    readonly propose: boolean;
+    readonly apply: boolean;
+    readonly publish: boolean;
+    readonly release: boolean;
+}
+
+/** Locator-free projection of a work-target record. Raw machine paths,
+ * credentials, and local storage ids never cross this client boundary. */
+export interface WorkTargetNode {
+    readonly id: WorkTargetId;
+    readonly name: string;
+    readonly ownerKind: "project" | "archetype";
+    readonly ownerId: string;
+    readonly authority: string;
+    readonly parties: readonly string[];
+    readonly kind: WorkTargetKind;
+    readonly adapter: string;
+    readonly adapterFamily: string;
+    readonly vcsPosture: TargetVcsPosture;
+    readonly currentBasis: string | null;
+    readonly pathScope: readonly string[];
+    readonly capabilities: TargetCapabilities;
+    readonly status: WorkTargetStatus;
+    readonly concurrency: TargetConcurrency;
+}
 
 /** A chat (engagement) leaf in the nav tree. */
 export interface ChatNode {
@@ -40,16 +84,28 @@ export interface ChatNode {
     readonly title: string;
     readonly kind: ChatKind;
     /** The id of the workstream this chat is homed to, or `null` for the placement
-     *  mainline (the default). Drives the nav membership badge (WS-F). */
+     *  mainline (the default). Drives workstream grouping in the nav (WS-F). */
     readonly workstream: WorkstreamId | null;
     /** The chat's placement (its authoring/work instance). Lets a workstream be created
      *  from this chat row, resolving the placement to the chat's own home (WS-H). */
     readonly placement: PlacementId | null;
+    /** The immutable workspace root used for workstream admission. */
+    readonly workspaceRoot: WorkspaceRootId;
+    readonly targetId: WorkTargetId;
+    readonly targetBasis: string;
+    readonly targetKind: WorkTargetKind;
+    readonly targetAdapter: string;
+    readonly targetPathScope: readonly string[];
+    readonly targetCapabilities: TargetCapabilities;
+    readonly candidateRevision: string;
+    readonly availableActs: readonly TargetActKind[];
     /** Per-chat status for the nav gem (WS-H b/c), folded from the chat's merge scope.
      *  `changes` = a finished turn's diff awaits the human's keep; `conflict` = an
      *  auto-sync / merge hit a conflict being repaired. */
     readonly changes: boolean;
     readonly conflict: boolean;
+    /** True while re-homing would discard/transplant a candidate workspace. */
+    readonly rehomeBlocked: boolean;
 }
 
 /** A **workstream** (WS-E): a named shared auto-sync line within a placement. Member
@@ -58,6 +114,9 @@ export interface WorkstreamNode {
     readonly id: WorkstreamId;
     readonly name: string;
     readonly placementId: PlacementId;
+    /** Exact immutable root eligible member chats must share. */
+    readonly workspaceRoot: WorkspaceRootId;
+    readonly targetId: WorkTargetId;
     readonly status: "active" | "archived";
     /** The chat ids currently homed to this workstream. */
     readonly members: EngagementId[];
@@ -70,6 +129,7 @@ export interface ArchetypeNode {
     /** The archetype's authoring instance — the root a workstream over its edit chats is
      *  created on (WS-F). */
     readonly instanceId: PlacementId;
+    readonly authoringTargetId: WorkTargetId;
     readonly isDefault: boolean;
     /** The source this archetype was forked from (ADR 0038), or null for an original.
      *  A fork shares its source's history, so it can pull upstream improvements. */
@@ -102,44 +162,161 @@ export interface PlacementNode {
      *  not-yet-accepted under an approval-required policy. It can't host work chats until
      *  the owner accepts it; the nav flags it. Frictionless placements are never pending. */
     readonly pending: boolean;
+    readonly targetIds: readonly WorkTargetId[];
     readonly chats: ChatNode[];
     /** The named workstreams (shared auto-sync lines) in this placement (WS-F). */
     readonly workstreams: WorkstreamNode[];
 }
-/** A **project** — a trust/data boundary (ADR 0036) holding its placements. The
- *  hidden default "Personal" project is filtered out by the backend. */
+/** A **project** — a trust/data boundary (ADR 0036) holding its placements. */
 export interface ProjectNode {
     readonly id: ProjectId;
+    readonly homeId: HomeId;
     readonly name: string;
+    /** The always-visible zero-setup personal trust boundary (ADR 0097). */
+    readonly isPersonal: boolean;
     /** Network egress posture (RF-B3): `true` isolates this project's chats from
      *  the network (fail-closed); `false` (the default) lets them reach the model. */
     readonly networkIsolated: boolean;
+    readonly targets: readonly WorkTargetNode[];
     readonly placements: PlacementNode[];
 }
-/** A flat "all chats" row, tagged with the archetype it came from + its kind, and the
- *  workstream it is homed to (if any) so the Chats facet can group by workstream. */
+
+export interface PublicDeploymentInput {
+    readonly placement_id: PlacementId;
+    readonly deployment_id: string;
+    readonly edge_origin: string;
+    readonly allowed_origins: readonly string[];
+    readonly panel_ceiling: readonly ("gw-chat" | "gw-viewer" | "gw-files" | "gw-chats")[];
+    readonly max_spend_cents: number;
+    readonly reserve_cents_per_turn: number;
+    readonly per_visitor_turn_limit: number;
+    readonly max_concurrent_sessions: number;
+    readonly funding_ref: string;
+    readonly credential_class: string;
+    readonly credential_ref: string;
+    readonly model: string;
+    readonly white_label: boolean;
+    /** How long a visitor may resume, within the ceiling the release declares
+     *  (ADR 0109). A resumption window, not a collection deadline — collection
+     *  latency is independent of it, which is why the two are separate fields
+     *  rather than one "how long do we keep this". Omitted fields take the
+     *  server's defaults. */
+    readonly retention_idle_ttl_seconds?: number;
+    readonly retention_absolute_ttl_seconds?: number;
+    /** Absent means this deployment collects nothing. */
+    readonly collection?: PublicDeploymentCollection;
+}
+
+/** What a collecting deployment gathers, and who it seals to (ADR 0109 §5–§7).
+ *
+ *  `exportable_paths` and `transcript_eligible` are release content — what the
+ *  author declared may leave at all. `recipient_ref` and `recipient_public_keys`
+ *  are the *deployment's* choice of keyring, and the edge refuses a reference
+ *  whose class the release does not permit. There is no ambient fallback: a
+ *  deployment that names no recipient collects nothing. */
+export interface PublicDeploymentCollection {
+    readonly exportable_paths: readonly string[];
+    readonly transcript_eligible: boolean;
+    readonly schema_ref: string;
+    readonly recipient_class: string;
+    readonly max_artifact_bytes: number;
+    readonly recipient_ref: string;
+    /** Public halves only, hex SEC1 P-256. The private halves never leave the
+     *  Home — they are what opens a drained artifact. */
+    readonly recipient_public_keys: readonly string[];
+}
+
+/** One collection recipient keyring this Home holds. */
+export interface CollectionRecipient {
+    readonly recipient_id: string;
+    readonly recipient_ref: string;
+    readonly public_key_hex: string;
+}
+
+export interface PublicDeploymentOutcome {
+    readonly deployment_id: string;
+    readonly release_id: string;
+    readonly edge_origin: string;
+    readonly deployment_url: string;
+    readonly embed_html: string;
+    readonly deployment: unknown;
+}
+
+export interface PublicCredentialMetadata {
+    readonly credential_ref: string;
+    readonly provider: "openai" | "anthropic";
+    readonly credential_class: string;
+    readonly label: string;
+    readonly created_at_unix_ms: number;
+}
+
+export interface ProvisionPublicCredentialInput {
+    readonly edge_origin: string;
+    readonly provider: "openai" | "anthropic";
+    readonly credential_class: string;
+    readonly api_key: string;
+    readonly label: string;
+}
+
+export interface PublicDeploymentInspection {
+    readonly deployment: {
+        readonly lifecycle: "active" | "paused" | "revoked";
+        readonly config: {
+            readonly deployment_id: string;
+            readonly allowed_origins: readonly string[];
+            readonly panel_ceiling: readonly string[];
+            readonly max_spend_cents: number;
+            readonly per_visitor_turn_limit: number;
+            readonly max_concurrent_sessions: number;
+        };
+        readonly active_release_id: string;
+        readonly activation_revision: number;
+        readonly spent_cents: number;
+        readonly reserved_cents: number;
+        readonly sessions: number;
+        readonly settled_turns: number;
+    };
+    readonly audience: readonly {
+        readonly session_id: string;
+        readonly release_id: string;
+        readonly origin: string;
+        readonly principal_mode: "anonymous" | "authenticated";
+        readonly audience_id: string | null;
+        readonly created_at_unix_ms: number;
+        readonly settled_turns: number;
+        readonly expired_at_unix_ms?: number;
+    }[];
+}
+/** A recent-chat row retained for search and activity projections. */
 export interface RecentChat {
     readonly id: EngagementId;
     readonly title: string;
     readonly archetype: string;
     readonly kind: ChatKind;
     readonly workstream: WorkstreamId | null;
-    /** The chat's placement (its home instance), so a workstream can be created from this
-     *  row in the cross-cutting Chats facet without picking a root (WS-H). */
+    /** The chat's placement (its home instance). */
     readonly placement: PlacementId | null;
+    readonly workspaceRoot: WorkspaceRootId;
+    readonly targetId: WorkTargetId;
+    readonly targetBasis: string;
+    readonly targetKind: WorkTargetKind;
+    readonly targetAdapter: string;
+    readonly candidateRevision: string;
+    readonly availableActs: readonly TargetActKind[];
     /** Per-chat nav-gem status (WS-H b/c); see {@link ChatNode}. */
     readonly changes: boolean;
     readonly conflict: boolean;
+    readonly rehomeBlocked: boolean;
 }
-/** The whole facet tree the nav renders: a projection over the library records. The
- *  flat `workstreams` list lets the Chats facet label cross-root workstream groups. */
+/** The whole facet tree the nav renders: a projection over the library records. */
 export interface Workspace {
     readonly archetypes: ArchetypeNode[];
     readonly projects: ProjectNode[];
     readonly recent: RecentChat[];
     readonly workstreams: WorkstreamNode[];
-    /** The hidden Personal placement personal chats root on — the target for a "+ workstream"
-     *  in the cross-cutting Chats facet (WS-H). */
+    readonly workTargets: WorkTargetNode[];
+    /** The explicit Personal project's default placement. Retained as a direct
+     * quick-start address alongside the rooted project tree. */
     readonly personalPlacement: PlacementId | null;
 }
 
@@ -158,18 +335,18 @@ export interface SearchHit {
 }
 
 /** A workspace-change **reference** pushed on the event stream (ADR 0037): what
- *  library record changed and how — never its content. The nav resolves the
- *  projection on receipt. */
+ *  library record changed and how — never its content. The nav resolves a scoped
+ *  delta projection on receipt. */
 export interface WorkspaceChange {
-    readonly record: "archetype" | "project" | "placement" | "chat";
+    readonly record: "archetype" | "project" | "placement" | "chat" | "workstream" | "work_target";
     readonly id: string;
     readonly op: "upsert" | "tombstone";
 }
 
 /** An event from the control-plane stream that clients reduce into a transcript. */
 export type StreamEvent =
-    | { type: "user"; text: string }
-    | { type: "assistant"; text: string }
+    | { type: "user"; text: string; entry_id?: number; forkable?: boolean }
+    | { type: "assistant"; text: string; entry_id?: number; forkable?: boolean }
     | { type: "text"; delta: string }
     | { type: "tool"; tool: string; mediated: boolean; call_id?: string; target?: string; args?: string }
     | { type: "toolresult"; call_id: string; ok: boolean; result?: string }
@@ -177,24 +354,27 @@ export type StreamEvent =
     | { type: "error"; reason: string; code?: string }
     | { type: "admitted"; kind: string; text: string };
 
-const WORKSPACE_RECORDS: readonly WorkspaceChange["record"][] = ["archetype", "project", "placement", "chat"];
+const WORKSPACE_RECORDS: readonly WorkspaceChange["record"][] = ["archetype", "project", "placement", "chat", "workstream", "work_target"];
 /** Narrow a raw event `record` to the closed {@link WorkspaceChange} set. */
 export function isWorkspaceRecord(v: unknown): v is WorkspaceChange["record"] {
     return typeof v === "string" && (WORKSPACE_RECORDS as readonly string[]).includes(v);
 }
 
 /** The kinds of task the top bar surfaces (ADR 0075 §5): a clean-merge chat
- *  awaiting keep/reject (`review`), or an onboarding checklist item from the
- *  per-boundary whip tracker (`issue`). */
-export type TaskKind = "review" | "answer" | "repair" | "reply" | "issue";
+ *  awaiting keep/reject (`review`), an onboarding checklist item from the
+ *  per-boundary whip tracker (`issue`), or inbound material a project's gate
+ *  has parked on a person (`screen`, ADR 0110 §7). */
+export type TaskKind = "review" | "answer" | "repair" | "reply" | "issue" | "screen";
 
 /** One item in the human task queue (the top bar). The kind is the **ask** —
  *  the verb the human is being asked to perform (ADR 0082 §2): `review` a clean
  *  merge (keep/reject), `answer` the agent's pending question, `repair` a merge
  *  conflict; `issue` tasks come from the account-global whip tracker
- *  (onboarding). Note `id` is an {@link EngagementId} for chat asks but a whip
- *  work-item id (`WS-N`) for `issue` tasks — narrow on `kind` before treating
- *  it as an engagement. */
+ *  (onboarding); `screen` inbound material a project's gate parked on a person.
+ *  Note `id` is an {@link EngagementId} for chat asks but a whip work-item id
+ *  (`WS-N`) for `issue` tasks — narrow on `kind` before treating it as an
+ *  engagement. A `screen` task's `id` *is* an engagement, but the task belongs
+ *  to `project` rather than to that chat. */
 export interface HumanTask {
     readonly id: string;
     readonly title: string;
@@ -203,41 +383,174 @@ export interface HumanTask {
     /** The authority this task is assigned to — v1: the acting/owner authority.
      *  Undefined = unassigned / visible to the boundary owner (ADR 0075 §4). */
     readonly assignee?: string;
+    /** `issue` only: the tracker boundary required when assigning its item id. */
+    readonly boundary?: string;
+    /** `screen` only: the project whose quarantine this counts. The task is
+     *  project-scoped — `id` names the chat the index opens in, which is where a
+     *  reviewer goes to look, not what the count belongs to. */
+    readonly project?: string;
+    /** `screen` only: how many items are waiting on a person. */
+    readonly waiting?: number;
 }
 
-const parseChat = (c: { id: string; title: string; kind?: ChatKind; workstream?: string | null; placement?: string | null; changes?: boolean; conflict?: boolean }): ChatNode => ({
+/** One active member in the host-derived roster used by ask and assignment. */
+export interface RosterPerson {
+    readonly authority: string;
+    readonly display: string;
+    readonly role: string;
+}
+
+function requiredString(value: unknown, field: string): string {
+    if (typeof value !== "string" || !value) throw new Error(`workspace: expected ${field}`);
+    return value;
+}
+
+function stringList(value: unknown, field: string): string[] {
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+        throw new Error(`workspace: expected ${field} string array`);
+    }
+    return value;
+}
+
+function valueList(value: unknown, field: string): unknown[] {
+    if (!Array.isArray(value)) throw new Error(`workspace: expected ${field} array`);
+    return value;
+}
+
+function parseTargetKind(value: unknown, field: string): WorkTargetKind {
+    if (value === "managed" || value === "external-vcs" || value === "external-folder") return value;
+    throw new Error(`workspace: expected ${field}`);
+}
+
+function parseTargetCapabilities(value: unknown, field: string): TargetCapabilities {
+    const o = (value ?? {}) as Record<string, unknown>;
+    for (const act of ["read", "propose", "apply", "publish", "release"] as const) {
+        if (typeof o[act] !== "boolean") throw new Error(`workspace: expected ${field}.${act}`);
+    }
+    return {
+        read: o.read as boolean,
+        propose: o.propose as boolean,
+        apply: o.apply as boolean,
+        publish: o.publish as boolean,
+        release: o.release as boolean,
+    };
+}
+
+function parseTargetActs(value: unknown, field: string): TargetActKind[] {
+    const allowed = new Set<TargetActKind>(["read", "propose", "apply", "publish", "release"]);
+    const values = stringList(value, field);
+    for (const act of values) {
+        if (!allowed.has(act as TargetActKind)) throw new Error(`workspace: bad ${field}`);
+    }
+    return values as TargetActKind[];
+}
+
+type RawChat = {
+    id: string;
+    title: string;
+    kind?: ChatKind;
+    workstream?: string | null;
+    placement?: string | null;
+    workspace_root: string;
+    target_id: string;
+    target_basis: string;
+    target_kind: WorkTargetKind;
+    target_adapter: string;
+    target_path_scope: string[];
+    target_capabilities: TargetCapabilities;
+    candidate_revision: string;
+    available_acts: TargetActKind[];
+    changes?: boolean;
+    conflict?: boolean;
+    rehome_blocked?: boolean;
+};
+
+const parseChat = (c: RawChat): ChatNode => ({
     id: engagementId(c.id),
     title: c.title,
     kind: c.kind === "edit" ? "edit" : "work",
     workstream: c.workstream ? workstreamId(c.workstream) : null,
     placement: c.placement ? (c.placement as PlacementId) : null,
+    workspaceRoot: requiredString(c.workspace_root, "chat.workspace_root") as WorkspaceRootId,
+    targetId: workTargetId(requiredString(c.target_id, "chat.target_id")),
+    targetBasis: requiredString(c.target_basis, "chat.target_basis"),
+    targetKind: parseTargetKind(c.target_kind, "chat.target_kind"),
+    targetAdapter: requiredString(c.target_adapter, "chat.target_adapter"),
+    targetPathScope: stringList(c.target_path_scope, "chat.target_path_scope"),
+    targetCapabilities: parseTargetCapabilities(c.target_capabilities, "chat.target_capabilities"),
+    candidateRevision: requiredString(c.candidate_revision, "chat.candidate_revision"),
+    availableActs: parseTargetActs(c.available_acts, "chat.available_acts"),
     changes: c.changes ?? false,
     conflict: c.conflict ?? false,
+    rehomeBlocked: c.rehome_blocked ?? true,
 });
 
 export const parseWorkstream = (w: {
     id: string;
     name: string;
     placement_id: string;
+    workspace_root: string;
+    target_id: string;
     status?: string;
     members?: string[];
 }): WorkstreamNode => ({
     id: workstreamId(w.id),
     name: w.name,
     placementId: w.placement_id as PlacementId,
+    workspaceRoot: requiredString(w.workspace_root, "workstream.workspace_root") as WorkspaceRootId,
+    targetId: workTargetId(requiredString(w.target_id, "workstream.target_id")),
     status: w.status === "archived" ? "archived" : "active",
     members: (w.members ?? []).map(engagementId),
 });
+
+export function parseWorkTarget(raw: unknown): WorkTargetNode {
+    const o = (raw ?? {}) as Record<string, unknown>;
+    if (typeof o.id !== "string" || !o.id) throw new Error("work target: expected id");
+    const kind = parseTargetKind(o.kind, `work target ${o.id}.kind`);
+    const ownerKind = o.owner_kind === "archetype" ? "archetype" : o.owner_kind === "project" ? "project" : null;
+    if (!ownerKind) throw new Error(`work target ${o.id}: bad owner`);
+    if (o.vcs_posture !== "managed" && o.vcs_posture !== "external-vcs" && o.vcs_posture !== "unversioned") {
+        throw new Error(`work target ${o.id}: bad VCS posture`);
+    }
+    const vcsPosture = o.vcs_posture as TargetVcsPosture;
+    if (o.status !== "available" && o.status !== "unavailable" && o.status !== "retired") {
+        throw new Error(`work target ${o.id}: bad status`);
+    }
+    const status = o.status as WorkTargetStatus;
+    if (o.concurrency !== "serialized" && o.concurrency !== "native-vcs" && o.concurrency !== "compare-before-write-weak") {
+        throw new Error(`work target ${o.id}: bad concurrency posture`);
+    }
+    return {
+        id: workTargetId(o.id),
+        name: requiredString(o.name, `work target ${o.id}.name`),
+        ownerKind,
+        ownerId: requiredString(o.owner_id, `work target ${o.id}.owner_id`),
+        authority: requiredString(o.authority, `work target ${o.id}.authority`),
+        parties: stringList(o.parties, `work target ${o.id}.parties`),
+        kind,
+        adapter: requiredString(o.adapter, `work target ${o.id}.adapter`),
+        adapterFamily: requiredString(o.adapter_family, `work target ${o.id}.adapter_family`),
+        vcsPosture,
+        currentBasis: o.current_basis === null ? null : requiredString(o.current_basis, `work target ${o.id}.current_basis`),
+        pathScope: stringList(o.path_scope, `work target ${o.id}.path_scope`),
+        capabilities: parseTargetCapabilities(o.capabilities, `work target ${o.id}.capabilities`),
+        status,
+        concurrency: o.concurrency,
+    };
+}
 
 /** Parse the raw workspace tree (the same wire shape from `GET /workspace` and the
  *  `/projections/library/workspace` carriage value) into the branded {@link Workspace}. */
 export function parseWorkspace(raw: unknown): Workspace {
     const o = (raw ?? {}) as {
-        archetypes?: { id: string; name: string; instance_id?: string; is_default: boolean; forked_from?: string | null; forked_from_name?: string | null; chats: { id: string; title: string; kind?: ChatKind; workstream?: string | null }[]; workstreams?: { id: string; name: string; placement_id: string; status?: string; members?: string[] }[] }[];
+        archetypes?: { id: string; name: string; instance_id?: string; authoring_target_id: string; is_default: boolean; forked_from?: string | null; forked_from_name?: string | null; chats: RawChat[]; workstreams?: { id: string; name: string; placement_id: string; workspace_root: string; target_id: string; status?: string; members?: string[] }[] }[];
         projects?: {
             id: string;
+            home_id?: string;
             name: string;
+            is_personal?: boolean;
             network_isolated?: boolean;
+            targets: unknown[];
             placements: {
                 placement_id: string;
                 archetype_id: string;
@@ -249,12 +562,14 @@ export function parseWorkspace(raw: unknown): Workspace {
                 current_version?: number;
                 upgrade_available?: boolean;
                 pending?: boolean;
-                chats: { id: string; title: string; kind?: ChatKind; workstream?: string | null }[];
-                workstreams?: { id: string; name: string; placement_id: string; status?: string; members?: string[] }[];
+                target_ids: string[];
+                chats: RawChat[];
+                workstreams?: { id: string; name: string; placement_id: string; workspace_root: string; target_id: string; status?: string; members?: string[] }[];
             }[];
         }[];
-        recent?: { id: string; title: string; archetype: string; kind?: ChatKind; workstream?: string | null; placement?: string | null; changes?: boolean; conflict?: boolean }[];
-        workstreams?: { id: string; name: string; placement_id: string; status?: string; members?: string[] }[];
+        recent?: (RawChat & { archetype: string })[];
+        workstreams?: { id: string; name: string; placement_id: string; workspace_root: string; target_id: string; status?: string; members?: string[] }[];
+        work_targets: unknown[];
         personal_placement?: string | null;
     };
     return {
@@ -262,6 +577,7 @@ export function parseWorkspace(raw: unknown): Workspace {
             id: a.id as ArchetypeId,
             name: a.name,
             instanceId: (a.instance_id ?? "") as PlacementId,
+            authoringTargetId: workTargetId(requiredString(a.authoring_target_id, "archetype.authoring_target_id")),
             isDefault: a.is_default,
             forkedFrom: a.forked_from ? (a.forked_from as ArchetypeId) : null,
             forkedFromName: a.forked_from_name ?? null,
@@ -270,8 +586,11 @@ export function parseWorkspace(raw: unknown): Workspace {
         })),
         projects: (o.projects ?? []).map((p) => ({
             id: p.id as ProjectId,
+            homeId: (p.home_id ?? "") as HomeId,
             name: p.name,
+            isPersonal: p.is_personal ?? false,
             networkIsolated: p.network_isolated ?? false,
+            targets: valueList(p.targets, "project.targets").map(parseWorkTarget),
             placements: p.placements.map((pl) => ({
                 placementId: pl.placement_id as PlacementId,
                 archetypeId: pl.archetype_id as ArchetypeId,
@@ -283,6 +602,7 @@ export function parseWorkspace(raw: unknown): Workspace {
                 currentVersion: pl.current_version ?? 1,
                 upgradeAvailable: pl.upgrade_available ?? false,
                 pending: pl.pending ?? false,
+                targetIds: stringList(pl.target_ids, "placement.target_ids").map(workTargetId),
                 chats: pl.chats.map(parseChat),
                 workstreams: (pl.workstreams ?? []).map(parseWorkstream),
             })),
@@ -294,10 +614,19 @@ export function parseWorkspace(raw: unknown): Workspace {
             kind: c.kind === "edit" ? "edit" : "work",
             workstream: c.workstream ? workstreamId(c.workstream) : null,
             placement: c.placement ? (c.placement as PlacementId) : null,
+            workspaceRoot: requiredString(c.workspace_root, "recent.workspace_root") as WorkspaceRootId,
+            targetId: workTargetId(requiredString(c.target_id, "recent.target_id")),
+            targetBasis: requiredString(c.target_basis, "recent.target_basis"),
+            targetKind: parseTargetKind(c.target_kind, "recent.target_kind"),
+            targetAdapter: requiredString(c.target_adapter, "recent.target_adapter"),
+            candidateRevision: requiredString(c.candidate_revision, "recent.candidate_revision"),
+            availableActs: parseTargetActs(c.available_acts, "recent.available_acts"),
             changes: c.changes ?? false,
             conflict: c.conflict ?? false,
+            rehomeBlocked: c.rehome_blocked ?? true,
         })),
         workstreams: (o.workstreams ?? []).map(parseWorkstream),
+        workTargets: valueList(o.work_targets, "work_targets").map(parseWorkTarget),
         personalPlacement: o.personal_placement ? (o.personal_placement as PlacementId) : null,
     };
 }
@@ -309,7 +638,6 @@ export type RunPhase =
     | "Requested"
     | "Admitted"
     | "Running"
-    | "AwaitingHuman"
     | "Completed"
     | "Failed"
     | "Canceled";
@@ -363,31 +691,20 @@ export interface ReviewState {
     readonly required: string[];
     readonly consented: string[];
 }
-/** Review commands (externally-tagged, matching serde). */
-export type ReviewCommand =
-    | { Propose: { required: string[] } }
-    | { Consent: string }
-    | { Reject: string }
-    | { Revoke: string }
-    | "Release"
-    | "Cancel";
+/** Decisions a caller may make on a concrete resource review. The authenticated
+ * actor is materialized by the server and is never accepted from this payload. */
+export type ResourceReviewAction = "consent" | "reject" | "revoke" | "release";
 
-export type ExportPhase = "Init" | "Requested" | "Cleared" | "Exported";
+export type ExportPhase = "Init" | "Requested" | "Cleared" | "Exported" | "Denied";
 export interface ExportState {
     readonly phase: ExportPhase;
     readonly source_required: string[];
     readonly source_consented: string[];
     readonly target_admitted: boolean;
 }
-export type ExportCommand =
-    | { ProposeExport: { source_required: string[] } }
-    | { SourceConsent: string }
-    | { Revoke: string }
-    | { Reject: string }
-    | "TargetAdmit"
-    | "Export"
-    | "Cancel"
-    | "Expire";
+/** Source decisions on a concrete resource export. Target admission and the
+ * final export fact belong to the egress implementation, not this caller. */
+export type ResourceExportAction = "consent" | "reject" | "revoke";
 
 /** One row of the audit timeline (`INV-6`). */
 export interface AuditEvent {
@@ -413,7 +730,7 @@ const ACCESS_PHASES: readonly AccessPhase[] = ["Init", "Requested", "Granted", "
 /** Validate a wire `access` value against the closed lifecycle (mirrors core
  *  `AccessPhase`); an unknown value throws at the edge rather than reading as a
  *  benign `Init`. */
-function parseAccessPhase(v: unknown): AccessPhase {
+export function parseAccessPhase(v: unknown): AccessPhase {
     if (typeof v === "string" && (ACCESS_PHASES as readonly string[]).includes(v)) return v as AccessPhase;
     throw new Error(`bad access phase: ${JSON.stringify(v)}`);
 }
@@ -466,6 +783,9 @@ export interface MergeState {
     readonly phase: MergePhase;
     readonly thread_state: string;
     readonly git_outcome: GitOutcome;
+    /** This clean candidate was explicitly held for per-change review. A clean
+     * workspace verdict alone does not imply human attention (ADR 0096). */
+    readonly review_requested: boolean;
 }
 export type MergeAction = "admit" | "reject" | "repair" | "retry" | "integrate";
 
@@ -485,6 +805,7 @@ export function parseMergeState(raw: unknown): MergeState {
         phase: o.phase,
         thread_state: typeof o.thread_state === "string" ? o.thread_state : "",
         git_outcome,
+        review_requested: o.review_requested === true,
     };
 }
 
@@ -503,7 +824,7 @@ export function parseReviewState(raw: unknown): ReviewState {
 }
 
 const isExportPhase = (v: unknown): v is ExportPhase =>
-    typeof v === "string" && ["Init", "Requested", "Cleared", "Exported"].includes(v);
+    typeof v === "string" && ["Init", "Requested", "Cleared", "Exported", "Denied"].includes(v);
 
 /** Parse a raw payload into the branded {@link ExportState} (phase-guarded edge). */
 export function parseExportState(raw: unknown): ExportState {
@@ -542,7 +863,6 @@ const isPhase = (v: unknown): v is RunPhase =>
         "Requested",
         "Admitted",
         "Running",
-        "AwaitingHuman",
         "Completed",
         "Failed",
         "Canceled",

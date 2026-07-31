@@ -13,7 +13,10 @@
  */
 
 import { createMemo, createResource, createSignal, onCleanup, Show } from "solid-js";
-import { type ArchetypeId } from "@gaugewright/control-plane-client";
+import {
+    type AgentAbility,
+    type ArchetypeId,
+} from "@gaugewright/control-plane-client";
 
 /** Turn a raw parser error (often double-wrapped JSON with a line/column) into one
  *  plain sentence (#2). The raw JSON is only the Advanced surface now, so we tell
@@ -58,6 +61,8 @@ export function writeFormConfig(prev: unknown, form: FormConfig): Record<string,
 export interface AgentSettingsApi {
     getArchetypeConfig(id: ArchetypeId): Promise<string>;
     setArchetypeConfig(id: ArchetypeId, config: string): Promise<void>;
+    getArchetypeAbilities(id: ArchetypeId): Promise<AgentAbility[]>;
+    setArchetypeAbilities(id: ArchetypeId, abilities: AgentAbility[]): Promise<void>;
 }
 
 export interface AgentSettingsProps {
@@ -67,10 +72,41 @@ export interface AgentSettingsProps {
     onClose: () => void;
 }
 
+export const AGENT_ABILITY_PRESETS: ReadonlyArray<{
+    name: string;
+    detail: string;
+    value: AgentAbility[];
+}> = [
+    {
+        name: "Chat only",
+        detail: "Conversation and reasoning, with no workspace tools.",
+        value: [],
+    },
+    {
+        name: "Read workspace",
+        detail: "Read, search, find, and list files.",
+        value: ["workspace.read"],
+    },
+    {
+        name: "Create artifacts",
+        detail: "Read files, then write and edit artifacts.",
+        value: ["workspace.read", "workspace.write"],
+    },
+    {
+        name: "Run workspace commands",
+        detail: "Create artifacts and run virtual bash. Commands are write-capable.",
+        value: ["workspace.read", "workspace.write", "command.run"],
+    },
+];
+
 export function AgentSettings(props: AgentSettingsProps) {
     const [loaded] = createResource(
         () => props.id,
         (id) => props.api.getArchetypeConfig(id),
+    );
+    const [loadedAbilities] = createResource(
+        () => props.id,
+        (id) => props.api.getArchetypeAbilities(id),
     );
     // The raw JSON the Advanced section edits. Until the user touches Advanced it
     // tracks the loaded config; the form edits flow through it too, so saving always
@@ -78,6 +114,9 @@ export function AgentSettings(props: AgentSettingsProps) {
     const [raw, setRaw] = createSignal<string | null>(null);
     const [msg, setMsg] = createSignal("");
     const [showAdvanced, setShowAdvanced] = createSignal(false);
+    const [selectedAbilities, setSelectedAbilities] = createSignal<AgentAbility[] | null>(
+        null,
+    );
     const text = () => raw() ?? loaded() ?? "{}";
 
     // Escape closes the modal (#6 round-5: it didn't, leaving the user to hunt for
@@ -98,6 +137,7 @@ export function AgentSettings(props: AgentSettingsProps) {
     });
     const form = createMemo(() => readFormConfig(parsed()));
     const rawIsValid = () => parsed() !== null;
+    const abilities = () => selectedAbilities() ?? loadedAbilities() ?? [];
 
     function updateForm(patch: Partial<FormConfig>) {
         const next = writeFormConfig(parsed() ?? {}, { ...form(), ...patch });
@@ -107,6 +147,7 @@ export function AgentSettings(props: AgentSettingsProps) {
 
     async function save() {
         try {
+            await props.api.setArchetypeAbilities(props.id, abilities());
             await props.api.setArchetypeConfig(props.id, text());
             setMsg("saved");
         } catch (e) {
@@ -121,11 +162,14 @@ export function AgentSettings(props: AgentSettingsProps) {
                 <button onClick={props.onClose}>close</button>
             </div>
             <p class="status" style={{ margin: "0 0 10px" }}>
-                GaugeDesk chooses the runtime here. Change behavior and tools in an edit chat, then publish the package.
+                These settings apply to test chats now and are frozen into the next published version.
             </p>
 
             <Show
-                when={loaded.state === "ready" || raw() !== null}
+                when={
+                    (loaded.state === "ready" || raw() !== null) &&
+                    loadedAbilities.state === "ready"
+                }
                 fallback={<div class="status">loading…</div>}
             >
                 <div class="settings-form" data-settings-form>
@@ -139,6 +183,43 @@ export function AgentSettings(props: AgentSettingsProps) {
                             onInput={(e) => updateForm({ model: e.currentTarget.value })}
                         />
                     </label>
+
+                    <fieldset class="settings-field" data-settings-abilities>
+                        <legend class="settings-label">Abilities</legend>
+                        <p class="status" style={{ margin: "2px 0 8px" }}>
+                            Choose the maximum workspace access this agent receives.
+                        </p>
+                        {AGENT_ABILITY_PRESETS.map((preset) => {
+                            const checked = () =>
+                                JSON.stringify([...abilities()].sort()) ===
+                                JSON.stringify([...preset.value].sort());
+                            return (
+                                <label
+                                    style={{
+                                        display: "grid",
+                                        "grid-template-columns": "auto 1fr",
+                                        gap: "2px 8px",
+                                        padding: "7px 0",
+                                        cursor: "pointer",
+                                    }}
+                                >
+                                    <input
+                                        type="radio"
+                                        name="agent-abilities"
+                                        checked={checked()}
+                                        onChange={() => {
+                                            setSelectedAbilities(preset.value);
+                                            setMsg("");
+                                        }}
+                                    />
+                                    <span>
+                                        <span style={{ display: "block" }}>{preset.name}</span>
+                                        <span class="status">{preset.detail}</span>
+                                    </span>
+                                </label>
+                            );
+                        })}
+                    </fieldset>
 
                 </div>
 

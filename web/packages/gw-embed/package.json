@@ -12,10 +12,7 @@
   },
   "exports": {
     ".": "./src/index.ts",
-    "./elements": "./src/elements.tsx",
-    "./embed-control-plane": "./src/embed-control-plane.ts",
-    "./example": "./src/example.ts",
-    "./remote-session": "./src/remote-session.ts"
+    "./elements": "./src/elements.tsx"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p ../../tsconfig.embed-client.json",

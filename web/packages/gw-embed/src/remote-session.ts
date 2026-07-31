@@ -1,17 +1,17 @@
 /**
- * A {@link Session} implemented over a **remote, scoped** control plane for a
- * single engagement (EMBED-2) — the *second* producer of the EMBED-1 Session
- * contract, and the thing that makes the panels demonstrably context-portable:
+ * A {@link Session} projection over one EDGE-5 browser connection for a single
+ * hosted engagement. This is the adapter that makes the shared panels
+ * context-portable:
  * the desktop's Session is built inline in `App.tsx` over its many signals; an
- * embed's is built here over a scoped embed control plane + one fixed engagement.
+ * embed's is built here over one Session DO client + one fixed engagement.
  *
- * It owns its OWN engagement state — the transcript snapshot+live, the run-stream
+ * It owns its OWN engagement projection — the transcript snapshot+live, the event
  * subscription, and the diff/merge projections — exactly the per-engagement
  * machinery the desktop keeps in its shell, condensed to one chat. Projection-first
  * (`INV-5`): everything exposed is a view or a scoped command, never authority.
  *
  * Must be created inside a Solid reactive root (the `<gw-session>` element's
- * render owns it). The returned `dispose` closes the live stream.
+ * render owns it). The returned `dispose` closes the event subscription.
  */
 import { createResource, createSignal } from "solid-js";
 import { type EngagementId, type MergeAction } from "@gaugewright/control-plane-client";
@@ -22,17 +22,13 @@ import {
     type Transcript,
 } from "@gaugewright/workbench-ui/transcript";
 import { type Session } from "@gaugewright/workbench-ui/session-context";
-import { type EmbedSessionApi } from "./embed-control-plane";
+import { type EmbedSessionApi } from "./session-api";
 
 export interface RemoteSessionOptions {
-    /** The transport, scoped to the embed's backend (a deployment's control plane). */
+    /** The canonical EDGE-5 client, scoped to one hosted deployment. */
     readonly api: EmbedSessionApi;
     /** The single engagement this embedded session is bound to. */
     readonly engagementId: EngagementId;
-    /** Drive turns through the **public embed** route (`/embed/sessions/:id/turn`, SERVE-1) —
-     *  the admitted, fail-closed, Use-mode path with lazy session activation. Default for a hosted
-     *  visitor session. When `false`, turns use the desktop chat route (`/chats/:id/task`). */
-    readonly publicEmbed?: boolean;
 }
 
 export function createRemoteSession(opts: RemoteSessionOptions): { session: Session; dispose: () => void } {
@@ -41,10 +37,12 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
     const [engagementId] = createSignal<EngagementId | null>(id);
     const [selectedFile, setSelectedFile] = createSignal<string | null>(null);
     const [worktreeRev, setWorktreeRev] = createSignal(0);
+    const [busy, setBusy] = createSignal(false);
     const bumpWorktree = () => setWorktreeRev((n) => n + 1);
 
-    // Transcript: durable snapshot of admitted records + the live SSE reduction of
-    // the in-progress turn (`transcript.ts`) — repairable from the snapshot.
+    // Transcript: durable snapshot of admitted records + live WebSocket events
+    // reduced into the in-progress turn (`transcript.ts`) — repairable from the
+    // snapshot.
     const [snapshot, setSnapshot] = createSignal<Transcript>(empty);
     const [live, setLive] = createSignal<Transcript>(empty);
     const transcript = (): Transcript => ({
@@ -60,12 +58,24 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         }
     }
     void loadSnapshot();
-    const unsubscribe = api.subscribe(id, (ev) => setLive((t) => reduce(t, ev)));
+    const unsubscribe = api.subscribe(id, (ev) => {
+        setLive((t) => reduce(t, ev));
+        if (ev.type !== "text" || !api.recordFirstTextRendered) return;
+        const record = () => api.recordFirstTextRendered?.();
+        if (typeof globalThis.requestAnimationFrame === "function") {
+            globalThis.requestAnimationFrame(record);
+        } else {
+            globalThis.queueMicrotask(record);
+        }
+    });
 
     // Engagement-scoped read projections (the desktop's `createResource`s, here for
     // one fixed engagement).
-    const [diff, { refetch: refetchDiff }] = createResource(engagementId, (eid) => api.engagementDiff(eid));
-    const [merge, { refetch: refetchMerge }] = createResource(engagementId, (eid) => api.getMerge(eid));
+    // Audience panels do not receive owner merge/diff authority. Their files/viewer projections
+    // are read-only and their sole command is the admitted public turn.
+    const ownerEngagement = (): EngagementId | false => false;
+    const [diff, { refetch: refetchDiff }] = createResource(ownerEngagement, (eid) => api.engagementDiff(eid));
+    const [merge, { refetch: refetchMerge }] = createResource(ownerEngagement, (eid) => api.getMerge(eid));
 
     // On a turn/merge settling, re-read durable truth (retiring the optimistic echo)
     // and bump the worktree rev so the files panel refetches.
@@ -76,14 +86,17 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
 
     function send(text: string) {
         const t = text.trim();
-        if (!t) return;
+        if (!t || busy()) return;
+        setBusy(true);
         // Optimistic echo: show the user's line the instant the turn starts; the
         // snapshot re-read in settle() retires it (a failed turn drops it).
         setLive((tr) => reduce(tr, { type: "user", text: t }));
-        // A hosted visitor session drives the admitted public-embed route (activate + Use-mode +
-        // fail-closed); the live SSE subscription streams the tokens while this blocks.
-        const turn = opts.publicEmbed ? api.runEmbedTurn(id, t) : api.runTask(id, t);
-        void turn.then(settle).catch(() => void loadSnapshot());
+        // The Session DO admits the stable command and streams its durable
+        // observations over the same WebSocket while this promise is pending.
+        void api.runEmbedTurn(id, t)
+            .then(settle)
+            .catch(() => void loadSnapshot())
+            .finally(() => setBusy(false));
     }
 
     const session: Session = {
@@ -100,9 +113,16 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         chatKind: () => "work",
         methodName: () => "",
         transcript,
+        busy,
         merge: (action: MergeAction) => void api.mergeCommand(id, action).then(() => settle()),
         onContentSaved: () => void Promise.allSettled([refetchDiff(), refetchMerge()]),
         send,
+        stop: api.stopTurn ? () => api.stopTurn!() : undefined,
     };
-    return { session, dispose: unsubscribe };
+    return {
+        session,
+        dispose: () => {
+            unsubscribe();
+        },
+    };
 }

@@ -6,24 +6,29 @@
 //! **fail-closed everywhere**: no rules → hold; a rule that doesn't fully cover
 //! the turn → hold; a fact that can't be resolved → hold. The only rule
 //! vocabulary today is `writes-within` — advance when every file the turn
-//! changed falls inside the operator's named path scopes — with two safety
+//! changed falls inside the operator's named path scopes — with three safety
 //! conjuncts no configuration can waive:
 //!
 //! - **A config-touching diff never auto-advances.** `.agent-config.json` is
 //!   where a policy loosening lives; the loosening review is a human gate
 //!   (this is deliberately *stricter* than detecting loosening — a tightening
 //!   holds too, and that's fine: fail toward holding).
+//! - **A gate-touching diff never auto-advances** (ADR 0110 §5, GATE-5).
+//!   Running a gate is work; changing one is an edit act. An agent holding
+//!   gate-approved content that then edits the gate is choosing what its own
+//!   next release will be allowed to say, and that loop closes silently if the
+//!   diff can auto-keep.
 //! - **An externally-tainted turn never auto-advances.** If the engagement has
 //!   read any resource whose owner is not the chat's own authority (or whose
 //!   owner can't be resolved), the outputs carry someone else's stake — the
 //!   read-side guard over the runtime-certified read-set (ADR 0082 §4).
 //!
-//! Write-side facts come from GaugeDesk's own workspace diff, which is authoritative
-//! **locally** (GaugeDesk owns the workspace repo). On a remote/managed
-//! placement the receipt is the only authority — that is WhippleScript DR-0036
-//! (workspace cut + dynamic guarantees); when it lands, these predicates
-//! degenerate to matching cited guarantee names (ADR 0082 §5). GaugeDesk grows
-//! no policy language here: the document is data, this module its one reader.
+//! Write-side decisions prefer WhippleScript's certified DR-0036 dynamic
+//! guarantee outcome, matched by exact name (ADR 0082 §5), which keeps the gate
+//! placement-neutral. An older/unwitnessed runtime falls back to GaugeDesk's
+//! local workspace diff; a certified violation holds without consulting that
+//! fallback. GaugeDesk grows no policy language here: the document is data,
+//! this module its one reader.
 //!
 //! Every auto-advance is admitted as ordinary merge events plus a transcript
 //! citation naming the rule and the facts it matched — the audit trail says
@@ -49,6 +54,24 @@ fn is_config_path(path: &str) -> bool {
         || name.eq_ignore_ascii_case("agent-config.json")
 }
 
+/// The project's inbound gate: its program and its governance envelope
+/// (ADR 0110 §5, GATE-5).
+///
+/// Running a gate is work; changing one is an edit act, and the difference is
+/// the whole reason the gate lives in the workspace as an ordinary editable
+/// program rather than behind a route. An agent that has just read gate-approved
+/// content and then edits the gate in the same turn is the attacker steering its
+/// own *future* release — a loop that closes silently if that diff can
+/// auto-keep.
+///
+/// Matched on the path the gate is installed at rather than on a directory
+/// prefix: `gates/` is the location `gate::GATE_PROGRAM_PATH` names, and tying
+/// this to those constants keeps the two from drifting apart.
+fn is_gate_path(path: &str) -> bool {
+    let normalized = path.trim_start_matches("./");
+    normalized == crate::gate::GATE_PROGRAM_PATH || normalized == crate::gate::GATE_ENVELOPE_PATH
+}
+
 /// The facts one settled turn presents to the rules — computed once at settle
 /// from GaugeDesk-owned truth (the workspace diff) and the engagement's certified
 /// read-set; the advance citation embeds what it matched.
@@ -70,6 +93,13 @@ impl TurnFacts {
     pub fn violates_safety(&self) -> Option<String> {
         if let Some(config) = self.changed_paths.iter().find(|p| is_config_path(p)) {
             return Some(format!("the turn touched the policy config `{config}`"));
+        }
+        // ADR 0110 §5: a gate edit is reviewed, never kept. Placed here rather
+        // than left to the operator's scopes because this is the one hold an
+        // operator must not be able to configure away — the scopes are the very
+        // thing an agent would be steering.
+        if let Some(gate) = self.changed_paths.iter().find(|p| is_gate_path(p)) {
+            return Some(format!("the turn edited the project's gate `{gate}`"));
         }
         if !self.external_read_stakeholders.is_empty() {
             return Some(format!(
@@ -117,6 +147,21 @@ fn scope_matches(pattern: &str, path: &str) -> bool {
         return path.ends_with(suffix);
     }
     pattern == path
+}
+
+/// Whether an operator scope would sweep the gate into auto-keep.
+///
+/// Uses the same matcher the decision uses, so `gates/**` and `*.whip` are
+/// caught alongside the exact path — a prefix scope is the likelier way an
+/// operator pulls the gate in, and it is the one a hand-written check would
+/// miss.
+fn covers_the_gate(scope: &str) -> bool {
+    [
+        crate::gate::GATE_PROGRAM_PATH,
+        crate::gate::GATE_ENVELOPE_PATH,
+    ]
+    .iter()
+    .any(|path| scope_matches(scope, path))
 }
 
 /// The parsed advancement rules. Total parse; empty on anything unusable.
@@ -170,10 +215,24 @@ impl AdvancementRules {
     /// Empty when no rules — nothing is declared, the runtime evaluates
     /// nothing, and everything holds. The local matcher and the runtime's glob
     /// agree on the documented forms (`dir/**`, `*.ext`, exact).
+    ///
+    /// Any scope that would cover the gate is dropped (GATE-5) — `gates/**` and
+    /// `*.whip` as much as the exact path, since a prefix scope is the likelier
+    /// way an operator sweeps the gate in. `violates_safety` already holds a
+    /// gate edit whatever this declares, so nothing turns on it for safety — but
+    /// a declaration claiming `gates/inbound.whip` is auto-keepable would be an
+    /// envelope stating something GaugeDesk will not honour, and an envelope
+    /// that overstates is worse than one that says less.
     pub fn declared_scopes(&self) -> Vec<String> {
         self.rules
             .first()
-            .map(|r| r.paths.clone())
+            .map(|rule| {
+                rule.paths
+                    .iter()
+                    .filter(|scope| !covers_the_gate(scope))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -372,5 +431,104 @@ mod tests {
             TurnFacts::changed_paths_of(diff),
             vec!["docs/a.md".to_string(), "gone.txt".to_string()]
         );
+    }
+
+    /// GATE-5: a gate edit is reviewed, never auto-kept (ADR 0110 §5).
+    ///
+    /// Placed among the unwaivable holds rather than left to the operator's
+    /// scopes, because the scopes are exactly what an agent would be steering.
+    /// Approved content is gate output; an agent that reads it and then edits
+    /// the gate in the same turn is choosing what its *next* release will be
+    /// allowed to say.
+    #[test]
+    fn a_gate_edit_never_auto_advances_however_wide_the_scopes() {
+        let rules = AdvancementRules::parse(Some(
+            r#"{"version":1,"rules":[{"advance":"writes-within","paths":["gates/**","docs/**"]}]}"#,
+        ));
+        let facts = TurnFacts {
+            changed_paths: vec![crate::gate::GATE_PROGRAM_PATH.to_string()],
+            ..Default::default()
+        };
+        assert!(
+            facts.violates_safety().is_some(),
+            "a gate edit is an unwaivable hold",
+        );
+        assert_eq!(
+            rules.decide(&facts),
+            None,
+            "and no operator scope can advance it",
+        );
+    }
+
+    #[test]
+    fn the_gate_envelope_holds_as_hard_as_the_gate_program() {
+        // The envelope is where `grant endorse` lives. Weakening it is weakening
+        // the gate just as surely as rewriting the program, and it is the
+        // quieter of the two edits.
+        let facts = TurnFacts {
+            changed_paths: vec![crate::gate::GATE_ENVELOPE_PATH.to_string()],
+            ..Default::default()
+        };
+        assert!(facts.violates_safety().is_some());
+    }
+
+    #[test]
+    fn a_certified_guarantee_does_not_rescue_a_gate_edit() {
+        // `decide_from_guarantees` can return `AdvanceHeld` for a runtime that
+        // certified the write was in scope. The safety conjuncts are evaluated
+        // outside that verdict, so a certified gate write still holds — the
+        // guarantee certifies *where* a write landed, not whether that place may
+        // be auto-kept.
+        let rules = AdvancementRules::parse(Some(
+            r#"{"version":1,"rules":[{"advance":"writes-within","paths":["gates/**"]}]}"#,
+        ));
+        let certified = vec![GuaranteeOutcome {
+            name: OPERATOR_WRITES_GUARANTEE.to_string(),
+            outcome: "held".to_string(),
+            detail: "1 write(s) within scope".to_string(),
+        }];
+        assert!(matches!(
+            rules.decide_from_guarantees(&certified),
+            GuaranteeVerdict::AdvanceHeld(_)
+        ));
+        let facts = TurnFacts {
+            changed_paths: vec![crate::gate::GATE_PROGRAM_PATH.to_string()],
+            ..Default::default()
+        };
+        assert!(
+            facts.violates_safety().is_some(),
+            "the safety conjunct is checked outside the certified verdict",
+        );
+    }
+
+    #[test]
+    fn the_declared_envelope_scopes_never_claim_the_gate() {
+        // A prefix scope is the likelier way the gate gets swept in, so the
+        // filter uses the same matcher the decision does rather than comparing
+        // strings.
+        for scope in ["gates/**", "*.whip", crate::gate::GATE_PROGRAM_PATH] {
+            let document = format!(
+                r#"{{"version":1,"rules":[{{"advance":"writes-within","paths":["{scope}","docs/**"]}}]}}"#
+            );
+            let declared = AdvancementRules::parse(Some(&document)).declared_scopes();
+            assert_eq!(
+                declared,
+                vec!["docs/**".to_string()],
+                "`{scope}` must not be declared auto-keepable",
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_workspace_file_still_advances() {
+        // The hold is narrow on purpose: it names the gate, not the project.
+        let rules = AdvancementRules::parse(Some(
+            r#"{"version":1,"rules":[{"advance":"writes-within","paths":["docs/**"]}]}"#,
+        ));
+        let facts = TurnFacts {
+            changed_paths: vec!["docs/notes.md".to_string()],
+            ..Default::default()
+        };
+        assert!(rules.decide(&facts).is_some());
     }
 }

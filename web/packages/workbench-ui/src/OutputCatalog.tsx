@@ -1,10 +1,8 @@
 /**
  * The **output catalog** (RF-E1 / m0-gate O-4): a listing of the produced
  * `output`-kind resources an engagement holds, read from the
- * `GET /chats/:id/resources` projection and filtered to outputs. Until now no
- * user-facing surface showed produced outputs — `ReviewShelf` is dev-only and the
- * `Shelf` shows only an activity timeline — so a finished deliverable had nowhere
- * to surface with its protection state. This catalog is available outside dev mode.
+ * `GET /chats/:id/resources` projection and filtered to outputs. It is the
+ * production surface for a finished deliverable and its protection state.
  *
  * Each output is shown with its availability/tombstone state and its review +
  * export **phase** (the protection gating it must pass before it can leave). The
@@ -14,33 +12,32 @@
  * metadata only, `INV-10`). It is mounted as a tab in the history `Shelf`.
  */
 
-import { createResource, For, Show } from "solid-js";
+import { createResource, createSignal, For, Show } from "solid-js";
 import {
     type EngagementId,
+    type ResourceExportAction,
+    type ResourceReviewAction,
     type ExportState,
     type ResourceView,
-    type ReviewCommand,
     type ReviewState,
-    type ScopeId,
-    scopeId,
 } from "@gaugewright/control-plane-client";
 import {
     availabilityLabel,
     availabilityOf,
     outputProtectionLabel,
     outputs,
-    resourceExportScope,
-    resourceReviewScope,
     resourceTitle,
 } from "./resource-catalog";
 import { LoadError } from "./LoadError";
 
 export interface OutputCatalogApi {
     getResources(id: EngagementId): Promise<ResourceView[]>;
-    getReview(scope: ScopeId): Promise<ReviewState>;
-    getExport(scope: ScopeId): Promise<ExportState>;
-    /** Drive the review reducer (UX-11): a stakeholder consents to release a held output. */
-    reviewCommand(scope: ScopeId, command: ReviewCommand): Promise<ReviewState>;
+    getResourceReview(id: EngagementId, resource: string): Promise<ReviewState>;
+    getResourceExport(id: EngagementId, resource: string): Promise<ExportState>;
+    proposeResourceReview(id: EngagementId, resource: string): Promise<{ scope: string; state: ReviewState }>;
+    proposeResourceExport(id: EngagementId, resource: string): Promise<{ scope: string; state: ExportState }>;
+    resourceReviewCommand(id: EngagementId, resource: string, action: ResourceReviewAction): Promise<ReviewState>;
+    resourceExportCommand(id: EngagementId, resource: string, action: ResourceExportAction): Promise<ExportState>;
 }
 
 export function OutputCatalog(props: {
@@ -48,6 +45,8 @@ export function OutputCatalog(props: {
     /** The engagement whose outputs to catalog (the resource route is engagement-keyed). */
     id: EngagementId;
     refreshKey?: unknown;
+    /** Desktop-only final egress hop. Absent in browser/enterprise surfaces. */
+    onSaveToDisk?: (resourceId: string) => Promise<{ exported: string[]; dest: string } | null>;
 }) {
     const [resources, { refetch }] = createResource(
         () => [props.id, props.refreshKey] as const,
@@ -69,7 +68,7 @@ export function OutputCatalog(props: {
                 >
                     <div class="resource-list">
                         <For each={produced()}>
-                            {(r) => <OutputRow api={props.api} engagement={props.id} resourceId={r.id} avail={availabilityOf(r)} title={resourceTitle(r)} tombstoned={r.tombstoned} />}
+                            {(r) => <OutputRow api={props.api} engagement={props.id} resourceId={r.id} avail={availabilityOf(r)} title={resourceTitle(r)} tombstoned={r.tombstoned} onSaveToDisk={props.onSaveToDisk} />}
                         </For>
                     </div>
                 </Show>
@@ -89,46 +88,84 @@ function OutputRow(props: {
     avail: ReturnType<typeof availabilityOf>;
     title: string;
     tombstoned: boolean;
+    onSaveToDisk?: (resourceId: string) => Promise<{ exported: string[]; dest: string } | null>;
 }) {
-    const reviewScope = () => scopeId(resourceReviewScope(props.engagement, props.resourceId));
-    const [review, { refetch: refetchReview }] = createResource(
-        () => props.resourceId,
-        async () => {
-            try {
-                return await props.api.getReview(reviewScope());
-            } catch {
-                return null;
-            }
-        },
-    );
-    // UX-11: a stakeholder party consents to release the held output. The provenance (which
-    // parties have a stake) is the review's `required` set = the output's stakeholders (the
-    // engagement taint). When every stakeholder consents, the reducer releases it.
-    const consent = async (party: string) => {
-        try {
-            await props.api.reviewCommand(reviewScope(), { Consent: party });
-        } finally {
-            void refetchReview();
-        }
-    };
-    // Once every stakeholder has consented (Cleared), the held output can be released.
-    const release = async () => {
-        try {
-            await props.api.reviewCommand(reviewScope(), "Release");
-        } finally {
-            void refetchReview();
-        }
-    };
-    const [exp] = createResource(
+    const [saveStatus, setSaveStatus] = createSignal<string | null>(null);
+    const [decisionError, setDecisionError] = createSignal<string | null>(null);
+    const [review, { mutate: setReview, refetch: refetchReview }] = createResource(
         () => props.resourceId,
         async (rid) => {
             try {
-                return await props.api.getExport(scopeId(resourceExportScope(props.engagement, rid)));
+                return await props.api.getResourceReview(props.engagement, rid);
             } catch {
                 return null;
             }
         },
     );
+    const proposeReview = async () => {
+        try {
+            const proposal = await props.api.proposeResourceReview(props.engagement, props.resourceId);
+            setReview(proposal.state);
+            setDecisionError(null);
+        } catch {
+            setDecisionError("couldn't request review");
+            await refetchReview();
+        }
+    };
+    const reviewAction = async (action: ResourceReviewAction) => {
+        try {
+            setReview(await props.api.resourceReviewCommand(props.engagement, props.resourceId, action));
+            setDecisionError(null);
+        } catch {
+            setDecisionError("that review decision wasn't admitted");
+            await refetchReview();
+        }
+    };
+    const [exp, { mutate: setExport, refetch: refetchExport }] = createResource(
+        () => props.resourceId,
+        async (rid) => {
+            try {
+                return await props.api.getResourceExport(props.engagement, rid);
+            } catch {
+                return null;
+            }
+        },
+    );
+    const proposeExport = async () => {
+        try {
+            const proposal = await props.api.proposeResourceExport(props.engagement, props.resourceId);
+            setExport(proposal.state);
+            setDecisionError(null);
+        } catch {
+            setDecisionError("couldn't prepare the export");
+            await refetchExport();
+        }
+    };
+    const exportAction = async (action: ResourceExportAction) => {
+        try {
+            setExport(await props.api.resourceExportCommand(props.engagement, props.resourceId, action));
+            setDecisionError(null);
+        } catch {
+            setDecisionError("that export decision wasn't admitted");
+            await refetchExport();
+        }
+    };
+    const sourceComplete = () => {
+        const state = exp();
+        return state?.phase === "Requested"
+            && state.source_required.every((party) => state.source_consented.includes(party));
+    };
+    const saveToDisk = async () => {
+        if (!props.onSaveToDisk) return;
+        setSaveStatus("saving…");
+        try {
+            const result = await props.onSaveToDisk(props.resourceId);
+            setSaveStatus(result ? `saved ${result.exported.length} file(s)` : null);
+            if (result) await refetchExport();
+        } catch {
+            setSaveStatus("couldn't save");
+        }
+    };
 
     return (
         <div
@@ -163,11 +200,27 @@ function OutputRow(props: {
             <Show when={review()?.phase === "Released"}>
                 <span class="badge released" data-output-released title="every stakeholder consented — this output can leave">released</span>
             </Show>
+            <Show when={!props.tombstoned && (sourceComplete() || exp()?.phase === "Cleared") && props.onSaveToDisk}>
+                <button
+                    type="button"
+                    class="link-btn"
+                    data-save-output={props.resourceId}
+                    onClick={() => void saveToDisk()}
+                >
+                    save to folder
+                </button>
+            </Show>
+            <Show when={saveStatus()}>{(message) => <span class="status" data-save-output-status>{message()}</span>}</Show>
+            <Show when={!props.tombstoned && review()?.phase === "Init"}>
+                <button type="button" class="link-btn" data-propose-review onClick={() => void proposeReview()}>
+                    request review
+                </button>
+            </Show>
             {/* UX-11: all stakeholders consented — the output is cleared and can be released. */}
             <Show when={review()?.phase === "Cleared"}>
                 <div class="output-review-cleared" data-output-review-cleared={props.resourceId}>
                     <span class="hold-note">All stakeholders consented — ready to release</span>
-                    <button type="button" class="link-btn" data-release onClick={() => void release()}>
+                    <button type="button" class="link-btn" data-release onClick={() => void reviewAction("release")}>
                         release
                     </button>
                 </div>
@@ -190,14 +243,7 @@ function OutputRow(props: {
                                         <Show
                                             when={consented()}
                                             fallback={
-                                                <button
-                                                    type="button"
-                                                    class="link-btn"
-                                                    data-consent={party}
-                                                    onClick={() => void consent(party)}
-                                                >
-                                                    consent
-                                                </button>
+                                                <span>awaiting consent</span>
                                             }
                                         >
                                             <span class="badge" data-consented={party}>consented ✓</span>
@@ -207,8 +253,40 @@ function OutputRow(props: {
                             }}
                         </For>
                     </ul>
+                    <button
+                        type="button"
+                        class="link-btn"
+                        data-consent-self
+                        onClick={() => void reviewAction("consent")}
+                    >
+                        consent as me
+                    </button>
                 </div>
             </Show>
+            <Show when={!props.tombstoned && review()?.phase === "Released" && exp()?.phase === "Init"}>
+                <button type="button" class="link-btn" data-propose-export onClick={() => void proposeExport()}>
+                    prepare export
+                </button>
+            </Show>
+            <Show when={!props.tombstoned && exp()?.phase === "Requested" && !sourceComplete()}>
+                <div class="output-export-hold" data-output-export-hold={props.resourceId}>
+                    <span class="hold-note">Export is waiting for its source stakeholders</span>
+                    <button
+                        type="button"
+                        class="link-btn"
+                        data-export-consent-self
+                        onClick={() => void exportAction("consent")}
+                    >
+                        consent to export as me
+                    </button>
+                </div>
+            </Show>
+            <Show when={!props.tombstoned && sourceComplete() && !props.onSaveToDisk}>
+                <span class="hold-note" data-export-source-ready>
+                    Source approved — waiting for target admission
+                </span>
+            </Show>
+            <Show when={decisionError()}>{(message) => <span class="status" data-output-decision-error>{message()}</span>}</Show>
         </div>
     );
 }

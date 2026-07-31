@@ -1,0 +1,59 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "gaugewright",
+  "name": "gaugewright",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "gaugewright",
+      "version": "0.1.0",
+      "standard": false
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "question.ask",
+      "description": "Ask a named person a question. The turn settles; the answer arrives as context in a later turn. Never suspends a turn and never blocks the person from acting."
+    }
+  ],
+  "providers": [
+    {
+      "id": "provider-question-gaugedesk",
+      "provider_kind": "gaugewright.question",
+      "capability": "question.ask",
+      "config": {
+        "transport": "host-owned; the question is a durable GaugeDesk record, not an outbound network effect",
+        "recipient": "an AuthorityId resolved against the account roster; absent means the chat owner",
+        "answer": "attributed to the authority that gave it",
+        "can_start_instances": false
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-question-asker",
+      "name": "question-asker",
+      "description": "Allow an agent to ask a named person a question.",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": ["question.ask"],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-question-gaugedesk",
+      "program_id": null,
+      "capability": "question.ask",
+      "provider": "gaugewright.question",
+      "config": {
+        "report": {
+          "direction": "bidirectional",
+          "identity": "authenticated_actor",
+          "interactions": ["choices"],
+          "content": ["text"],
+          "delivery_receipts": ["accepted"]
+        }
+      }
+    }
+  ]
+}

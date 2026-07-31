@@ -1,0 +1,1 @@
+-keep class com.gaugewright.gaugedesk.deviceidentity.** { *; }

@@ -96,13 +96,16 @@ fn full_turn_runs_over_workspace_and_harness_trait_objects() {
         provider_binding_ref: None,
         credential_ref: None,
         placement_ceiling_ref: None,
+        runtime_placement_id: None,
         provider: None,
         model: None,
+        base_url: None,
         thinking: None,
         system_prompt: None,
         credential_capability: None,
         credentials: Vec::new(),
         sandbox: SandboxPolicy::new(vec![chat.path().to_path_buf()]),
+        roster: Vec::new(),
     };
     let mut harness = factory.create(&spec).unwrap();
 

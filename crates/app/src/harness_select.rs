@@ -128,5 +128,13 @@ fn fake_turn() -> ScriptedTurn {
                 ok: true,
             },
         ],
+        runtime_start_position: Some(gaugewright_harness::RuntimePosition {
+            instance_ref: "scripted-fake".into(),
+            sequence: 0,
+        }),
+        runtime_terminal_position: Some(gaugewright_harness::RuntimePosition {
+            instance_ref: "scripted-fake".into(),
+            sequence: 1,
+        }),
     }
 }

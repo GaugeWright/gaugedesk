@@ -10,11 +10,16 @@
 //! the stored record is ciphertext, decrypted only when the local runtime needs it,
 //! never crossing as payload (`INV-10`). Adds no protection invariant (ADR 0020).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+pub use gaugewright_directory_protocol::DirectoryRecord;
 
 use gaugewright_harness::{CredentialCapability, CredentialMaterial};
 use gaugewright_store::{AdmitError, Store};
@@ -22,6 +27,7 @@ use gaugewright_store::{AdmitError, Store};
 use crate::at_rest::{Encryptor, LocalAeadEncryptor};
 pub use crate::library::RecordOp;
 use crate::Workbench;
+use gaugewright_core::ids::HomeId;
 
 /// The reserved store scope holding the person's account state.
 pub const ACCOUNT_SCOPE: &str = "account";
@@ -49,6 +55,20 @@ pub struct DeviceRecord {
     pub subkey_pubkey: String,
     #[serde(default)]
     pub status: DeviceStatus,
+    /// When this device first joined the account. Zero denotes a legacy record
+    /// written before enrollment time was durable; it is never guessed from
+    /// projection or log order.
+    #[serde(default)]
+    pub enrolled_at: u64,
+}
+
+/// Wall-clock evidence recorded only when a device joins. Existing records retain
+/// their original value across later metadata changes and revocation.
+pub fn device_enrolled_at_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 /// A latest-wins preference (`id` = the setting key).
@@ -71,6 +91,104 @@ pub struct CredentialRecord {
     /// Hex-encoded `SEC-4` ciphertext of the OAuth token.
     #[serde(default)]
     pub sealed_token: String,
+    /// The OpenAI-compatible endpoint base URL for an **endpoint-configurable**
+    /// provider (`openai-generic`, ADR 0083). **Non-secret** — stored plaintext
+    /// beside the sealed token; empty for the fixed-host providers. `#[serde(default)]`
+    /// so every pre-existing credential record folds unchanged (no migration).
+    #[serde(default)]
+    pub base_url: String,
+    /// Monotonic identity version. Linking or rotating material increments it;
+    /// revocation preserves it so prior evidence keeps naming the exact version
+    /// that was denied for future use.
+    #[serde(default = "initial_credential_version")]
+    pub version: u64,
+    /// Authentication shape injected only by the final egress broker.
+    #[serde(default)]
+    pub authentication: CredentialAuthentication,
+    /// Current future-use state. Revoked records remain in the append-only fold
+    /// so a stale reference fails because it is revoked, not because history was
+    /// rewritten.
+    #[serde(default)]
+    pub status: CredentialStatus,
+    /// Explicit execution classes admitted by the owner. Empty denies all use.
+    #[serde(default)]
+    pub execution_classes: BTreeSet<ModelExecutionClass>,
+}
+
+fn initial_credential_version() -> u64 {
+    1
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialAuthentication {
+    #[default]
+    Bearer,
+    ApiKey,
+    OAuth,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialStatus {
+    #[default]
+    Active,
+    Revoked,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelExecutionClass {
+    LocalInteractive,
+    PrivateHome,
+    PublicDeployment,
+}
+
+impl CredentialRecord {
+    pub fn admits(&self, class: ModelExecutionClass) -> bool {
+        self.op == RecordOp::Upsert
+            && self.status == CredentialStatus::Active
+            && self.execution_classes.contains(&class)
+    }
+}
+
+/// A Home the account may select for new projects. This is reachability and
+/// facility metadata only; project records/content remain on the Home.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredHomeRecord {
+    pub id: HomeId,
+    #[serde(default)]
+    pub op: RecordOp,
+    #[serde(default)]
+    pub kind: crate::home::HomeKind,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<crate::home::OpaqueRelayLocator>,
+}
+
+/// The blind account-plane route for one granted project.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HomeRouteRecord {
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    pub home_id: HomeId,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<crate::home::OpaqueRelayLocator>,
+}
+
+impl From<HomeRouteRecord> for crate::home::OpaqueHomeRoute {
+    fn from(record: HomeRouteRecord) -> Self {
+        Self {
+            project: record.id,
+            home_id: record.home_id,
+            endpoint: record.endpoint,
+            relay: record.relay,
+        }
+    }
 }
 
 /// The folded account projection (derived, rebuildable — `INV-5`).
@@ -79,6 +197,9 @@ pub struct Account {
     pub devices: BTreeMap<String, DeviceRecord>,
     pub settings: BTreeMap<String, SettingRecord>,
     pub credentials: BTreeMap<String, CredentialRecord>,
+    pub homes: BTreeMap<String, RegisteredHomeRecord>,
+    pub home_routes: BTreeMap<String, HomeRouteRecord>,
+    pub managed_inference_plan: Option<crate::managed_inference::ManagedInferencePlan>,
 }
 
 fn fold<T>(map: &mut BTreeMap<String, T>, id: String, op: RecordOp, rec: T) {
@@ -128,6 +249,15 @@ impl Account {
             let r: CredentialRecord = serde_json::from_str(&row)?;
             fold(&mut acct.credentials, r.id.clone(), r.op, r);
         }
+        for row in store.records(scope, "home")? {
+            let r: RegisteredHomeRecord = serde_json::from_str(&row)?;
+            fold(&mut acct.homes, r.id.as_str().to_owned(), r.op, r);
+        }
+        for row in store.records(scope, "home_route")? {
+            let r: HomeRouteRecord = serde_json::from_str(&row)?;
+            fold(&mut acct.home_routes, r.id.clone(), r.op, r);
+        }
+        acct.managed_inference_plan = crate::managed_inference::fold_plan(store, scope)?;
         Ok(acct)
     }
 
@@ -186,7 +316,29 @@ pub fn unseal_token(key: [u8; 32], sealed_hex: &str) -> Option<String> {
 pub fn resolve_token(store: &Store, key: [u8; 32], provider: &str) -> Option<String> {
     let acct = Account::rebuild(store).ok()?;
     let rec = acct.credentials.get(provider)?;
+    if !rec.admits(ModelExecutionClass::LocalInteractive) {
+        return None;
+    }
     unseal_token(key, &rec.sealed_token)
+}
+
+/// Validate the endpoint supplied when linking a credential and return the non-secret
+/// `base_url` to persist (ADR 0083). `openai-generic` **requires** a base URL that
+/// parses and satisfies the TLS policy (https for remote, http only for loopback); the
+/// fixed-host providers ignore any supplied endpoint and persist an empty string. The
+/// single home for the link-time endpoint rule, shared by the account + project routes.
+pub fn link_base_url_for(provider: &str, base_url: Option<&str>) -> Result<String, String> {
+    if provider != "openai-generic" {
+        return Ok(String::new());
+    }
+    let base_url = base_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| "openai-generic requires an endpoint URL".to_owned())?;
+    // Validate parseability + TLS policy; the derived host is not needed here.
+    gaugewright_whip_runtime::openai_generic_endpoint_host(base_url)
+        .map_err(|error| error.to_string())?;
+    Ok(base_url.to_owned())
 }
 
 /// The provider → API-key env-var mapping — the ONE map (the engine's fail-closed
@@ -199,6 +351,14 @@ pub(crate) fn provider_env_var(provider: &str) -> Option<&'static str> {
         "openai" => Some("OPENAI_API_KEY"),
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         _ => None,
+    }
+}
+
+pub fn authentication_for_provider(provider: &str) -> CredentialAuthentication {
+    match provider {
+        "anthropic" => CredentialAuthentication::ApiKey,
+        "openai-codex" => CredentialAuthentication::OAuth,
+        _ => CredentialAuthentication::Bearer,
     }
 }
 
@@ -235,6 +395,9 @@ pub fn credential_envs_in_scope(
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (provider, rec) in credentials_in_scope(store, scope) {
+        if !rec.admits(ModelExecutionClass::LocalInteractive) {
+            continue;
+        }
         let Some(var) = provider_env_var(&provider) else {
             continue;
         };
@@ -271,6 +434,18 @@ pub fn resolved_credential_envs(
     envs.into_iter().collect()
 }
 
+#[derive(Clone, Debug)]
+enum SelectedCredentialScope {
+    Account(String),
+    Project(String),
+}
+
+#[derive(Clone, Debug)]
+struct SelectedCredential {
+    scope: SelectedCredentialScope,
+    record: CredentialRecord,
+}
+
 impl Workbench {
     /// The **account encryption key** this workbench seals/unseals account state with
     /// (ADR 0053 §4). Resolution order: the key this device **recovered** over enrollment
@@ -297,6 +472,107 @@ impl Workbench {
         unseal_token(self.account_key(), sealed)
     }
 
+    /// Seal a project-owned credential under a project-specific data key. The
+    /// data key is wrapped at rest by the current Home/account boundary, but the
+    /// credential ciphertext itself is independent of that wrapper. A handoff
+    /// transfers the data key sealed to the target authority and re-wraps it
+    /// there, so the project does not remain encrypted to its former owner's
+    /// account key (`LLM-5`, ADR 0085).
+    pub fn seal_project_secret(&self, project_id: &str, value: &str) -> Option<String> {
+        seal_token(self.project_credential_key(project_id)?, value)
+    }
+
+    /// Open a project-owned credential using only that project's data key.
+    /// Account-key ciphertext therefore fails closed on this path and must be
+    /// re-linked rather than silently retaining the old ownership boundary.
+    pub fn unseal_project_secret(&self, project_id: &str, sealed: &str) -> Option<String> {
+        unseal_token(self.existing_project_credential_key(project_id)?, sealed)
+    }
+
+    fn project_credential_key_path(&self, project_id: &str) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(project_id.as_bytes());
+        self.root_path()
+            .join("keys")
+            .join("project-credentials")
+            .join(format!("{}.key", hex::encode(digest)))
+    }
+
+    fn bare_project_credential_key(&self, project_id: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"gaugewright-project-credential-key:test:v1:");
+        digest.update(self.account_key());
+        digest.update(project_id.as_bytes());
+        digest.finalize().into()
+    }
+
+    fn existing_project_credential_key(&self, project_id: &str) -> Option<[u8; 32]> {
+        if self.root_path().as_os_str().is_empty() {
+            return Some(self.bare_project_credential_key(project_id));
+        }
+        let wrapped = fs::read_to_string(self.project_credential_key_path(project_id)).ok()?;
+        let encoded = unseal_token(self.account_key(), wrapped.trim())?;
+        let bytes = hex::decode(encoded).ok()?;
+        bytes.try_into().ok()
+    }
+
+    fn project_credential_key(&self, project_id: &str) -> Option<[u8; 32]> {
+        if let Some(key) = self.existing_project_credential_key(project_id) {
+            return Some(key);
+        }
+        let mut key = [0_u8; 32];
+        getrandom::getrandom(&mut key).ok()?;
+        self.install_project_credential_key(project_id, key)?;
+        Some(key)
+    }
+
+    fn write_project_credential_key(&self, project_id: &str, key: [u8; 32]) -> Option<()> {
+        if self.root_path().as_os_str().is_empty() {
+            return Some(());
+        }
+        let path = self.project_credential_key_path(project_id);
+        fs::create_dir_all(path.parent()?).ok()?;
+        let wrapped = seal_token(self.account_key(), &hex::encode(key))?;
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, wrapped).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).ok()?;
+        }
+        fs::rename(temporary, path).ok()?;
+        Some(())
+    }
+
+    /// Raw project key access is crate-private and exists only for the authenticated
+    /// handoff shell. It is never serialized unsealed or exposed through HTTP.
+    pub(crate) fn project_credential_key_for_handoff(&self, project_id: &str) -> Option<[u8; 32]> {
+        self.existing_project_credential_key(project_id)
+    }
+
+    /// Install a handoff-carried project key after it was opened under this
+    /// authority's private governance key, re-wrapping it for this Home at rest.
+    pub(crate) fn install_project_credential_key(
+        &self,
+        project_id: &str,
+        key: [u8; 32],
+    ) -> Option<()> {
+        self.write_project_credential_key(project_id, key)
+    }
+
+    /// Remove this Home's wrapped copy only after the target commits the handoff.
+    pub(crate) fn remove_project_credential_key(&self, project_id: &str) -> io::Result<()> {
+        if self.root_path().as_os_str().is_empty() {
+            return Ok(());
+        }
+        match fs::remove_file(self.project_credential_key_path(project_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// This account's governance root **seed** — the private key material the account key
     /// and the recovered-key wrap both derive from. Resolved through the file-backed key
     /// store when a real state root exists (persisted on first use, stable across restarts);
@@ -317,63 +593,212 @@ impl Workbench {
         }
     }
 
+    /// The execution class this composition may grant by default when a person
+    /// links a credential. Public use is never inferred here; it requires a
+    /// deployment-specific grant.
+    pub fn default_model_execution_classes(&self) -> BTreeSet<ModelExecutionClass> {
+        BTreeSet::from([self.model_execution_class()])
+    }
+
+    pub fn model_execution_class(&self) -> ModelExecutionClass {
+        if self.hosted_home_mode {
+            ModelExecutionClass::PrivateHome
+        } else {
+            ModelExecutionClass::LocalInteractive
+        }
+    }
+
+    fn selected_credential_for_chat_in_class(
+        &self,
+        chat_id: &str,
+        provider: &str,
+        actor: &str,
+        class: ModelExecutionClass,
+    ) -> Option<SelectedCredential> {
+        if let Some(project_id) = self.library_project_of_chat(chat_id) {
+            if let Some(record) =
+                credentials_in_scope(self.store_ref(), &project_scope(&project_id))
+                    .remove(provider)
+                    .filter(|record| record.admits(class))
+            {
+                return Some(SelectedCredential {
+                    scope: SelectedCredentialScope::Project(project_id),
+                    record,
+                });
+            }
+        }
+        credentials_in_scope(self.store_ref(), &self.account_scope_for_actor(actor))
+            .remove(provider)
+            .filter(|record| record.admits(class))
+            .map(|record| SelectedCredential {
+                scope: SelectedCredentialScope::Account(actor.to_owned()),
+                record,
+            })
+    }
+
+    fn versioned_credential_ref(
+        scope: &SelectedCredentialScope,
+        provider: &str,
+        version: u64,
+    ) -> String {
+        let (kind, owner) = match scope {
+            SelectedCredentialScope::Account(authority) => ("account", authority.as_str()),
+            SelectedCredentialScope::Project(project) => ("project", project.as_str()),
+        };
+        format!(
+            "gaugedesk:credential:v2:{kind}:{}:{provider}:{version}",
+            hex::encode(owner.as_bytes())
+        )
+    }
+
     /// Stable, non-secret identity for the credential selected by the same
     /// nearest-scope-wins rule as the ephemeral secret resolver.
-    pub(crate) fn credential_ref_for_chat(&self, chat_id: &str, provider: &str) -> String {
-        let project = self.library_project_of_chat(chat_id);
-        let scope = project
-            .as_deref()
-            .filter(|project_id| {
-                credentials_in_scope(self.store_ref(), &project_scope(project_id))
-                    .contains_key(provider)
+    #[cfg(test)]
+    pub(crate) fn credential_ref_for_chat(
+        &self,
+        chat_id: &str,
+        provider: &str,
+        actor: &str,
+    ) -> String {
+        self.credential_ref_for_chat_in_class(
+            chat_id,
+            provider,
+            actor,
+            self.model_execution_class(),
+        )
+    }
+
+    pub(crate) fn credential_ref_for_chat_in_class(
+        &self,
+        chat_id: &str,
+        provider: &str,
+        actor: &str,
+        class: ModelExecutionClass,
+    ) -> String {
+        self.selected_credential_for_chat_in_class(chat_id, provider, actor, class)
+            .map(|selected| {
+                Self::versioned_credential_ref(&selected.scope, provider, selected.record.version)
             })
-            .map(|project_id| format!("project:{project_id}"))
-            .unwrap_or_else(|| "account".to_owned());
-        format!("gaugedesk:credential:{scope}:{provider}")
+            .unwrap_or_else(|| {
+                Self::versioned_credential_ref(
+                    &SelectedCredentialScope::Account(actor.to_owned()),
+                    provider,
+                    0,
+                )
+            })
     }
 
     /// Resolve the nearest-scope BYOK credential into an exact-reference
     /// capability. The secret remains private to this in-memory object and is
     /// released only after WhippleScript admits the matching reference.
+    #[cfg(test)]
     pub(crate) fn credential_capability_for_chat(
         &self,
         chat_id: &str,
         provider: &str,
+        actor: &str,
     ) -> Option<Arc<dyn CredentialCapability>> {
-        let project = self.library_project_of_chat(chat_id);
-        let project_record = project.as_deref().and_then(|project_id| {
-            credentials_in_scope(self.store_ref(), &project_scope(project_id)).remove(provider)
-        });
-        let record = project_record
-            .or_else(|| credentials_in_scope(self.store_ref(), ACCOUNT_SCOPE).remove(provider))?;
-        let secret = unseal_token(self.account_key(), &record.sealed_token)?;
+        self.credential_capability_for_chat_in_class(
+            chat_id,
+            provider,
+            actor,
+            self.model_execution_class(),
+        )
+    }
+
+    pub(crate) fn credential_capability_for_chat_in_class(
+        &self,
+        chat_id: &str,
+        provider: &str,
+        actor: &str,
+        class: ModelExecutionClass,
+    ) -> Option<Arc<dyn CredentialCapability>> {
+        let selected =
+            self.selected_credential_for_chat_in_class(chat_id, provider, actor, class)?;
+        let secret = match &selected.scope {
+            SelectedCredentialScope::Project(project_id) => {
+                self.unseal_project_secret(project_id, &selected.record.sealed_token)?
+            }
+            SelectedCredentialScope::Account(_) => {
+                unseal_token(self.account_key(), &selected.record.sealed_token)?
+            }
+        };
         Some(resolved_credential_capability(
-            self.credential_ref_for_chat(chat_id, provider),
+            Self::versioned_credential_ref(&selected.scope, provider, selected.record.version),
             secret,
             None,
         ))
+    }
+
+    /// The non-secret OpenAI-compatible endpoint of the nearest-scope credential for
+    /// `provider` (ADR 0083), by the same project-then-account precedence as the secret
+    /// resolver. `None` when no credential resolves or it carries no endpoint (the
+    /// fixed-host providers) — the caller fails closed on a missing `openai-generic`
+    /// endpoint.
+    pub(crate) fn credential_base_url_for_chat_in_class(
+        &self,
+        chat_id: &str,
+        provider: &str,
+        actor: &str,
+        class: ModelExecutionClass,
+    ) -> Option<String> {
+        let selected =
+            self.selected_credential_for_chat_in_class(chat_id, provider, actor, class)?;
+        Some(selected.record.base_url).filter(|url| !url.is_empty())
     }
 
     /// Provider ids pinned as BYOK credentials in one project's coordination scope.
     pub fn project_credential_providers(&self, project_id: &str) -> Vec<String> {
         let scope = project_scope(project_id);
         credentials_in_scope(self.store_ref(), &scope)
-            .into_keys()
+            .into_iter()
+            .filter(|(_, record)| record.status == CredentialStatus::Active)
+            .map(|(provider, _)| provider)
             .collect()
     }
 
-    /// Persist a sealed BYOK credential pin for one project.
+    /// Persist a sealed BYOK credential pin for one project. `base_url` is the
+    /// non-secret OpenAI-compatible endpoint for an `openai-generic` pin (ADR 0083),
+    /// empty for the fixed-host providers.
     pub fn upsert_project_credential(
         &mut self,
         project_id: &str,
         provider: String,
         sealed_token: String,
+        base_url: String,
+    ) -> Result<(), AdmitError> {
+        let execution_classes = self.default_model_execution_classes();
+        self.upsert_project_credential_with_policy(
+            project_id,
+            provider,
+            sealed_token,
+            base_url,
+            execution_classes,
+        )
+    }
+
+    pub fn upsert_project_credential_with_policy(
+        &mut self,
+        project_id: &str,
+        provider: String,
+        sealed_token: String,
+        base_url: String,
+        execution_classes: BTreeSet<ModelExecutionClass>,
     ) -> Result<(), AdmitError> {
         let scope = project_scope(project_id);
+        let version = credentials_in_scope(self.store_ref(), &scope)
+            .get(&provider)
+            .map(|record| record.version.saturating_add(1))
+            .unwrap_or(1);
         let record = CredentialRecord {
+            authentication: authentication_for_provider(&provider),
             id: provider,
             op: RecordOp::Upsert,
             sealed_token,
+            base_url,
+            version,
+            status: CredentialStatus::Active,
+            execution_classes,
         };
         self.store_mut().append_record(
             &scope,
@@ -391,17 +816,31 @@ impl Workbench {
         provider: String,
     ) -> Result<(), AdmitError> {
         let scope = project_scope(project_id);
+        let previous = credentials_in_scope(self.store_ref(), &scope).remove(&provider);
         let record = CredentialRecord {
+            authentication: previous
+                .as_ref()
+                .map(|record| record.authentication)
+                .unwrap_or_else(|| authentication_for_provider(&provider)),
             id: provider,
-            op: RecordOp::Tombstone,
+            op: RecordOp::Upsert,
             sealed_token: String::new(),
+            base_url: previous
+                .as_ref()
+                .map(|record| record.base_url.clone())
+                .unwrap_or_default(),
+            version: previous.as_ref().map(|record| record.version).unwrap_or(1),
+            status: CredentialStatus::Revoked,
+            execution_classes: previous
+                .map(|record| record.execution_classes)
+                .unwrap_or_default(),
         };
         self.store_mut().append_record(
             &scope,
             "credential",
             &serde_json::to_string(&record).unwrap(),
         )?;
-        self.notify_library_changed(&scope, &record.id, "upsert");
+        self.notify_library_changed(&scope, &record.id, "revoke");
         Ok(())
     }
 
@@ -441,7 +880,9 @@ impl Workbench {
     pub fn account_credential_providers_in(&self, scope: &str) -> Result<Vec<String>, AdmitError> {
         Ok(Account::rebuild_in(self.store_ref(), scope)?
             .credentials
-            .into_keys()
+            .into_iter()
+            .filter(|(_, record)| record.status == CredentialStatus::Active)
+            .map(|(provider, _)| provider)
             .collect())
     }
 
@@ -472,7 +913,14 @@ impl Workbench {
         scope: &str,
         record: &DeviceRecord,
     ) -> Result<(), AdmitError> {
-        self.write_account_record_in(scope, "device", &record.id, record)
+        let account = Account::rebuild_in(self.store_ref(), scope)?;
+        let mut stored = record.clone();
+        if let Some(existing) = account.devices.get(&record.id) {
+            // A zero is meaningful for legacy records: preserve its honest
+            // "unknown" rather than relabeling an update as the enrollment.
+            stored.enrolled_at = existing.enrolled_at;
+        }
+        self.write_account_record_in(scope, "device", &stored.id, &stored)
     }
 
     /// Mark one trusted device revoked in `scope`, preserving its label/subkey metadata.
@@ -520,21 +968,52 @@ impl Workbench {
         &mut self,
         provider: String,
         sealed_token: String,
+        base_url: String,
     ) -> Result<(), AdmitError> {
-        self.upsert_account_credential_in(ACCOUNT_SCOPE, provider, sealed_token)
+        self.upsert_account_credential_in(ACCOUNT_SCOPE, provider, sealed_token, base_url)
     }
 
     /// Persist one sealed account credential in `scope` (the caller's account).
+    /// `base_url` is the non-secret OpenAI-compatible endpoint for an
+    /// `openai-generic` credential (ADR 0083), empty for the fixed-host providers.
     pub fn upsert_account_credential_in(
         &mut self,
         scope: &str,
         provider: String,
         sealed_token: String,
+        base_url: String,
     ) -> Result<(), AdmitError> {
+        let execution_classes = self.default_model_execution_classes();
+        self.upsert_account_credential_in_with_policy(
+            scope,
+            provider,
+            sealed_token,
+            base_url,
+            execution_classes,
+        )
+    }
+
+    pub fn upsert_account_credential_in_with_policy(
+        &mut self,
+        scope: &str,
+        provider: String,
+        sealed_token: String,
+        base_url: String,
+        execution_classes: BTreeSet<ModelExecutionClass>,
+    ) -> Result<(), AdmitError> {
+        let version = credentials_in_scope(self.store_ref(), scope)
+            .get(&provider)
+            .map(|record| record.version.saturating_add(1))
+            .unwrap_or(1);
         let record = CredentialRecord {
+            authentication: authentication_for_provider(&provider),
             id: provider,
             op: RecordOp::Upsert,
             sealed_token,
+            base_url,
+            version,
+            status: CredentialStatus::Active,
+            execution_classes,
         };
         self.write_account_record_in(scope, "credential", &record.id, &record)
     }
@@ -550,10 +1029,24 @@ impl Workbench {
         scope: &str,
         provider: String,
     ) -> Result<(), AdmitError> {
+        let previous = credentials_in_scope(self.store_ref(), scope).remove(&provider);
         let record = CredentialRecord {
+            authentication: previous
+                .as_ref()
+                .map(|record| record.authentication)
+                .unwrap_or_else(|| authentication_for_provider(&provider)),
             id: provider,
-            op: RecordOp::Tombstone,
+            op: RecordOp::Upsert,
             sealed_token: String::new(),
+            base_url: previous
+                .as_ref()
+                .map(|record| record.base_url.clone())
+                .unwrap_or_default(),
+            version: previous.as_ref().map(|record| record.version).unwrap_or(1),
+            status: CredentialStatus::Revoked,
+            execution_classes: previous
+                .map(|record| record.execution_classes)
+                .unwrap_or_default(),
         };
         self.write_account_record_in(scope, "credential", &record.id, &record)
     }
@@ -685,6 +1178,8 @@ pub struct AccountBlob {
     pub settings: BTreeMap<String, String>,
     pub devices: Vec<DeviceRecord>,
     pub credentials: Vec<CredentialRecord>,
+    #[serde(default)]
+    pub homes: Vec<RegisteredHomeRecord>,
 }
 
 /// Project the folded account to the syncable blob shape.
@@ -697,6 +1192,7 @@ pub fn account_blob(acct: &Account) -> AccountBlob {
             .collect(),
         devices: acct.devices.values().cloned().collect(),
         credentials: acct.credentials.values().cloned().collect(),
+        homes: acct.homes.values().cloned().collect(),
     }
 }
 
@@ -719,22 +1215,13 @@ pub fn open_account_blob(key: [u8; 32], sealed_hex: &str) -> Option<AccountBlob>
 /// The **readable** record the blind directory holds for routing/identity (`INV-10`:
 /// pubkeys + addresses only, never secrets). It is what lets any device prove who you
 /// are, see your devices, and find your placements — even with your machine off.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-pub struct DirectoryRecord {
-    /// The account root public key (the self-certifying identity).
-    pub root_pubkey: String,
-    /// The active device subkey public keys (which devices are yours).
-    pub device_pubkeys: Vec<String>,
-    /// Rendezvous pointers to reach your placements (addresses, not content).
-    pub placement_pointers: Vec<String>,
-}
-
 /// Build the directory record from the account + your placement pointers. Carries
 /// **no** secrets: only the root pubkey, your active devices' pubkeys, and addresses.
 pub fn directory_record(
     root_pubkey: &str,
     acct: &Account,
     placement_pointers: Vec<String>,
+    home_routes: Vec<crate::home::OpaqueHomeRoute>,
 ) -> DirectoryRecord {
     DirectoryRecord {
         root_pubkey: root_pubkey.to_string(),
@@ -744,12 +1231,14 @@ pub fn directory_record(
             .map(|d| d.subkey_pubkey.clone())
             .collect(),
         placement_pointers,
+        home_routes,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LockUnpoisoned;
 
     /// A fixed account key for the sealing tests (stands in for the seed-derived key the
     /// [`Workbench::account_key`] resolver hands the sealing primitives at runtime).
@@ -798,6 +1287,138 @@ mod tests {
     }
 
     #[test]
+    fn hosted_turn_resolves_the_authenticated_actors_scope_and_versioned_ref() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let mut wb = shared.lock_unpoisoned();
+        wb.enable_hosted_home_mode();
+        let sealed = seal_token(wb.account_key(), "alice-provider-secret").unwrap();
+        wb.upsert_account_credential_in(
+            &account_scope("alice"),
+            "openai".to_owned(),
+            sealed,
+            String::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            wb.credential_ref_for_chat("unknown-chat", "openai", "alice"),
+            "gaugedesk:credential:v2:account:616c696365:openai:1"
+        );
+        let capability = wb
+            .credential_capability_for_chat("unknown-chat", "openai", "alice")
+            .expect("alice's Home-scoped credential resolves");
+        assert_eq!(
+            capability.credential_ref(),
+            "gaugedesk:credential:v2:account:616c696365:openai:1"
+        );
+        assert_eq!(
+            capability
+                .resolve(capability.credential_ref())
+                .unwrap()
+                .secret(),
+            "alice-provider-secret"
+        );
+        assert!(wb
+            .credential_capability_for_chat("unknown-chat", "openai", "bob")
+            .is_none());
+    }
+
+    #[test]
+    fn rotation_versions_refs_and_revocation_or_wrong_execution_class_denies_future_use() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let mut wb = shared.lock_unpoisoned();
+        wb.enable_hosted_home_mode();
+        let scope = account_scope("alice");
+
+        for secret in ["first", "rotated"] {
+            let sealed = seal_token(wb.account_key(), secret).unwrap();
+            wb.upsert_account_credential_in(&scope, "openai".to_owned(), sealed, String::new())
+                .unwrap();
+        }
+        assert_eq!(
+            wb.credential_ref_for_chat("unknown-chat", "openai", "alice"),
+            "gaugedesk:credential:v2:account:616c696365:openai:2"
+        );
+
+        wb.tombstone_account_credential_in(&scope, "openai".to_owned())
+            .unwrap();
+        let revoked = credentials_in_scope(wb.store_ref(), &scope)
+            .remove("openai")
+            .unwrap();
+        assert_eq!(revoked.version, 2);
+        assert_eq!(revoked.status, CredentialStatus::Revoked);
+        assert!(wb
+            .credential_capability_for_chat("unknown-chat", "openai", "alice")
+            .is_none());
+
+        let sealed = seal_token(wb.account_key(), "local-only").unwrap();
+        wb.upsert_account_credential_in_with_policy(
+            &scope,
+            "openai".to_owned(),
+            sealed,
+            String::new(),
+            BTreeSet::from([ModelExecutionClass::LocalInteractive]),
+        )
+        .unwrap();
+        assert_eq!(
+            credentials_in_scope(wb.store_ref(), &scope)
+                .remove("openai")
+                .unwrap()
+                .version,
+            3
+        );
+        assert!(wb
+            .credential_capability_for_chat("unknown-chat", "openai", "alice")
+            .is_none());
+    }
+
+    #[test]
+    fn public_execution_requires_an_explicit_public_credential_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let mut wb = shared.lock_unpoisoned();
+        wb.enable_hosted_home_mode();
+        let scope = account_scope("alice");
+        let sealed = seal_token(wb.account_key(), "public-secret").unwrap();
+        wb.upsert_account_credential_in_with_policy(
+            &scope,
+            "openai".to_owned(),
+            sealed,
+            String::new(),
+            BTreeSet::from([ModelExecutionClass::PublicDeployment]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            wb.credential_ref_for_chat_in_class(
+                "unknown-chat",
+                "openai",
+                "alice",
+                ModelExecutionClass::PublicDeployment,
+            ),
+            "gaugedesk:credential:v2:account:616c696365:openai:1"
+        );
+        assert!(wb
+            .credential_capability_for_chat_in_class(
+                "unknown-chat",
+                "openai",
+                "alice",
+                ModelExecutionClass::PublicDeployment,
+            )
+            .is_some());
+        assert!(wb
+            .credential_capability_for_chat_in_class(
+                "unknown-chat",
+                "openai",
+                "alice",
+                ModelExecutionClass::PrivateHome,
+            )
+            .is_none());
+    }
+
+    #[test]
     fn devices_settings_credentials_fold_latest_wins() {
         let mut s = store();
         let dev = DeviceRecord {
@@ -806,6 +1427,7 @@ mod tests {
             label: "My phone".into(),
             subkey_pubkey: "abcd".into(),
             status: DeviceStatus::Active,
+            enrolled_at: 1_700_000_000,
         };
         s.append_record(
             ACCOUNT_SCOPE,
@@ -840,6 +1462,7 @@ mod tests {
             label: "Old laptop".into(),
             subkey_pubkey: "ff".into(),
             status: DeviceStatus::Active,
+            enrolled_at: 1_700_000_000,
         };
         s.append_record(
             ACCOUNT_SCOPE,
@@ -862,6 +1485,52 @@ mod tests {
         assert_eq!(
             acct.devices.get("old").unwrap().status,
             DeviceStatus::Revoked
+        );
+    }
+
+    #[test]
+    fn device_enrollment_time_survives_metadata_updates_and_revocation() {
+        let mut wb = Workbench::new(store());
+        let original = DeviceRecord {
+            id: "laptop".into(),
+            op: RecordOp::Upsert,
+            label: "Old label".into(),
+            subkey_pubkey: "ff".into(),
+            status: DeviceStatus::Active,
+            enrolled_at: 1_700_000_000,
+        };
+        wb.upsert_account_device(&original).unwrap();
+        wb.upsert_account_device(&DeviceRecord {
+            label: "New label".into(),
+            enrolled_at: 1_800_000_000,
+            ..original.clone()
+        })
+        .unwrap();
+        let revoked = wb.revoke_account_device("laptop").unwrap().unwrap();
+        assert_eq!(revoked.enrolled_at, 1_700_000_000);
+        assert_eq!(
+            Account::rebuild(wb.store_ref()).unwrap().devices["laptop"].enrolled_at,
+            1_700_000_000,
+        );
+
+        let legacy = DeviceRecord {
+            id: "legacy".into(),
+            op: RecordOp::Upsert,
+            label: "Before dates".into(),
+            subkey_pubkey: "old".into(),
+            status: DeviceStatus::Active,
+            enrolled_at: 0,
+        };
+        wb.upsert_account_device(&legacy).unwrap();
+        wb.upsert_account_device(&DeviceRecord {
+            label: "Renamed legacy".into(),
+            enrolled_at: 1_800_000_000,
+            ..legacy
+        })
+        .unwrap();
+        assert_eq!(
+            Account::rebuild(wb.store_ref()).unwrap().devices["legacy"].enrolled_at,
+            0,
         );
     }
 
@@ -896,6 +1565,7 @@ mod tests {
                 label: "Phone".into(),
                 subkey_pubkey: "dev-pub-1".into(),
                 status: DeviceStatus::Active,
+                enrolled_at: 1_700_000_000,
             },
         );
         acct.credentials.insert(
@@ -904,6 +1574,11 @@ mod tests {
                 id: "openai".into(),
                 op: RecordOp::Upsert,
                 sealed_token: seal_token(KEY, "tok").unwrap(),
+                base_url: String::new(),
+                version: 1,
+                authentication: CredentialAuthentication::Bearer,
+                status: CredentialStatus::Active,
+                execution_classes: BTreeSet::from([ModelExecutionClass::LocalInteractive]),
             },
         );
         acct
@@ -921,6 +1596,11 @@ mod tests {
                 id: provider.into(),
                 op: RecordOp::Upsert,
                 sealed_token: seal_token(KEY, token).unwrap(),
+                base_url: String::new(),
+                version: 1,
+                authentication: authentication_for_provider(provider),
+                status: CredentialStatus::Active,
+                execution_classes: BTreeSet::from([ModelExecutionClass::LocalInteractive]),
             };
             s.append_record(
                 ACCOUNT_SCOPE,
@@ -953,7 +1633,7 @@ mod tests {
     #[test]
     fn directory_record_is_routing_only_no_secrets() {
         let acct = seeded_account();
-        let rec = directory_record("root-pub", &acct, vec!["relay://abc".into()]);
+        let rec = directory_record("root-pub", &acct, vec!["relay://abc".into()], vec![]);
         assert_eq!(rec.root_pubkey, "root-pub");
         assert_eq!(rec.device_pubkeys, vec!["dev-pub-1".to_string()]);
         assert_eq!(rec.placement_pointers, vec!["relay://abc".to_string()]);
@@ -969,6 +1649,11 @@ mod tests {
             id: "openai".into(),
             op: RecordOp::Upsert,
             sealed_token: seal_token(KEY, "tok-abc").unwrap(),
+            base_url: String::new(),
+            version: 1,
+            authentication: CredentialAuthentication::Bearer,
+            status: CredentialStatus::Active,
+            execution_classes: BTreeSet::from([ModelExecutionClass::LocalInteractive]),
         };
         s.append_record(
             ACCOUNT_SCOPE,
@@ -990,6 +1675,31 @@ mod tests {
         assert_eq!(resolve_token(&s, KEY, "anthropic"), None);
     }
 
+    /// ADR 0083: linking `openai-generic` requires a policy-valid endpoint; the
+    /// fixed-host providers ignore any supplied endpoint and persist nothing.
+    #[test]
+    fn link_base_url_for_enforces_the_endpoint_policy() {
+        // Fixed-host providers: endpoint ignored (empty), even if one is passed.
+        assert_eq!(
+            link_base_url_for("openai", Some("https://api.example.com")).unwrap(),
+            ""
+        );
+        assert_eq!(link_base_url_for("anthropic", None).unwrap(), "");
+        // openai-generic: a valid https (or loopback http) endpoint is kept verbatim.
+        assert_eq!(
+            link_base_url_for("openai-generic", Some("https://api.together.xyz/v1")).unwrap(),
+            "https://api.together.xyz/v1"
+        );
+        assert_eq!(
+            link_base_url_for("openai-generic", Some("http://localhost:11434/v1")).unwrap(),
+            "http://localhost:11434/v1"
+        );
+        // openai-generic without / with a policy-invalid endpoint fails closed.
+        assert!(link_base_url_for("openai-generic", None).is_err());
+        assert!(link_base_url_for("openai-generic", Some("  ")).is_err());
+        assert!(link_base_url_for("openai-generic", Some("http://api.remote.com")).is_err());
+    }
+
     /// LLM-2 (ADR 0062): a credential pinned in the chat's project overrides the account
     /// default **per provider** (nearest-scope-wins); providers the project does not pin
     /// fall through to the account; `project = None` resolves to the account alone.
@@ -1002,6 +1712,11 @@ mod tests {
                 id: provider.into(),
                 op: RecordOp::Upsert,
                 sealed_token: seal(tok),
+                base_url: String::new(),
+                version: 1,
+                authentication: authentication_for_provider(provider),
+                status: CredentialStatus::Active,
+                execution_classes: BTreeSet::from([ModelExecutionClass::LocalInteractive]),
             };
             s.append_record(scope, "credential", &serde_json::to_string(&rec).unwrap())
                 .unwrap();

@@ -14,6 +14,7 @@
 //! that open code also consumes. This crate only *composes* those seams.
 
 pub mod auth_oidc;
+pub mod environment_routes;
 pub mod identity_oidc;
 pub mod identity_saml;
 pub mod org_routes;

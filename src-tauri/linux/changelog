@@ -1,0 +1,5 @@
+gauge-desk (0.4.3) stable; urgency=medium
+
+  * Publish GaugeDesk as a self-contained desktop workbench.
+
+ -- GaugeWright <support@gaugewright.com>  Mon, 13 Jul 2026 00:00:00 -0400

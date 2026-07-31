@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{HumanPrompt, Observation, ToolInfo, TurnOutcome};
+use crate::{ModelUsage, Observation, ToolInfo, TurnOutcome};
 
 /// One turn handed to a remote harness — the request line the orchestrator sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,9 +56,9 @@ pub struct WireTurnOutcome {
     #[serde(default)]
     pub pending_approvals: Vec<String>,
     #[serde(default)]
-    pub pending_human: Option<HumanPrompt>,
-    #[serde(default)]
     pub runtime_evidence_pointers: Vec<String>,
+    #[serde(default)]
+    pub managed_usage: Option<ModelUsage>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -101,8 +101,8 @@ impl From<&TurnOutcome> for WireTurnOutcome {
             observations: o.observations.iter().map(WireObservation::from).collect(),
             mediated_tool_calls: o.mediated_tool_calls.clone(),
             pending_approvals: o.pending_approvals.clone(),
-            pending_human: o.pending_human.clone(),
             runtime_evidence_pointers: o.runtime_evidence_pointers.clone(),
+            managed_usage: o.managed_usage.clone(),
             error: o.error.clone(),
         }
     }
@@ -115,12 +115,17 @@ impl From<&WireTurnOutcome> for TurnOutcome {
             observations: w.observations.iter().map(Observation::from).collect(),
             mediated_tool_calls: w.mediated_tool_calls.clone(),
             pending_approvals: w.pending_approvals.clone(),
-            pending_human: w.pending_human.clone(),
+            // The wire protocol carries no questions: a remote peer asks its own
+            // people, not ours (ADR 0113).
+            asked_questions: Vec::new(),
             runtime_evidence_pointers: w.runtime_evidence_pointers.clone(),
             output_flow_signature: Vec::new(),
             // The wire protocol predates DR-0036; a remote peer certifies no
             // guarantees here — consumers fall back to local truth.
             guarantee_outcomes: Vec::new(),
+            runtime_start_position: None,
+            runtime_terminal_position: None,
+            managed_usage: w.managed_usage.clone(),
             error: w.error.clone(),
         }
     }
@@ -135,7 +140,6 @@ pub fn intern_kind(kind: &str) -> &'static str {
         "text" => "text",
         "progress" => "progress",
         "approval" => "approval",
-        "human_ask" => "human_ask",
         "go" => "go",
         "egress" => "egress",
         "egress_blocked" => "egress_blocked",
@@ -219,10 +223,13 @@ mod tests {
             ],
             mediated_tool_calls: vec!["bash".into()],
             pending_approvals: vec!["fs:read (id-7)".into()],
-            pending_human: None,
+            asked_questions: Vec::new(),
             runtime_evidence_pointers: vec!["{\"pointer_kind\":\"event\"}".into()],
             output_flow_signature: Vec::new(),
             guarantee_outcomes: Vec::new(),
+            runtime_start_position: None,
+            runtime_terminal_position: None,
+            managed_usage: None,
             error: None,
         }
     }
@@ -270,7 +277,6 @@ mod tests {
             "text",
             "progress",
             "approval",
-            "human_ask",
             "go",
             "egress",
             "egress_blocked",

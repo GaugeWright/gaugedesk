@@ -1,49 +1,97 @@
-/**
- * The embed example/demo page bootstrap (EMBED-2). It registers the custom
- * elements, then composes a `<gw-session>` with all three panels, pointed at a
- * scoped control plane. `?cp=` overrides the backend base; `?engagement=` binds an
- * existing chat — and absent one (the demo/e2e case) it spins up a fresh work chat
- * via the same quick-start the workbench uses, so the page is self-contained.
- */
-import { registerEmbedElements } from "./elements";
-import { EmbedControlPlane, controlPlaneBase } from "./embed-control-plane";
+import { createRoot } from "solid-js";
+import type {
+    EngagementId,
+    FileEntry,
+    MergeAction,
+    MergeState,
+    StreamEvent,
+} from "@gaugewright/control-plane-client";
+
+import { registerEmbedElements, type GwSessionElement } from "./elements";
+import { createRemoteSession } from "./remote-session";
+import type { EmbedSessionApi } from "./session-api";
 
 registerEmbedElements();
 
-async function main() {
-    const params = new URLSearchParams(location.search);
-    const base = params.get("cp") ?? controlPlaneBase();
-    // `?auth=1` demos the authenticated mode (EMBED-4/5): sign in a managed-auth
-    // end-user, persist a durable chat, and show my-chats. Default is anonymous.
-    const authed = params.get("auth") === "1";
+const params = new URLSearchParams(location.search);
+const requestedPanels = (params.get("panels") ?? "chat,viewer,files")
+    .split(",")
+    .map((panel) => panel.trim())
+    .filter(Boolean);
+const mount = document.getElementById("mount");
 
-    let token: string | undefined;
-    if (authed) {
-        const api = new EmbedControlPlane(base);
-        const signin = await api.embedSignin("demo@reader.example");
-        token = signin.token;
-        api.setBearer(token);
-        await api.embedCreateChat("my saved chapter");
-    }
-
-    let engagement = params.get("engagement");
-    if (!engagement) {
-        const api = new EmbedControlPlane(base);
-        const eng = await api.createEngagement();
-        engagement = String(eng.id);
-    }
-
-    const session = document.createElement("gw-session");
-    session.setAttribute("cp", base);
-    session.setAttribute("engagement", engagement);
-    if (token) session.setAttribute("token", token);
-    // Authenticated: chat + the my-chats listing. Anonymous: the full panel set.
-    session.innerHTML = authed
-        ? "<gw-chat></gw-chat><gw-chats></gw-chats>"
-        : "<gw-chat></gw-chat><gw-viewer></gw-viewer><gw-files></gw-files>";
-
-    const mount = document.getElementById("mount");
-    if (mount) mount.appendChild(session);
+function panelMarkup(): string {
+    return requestedPanels
+        .filter((panel) => ["chat", "viewer", "files", "chats"].includes(panel))
+        .map((panel) => `<gw-${panel}></gw-${panel}>`)
+        .join("");
 }
 
-void main();
+function mountHosted(host: string): void {
+    const session = document.createElement("gw-session");
+    session.setAttribute("host", host);
+    session.setAttribute("panels", requestedPanels.join(","));
+    const token = params.get("token");
+    if (token) session.setAttribute("token", token);
+    session.innerHTML = panelMarkup();
+    mount?.appendChild(session);
+}
+
+function fixtureApi(): EmbedSessionApi {
+    const emptyMerge = { phase: "Clean" } as MergeState;
+    return {
+        getTranscript: async () => [] as StreamEvent[],
+        subscribe: () => () => undefined,
+        engagementDiff: async () => "",
+        getMerge: async () => emptyMerge,
+        // Keep the hermetic browser fixture in-flight so the shared panel's
+        // optimistic user projection remains visible without fabricating a
+        // terminal runtime response.
+        runEmbedTurn: () => new Promise<never>(() => undefined),
+        runTask: () => new Promise<never>(() => undefined),
+        mergeCommand: async (_id: EngagementId, _action: MergeAction) =>
+            emptyMerge,
+        getFile: async () => "",
+        putFile: async () => {
+            throw new Error("fixture files are read-only");
+        },
+        getTree: async () => [] as FileEntry[],
+        embedMyChats: async () => [],
+        embedGetConfig: async () => ({ white_label: false }),
+    };
+}
+
+function mountFixture(): void {
+    createRoot((dispose) => {
+        const engagement = "embed-browser-fixture" as EngagementId;
+        const binding = createRemoteSession({
+            api: fixtureApi(),
+            engagementId: engagement,
+        });
+        const session = document.createElement("gw-session") as GwSessionElement;
+        session.session = binding.session;
+        session.setAttribute("panels", requestedPanels.join(","));
+        session.innerHTML = panelMarkup();
+        mount?.appendChild(session);
+        globalThis.addEventListener(
+            "pagehide",
+            () => {
+                binding.dispose();
+                dispose();
+            },
+            { once: true },
+        );
+    });
+}
+
+if (params.get("fixture") === "1") {
+    mountFixture();
+} else {
+    const host = params.get("host");
+    if (host) {
+        mountHosted(host);
+    } else if (mount) {
+        mount.textContent =
+            "Add ?host=https://panels.gaugewright.com/d/<deployment> to open a hosted agent.";
+    }
+}

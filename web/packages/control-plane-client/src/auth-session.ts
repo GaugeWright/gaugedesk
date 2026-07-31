@@ -29,6 +29,8 @@
  */
 
 import { createSignal } from "solid-js";
+import { browserRouteRequest } from "./browser-route-json";
+import { newIdempotencyKey } from "./control-plane-transport";
 
 /**
  * Parse an OIDC callback URL fragment for the delivered id-token. Accepts the
@@ -124,6 +126,82 @@ export function signOut(): void {
     setBearer(null);
 }
 
+/** End the hosted HttpOnly-cookie session, then clear any in-memory bearer used by a local
+ * OIDC client. The server endpoint is idempotent and deliberately works even after the session
+ * token expires, giving every account menu a reliable path back to the signed-out screen. */
+export async function endSession(controlPlaneBase: string): Promise<void> {
+    const base = controlPlaneBase.replace(/\/+$/, "");
+    const response = await fetch(`${base}/auth/logout`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "idempotency-key": newIdempotencyKey() },
+    });
+    if (!response.ok) {
+        throw new Error(`Sign out failed (${response.status}). Please try again.`);
+    }
+    signOut();
+}
+
+/** Exchange a native login handoff through the shared browser transport. The
+ * custom-scheme callback carries only an opaque single-use code; the verifier
+ * is supplied from the initiating device and the returned account token never
+ * appears in a URL. */
+export async function exchangeMobileAccountHandoff(
+    controlPlaneBase: string,
+    code: string,
+    verifier: string,
+): Promise<string> {
+    const response = await browserRouteRequest(controlPlaneBase)(
+        "/auth/mobile/exchange",
+        {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ code, verifier }),
+        },
+    );
+    if (!response.ok) {
+        throw new Error(`Mobile sign-in handoff failed (${response.status})`);
+    }
+    const body = await response.json() as { id_token?: unknown };
+    if (typeof body.id_token !== "string" || !body.id_token) {
+        throw new Error("Mobile sign-in handoff response is malformed");
+    }
+    return body.id_token;
+}
+
+/** Proactively refresh a still-valid native account session through the same
+ * credentialed request owner used by every other browser control-plane call. */
+export async function refreshMobileAccountToken(
+    controlPlaneBase: string,
+    token: string,
+): Promise<string> {
+    const response = await browserRouteRequest(controlPlaneBase, {
+        bearer: () => token,
+    })("/auth/mobile/refresh", { method: "POST" });
+    if (!response.ok) {
+        throw new Error(`Mobile account refresh failed (${response.status})`);
+    }
+    const body = await response.json() as { id_token?: unknown };
+    if (typeof body.id_token !== "string" || !body.id_token) {
+        throw new Error("Mobile account refresh response is malformed");
+    }
+    return body.id_token;
+}
+
+/** Proactively refresh one hosted HttpOnly-cookie account session. The cookie is
+ * the only browser credential and remains unreadable to JavaScript; callers
+ * receive only whether the server admitted and refreshed the session. */
+export async function refreshHostedAccountSession(
+    controlPlaneBase: string,
+): Promise<boolean> {
+    const base = controlPlaneBase.replace(/\/+$/, "");
+    const response = await fetch(`${base}/auth/refresh`, {
+        method: "GET",
+        credentials: "include",
+    });
+    return response.ok;
+}
+
 /**
  * Keep a hosted **cookie session** alive (ADR 0077 session refresh). The hub sets an HttpOnly
  * `.gaugewright.com` session cookie carrying a ~1h id-token; `GET /auth/refresh` mints a fresh one
@@ -132,14 +210,14 @@ export function signOut(): void {
  * the browser swaps in the new cookie, and a long-open tab never gets logged out mid-use.
  *
  * Fire-and-forget + credentialed (the HttpOnly cookie is not JS-readable). No-op unless `base` is a
- * remote `https` hub (the hosted Console) — the loopback desktop has no cookie session. Returns a
+ * remote `https` Hub API — the loopback desktop has no cookie session. Returns a
  * stop function. Safe when there is no `window`.
  */
 export function startSessionRefresh(base: string, intervalMs = 45 * 60 * 1000): () => void {
     if (typeof window === "undefined" || !base.startsWith("https://")) return () => {};
     const tick = () => {
         // Ignore the outcome: a 200 refreshed the cookie; a 401/404 just means re-login on next use.
-        void fetch(`${base}/auth/refresh`, { method: "GET", credentials: "include" }).catch(() => {});
+        void refreshHostedAccountSession(base).catch(() => {});
     };
     const id = window.setInterval(tick, intervalMs);
     return () => window.clearInterval(id);

@@ -4,19 +4,21 @@
  * reads) and assert on rendered projections — never on internal state.
  *
  * The model (ADR 0035/0036): the nav is **project-first**, facets
- * **Chats | Projects | Library** (default Chats). An **archetype** is the
+ * **Recent | Projects | Library** (default Projects). An **archetype** is the
  * reusable method (Library); a **placement** is an archetype installed on a
  * **project** (Projects) — what you chat with to do work. A chat's **kind** is
  * its ROOT, fixed at creation: rooted on an archetype ⇒ an *edit* chat; rooted on
  * a placement ⇒ a *work* chat. There is no mode toggle. The default "Personal"
- * project (and its default placement) is hidden, so a *work* chat is reached by
- * creating a project, placing an archetype on it, then opening a chat under that
- * placement.
+ * project is explicit and carries the zero-setup default placement.
  */
 
 import { expect, type Page } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { aliceCP } from "../ports.mjs";
+import { mutationHeaders } from "./idempotency";
 
 const { Given, When, Then, Before } = createBdd();
 
@@ -28,7 +30,7 @@ const { Given, When, Then, Before } = createBdd();
 // fed-control-plane.sh) stops live agents, wipes the state, and re-seeds — so every
 // scenario starts from the same fresh workbench, pollution-proof by construction.
 Before(async ({ request }) => {
-    const res = await request.post(`${aliceCP}/test/reset`);
+    const res = await request.post(`${aliceCP}/test/reset`, { headers: mutationHeaders() });
     if (!res.ok()) throw new Error(`control-plane reset failed: ${res.status()} ${await res.text()}`);
 });
 
@@ -43,6 +45,7 @@ function freshProjectName(): string {
 // (round-13): shared across that scenario's steps so "another chat under that
 // placement" targets the same placement.
 let concProject = "";
+let exportDestination = "";
 
 /** Create a project, place the (default) archetype on it, and return the project
  *  group locator — the placement under it is what work chats are rooted on. */
@@ -58,6 +61,7 @@ async function placeArchetypeOnFreshProject(page: Page): Promise<string> {
     await group.locator(".tree-node.project").click({ button: "right" });
     await page.locator(".menu-item", { hasText: "add an archetype" }).click();
     await pickFirstMethod(page);
+    await ensureArchetypeLens(page, name);
     await expect(group.locator(".tree-subgroup[data-placement]").first()).toBeVisible();
     return name;
 }
@@ -69,12 +73,24 @@ async function pickFirstMethod(page: import("@playwright/test").Page) {
     await page.locator("[data-picker-archetype]").first().click();
 }
 
+// ADR 0112: projects open in the flat `chats` lens. Steps that address placement
+// STRUCTURE (placement nodes, workstream groups, drag targets) pivot the project
+// to its `by archetype` lens first. Idempotent; the lens persists for the
+// scenario, so one pivot covers every later structural step on that project.
+async function ensureArchetypeLens(page: import("@playwright/test").Page, name: string) {
+    const toggle = page.locator("[data-project]", { hasText: name }).locator("[data-lens-toggle]");
+    if ((await toggle.getAttribute("data-lens")) === "chats") await toggle.click();
+}
+
 // ---- navigation / setup ----
 
 Given("the workbench is open", async ({ page }) => {
     await page.goto("/");
-    // Chats is the default facet (WS-H): it gets `.active`.
-    await expect(page.locator(".facet.active", { hasText: "Chats" })).toBeVisible();
+    await expect(page.locator(".facet.active", { hasText: "Projects" })).toBeVisible();
+});
+
+Then("the empty chat composer is ready", async ({ page }) => {
+    await expect(page.locator("[data-empty-chat-composer] textarea[aria-label='Message']")).toBeVisible();
 });
 
 // A new engagement is a usable WORK chat: a chat rooted on a placement (an
@@ -83,7 +99,7 @@ Given("a new engagement", async ({ page }) => {
     await page.goto("/");
     const project = await placeArchetypeOnFreshProject(page);
     const group = page.locator(`.tree-group[data-project]`, { hasText: project });
-    await group.locator(".tree-subgroup[data-placement] .action-row .create-btn").first().click();
+    await group.locator(".tree-subgroup[data-placement] [data-create='new-placement-chat']").first().click();
     // selected → the chat-status badge carries the raw run phase as data-run-phase
     // (its visible text is the plain-language label).
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
@@ -98,11 +114,18 @@ When("I task the agent with {string}", async ({ page }, prompt: string) => {
     // Target the composer input structurally, not by placeholder: a work chat reads
     // "task the agent…" but an edit chat reads "Describe what to change about …", so
     // a placeholder match silently fails in edit chats (round10:6).
-    await page.locator(".composer input").fill(prompt);
-    await page.getByRole("button", { name: "send", exact: true }).click();
+    const composer = page.locator('[data-desktop-composer] textarea[aria-label="Message"]');
+    await composer.fill(prompt);
+    await composer.locator("xpath=following::button[normalize-space()='Send'][1]").click();
     // Fake agent returns instantly; a real-model (@live) turn can take ~20s. The turn's
     // completion shows on the chat-status badge reaching the terminal run phase.
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Completed", { timeout: 45_000 });
+});
+
+When("I request review for the next change", async ({ page }) => {
+    const review = page.locator("[data-review-next]");
+    await review.click();
+    await expect(review).toHaveAttribute("aria-pressed", "true");
 });
 
 // ---- run lifecycle ----
@@ -139,6 +162,43 @@ Then("the review task carries its archetype tag", async ({ page }) => {
     // colour is keyed off it. Asserting the attribute is present proves the colour
     // has a basis.
     await expect(page.locator("[data-testid=taskbar] [data-task-agent]").first()).toBeVisible();
+});
+
+Given("an assignable onboarding task", async ({ page, request }) => {
+    const response = await request.post(`${aliceCP}/test/reset?assignable_task=true`, {
+        headers: mutationHeaders(),
+    });
+    if (!response.ok()) throw new Error(`task seed failed: ${response.status()} ${await response.text()}`);
+    const roster = page.waitForResponse((candidate) => {
+        const url = new URL(candidate.url());
+        return candidate.request().method() === "GET" && url.pathname === "/roster";
+    });
+    const tasks = page.waitForResponse((candidate) => {
+        const url = new URL(candidate.url());
+        return candidate.request().method() === "GET" && url.pathname === "/tasks";
+    });
+    await page.goto("/");
+    expect((await roster).status()).toBe(200);
+    const taskResponse = await tasks;
+    expect(taskResponse.status()).toBe(200);
+    expect((await taskResponse.json()).tasks).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "issue", boundary: "account::global" }),
+    ]));
+    await expect(page.locator('[data-task-kind="issue"] [data-task-assignee]')).toBeVisible();
+});
+
+When("I assign the onboarding task to the active owner", async ({ page }) => {
+    const assigned = page.waitForResponse((candidate) => {
+        const url = new URL(candidate.url());
+        return candidate.request().method() === "POST"
+            && /^\/work-items\/[^/]+\/assign$/.test(url.pathname);
+    });
+    await page.locator('[data-task-kind="issue"] [data-task-assignee]').selectOption("local-user");
+    expect((await assigned).status()).toBe(200);
+});
+
+Then("the onboarding task shows the active owner", async ({ page }) => {
+    await expect(page.locator('[data-task-kind="issue"] [data-task-assignee]')).toHaveValue("local-user");
 });
 
 // Only tool lines with additive detail (a command's full text / output, a file's
@@ -250,6 +310,45 @@ When("I switch to the {string} facet", async ({ page }, label: string) => {
     await expect(page.locator(".facet.active", { hasText: label })).toBeVisible();
 });
 
+Then(
+    "Recent shows a chat in project {string} with archetype {string} and workstream {string}",
+    async ({ page }, project: string, archetype: string, workstream: string) => {
+        const lineage = `${project} · ${archetype} · ${workstream}`;
+        const row = page.locator("[data-recent-chat]", {
+            has: page.locator("[data-recent-lineage]", { hasText: new RegExp(`^${lineage}$`) }),
+        });
+        await expect(row).toBeVisible();
+        await expect(row.locator("[data-recent-lineage]")).toHaveText(lineage);
+        await expect(row).not.toHaveAttribute("draggable", "true");
+    },
+);
+
+Then("Recent shows no workstream groups", async ({ page }) => {
+    await expect(page.locator("[data-recent-list] .ws-group")).toHaveCount(0);
+    await expect(page.locator("[data-recent-list] [data-workstream]")).toHaveCount(0);
+    await expect(page.locator("[data-recent-list] [data-main-workstream]")).toHaveCount(0);
+});
+
+Then("Recent uses the same menu as the chat's rooted row", async ({ page }) => {
+    const rooted = page.locator('.chat-item.active[data-chat]:not([data-recent-chat])');
+    await expect(rooted).toBeVisible();
+    const chatId = await rooted.getAttribute("data-chat");
+    await rooted.click({ button: "right" });
+    const rootedItems = await page.locator(".context-menu .menu-item-label").allTextContents();
+    await page.keyboard.press("Escape");
+
+    await page.locator(".facet", { hasText: "Recent" }).click();
+    const recent = page.locator(`[data-recent-chat="${chatId}"]`);
+    await expect(recent).toBeVisible();
+    await recent.click({ button: "right" });
+    await expect(page.locator(".context-menu")).toBeVisible();
+    const recentItems = await page.locator(".context-menu .menu-item-label").allTextContents();
+    expect(recentItems).toEqual(rootedItems);
+    expect(recentItems).toContain("rename");
+    expect(recentItems).toContain("delete");
+    expect(recentItems).toContain("fork");
+});
+
 When("I search the facets for {string}", async ({ page }, q: string) => {
     await page.locator('[data-testid="facet-search"]').fill(q);
 });
@@ -311,6 +410,10 @@ When("I add an edit chat under the archetype {string}", async ({ page }, name: s
         .locator(".tree-node.archetype")
         .click({ button: "right" });
     await page.locator(".menu-item", { hasText: "edit" }).click();
+    // Creating the chat and opening its event stream are separate operations.
+    // The scripted agent can finish before a late subscriber sees completion,
+    // so never send until the same production SSE path used by work chats is up.
+    await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 
 // Place an archetype onto a project → a placement (the old "bind").
@@ -322,6 +425,7 @@ When("I place an archetype on the project {string}", async ({ page }, name: stri
         .click({ button: "right" });
     await page.locator(".menu-item", { hasText: "add an archetype" }).click();
     await pickFirstMethod(page);
+    await ensureArchetypeLens(page, name);
     await expect(
         page.locator("[data-project]", { hasText: name }).locator(".tree-subgroup[data-placement]").first(),
     ).toBeVisible();
@@ -329,13 +433,20 @@ When("I place an archetype on the project {string}", async ({ page }, name: stri
 
 // A WORK chat is rooted on a placement (do the job).
 When("I add a chat under the placement", async ({ page }) => {
-    await page.locator("[data-placement]").first().getByRole("button", { name: "+ chat" }).click();
+    await page.locator("[data-placement]").first().locator("[data-create='new-placement-chat']").click();
 });
 
-// The All-chats "just start typing" quick-start: roots on the hidden Personal
-// default placement (ADR 0036), no project/method setup. Opens + selects the chat.
-When("I start a new chat from All chats", async ({ page }) => {
-    await page.getByTestId("new-default-chat").click();
+// Personal is the explicit zero-setup project (ADR 0097). Its chat action roots
+// the new work chat on Personal's default placement.
+When("I start a new chat in Personal", async ({ page }) => {
+    const chats = page.locator(".chat-item");
+    const before = await chats.count();
+    await page.locator("[data-create='new-project-chat']").first().click();
+    // `stream-ready` may already belong to the previously selected chat. Wait for
+    // the standing workspace projection to contain the newly-created row before a
+    // following step addresses "latest"; otherwise it can right-click the old row
+    // while the refresh is still in flight (the intermittent WS-H timeout).
+    await expect(chats).toHaveCount(before + 1);
     await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 
@@ -344,19 +455,26 @@ Then("the active chat is a work chat", async ({ page }) => {
     await expect(page.locator('[data-chat].active[data-kind="work"]')).toBeVisible();
 });
 
-Then("I see a chat in All chats", async ({ page }) => {
-    await expect(page.locator(".facet.active", { hasText: "Chats" })).toBeVisible();
-    await expect(page.locator(".chat-item").first()).toBeVisible();
+Then("I see a chat in Personal", async ({ page }) => {
+    await expect(page.locator(".facet.active", { hasText: "Projects" })).toBeVisible();
+    await expect(page.locator("[data-project]", { hasText: "Personal" }).locator(".chat-item").first()).toBeVisible();
 });
 
 // WS-H: start a workstream from a chat row. Right-click the chat → "new workstream" →
 // name it. The control plane creates the line on the chat's own placement and joins it.
 When("I create a workstream named {string} from that chat", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Chats" }).click();
+    await page.locator(".facet", { hasText: "Projects" }).click();
     await page.locator(".chat-item").first().click({ button: "right" });
     await page.locator(".menu-item", { hasText: "new workstream" }).click();
     await page.locator(".inline-edit").fill(name);
     await page.locator(".inline-edit").press("Enter");
+    await ensureArchetypeLens(page, "Personal");
+    // Creating the line and joining the chat are one asynchronous command chain.
+    // Do not let a following facet switch outrun the resulting workspace refresh.
+    const group = page.locator(".ws-group", {
+        has: page.locator(".ws-label-name", { hasText: new RegExp(`^${name}$`) }),
+    });
+    await expect(group.locator(".ws-members .chat-item").first()).toBeVisible();
 });
 
 // The chat is now a member of the named line: it renders inside that workstream's
@@ -418,17 +536,42 @@ Then("there is no workstream {string}", async ({ page }, name: string) => {
     ).toHaveCount(0);
 });
 
-// Promote the line into the placement mainline via its label menu (WS-F). Not
-// destructive (no confirm) — a single click runs it; the toast reports the result.
+// Promote the line into the placement mainline from its right-aligned nav control.
+// The first click only arms the operation; the second is the explicit confirmation.
 When("I promote the workstream {string}", async ({ page }, name: string) => {
-    await page.locator(".ws-label", { hasText: new RegExp(name) }).first().click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "promote into mainline" }).click();
+    const group = page.locator(".ws-group", {
+        has: page.locator(".ws-label-name", { hasText: new RegExp(`^${name}$`) }),
+    });
+    const merge = group.locator(".ws-merge");
+    await merge.click();
+    await expect(merge).toHaveText("Confirm merge");
+    await merge.click();
 });
 
-// Join the most-recently-created (ungrouped, so last in document order) chat to an
-// existing line via its context menu (WS-H join from the Chats facet).
+When("I arm merge for workstream {string}", async ({ page }, name: string) => {
+    const merge = page.locator(".ws-group", {
+        has: page.locator(".ws-label-name", { hasText: new RegExp(`^${name}$`) }),
+    }).locator(".ws-merge");
+    await merge.click();
+    await expect(merge).toHaveText("Confirm merge");
+});
+
+When("I click away from the workstream merge", async ({ page }) => {
+    await page.locator("[data-main-workstream].ws-label").click();
+});
+
+Then("workstream {string} merge is not armed", async ({ page }, name: string) => {
+    const merge = page.locator(".ws-group", {
+        has: page.locator(".ws-label-name", { hasText: new RegExp(`^${name}$`) }),
+    }).locator(".ws-merge");
+    await expect(merge).toHaveText("Merge");
+});
+
+// Join the most-recently-created chat from Main to an existing line via its context
+// menu (WS-H join from the rooted Projects facet). Main renders before named groups, so document
+// order cannot identify this row once a named workstream exists.
 When("I add the latest chat to the workstream {string}", async ({ page }, name: string) => {
-    await page.locator(".chat-item").last().click({ button: "right" });
+    await page.locator("[data-main-workstream].ws-group .chat-item").last().click({ button: "right" });
     await page.locator(".menu-item", { hasText: `join "${name}"` }).click();
 });
 
@@ -437,6 +580,45 @@ Then("the workstream {string} has {int} chats", async ({ page }, name: string, n
         has: page.locator(".ws-label-name", { hasText: new RegExp(`^${name}$`) }),
     });
     await expect(group.locator(".ws-members .chat-item")).toHaveCount(n);
+});
+
+When("I drag a chat from workstream {string} onto workstream {string}", async ({ page }, source, destination) => {
+    const group = (name: string) => page.locator(".ws-group", {
+        has: page.locator(".ws-label-name", { hasText: new RegExp(`^${name}$`) }),
+    });
+    const sourceRow = group(source).locator(".ws-members .chat-item").first();
+    const destinationLabel = group(destination).locator(".ws-label");
+    const destinationElement = await destinationLabel.elementHandle();
+    if (!destinationElement) throw new Error(`missing workstream drop target ${destination}`);
+    // Playwright's convenience `dragTo` cannot consistently retain DataTransfer across
+    // delegated Solid handlers. Drive the browser's native drag event sequence directly.
+    await sourceRow.evaluate((sourceElement, targetElement) => {
+        const target = targetElement as HTMLElement;
+        const dataTransfer = new DataTransfer();
+        sourceElement.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer }));
+        target.dispatchEvent(new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer }));
+        target.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer }));
+        target.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer }));
+        sourceElement.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer }));
+    }, destinationElement);
+});
+
+When("I drag a chat from workstream {string} onto Main", async ({ page }, source) => {
+    const sourceRow = page.locator(".ws-group", {
+        has: page.locator(".ws-label-name", { hasText: new RegExp(`^${source}$`) }),
+    }).locator(".ws-members .chat-item").first();
+    const mainLabel = page.locator("[data-main-workstream].ws-label").first();
+    const mainElement = await mainLabel.elementHandle();
+    if (!mainElement) throw new Error("missing Main workstream drop target");
+    await sourceRow.evaluate((sourceElement, targetElement) => {
+        const target = targetElement as HTMLElement;
+        const dataTransfer = new DataTransfer();
+        sourceElement.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer }));
+        target.dispatchEvent(new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer }));
+        target.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer }));
+        target.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer }));
+        sourceElement.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer }));
+    }, mainElement);
 });
 
 Then("the archetype {string} is gone", async ({ page }, name: string) => {
@@ -463,12 +645,14 @@ When("I collapse the project {string}", async ({ page }, name: string) => {
 
 When("I add a work chat in project {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Projects" }).click();
-    await page.locator("[data-project]", { hasText: name }).locator(".tree-subgroup[data-placement] .action-row .create-btn").first().click();
+    await ensureArchetypeLens(page, name);
+    await page.locator("[data-project]", { hasText: name }).locator(".tree-subgroup[data-placement] [data-create='new-placement-chat']").first().click();
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
 });
 
 Then("the placement in project {string} shows a chat", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Projects" }).click();
+    await ensureArchetypeLens(page, name);
     await expect(page.locator("[data-project]", { hasText: name }).locator(".tree-subgroup[data-placement] .chat-item").first()).toBeVisible();
 });
 
@@ -476,6 +660,7 @@ Then("the placement in project {string} shows a chat", async ({ page }, name: st
 // customize → set notes → save. Tweaks this client's placement without forking.
 When("I customize the placement in project {string} with notes {string}", async ({ page }, project: string, notes: string) => {
     await page.locator(".facet", { hasText: "Projects" }).click();
+    await ensureArchetypeLens(page, project);
     await page
         .locator("[data-project]", { hasText: project })
         .locator(".tree-subgroup[data-placement] .tree-node.placement")
@@ -510,6 +695,7 @@ When("I pull updates into the fork of {string}", async ({ page }, source: string
 });
 
 When("I collapse the placement in project {string}", async ({ page }, name: string) => {
+    await ensureArchetypeLens(page, name);
     await page.locator("[data-project]", { hasText: name }).locator(".tree-subgroup[data-placement] .tree-node.placement .node-icon").first().click();
 });
 
@@ -533,6 +719,7 @@ Then("the project {string} shows its placements", async ({ page }, name: string)
     // on a project…" flow leaves you on Library); the project tree lives under the
     // Projects facet, so pivot there before reading it.
     await page.locator(".facet", { hasText: "Projects" }).click();
+    await ensureArchetypeLens(page, name);
     await expect(page.locator("[data-project]", { hasText: name }).locator(".tree-subgroup").first()).toBeVisible();
 });
 
@@ -553,7 +740,7 @@ Then("I see a forked copy of the archetype {string}", async ({ page }, name: str
 });
 
 When("I fork the first chat", async ({ page }) => {
-    await page.locator(".chat-item").first().click({ button: "right" });
+    await page.locator("[data-chat].active").click({ button: "right" });
     await page.locator(".menu-item", { hasText: /^fork$/ }).click();
 });
 
@@ -592,6 +779,10 @@ When("I create an edit chat under the archetype {string}", async ({ page }, name
         .locator(".tree-node.archetype")
         .click({ button: "right" });
     await page.locator(".menu-item", { hasText: "edit" }).click();
+    // Creation navigates asynchronously. Do not let the next step operate on the
+    // quick-start composer that was visible before the new edit chat was selected.
+    await expect(page.locator('[data-chat].active[data-kind="edit"]')).toBeVisible();
+    await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 
 // The chat's kind (its root) is shown read-only via the lineage header; there is
@@ -606,19 +797,23 @@ Then("an edit chat is marked in the nav", async ({ page }) => {
 });
 
 When("I reopen the chat", async ({ page }) => {
-    await page.locator("[data-chat]").first().click();
+    await page.locator("[data-chat].active").click();
     await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 
 When("I reload the workbench", async ({ page }) => {
     await page.reload();
-    await expect(page.locator(".facet.active", { hasText: "Chats" })).toBeVisible();
+    await expect(page.locator(".facet.active", { hasText: "Projects" })).toBeVisible();
 });
 
 // ---- content viewer (view / edit / diff) ----
 
 When("I select the file {string} in the workspace", async ({ page }, file: string) => {
     await page.locator("[data-worktree] .file", { hasText: file }).click();
+});
+
+Then("the target workspace does not contain {string}", async ({ page }, file: string) => {
+    await expect(page.locator("[data-worktree] .file", { hasText: file })).toHaveCount(0);
 });
 
 When("I replace the editor content with {string}", async ({ page }, text: string) => {
@@ -651,61 +846,12 @@ When("I keep the work", async ({ page }) => {
 
 // ---- the review/audit shelf (an overlay surface) ----
 
-When("I open the review shelf", async ({ page }) => {
-    // The raw review/export state machine is engine-authoring material, gated
-    // behind developer mode (round-6 #1). Tests of that lifecycle opt into dev
-    // mode; the Shelf reads the flag fresh when it mounts, so no reload is needed.
-    await page.evaluate(() => localStorage.setItem("ui.dev", "1"));
-    await page.getByRole("button", { name: "History", exact: true }).click();
-    await page.locator('.shelf-drawer .tab[data-tab="review"]').click();
-});
-
 When("I open the audit shelf", async ({ page }) => {
     await page.getByRole("button", { name: "History", exact: true }).click();
     // In the user-facing build the Activity list is the only thing in the drawer
     // (no tabs); the tab only exists under dev mode. Click it only if present.
     const auditTab = page.locator('.shelf-drawer .tab[data-tab="audit"]');
     if (await auditTab.count()) await auditTab.click();
-});
-
-// ---- review shelf ----
-
-When("I propose review", async ({ page }) => {
-    await page.getByTestId("review-propose").click();
-});
-
-When("the stakeholder {string} consents to review", async ({ page }, who: string) => {
-    await page.getByTestId(`review-consent-${who}`).click();
-});
-
-When("I release the review", async ({ page }) => {
-    await page.getByTestId("review-release").click();
-});
-
-Then("the review phase is {string}", async ({ page }, phase: string) => {
-    await expect(page.locator("[data-review-phase]")).toHaveText(phase);
-});
-
-// ---- export gating ----
-
-When("I propose export", async ({ page }) => {
-    await page.getByTestId("export-propose").click();
-});
-
-When("the source {string} consents to export", async ({ page }, who: string) => {
-    await page.getByTestId(`export-source-${who}`).click();
-});
-
-When("the target admits the export", async ({ page }) => {
-    await page.getByTestId("export-target-admit").click();
-});
-
-When("I export", async ({ page }) => {
-    await page.getByTestId("export-export").click();
-});
-
-Then("the export phase is {string}", async ({ page }, phase: string) => {
-    await expect(page.locator("[data-export-phase]")).toHaveText(phase);
 });
 
 // ---- audit ----
@@ -728,10 +874,7 @@ When("I open the config editor", async ({ page }) => {
     // Settings live on the archetype now (ADR 0035): Library → right-click the
     // default archetype → settings.
     await page.locator(".facet", { hasText: "Library" }).click();
-    await page
-        .locator("[data-archetype]", { hasText: "assistant" })
-        .locator(".tree-node.archetype")
-        .click({ button: "right" });
+    await page.locator("[data-archetype] .tree-node.archetype").first().click({ button: "right" });
     await page.locator(".menu-item", { hasText: /^settings$/ }).click();
     await expect(page.locator("[data-config-editor]")).toBeVisible();
 });
@@ -765,6 +908,33 @@ When("I attach the context folder {string}", async ({ page }, path: string) => {
     // e.g. gaugewright-plugin.ts, are what downstream diff/context assertions look
     // for). No `Add files` click is needed — the input is set programmatically.
     await page.locator("[data-add-folder-input]").setInputFiles(path);
+});
+
+When("I reload as the desktop app and add the repository plugin folder", async ({ page }) => {
+    const pluginPath = resolve(process.cwd(), "../plugin");
+    await page.addInitScript(({ selectedPath }) => {
+        Object.defineProperty(window, "__TAURI_INTERNALS__", {
+            configurable: true,
+            value: {
+                invoke: async (command: string) =>
+                    command === "plugin:dialog|open" ? selectedPath : null,
+            },
+        });
+    }, { selectedPath: pluginPath });
+    await page.reload();
+    const addFiles = page.getByRole("button", { name: "Add files" });
+    await expect(addFiles).toBeVisible();
+    const responsePromise = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "POST"
+            && /^\/chats\/[^/]+\/context$/.test(url.pathname);
+    });
+    await addFiles.click();
+    const response = await responsePromise;
+    expect(response.status()).toBe(200);
+    expect(await response.json()).toMatchObject({
+        ingested: expect.any(Number),
+    });
 });
 
 // ---- message attachments (composer paperclip, UX-14) ----
@@ -802,16 +972,59 @@ Then("the composer shows an image attachment {string}", async ({ page }, name: s
     await expect(page.locator(`[data-attachment][data-kind="image"]`, { hasText: name })).toBeVisible();
 });
 
-// PDF/Office aren't supported yet — attaching one is refused with a status message,
-// nothing is added to the composer.
+// A minimal, valid DOCX package containing one paragraph. Its bytes stay in the
+// browser; the composer only receives the locally extracted text.
+const TINY_DOCX = Buffer.from(
+    "UEsDBBQAAAAIAN0A7lzMVIwQ4AAAAJwBAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbH2Qy07DMBBFf8XyFsUOLBBCSbrgsQQW5QNG9iSx8Eset5S/Z9KWLlDbpX0fZ3S71S54scVCLsVe3qpWCowmWRenXn6uX5sHuRq69U9GEmyN1Mu51vyoNZkZA5BKGSMrYyoBKj/LpDOYL5hQ37XtvTYpVoy1qUuHHLpnHGHjq3jZ8fcBW9CTFE8H48LqJeTsnYHKut5G+4/SHAmKk3sPzS7TDRukPktYlMuAY+6ddyjOoviAUt8gsEt/p2K1TWYTOKmu15y5M42jM3jKL225JINEPHDw6qQEcPHvfr2fe/gFUEsDBBQAAAAIAN0A7lw2V97cogAAABgBAAALAAAAX3JlbHMvLnJlbHONzzsOwjAMBuCrRN6pCwNCqGkXhNQVlQNEiZtGNA8l4XV7MjBQxMBo+/dnuekedmY3isl4x2Fd1cDISa+M0xzOw3G1g65tTjSLXBJpMiGxsuIShynnsEdMciIrUuUDuTIZfbQilzJqDEJehCbc1PUW46cBS5P1ikPs1RrY8Az0j+3H0Ug6eHm15PKPE1+JIouoKXO4+6hQvdtVYQHbBhcvti9QSwMEFAAAAAgA3QDuXLF/RYedAAAA0gAAABEAAAB3b3JkL2RvY3VtZW50LnhtbDWOuw7CMAxFfyXKTlMYEKr62JgZQMwlcR9SEkdOIPD3OEUsx497feV2eDsrXkBxRd/JfVVLAV6jWf3cydv1vDvJoW9zY1A/Hfgk2O9jkzu5pBQapaJewI2xwgCetQnJjYlHmlVGMoFQQ4wc56w61PVRuXH1skQ+0HxKDQVUkPoFrEUxETpx5+tWlWUh68zNGkGnC6lt8cvg5v9f/wVQSwECFAAUAAAACADdAO5czFSMEOAAAACcAQAAEwAAAAAAAAAAAAAAAAAAAAAAW0NvbnRlbnRfVHlwZXNdLnhtbFBLAQIUABQAAAAIAN0A7lw2V97cogAAABgBAAALAAAAAAAAAAAAAAAAABEBAABfcmVscy8ucmVsc1BLAQIUABQAAAAIAN0A7lyxf0WHnQAAANIAAAARAAAAAAAAAAAAAAAAANwBAAB3b3JkL2RvY3VtZW50LnhtbFBLBQYAAAAAAwADALkAAACoAgAAAAA=",
+    "base64",
+);
+
+When("I attach a DOCX document {string}", async ({ page }, name: string) => {
+    await page.locator("[data-attach-input]").setInputFiles({
+        name,
+        mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        buffer: TINY_DOCX,
+    });
+    await expect(page.locator(`[data-attachment][data-kind="text"]`, { hasText: name })).toBeVisible();
+});
+
+/** Build a small valid PDF with exact xref offsets so PDF.js exercises its real
+ *  browser worker rather than a mocked parser. */
+function tinyPdf(text: string): Buffer {
+    const escaped = text.replaceAll("\\", "\\\\").replaceAll("(", "\\(").replaceAll(")", "\\)");
+    const stream = `BT /F1 12 Tf 72 720 Td (${escaped}) Tj ET`;
+    const objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+    ];
+    let body = "%PDF-1.4\n";
+    const offsets = [0];
+    for (const [index, object] of objects.entries()) {
+        offsets.push(Buffer.byteLength(body));
+        body += `${index + 1} 0 obj\n${object}\nendobj\n`;
+    }
+    const xref = Buffer.byteLength(body);
+    body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    body += offsets
+        .slice(1)
+        .map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`)
+        .join("");
+    body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+    return Buffer.from(body);
+}
+
 When(
-    "I attach an unsupported file {string} of type {string}",
-    async ({ page }, name: string, mimeType: string) => {
+    "I attach the PDF document {string} containing {string}",
+    async ({ page }, name: string, content: string) => {
         await page.locator("[data-attach-input]").setInputFiles({
             name,
-            mimeType,
-            buffer: Buffer.from("%PDF-1.4 not really"),
+            mimeType: "application/pdf",
+            buffer: tinyPdf(content),
         });
+        await expect(page.locator(`[data-attachment][data-kind="text"]`, { hasText: name })).toBeVisible();
     },
 );
 
@@ -825,7 +1038,7 @@ Then("the composer has no pending attachments", async ({ page }) => {
 // while the agent is busy. Pair with a `[slow]` prompt to widen that window.
 When("I start tasking the agent with {string}", async ({ page }, prompt: string) => {
     await page.getByPlaceholder("task the agent…").fill(prompt);
-    await page.getByRole("button", { name: "send", exact: true }).click();
+    await page.getByRole("button", { name: /^send$/i }).click();
 });
 
 Then("the agent is working", async ({ page }) => {
@@ -844,14 +1057,14 @@ When("I stop the turn", async ({ page }) => {
     await page.getByTestId("stop-turn").click();
 });
 Then("the composer is ready to send again", async ({ page }) => {
-    await expect(page.getByRole("button", { name: "send", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: /^send$/i })).toBeVisible();
 });
 // Panel header labels.
 Then("the run pane is labelled {string}", async ({ page }, label) => {
-    await expect(page.locator(".panel.run h2")).toContainText(label);
+    await expect(page.locator(".panel.run > .panel-heading")).toContainText(label);
 });
 Then("the workspace pane is labelled {string}", async ({ page }, label) => {
-    await expect(page.locator(".panel.workspace h2")).toContainText(label);
+    await expect(page.locator(".panel.workspace .panel-body > h2")).toContainText(label);
 });
 
 // Panel collapse (legacy 13-chrome-ui.md §6). Steps refer to a panel by its
@@ -878,6 +1091,30 @@ Then("the {string} panel is open", async ({ page }, title: string) => {
     await expect(page.locator(`[data-collapse="${cls}"]`)).toBeVisible();
     await expect(page.locator(`[data-rail="${cls}"]`)).toHaveCount(0);
 });
+Then("the {string} panel collapse control is on the left edge", async ({ page }, title: string) => {
+    const cls = panelClass(title);
+    const control = page.locator(`[data-collapse="${cls}"]`);
+    const panel = page.locator(`.panel.${cls}.collapsible`);
+    await expect(control).toBeVisible();
+    await expect(panel).toBeVisible();
+    const [controlBox, panelBox] = await Promise.all([control.boundingBox(), panel.boundingBox()]);
+    if (!controlBox || !panelBox) throw new Error(`${title} panel geometry is unavailable`);
+    expect(controlBox.x).toBeLessThanOrEqual(panelBox.x + 12);
+});
+Then("the {string} panel collapse control is on the right edge", async ({ page }, title: string) => {
+    const cls = panelClass(title);
+    const control = page.locator(`[data-collapse="${cls}"]`);
+    const panel = page.locator(`.panel.${cls}`);
+    await expect(control).toBeVisible();
+    await expect(panel).toBeVisible();
+    const [controlBox, panelBox] = await Promise.all([control.boundingBox(), panel.boundingBox()]);
+    if (!controlBox || !panelBox) throw new Error(`${title} panel geometry is unavailable`);
+    expect(controlBox.x + controlBox.width).toBeGreaterThanOrEqual(panelBox.x + panelBox.width - 12);
+});
+Then("the {string} panel collapse control faces {string}", async ({ page }, title: string, direction: string) => {
+    const icon = page.locator(`[data-collapse="${panelClass(title)}"] .panel-collapse-icon`);
+    await expect(icon).toHaveAttribute("data-direction", direction);
+});
 
 // The stage-gate (#24): stage messages without running them, then release. The
 // control is a single inline chip left of `send` (⏸ hold / ▶ release) — always
@@ -894,6 +1131,12 @@ When("I release the stage-gate", async ({ page }) => {
 When("I steer with {string}", async ({ page }, text: string) => {
     await page.getByPlaceholder("task the agent…").fill(text);
     await page.getByTestId("steer-turn").click();
+    // Steering interrupts one run and starts another asynchronously. Do not let
+    // the following "agent finishes" observe the old run's brief idle edge
+    // before the redirected turn has been admitted.
+    await expect(
+        page.locator(".run .transcript .line.user", { hasText: text }),
+    ).toBeVisible();
 });
 
 Then(/^the queue shows (\d+) messages?$/, async ({ page }, n: string) => {
@@ -1222,6 +1465,10 @@ When("I reveal the internal settings file in the review", async ({ page }) => {
     await page.locator("[data-diff-internal-toggle]").click();
 });
 
+Then("the review offers no internal-file toggle", async ({ page }) => {
+    await expect(page.locator("[data-diff-internal-toggle]")).toHaveCount(0);
+});
+
 // The chat header leads with the chat's own name (#6) so two chats under one
 // method are distinguishable.
 Then("the chat header shows the title {string}", async ({ page }, title: string) => {
@@ -1255,7 +1502,7 @@ When("the window is a short frame", async ({ page }) => {
 // The single most important control must be fully within the viewport — not
 // clipped off-panel and not scrolled below the fold.
 Then("the send button is fully on screen", async ({ page }) => {
-    const send = page.getByRole("button", { name: "send", exact: true });
+    const send = page.getByRole("button", { name: /^send$/i });
     await expect(send).toBeVisible();
     const box = await send.boundingBox();
     const vp = page.viewportSize();
@@ -1264,6 +1511,31 @@ Then("the send button is fully on screen", async ({ page }) => {
     expect(box!.y).toBeGreaterThanOrEqual(0);
     expect(box!.x + box!.width).toBeLessThanOrEqual(vp!.width + 1);
     expect(box!.y + box!.height).toBeLessThanOrEqual(vp!.height + 1);
+});
+
+Then("the message field wraps, grows, and stops at half the Chat panel", async ({ page }) => {
+    const composer = page.locator('[data-desktop-composer] textarea[aria-label="Message"]');
+    const panel = page.locator(".panel.run");
+    const initial = await composer.boundingBox();
+    await composer.fill("This is wrapped text ".repeat(240));
+    await expect.poll(async () => (await composer.boundingBox())?.height).toBeGreaterThan(initial!.height);
+    const [grown, panelBox, metrics] = await Promise.all([
+        composer.boundingBox(),
+        panel.boundingBox(),
+        composer.evaluate((element) => ({
+            clientHeight: element.clientHeight,
+            scrollHeight: element.scrollHeight,
+            scrollWidth: element.scrollWidth,
+            clientWidth: element.clientWidth,
+            whiteSpace: getComputedStyle(element).whiteSpace,
+        })),
+    ]);
+    expect(grown).not.toBeNull();
+    expect(panelBox).not.toBeNull();
+    expect(grown!.height).toBeLessThanOrEqual(panelBox!.height / 2 + 1);
+    expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight);
+    expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.clientWidth);
+    expect(metrics.whiteSpace).toBe("pre-wrap");
 });
 
 // (View auto-opening the single changed file (round-7 #3) reuses the existing
@@ -1314,7 +1586,9 @@ Then("the menu does not promise working alongside it live", async ({ page }) => 
 
 // The improve composer names the method and drops "archetype" / "the editor" (#4).
 Then("the composer placeholder does not mention {string}", async ({ page }, word: string) => {
-    const ph = await page.locator(".composer input").getAttribute("placeholder");
+    const ph = await page
+        .locator('[data-desktop-composer] textarea[aria-label="Message"]')
+        .getAttribute("placeholder");
     expect(ph ?? "").not.toContain(word);
 });
 
@@ -1392,13 +1666,57 @@ Then("the context sources panel shows no context sources", async ({ page }) => {
     await expect(page.locator(".context-drawer .status", { hasText: "No context" })).toBeVisible();
 });
 
+Given("a withheld context source", async ({ page, request }) => {
+    const response = await request.post(`${aliceCP}/test/reset?withheld_resource=true`, {
+        headers: mutationHeaders(),
+    });
+    if (!response.ok()) {
+        throw new Error(`access resource seed failed: ${response.status()} ${await response.text()}`);
+    }
+    await page.goto("/?chat=access-contract");
+    await page.locator("[data-open-sources]").click();
+    await expect(page.locator('[data-context-source="withheld-context"]')).toHaveAttribute(
+        "data-availability",
+        "pending",
+    );
+});
+
+When("I request access to the withheld context source", async ({ page }) => {
+    const posted = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "POST"
+            && url.pathname === "/chats/access-contract/resources/withheld-context/access/request";
+    });
+    await page.locator('[data-resource-access-request="withheld-context"]').click();
+    expect((await posted).status()).toBe(200);
+    await expect(page.locator('[data-resource-access-approve="withheld-context"]')).toBeVisible();
+});
+
+When("I approve access to the withheld context source", async ({ page }) => {
+    const posted = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "POST"
+            && url.pathname === "/chats/access-contract/resources/withheld-context/access/approve";
+    });
+    await page.locator('[data-resource-access-approve="withheld-context"]').click();
+    expect((await posted).status()).toBe(200);
+});
+
+Then("the withheld context source is available", async ({ page }) => {
+    await expect(page.locator('[data-context-source="withheld-context"]')).toHaveAttribute(
+        "data-availability",
+        "available",
+    );
+});
+
 // ---- RF-E1 / O-4: output catalog -------------------------------------------
 
 // A turn under a chat that holds context produces the engagement's output
 // resource; we run one turn and let it settle so the catalog has an output.
 When("I task the agent and let the turn settle", async ({ page }) => {
-    await page.locator(".composer input").fill("produce something");
-    await page.getByRole("button", { name: "send", exact: true }).click();
+    const composer = page.locator('[data-desktop-composer] textarea[aria-label="Message"]');
+    await composer.fill("produce something");
+    await composer.locator("xpath=following::button[normalize-space()='Send'][1]").click();
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Completed", { timeout: 45_000 });
 });
 
@@ -1419,6 +1737,46 @@ Then("the output shows its review state", async ({ page }) => {
 Then("the outputs catalog shows no outputs", async ({ page }) => {
     await expect(page.locator("[data-output]")).toHaveCount(0);
     await expect(page.locator(".output-catalog .status", { hasText: "No outputs" })).toBeVisible();
+});
+
+Given("a desktop chat with a source-approved output", async ({ page, request }) => {
+    const response = await request.post(`${aliceCP}/test/reset?exportable_output=true`, {
+        headers: mutationHeaders(),
+    });
+    if (!response.ok()) {
+        throw new Error(`export output seed failed: ${response.status()} ${await response.text()}`);
+    }
+    exportDestination = await mkdtemp(join(tmpdir(), "gaugedesk-export-bdd-"));
+    await page.addInitScript(({ selectedPath }) => {
+        Object.defineProperty(window, "__TAURI_INTERNALS__", {
+            configurable: true,
+            value: {
+                invoke: async (command: string) =>
+                    command === "plugin:dialog|open" ? selectedPath : null,
+            },
+        });
+    }, { selectedPath: exportDestination });
+    await page.goto("/?chat=export-contract");
+    await page.getByRole("button", { name: "History", exact: true }).click();
+    await page.locator('.shelf-drawer .tab[data-tab="outputs"]').click();
+    await expect(page.locator('[data-output="out-export-contract"]')).toBeVisible();
+    await expect(page.locator('[data-save-output="out-export-contract"]')).toBeVisible();
+});
+
+When("I save the source-approved output to a folder", async ({ page }) => {
+    const posted = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "POST"
+            && url.pathname === "/chats/export-contract/resources/out-export-contract/export-to-disk";
+    });
+    await page.locator('[data-save-output="out-export-contract"]').click();
+    expect((await posted).status()).toBe(200);
+    await expect(page.locator("[data-save-output-status]")).toContainText(/saved [1-9]\d* file/);
+});
+
+Then("the production export-to-disk route writes the deliverable", async () => {
+    await expect(readFile(join(exportDestination, "deliverable.txt"), "utf8"))
+        .resolves.toBe("desktop export proof\n");
 });
 
 // ---- RF-E4: projection freshness + retry (error path) ----------------------
@@ -1472,14 +1830,14 @@ Given("a placement I can open more chats under", async ({ page }) => {
     await page.goto("/");
     concProject = await placeArchetypeOnFreshProject(page);
     const group = page.locator(`.tree-group[data-project]`, { hasText: concProject });
-    await group.locator(".tree-subgroup[data-placement] .action-row .create-btn").first().click();
+    await group.locator(".tree-subgroup[data-placement] [data-create='new-placement-chat']").first().click();
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
     await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 
 When("I open another chat under that placement", async ({ page }) => {
     const group = page.locator(`.tree-group[data-project]`, { hasText: concProject });
-    await group.locator(".tree-subgroup[data-placement] .action-row .create-btn").first().click();
+    await group.locator(".tree-subgroup[data-placement] [data-create='new-placement-chat']").first().click();
     await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 
@@ -1573,8 +1931,11 @@ Then("the project-home panel is open", async ({ page }) => {
 Then("the project-home panel shows at least {int} placement", async ({ page }, n: number) => {
     const badge = page.locator("[data-project-home-panel] [data-audit-placements]");
     await expect(badge).toBeVisible();
-    const text = (await badge.textContent()) ?? "0";
-    expect(Number.parseInt(text, 10)).toBeGreaterThanOrEqual(n);
+    // The dialog mounts before its projection resource resolves. Assert the
+    // eventual rollup instead of sampling the transient zero placeholder.
+    await expect
+        .poll(async () => Number.parseInt((await badge.textContent()) ?? "0", 10))
+        .toBeGreaterThanOrEqual(n);
 });
 
 // ---- fork tree (UX-8) ----
@@ -1594,14 +1955,16 @@ Then("the fork tree shows at least {int} chats", async ({ page }, n: number) => 
 
 // ---- UX-11: cross-party output review (held output + provenance + consent) ----
 
-// Propose review on the current chat's produced output — keyed on the chat id from the
-// UX-4 URL (?chat=<id>); the output resource is out-<chat>. This puts the output in the held
-// (Proposed) state the catalog surfaces, with its stakeholder parties (the taint) as required.
-When("review is proposed on this chat's output", async ({ page, request }) => {
+When("I request review of the held output", async ({ page }) => {
     const chat = new URL(page.url()).searchParams.get("chat");
     if (!chat) throw new Error("no chat selected in the URL (UX-4 ?chat=)");
-    const res = await request.post(`${aliceCP}/chats/${chat}/resources/out-${chat}/review`);
-    expect(res.ok(), "propose review on the output").toBeTruthy();
+    const posted = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "POST"
+            && url.pathname === `/chats/${chat}/resources/out-${chat}/review`;
+    });
+    await page.locator("[data-propose-review]").first().click();
+    expect((await posted).status()).toBe(200);
 });
 
 Then("the held output shows stakeholder {string}", async ({ page }, party: string) => {
@@ -1610,7 +1973,15 @@ Then("the held output shows stakeholder {string}", async ({ page }, party: strin
 });
 
 When("I consent to release the held output for {string}", async ({ page }, party: string) => {
-    await page.locator(`[data-consent="${party}"]`).first().click();
+    await expect(page.locator(`[data-review-party="${party}"]`).first()).toBeVisible();
+    const posted = page.waitForResponse((response) =>
+        response.request().method() === "POST"
+        && new URL(response.url()).pathname.endsWith("/review/command"),
+    );
+    await page.locator("[data-consent-self]").first().click();
+    const response = await posted;
+    expect(response.status()).toBe(200);
+    expect(response.request().postDataJSON()).toEqual({ action: "consent" });
 });
 
 Then("the held output is released", async ({ page }) => {
@@ -1618,5 +1989,36 @@ Then("the held output is released", async ({ page }) => {
 });
 
 Then("I release the held output", async ({ page }) => {
+    const posted = page.waitForResponse((response) =>
+        response.request().method() === "POST"
+        && new URL(response.url()).pathname.endsWith("/review/command"),
+    );
     await page.locator("[data-release]").first().click();
+    const response = await posted;
+    expect(response.status()).toBe(200);
+    expect(response.request().postDataJSON()).toEqual({ action: "release" });
+});
+
+When("I prepare the released output for export", async ({ page }) => {
+    const posted = page.waitForResponse((response) =>
+        response.request().method() === "POST"
+        && /\/resources\/[^/]+\/export$/.test(new URL(response.url()).pathname),
+    );
+    await page.locator("[data-propose-export]").first().click();
+    expect((await posted).status()).toBe(200);
+});
+
+When("I consent to export as the source stakeholder", async ({ page }) => {
+    const posted = page.waitForResponse((response) =>
+        response.request().method() === "POST"
+        && new URL(response.url()).pathname.endsWith("/export/command"),
+    );
+    await page.locator("[data-export-consent-self]").first().click();
+    const response = await posted;
+    expect(response.status()).toBe(200);
+    expect(response.request().postDataJSON()).toEqual({ action: "consent" });
+});
+
+Then("the output is waiting for target admission", async ({ page }) => {
+    await expect(page.locator("[data-export-source-ready]").first()).toBeVisible();
 });

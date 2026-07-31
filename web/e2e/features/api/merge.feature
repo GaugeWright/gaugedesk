@@ -5,7 +5,7 @@ Feature: Merge to mainline (M0 keep + M2 WS-1 integrate)
 
   Scenario: keep a turn's diff and integrate it into the mainline
     Given an engagement "mrg1"
-    When the agent runs a turn in "mrg1"
+    When the agent runs a reviewed turn in "mrg1"
     Then the merge of "mrg1" is "Clean"
     When the diff of "mrg1" is admitted
     Then the merge of "mrg1" is "Advanced"
@@ -14,7 +14,7 @@ Feature: Merge to mainline (M0 keep + M2 WS-1 integrate)
 
   Scenario: rejecting a turn's diff isolates the engagement
     Given an engagement "mrg2"
-    When the agent runs a turn in "mrg2"
+    When the agent runs a reviewed turn in "mrg2"
     Then the merge of "mrg2" is "Clean"
     When the diff of "mrg2" is rejected
     Then the merge of "mrg2" is "Rejected"
@@ -22,7 +22,7 @@ Feature: Merge to mainline (M0 keep + M2 WS-1 integrate)
   Scenario: sync pulls an integrated mainline change into another engagement
     Given an engagement "syncA"
     And an engagement "syncB"
-    When the agent runs a turn in "syncA"
+    When the agent runs a reviewed turn in "syncA"
     And the diff of "syncA" is admitted
     And "syncA" is integrated to the mainline
     And "syncB" syncs from the mainline

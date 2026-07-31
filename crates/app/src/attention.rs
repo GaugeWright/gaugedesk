@@ -35,7 +35,9 @@ pub enum Attention {
 /// reviews does not silence reply pings).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
-    /// The turn is suspended on a human question → ask `answer`.
+    /// The agent asked a person something and it is unanswered → ask `answer`.
+    /// The turn is **not** suspended (ADR 0111 §1): it settled, and the answer
+    /// reaches the agent as context on a later turn.
     Question,
     /// The merge conflicted → ask `repair`.
     Conflict,

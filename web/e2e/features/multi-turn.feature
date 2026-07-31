@@ -8,9 +8,10 @@ Feature: Multi-turn conversation
     When I task the agent with "first task"
     And I task the agent with "second task"
     Then the run phase is "Completed"
-    When I open the "diff" tab
-    Then the diff shows "first task"
-    And the diff shows "second task"
+    When I select the file "agent-note.txt" in the workspace
+    And I open the "view" tab
+    Then the file view shows "first task"
+    And the file view shows "second task"
 
   @live
   Scenario: the conversation remembers across turns
@@ -24,6 +25,6 @@ Feature: Multi-turn conversation
     When I task the agent with "remember this message"
     Then the run phase is "Completed"
     When I reload the workbench
-    And I switch to the "Chats" facet
+    And I switch to the "Projects" facet
     And I reopen the chat
     Then the transcript shows "remember this message"

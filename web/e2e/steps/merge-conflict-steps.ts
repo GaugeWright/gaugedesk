@@ -7,11 +7,15 @@
 import { expect } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
 import { aliceCP } from "../ports.mjs";
+import { mutationHeaders } from "./idempotency";
 
 const { When, Then } = createBdd();
 
 When("merge conflict injection is on", async ({ request }) => {
-    const res = await request.post(`${aliceCP}/test/force-conflict`, { data: { on: true } });
+    const res = await request.post(`${aliceCP}/test/force-conflict`, {
+        headers: mutationHeaders(),
+        data: { on: true },
+    });
     expect(res.ok()).toBeTruthy();
 });
 

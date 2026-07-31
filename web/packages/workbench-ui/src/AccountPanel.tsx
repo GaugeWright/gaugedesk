@@ -10,7 +10,16 @@
 import { createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import type {
     AccountDevice,
+    AccountFacility,
+    AccountInvitation,
+    AccountSignInMethod,
+    AccountTenant,
     LinkedProvider,
+    ManagedInferenceBilling,
+    ManagedInferencePlan,
+    ManagedPlanStatus,
+    CodexLoginStart,
+    CodexStatus,
 } from "@gaugewright/control-plane-client";
 import {
     ADVANCEMENT_RULES_SETTING,
@@ -32,27 +41,67 @@ import {
     modelKey,
     parseEnabledModels,
     pickableModels,
+    providerTakesCustomModel,
     serializeEnabledModels,
 } from "./model-picker";
 
-const PROVIDERS = ["openai", "anthropic"];
+const PROVIDERS = ["openai", "anthropic", "openai-generic"];
+
+/** Enrollment time is account evidence, not presence. Legacy records honestly
+ * report that their original join time was not recorded. */
+export function deviceAddedLabel(enrolledAt: number): string {
+    if (!Number.isFinite(enrolledAt) || enrolledAt <= 0) {
+        return "Added before enrollment dates were recorded";
+    }
+    const date = new Date(enrolledAt * 1000);
+    return Number.isNaN(date.getTime())
+        ? "Added before enrollment dates were recorded"
+        : `Added ${date.toLocaleDateString()}`;
+}
+
+/** Current-session copy is intentionally separate from a durable linked sign-in method. */
+export function signInMethodLabel(method: AccountSignInMethod | undefined): string {
+    return method?.label.trim() || "Current session";
+}
+
+export function managedInferenceWriteAvailable(editable: boolean | undefined): boolean {
+    return editable !== false;
+}
 
 export interface AccountPanelApi {
+    accountSignInMethod(): Promise<AccountSignInMethod>;
     accountCredentials(): Promise<LinkedProvider[]>;
     accountDevices(): Promise<AccountDevice[]>;
-    codexStatus(): Promise<{ linked: boolean; expires: number | null; expired: boolean }>;
-    codexLoginStart(): Promise<{ url: string }>;
-    accountLinkCredential(provider: string, token: string): Promise<void>;
+    accountInvitations(): Promise<AccountInvitation[]>;
+    acceptAccountInvitation(tenantId: string): Promise<AccountTenant>;
+    codexStatus(): Promise<CodexStatus>;
+    codexLoginStart(): Promise<CodexLoginStart>;
+    codexLoginCancel(): Promise<void>;
+    accountLinkCredential(provider: string, token: string, baseUrl?: string): Promise<void>;
     accountUnlinkCredential(provider: string): Promise<void>;
+    accountManagedInference(): Promise<ManagedInferenceBilling>;
+    accountSetManagedInference(plan: ManagedInferencePlan): Promise<void>;
     accountRevokeDevice(id: string): Promise<void>;
     accountSettings(): Promise<Record<string, string>>;
     accountSetSetting(key: string, value: string): Promise<void>;
+    accountFacilities(): Promise<AccountFacility[]>;
+    accountAttachFacility(input: {
+        id: string;
+        kind?: string;
+        displayName?: string;
+    }): Promise<AccountFacility>;
+    accountDetachFacility(id: string): Promise<void>;
+    accountPublishLibrarySync(): Promise<void>;
+    accountPullLibrarySync(): Promise<{ found: boolean; merged: number }>;
 }
 
 export function AccountPanel(props: {
     api: AccountPanelApi;
-    /** Whether this runtime can complete the local Codex OAuth helper flow. */
+    /** Whether this runtime offers an OpenAI authorization flow. */
     codexLoginAvailable?: boolean;
+    /** Hosted billing owns managed-plan writes; those compositions project the
+     * plan and usage here but must not offer the local self-managed editor. */
+    managedInferenceEditable?: boolean;
     onClose: () => void;
 }): JSX.Element {
     const [tick, setTick] = createSignal(0);
@@ -60,12 +109,17 @@ export function AccountPanel(props: {
     const [status, setStatus] = createSignal("");
 
     const [credentials] = createResource(tick, () => props.api.accountCredentials());
+    const [signInMethod] = createResource(tick, () => props.api.accountSignInMethod());
     const [devices] = createResource(tick, () => props.api.accountDevices());
+    const [invitations] = createResource(tick, () => props.api.accountInvitations());
+    const [managed] = createResource(tick, () => props.api.accountManagedInference());
+    const [facilities] = createResource(tick, () => props.api.accountFacilities());
     // Codex OAuth (LLM-1, ADR 0062): presence + expiry in GaugeDesk's sealed
     // account store. `authUrl` holds the link as a manual
     // fallback if the popup is blocked.
     const [codex] = createResource(tick, () => props.api.codexStatus());
     const [authUrl, setAuthUrl] = createSignal("");
+    const [deviceCode, setDeviceCode] = createSignal("");
     const codexExpiry = () => {
         const e = codex()?.expires;
         return e ? new Date(e).toLocaleDateString() : null;
@@ -81,14 +135,19 @@ export function AccountPanel(props: {
     const linkCodex = async () => {
         setStatus("starting OpenAI sign-in…");
         setAuthUrl("");
+        setDeviceCode("");
         // A re-sign-in starts with the old credential still linked, so completion
         // is "the expiry changed", not "a credential exists" — baseline it here.
         const baselineExpires = codex()?.expires ?? null;
         try {
-            const { url } = await props.api.codexLoginStart();
+            const login = await props.api.codexLoginStart();
+            const url = login.mode === "browser" ? login.url : login.login.verificationUrl;
             setAuthUrl(url);
+            if (login.mode === "device") setDeviceCode(login.login.userCode);
             window.open(url, "_blank", "noopener,noreferrer");
-            setStatus("finish the OpenAI sign-in in your browser — this panel updates by itself");
+            setStatus(login.mode === "device"
+                ? `enter code ${login.login.userCode} on the OpenAI page — this panel updates by itself`
+                : "finish the OpenAI sign-in in your browser — this panel updates by itself");
         } catch (e) {
             setStatus(`could not start sign-in: ${e instanceof Error ? e.message : String(e)}`);
             return;
@@ -103,6 +162,7 @@ export function AccountPanel(props: {
             if (disposed) return;
             if (linked) {
                 setAuthUrl("");
+                setDeviceCode("");
                 setStatus("signed in ✓");
                 refresh();
             } else {
@@ -112,18 +172,41 @@ export function AccountPanel(props: {
             watchingLink = false;
         }
     };
+    const cancelCodex = async () => {
+        try {
+            await props.api.codexLoginCancel();
+            setAuthUrl("");
+            setDeviceCode("");
+            setStatus("OpenAI sign-in cancelled");
+            refresh();
+        } catch (e) {
+            setStatus(`could not cancel sign-in: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    };
 
     const [provider, setProvider] = createSignal("openai");
     const [token, setToken] = createSignal("");
+    // The OpenAI-compatible endpoint, shown + required only for openai-generic (ADR 0083).
+    const [endpoint, setEndpoint] = createSignal("");
+    const needsEndpoint = () => providerTakesCustomModel(provider());
 
     const link = async () => {
         if (!token()) {
             setStatus("paste a token first");
             return;
         }
+        if (needsEndpoint() && !endpoint().trim()) {
+            setStatus("enter the endpoint URL first");
+            return;
+        }
         try {
-            await props.api.accountLinkCredential(provider(), token());
+            await props.api.accountLinkCredential(
+                provider(),
+                token(),
+                needsEndpoint() ? endpoint().trim() : undefined,
+            );
             setToken("");
+            setEndpoint("");
             setStatus(`linked ${provider()} ✓`);
             refresh();
         } catch (e) {
@@ -146,6 +229,84 @@ export function AccountPanel(props: {
             refresh();
         } catch (e) {
             setStatus(`could not revoke: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    };
+    const acceptInvitation = async (invitation: AccountInvitation) => {
+        try {
+            const tenant = await props.api.acceptAccountInvitation(invitation.tenantId);
+            setStatus(`joined ${tenant.displayName} ✓`);
+            refresh();
+        } catch (e) {
+            setStatus(`could not accept invitation: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    };
+    const librarySync = () => (facilities() ?? []).find((facility) =>
+        facility.kind === "library_sync" && facility.status === "active"
+    );
+    const enableLibrarySync = async () => {
+        try {
+            await props.api.accountAttachFacility({
+                id: "library-sync",
+                kind: "library_sync",
+                displayName: "Library sync",
+            });
+            await props.api.accountPublishLibrarySync();
+            setStatus("library sync enabled and published ✓");
+            refresh();
+        } catch (e) {
+            setStatus(`could not enable library sync: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    };
+    const publishLibrarySync = async () => {
+        try {
+            await props.api.accountPublishLibrarySync();
+            setStatus("account published to library sync ✓");
+        } catch (e) {
+            setStatus(`could not publish library sync: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    };
+    const pullLibrarySync = async () => {
+        try {
+            const result = await props.api.accountPullLibrarySync();
+            setStatus(result.found
+                ? `library sync merged ${result.merged} record${result.merged === 1 ? "" : "s"} ✓`
+                : "library sync has no published account yet");
+            refresh();
+        } catch (e) {
+            setStatus(`could not pull library sync: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    };
+    const disableLibrarySync = async () => {
+        const facility = librarySync();
+        if (!facility) return;
+        try {
+            await props.api.accountDetachFacility(facility.id);
+            setStatus("library sync disabled");
+            refresh();
+        } catch (e) {
+            setStatus(`could not disable library sync: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    };
+
+    const [managedPlan, setManagedPlan] = createSignal("");
+    const [managedStatus, setManagedStatus] = createSignal<ManagedPlanStatus | "">("");
+    const [managedIncluded, setManagedIncluded] = createSignal("");
+    const saveManaged = async () => {
+        const plan = managedPlan() || managed()?.plan?.plan || "managed";
+        const state = managedStatus() || managed()?.plan?.status || "suspended";
+        const included = Number(
+            managedIncluded() || String(managed()?.plan?.included_tokens ?? 0),
+        );
+        try {
+            await props.api.accountSetManagedInference({
+                plan,
+                status: state,
+                included_tokens: Number.isFinite(included) ? Math.max(0, included) : 0,
+            });
+            setStatus(`managed plan ${state} ✓`);
+            refresh();
+        } catch (e) {
+            setStatus(`could not update managed plan: ${e instanceof Error ? e.message : String(e)}`);
         }
     };
 
@@ -231,9 +392,54 @@ export function AccountPanel(props: {
                     </button>
                 </div>
 
-                {/* This one-click flow starts a callback listener on the local machine, so it
-                    is only offered by runtimes that actually host that helper. */}
-                <Show when={props.codexLoginAvailable ?? true}>
+                <section class="admin-section" data-account-sign-in-method>
+                    <h4>Sign-in</h4>
+                    <p class="member-row">
+                        <span>Signed in with <strong>{signInMethodLabel(signInMethod())}</strong>.</span>
+                    </p>
+                    <p class="muted">
+                        This describes the current browser session. Additional sign-in methods and
+                        recovery choices are managed only when their account controls are available.
+                    </p>
+                </section>
+
+                <section class="admin-section" data-account-invitations>
+                    <h4>Workspace invitations</h4>
+                    <ul class="member-list">
+                        <For
+                            each={invitations()}
+                            fallback={<li class="muted">No pending invitations.</li>}
+                        >
+                            {(invitation) => (
+                                <li class="member-row" data-account-invitation={invitation.tenantId}>
+                                    <span>
+                                        <span class="member-id">{invitation.displayName}</span>
+                                        <small class="muted">Invited as {invitation.role}</small>
+                                    </span>
+                                    <button
+                                        type="button"
+                                        class="tree-action"
+                                        aria-label={`Accept invitation to ${invitation.displayName}`}
+                                        onClick={() => void acceptInvitation(invitation)}
+                                    >
+                                        accept
+                                    </button>
+                                </li>
+                            )}
+                        </For>
+                    </ul>
+                </section>
+
+                <Show
+                    when={props.codexLoginAvailable ?? true}
+                    fallback={<section class="admin-section" data-codex-oauth-unavailable>
+                        <h4>OpenAI model access</h4>
+                        <p class="muted">
+                            GaugeWright account sign-in does not authorize OpenAI. Link an OpenAI
+                            API key below, or enable OpenAI account sign-in for this runtime.
+                        </p>
+                    </section>}
+                >
                     <section class="admin-section" data-codex-oauth>
                         <h4>OpenAI sign-in (codex)</h4>
                         <p class="muted">
@@ -257,12 +463,20 @@ export function AccountPanel(props: {
                         </div>
                         <Show when={authUrl()}>
                             <p class="muted">
+                                <Show when={deviceCode()}>
+                                    Enter code <code data-codex-device-code>{deviceCode()}</code> at{" "}
+                                </Show>
                                 If the browser didn't open,{" "}
                                 <a href={authUrl()} target="_blank" rel="noopener noreferrer">open the sign-in page</a>.
                                 {" "}When done,{" "}
                                 <button type="button" class="link-btn" data-codex-refresh onClick={refresh}>
                                     refresh
-                                </button>{" "}
+                                </button>
+                                <Show when={deviceCode()}>
+                                    {" or "}<button type="button" class="link-btn" data-codex-cancel onClick={cancelCodex}>
+                                        cancel
+                                    </button>
+                                </Show>{" "}
                                 to confirm.
                             </p>
                         </Show>
@@ -297,7 +511,11 @@ export function AccountPanel(props: {
                         </For>
                     </ul>
                     <div class="admin-invite">
-                        <select value={provider()} onChange={(e) => setProvider(e.currentTarget.value)}>
+                        <select
+                            data-account-provider
+                            value={provider()}
+                            onChange={(e) => setProvider(e.currentTarget.value)}
+                        >
                             <For each={PROVIDERS}>
                                 {(p) => (
                                     <option value={p}>
@@ -307,6 +525,15 @@ export function AccountPanel(props: {
                                 )}
                             </For>
                         </select>
+                        <Show when={needsEndpoint()}>
+                            <input
+                                data-account-endpoint
+                                type="url"
+                                value={endpoint()}
+                                onInput={(e) => setEndpoint(e.currentTarget.value)}
+                                placeholder="endpoint URL (e.g. https://api.together.xyz/v1)"
+                            />
+                        </Show>
                         <input
                             data-account-token
                             type="password"
@@ -314,10 +541,68 @@ export function AccountPanel(props: {
                             onInput={(e) => setToken(e.currentTarget.value)}
                             placeholder="paste API key / token"
                         />
-                        <button type="button" class="tree-action" onClick={link}>
+                        <button type="button" class="tree-action" data-account-link onClick={link}>
                             link
                         </button>
                     </div>
+                </section>
+
+                <section class="admin-section" data-managed-inference>
+                    <h4>Managed inference</h4>
+                    <p class="muted">
+                        Use GaugeDesk-managed model access instead of a linked key. Suspending the
+                        plan blocks future managed calls only; prior chats and usage stay intact.
+                    </p>
+                    <p class="muted" data-managed-usage>
+                        {managed()?.usage.runs ?? 0} runs · {managed()?.usage.total_tokens ?? 0} tokens
+                        {managed()?.usage.overage_tokens
+                            ? ` · ${managed()?.usage.overage_tokens} over included usage`
+                            : ""}
+                    </p>
+                    <Show
+                        when={managedInferenceWriteAvailable(props.managedInferenceEditable)}
+                        fallback={
+                            <p class="muted" data-managed-inference-read-only>
+                                Managed plan changes are controlled by billing for this hosted account.
+                            </p>
+                        }
+                    >
+                        {/* Each control carries a visible label — a row of unlabeled
+                            plan/status/number fields was a guessing game. */}
+                        <div class="admin-invite managed-plan-row">
+                            <label class="settings-field">
+                                <span class="settings-label">plan</span>
+                                <input
+                                    value={managedPlan() || managed()?.plan?.plan || ""}
+                                    onInput={(e) => setManagedPlan(e.currentTarget.value)}
+                                    placeholder="plan"
+                                />
+                            </label>
+                            <label class="settings-field">
+                                <span class="settings-label">status</span>
+                                <select
+                                    value={managedStatus() || managed()?.plan?.status || "suspended"}
+                                    onChange={(e) => setManagedStatus(e.currentTarget.value as ManagedPlanStatus)}
+                                >
+                                    <option value="active">active</option>
+                                    <option value="suspended">suspended</option>
+                                    <option value="lapsed">lapsed</option>
+                                </select>
+                            </label>
+                            <label class="settings-field">
+                                <span class="settings-label">included tokens</span>
+                                <input
+                                    type="number"
+                                    min="0"
+                                    value={managedIncluded() || String(managed()?.plan?.included_tokens ?? 0)}
+                                    onInput={(e) => setManagedIncluded(e.currentTarget.value)}
+                                />
+                            </label>
+                            <button type="button" class="tree-action" onClick={saveManaged}>
+                                save managed plan
+                            </button>
+                        </div>
+                    </Show>
                 </section>
 
                 {/* Which models show in the composer picker (LLM-1) */}
@@ -421,6 +706,39 @@ export function AccountPanel(props: {
                     </div>
                 </section>
 
+                <section class="admin-section" data-library-sync>
+                    <h4>Library sync</h4>
+                    <p class="muted">
+                        Keep sealed account settings and opaque Home routes available when this
+                        device is offline. GaugeWright's blind directory can route and store the
+                        ciphertext, but cannot open it.
+                    </p>
+                    <Show
+                        when={librarySync()}
+                        fallback={<button
+                            type="button"
+                            class="tree-action"
+                            data-library-sync-enable
+                            onClick={() => void enableLibrarySync()}
+                        >
+                            enable and publish
+                        </button>}
+                    >
+                        <div class="member-row">
+                            <span><span class="badge">active</span></span>
+                            <button type="button" class="tree-action" data-library-sync-publish onClick={() => void publishLibrarySync()}>
+                                publish now
+                            </button>
+                            <button type="button" class="tree-action" data-library-sync-pull onClick={() => void pullLibrarySync()}>
+                                pull now
+                            </button>
+                            <button type="button" class="tree-action" data-library-sync-disable onClick={() => void disableLibrarySync()}>
+                                disable
+                            </button>
+                        </div>
+                    </Show>
+                </section>
+
                 {/* Trusted devices */}
                 <section class="admin-section">
                     <h4>Trusted devices</h4>
@@ -431,7 +749,10 @@ export function AccountPanel(props: {
                         >
                             {(d) => (
                                 <li class="member-row" data-device={d.id}>
-                                    <span class="member-id">{d.label || d.id}</span>
+                                    <span>
+                                        <span class="member-id">{d.label || d.id}</span>
+                                        <small class="muted">{deviceAddedLabel(d.enrolledAt)}</small>
+                                    </span>
                                     <span class="member-status">{d.status}</span>
                                     <Show when={d.status === "active"}>
                                         <button

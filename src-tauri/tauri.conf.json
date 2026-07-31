@@ -4,14 +4,15 @@
   "version": "0.4.3",
   "identifier": "com.gaugewright.gaugedesk",
   "build": {
-    "frontendDist": "../web/dist",
-    "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm --prefix ../web run dev",
-    "beforeBuildCommand": "npm --prefix ../web run build"
+    "frontendDist": "../ee/web/dist-enterprise-workbench",
+    "devUrl": "http://localhost:5173/apps/enterprise-workbench/",
+    "beforeDevCommand": "npm --prefix ../ee/web run dev -- --host localhost --port 5173 --strictPort",
+    "beforeBuildCommand": "npm --prefix ../ee/web run build"
   },
   "app": {
     "windows": [
       {
+        "create": false,
         "title": "GaugeDesk",
         "width": 1280,
         "height": 800,
@@ -26,6 +27,8 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "Productivity",
+    "copyright": "Copyright 2026 GaugeWright",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -37,9 +40,15 @@
     "linux": {
       "deb": {
         "desktopTemplate": "deep-link.desktop",
-        "provides": ["gaugebench"],
-        "conflicts": ["gaugebench"],
-        "replaces": ["gaugebench"]
+        "depends": ["libc6", "libwebkit2gtk-4.1-0", "libgtk-3-0"],
+        "section": "utils",
+        "files": {
+          "/usr/share/doc/gauge-desk/changelog.gz": "linux/changelog.gz",
+          "/usr/share/doc/gauge-desk/copyright": "linux/copyright"
+        },
+        "provides": ["gauge-bench", "gaugebench"],
+        "conflicts": ["gauge-bench", "gaugebench"],
+        "replaces": ["gauge-bench", "gaugebench"]
       }
     },
     "windows": {
@@ -51,7 +60,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/jamesjscully/gaugedesk/releases/latest/download/latest.json"
+        "https://github.com/GaugeWright/gaugedesk/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYxNTg4RUI0OUEyMDE5QwpSV1NjQWFKSjY0Z1ZCdXdXMXN0VGRvSnp1SVR0RzhTbU5maUMxMEtPY3ZWbUp2ZllNOUdJZVY2Kwo="
     },

@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "documents": [
+    { "id": "administration.overview", "path": "overview.json", "schema": "gw://schemas/administration/overview/v1", "view": "views/overview.mdx", "help": "help/overview.md" },
+    { "id": "administration.organization", "path": "organization.json", "schema": "gw://schemas/administration/organization/v1", "view": "views/organization.mdx", "help": "help/organization.md" },
+    { "id": "administration.access", "path": "access.json", "schema": "gw://schemas/administration/access/v1", "view": "views/access.mdx", "help": "help/access.md" },
+    { "id": "administration.identity", "path": "identity.json", "schema": "gw://schemas/administration/identity/v1", "view": "views/identity.mdx", "help": "help/identity.md" },
+    { "id": "administration.policy", "path": "policy.json", "schema": "gw://schemas/administration/policy/v1", "view": "views/policy.mdx", "help": "help/policy.md" },
+    { "id": "administration.software-policy", "path": "software-policy.json", "schema": "gw://schemas/administration/software-policy/v1", "view": "views/software-policy.mdx", "help": "help/software.md" },
+    { "id": "administration.clients", "path": "clients.json", "schema": "gw://schemas/administration/clients/v1", "view": "views/clients.mdx", "help": "help/clients.md" },
+    { "id": "administration.machines", "path": "machines.json", "schema": "gw://schemas/administration/machines/v1", "view": "views/machines.mdx", "help": "help/machines.md" },
+    { "id": "administration.backups", "path": "backups.json", "schema": "gw://schemas/administration/backups/v1", "view": "views/backups.mdx", "help": "help/backups.md" },
+    { "id": "administration.deployments", "path": "deployments.json", "schema": "gw://schemas/administration/deployments/v1", "view": "views/deployments.mdx", "help": "help/deployments.md" },
+    { "id": "administration.automations", "path": "automations.json", "schema": "gw://schemas/administration/automations/v1", "view": "views/automations.mdx", "help": "help/automations.md" },
+    { "id": "administration.audit", "path": "audit.json", "schema": "gw://schemas/administration/audit/v1", "view": "views/audit.mdx", "help": "help/audit.md" },
+    { "id": "administration.billing", "path": "billing.json", "schema": "gw://schemas/administration/billing/v1", "view": "views/billing.mdx", "help": "help/billing.md" }
+  ]
+}

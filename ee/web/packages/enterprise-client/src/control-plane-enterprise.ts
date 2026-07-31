@@ -1,10 +1,40 @@
 import type { RouteJson } from "@gaugewright/control-plane-client";
 
+/** Stable server-derived Administration capabilities (`ADMIN-ENV-2`). */
+export type AdminCapability =
+    | "edit_org_settings"
+    | "manage_members"
+    | "configure_sso"
+    | "configure_provisioning"
+    | "view_audit"
+    | "configure_security"
+    | "manage_billing";
+
+export type AdminAgentTool =
+    | "admin.files.list"
+    | "admin.files.read"
+    | "admin.homes.query"
+    | "admin.changes.propose"
+    | "question.ask";
+
+/** Fail-closed server projection for the Admin Session's non-chat abilities. */
+export interface AdminAgentCapabilities {
+    readonly message_attachments: boolean;
+    readonly additional_tools: boolean;
+    readonly tools: readonly AdminAgentTool[];
+}
+
+export interface AdminCapabilityDiscovery {
+    readonly capabilities: readonly AdminCapability[];
+    readonly agent: AdminAgentCapabilities;
+}
+
 /** Org profile + defaults (B10). */
 export interface OrgSettings {
     readonly display_name: string;
     readonly verified_domains: string[];
     readonly default_region?: string | null;
+    readonly kind: "client" | "consultant";
 }
 /** A directory member (B11). */
 export interface Member {
@@ -70,10 +100,30 @@ export interface PlacementPolicy {
     readonly require_attested: boolean;
     readonly allowed_operators: ReadonlyArray<"local" | "counterparty" | "neutral">;
 }
+/** Organization client/session compatibility floor (`ITGOV-4`). */
+export interface SoftwarePolicy {
+    readonly minimum_version: string;
+    readonly minimum_protocol: number;
+    readonly allowed_channels: ReadonlyArray<"stable" | "beta" | "dev">;
+    readonly grace_until_unix_ms?: number | null;
+}
 /** Billing/seat state (B16). */
 export interface Billing {
     readonly plan: string;
     readonly seats: number;
+    readonly managed_inference?: {
+        readonly plan: string;
+        readonly status: "active" | "suspended" | "lapsed";
+        readonly included_tokens: number;
+    } | null;
+}
+export interface ManagedUsageSummary {
+    readonly runs: number;
+    readonly input_tokens: number;
+    readonly output_tokens: number;
+    readonly total_tokens: number;
+    readonly included_tokens: number;
+    readonly overage_tokens: number;
 }
 /** One audit-timeline entry (B14). */
 export interface AdminAuditEntry {
@@ -82,74 +132,132 @@ export interface AdminAuditEntry {
     readonly target: string;
 }
 
+/** An admitted member-to-project access grant (`ENTSEC-2`). */
+export interface MemberGrant {
+    readonly id: string;
+    readonly authority: string;
+    readonly project_id: string;
+}
+
+/** Result of walking and, when present, checkpoint-verifying the audit chain. */
+export interface AuditIntegrity {
+    readonly ok: boolean;
+    readonly entries: number;
+    readonly head: string;
+    readonly broken_at: number | null;
+    readonly anchored: boolean;
+}
+
+export type AuditExportFormat = "csv" | "json";
+
+export interface AuditExport {
+    readonly format: AuditExportFormat;
+    readonly body: string;
+    readonly contentType: string;
+    readonly filename: string;
+}
+
+export interface AdminPlacementProjection {
+    readonly id: string;
+    readonly archetype_id: string;
+    readonly archetype_name: string;
+    readonly version: number;
+    readonly current_version: number;
+    readonly upgrade_available: boolean;
+    readonly pending: boolean;
+}
+
+export interface AdminProjectProjection {
+    readonly id: string;
+    readonly name: string;
+    readonly network_isolated: boolean;
+    readonly placements: AdminPlacementProjection[];
+}
+
+export interface AdminMachineExecutionProfile {
+    readonly available: boolean;
+    readonly enabled_by_tenant_policy?: boolean;
+    readonly capabilities: readonly string[];
+    readonly compute_state: string;
+    readonly metering: {
+        readonly kind: "included" | "usage" | "unavailable";
+        readonly reservation_nanos_usd?: number | null;
+        readonly nanos_usd_per_second?: number | null;
+    };
+    readonly reason?: string | null;
+}
+
+export interface AdminMachineExecutionProjection {
+    readonly freshness: string;
+    readonly selection_policy: "exact_capability_match_no_fallback";
+    readonly profiles: {
+        readonly durable_workflow: AdminMachineExecutionProfile;
+        readonly isolated_workspace: AdminMachineExecutionProfile;
+        readonly dedicated_compute: AdminMachineExecutionProfile;
+    };
+    readonly queue: {
+        readonly total: number;
+        readonly by_phase: Readonly<Record<string, number>>;
+        readonly by_profile: Readonly<Record<string, number>>;
+    };
+    readonly compute: {
+        readonly state: string;
+        readonly active_attempts: number;
+        readonly wake: "on_demand";
+        readonly idle_behavior?: string;
+    };
+    readonly usage: {
+        readonly billable_nanos_usd: number;
+        readonly charged_nanos_usd: number;
+        readonly wall_millis: number;
+    };
+    readonly failures: readonly {
+        readonly command_id: string;
+        readonly profile: string;
+        readonly phase: string;
+        readonly attempt: number;
+        readonly observed_at: number;
+    }[];
+}
+
+/** One target-admitted Home projection. A non-live state carries no projects. */
+export interface AdminHomeProjection {
+    readonly id: string;
+    readonly kind: "local" | "registered" | "cloud";
+    readonly endpoint: string;
+    readonly state: "live" | "stale" | "partial" | "redacted" | "indeterminate" | "unreachable" | "identity_mismatch";
+    /** Commercial/operational lifecycle is distinct from target-admitted
+     * inventory freshness. Present for managed machines only. */
+    readonly lifecycle?: "provisioning" | "active" | "suspended" | "retention" | "deleted";
+    readonly repair_hint: string | null;
+    readonly projects: AdminProjectProjection[];
+    /** Home-admitted managed execution status; present only for managed Machines. */
+    readonly execution?: AdminMachineExecutionProjection;
+}
+
 export interface EnterpriseAdminApi {
-    adminGetOrg(): Promise<OrgSettings | null>;
-    adminSetOrg(s: OrgSettings): Promise<void>;
-    adminDomainVerifyToken(
-        domain: string,
-    ): Promise<{ domain: string; record_name: string; record_type: string; value: string }>;
-    adminDomainVerify(
-        domain: string,
-    ): Promise<{ verified: boolean; domain?: string; expected?: { record_name: string; value: string } }>;
-    adminGetMembers(): Promise<Member[]>;
-    adminGetSessions(): Promise<Session[]>;
-    adminInvite(m: { authority: string; email?: string; role: string }): Promise<void>;
-    adminSetRole(id: string, role: string): Promise<void>;
-    adminDeactivate(id: string): Promise<void>;
+    adminCapabilities(): Promise<AdminCapabilityDiscovery>;
     adminIntegration(): Promise<IntegrationDetails>;
-    adminGetSso(): Promise<SsoConnection | null>;
-    adminSetSso(s: SsoConnection): Promise<void>;
     adminTestSso(s: SsoConnection): Promise<{ ok: boolean; detail: string }>;
-    adminGetSecurity(): Promise<SecurityPolicy | null>;
-    adminSetSecurity(s: SecurityPolicy): Promise<void>;
-    adminGetArchetypeApproval(): Promise<ArchetypeApprovalPolicy>;
-    adminSetArchetypeApproval(p: ArchetypeApprovalPolicy): Promise<void>;
-    adminGetPlacementPolicy(): Promise<PlacementPolicy>;
-    adminSetPlacementPolicy(p: PlacementPolicy): Promise<void>;
-    adminGetBilling(): Promise<{ billing: Billing | null; seats_used: number }>;
-    adminSetBilling(b: Billing): Promise<void>;
-    adminGetAudit(): Promise<AdminAuditEntry[]>;
-    adminIssueScimToken(): Promise<string>;
+    exportAdministrationAudit(
+        format: AuditExportFormat,
+        filters?: { readonly actor?: string; readonly action?: string },
+    ): Promise<AuditExport>;
 }
 
-export async function adminGetOrg(json: RouteJson): Promise<OrgSettings | null> {
-    const o = (await json("GET", "/admin/org")) as { org: OrgSettings | null };
-    return o.org;
-}
-
-export async function adminSetOrg(json: RouteJson, s: OrgSettings): Promise<void> {
-    await json("POST", "/admin/org", s);
-}
-
-/** The TXT record to publish to prove control of a domain (`ONB-5`). */
-export async function adminDomainVerifyToken(
-    json: RouteJson,
-    domain: string,
-): Promise<{ domain: string; record_name: string; record_type: string; value: string }> {
-    return (await json("POST", "/admin/domains/verify-token", { domain })) as {
-        domain: string;
-        record_name: string;
-        record_type: string;
-        value: string;
+export async function adminCapabilities(json: RouteJson): Promise<AdminCapabilityDiscovery> {
+    const value = (await json("GET", "/admin/capabilities")) as {
+        capabilities?: AdminCapability[];
+        agent?: Partial<AdminAgentCapabilities>;
     };
-}
-
-/** Verify a domain via its published TXT record (DoH); on success it joins the
- *  org's verified domains (powers auto-join/JIT). `ONB-5`. */
-export async function adminDomainVerify(
-    json: RouteJson,
-    domain: string,
-): Promise<{ verified: boolean; domain?: string; expected?: { record_name: string; value: string } }> {
-    return (await json("POST", "/admin/domains/verify", { domain })) as {
-        verified: boolean;
-        domain?: string;
-        expected?: { record_name: string; value: string };
+    return {
+        capabilities: Array.isArray(value.capabilities) ? value.capabilities : [],
+        agent: {
+            message_attachments: value.agent?.message_attachments === true,
+            additional_tools: value.agent?.additional_tools === true,
+            tools: Array.isArray(value.agent?.tools) ? value.agent.tools : [],
+        },
     };
-}
-
-export async function adminGetMembers(json: RouteJson): Promise<Member[]> {
-    const o = (await json("GET", "/admin/members")) as { members: Member[] };
-    return o.members;
 }
 
 /** One live session in the IT roster (ITGOV-2): the active member's authority + how long
@@ -158,40 +266,19 @@ export interface Session {
     readonly authority: string;
     readonly age_ms: number;
     readonly idle_ms: number;
-}
-
-export async function adminGetSessions(json: RouteJson): Promise<Session[]> {
-    const o = (await json("GET", "/admin/sessions")) as { sessions: Session[] };
-    return Array.isArray(o.sessions) ? o.sessions : [];
-}
-
-export async function adminInvite(
-    json: RouteJson,
-    m: { authority: string; email?: string; role: string },
-): Promise<void> {
-    await json("POST", "/admin/members", m);
-}
-
-export async function adminSetRole(json: RouteJson, id: string, role: string): Promise<void> {
-    await json("POST", `/admin/members/${encodeURIComponent(id)}/role`, { role });
-}
-
-export async function adminDeactivate(json: RouteJson, id: string): Promise<void> {
-    await json("POST", `/admin/members/${encodeURIComponent(id)}/deactivate`);
+    readonly client: {
+        readonly version?: string | null;
+        readonly protocol?: number | null;
+        readonly channel?: string | null;
+        readonly platform?: string | null;
+    };
+    readonly software_status: "unmanaged" | "current" | "warning" | "blocked";
+    readonly software_reason: string;
 }
 
 /** The SP-side integration values an admin pastes into their IdP (`ONB-1`). */
 export async function adminIntegration(json: RouteJson): Promise<IntegrationDetails> {
     return (await json("GET", "/admin/integration")) as IntegrationDetails;
-}
-
-export async function adminGetSso(json: RouteJson): Promise<SsoConnection | null> {
-    const o = (await json("GET", "/admin/sso")) as { sso: SsoConnection | null };
-    return o.sso;
-}
-
-export async function adminSetSso(json: RouteJson, s: SsoConnection): Promise<void> {
-    await json("POST", "/admin/sso", s);
 }
 
 /** Live OIDC discovery+JWKS reachability test of a connection (`ONB-3`); not stored. */
@@ -200,65 +287,4 @@ export async function adminTestSso(
     s: SsoConnection,
 ): Promise<{ ok: boolean; detail: string }> {
     return (await json("POST", "/admin/sso/test", s)) as { ok: boolean; detail: string };
-}
-
-export async function adminGetSecurity(json: RouteJson): Promise<SecurityPolicy | null> {
-    const o = (await json("GET", "/admin/security")) as { security: SecurityPolicy | null };
-    return o.security;
-}
-
-export async function adminSetSecurity(json: RouteJson, s: SecurityPolicy): Promise<void> {
-    await json("POST", "/admin/security", s);
-}
-
-/** The org's archetype-approval policy (ADR 0063): whether adding an archetype to a
- *  project requires owner approval (pending) or is frictionless (active at once). */
-export async function adminGetArchetypeApproval(
-    json: RouteJson,
-): Promise<ArchetypeApprovalPolicy> {
-    return (await json("GET", "/admin/archetype-approval")) as ArchetypeApprovalPolicy;
-}
-
-export async function adminSetArchetypeApproval(
-    json: RouteJson,
-    p: ArchetypeApprovalPolicy,
-): Promise<void> {
-    await json("POST", "/admin/archetype-approval", p);
-}
-
-export async function adminGetPlacementPolicy(json: RouteJson): Promise<PlacementPolicy> {
-    const o = (await json("GET", "/admin/placement-policy")) as {
-        placement_policy: PlacementPolicy;
-    };
-    return o.placement_policy;
-}
-
-export async function adminSetPlacementPolicy(
-    json: RouteJson,
-    p: PlacementPolicy,
-): Promise<void> {
-    await json("POST", "/admin/placement-policy", p);
-}
-
-export async function adminGetBilling(
-    json: RouteJson,
-): Promise<{ billing: Billing | null; seats_used: number }> {
-    return (await json("GET", "/admin/billing")) as {
-        billing: Billing | null;
-        seats_used: number;
-    };
-}
-
-export async function adminSetBilling(json: RouteJson, b: Billing): Promise<void> {
-    await json("POST", "/admin/billing", b);
-}
-
-export async function adminGetAudit(json: RouteJson): Promise<AdminAuditEntry[]> {
-    const o = (await json("GET", "/admin/audit")) as { entries: AdminAuditEntry[] };
-    return o.entries;
-}
-
-export async function adminIssueScimToken(json: RouteJson): Promise<string> {
-    const o = (await json("POST", "/admin/scim/token")) as { token: string };
-    return o.token;
 }

@@ -71,16 +71,26 @@ pub enum FacilityOwner {
 }
 
 /// A facility's lifecycle status. Only [`Active`](FacilityStatus::Active) opens a connection
-/// / contributes a live surface; `Suspended` (e.g. a lapsed invoice, `INV-18`) and `Revoked`
-/// open nothing (fail-closed, `INV-20`).
+/// / contributes a live surface; every other lifecycle state opens no facility
+/// connection (fail-closed, `INV-20`).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FacilityStatus {
+    /// The tenant has admitted the commercial/configuration fact but the
+    /// isolated Home root is not ready yet. Retries resume the same facility.
+    Provisioning,
     #[default]
     Active,
     /// Standing paused going forward (billing gate); re-activating restores it. Forward-only
     /// (`INV-18`): suspension never reaches back into already-admitted work.
     Suspended,
+    /// Service is stopped and preserved only through its declared grace/
+    /// retention deadline. Reads/exports remain possible; new hosted acts do not.
+    Retention,
+    /// Terminal lifecycle fact retained for administration/audit after the
+    /// Home's storage domain has been erased.
+    Deleted,
+    /// Legacy spelling for a detached non-Cloud facility.
     Revoked,
 }
 

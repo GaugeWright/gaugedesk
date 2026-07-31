@@ -54,6 +54,20 @@ impl Capability {
         Capability::ConfigureSecurity,
         Capability::ManageBilling,
     ];
+
+    /// Stable transport name used by capability discovery. These names are part
+    /// of the enterprise client/server contract, not UI labels.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Capability::EditOrgSettings => "edit_org_settings",
+            Capability::ManageMembers => "manage_members",
+            Capability::ConfigureSso => "configure_sso",
+            Capability::ConfigureProvisioning => "configure_provisioning",
+            Capability::ViewAudit => "view_audit",
+            Capability::ConfigureSecurity => "configure_security",
+            Capability::ManageBilling => "manage_billing",
+        }
+    }
 }
 
 /// Whether `role` may perform `cap`. The fixed matrix (admin-console.md):
@@ -98,6 +112,17 @@ mod tests {
             assert_eq!(role_can(&billing, cap), cap == Capability::ManageBilling);
         }
         assert!(can_access_console(&billing));
+    }
+
+    #[test]
+    fn capability_transport_names_are_unique_and_stable() {
+        let names: std::collections::BTreeSet<_> = Capability::ALL
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect();
+        assert_eq!(names.len(), Capability::ALL.len());
+        assert!(names.contains("manage_billing"));
+        assert!(names.contains("configure_security"));
     }
 
     #[test]

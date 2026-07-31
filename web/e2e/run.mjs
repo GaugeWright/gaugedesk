@@ -2,8 +2,8 @@
  * Concurrency-safe e2e launcher (the `npm run e2e` entrypoint).
  *
  * Resolves the harness ports ONCE — honoring `GW_E2E_{ALICE,BOB,BROKER,PREVIEW,ENTERPRISE,
- * ADMIN_APP}` if set (CI reproducibility), else binding `:0` to grab free ones —
- * then runs the pipeline (the workbench + standalone-app `vite build`s → `bddgen` →
+ * ENTERPRISE_APP}` if set (CI reproducibility), else binding `:0` to grab free ones —
+ * then runs the pipeline (the open + enterprise workbench `vite build`s → `bddgen` →
  * `playwright test`) as children that inherit the resolved values.
  * Because every port is chosen up front and exported, a parallel run / second worktree picks a
  * disjoint set and the two never collide. `VITE_CP_BASE` points the built client at this run's
@@ -45,12 +45,9 @@ const alice = await resolve("GW_E2E_ALICE", 7878);
 const bob = await resolve("GW_E2E_BOB", 7879);
 const broker = await resolve("GW_E2E_BROKER", 7900);
 const preview = await resolve("GW_E2E_PREVIEW", 4173);
-// The standalone app preview (SPLIT-2): the enterprise admin console lives OUTSIDE
-// the workbench bundle, so the suite builds/serves it separately and boots
-// `gaugewright-enterprise-server` (the ee composition that mounts the /admin/*
-// routes it drives).
+// The combined enterprise workbench preview and its enterprise control plane.
 const enterprise = await resolve("GW_E2E_ENTERPRISE", 7882);
-const adminApp = await resolve("GW_E2E_ADMIN_APP", 4174);
+const enterpriseApp = await resolve("GW_E2E_ENTERPRISE_APP", 4174);
 
 const env = {
     ...process.env,
@@ -59,7 +56,7 @@ const env = {
     GW_E2E_BROKER: String(broker),
     GW_E2E_PREVIEW: String(preview),
     GW_E2E_ENTERPRISE: String(enterprise),
-    GW_E2E_ADMIN_APP: String(adminApp),
+    GW_E2E_ENTERPRISE_APP: String(enterpriseApp),
     // The built client talks to THIS run's control plane (overrides SOLO_CONTROL_PLANE).
     VITE_CP_BASE: `http://127.0.0.1:${alice}`,
 };
@@ -68,11 +65,13 @@ if (process.env.GW_E2E_LIVE) {
     delete env.GAUGEWRIGHT_FAKE_AGENT;
 } else {
     env.GAUGEWRIGHT_FAKE_AGENT = process.env.GAUGEWRIGHT_FAKE_AGENT ?? "1";
+    env.GAUGEWRIGHT_FAKE_MANAGEMENT_AGENT =
+        process.env.GAUGEWRIGHT_FAKE_MANAGEMENT_AGENT ?? "1";
 }
 
 console.log(
     `[e2e] ports → alice:${alice} bob:${bob} broker:${broker} preview:${preview} ` +
-        `enterprise:${enterprise} adminApp:${adminApp}`,
+        `enterprise:${enterprise} enterpriseApp:${enterpriseApp}`,
 );
 
 const passthrough = process.argv.slice(2);
@@ -92,9 +91,37 @@ const installs = [eeWeb]
 
 const steps = [
     ...installs,
+    // The open harness scripts exec target/debug/gaugewright-app directly.
+    // Build that exact binary first: building the enterprise server can refresh
+    // the app library dependency without refreshing the standalone executable,
+    // which otherwise lets browser acceptance exercise a stale route surface.
+    [
+        "cargo",
+        ["build", "-p", "gaugewright-app", "--bin", "gaugewright-app"],
+        { cwd: repoRoot },
+    ],
+    // The enterprise webServer likewise launches this exact debug binary.
+    [
+        "cargo",
+        ["build", "-p", "gaugewright-ee", "--bin", "gaugewright-enterprise-server"],
+        { cwd: repoRoot },
+    ],
+    [
+        "cargo",
+        [
+            "build",
+            "-p",
+            "gaugewright-relay-transport",
+            "--features",
+            "test-relay",
+            "--example",
+            "test-wss-relay",
+        ],
+        { cwd: repoRoot },
+    ],
     ["npx", ["vite", "build"]],
-    // The standalone enterprise admin console (ee/web).
-    ["npx", ["vite", "build", "--config", "apps/admin-console/vite.config.ts"], { cwd: eeWeb }],
+    // The combined enterprise workbench (ee/web).
+    ["npx", ["vite", "build", "--config", "apps/enterprise-workbench/vite.config.ts"], { cwd: eeWeb }],
     ["npx", ["bddgen"]],
     ["npx", ["playwright", "test", ...grep, ...passthrough]],
 ];
@@ -122,7 +149,7 @@ function killGroup(child, signal) {
 
 /** Free this run's own ports (kills whatever's listening on them) — port-scoped, never by name. */
 function freeOwnPorts() {
-    for (const port of [alice, bob, broker, preview, enterprise, adminApp]) {
+    for (const port of [alice, bob, broker, preview, enterprise, enterpriseApp]) {
         try {
             execSync(
                 `fuser -k ${port}/tcp 2>/dev/null || lsof -ti tcp:${port} 2>/dev/null | xargs -r kill -9`,

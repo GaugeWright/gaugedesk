@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use gaugewright_core::abac::AuthorityAttributes;
-use gaugewright_core::ids::AuthorityId;
+use gaugewright_core::ids::{AuthorityId, HomeId};
 
 use crate::Workbench;
 
@@ -30,6 +30,12 @@ impl Workbench {
         if let Ok(authority) = std::env::var("GAUGEWRIGHT_AUTHORITY") {
             if !authority.is_empty() {
                 self.authority = AuthorityId::new(authority);
+                self.home_id = HomeId::new(format!("home:{}", self.authority.as_str()));
+            }
+        }
+        if let Ok(home) = std::env::var("GAUGEWRIGHT_HOME_ID") {
+            if !home.is_empty() {
+                self.home_id = HomeId::new(home);
             }
         }
     }
@@ -38,6 +44,43 @@ impl Workbench {
     /// context and the signer of its pairing tickets / federated envelopes.
     pub fn authority(&self) -> &AuthorityId {
         &self.authority
+    }
+
+    /// This control plane's stable logical Home identity (`HOME-1`). It is not
+    /// derived from a browser session, process id, VM, or Durable Object.
+    pub fn home_id(&self) -> &HomeId {
+        &self.home_id
+    }
+
+    /// Bind a hosted/registered composition to its provisioned Home identity.
+    /// The local default remains `home:<authority>`.
+    pub fn with_home_id(mut self, home_id: HomeId) -> Self {
+        self.home_id = home_id;
+        self
+    }
+
+    /// Bind this workbench to the private hosted-Home authorization posture.
+    /// The managed Home router calls this during composition; local/Hub/Public
+    /// workbenches retain their distinct defaults.
+    pub fn enable_hosted_home_mode(&mut self) {
+        self.hosted_home_mode = true;
+    }
+
+    pub(crate) fn hosted_home_mode(&self) -> bool {
+        self.hosted_home_mode
+    }
+
+    pub(crate) fn configured_home_id() -> HomeId {
+        if let Ok(home) = std::env::var("GAUGEWRIGHT_HOME_ID") {
+            if !home.is_empty() {
+                return HomeId::new(home);
+            }
+        }
+        let authority = std::env::var("GAUGEWRIGHT_AUTHORITY")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| crate::LOCAL_AUTHORITY.to_string());
+        HomeId::new(format!("home:{authority}"))
     }
 }
 

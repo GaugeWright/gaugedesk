@@ -7,9 +7,11 @@
   "description": "Transitional open-source workbench web app root.",
   "dependencies": {
     "@gaugewright/control-plane-client": "0.0.0",
+    "@gaugewright/gw-embed": "0.0.0",
     "@gaugewright/mobile-web": "0.0.0",
     "@gaugewright/workbench-ui": "0.0.0",
     "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "solid-js": "^1.9.0"
   },
   "exports": {

@@ -7,6 +7,8 @@ Feature: Embedded panels (EMBED-2)
   Scenario: the embedded chat renders and sends against a scoped session
     Given the embed example page is open
     Then the embedded chat shows a composer
+    And the embedded chat uses the shared docked composer
+    And the embedded panel set owns one attribution mark
     When I send "hello from the embed" in the embedded chat
     Then the embedded transcript shows "hello from the embed"
 
@@ -14,3 +16,8 @@ Feature: Embedded panels (EMBED-2)
     Given the embed example page is open
     Then the embedded chat is themed by the workbench palette
     And a "--gw-bg" override cascades into the panel's shadow root
+
+  Scenario: the Environment manifest gates which shared panels bind
+    Given the chat-only embed Environment is open
+    Then the embedded chat shows a composer
+    And the unselected files and viewer panels are not composed

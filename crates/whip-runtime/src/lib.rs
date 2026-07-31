@@ -7,13 +7,10 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use gaugewright_core::ids::{AuthorityId, PublicKey};
@@ -21,8 +18,8 @@ use gaugewright_core::signature::{verify_signature, Signature, SigningKey};
 use gaugewright_harness::sandbox::Network;
 use gaugewright_harness::{
     CredentialCapability, CredentialProbe, EgressGate, Harness, HarnessContinuitySpec,
-    HarnessFactory, HarnessSpec, HumanPrompt, ImageContent, Observation, OutputFieldFlow, ToolInfo,
-    TurnOutcome,
+    HarnessFactory, HarnessSpec, ImageContent, Observation, OutputFieldFlow, RuntimePosition,
+    ToolInfo, TurnOutcome,
 };
 pub use whipplescript::gov::{
     external_signing_bytes, ExternalAttestation, GovernanceAttestationVerifier, SignedEnvelope,
@@ -32,23 +29,69 @@ pub use whipplescript::host_policy::{
     ResourcePolicy,
 };
 pub use whipplescript::host_protocol::{
-    AnswerHumanAskCommand, CredentialRef, EventPosition, ForkInstanceCommand, ForkedInstance,
-    HumanAnswerReceipt, LabeledHumanAsk, LabeledRuntimeEvent, OpenInstanceCommand, OpenedInstance,
-    PolicyEpochRef, ProtocolError, ProviderBindingRef, ResourceRef, RuntimeEvidencePointer,
-    StartTurnCommand, TurnInput, TurnReceipt, TurnStatus, HOST_PROTOCOL,
+    CredentialRef, EventPosition, ForkInstanceCommand, ForkedInstance, LabeledRuntimeEvent,
+    OpenInstanceCommand, OpenedInstance, PolicyEpochRef, ProtocolError, ProviderBindingRef,
+    ResourceRef, RuntimeEvidencePointer, StartTurnCommand, TurnInput, TurnReceipt, TurnStatus,
+    HOST_PROTOCOL,
 };
 pub use whipplescript::host_runtime::{
     native_workspace_tool_specs, native_workspace_tool_specs_with_capabilities,
-    native_workspace_tool_specs_with_command, AdmittedCommand, AuthoredAgentPackage,
-    CertifiedOutputFieldFlow, CommandExecutionOutput, CommandExecutor, GovernedHostRuntime,
-    HostCancellationHandle, HostRuntimeError, HumanAnswerExecution, LabeledTurnOutput,
-    ModelProvider, NativeCommandPolicy, NativeWorkspaceResolver, PackageResolver, PendingHumanTurn,
-    ProjectedToolCall, ResolvedImage, ResolvedPackage, ResolvedProviderBinding, ResourceResolver,
-    SecretResolver, ToolCall, TurnExecution,
+    native_workspace_tool_specs_with_command, AuthoredAgentPackage, CertifiedOutputFieldFlow,
+    GovernedHostRuntime, HostCancellationHandle, HostRuntimeError, LabeledTurnOutput,
+    ModelProvider, NativeWorkspaceResolver, PackageResolver, ProjectedToolCall, ResolvedImage,
+    ResolvedPackage, ResolvedProviderBinding, ResourceResolver, SecretResolver, ToolCall,
+    TurnExecution,
 };
+/// WhippleScript's information-flow surface, re-exported so a host can parse and
+/// check the governance envelopes it ships rather than trusting their text.
+pub use whipplescript::ifc;
+
+/// One compiled WhippleScript program, with its diagnostics flattened to
+/// messages so callers do not need the parser's diagnostic type.
+pub struct CompiledWhipProgram {
+    pub ir: Option<whipplescript_parser::IrProgram>,
+    pub diagnostics: Vec<String>,
+}
+
+/// Compile a governed program so it can be admitted before it runs.
+///
+/// A host that executes a WhippleScript program it did not write — a project's
+/// own gate, for instance — must be able to refuse it, and refusing requires
+/// compiling it here rather than trusting that it compiled somewhere else.
+pub fn compile_whip_program(source: &str) -> CompiledWhipProgram {
+    let compiled = whipplescript_parser::compile_program(source);
+    CompiledWhipProgram {
+        ir: compiled.ir,
+        diagnostics: compiled
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect(),
+    }
+}
 use whipplescript::ifc::VerifiedEnvelope;
 
+pub mod gate_runner;
+/// The sans-I/O HTTP types a gate host implements its transport against.
+pub mod sansio_types {
+    pub use whipplescript_kernel::sansio::{HttpRequest, HttpResponse, TransportError};
+}
+mod hosted;
+pub use hosted::{DoHostConfig, DoHostRequest, DoHostResponse, DoHostTransport};
+
 pub const GAUGEDESK_ATTESTATION_ALGORITHM: &str = "p256-sha256";
+
+/// The capability that admits asking, declared by GaugeWright's package manifest
+/// (ADR 0113 §1). Held here rather than beside the question record because the
+/// *gate* lives here: this crate turns an ability ceiling into admitted turn
+/// resources, and app re-exports these so the manifest, the gate, and the record
+/// cannot drift onto three different strings.
+pub const QUESTION_ASK_CAPABILITY: &str = "question.ask";
+
+/// The turn resource admitted when the ceiling carries [`QUESTION_ASK_CAPABILITY`].
+/// `execute_tool` refuses `ask` without it, exactly as `bash` refuses without
+/// `command`.
+pub const QUESTION_RESOURCE: &str = "question";
 
 /// The pinned GaugeDesk governance root WhippleScript calls to verify an
 /// externally signed policy envelope. Both the responsible authority identity
@@ -201,7 +244,8 @@ const GAUGEDESK_EDITOR_MANIFEST: &str = r#"{
   "workflow": "GaugeDeskEditor",
   "agent": "editor",
   "system_prompt": "editor.md",
-  "capabilities": ["workspace.read", "workspace.write", "command.run", "human.ask"],
+  "capabilities": ["workspace.read", "workspace.write", "command.run"],
+  "agent_abilities": ["workspace.read", "workspace.write", "command.run"],
   "max_steps": 32
 }"#;
 
@@ -217,22 +261,19 @@ workflow GaugeDeskEditor {
     provider owned
     profile "repo-writer"
     capacity 1
-    capabilities ["workspace.read", "workspace.write", "command.run", "human.ask"]
+    capabilities ["workspace.read", "workspace.write", "command.run"]
   }
 
   rule edit
     when started
   => {
-    tell editor requires ["workspace.read", "workspace.write", "command.run", "human.ask"]
+    tell editor requires ["workspace.read", "workspace.write", "command.run"]
       with access to project {
         read ["**"]
         write ["**"]
       }
       with access to command {
         run
-      }
-      with access to human {
-        ask
       }
       "Edit the selected GaugeDesk method package."
   }
@@ -255,9 +296,10 @@ pub fn editor_package_capabilities() -> io::Result<BTreeSet<String>> {
 /// tool execution, and the labeled output projection remain WhippleScript-owned.
 #[derive(Clone)]
 pub struct WhipHarnessFactory {
-    authority: AuthorityId,
+    pub(crate) authority: AuthorityId,
     signing_key: SigningKey,
     runtime_root: PathBuf,
+    hosted: Option<DoHostConfig>,
 }
 
 impl WhipHarnessFactory {
@@ -270,7 +312,13 @@ impl WhipHarnessFactory {
             authority,
             signing_key,
             runtime_root: runtime_root.into(),
+            hosted: None,
         }
+    }
+
+    pub fn with_do_host(mut self, config: DoHostConfig) -> Self {
+        self.hosted = Some(config);
+        self
     }
 
     fn runtime_for_chat(
@@ -292,7 +340,7 @@ impl WhipHarnessFactory {
         .map_err(invalid_data)
     }
 
-    fn package_for(
+    pub(crate) fn package_for(
         mode: gaugewright_harness::ChatMode,
         package_root: Option<&Path>,
         package_version_ref: Option<&str>,
@@ -345,13 +393,15 @@ impl WhipHarnessFactory {
         worktree: &Path,
         mode: gaugewright_harness::ChatMode,
         prompt_override: Option<&str>,
+        roster: &[(String, String)],
     ) -> io::Result<StaticPackage> {
         let system_prompt = legacy_method_prompt(worktree, prompt_override)?;
         Ok(StaticPackage {
             version_ref: package_version_ref(mode, &system_prompt, "human-v1"),
             system_prompt,
             writable: true,
-            human_interaction: true,
+            can_ask: true,
+            roster: roster.to_vec(),
         })
     }
 
@@ -376,8 +426,12 @@ impl WhipHarnessFactory {
             spec.package_version_ref.as_deref(),
             spec.system_prompt.as_deref(),
         )?;
-        let previous =
-            Self::previous_package_for(&spec.worktree, spec.mode, spec.system_prompt.as_deref())?;
+        let previous = Self::previous_package_for(
+            &spec.worktree,
+            spec.mode,
+            spec.system_prompt.as_deref(),
+            &spec.roster,
+        )?;
         let packages = StaticPackages {
             current: package.clone(),
             previous,
@@ -447,13 +501,7 @@ impl WhipHarnessFactory {
             .collect::<io::Result<Vec<_>>>()?;
         let workspace = NativeWorkspaceResolver::new(&spec.worktree)
             .and_then(|resolver| resolver.read_only(read_only))
-            .map_err(invalid_data)?
-            .command_execution(
-                NativeCommandPolicy::allow_any(Duration::from_secs(120)),
-                Arc::new(GaugeDeskCommandExecutor {
-                    sandbox: spec.sandbox.clone(),
-                }),
-            );
+            .map_err(invalid_data)?;
 
         Ok(WhipHarness {
             runtime,
@@ -480,6 +528,7 @@ impl WhipHarnessFactory {
             })?,
             respondent_ref: self.authority.as_str().to_owned(),
             turn_sequence: 0,
+            next_command_id: None,
             cancellation: Arc::new(Mutex::new(None)),
         })
     }
@@ -487,12 +536,26 @@ impl WhipHarnessFactory {
 
 impl HarnessFactory for WhipHarnessFactory {
     fn kind(&self) -> &'static str {
-        "whip"
+        if self.hosted.is_some() {
+            "whip-do"
+        } else {
+            "whip"
+        }
     }
 
     fn create(&self, spec: &HarnessSpec) -> io::Result<Box<dyn Harness>> {
+        if let Some(config) = &self.hosted {
+            return hosted::create_harness(self, config, spec);
+        }
         self.create_harness(spec)
             .map(|harness| Box::new(harness) as Box<dyn Harness>)
+    }
+
+    fn reuse_across_turns(&self) -> bool {
+        self.hosted
+            .as_ref()
+            .map(DoHostConfig::reuse_across_turns)
+            .unwrap_or(true)
     }
 
     fn clone_continuity(
@@ -500,6 +563,9 @@ impl HarnessFactory for WhipHarnessFactory {
         source: &HarnessContinuitySpec,
         target: &HarnessContinuitySpec,
     ) -> io::Result<()> {
+        if let Some(config) = &self.hosted {
+            return hosted::clone_continuity(config, source, target);
+        }
         if source.policy_epoch.is_none() && source.signed_policy_envelope.is_none() {
             return Ok(());
         }
@@ -549,9 +615,23 @@ impl HarnessFactory for WhipHarnessFactory {
         let source_instance = source_runtime
             .open_instance(&source_open, &source_package)
             .map_err(invalid_data)?;
-        let source_position = source_runtime
-            .current_position(&source_instance.instance_ref)
-            .map_err(invalid_data)?;
+        let source_position = match &source.source_position {
+            Some(position) => {
+                if position.instance_ref != source_instance.instance_ref {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "WhippleScript continuity position belongs to a different source instance",
+                    ));
+                }
+                EventPosition {
+                    instance_ref: position.instance_ref.clone(),
+                    sequence: position.sequence,
+                }
+            }
+            None => source_runtime
+                .current_position(&source_instance.instance_ref)
+                .map_err(invalid_data)?,
+        };
 
         let mut target_runtime = self.runtime_for_chat(&target.chat_id, epoch, signed_policy)?;
         let target_open = Self::open_request(
@@ -581,6 +661,9 @@ impl HarnessFactory for WhipHarnessFactory {
         provider: &str,
         capability: Option<&dyn CredentialCapability>,
     ) -> CredentialProbe {
+        if self.hosted.is_some() {
+            return CredentialProbe::Ready;
+        }
         match capability {
             Some(capability) if !capability.credential_ref().is_empty() => CredentialProbe::Ready,
             _ if provider == "openai-codex" => CredentialProbe::Missing(
@@ -607,6 +690,7 @@ struct WhipHarness {
     placement_ceiling_ref: String,
     respondent_ref: String,
     turn_sequence: u64,
+    next_command_id: Option<String>,
     cancellation: Arc<Mutex<Option<HostCancellationHandle>>>,
 }
 
@@ -617,6 +701,10 @@ impl Harness for WhipHarness {
         }
     }
 
+    fn bind_runtime_command_id(&mut self, command_id: Option<&str>) {
+        self.next_command_id = command_id.map(str::to_owned);
+    }
+
     fn run_turn(
         &mut self,
         _legacy_gate: &dyn EgressGate,
@@ -624,7 +712,12 @@ impl Harness for WhipHarness {
         images: &[ImageContent],
         sink: &mut dyn FnMut(&Observation),
     ) -> io::Result<TurnOutcome> {
+        let runtime_start_position = self
+            .runtime
+            .current_position(&self.instance_ref)
+            .map_err(invalid_data)?;
         self.turn_sequence += 1;
+        let admitted_command_id = self.next_command_id.take();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -632,67 +725,48 @@ impl Harness for WhipHarness {
         let resources = TurnResources {
             workspace: &self.workspace,
             images,
+            asked: std::cell::RefCell::new(Vec::new()),
         };
-        let pending = self
+        // ADR 0111: a question settles the turn. There is no suspended epoch to
+        // resume into, because WhippleScript 0.2.2 removed the host-facing
+        // suspension contract — a parked turn now surfaces as
+        // `HostRuntimeError::Incomplete` rather than a resumable state. Every
+        // turn is an ordinary turn; an agent that needs a person files a task
+        // and the answer arrives as the next turn's context.
+        let command = self.new_turn_command(prompt, images, nonce, admitted_command_id);
+        self.install_cancellation(&command);
+        let execution = self
             .runtime
-            .pending_human_turn(&self.instance_ref, &self.package)
-            .map_err(invalid_data)?;
-        let (command, execution, evidence_pointers) = if let Some(pending) = pending {
-            if !images.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "a human answer cannot attach new images to the suspended epoch",
-                ));
-            }
-            let answer = AnswerHumanAskCommand {
-                protocol: HOST_PROTOCOL.to_owned(),
-                answer_id: format!(
-                    "gaugedesk:answer:{}:{}:{nonce}",
-                    self.chat_id, self.turn_sequence
-                ),
-                ask_ref: pending.ask.ask_ref,
-                instance_ref: self.instance_ref.clone(),
-                policy: pending.command.policy.clone(),
-                respondent_ref: self.respondent_ref.clone(),
-                answer: prompt.to_owned(),
-            };
-            answer.validate().map_err(invalid_data)?;
-            self.install_cancellation(&pending.command);
-            let resumed = self
-                .runtime
-                .answer_human_ask(&answer, &self.package, &self.provider, &resources)
-                .map_err(invalid_data);
-            self.clear_cancellation();
-            let resumed = resumed?;
-            resumed
-                .answer_receipt
-                .validate_for(&answer)
-                .map_err(invalid_data)?;
-            let evidence_pointers = resumed.evidence_pointers();
-            (pending.command, resumed.turn, evidence_pointers)
-        } else {
-            let command = self.new_turn_command(prompt, images, nonce);
-            self.install_cancellation(&command);
-            let execution = self
-                .runtime
-                .run_turn(&command, &self.package, &self.provider, &resources)
-                .map_err(invalid_data);
-            self.clear_cancellation();
-            let execution = execution?;
-            let evidence_pointers = execution.evidence_pointers();
-            (command, execution, evidence_pointers)
-        };
+            .run_turn(&command, &self.package, &self.provider, &resources)
+            .map_err(invalid_data);
+        self.clear_cancellation();
+        let execution = execution?;
+        let evidence_pointers = execution.evidence_pointers();
         let mut outcome = project_turn_execution(execution, evidence_pointers, &command, sink)?;
+        outcome.asked_questions = resources.asked.into_inner();
+        outcome.runtime_start_position = Some(RuntimePosition {
+            instance_ref: runtime_start_position.instance_ref,
+            sequence: runtime_start_position.sequence,
+        });
+        if outcome.runtime_terminal_position.is_none() {
+            let suspended_position = self
+                .runtime
+                .current_position(&self.instance_ref)
+                .map_err(invalid_data)?;
+            outcome.runtime_terminal_position = Some(RuntimePosition {
+                instance_ref: suspended_position.instance_ref,
+                sequence: suspended_position.sequence,
+            });
+        }
         // DR-0036 §2 → ADR 0082 §5: attach the turn's certified dynamic
         // guarantee outcomes so the settle-time advancement policy can match
         // them by name. Best-effort by design — a runtime/report predating
-        // DR-0036 yields nothing and consumers fall back to host-local truth;
-        // a suspended turn has no terminal receipt yet, hence no report.
-        if outcome.pending_human.is_none() {
-            if let Ok(Some(report)) = self.runtime.turn_guarantee_report(&command) {
-                outcome.guarantee_outcomes =
-                    gaugewright_harness::GuaranteeOutcome::from_report(&report);
-            }
+        // DR-0036 yields nothing and consumers fall back to host-local truth.
+        // Unconditional since ADR 0111: every turn now reaches a terminal, so
+        // there is no suspended case without a receipt.
+        if let Ok(Some(report)) = self.runtime.turn_guarantee_report(&command) {
+            outcome.guarantee_outcomes =
+                gaugewright_harness::GuaranteeOutcome::from_report(&report);
         }
         Ok(outcome)
     }
@@ -717,11 +791,14 @@ impl WhipHarness {
         prompt: &str,
         images: &[ImageContent],
         nonce: u128,
+        admitted_command_id: Option<String>,
     ) -> StartTurnCommand {
-        let command_id = format!("gaugedesk:{}:{}:{nonce}", self.chat_id, self.turn_sequence);
+        let command_id = admitted_command_id.unwrap_or_else(|| {
+            format!("gaugedesk:{}:{}:{nonce}", self.chat_id, self.turn_sequence)
+        });
         let has = |name: &str| {
             self.package
-                .capabilities()
+                .agent_abilities()
                 .iter()
                 .any(|capability| capability == name)
         };
@@ -740,10 +817,13 @@ impl WhipHarness {
                 selector: None,
             });
         }
-        if has("human.ask") {
+        // ADR 0113: asking is a governed ability. An archetype whose ceiling
+        // omits `question.ask` admits no question resource, and the tool refuses
+        // without it — the same gate that makes `bash` require `command`.
+        if has(QUESTION_ASK_CAPABILITY) {
             resources.push(ResourceRef {
-                handle: "human".to_owned(),
-                kind: "human".to_owned(),
+                handle: QUESTION_RESOURCE.to_owned(),
+                kind: QUESTION_RESOURCE.to_owned(),
                 selector: None,
             });
         }
@@ -809,35 +889,14 @@ fn project_turn_execution(
             .collect::<io::Result<Vec<_>>>()?,
         ..TurnOutcome::default()
     };
-    if let Some(ask) = execution.pending_human_ask {
-        if execution.receipt.is_some() {
-            return Err(invalid_data(
-                "WhippleScript returned both a human ask and a terminal receipt",
-            ));
-        }
-        outcome.assistant_text = ask.question.clone();
-        outcome.pending_human = Some(HumanPrompt {
-            ask_ref: ask.ask_ref,
-            question: ask.question.clone(),
-            choices: ask.choices,
-            freeform_allowed: ask.freeform_allowed,
-            label_ref: ask.label_ref,
-            evidence_ref: ask.evidence_ref,
-        });
-        let observation = Observation {
-            kind: "human_ask",
-            detail: ask.question,
-            tool: None,
-        };
-        sink(&observation);
-        outcome.observations.push(observation);
-        return Ok(outcome);
-    }
-
     let receipt = execution
         .receipt
-        .ok_or_else(|| invalid_data("WhippleScript returned neither a terminal nor a human ask"))?;
+        .ok_or_else(|| invalid_data("WhippleScript returned no terminal receipt"))?;
     receipt.validate_for(command).map_err(invalid_data)?;
+    outcome.runtime_terminal_position = Some(RuntimePosition {
+        instance_ref: receipt.terminal_position.instance_ref.clone(),
+        sequence: receipt.terminal_position.sequence,
+    });
     if let Some(output) = execution.output {
         outcome.output_flow_signature = output
             .flow_signature
@@ -891,7 +950,12 @@ struct StaticPackage {
     version_ref: String,
     system_prompt: String,
     writable: bool,
-    human_interaction: bool,
+    /// Whether this package's ceiling admits `question.ask` (ADR 0113).
+    can_ask: bool,
+    /// Who this agent may name, as `(authority, who they are)` (`GATE-3f`).
+    /// Rendered into the `ask` tool's `to` field so the choice is offered rather
+    /// than guessed. Empty leaves `to` a free string the host still resolves.
+    roster: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -900,172 +964,180 @@ struct StaticPackages {
     previous: StaticPackage,
 }
 
-const COMMAND_OUTPUT_LIMIT: usize = 1_000_000;
+// Historical OS-command realization retained outside the compiled surface for
+// one release so downstream patches remain reviewable. `bash` is implemented
+// solely by WhippleScript's shared Bashkit-backed virtual shell.
+#[cfg(any())]
+mod retired_os_command_executor {
+    use super::*;
 
-/// GaugeDesk realizes an already-admitted WhippleScript command inside the
-/// product's OS boundary. It deliberately does not parse or reinterpret command
-/// authority: WhippleScript owns the simple-command grammar, allow policy,
-/// timeout ceiling, and output projection.
-struct GaugeDeskCommandExecutor {
-    sandbox: gaugewright_harness::sandbox::SandboxPolicy,
-}
+    const COMMAND_OUTPUT_LIMIT: usize = 1_000_000;
 
-impl CommandExecutor for GaugeDeskCommandExecutor {
-    fn execute(&self, admitted: &AdmittedCommand) -> Result<CommandExecutionOutput, String> {
-        let policy = command_sandbox_policy(&self.sandbox, admitted);
+    /// GaugeDesk realizes an already-admitted WhippleScript command inside the
+    /// product's OS boundary. It deliberately does not parse or reinterpret command
+    /// authority: WhippleScript owns the simple-command grammar, allow policy,
+    /// timeout ceiling, and output projection.
+    struct GaugeDeskCommandExecutor {
+        sandbox: gaugewright_harness::sandbox::SandboxPolicy,
+    }
 
-        let args = vec!["-c".to_owned(), admitted.command.clone()];
-        let mut command = gaugewright_harness::sandbox::wrap_strict(
-            &policy,
-            "/bin/sh",
-            &args,
-            Some(&admitted.workspace_root),
-        )
-        .map_err(|error| format!("cannot realize governed command: {error}"))?;
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    impl CommandExecutor for GaugeDeskCommandExecutor {
+        fn execute(&self, admitted: &AdmittedCommand) -> Result<CommandExecutionOutput, String> {
+            let policy = command_sandbox_policy(&self.sandbox, admitted);
+
+            let args = vec!["-c".to_owned(), admitted.command.clone()];
+            let mut command = gaugewright_harness::sandbox::wrap_strict(
+                &policy,
+                "/bin/sh",
+                &args,
+                Some(&admitted.workspace_root),
+            )
+            .map_err(|error| format!("cannot realize governed command: {error}"))?;
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                command.process_group(0);
+            }
+            let mut child = command
+                .spawn()
+                .map_err(|error| format!("cannot spawn governed command: {error}"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "governed command stdout was not captured".to_owned())?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| "governed command stderr was not captured".to_owned())?;
+            let output_bytes = Arc::new(AtomicUsize::new(0));
+            let readers_done = Arc::new(AtomicUsize::new(0));
+            let stdout_reader =
+                spawn_bounded_reader(stdout, Arc::clone(&output_bytes), Arc::clone(&readers_done));
+            let stderr_reader =
+                spawn_bounded_reader(stderr, Arc::clone(&output_bytes), Arc::clone(&readers_done));
+            let started = Instant::now();
+            let status = loop {
+                match child
+                    .try_wait()
+                    .map_err(|error| format!("cannot observe governed command: {error}"))?
+                {
+                    Some(status) => break status,
+                    None if output_bytes.load(Ordering::Relaxed) > COMMAND_OUTPUT_LIMIT => {
+                        kill_governed_command(&mut child);
+                        let _ = child.wait();
+                        let _ = stdout_reader.join();
+                        let _ = stderr_reader.join();
+                        return Err(format!(
+                            "governed command exceeded the {} byte output limit",
+                            COMMAND_OUTPUT_LIMIT
+                        ));
+                    }
+                    None if started.elapsed() >= admitted.timeout => {
+                        kill_governed_command(&mut child);
+                        let _ = child.wait();
+                        let _ = stdout_reader.join();
+                        let _ = stderr_reader.join();
+                        return Err(format!(
+                            "governed command exceeded its {} second timeout",
+                            admitted.timeout.as_secs()
+                        ));
+                    }
+                    None => thread::sleep(Duration::from_millis(10)),
+                }
+            };
+            // A simple command may itself fork. The admitted invocation ends with
+            // its foreground process; do not let any descendant retain workspace
+            // authority or keep captured pipes alive past that boundary.
+            let drain_deadline = Instant::now() + Duration::from_secs(1);
+            while readers_done.load(Ordering::Relaxed) < 2 && Instant::now() < drain_deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if readers_done.load(Ordering::Relaxed) < 2 {
+                kill_governed_command(&mut child);
+            }
+            let stdout = stdout_reader
+                .join()
+                .map_err(|_| "governed command stdout reader panicked".to_owned())??;
+            let stderr = stderr_reader
+                .join()
+                .map_err(|_| "governed command stderr reader panicked".to_owned())??;
+            if output_bytes.load(Ordering::Relaxed) > COMMAND_OUTPUT_LIMIT {
+                return Err(format!(
+                    "governed command exceeded the {} byte output limit",
+                    COMMAND_OUTPUT_LIMIT
+                ));
+            }
+            Ok(CommandExecutionOutput {
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                exit_code: status.code(),
+            })
+        }
+    }
+
+    fn kill_governed_command(child: &mut std::process::Child) {
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt as _;
-            command.process_group(0);
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("cannot spawn governed command: {error}"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "governed command stdout was not captured".to_owned())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "governed command stderr was not captured".to_owned())?;
-        let output_bytes = Arc::new(AtomicUsize::new(0));
-        let readers_done = Arc::new(AtomicUsize::new(0));
-        let stdout_reader =
-            spawn_bounded_reader(stdout, Arc::clone(&output_bytes), Arc::clone(&readers_done));
-        let stderr_reader =
-            spawn_bounded_reader(stderr, Arc::clone(&output_bytes), Arc::clone(&readers_done));
-        let started = Instant::now();
-        let status = loop {
-            match child
-                .try_wait()
-                .map_err(|error| format!("cannot observe governed command: {error}"))?
-            {
-                Some(status) => break status,
-                None if output_bytes.load(Ordering::Relaxed) > COMMAND_OUTPUT_LIMIT => {
-                    kill_governed_command(&mut child);
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(format!(
-                        "governed command exceeded the {} byte output limit",
-                        COMMAND_OUTPUT_LIMIT
-                    ));
-                }
-                None if started.elapsed() >= admitted.timeout => {
-                    kill_governed_command(&mut child);
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(format!(
-                        "governed command exceeded its {} second timeout",
-                        admitted.timeout.as_secs()
-                    ));
-                }
-                None => thread::sleep(Duration::from_millis(10)),
+            // SAFETY: the child was placed in a fresh process group whose id is its
+            // pid immediately before spawn. A negative pid targets only that group.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
-        };
-        // A simple command may itself fork. The admitted invocation ends with
-        // its foreground process; do not let any descendant retain workspace
-        // authority or keep captured pipes alive past that boundary.
-        let drain_deadline = Instant::now() + Duration::from_secs(1);
-        while readers_done.load(Ordering::Relaxed) < 2 && Instant::now() < drain_deadline {
-            thread::sleep(Duration::from_millis(10));
         }
-        if readers_done.load(Ordering::Relaxed) < 2 {
-            kill_governed_command(&mut child);
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
         }
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| "governed command stdout reader panicked".to_owned())??;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| "governed command stderr reader panicked".to_owned())??;
-        if output_bytes.load(Ordering::Relaxed) > COMMAND_OUTPUT_LIMIT {
-            return Err(format!(
-                "governed command exceeded the {} byte output limit",
-                COMMAND_OUTPUT_LIMIT
-            ));
+    }
+
+    fn command_sandbox_policy(
+        base: &gaugewright_harness::sandbox::SandboxPolicy,
+        admitted: &AdmittedCommand,
+    ) -> gaugewright_harness::sandbox::SandboxPolicy {
+        let mut policy = base.clone();
+        policy.writable_roots = vec![admitted.workspace_root.clone()];
+        policy.read_only_roots = admitted.read_only_paths.clone();
+
+        // The filtered provider route belongs to WhippleScript's in-process
+        // provider connection, not arbitrary repository commands. Commands get no
+        // network under that posture; only GaugeDesk's explicit unfiltered project
+        // opt-in carries through as network authority.
+        if policy.network == Network::Filtered {
+            policy.network = Network::Deny;
         }
-        Ok(CommandExecutionOutput {
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            exit_code: status.code(),
+        policy
+    }
+
+    fn spawn_bounded_reader<R>(
+        mut reader: R,
+        output_bytes: Arc<AtomicUsize>,
+        readers_done: Arc<AtomicUsize>,
+    ) -> thread::JoinHandle<Result<Vec<u8>, String>>
+    where
+        R: Read + Send + 'static,
+    {
+        thread::spawn(move || {
+            let result = (|| {
+                let mut captured = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = reader.read(&mut buffer).map_err(|error| {
+                        format!("cannot capture governed command output: {error}")
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    let previous = output_bytes.fetch_add(read, Ordering::Relaxed);
+                    let remaining = COMMAND_OUTPUT_LIMIT.saturating_sub(previous);
+                    captured.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+                Ok(captured)
+            })();
+            readers_done.fetch_add(1, Ordering::Relaxed);
+            result
         })
     }
-}
-
-fn kill_governed_command(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        // SAFETY: the child was placed in a fresh process group whose id is its
-        // pid immediately before spawn. A negative pid targets only that group.
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-}
-
-fn command_sandbox_policy(
-    base: &gaugewright_harness::sandbox::SandboxPolicy,
-    admitted: &AdmittedCommand,
-) -> gaugewright_harness::sandbox::SandboxPolicy {
-    let mut policy = base.clone();
-    policy.writable_roots = vec![admitted.workspace_root.clone()];
-    policy.read_only_roots = admitted.read_only_paths.clone();
-
-    // The filtered provider route belongs to WhippleScript's in-process
-    // provider connection, not arbitrary repository commands. Commands get no
-    // network under that posture; only GaugeDesk's explicit unfiltered project
-    // opt-in carries through as network authority.
-    if policy.network == Network::Filtered {
-        policy.network = Network::Deny;
-    }
-    policy
-}
-
-fn spawn_bounded_reader<R>(
-    mut reader: R,
-    output_bytes: Arc<AtomicUsize>,
-    readers_done: Arc<AtomicUsize>,
-) -> thread::JoinHandle<Result<Vec<u8>, String>>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let result = (|| {
-            let mut captured = Vec::new();
-            let mut buffer = [0_u8; 8192];
-            loop {
-                let read = reader
-                    .read(&mut buffer)
-                    .map_err(|error| format!("cannot capture governed command output: {error}"))?;
-                if read == 0 {
-                    break;
-                }
-                let previous = output_bytes.fetch_add(read, Ordering::Relaxed);
-                let remaining = COMMAND_OUTPUT_LIMIT.saturating_sub(previous);
-                captured.extend_from_slice(&buffer[..read.min(remaining)]);
-            }
-            Ok(captured)
-        })();
-        readers_done.fetch_add(1, Ordering::Relaxed);
-        result
-    })
 }
 
 impl PackageResolver for StaticPackage {
@@ -1075,7 +1147,7 @@ impl PackageResolver for StaticPackage {
         }
         ResolvedPackage::compile(
             self.version_ref.clone(),
-            if self.human_interaction {
+            if self.can_ask {
                 GAUGEDESK_CHAT_PACKAGE
             } else {
                 GAUGEDESK_CHAT_PACKAGE_COMMAND_V1
@@ -1083,10 +1155,10 @@ impl PackageResolver for StaticPackage {
             Some("GaugeDeskChat"),
             "assistant",
             self.system_prompt.clone(),
-            native_workspace_tool_specs_with_capabilities(
-                self.writable,
-                true,
-                self.human_interaction,
+            question_tool_specs(
+                native_workspace_tool_specs_with_capabilities(self.writable, true),
+                self.can_ask,
+                &self.roster,
             ),
             32,
         )
@@ -1123,10 +1195,92 @@ pub struct NativeProviderDescriptor {
     pub credential_env: &'static str,
 }
 
+/// Whether `host` is a loopback address the TLS policy admits over plain `http`
+/// (ADR 0083): a local model server (Ollama / LM Studio / a dev vLLM) has no
+/// network to encrypt over, so cleartext is acceptable there and there only.
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Derive the egress host the sandbox must admit from an `openai-generic`
+/// endpoint base URL, enforcing the ADR 0083 TLS policy: `https` for any host,
+/// `http` **only** for a loopback host. Pure and total — the single home for the
+/// endpoint URL rule, called both at link time (validation) and at descriptor
+/// derivation (defense in depth). Returns the bare lowercase host (no scheme,
+/// port, or path) so it matches the exact-host egress allowlist (ADR 0079).
+pub fn openai_generic_endpoint_host(base_url: &str) -> io::Result<String> {
+    let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidInput, msg.to_owned());
+    let base_url = base_url.trim();
+    let (scheme, rest) = base_url
+        .split_once("://")
+        .ok_or_else(|| invalid("openai-generic endpoint must be an absolute http(s) URL"))?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(invalid("openai-generic endpoint must use http or https"));
+    }
+    // authority = up to the first path/query/fragment delimiter.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@') // drop any userinfo
+        .next()
+        .unwrap_or("");
+    // host[:port], with IPv6 hosts in brackets.
+    let host = if let Some(after) = authority.strip_prefix('[') {
+        after
+            .split_once(']')
+            .map(|(h, _)| h)
+            .ok_or_else(|| invalid("openai-generic endpoint has a malformed IPv6 host"))?
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let host = host.to_ascii_lowercase();
+    if host.is_empty() {
+        return Err(invalid("openai-generic endpoint has no host"));
+    }
+    if scheme == "http" && !is_loopback_host(&host) {
+        return Err(invalid(
+            "openai-generic endpoint must use https for a non-loopback host (ADR 0083)",
+        ));
+    }
+    Ok(host)
+}
+
+/// Resolve a provider's endpoint descriptor. `base_url` is honored only for the
+/// endpoint-configurable `openai-generic` provider (ADR 0083), where it is
+/// required and its host is derived under the TLS policy; the fixed-host
+/// providers ignore it.
 pub fn native_provider_descriptor(
     provider_name: &str,
     model: Option<&str>,
+    base_url: Option<&str>,
 ) -> io::Result<NativeProviderDescriptor> {
+    if provider_name == "openai-generic" {
+        let base_url = base_url
+            .filter(|url| !url.trim().is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "openai-generic provider requires a linked endpoint base URL",
+                )
+            })?;
+        let endpoint_host = openai_generic_endpoint_host(base_url)?;
+        let model = model.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "openai-generic provider requires an explicit model",
+            )
+        })?;
+        return Ok(NativeProviderDescriptor {
+            provider_name: provider_name.to_owned(),
+            model: model.to_owned(),
+            base_url: base_url.trim().to_owned(),
+            endpoint_host,
+            // The key rides the CredentialCapability path, not the env resolver.
+            credential_env: "OPENAI_API_KEY",
+        });
+    }
     let (base_url, endpoint_host, credential_env, default_model) = match provider_name {
         "openai" => (
             "https://api.openai.com",
@@ -1176,9 +1330,17 @@ impl ProviderConfig {
                 "WhippleScript provider is required",
             )
         })?;
-        let descriptor = native_provider_descriptor(provider_name, spec.model.as_deref())?;
+        let descriptor = native_provider_descriptor(
+            provider_name,
+            spec.model.as_deref(),
+            spec.base_url.as_deref(),
+        )?;
         let provider = match provider_name {
             "openai" => ModelProvider::OpenAi,
+            // openai-generic targets a configured OpenAI-**compatible** endpoint over
+            // the Chat Completions API (ADR 0083), a distinct wire client from the
+            // Responses-API `OpenAi` provider.
+            "openai-generic" => ModelProvider::OpenAiCompat,
             "anthropic" => ModelProvider::Anthropic,
             "openai-codex" => ModelProvider::Codex,
             _ => unreachable!("validated by native_provider_descriptor"),
@@ -1277,6 +1439,10 @@ impl SecretResolver for ProviderConfig {
 struct TurnResources<'a> {
     workspace: &'a NativeWorkspaceResolver,
     images: &'a [ImageContent],
+    /// Questions asked during this turn. Interior mutability because
+    /// `execute_tool` takes `&self`; the engine drains these once the turn
+    /// settles, since it holds the store across the run (ADR 0113).
+    asked: std::cell::RefCell<Vec<gaugewright_harness::AskedQuestion>>,
 }
 
 impl ResourceResolver for TurnResources<'_> {
@@ -1308,8 +1474,130 @@ impl ResourceResolver for TurnResources<'_> {
         admitted_resources: &[ResourceRef],
         call: &ToolCall,
     ) -> Result<String, String> {
+        if call.name == "ask" {
+            if !admitted_resources
+                .iter()
+                .any(|resource| resource.kind == QUESTION_RESOURCE)
+            {
+                return Err("turn has no admitted question capability".to_owned());
+            }
+            let arguments = &call.arguments;
+            // The tool's argument name, which coincides with the resource handle but
+            // is a different thing — do not fold them onto one constant.
+            let question = arguments
+                .get("question")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            if question.is_empty() {
+                return Err("`ask` requires a question".to_owned());
+            }
+            let choices = arguments
+                .get("choices")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let to = arguments
+                .get("to")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
+            let blocking = arguments
+                .get("blocking")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            self.asked
+                .borrow_mut()
+                .push(gaugewright_harness::AskedQuestion {
+                    question,
+                    choices,
+                    to,
+                    blocking,
+                });
+            // The answer arrives in a later turn (ADR 0111): the turn settles,
+            // it does not park waiting for one.
+            return Ok(serde_json::json!({
+                "asked": true,
+                "note": "the answer will arrive as context in a later turn; this turn should settle"
+            })
+            .to_string());
+        }
         self.workspace.execute_tool(admitted_resources, call)
     }
+}
+
+/// Append GaugeDesk's `ask` tool when the ability ceiling admits it (ADR 0113).
+///
+/// The workspace tools are WhippleScript's and their schemas are not ours to
+/// change; this is a GaugeWright ability layered beside them, gated by the same
+/// ceiling that admits the `question` resource `execute_tool` checks for.
+fn question_tool_specs(
+    mut tools: Vec<whipplescript_kernel::harness_loop::ToolSpec>,
+    can_ask: bool,
+    roster: &[(String, String)],
+) -> Vec<whipplescript_kernel::harness_loop::ToolSpec> {
+    if !can_ask {
+        return tools;
+    }
+    // The roster on the tool itself (`GATE-3f`). Removing `askHuman` moved the
+    // choice of *who* to the agent, and until now the only way for it to find out
+    // who exists was to guess and read the refusal. A model should not have to
+    // fail to discover a fact the host already knows.
+    //
+    // `enum` rather than a described free string: this is a closed set the host
+    // resolves, so constraining it turns "asked a person who does not exist" from
+    // a runtime refusal into something the call cannot express. The refusal path
+    // stays — a roster can change between this schema being built and the call
+    // arriving — but it is no longer the primary discovery mechanism.
+    let mut to_schema = serde_json::json!({
+        "type": "string",
+        "description": if roster.is_empty() {
+            "Who to ask. Omit for the chat's owner.".to_owned()
+        } else {
+            format!(
+                "Who to ask, as one of the listed authorities. Omit for the chat's owner. \
+                 People: {}",
+                roster
+                    .iter()
+                    .map(|(authority, who)| format!("{authority} = {who}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        },
+    });
+    if !roster.is_empty() {
+        to_schema["enum"] = serde_json::Value::Array(
+            roster
+                .iter()
+                .map(|(authority, _)| serde_json::Value::String(authority.clone()))
+                .collect(),
+        );
+    }
+    tools.push(whipplescript_kernel::harness_loop::ToolSpec {
+        name: "ask".to_owned(),
+        description:
+            "Ask a person a question. The turn settles; the answer arrives in a later turn."
+                .to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question": { "type": "string", "minLength": 1, "maxLength": 10000 },
+                "choices": { "type": "array", "maxItems": 20, "items": {
+                    "type": "string", "minLength": 1, "maxLength": 256
+                }},
+                "to": to_schema,
+                "blocking": { "type": "boolean" }
+            },
+            "required": ["question"],
+            "additionalProperties": false
+        }),
+    });
+    tools
 }
 
 fn legacy_method_prompt(worktree: &Path, prompt_override: Option<&str>) -> io::Result<String> {
@@ -1477,6 +1765,62 @@ impl std::error::Error for PolicyAdmissionError {}
 
 #[cfg(test)]
 mod tests {
+    /// `GATE-3f`: the roster reaches the agent on the tool, not by trial and error.
+    ///
+    /// Before this, an agent's only way to learn who exists was to name someone,
+    /// be refused, and read the roster out of the error. A model should not have
+    /// to fail to discover a fact the host already knows.
+    #[test]
+    fn the_ask_tool_offers_the_roster_as_a_closed_choice() {
+        let roster = vec![
+            ("auth:alex".to_owned(), "alex@example.com".to_owned()),
+            ("auth:owner".to_owned(), "auth:owner".to_owned()),
+        ];
+        let specs = super::question_tool_specs(Vec::new(), true, &roster);
+        let ask = specs
+            .iter()
+            .find(|spec| spec.name == "ask")
+            .expect("the ask tool");
+        let to = &ask.input_schema["properties"]["to"];
+        assert_eq!(
+            to["enum"],
+            serde_json::json!(["auth:alex", "auth:owner"]),
+            "the choice is closed over the roster's authorities",
+        );
+        // ...and says which opaque authority is which person, or the model would
+        // be choosing between indistinguishable identifiers.
+        let described = to["description"].as_str().expect("described");
+        assert!(
+            described.contains("auth:alex = alex@example.com"),
+            "{described}"
+        );
+    }
+
+    /// An empty roster must not produce `enum: []`, which is unsatisfiable — a
+    /// deployment with no directory has to leave `to` free for the host to
+    /// resolve, not forbid every value.
+    #[test]
+    fn an_empty_roster_leaves_the_recipient_free_rather_than_impossible() {
+        let specs = super::question_tool_specs(Vec::new(), true, &[]);
+        let ask = specs
+            .iter()
+            .find(|spec| spec.name == "ask")
+            .expect("the ask tool");
+        let to = &ask.input_schema["properties"]["to"];
+        assert!(to.get("enum").is_none(), "no impossible enum: {to}");
+        assert_eq!(to["type"], "string");
+    }
+
+    /// A package whose ceiling does not admit `question.ask` gets no tool at all,
+    /// roster or otherwise — the roster is a convenience on an admitted ability,
+    /// never a way to acquire one.
+    #[test]
+    fn a_package_that_cannot_ask_gets_no_ask_tool() {
+        let roster = vec![("auth:alex".to_owned(), "alex@example.com".to_owned())];
+        let specs = super::question_tool_specs(Vec::new(), false, &roster);
+        assert!(specs.iter().all(|spec| spec.name != "ask"));
+    }
+
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
@@ -1538,7 +1882,6 @@ mod tests {
                 ("file:workspace:chat-1".to_owned(), ordinary.clone()),
                 ("memory:turn-images:chat-1".to_owned(), ordinary),
                 ("command:workspace:chat-1".to_owned(), principal.clone()),
-                ("human:owner".to_owned(), principal.clone()),
                 ("provider:openai".to_owned(), principal.clone()),
                 ("provider:owned".to_owned(), principal.clone()),
                 ("placement:local".to_owned(), principal),
@@ -1550,7 +1893,6 @@ mod tests {
                     "memory:turn-images:chat-1".to_owned(),
                 ),
                 ("command".to_owned(), "command:workspace:chat-1".to_owned()),
-                ("human".to_owned(), "human:owner".to_owned()),
                 ("model".to_owned(), "provider:openai".to_owned()),
                 ("owned".to_owned(), "provider:owned".to_owned()),
                 ("local".to_owned(), "placement:local".to_owned()),
@@ -1559,7 +1901,6 @@ mod tests {
                 "workspace.read".to_owned(),
                 "workspace.write".to_owned(),
                 "command.run".to_owned(),
-                "human.ask".to_owned(),
             ]),
             provider_bindings: std::collections::BTreeMap::from([(
                 "model".to_owned(),
@@ -1596,6 +1937,67 @@ mod tests {
         assert_eq!(admitted.envelope_hash().len(), 64);
         assert_eq!(admitted.protocol_ref().epoch, 7);
         assert!(admitted.governs("project"));
+    }
+
+    #[test]
+    fn openai_generic_endpoint_host_derives_and_enforces_tls_policy() {
+        // https remote: host derived, lowercased, port/path stripped.
+        assert_eq!(
+            openai_generic_endpoint_host("https://API.OpenRouter.ai/v1").unwrap(),
+            "api.openrouter.ai"
+        );
+        assert_eq!(
+            openai_generic_endpoint_host("https://gw.example.com:8443/v1/").unwrap(),
+            "gw.example.com"
+        );
+        // http allowed for loopback only (ADR 0083 — local model servers).
+        assert_eq!(
+            openai_generic_endpoint_host("http://localhost:11434/v1").unwrap(),
+            "localhost"
+        );
+        assert_eq!(
+            openai_generic_endpoint_host("http://127.0.0.1:1234").unwrap(),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            openai_generic_endpoint_host("http://[::1]:8000/v1").unwrap(),
+            "::1"
+        );
+        // http to a remote host is refused (cleartext to a TCB endpoint).
+        assert!(openai_generic_endpoint_host("http://api.example.com/v1").is_err());
+        // Non-http(s) scheme, missing host, and non-URL input all fail closed.
+        assert!(openai_generic_endpoint_host("ftp://api.example.com").is_err());
+        assert!(openai_generic_endpoint_host("https:///v1").is_err());
+        assert!(openai_generic_endpoint_host("api.example.com").is_err());
+    }
+
+    #[test]
+    fn openai_generic_descriptor_requires_endpoint_and_model_and_maps_to_openai() {
+        // Endpoint + model present: descriptor carries the exact host + full base_url.
+        let desc = native_provider_descriptor(
+            "openai-generic",
+            Some("llama-3.3-70b"),
+            Some("https://api.together.xyz/v1"),
+        )
+        .expect("openai-generic descriptor");
+        assert_eq!(desc.endpoint_host, "api.together.xyz");
+        assert_eq!(desc.base_url, "https://api.together.xyz/v1");
+        assert_eq!(desc.model, "llama-3.3-70b");
+        // Missing endpoint and missing model both fail closed.
+        assert!(native_provider_descriptor("openai-generic", Some("m"), None).is_err());
+        assert!(native_provider_descriptor(
+            "openai-generic",
+            None,
+            Some("https://api.together.xyz")
+        )
+        .is_err());
+        // A bad (remote http) endpoint is refused at descriptor derivation too.
+        assert!(native_provider_descriptor(
+            "openai-generic",
+            Some("m"),
+            Some("http://api.together.xyz")
+        )
+        .is_err());
     }
 
     #[test]
@@ -1711,7 +2113,8 @@ mod tests {
   "workflow":"Method",
   "agent":"assistant",
   "system_prompt":"persona.md",
-  "capabilities":["workspace.read","workspace.write","command.run","human.ask"],
+  "capabilities":["workspace.read","workspace.write","command.run"],
+  "agent_abilities":["workspace.read","workspace.write","command.run"],
   "max_steps":32
 }"#,
         )
@@ -1725,13 +2128,12 @@ workflow Method {
     provider owned
     profile "repo-writer"
     capacity 1
-    capabilities ["workspace.read", "workspace.write", "command.run", "human.ask"]
+    capabilities ["workspace.read", "workspace.write", "command.run"]
   }
   rule converse when started => {
-    tell assistant requires ["workspace.read", "workspace.write", "command.run", "human.ask"]
+    tell assistant requires ["workspace.read", "workspace.write", "command.run"]
       with access to project { read ["**"] write ["**"] }
       with access to command { run }
-      with access to human { ask }
       "Run."
   }
 }
@@ -1754,8 +2156,10 @@ workflow Method {
             provider_binding_ref: Some("model".to_owned()),
             credential_ref: Some("gaugedesk:credential:account:openai".to_owned()),
             placement_ceiling_ref: Some("local".to_owned()),
+            runtime_placement_id: Some("placement-test".to_owned()),
             provider: Some("openai".to_owned()),
             model: Some("gpt-test".to_owned()),
+            base_url: None,
             thinking: None,
             system_prompt: None,
             credential_capability: Some(test_credential_capability()),
@@ -1765,6 +2169,7 @@ workflow Method {
                 .to_path_buf()])
             .read_only(vec![worktree.path().join(".whipple")])
             .filter_egress(vec!["api.openai.com".to_owned()]),
+            roster: Vec::new(),
         };
         let factory = WhipHarnessFactory::new(
             AuthorityId::new("authority:owner"),
@@ -1773,48 +2178,37 @@ workflow Method {
         );
         let first = factory.create_harness(&spec).expect("first harness");
         assert_eq!(first.package.version_ref(), package_ref);
-        assert!(first
+        assert!(!first
             .package
-            .capabilities()
+            .agent_abilities()
             .iter()
             .any(|capability| capability == "human.ask"));
-        assert!(
-            native_workspace_tool_specs_with_capabilities(true, true, true)
-                .iter()
-                .any(|tool| tool.name == "ask_human")
-        );
-        assert!(first
-            .new_turn_command("question", &[], 1)
+        assert!(!first
+            .new_turn_command("question", &[], 1, None)
             .resources
             .iter()
             .any(|resource| resource.kind == "human"));
+        assert_eq!(
+            first
+                .new_turn_command("question", &[], 2, Some("home-command:stable".to_owned()))
+                .command_id,
+            "home-command:stable"
+        );
         assert!(native_workspace_tool_specs(true)
             .iter()
             .any(|tool| tool.name == "write"));
         assert!(native_workspace_tool_specs_with_command(true, true)
             .iter()
             .any(|tool| tool.name == "bash"));
-        let admitted_command = AdmittedCommand {
-            command: "git status".to_owned(),
-            workspace_root: worktree.path().to_path_buf(),
-            read_only_paths: vec![worktree.path().join(".whipple")],
-            timeout: Duration::from_secs(30),
-        };
-        let command_policy = command_sandbox_policy(&spec.sandbox, &admitted_command);
-        assert_eq!(command_policy.network, Network::Deny);
-        assert_eq!(
-            command_policy.writable_roots,
-            vec![worktree.path().to_path_buf()]
-        );
-        assert_eq!(
-            command_policy.read_only_roots,
-            vec![worktree.path().join(".whipple")]
-        );
         assert!(first.interrupt_handle().is_some());
         let instance = first.instance_ref.clone();
         drop(first);
         let reopened = factory.create_harness(&spec).expect("reopened harness");
         assert_eq!(reopened.instance_ref, instance);
+        let exact_source_position = reopened
+            .runtime
+            .current_position(&reopened.instance_ref)
+            .expect("source position");
 
         let respondent = AuthorityId::new("authority:authenticated-member");
         let mut attributed = factory.create_harness(&spec).expect("attributed harness");
@@ -1830,6 +2224,7 @@ workflow Method {
         }
         let source_continuity = HarnessContinuitySpec {
             chat_id: spec.chat_id.clone(),
+            runtime_placement_id: spec.runtime_placement_id.clone(),
             worktree: spec.worktree.clone(),
             mode: spec.mode,
             package_root: Some(package_root),
@@ -1837,9 +2232,14 @@ workflow Method {
             system_prompt: None,
             policy_epoch: spec.policy_epoch,
             signed_policy_envelope: spec.signed_policy_envelope.clone(),
+            source_position: Some(RuntimePosition {
+                instance_ref: exact_source_position.instance_ref,
+                sequence: exact_source_position.sequence,
+            }),
         };
         let target_continuity = HarnessContinuitySpec {
             chat_id: "chat-2".to_owned(),
+            runtime_placement_id: spec.runtime_placement_id.clone(),
             worktree: target_worktree.path().to_path_buf(),
             mode: spec.mode,
             package_root: Some(target_package_root),
@@ -1847,6 +2247,7 @@ workflow Method {
             system_prompt: None,
             policy_epoch: spec.policy_epoch,
             signed_policy_envelope: spec.signed_policy_envelope.clone(),
+            source_position: None,
         };
         factory
             .clone_continuity(&source_continuity, &target_continuity)

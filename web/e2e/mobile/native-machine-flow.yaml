@@ -1,0 +1,87 @@
+appId: ${APP_ID}
+name: Native Machine pairing, chat, and restart
+---
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - launchApp
+      - extendedWaitUntil:
+          visible: "pair a Machine"
+          timeout: 30000
+      - stopApp
+      - openLink:
+          link: ${INVITATION_URL}
+          autoVerify: true
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      # Cold-launch the package first so Tauri's shared deep-link listener is
+      # installed before the OS delivers the invitation. iOS does not retain a
+      # custom URL delivered before that listener exists.
+      - launchApp:
+          stopApp: false
+      - extendedWaitUntil:
+          visible: "pair a Machine"
+          timeout: 180000
+      # iOS 26 has exhibited both sides of the same LaunchServices race on fresh
+      # hosted Simulators: the custom URL can be ignored, or its confirmation
+      # can arrive after openLink returns. Retry only that OS boundary and wait
+      # for either the product transition or the exact system confirmation.
+      # autoVerify is intentionally absent because Maestro defines it for
+      # Android app-link verification only.
+      - retry:
+          maxRetries: 3
+          commands:
+            - openLink:
+                link: ${INVITATION_URL}
+            - extendedWaitUntil:
+                visible: "Browse|Open in.*GaugeDesk.*"
+                timeout: 15000
+            - runFlow:
+                when:
+                  visible: "Open in.*GaugeDesk.*"
+                commands:
+                  - tapOn:
+                      text: "Open"
+                      label: "Accept the iOS Machine invitation handoff"
+            - extendedWaitUntil:
+                visible: "Browse"
+                timeout: 60000
+- extendedWaitUntil:
+    visible: "Browse"
+    timeout: 60000
+- assertVisible: "paired.*"
+- tapOn: "Chat"
+- extendedWaitUntil:
+    visible: "Message…"
+    timeout: 30000
+- tapOn: "Message…"
+- inputText: "native acceptance turn"
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      # WKWebView's keyboard does not expose Maestro's standard dismiss
+      # action, but iOS supplies a visible input-assistant Done control.
+      - tapOn: "Done"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- assertVisible: "native acceptance turn"
+- tapOn: "send"
+- extendedWaitUntil:
+    visible: "turn complete"
+    timeout: 60000
+# Prove recovery from a stopped process without clearing app data. Maestro's
+# Android killApp primitive can take its own ADB device server offline on hosted
+# emulators; stopApp still forces a real process restart and preserves state.
+- stopApp
+- launchApp:
+    stopApp: false
+- extendedWaitUntil:
+    visible: "paired.*"
+    timeout: 30000

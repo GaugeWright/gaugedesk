@@ -16,24 +16,24 @@ Feature: Round 9 — honest banners, legible search, one honest improve entry
   Scenario: searching hides the "+ archetype" create affordance so it can't read as a hit
     Given the workbench is open
     Then I can create a new method
-    When I search the facets for "assistant"
+    When I search the facets for "Default"
     Then I cannot create a new method
     When I clear the facet search
     Then I can create a new method
 
   Scenario: the method-improve menu offers a single, honest improve entry
     Given the workbench is open
-    When I open the context menu on the archetype "assistant"
+    When I open the context menu on the archetype "Default"
     Then the menu offers exactly one improve entry
     And the menu does not promise working alongside it live
 
   Scenario: the improve composer names the method and drops jargon
     Given the workbench is open
-    When I create an edit chat under the archetype "assistant"
+    When I create an edit chat under the archetype "Default"
     Then the composer placeholder does not mention "archetype"
     And the composer placeholder does not mention "the editor"
 
   Scenario: renaming a method selects the existing name so you can type over it
     Given the workbench is open
-    When I start renaming the archetype "assistant"
+    When I start renaming the archetype "Default"
     Then the rename field has the existing name selected

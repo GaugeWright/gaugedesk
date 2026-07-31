@@ -3,18 +3,19 @@
 # public source: Rust fmt/clippy/test and the web/ee typecheck+build+unit tests.
 # The private repo's ci.yml additionally runs the Quint model checks, the
 # spec-audit tracker gate, and coverage — all of which need the private specs/.
-name: ci
+name: ci (public mirror)
 
 on:
   push:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-public-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   rust:
+    if: ${{ github.event.repository.private == false }}
     name: rust (fmt · clippy · test)
     runs-on: ubuntu-latest
     steps:
@@ -32,7 +33,20 @@ jobs:
       - name: app no-default feature gate
         run: cargo check -p gaugewright-app --no-default-features --all-targets
 
+  architecture:
+    if: ${{ github.event.repository.private == false }}
+    name: architecture boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: enforce crate and transport boundaries
+        run: python3 scripts/architecture-check.py
+
   web:
+    if: ${{ github.event.repository.private == false }}
     name: web (typecheck · vitest)
     runs-on: ubuntu-latest
     defaults:

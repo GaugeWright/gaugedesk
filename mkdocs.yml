@@ -1,5 +1,5 @@
 site_name: GaugeDesk Docs
-site_description: Documentation for GaugeDesk — build, run, and deploy expert AI agents against private context under an enforced boundary.
+site_description: Learn how to build, run, review, and publish agents with GaugeDesk.
 site_url: https://docs.gaugewright.com/
 copyright: © 2026 GaugeWright LLC
 
@@ -12,7 +12,7 @@ theme:
   # loader avoids requesting Commit Mono from Google Fonts, where it is absent.
   font: false
   palette:
-    # Navy-led by default (matches the marketing site); light is a toggle.
+    # Navy-led by default (matches the marketing site). Light is a toggle.
     - scheme: slate
       primary: black
       accent: blue
@@ -37,8 +37,8 @@ theme:
   icon:
     repo: fontawesome/brands/github
 
-repo_url: https://github.com/jamesjscully/gaugedesk
-repo_name: jamesjscully/gaugedesk
+repo_url: https://github.com/GaugeWright/gaugedesk
+repo_name: GaugeWright/gaugedesk
 edit_uri: edit/main/docs/
 
 extra_css:
@@ -62,37 +62,36 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Getting started: getting-started.md
-  - Concepts:
-      - concepts/index.md
+  - Build an agent:
+      - Overview: guides/expert/index.md
+      - Build your first agent: guides/expert/build-an-agent.md
+      - Save and update versions: guides/expert/versioning-and-forking.md
+  - Run and review:
+      - Run an agent: guides/expert/run-and-review.md
+      - Review work from an agent: guides/client/review-and-release.md
+      - Check an agent before use: guides/client/verify-before-trust.md
+  - Publish:
+      - Publish on a website: guides/embed/index.md
+      - Package for another team: guides/expert/package-and-deploy.md
+  - Manage GaugeDesk:
+      - Administration: guides/admin/index.md
+      - Set up SSO and SCIM: guides/admin/identity-and-provisioning.md
+      - Working with another team: guides/client/index.md
+  - Troubleshooting: guides/expert/troubleshooting.md
+  - Understand GaugeDesk:
+      - Overview: concepts/index.md
+      - How GaugeDesk protects your work: concepts/protection.md
+      - Where work runs: concepts/deployment-modes.md
       - Glossary: concepts/glossary.md
-      - How GaugeWright protects your work: concepts/protection.md
-      - Deployment modes: concepts/deployment-modes.md
-  - Guides:
-      - For experts (consultants):
-          - guides/expert/index.md
-          - Build an agent: guides/expert/build-an-agent.md
-          - Run & review work: guides/expert/run-and-review.md
-          - Versioning, freezing & forking: guides/expert/versioning-and-forking.md
-          - Package & deploy: guides/expert/package-and-deploy.md
-          - Troubleshooting: guides/expert/troubleshooting.md
-      - For clients:
-          - guides/client/index.md
-          - Review & release outputs: guides/client/review-and-release.md
-          - Verify before you trust: guides/client/verify-before-trust.md
-      - For admins (IT):
-          - guides/admin/index.md
-          - Identity & provisioning (SSO, SCIM): guides/admin/identity-and-provisioning.md
-      - For embedded end-users:
-          - guides/embed/index.md
-  - Security &amp; trust:
+  - Security and trust:
       - security.md
-      - Subprocessors &amp; data processing: trust/subprocessors.md
-      - Support &amp; response targets: trust/support.md
-      - Security operations &amp; hardening: trust/security-operations.md
-      - Incident-response runbook: trust/incident-response.md
+      - Data processing and subprocessors: trust/subprocessors.md
+      - Support: trust/support.md
+      - Security operations: trust/security-operations.md
+      - Incident response: trust/incident-response.md
   - Reference:
-      - Roadmap &amp; status: reference/status.md
-      - Known limitations & gaps: reference/limitations.md
-      - Verifying the security claims: reference/verifying-claims.md
-  - FAQ: faq.md
+      - Product status: reference/status.md
+      - Current limits: reference/limitations.md
+      - Verify security claims: reference/verifying-claims.md
+      - FAQ: faq.md
+      - Documentation license: LICENSE.md

@@ -7,7 +7,7 @@ private operational context under review, release, and audit controls.
 This repository is the open, source-available distribution of the GaugeDesk
 platform.
 
-## What's here
+## What is here
 
 - **Core crates** — `crates/core` (pure, property-tested reducers), `crates/store`
   (SQLite event log + admission), `crates/workspace` (git instance/worktrees),
@@ -24,8 +24,8 @@ platform.
 ## Download
 
 Prebuilt desktop bundles — Linux `.deb`/`.AppImage`, macOS `.dmg`, Windows `.msi`
-— are on the [releases page](https://github.com/jamesjscully/gaugedesk/releases).
-Installers are currently unsigned.
+— are on the [releases page](https://github.com/GaugeWright/gaugedesk/releases).
+Installers are now unsigned.
 
 ## Licensing
 
@@ -35,7 +35,7 @@ Two license bands, split by directory:
   [`NOTICE`](NOTICE).
 - Everything under `ee/` is **Business Source License 1.1** with the GaugeWright
   Enterprise Use Grant — see [`ee/LICENSE`](ee/LICENSE). It is publicly readable
-  by design; production use is governed by the BUSL terms.
+  by design. Production use is governed by the BUSL terms.
 
 ## Quick start
 
@@ -56,7 +56,7 @@ GaugeDesk's protection model is structural, and much of it is machine-checked.
 [Verifying the security claims](docs/reference/verifying-claims.md) maps each
 guarantee to the executable tests in this repository that exercise it. The formal
 Quint models those tests are derived from are maintained in a separate private
-repository; the tests that check the same properties are public here.
+repository. The tests that check the same properties are public here.
 
 ## Related projects
 

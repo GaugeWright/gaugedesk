@@ -9,8 +9,6 @@ import {
     kindLabel,
     outputProtectionLabel,
     outputs,
-    resourceExportScope,
-    resourceReviewScope,
     resourceTitle,
     reviewPhaseLabel,
 } from "./resource-catalog";
@@ -114,12 +112,5 @@ describe("output protection labels — plain words, never raw phase tokens (roun
     it("prefers the later export stage when it is meaningful", () => {
         expect(outputProtectionLabel("Cleared", "Exported")).toBe("sent out");
         expect(outputProtectionLabel("Proposed", "Init")).toBe("awaiting review");
-    });
-});
-
-describe("per-resource scopes", () => {
-    it("mirror the resource_store scope formats", () => {
-        expect(resourceReviewScope("x1", "out-x1")).toBe("x1-review-out-x1");
-        expect(resourceExportScope("x1", "out-x1")).toBe("x1-export-out-x1");
     });
 });

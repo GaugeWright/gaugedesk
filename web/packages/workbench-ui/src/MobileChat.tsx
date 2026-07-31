@@ -39,6 +39,8 @@ export interface MobileChatProps {
      *  expired) disables send here, paired with the {@link ConnectionBanner} that
      *  explains why — never a silently dead control (MOB-028). */
     readonly connection: ConnectionStatus;
+    /** Opt the next candidate into review; false keeps shared-line auto-sync. */
+    readonly reviewNext?: boolean;
     /** Apply a reduced composer state (the host's setter). Every edit and send
      *  flows through here; the island never mutates truth itself. */
     readonly onState: (next: ComposerState) => void;
@@ -46,6 +48,7 @@ export interface MobileChatProps {
      *  ClientRequestId} the host minted for it (so the answering projection can
      *  reconcile it). The host issues the actual control-plane request. */
     readonly onSend: (text: string) => void;
+    readonly onToggleReview?: () => void;
     /** Request the running turn be aborted (the stop command). The host issues
      *  the control-plane stop; this island only offers the affordance. */
     readonly onStop: () => void;
@@ -93,6 +96,19 @@ export function MobileChat(props: MobileChatProps): JSX.Element {
                     <span class="composer-pending" data-pending role="status">
                         sending… ({view().pendingCount})
                     </span>
+                </Show>
+
+                <Show when={props.onToggleReview && !view().canStop}>
+                    <button
+                        type="button"
+                        class="review-toggle"
+                        classList={{ active: props.reviewNext === true }}
+                        data-review-next
+                        aria-pressed={props.reviewNext === true}
+                        onClick={() => props.onToggleReview?.()}
+                    >
+                        review
+                    </button>
                 </Show>
 
                 {/* Stop is offered only while a turn is running. */}

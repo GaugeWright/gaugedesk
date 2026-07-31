@@ -3,13 +3,15 @@
 //! `WorkstreamMergeRepair`).
 //!
 //! Workspace reconciliation is automatic, but advancing the standing line (`main`)
-//! is **gated**: it happens only on a clean substrate merge AND admitted policy. A
+//! is **admitted**: it happens only on a clean substrate merge AND admitted policy.
+//! Shared-line policy auto-admits ordinary clean turns; an explicit per-change review
+//! defers that admission to the human. A
 //! workspace conflict or a policy reject **isolates** the
 //! engagement with a preserved candidate and a repair context; repair retries are
 //! idempotent (the ref advances at most once). A partial merge is never settled.
 //!
 //! The reducer is pure: the imperative shell asks the workspace for a verdict and
-//! surfaces review, then issues `WorkspaceClean`/`WorkspaceConflict` and the policy
+//! surfaces requested review, then issues `WorkspaceClean`/`WorkspaceConflict` and the policy
 //! command. Discharges (`INV`-grade): standing-advance-requires-workspace-and-policy ·
 //! rejected-preserves-repair-basis · partial-merge-never-standing ·
 //! repair-retry-idempotent · isolated-thread-not-current-without-repair ·
@@ -69,6 +71,10 @@ pub struct MergeState {
     pub standing_advance_count: u32,
     pub retry_keys_used: BTreeSet<String>,
     pub boundary_command_admitted: bool,
+    /// The current clean candidate was explicitly held for human review. Clean by
+    /// itself is a workspace verdict; this fact distinguishes an intentional hold
+    /// from the auto-admit default (ADR 0096).
+    pub review_requested: bool,
 }
 
 impl Default for MergeState {
@@ -85,6 +91,7 @@ impl Default for MergeState {
             standing_advance_count: 0,
             retry_keys_used: BTreeSet::new(),
             boundary_command_admitted: false,
+            review_requested: false,
         }
     }
 }
@@ -97,6 +104,8 @@ pub enum MergeCommand {
     WorkspaceClean,
     /// Workspace reports a conflict (isolate and preserve the candidate).
     WorkspaceConflict,
+    /// Hold this clean candidate for explicit per-change review.
+    RequestReview,
     /// The human reviewed the diff and admitted.
     PolicyAdmit,
     /// The human reviewed the diff and rejected.
@@ -121,6 +130,7 @@ pub enum MergeEvent {
     WorkspaceCleaned,
     #[serde(rename = "GitConflicted")]
     WorkspaceConflicted,
+    ReviewRequested,
     PolicyAdmitted,
     PolicyRejected,
     StandingRefAdvanced,
@@ -150,6 +160,10 @@ pub fn decide(state: &MergeState, command: MergeCommand) -> Result<Vec<MergeEven
         MergeCommand::WorkspaceConflict => match state.phase {
             Merging => Ok(vec![MergeEvent::WorkspaceConflicted]),
             _ => reject("workspaceConflict: not merging"),
+        },
+        MergeCommand::RequestReview => match state.phase {
+            Clean => Ok(vec![MergeEvent::ReviewRequested]),
+            _ => reject("requestReview: not a clean candidate"),
         },
         MergeCommand::PolicyAdmit => {
             if state.phase == Clean && state.workspace_outcome == WorkspaceOutcome::Success {
@@ -229,6 +243,7 @@ pub fn evolve(state: &MergeState, event: MergeEvent) -> MergeState {
             s.repair_context_created = true;
             s.thread_state = ThreadState::Isolated;
         }
+        MergeEvent::ReviewRequested => s.review_requested = true,
         MergeEvent::PolicyAdmitted => s.policy_outcome = PolicyOutcome::Admitted,
         MergeEvent::PolicyRejected => {
             s.phase = P::Rejected;
@@ -300,6 +315,23 @@ mod tests {
     }
 
     #[test]
+    fn explicit_review_is_a_durable_fact_on_the_clean_candidate() {
+        use MergeCommand::*;
+        let s = apply(&MergeState::default(), StartMerge);
+        let s = apply(&s, WorkspaceClean);
+        let s = apply(&s, RequestReview);
+        assert_eq!(s.phase, MergePhase::Clean);
+        assert!(s.review_requested);
+
+        let next = apply(&s, StartMerge);
+        assert_eq!(next.phase, MergePhase::Merging);
+        assert!(
+            !next.review_requested,
+            "the hold applies to one candidate only"
+        );
+    }
+
+    #[test]
     fn conflict_isolates_then_repairs() {
         use MergeCommand::*;
         let s = MergeState::default();
@@ -331,6 +363,7 @@ mod tests {
             Just(StartMerge),
             Just(WorkspaceClean),
             Just(WorkspaceConflict),
+            Just(RequestReview),
             Just(PolicyAdmit),
             Just(PolicyReject),
             Just(AdvanceStandingRef),

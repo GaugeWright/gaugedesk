@@ -8,7 +8,8 @@ Feature: Round 5 — honest View after discard, plain chat types, reachable nav,
 
   Scenario: after a discard, the View tab honestly explains the file still shows the unkept changes
     Given a new engagement
-    When I task the agent with "Add a friendly greeting"
+    When I request review for the next change
+    And I task the agent with "Add a friendly greeting"
     Then the run phase is "Completed"
     When I open the "diff" tab
     And I discard the work

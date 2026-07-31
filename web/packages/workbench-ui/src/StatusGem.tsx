@@ -1,7 +1,7 @@
 /**
  * The per-row **status gem** (WS-H): a compact kind glyph that doubles as the row's
- * status light. The glyph says *what kind* of row it is (a **work** or **edit**
- * [[chat]], a project); its colour says the single most important *state* — a sync
+ * status light. Chats use a robot glyph while its tooltip says whether it is a
+ * **work** or **edit** chat; its colour says the single most important *state* — a sync
  * **conflict** to resolve, the agent **working**, a turn that **errored**, or changes
  * waiting for **review**; and a conflict carries a `!` mark.
  *
@@ -15,14 +15,14 @@
 
 import { Show, type JSX } from "solid-js";
 import { type ChatRunTone, runDotTitle } from "./chat-run-state";
+import { Icon } from "./icons";
 
-/** The kind of row a gem sits on — its glyph. A chat's kind is its root (ADR 0035). */
+/** The kind of row a gem sits on — a chat's kind is its root (ADR 0035). */
 export type GemKind = "work" | "edit" | "project";
 
 /** The single state the gem paints, most-urgent first (see {@link gemState}). */
 export type GemState = "idle" | "working" | "review" | "error" | "conflict";
 
-const GLYPH: Record<GemKind, string> = { work: "◧", edit: "✎", project: "▣" };
 const KIND_TITLE: Record<GemKind, string> = {
     work: "work chat — uses the method to do the project's work",
     edit: "edit chat — changes what the method itself does",
@@ -73,7 +73,12 @@ export function StatusGem(props: {
             title={title()}
             aria-label={title()}
         >
-            <span class="status-gem-glyph" aria-hidden="true">{GLYPH[props.kind]}</span>
+            <Show
+                when={props.kind !== "project"}
+                fallback={<span class="status-gem-glyph" aria-hidden="true">▣</span>}
+            >
+                <Icon name="robot" class="status-gem-glyph" />
+            </Show>
             <Show when={state() === "conflict"}>
                 <span class="status-gem-mark" data-gem-conflict aria-hidden="true">!</span>
             </Show>

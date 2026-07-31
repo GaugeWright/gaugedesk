@@ -6,6 +6,7 @@ import {
     lineVisible,
     loadPrefs,
     messageCategoryOf,
+    savePrefs,
     toolExpanded,
     type FilterPrefs,
 } from "./transcript-filter";
@@ -80,9 +81,10 @@ describe("toolExpanded / lineToolGroup", () => {
 });
 
 describe("isFiltering — funnel 'on' state", () => {
-    it("is false at defaults, true once anything is hidden", () => {
+    it("is neutral at defaults and active when additional content is hidden", () => {
         expect(isFiltering(defaultPrefs)).toBe(false);
-        expect(isFiltering({ ...defaultPrefs, messages: { ...defaultPrefs.messages, system: false } })).toBe(true);
+        expect(isFiltering({ ...defaultPrefs, messages: { ...defaultPrefs.messages, system: true } })).toBe(false);
+        expect(isFiltering({ ...defaultPrefs, messages: { ...defaultPrefs.messages, agent: false } })).toBe(true);
         expect(
             isFiltering({ ...defaultPrefs, tools: { ...defaultPrefs.tools, ls: { visible: false, expanded: false } } }),
         ).toBe(true);
@@ -96,15 +98,36 @@ describe("loadPrefs — seed from storage, merged over defaults", () => {
         expect(loadPrefs(null)).toEqual(defaultPrefs);
         expect(loadPrefs(store(null))).toEqual(defaultPrefs);
         expect(loadPrefs(store("{not json"))).toEqual(defaultPrefs);
+        expect(defaultPrefs.messages.system).toBe(false);
     });
 
-    it("applies a saved partial blob over the defaults (forward-compatible)", () => {
-        const saved = JSON.stringify({ messages: { system: false }, tools: { grep: { visible: false } } });
+    it("migrates legacy saves to the hidden-system-note baseline", () => {
+        const saved = JSON.stringify({
+            messages: { agent: false, system: true },
+            tools: { grep: { visible: false } },
+        });
         const prefs = loadPrefs(store(saved));
         expect(prefs.messages.system).toBe(false);
-        expect(prefs.messages.agent).toBe(true);
+        expect(prefs.messages.agent).toBe(false);
         expect(prefs.tools.grep.visible).toBe(false);
         expect(prefs.tools.grep.expanded).toBe(false);
         expect(prefs.tools.read).toEqual(defaultPrefs.tools.read);
+    });
+
+    it("honors an explicit system-note choice saved under the current schema", () => {
+        const saved = JSON.stringify({ version: 2, messages: { system: true } });
+        expect(loadPrefs(store(saved)).messages.system).toBe(true);
+    });
+});
+
+describe("savePrefs — versioned persistence", () => {
+    it("marks saves so an explicit system-note choice survives reload", () => {
+        let raw = "";
+        savePrefs({ setItem: (_key, value) => (raw = value) }, {
+            ...defaultPrefs,
+            messages: { ...defaultPrefs.messages, system: true },
+        });
+        expect(JSON.parse(raw)).toMatchObject({ version: 2, messages: { system: true } });
+        expect(loadPrefs(store(raw)).messages.system).toBe(true);
     });
 });

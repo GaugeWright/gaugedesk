@@ -1,22 +1,28 @@
 import * as accountClient from "@gaugewright/control-plane-client";
-import * as embedClient from "@gaugewright/control-plane-client";
 import * as federationClient from "@gaugewright/control-plane-client";
 import * as workbenchClient from "@gaugewright/control-plane-client";
 import type {
+    AccessPhase,
     ArchetypeId,
     AuditEvent,
     Engagement,
     EngagementId,
-    ExportCommand,
     ExportState,
     FileEntry,
     HumanTask,
     MergeAction,
     MergeState,
     PlacementId,
+    PublicDeploymentInput,
+    PublicDeploymentInspection,
+    PublicDeploymentOutcome,
+    PublicCredentialMetadata,
+    ProvisionPublicCredentialInput,
     ProjectId,
     ResourceView,
-    ReviewCommand,
+    RosterPerson,
+    ResourceExportAction,
+    ResourceReviewAction,
     ReviewState,
     RunCommand,
     RunState,
@@ -25,31 +31,139 @@ import type {
     StreamEvent,
     WorkstreamId,
     WorkstreamNode,
+    WorkTargetId,
+    WorkTargetNode,
     Workspace,
     WorkspaceChange,
+    WorkspaceDelta,
     ProjectionCarriage,
     ProjectHome,
+    AccountHome,
+    HomeId,
+    OpaqueHomeRoute,
+    CreatedHomeInvitation,
 } from "@gaugewright/control-plane-client";
 import {
+    browserRouteEventStream,
     browserRouteJson,
+    browserRouteRequest,
     controlPlaneBase,
+    isSecureControlPlaneEndpoint,
+    RemoteControlPlane,
+    type RouteEventStream,
     type RouteJson,
+    type RouteRequest,
 } from "@gaugewright/control-plane-client";
 import type { ControlPlane } from "@gaugewright/control-plane-client";
 
 export { controlPlaneBase };
 
+export type HomeBootstrapState =
+    | { readonly kind: "direct" }
+    | { readonly kind: "connected"; readonly home: AccountHome }
+    | {
+          readonly kind: "none";
+          readonly homes: AccountHome[];
+          readonly routes: OpaqueHomeRoute[];
+      };
+
+/** A Console-safe pointer: the owning workspace and a count, never review data. */
+export interface TenantReviewNotification {
+    readonly tenant: string;
+    readonly count: number;
+    /** Homes that could not be checked after target admission. */
+    readonly unavailableHomes: number;
+}
+
+/** A member-visible, non-secret projection used only to decide whether the
+ * signed desktop updater may offer its stable release lane. */
+export interface SoftwareUpdatePolicy {
+    readonly allowedChannels: readonly string[];
+}
+
+class NoSelectedHomeError extends Error {}
+
 /** App-owned control-plane edge for the open workbench shell. */
 export class WorkbenchControlPlane implements ControlPlane {
     private bearer: string | null = null;
+    private homeAdmission: string | null = null;
     private readonly route: RouteJson;
+    private readonly request: RouteRequest;
+    private readonly events: RouteEventStream;
+    private readonly splitHomes: boolean;
+    private readonly workTransport: workbenchClient.WorkbenchTransport;
+    private homeTransport: Promise<workbenchClient.WorkbenchTransport> | null = null;
 
-    constructor(private readonly base = controlPlaneBase()) {
-        this.route = browserRouteJson(this.base, { bearer: () => this.bearer });
+    constructor(
+        private readonly base = controlPlaneBase(),
+        options: { readonly splitHomes?: boolean } = {},
+    ) {
+        this.splitHomes = options.splitHomes ?? import.meta.env?.VITE_HOME_SPLIT === "true";
+        const auth = {
+            bearer: () => this.bearer,
+            // In split mode this is the Hub transport. A Home credential must
+            // never leak onto account-plane requests: besides crossing the
+            // authority boundary, the edge uses that header to select Home.
+            homeAdmission: () => (this.splitHomes ? null : this.homeAdmission),
+        };
+        this.route = browserRouteJson(this.base, auth);
+        this.request = browserRouteRequest(this.base, auth);
+        this.events = browserRouteEventStream(this.base, auth);
+        this.workTransport = this.splitHomes
+            ? {
+                  base: "",
+                  json: async (...args) => (await this.requireHomeTransport()).json(...args),
+                  request: async (...args) => {
+                      const request = (await this.requireHomeTransport()).request;
+                      if (!request) throw new Error("Home raw transport unavailable");
+                      return request(...args);
+                  },
+                  events: (path, onMessage, onOpen) => {
+                      let closed = false;
+                      let stop = () => {};
+                      void this.requireHomeTransport()
+                          .then((transport) => {
+                              if (!closed && transport.events) {
+                                  stop = transport.events(path, onMessage, onOpen);
+                              }
+                          })
+                          .catch(() => {});
+                      return () => {
+                          closed = true;
+                          stop();
+                      };
+                  },
+              }
+            : {
+                  base: this.base,
+                  json: this.route,
+                  request: this.request,
+                  events: this.events,
+              };
     }
 
     setBearer(token: string | null): void {
+        if (this.bearer !== token) {
+            this.homeAdmission = null;
+            this.homeTransport = null;
+        }
         this.bearer = token;
+    }
+
+    setHomeAdmission(token: string | null): void {
+        this.homeAdmission = token;
+    }
+
+    async admitHome(): Promise<string> {
+        const result = (await this.route("POST", "/home/admissions")) as {
+            home?: unknown;
+            admission?: unknown;
+        };
+        if (typeof result.home !== "string" || typeof result.admission !== "string") {
+            throw new Error("Home admission response is malformed");
+        }
+        this.homeAdmission = result.admission;
+        return result.home;
     }
 
     private routeJson(): RouteJson {
@@ -57,7 +171,278 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     private workbenchTransport(): workbenchClient.WorkbenchTransport {
-        return { base: this.base, json: this.routeJson() };
+        return this.workTransport;
+    }
+
+    private async runtimeAccountJson(): Promise<RouteJson> {
+        return this.splitHomes ? (await this.requireHomeTransport()).json : this.route;
+    }
+
+    private requireHomeTransport(): Promise<workbenchClient.WorkbenchTransport> {
+        if (!this.splitHomes) return Promise.resolve(this.workTransport);
+        this.homeTransport ??= this.connectSelectedHome();
+        return this.homeTransport;
+    }
+
+    private async connectSelectedHome(): Promise<workbenchClient.WorkbenchTransport> {
+        const state = await accountClient.accountHomes(this.route);
+        const selected = state.homes.find((home) => home.id === state.selectedHome);
+        if (!selected) throw new NoSelectedHomeError("No reachable Home is selected");
+        let admission: string | null = null;
+        const auth = {
+            bearer: () => this.bearer,
+            homeAdmission: () => admission,
+        };
+        const json = browserRouteJson(selected.endpoint, auth);
+        const result = (await json("POST", "/home/admissions")) as {
+            home?: unknown;
+            admission?: unknown;
+        };
+        if (result.home !== selected.id || typeof result.admission !== "string") {
+            throw new Error(`Selected Home identity mismatch: expected ${selected.id}`);
+        }
+        admission = result.admission;
+        this.homeAdmission = admission;
+        return {
+            base: selected.endpoint,
+            json,
+            request: browserRouteRequest(selected.endpoint, auth),
+            events: browserRouteEventStream(selected.endpoint, auth),
+        };
+    }
+
+    async bootstrapHome(): Promise<HomeBootstrapState> {
+        if (!this.splitHomes) return { kind: "direct" };
+        try {
+            await this.requireHomeTransport();
+            const state = await accountClient.accountHomes(this.route);
+            const home = state.homes.find((item) => item.id === state.selectedHome);
+            if (!home) throw new NoSelectedHomeError("No reachable Home is selected");
+            return { kind: "connected", home };
+        } catch (error) {
+            if (!(error instanceof NoSelectedHomeError)) throw error;
+            const [state, routes] = await Promise.all([
+                accountClient.accountHomes(this.route),
+                accountClient.accountHomeRoutes(this.route),
+            ]);
+            return { kind: "none", homes: state.homes, routes };
+        }
+    }
+
+    async connectHome(endpoint: string): Promise<HomeBootstrapState> {
+        const normalized = endpoint.trim().replace(/\/+$/, "");
+        if (!isSecureControlPlaneEndpoint(normalized)) {
+            throw new Error("Use an HTTPS Home endpoint (HTTP is allowed only on this computer)");
+        }
+        const home = new RemoteControlPlane(normalized, { bearer: () => this.bearer });
+        const id = (await home.admitHome()) as HomeId;
+        await accountClient.accountRegisterHome(
+            this.route,
+            { id, kind: "registered", endpoint: normalized },
+            true,
+        );
+        this.homeTransport = null;
+        return this.bootstrapHome();
+    }
+
+    async selectHome(id: HomeId): Promise<HomeBootstrapState> {
+        await accountClient.accountSelectHome(this.route, id);
+        this.homeTransport = null;
+        return this.bootstrapHome();
+    }
+
+    /** Resolve a Console workspace to its tenant-owned Cloud Home before project
+     * work mounts. The membership-gated Hub route is authoritative; a local
+     * resume hint can never select another tenant's Home. */
+    async selectTenantWorkspace(tenant: string): Promise<void> {
+        if (!this.splitHomes) return;
+        const home = await this.getCloudHome(tenant);
+        if (home.status !== "active") {
+            throw new Error("This workspace's Cloud Home is not active yet.");
+        }
+        await accountClient.accountRegisterHome(this.route, {
+            id: home.homeId,
+            kind: "cloud",
+            endpoint: home.endpoint,
+        }, true);
+        this.homeAdmission = null;
+        this.homeTransport = null;
+    }
+
+    tenantHosts(tenant: string): Promise<accountClient.TenantHost[]> {
+        return accountClient.tenantHosts(this.route, tenant);
+    }
+
+    tenantFacilities(tenant: string): Promise<accountClient.AccountFacility[]> {
+        return accountClient.tenantFacilities(this.route, tenant);
+    }
+
+    /** Read each currently accessible tenant Home through a short-lived target
+     * admission and return only a pending-review count for its workspace. This
+     * never selects/registers a Home in the account directory. */
+    async reviewNotifications(
+        tenants: readonly accountClient.AccountTenant[],
+    ): Promise<TenantReviewNotification[]> {
+        return Promise.all(tenants.map(async (tenant) => {
+            const [hosts, facilities] = await Promise.allSettled([
+                this.tenantHosts(tenant.id),
+                this.tenantFacilities(tenant.id),
+            ]);
+            let unavailableHomes = hosts.status === "rejected" ? 1 : 0;
+            const targets: Array<{ homeId: string; endpoint: string }> =
+                hosts.status === "fulfilled"
+                    ? hosts.value.map((host) => ({ homeId: host.homeId, endpoint: host.endpoint }))
+                    : [];
+            const cloudFacilityHeld = facilities.status === "fulfilled"
+                && facilities.value.some((facility) =>
+                    facility.owner === "tenant"
+                    && facility.kind === "hosted_home_node"
+                    && facility.status === "active",
+                );
+            // A missing Cloud Home is an ordinary facility projection, not an
+            // exceptional route probe. Retain the direct-read fallback only
+            // when the independently deployed facility endpoint is unavailable.
+            if (cloudFacilityHeld || facilities.status === "rejected") {
+                try {
+                    const cloudHome = await this.getCloudHome(tenant.id);
+                    if (cloudHome.status === "active") {
+                        targets.push({ homeId: cloudHome.homeId, endpoint: cloudHome.endpoint });
+                    }
+                } catch (error) {
+                    if (!String(error).includes(": 404")) unavailableHomes += 1;
+                }
+            }
+            const seen = new Set<string>();
+            const uniqueTargets = targets.filter((target) => {
+                const key = `${target.homeId}\n${target.endpoint}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
+            const counts = await Promise.all(uniqueTargets.map(async (target) => {
+                const home = new RemoteControlPlane(target.endpoint, { bearer: () => this.bearer });
+                try {
+                    if (await home.admitHome() !== target.homeId) {
+                        unavailableHomes += 1;
+                        return 0;
+                    }
+                    return await home.reviewNotificationCount();
+                } catch {
+                    unavailableHomes += 1;
+                    return 0;
+                } finally {
+                    await home.revokeHomeAdmission().catch(() => {});
+                }
+            }));
+            return { tenant: tenant.id, count: counts.reduce((total, count) => total + count, 0), unavailableHomes };
+        }));
+    }
+
+    /** Operational host evidence is browser-collected after Home admission and
+     * deliberately stays out of the Hub's tenant directory. */
+    async tenantHostOverviews(tenant: string): Promise<accountClient.TenantHostOverview[]> {
+        const hosts = await this.tenantHosts(tenant);
+        return Promise.all(hosts.map(async (host) => {
+            const home = new RemoteControlPlane(host.endpoint, { bearer: () => this.bearer });
+            try {
+                const admitted = await home.admitHome();
+                if (admitted !== host.homeId) {
+                    return { ...host, reachability: "identity-mismatch", projects: [] };
+                }
+                const workspace = await home.getWorkspace();
+                return {
+                    ...host,
+                    reachability: "online",
+                    projects: workspace.projects.map((project) => ({ id: project.id, name: project.name })),
+                };
+            } catch {
+                return { ...host, reachability: "offline", projects: [] };
+            } finally {
+                await home.revokeHomeAdmission().catch(() => {});
+            }
+        }));
+    }
+
+    /** Select one tenant-owned registered Home after freshly verifying the
+     * directory pointer. Work is then mounted through the normal adapter. */
+    async selectTenantHost(tenant: string, hostId: string): Promise<void> {
+        const host = (await this.tenantHosts(tenant)).find((item) => item.id === hostId);
+        if (!host) throw new Error("This computer is no longer registered for the workspace.");
+        const home = new RemoteControlPlane(host.endpoint, { bearer: () => this.bearer });
+        try {
+            const admitted = await home.admitHome();
+            if (admitted !== host.homeId) {
+                throw new Error("This computer no longer identifies as its registered Home.");
+            }
+        } finally {
+            await home.revokeHomeAdmission().catch(() => {});
+        }
+        await accountClient.accountRegisterHome(this.route, {
+            id: host.homeId,
+            kind: "registered",
+            endpoint: host.endpoint,
+        }, true);
+        this.homeAdmission = null;
+        this.homeTransport = null;
+    }
+
+    getCloudHome(tenant: string): Promise<accountClient.CloudHomeProjection> {
+        return accountClient.getCloudHome(this.route, tenant);
+    }
+    queueBackgroundCommand(
+        chat: EngagementId,
+        prompt: string,
+        runAt?: number,
+    ): Promise<accountClient.BackgroundCommand> {
+        return accountClient.queueBackgroundCommand(this.workbenchTransport(), chat, prompt, runAt);
+    }
+
+    listBackgroundCommands(chat: EngagementId): Promise<accountClient.BackgroundCommand[]> {
+        return accountClient.listBackgroundCommands(this.workbenchTransport(), chat);
+    }
+
+    cancelBackgroundCommand(id: string): Promise<accountClient.BackgroundCommand> {
+        return accountClient.cancelBackgroundCommand(this.workbenchTransport(), id);
+    }
+
+    async acceptHomeInvitation(invite: string): Promise<HomeBootstrapState> {
+        if (!this.splitHomes) throw new Error("Home invitations require hosted Home routing");
+        const accepted = await accountClient.acceptHomeInvitation(invite, {
+            bearer: () => this.bearer,
+        });
+        const home: AccountHome = {
+            id: accepted.homeId,
+            kind: "registered",
+            endpoint: accepted.endpoint,
+        };
+        await accountClient.accountRegisterHome(this.route, home, true);
+        await accountClient.accountPublishHomeRoute(this.route, {
+            project: accepted.project,
+            homeId: accepted.homeId,
+            endpoint: accepted.endpoint,
+        });
+        this.homeAdmission = accepted.admission;
+        this.homeTransport = Promise.resolve(
+            accountClient.acceptedHomeTransport(accepted, () => this.bearer),
+        );
+        return { kind: "connected", home };
+    }
+
+    async createHomeInvitation(
+        authority: string,
+        project: ProjectId,
+        role: "member" | "viewer" = "member",
+    ): Promise<CreatedHomeInvitation> {
+        const state = await accountClient.accountHomes(this.route);
+        const selected = state.homes.find((home) => home.id === state.selectedHome);
+        if (!selected) throw new NoSelectedHomeError("No reachable Home is selected");
+        const transport = await this.requireHomeTransport();
+        return accountClient.createHomeInvitation(transport.json, {
+            authority: authority.trim(),
+            project,
+            endpoint: selected.endpoint,
+            role,
+        });
     }
 
     getRun(scope: ScopeId): Promise<RunState> {
@@ -76,8 +461,44 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.getWorkspaceCarriage(this.workbenchTransport());
     }
 
+    getWorkspaceDeltaCarriage(
+        change: WorkspaceChange,
+    ): Promise<ProjectionCarriage<WorkspaceDelta>> {
+        return workbenchClient.getWorkspaceDeltaCarriage(
+            this.workbenchTransport(),
+            change,
+        );
+    }
+
     getTasks(): Promise<HumanTask[]> {
         return workbenchClient.getTasks(this.workbenchTransport());
+    }
+
+    getRoster(): Promise<RosterPerson[]> {
+        return workbenchClient.getRoster(this.workbenchTransport());
+    }
+
+    assignWorkItem(boundary: string, item: string, to: string | null): Promise<string | null> {
+        return workbenchClient.assignWorkItem(this.workbenchTransport(), boundary, item, to);
+    }
+
+    async softwareUpdatePolicy(): Promise<SoftwareUpdatePolicy | null> {
+        try {
+            const value = await this.workbenchTransport().json("GET", "/admin/software-policy") as {
+                software_policy?: { allowed_channels?: unknown };
+            };
+            const channels = value.software_policy?.allowed_channels;
+            return {
+                allowedChannels: Array.isArray(channels)
+                    ? channels.filter((channel): channel is string => typeof channel === "string")
+                    : [],
+            };
+        } catch (error) {
+            // The open/solo control plane intentionally has no Administration
+            // route; that is an unmanaged installation, not an updater failure.
+            if (String(error).includes(" 404")) return null;
+            throw error;
+        }
     }
 
     search(query: string): Promise<SearchHit[]> {
@@ -98,6 +519,25 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     setArchetypeConfig(id: ArchetypeId, config: string): Promise<void> {
         return workbenchClient.setArchetypeConfig(this.workbenchTransport(), id, config);
+    }
+
+    getArchetypeAbilities(id: ArchetypeId): Promise<workbenchClient.AgentAbility[]> {
+        return workbenchClient.getArchetypeAbilities(this.workbenchTransport(), id);
+    }
+
+    setArchetypeAbilities(
+        id: ArchetypeId,
+        abilities: workbenchClient.AgentAbility[],
+    ): Promise<void> {
+        return workbenchClient.setArchetypeAbilities(
+            this.workbenchTransport(),
+            id,
+            abilities,
+        );
+    }
+
+    getPlacementAbilities(id: PlacementId): Promise<workbenchClient.AgentAbility[]> {
+        return workbenchClient.getPlacementAbilities(this.workbenchTransport(), id);
     }
 
     deleteArchetype(id: ArchetypeId): Promise<void> {
@@ -136,12 +576,25 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.forkChat(this.workbenchTransport(), id);
     }
 
+    forkChatAt(id: EngagementId, entryId: number): Promise<EngagementId> {
+        return workbenchClient.forkChatAt(this.workbenchTransport(), id, entryId);
+    }
+
     revertChat(id: EngagementId): Promise<void> {
         return workbenchClient.revertChat(this.workbenchTransport(), id);
     }
 
     createProject(name: string): Promise<ProjectId> {
         return workbenchClient.createProject(this.workbenchTransport(), name);
+    }
+
+    attachTarget(
+        projectId: ProjectId,
+        name: string,
+        kind: "external-vcs" | "external-folder",
+        path: string,
+    ): Promise<WorkTargetNode> {
+        return workbenchClient.attachTarget(this.workbenchTransport(), projectId, name, kind, path);
     }
 
     renameProject(id: ProjectId, name: string): Promise<void> {
@@ -168,6 +621,78 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.placeArchetype(this.workbenchTransport(), pid, archetypeId);
     }
 
+    publishDeployment(input: PublicDeploymentInput): Promise<PublicDeploymentOutcome> {
+        return workbenchClient.publishDeployment(this.workbenchTransport(), input);
+    }
+
+    // The collection surfaces (ADR 0109 §5–§7, GATE-8): which keyrings exist, how
+    // one is minted, and the drain that ends this surface at the project's
+    // quarantine rather than in a workspace.
+    listCollectionRecipients() {
+        return workbenchClient.listCollectionRecipients(this.workbenchTransport());
+    }
+
+    ensureCollectionRecipient(recipientId: string) {
+        return workbenchClient.ensureCollectionRecipient(this.workbenchTransport(), recipientId);
+    }
+
+    drainCollections(input: {
+        deployment_id: string;
+        edge_origin: string;
+        project_id: string;
+        recipient_id: string;
+        schema_ref: string;
+        admission_scope: string;
+    }) {
+        return workbenchClient.drainCollections(this.workbenchTransport(), input);
+    }
+
+    inspectDeployment(edge: string, deployment: string): Promise<PublicDeploymentInspection> {
+        return workbenchClient.inspectDeployment(this.workbenchTransport(), edge, deployment);
+    }
+
+    controlDeployment(
+        edge: string,
+        deployment: string,
+        command: "pause" | "resume" | "revoke",
+        expectedRevision: number,
+    ): Promise<PublicDeploymentInspection["deployment"]> {
+        return workbenchClient.controlDeployment(
+            this.workbenchTransport(),
+            edge,
+            deployment,
+            command,
+            expectedRevision,
+        );
+    }
+
+    erasePublicSession(edge: string, deployment: string, session: string): Promise<void> {
+        return workbenchClient.erasePublicSession(
+            this.workbenchTransport(),
+            edge,
+            deployment,
+            session,
+        );
+    }
+
+    listPublicCredentials(edge: string): Promise<PublicCredentialMetadata[]> {
+        return workbenchClient.listPublicCredentials(this.workbenchTransport(), edge);
+    }
+
+    provisionPublicCredential(
+        input: ProvisionPublicCredentialInput,
+    ): Promise<PublicCredentialMetadata> {
+        return workbenchClient.provisionPublicCredential(this.workbenchTransport(), input);
+    }
+
+    revokePublicCredential(edge: string, credentialRef: string): Promise<void> {
+        return workbenchClient.revokePublicCredential(
+            this.workbenchTransport(),
+            edge,
+            credentialRef,
+        );
+    }
+
     removePlacement(pid: ProjectId, placementId: PlacementId): Promise<void> {
         return workbenchClient.removePlacement(this.workbenchTransport(), pid, placementId);
     }
@@ -180,8 +705,8 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.useArchetype(this.workbenchTransport(), archetypeId, title);
     }
 
-    createChatUnderPlacement(pid: ProjectId, placementId: PlacementId, title: string): Promise<EngagementId> {
-        return workbenchClient.createChatUnderPlacement(this.workbenchTransport(), pid, placementId, title);
+    createChatUnderPlacement(pid: ProjectId, placementId: PlacementId, title: string, targetId: WorkTargetId): Promise<EngagementId> {
+        return workbenchClient.createChatUnderPlacement(this.workbenchTransport(), pid, placementId, title, targetId);
     }
 
     renameChat(id: EngagementId, title: string): Promise<void> {
@@ -204,8 +729,13 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.createEngagement(this.workbenchTransport(), id);
     }
 
-    runTask(id: EngagementId, prompt: string, images: { data: string; mimeType: string }[] = []): Promise<unknown> {
-        return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images);
+    runTask(
+        id: EngagementId,
+        prompt: string,
+        images: { data: string; mimeType: string }[] = [],
+        review = false,
+    ): Promise<unknown> {
+        return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images, review);
     }
 
     stopTurn(id: EngagementId): Promise<{ stopped: boolean }> {
@@ -216,8 +746,8 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.syncFromMain(this.workbenchTransport(), id);
     }
 
-    createWorkstream(placementId: PlacementId, name: string): Promise<WorkstreamNode> {
-        return workbenchClient.createWorkstream(this.workbenchTransport(), placementId, name);
+    createWorkstream(placementId: PlacementId, name: string, targetId: WorkTargetId): Promise<WorkstreamNode> {
+        return workbenchClient.createWorkstream(this.workbenchTransport(), placementId, name, targetId);
     }
 
     listWorkstreams(placementId: PlacementId): Promise<WorkstreamNode[]> {
@@ -260,28 +790,115 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.subscribeWorkspace(this.workbenchTransport(), onChange);
     }
 
-    getReview(scope: ScopeId): Promise<ReviewState> {
-        return workbenchClient.getReview(this.workbenchTransport(), scope);
+    getResourceReview(id: EngagementId, resource: string): Promise<ReviewState> {
+        return workbenchClient.getResourceReview(this.workbenchTransport(), id, resource);
     }
 
-    reviewCommand(scope: ScopeId, command: ReviewCommand): Promise<ReviewState> {
-        return workbenchClient.reviewCommand(this.workbenchTransport(), scope, command);
+    resourceReviewCommand(
+        id: EngagementId,
+        resource: string,
+        action: ResourceReviewAction,
+    ): Promise<ReviewState> {
+        return workbenchClient.resourceReviewCommand(this.workbenchTransport(), id, resource, action);
     }
 
-    getExport(scope: ScopeId): Promise<ExportState> {
-        return workbenchClient.getExport(this.workbenchTransport(), scope);
+    getResourceExport(id: EngagementId, resource: string): Promise<ExportState> {
+        return workbenchClient.getResourceExport(this.workbenchTransport(), id, resource);
     }
 
-    exportCommand(scope: ScopeId, command: ExportCommand): Promise<ExportState> {
-        return workbenchClient.exportCommand(this.workbenchTransport(), scope, command);
+    resourceExportCommand(
+        id: EngagementId,
+        resource: string,
+        action: ResourceExportAction,
+    ): Promise<ExportState> {
+        return workbenchClient.resourceExportCommand(this.workbenchTransport(), id, resource, action);
     }
 
     getAudit(scope: ScopeId): Promise<AuditEvent[]> {
         return workbenchClient.getAudit(this.workbenchTransport(), scope);
     }
 
+    getChatGovernanceAudit(id: EngagementId): Promise<unknown[]> {
+        return workbenchClient.getChatGovernanceAudit(this.workbenchTransport(), id);
+    }
+
+    getTargetActs(target: WorkTargetId): Promise<unknown[]> {
+        return workbenchClient.getTargetActs(this.workbenchTransport(), target);
+    }
+
+    publishTarget(chat: EngagementId): Promise<void> {
+        return workbenchClient.publishTarget(this.workbenchTransport(), chat);
+    }
+
     getResources(id: EngagementId): Promise<ResourceView[]> {
         return workbenchClient.getResources(this.workbenchTransport(), id);
+    }
+
+    getResourceContent(id: EngagementId, resource: string, path?: string): Promise<string> {
+        return workbenchClient.getResourceContent(this.workbenchTransport(), id, resource, path);
+    }
+
+    getResourceAccess(id: EngagementId, resource: string): Promise<AccessPhase> {
+        return workbenchClient.getResourceAccess(this.workbenchTransport(), id, resource);
+    }
+
+    requestResourceAccess(
+        id: EngagementId,
+        resource: string,
+    ): Promise<AccessPhase> {
+        return workbenchClient.requestResourceAccess(
+            this.workbenchTransport(),
+            id,
+            resource,
+        );
+    }
+
+    approveResourceAccess(
+        id: EngagementId,
+        resource: string,
+    ): Promise<AccessPhase> {
+        return workbenchClient.approveResourceAccess(
+            this.workbenchTransport(),
+            id,
+            resource,
+        );
+    }
+
+    revokeResourceAccess(id: EngagementId, resource: string): Promise<AccessPhase> {
+        return workbenchClient.revokeResourceAccess(this.workbenchTransport(), id, resource);
+    }
+
+    proposeResourceReview(
+        id: EngagementId,
+        resource: string,
+    ): Promise<{ scope: string; state: ReviewState }> {
+        return workbenchClient.proposeResourceReview(this.workbenchTransport(), id, resource);
+    }
+
+    proposeResourceExport(
+        id: EngagementId,
+        resource: string,
+    ): Promise<{ scope: string; state: ExportState }> {
+        return workbenchClient.proposeResourceExport(this.workbenchTransport(), id, resource);
+    }
+
+    exportResourceToDisk(
+        id: EngagementId,
+        resource: string,
+        dest: string,
+        path?: string,
+    ): Promise<{ exported: string[]; dest: string }> {
+        return workbenchClient.exportResourceToDisk(
+            this.workbenchTransport(),
+            id,
+            resource,
+            dest,
+            path,
+        );
+    }
+
+    tombstoneResource(id: EngagementId, resource: string): Promise<void> {
+        return workbenchClient.tombstoneResource(this.workbenchTransport(), id, resource);
     }
 
     getTranscript(id: EngagementId): Promise<StreamEvent[]> {
@@ -294,6 +911,32 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     getFile(id: EngagementId, path: string): Promise<string> {
         return workbenchClient.getFile(this.workbenchTransport(), id, path);
+    }
+
+    // The review surface's three reads/commands (ADR 0110 §7). Project-scoped, not
+    // engagement-scoped: quarantine belongs to a project and reaches no chat's
+    // worktree, which is the whole protection (ADR 0110 §1).
+    listQuarantine(project: string) {
+        return workbenchClient.listQuarantine(this.workbenchTransport(), project);
+    }
+
+    readQuarantinedItem(project: string, item: string): Promise<string> {
+        return workbenchClient.readQuarantinedItem(this.workbenchTransport(), project, item);
+    }
+
+    reviewQuarantinedItem(
+        project: string,
+        item: string,
+        chat: EngagementId,
+        verdict: "keep" | "flag",
+    ): Promise<{ workspacePath: string | null }> {
+        return workbenchClient.reviewQuarantinedItem(
+            this.workbenchTransport(),
+            project,
+            item,
+            chat,
+            verdict,
+        );
     }
 
     getFileWithCut(
@@ -361,10 +1004,6 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.pairingStatus(this.workbenchTransport(), boundaryId);
     }
 
-    embedMyChats(): Promise<{ chat: string; title: string }[]> {
-        return embedClient.embedMyChats(this.routeJson());
-    }
-
     mintPairingTicket(): Promise<federationClient.PairingTicket> {
         return federationClient.mintPairingTicket(this.routeJson());
     }
@@ -375,6 +1014,10 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     listPeers(): Promise<federationClient.FederationPeer[]> {
         return federationClient.listPeers(this.routeJson());
+    }
+
+    revokePeer(authority: string): Promise<void> {
+        return federationClient.revokePeer(this.routeJson(), authority);
     }
 
     cross(peer: string, handle: string, correlation: string): Promise<boolean> {
@@ -391,18 +1034,6 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     federationInbox(): Promise<federationClient.FederatedFact[]> {
         return federationClient.federationInbox(this.routeJson());
-    }
-
-    handoffOffer(project: ProjectId): Promise<federationClient.HandoffStatus> {
-        return federationClient.handoffOffer(this.routeJson(), project);
-    }
-
-    handoffSync(project: ProjectId): Promise<federationClient.HandoffStatus> {
-        return federationClient.handoffSync(this.routeJson(), project);
-    }
-
-    handoffCommit(project: ProjectId): Promise<federationClient.HandoffStatus> {
-        return federationClient.handoffCommit(this.routeJson(), project);
     }
 
     handoffAbort(project: ProjectId): Promise<federationClient.HandoffStatus> {
@@ -423,8 +1054,17 @@ export class WorkbenchControlPlane implements ControlPlane {
         archetype: string,
         dataHandle: string,
         prompt: string,
+        targetChat?: string,
     ): Promise<federationClient.PlacedRun> {
-        return federationClient.placeRun(this.routeJson(), peer, project, archetype, dataHandle, prompt);
+        return federationClient.placeRun(
+            this.routeJson(),
+            peer,
+            project,
+            archetype,
+            dataHandle,
+            prompt,
+            targetChat,
+        );
     }
 
     runQueue(): Promise<federationClient.QueuedRun[]> {
@@ -509,8 +1149,32 @@ export class WorkbenchControlPlane implements ControlPlane {
         return accountClient.accountDetachFacility(this.routeJson(), id);
     }
 
+    accountPublishLibrarySync(): Promise<void> {
+        return accountClient.accountPublishLibrarySync(this.routeJson());
+    }
+
+    accountPullLibrarySync(): Promise<accountClient.LibrarySyncPullResult> {
+        return accountClient.accountPullLibrarySync(this.routeJson());
+    }
+
     accountTenants(): Promise<accountClient.AccountTenant[]> {
         return accountClient.accountTenants(this.routeJson());
+    }
+
+    accountSignInMethod(): Promise<accountClient.AccountSignInMethod> {
+        return accountClient.accountSignInMethod(this.routeJson());
+    }
+
+    accountInvitations(): Promise<accountClient.AccountInvitation[]> {
+        return accountClient.accountInvitations(this.routeJson());
+    }
+
+    acceptAccountInvitation(tenantId: string): Promise<accountClient.AccountTenant> {
+        return accountClient.acceptAccountInvitation(this.routeJson(), tenantId);
+    }
+
+    createOrganization(displayName: string): Promise<accountClient.AccountTenant> {
+        return accountClient.createOrganization(this.routeJson(), displayName);
     }
 
     accountDevices(): Promise<accountClient.AccountDevice[]> {
@@ -523,6 +1187,32 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     enrollHost(): Promise<accountClient.EnrollmentTicket> {
         return accountClient.enrollHost(this.routeJson());
+    }
+
+    mintMachineControllerInvitation(
+        endpoint: string,
+    ): Promise<accountClient.MachineControllerInvitation> {
+        return accountClient.mintMachineControllerInvitation(this.routeJson(), endpoint);
+    }
+
+    listMachineControllerRequests(): Promise<accountClient.MachineControllerRequest[]> {
+        return accountClient.listMachineControllerRequests(this.routeJson());
+    }
+
+    approveMachineController(requestId: string): Promise<void> {
+        return accountClient.approveMachineController(this.routeJson(), requestId);
+    }
+
+    rejectMachineController(requestId: string): Promise<void> {
+        return accountClient.rejectMachineController(this.routeJson(), requestId);
+    }
+
+    listMachineControllers(): Promise<accountClient.MachineController[]> {
+        return accountClient.listMachineControllers(this.routeJson());
+    }
+
+    revokeMachineController(controllerId: string): Promise<void> {
+        return accountClient.revokeMachineController(this.routeJson(), controllerId);
     }
 
     enrollHostStatus(session: string): Promise<accountClient.EnrollmentStatus> {
@@ -550,42 +1240,74 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     accountCredentials(): Promise<accountClient.LinkedProvider[]> {
-        return accountClient.accountCredentials(this.routeJson());
+        return this.runtimeAccountJson().then((json) => accountClient.accountCredentials(json));
     }
 
-    accountLinkCredential(provider: string, token: string): Promise<void> {
-        return accountClient.accountLinkCredential(this.routeJson(), provider, token);
+    accountLinkCredential(provider: string, token: string, baseUrl?: string): Promise<void> {
+        return this.runtimeAccountJson().then((json) =>
+            accountClient.accountLinkCredential(json, provider, token, baseUrl),
+        );
     }
 
     accountUnlinkCredential(provider: string): Promise<void> {
-        return accountClient.accountUnlinkCredential(this.routeJson(), provider);
+        return this.runtimeAccountJson().then((json) =>
+            accountClient.accountUnlinkCredential(json, provider),
+        );
+    }
+
+    accountManagedInference(): Promise<accountClient.ManagedInferenceBilling> {
+        return accountClient.accountManagedInference(this.routeJson());
+    }
+
+    accountSetManagedInference(plan: accountClient.ManagedInferencePlan): Promise<void> {
+        return accountClient.accountSetManagedInference(this.routeJson(), plan).then(async () => {
+            if (this.splitHomes) {
+                const json = await this.runtimeAccountJson();
+                await accountClient.accountSetManagedInference(json, plan);
+            }
+        });
     }
 
     projectCredentials(project: string): Promise<accountClient.LinkedProvider[]> {
-        return accountClient.projectCredentials(this.routeJson(), project);
+        return this.runtimeAccountJson().then((json) =>
+            accountClient.projectCredentials(json, project),
+        );
     }
 
-    linkProjectCredential(project: string, provider: string, token: string): Promise<void> {
-        return accountClient.linkProjectCredential(this.routeJson(), project, provider, token);
+    linkProjectCredential(
+        project: string,
+        provider: string,
+        token: string,
+        baseUrl?: string,
+    ): Promise<void> {
+        return this.runtimeAccountJson().then((json) =>
+            accountClient.linkProjectCredential(json, project, provider, token, baseUrl),
+        );
     }
 
     unlinkProjectCredential(project: string, provider: string): Promise<void> {
-        return accountClient.unlinkProjectCredential(this.routeJson(), project, provider);
+        return this.runtimeAccountJson().then((json) =>
+            accountClient.unlinkProjectCredential(json, project, provider),
+        );
     }
 
-    codexStatus(): Promise<{ linked: boolean; expires: number | null; expired: boolean }> {
-        return accountClient.codexStatus(this.routeJson());
+    codexStatus(): Promise<accountClient.CodexStatus> {
+        return this.runtimeAccountJson().then((json) => accountClient.codexStatus(json));
     }
 
     onboardingStatus(): Promise<{ credentialRequired: boolean }> {
-        return accountClient.onboardingStatus(this.routeJson());
+        return this.runtimeAccountJson().then((json) => accountClient.onboardingStatus(json));
     }
 
     defaultModel(): Promise<{ provider: string; model: string | null }> {
-        return accountClient.defaultModel(this.routeJson());
+        return this.runtimeAccountJson().then((json) => accountClient.defaultModel(json));
     }
 
-    codexLoginStart(): Promise<{ url: string }> {
-        return accountClient.codexLoginStart(this.routeJson());
+    codexLoginStart(): Promise<accountClient.CodexLoginStart> {
+        return this.runtimeAccountJson().then((json) => accountClient.codexLoginStart(json));
+    }
+
+    codexLoginCancel(): Promise<void> {
+        return this.runtimeAccountJson().then((json) => accountClient.codexLoginCancel(json));
     }
 }

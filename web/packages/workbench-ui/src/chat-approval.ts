@@ -2,7 +2,7 @@
  * The mobile **inline merge/review approval flow** (`mobile-client.md`, MOB-031):
  * the pure state machine the {@link ChatApprovalCard} island reduces over when a
  * turn surfaces a *result that needs approval* in the chat transcript. On the
- * desktop this is the {@link ReviewShelf} (conjunctive consent → clear → release);
+ * desktop this is the output catalog (conjunctive consent → clear → release);
  * on a phone the same review lifecycle rides *inline in the chat stop*, as a card
  * threaded between the turns that produced it — the carousel has no second shelf.
  *

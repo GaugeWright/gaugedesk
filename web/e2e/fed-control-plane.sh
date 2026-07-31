@@ -28,7 +28,7 @@ export GAUGEWRIGHT_TEST_RESET=1
 # `/federation/*` surface (e.g. `POST /federation/pairing-ticket`) is reachable here.
 export GAUGEWRIGHT_FEDERATION=1
 export GAUGEWRIGHT_ADDR="127.0.0.1:${PORT}"
-export GAUGEWRIGHT_BROKER_ADDR="${GAUGEWRIGHT_BROKER_ADDR:-127.0.0.1:7900}"
+export GAUGEWRIGHT_RELAY_ENDPOINT="${GAUGEWRIGHT_RELAY_ENDPOINT:-ws://127.0.0.1:7900}"
 # Each control plane is its OWN machine: pin its data root to its isolated state dir.
 # Without this, `control_plane_root()` falls through to the shared OS app-data dir, so
 # alice and bob would share one `instances/` tree — a relocation then tries to

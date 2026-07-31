@@ -21,7 +21,7 @@ function recorder(reply: unknown = {}) {
 const TICKET: EnrollmentTicket = {
     session: "sess-1",
     account_root: "04root",
-    broker: "127.0.0.1:7900",
+    broker: "wss://relay.gaugewright.com",
 };
 
 describe("device-enrollment handshake client (ACCT-1)", () => {

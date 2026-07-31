@@ -29,6 +29,20 @@ use whipplescript_store::vcs::{
     VcsWriteOutcome,
 };
 
+mod external;
+pub use external::{ExternalTargetKind, ExternalWorkspace};
+
+/// Host-owned per-chat materializations are never target history. The runtime
+/// mount contains the selected archetype discipline; it is recreated from the
+/// immutable archetype version and layered read-only by the sandbox.
+const CHAT_LOCAL_PATHS: &[&str] = &[".gaugedesk-runtime"];
+
+fn is_chat_local_path(path: &str) -> bool {
+    CHAT_LOCAL_PATHS
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+}
+
 /// Same-provider export envelope: raw snapshots of the two store files.
 /// Full fidelity (every branch, cut, op, and blob travels), version-stamped.
 pub const EXPORT_FORMAT: &str = "whipplescript-vcs-export-v1";
@@ -40,12 +54,12 @@ pub struct WorkspaceError {
 }
 
 impl WorkspaceError {
-    fn io(error: std::io::Error) -> Self {
+    pub(crate) fn io(error: std::io::Error) -> Self {
         Self {
             message: error.to_string(),
         }
     }
-    fn msg(message: impl Into<String>) -> Self {
+    pub(crate) fn msg(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -143,7 +157,7 @@ pub struct WorkspaceExport(pub Vec<u8>);
 
 /// Opaque same-provider lineage source. It contains only the local native store
 /// location; callers cannot derive workspace semantics from it.
-pub struct PeerSource(PathBuf);
+pub struct PeerSource(pub(crate) PathBuf);
 
 // ---------------------------------------------------------------------------
 // ids and time: cut ids are caller-minted in whip's vcs; recorded_at is an
@@ -215,18 +229,18 @@ impl Instance {
         &self.repo
     }
 
-    /// Open the store, ensuring mainline exists. A legacy instance (the
-    /// pre-vcs mirror store, or the older git-based layout) is migrated
-    /// once, by RESEED: the materialized trees on disk are the truth and
-    /// become the initial cuts; old history stays behind in the renamed
-    /// legacy file.
+    /// Open the native store. Pre-target/legacy layouts are rejected: this is
+    /// a pre-user hard cutover and silently reseeding them would manufacture a
+    /// second authority for files whose ownership is unknown.
     fn store(&self) -> Result<NativeWorkspaceVcs> {
         let fresh = !self.store_root.join("branches.sqlite").exists();
         if fresh
             && (self.store_root.join("workspace.sqlite3").exists()
                 || self.repo.join(".git").exists())
         {
-            self.migrate_legacy()?;
+            return Err(WorkspaceError::msg(
+                "pre-target workspace layout is unsupported; reset this pre-release state root",
+            ));
         }
         let mut vcs = NativeWorkspaceVcs::open(
             self.store_root.join("branches.sqlite"),
@@ -236,58 +250,8 @@ impl Instance {
         Ok(vcs)
     }
 
-    /// One-time reseed of a legacy instance: line names and upstream
-    /// targets are recovered from the old store when readable; content
-    /// comes from the checked-out trees (repo + worktrees). Git metadata
-    /// is deliberately dropped, never imported.
-    fn migrate_legacy(&self) -> Result<()> {
-        let upstream_of = read_legacy_lines(&self.store_root.join("workspace.sqlite3"));
-        remove_git_metadata(&self.repo)?;
-        let mut vcs = NativeWorkspaceVcs::open(
-            self.store_root.join("branches.sqlite"),
-            self.store_root.join("content.sqlite"),
-        )?;
-        let at = now_at();
-        vcs.init(&at)?;
-        if self.repo.is_dir() {
-            sync_in(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
-        }
-        // Workstream lines first: engagements may target them.
-        for line in upstream_of.keys() {
-            if line.starts_with("workstream/") {
-                let _ = vcs.create_branch(line, None, MAINLINE_BRANCH_ID, &now_at())?;
-            }
-        }
-        if self.worktrees.is_dir() {
-            for entry in std::fs::read_dir(&self.worktrees).map_err(WorkspaceError::io)? {
-                let entry = entry.map_err(WorkspaceError::io)?;
-                if !entry.file_type().map_err(WorkspaceError::io)?.is_dir() {
-                    continue;
-                }
-                let id = entry.file_name().to_string_lossy().to_string();
-                let line = engagement_line(&id);
-                let path = entry.path();
-                remove_git_metadata(&path)?;
-                let target = upstream_of
-                    .get(&line)
-                    .cloned()
-                    .unwrap_or_else(|| MAINLINE_BRANCH_ID.to_owned());
-                let created = vcs.create_branch(&line, None, &target, &now_at())?;
-                if matches!(created, CreateBranchOutcome::ParentMissing) {
-                    let _ = vcs.create_branch(&line, None, MAINLINE_BRANCH_ID, &now_at())?;
-                }
-                sync_in(&mut vcs, &self.store_root, &line, &path)?;
-            }
-        }
-        let legacy = self.store_root.join("workspace.sqlite3");
-        if legacy.exists() {
-            let _ = std::fs::rename(&legacy, self.store_root.join("workspace.sqlite3.pre-vcs"));
-        }
-        write_substrate_stamp(&self.store_root)
-    }
-
     pub fn export(&self) -> Result<WorkspaceExport> {
-        let _ = self.store()?; // ensure the store exists (and any migration ran)
+        let _ = self.store()?;
         let branches = snapshot_sqlite(&self.store_root.join("branches.sqlite"))?;
         let content = snapshot_sqlite(&self.store_root.join("content.sqlite"))?;
         let mut bytes = Vec::with_capacity(16 + 16 + branches.len() + content.len());
@@ -512,6 +476,36 @@ impl Instance {
         })
     }
 
+    /// Create an engagement with WhippleScript lineage pinned to an exact
+    /// durable cut of another engagement branch.
+    pub fn fork_engagement_at(
+        &self,
+        id: &str,
+        source_branch: &str,
+        target: &str,
+        cut_id: &str,
+    ) -> Result<Engagement> {
+        let mut vcs = self.store()?;
+        let branch = engagement_line(id);
+        match vcs.fork_with_lineage(&branch, None, source_branch, Some(cut_id), &now_at())? {
+            CreateBranchOutcome::Created(_) | CreateBranchOutcome::Existing(_) => {}
+            other => {
+                return Err(WorkspaceError::msg(format!(
+                    "could not fork engagement line `{branch}` at `{cut_id}`: {other:?}"
+                )))
+            }
+        }
+        let path = self.worktrees.join(id);
+        sync_out(&mut vcs, &self.store_root, &branch, &path)?;
+        Ok(Engagement {
+            store_root: self.store_root.clone(),
+            repo: self.repo.clone(),
+            path,
+            branch,
+            target: target.into(),
+        })
+    }
+
     pub fn remove_engagement(&self, id: &str) -> Result<()> {
         let mut vcs = self.store()?;
         let _ = vcs.discard_branch(&engagement_line(id), &now_at())?;
@@ -597,6 +591,7 @@ impl Instance {
     }
 }
 
+#[derive(Clone)]
 pub struct Engagement {
     store_root: PathBuf,
     repo: PathBuf,
@@ -650,9 +645,89 @@ impl Engagement {
         }
     }
 
+    /// Move a settled chat to another shared line in the same workspace root.
+    ///
+    /// This is deliberately stronger than [`set_target`]. A re-home is refused while
+    /// the chat differs from its current target, then the engagement branch is restored
+    /// to the destination cut and its worktree is rematerialized. The transcript lives
+    /// outside this provider and therefore survives; file history from the old line does
+    /// not become a candidate against the new line.
+    pub fn rehome(&mut self, target: impl Into<String>) -> Result<()> {
+        let target = target.into();
+        if target == self.target {
+            return Ok(());
+        }
+
+        let mut vcs = self.store()?;
+        self.import_sides(&mut vcs)?;
+        let pending = vcs
+            .diff_against(&self.branch, Some(&self.target), 1)?
+            .ok_or_else(|| WorkspaceError::msg(format!("no branch `{}`", self.branch)))?;
+        if pending.iter().any(|entry| !is_chat_local_path(&entry.path)) {
+            return Err(WorkspaceError::msg(
+                "chat has unsettled workspace changes; settle or discard them before moving",
+            ));
+        }
+        let local_overlays = snapshot_local_files(&self.path)?;
+
+        let destination = vcs
+            .get_branch(&target)?
+            .ok_or_else(|| WorkspaceError::msg(format!("no target line `{target}`")))?;
+        let previous = self.target.clone();
+        match vcs.retarget(&self.branch, &target, &now_at())? {
+            RetargetOutcome::Retargeted(_) => {}
+            other => {
+                return Err(WorkspaceError::msg(format!(
+                    "could not retarget `{}` onto `{target}`: {other:?}",
+                    self.branch
+                )))
+            }
+        }
+
+        let restored = match destination.head_cut_id {
+            Some(head_cut) => {
+                match vcs.restore(&self.branch, &head_cut, &fresh_cut_id("rehome"), &now_at())? {
+                    RestoreOutcome::Restored { .. } | RestoreOutcome::AlreadyThere => Ok(()),
+                    other => Err(WorkspaceError::msg(format!(
+                        "rehome restore refused: {other:?}"
+                    ))),
+                }
+            }
+            None => {
+                clear_worktree(&self.path)?;
+                sync_in(&mut vcs, &self.store_root, &self.branch, &self.path).map(|_| ())
+            }
+        };
+        if let Err(error) = restored {
+            let _ = vcs.retarget(&self.branch, &previous, &now_at());
+            return Err(error);
+        }
+
+        sync_out(&mut vcs, &self.store_root, &self.branch, &self.path)?;
+        for (path, body) in local_overlays {
+            self.write_file(&path, &body)?;
+        }
+        self.target = target;
+        Ok(())
+    }
+
     pub fn commit_turn(&self, _message: &str) -> Result<Option<RevisionId>> {
         let mut vcs = self.store()?;
-        Ok(sync_in(&mut vcs, &self.store_root, &self.branch, &self.path)?.map(RevisionId))
+        if let Some(cut) = sync_in(&mut vcs, &self.store_root, &self.branch, &self.path)? {
+            return Ok(Some(RevisionId(cut)));
+        }
+        let cut_id = fresh_cut_id("turn-boundary");
+        let cut = vcs
+            .cut_at_quiescence(&self.branch, &cut_id, &now_at())?
+            .ok_or_else(|| WorkspaceError::msg(format!("no branch `{}`", self.branch)))?;
+        Ok(Some(RevisionId(cut.cut_id)))
+    }
+
+    /// Ensure the current worktree state has a durable address even before a
+    /// turn starts. This is the pre-user half of point-fork semantics.
+    pub fn boundary_cut(&self) -> Result<RevisionId> {
+        self.commit_turn("turn boundary")?
+            .ok_or_else(|| WorkspaceError::msg("turn boundary did not produce a cut"))
     }
 
     pub fn diff_against_main(&self) -> Result<String> {
@@ -838,7 +913,8 @@ impl Engagement {
                 // body (an empty base also matches a cut without the
                 // path — the "file didn't exist yet" base).
                 let id = vcs.content_store().put(body)?;
-                vcs.list_cuts(&self.branch, 200)?
+                let matching_cut = vcs
+                    .list_cuts(&self.branch, 200)?
                     .into_iter()
                     .find(|cut| {
                         vcs.cut_manifest(&cut.cut_id)
@@ -849,7 +925,20 @@ impl Engagement {
                                 None => body.is_empty(),
                             })
                     })
-                    .map(|cut| cut.cut_id)
+                    .map(|cut| cut.cut_id);
+                if matching_cut.is_some() {
+                    matching_cut
+                } else if self.read_file(relative).ok().as_deref() == Some(body) {
+                    // A freshly materialized target basis can predate the
+                    // branch's bounded content lookup. `sync_in` above made the
+                    // exact bytes the current addressable head, so an unchanged
+                    // editor base safely names that head without weakening the
+                    // stale-base comparison.
+                    vcs.get_branch(&self.branch)?
+                        .and_then(|branch| branch.head_cut_id)
+                } else {
+                    None
+                }
             }
         };
         let Some(base_cut) = base_cut else {
@@ -1016,11 +1105,11 @@ fn sync_in(
     )?;
     let manifest = vcs.manifest(branch)?.unwrap_or_default();
     let mut changed = import.changed;
-    changed.retain(|path, hash| manifest.get(path) != Some(hash));
+    changed.retain(|path, hash| !is_chat_local_path(path) && manifest.get(path) != Some(hash));
     let removed: Vec<String> = import
         .removed
         .into_iter()
-        .filter(|path| manifest.contains_key(path))
+        .filter(|path| !is_chat_local_path(path) && manifest.contains_key(path))
         .collect();
     if changed.is_empty() && removed.is_empty() {
         persist_scratch(store_root, branch, &import.cache)?;
@@ -1038,8 +1127,14 @@ fn sync_in(
     }
 }
 
-/// Project the branch head into its worktree: prune files the manifest no
+/// Project the branch head into its worktree: clear files the manifest no
 /// longer names, materialize the rest, persist the fresh stat cache.
+///
+/// A file the manifest does not name is not necessarily settled history — it
+/// may be un-synced user or agent work (a file dropped into the worktree while
+/// the host was down, or a failed import). So clearing never destroys bytes
+/// (DR-0054 Phase A): unmanifested files move into the chat-local quarantine,
+/// which cuts, diffs, and future syncs all ignore, and stay recoverable there.
 fn sync_out(
     vcs: &mut NativeWorkspaceVcs,
     store_root: &Path,
@@ -1052,12 +1147,30 @@ fn sync_out(
     std::fs::create_dir_all(root).map_err(WorkspaceError::io)?;
     let mut on_disk = Vec::new();
     walk_tree(root, root, &mut on_disk).map_err(WorkspaceError::io)?;
-    for entry in on_disk.iter().filter(|entry| !entry.is_dir) {
-        if !manifest.contains_key(&entry.path) {
-            let _ = std::fs::remove_file(root.join(&entry.path));
+    let unmanifested: Vec<&FileEntry> = on_disk
+        .iter()
+        .filter(|entry| {
+            !entry.is_dir && !manifest.contains_key(&entry.path) && !is_chat_local_path(&entry.path)
+        })
+        .collect();
+    if !unmanifested.is_empty() {
+        let quarantine = root
+            .join(".gaugedesk-runtime")
+            .join("quarantine")
+            .join(now_nanos().to_string());
+        for entry in unmanifested {
+            let destination = quarantine.join(&entry.path);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).map_err(WorkspaceError::io)?;
+            }
+            std::fs::rename(root.join(&entry.path), &destination).map_err(WorkspaceError::io)?;
         }
     }
-    for entry in on_disk.iter().rev().filter(|entry| entry.is_dir) {
+    for entry in on_disk
+        .iter()
+        .rev()
+        .filter(|entry| entry.is_dir && !is_chat_local_path(&entry.path))
+    {
         // Bottom-up best-effort prune; non-empty directories refuse.
         let _ = std::fs::remove_dir(root.join(&entry.path));
     }
@@ -1082,6 +1195,19 @@ fn clear_worktree(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn snapshot_local_files(root: &Path) -> Result<Vec<(String, String)>> {
+    let mut tree = Vec::new();
+    walk_tree(root, root, &mut tree).map_err(WorkspaceError::io)?;
+    tree.into_iter()
+        .filter(|entry| !entry.is_dir && is_chat_local_path(&entry.path))
+        .map(|entry| {
+            std::fs::read_to_string(root.join(&entry.path))
+                .map(|body| (entry.path, body))
+                .map_err(WorkspaceError::io)
+        })
+        .collect()
+}
+
 /// Unified-diff text for the reviewer surface: whip's own rendering per
 /// entry, under the `diff --git` segment header both the engine's no-op
 /// rule and the web client's changed-files parser key on.
@@ -1098,47 +1224,6 @@ fn render_diff(entries: &[DiffEntry]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy migration + export plumbing.
-
-/// Line upstream targets from the pre-vcs mirror store, best-effort: a
-/// missing or unreadable legacy file degrades to everything targeting
-/// mainline, never to a failed migration.
-fn read_legacy_lines(path: &Path) -> BTreeMap<String, String> {
-    let mut result = BTreeMap::new();
-    if !path.exists() {
-        return result;
-    }
-    let Ok(connection) = rusqlite::Connection::open(path) else {
-        return result;
-    };
-    let Ok(mut statement) = connection.prepare("SELECT name, upstream FROM workspace_lines") else {
-        return result;
-    };
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    });
-    if let Ok(rows) = rows {
-        for row in rows.flatten() {
-            let (name, upstream) = row;
-            result.insert(
-                name,
-                upstream.unwrap_or_else(|| MAINLINE_BRANCH_ID.to_owned()),
-            );
-        }
-    }
-    result
-}
-
-fn remove_git_metadata(root: &Path) -> Result<()> {
-    let git = root.join(".git");
-    if git.is_dir() {
-        std::fs::remove_dir_all(&git).map_err(WorkspaceError::io)?;
-    } else if git.is_file() {
-        std::fs::remove_file(&git).map_err(WorkspaceError::io)?;
-    }
-    Ok(())
-}
-
 /// A consistent point-in-time copy of one sqlite file (WAL-safe: VACUUM
 /// INTO serializes through the connection, not the filesystem).
 fn snapshot_sqlite(path: &Path) -> Result<Vec<u8>> {
@@ -1194,6 +1279,13 @@ pub trait Workspace: Send {
     fn workstream_id_of(&self, target: &str) -> Option<String>;
     fn create_engagement(&self, id: &str) -> Result<Box<dyn ChatWorkspace>>;
     fn create_engagement_on(&self, id: &str, target: &str) -> Result<Box<dyn ChatWorkspace>>;
+    fn fork_engagement_at(
+        &self,
+        id: &str,
+        source_branch: &str,
+        target: &str,
+        cut_id: &str,
+    ) -> Result<Box<dyn ChatWorkspace>>;
     fn remove_engagement(&self, id: &str) -> Result<()>;
     fn purge_unreachable_objects(&self) -> Result<()>;
     fn reconcile_engagements(&self) -> Result<Vec<(String, Box<dyn ChatWorkspace>)>>;
@@ -1207,11 +1299,29 @@ pub trait Workspace: Send {
 }
 
 pub trait ChatWorkspace: Send {
+    /// An owned copy of this handle.
+    ///
+    /// A chat workspace is a *locator* — roots, a path, a branch, a target — and
+    /// every operation opens its backing store on demand. So a copy is cheap, and
+    /// it is what lets a long agent turn hold its workspace without holding the
+    /// workbench lock that owns the engagement map for the turn's whole duration.
+    fn boxed_clone(&self) -> Box<dyn ChatWorkspace>;
     fn path(&self) -> &Path;
     fn branch(&self) -> &str;
     fn target(&self) -> &str;
     fn set_target(&mut self, target: &str) -> Result<()>;
+    fn rehome(&mut self, target: &str) -> Result<()>;
     fn commit_turn(&self, message: &str) -> Result<Option<RevisionId>>;
+    fn boundary_cut(&self) -> Result<RevisionId>;
+    /// Exact revision/fingerprint currently held by the target authority.
+    fn standing_revision(&self) -> Result<RevisionId>;
+    /// Adapter-specific publication (for example `git push`). It is never
+    /// implied by apply and must be invoked through a separately admitted act.
+    fn publish(&self) -> Result<RevisionId> {
+        Err(WorkspaceError::msg(
+            "this workspace adapter has no publisher",
+        ))
+    }
     fn diff_against_main(&self) -> Result<String>;
     fn revert_to_main(&self) -> Result<()>;
     fn sync_from_main(&self) -> Result<MergeOutcome>;
@@ -1254,6 +1364,21 @@ impl Workspace for Instance {
     fn create_engagement_on(&self, id: &str, target: &str) -> Result<Box<dyn ChatWorkspace>> {
         Ok(Box::new(Self::create_engagement_on(self, id, target)?))
     }
+    fn fork_engagement_at(
+        &self,
+        id: &str,
+        source_branch: &str,
+        target: &str,
+        cut_id: &str,
+    ) -> Result<Box<dyn ChatWorkspace>> {
+        Ok(Box::new(Self::fork_engagement_at(
+            self,
+            id,
+            source_branch,
+            target,
+            cut_id,
+        )?))
+    }
     fn remove_engagement(&self, id: &str) -> Result<()> {
         Self::remove_engagement(self, id)
     }
@@ -1290,6 +1415,9 @@ impl Workspace for Instance {
 }
 
 impl ChatWorkspace for Engagement {
+    fn boxed_clone(&self) -> Box<dyn ChatWorkspace> {
+        Box::new(self.clone())
+    }
     fn path(&self) -> &Path {
         self.path()
     }
@@ -1302,8 +1430,17 @@ impl ChatWorkspace for Engagement {
     fn set_target(&mut self, target: &str) -> Result<()> {
         self.set_target(target)
     }
+    fn rehome(&mut self, target: &str) -> Result<()> {
+        self.rehome(target)
+    }
     fn commit_turn(&self, message: &str) -> Result<Option<RevisionId>> {
         self.commit_turn(message)
+    }
+    fn boundary_cut(&self) -> Result<RevisionId> {
+        self.boundary_cut()
+    }
+    fn standing_revision(&self) -> Result<RevisionId> {
+        self.boundary_cut()
     }
     fn diff_against_main(&self) -> Result<String> {
         self.diff_against_main()
@@ -1742,7 +1879,7 @@ mod tests {
     fn no_op_cut_and_file_facets_remain_compatible() {
         let (_directory, instance) = instance();
         let chat = instance.create_engagement("chat").expect("chat");
-        assert_eq!(chat.commit_turn("nothing").expect("noop"), None);
+        assert!(chat.commit_turn("nothing").expect("noop").is_some());
         chat.ingest_upload(&[("../safe.txt".into(), "safe".into())])
             .expect("upload");
         assert_eq!(chat.read_file("safe.txt").expect("read"), "safe");
@@ -1761,6 +1898,22 @@ mod tests {
     }
 
     #[test]
+    fn engagement_fork_pins_an_earlier_durable_cut() {
+        let (_directory, instance) = instance();
+        let chat = instance.create_engagement("source").expect("source");
+        chat.write_file("answer.txt", "one").expect("write one");
+        let first = chat.commit_turn("one").expect("first").expect("cut");
+        chat.write_file("answer.txt", "two").expect("write two");
+        chat.commit_turn("two").expect("second").expect("cut");
+
+        let fork = instance
+            .fork_engagement_at("fork", chat.branch(), chat.target(), &first.0)
+            .expect("fork at first");
+        assert_eq!(fork.read_file("answer.txt").expect("fork body"), "one");
+        assert_eq!(chat.read_file("answer.txt").expect("source body"), "two");
+    }
+
+    #[test]
     fn workstream_member_promotion_materializes_into_a_sibling() {
         let (_directory, instance) = instance();
         let mut a = instance.create_engagement("a").expect("a");
@@ -1776,6 +1929,85 @@ mod tests {
         assert_eq!(a.merge_into_main().expect("promote"), MergeOutcome::Clean);
         assert_eq!(b.sync_from_main().expect("sync"), MergeOutcome::Clean);
         assert_eq!(b.read_file("shared.txt").expect("materialized"), "from a");
+    }
+
+    #[test]
+    fn settled_rehome_materializes_destination_without_carrying_old_line() {
+        let (_directory, instance) = instance();
+        instance.create_workstream("one").expect("one");
+        instance.create_workstream("two").expect("two");
+
+        let one = instance
+            .create_engagement_on("one-writer", "workstream/one/main")
+            .expect("one writer");
+        one.write_file("one.txt", "only one").expect("write one");
+        one.commit_turn("one").expect("cut one");
+        assert_eq!(
+            one.merge_into_main().expect("land one"),
+            MergeOutcome::Clean
+        );
+
+        let two = instance
+            .create_engagement_on("two-writer", "workstream/two/main")
+            .expect("two writer");
+        two.write_file("two.txt", "only two").expect("write two");
+        two.commit_turn("two").expect("cut two");
+        assert_eq!(
+            two.merge_into_main().expect("land two"),
+            MergeOutcome::Clean
+        );
+
+        let mut chat = instance
+            .create_engagement_on("moving", "workstream/one/main")
+            .expect("moving");
+        assert_eq!(chat.read_file("one.txt").expect("old line"), "only one");
+        chat.rehome("workstream/two/main").expect("rehome");
+        assert_eq!(chat.target(), "workstream/two/main");
+        assert_eq!(chat.read_file("two.txt").expect("new line"), "only two");
+        assert!(
+            chat.read_file("one.txt").is_err(),
+            "old line must not travel"
+        );
+        assert!(chat.diff_against_main().expect("settled diff").is_empty());
+    }
+
+    #[test]
+    fn rehome_preserves_the_ephemeral_discipline_mount() {
+        let (_directory, instance) = instance();
+        instance.create_workstream("team").expect("team");
+        let mut chat = instance.create_engagement("moving").expect("chat");
+        chat.write_file(".gaugedesk-runtime/discipline/checks/review.sh", "exit 0\n")
+            .expect("runtime mount");
+
+        chat.rehome("workstream/team/main").expect("rehome");
+        assert_eq!(
+            chat.read_file(".gaugedesk-runtime/discipline/checks/review.sh")
+                .expect("preserved runtime mount"),
+            "exit 0\n"
+        );
+        assert!(chat.diff_against_main().expect("target diff").is_empty());
+        assert_eq!(chat.target(), "workstream/team/main");
+    }
+
+    #[test]
+    fn rehome_refuses_an_unsettled_candidate() {
+        let (_directory, instance) = instance();
+        instance.create_workstream("one").expect("one");
+        instance.create_workstream("two").expect("two");
+        let mut chat = instance
+            .create_engagement_on("moving", "workstream/one/main")
+            .expect("moving");
+        chat.write_file("candidate.txt", "keep me")
+            .expect("candidate");
+        chat.commit_turn("candidate").expect("cut");
+
+        let error = chat.rehome("workstream/two/main").expect_err("must refuse");
+        assert!(error.to_string().contains("unsettled workspace changes"));
+        assert_eq!(chat.target(), "workstream/one/main");
+        assert_eq!(
+            chat.read_file("candidate.txt").expect("preserved"),
+            "keep me"
+        );
     }
 
     /// Peer federation over the vcs substrate: a fork shares cut history,
@@ -1810,8 +2042,45 @@ mod tests {
         );
     }
 
+    /// DR-0054 Phase A: worktree projection never destroys bytes. A file the
+    /// branch manifest does not name (dropped into the worktree without a
+    /// sync-in — an interrupted agent, a user copy while the host was down) is
+    /// quarantined under the chat-local runtime area, not deleted.
     #[test]
-    fn opening_a_legacy_instance_migrates_checked_out_snapshots_and_stamps_it() {
+    fn sync_out_quarantines_unmanifested_files_instead_of_destroying_them() {
+        let (_directory, instance) = instance();
+        instance
+            .seed_main(&[("tracked.txt", "tracked")])
+            .expect("seed");
+        let chat = instance.create_engagement("keeper").expect("chat");
+
+        // Dropped in behind the store's back: on disk, in no manifest.
+        std::fs::write(chat.path().join("dropped.txt"), "irreplaceable bytes").expect("drop");
+
+        // revert_to_main restores the target head and re-projects the
+        // worktree — the sync_out path that used to delete the file.
+        chat.revert_to_main().expect("revert");
+
+        assert!(
+            !chat.path().join("dropped.txt").exists(),
+            "sync semantics stay clean: the unmanifested file leaves the tree"
+        );
+        let quarantine = chat.path().join(".gaugedesk-runtime").join("quarantine");
+        let stamp = std::fs::read_dir(&quarantine)
+            .expect("quarantine directory exists")
+            .next()
+            .expect("one quarantine sweep")
+            .expect("readable entry")
+            .path();
+        assert_eq!(
+            std::fs::read_to_string(stamp.join("dropped.txt")).expect("preserved bytes"),
+            "irreplaceable bytes",
+            "the bytes stay recoverable in the chat-local quarantine"
+        );
+    }
+
+    #[test]
+    fn opening_a_pre_target_layout_is_rejected_without_migration() {
         let directory = tempfile::tempdir().expect("temp");
         let repo = directory.path().join("repo");
         let worktrees = directory.path().join("worktrees");
@@ -1823,15 +2092,15 @@ mod tests {
         std::fs::write(worktrees.join("chat/draft.txt"), "draft").expect("draft snapshot");
 
         let instance = Instance::open(&repo, &worktrees);
-        let chats = instance.reconcile_engagements().expect("migrate on open");
-        assert_eq!(
-            std::fs::read_to_string(repo.join("main.txt")).expect("main"),
-            "main"
+        let error = instance
+            .reconcile_engagements()
+            .err()
+            .expect("pre-target layout must fail");
+        assert!(error.to_string().contains("pre-target workspace layout"));
+        assert!(
+            repo.join(".git").exists(),
+            "rejection must not mutate old state"
         );
-        assert_eq!(chats[0].0, "chat");
-        assert_eq!(chats[0].1.read_file("draft.txt").expect("draft"), "draft");
-        assert!(!repo.join(".git").exists());
-        assert!(!worktrees.join("chat/.git").exists());
-        assert!(store_root_for(&repo).join("substrate.json").is_file());
+        assert!(worktrees.join("chat/.git").exists());
     }
 }

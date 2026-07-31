@@ -8,6 +8,7 @@
 //! `scripts/keycloak-oidc-check.sh` harness supplies a real id-token from the
 //! self-hosted Keycloak, so this runs with no vendor signup.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -15,7 +16,10 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use tower::ServiceExt;
 
-use gaugewright_app::org::{SsoConnectionRecord, SsoProtocol};
+use gaugewright_app::org::{
+    MembershipRecord, MembershipStatus, RecordOp, SsoConnectionRecord, SsoProtocol, ORG_ID,
+    ORG_SCOPE,
+};
 use gaugewright_app::Workbench;
 use gaugewright_ee::auth_oidc::build_oidc_idp;
 use gaugewright_ee::org_routes::enterprise_control_plane;
@@ -41,6 +45,13 @@ async fn status(
     bearer: Option<&str>,
 ) -> StatusCode {
     let mut builder = Request::builder().method(method).uri(uri);
+    static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+    if method != "GET" && method != "HEAD" && method != "OPTIONS" {
+        builder = builder.header(
+            "idempotency-key",
+            format!("oidc-test-{}", NEXT_KEY.fetch_add(1, Ordering::Relaxed)),
+        );
+    }
     if let Some(token) = bearer {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
@@ -81,32 +92,51 @@ async fn admin_gate_admits_a_real_member_token_and_refuses_others() {
         .as_str()
         .to_string();
 
-    let wb = Workbench::new(Store::open_in_memory().unwrap()).with_identity_provider(idp);
+    // Tenant/account provisioning establishes the first owner before the
+    // Administration Environment can open; there is deliberately no bootstrap
+    // `/admin/*` mutation bypass.
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .append_record(
+            ORG_SCOPE,
+            "membership",
+            &serde_json::to_string(&MembershipRecord {
+                id: subject.clone(),
+                op: RecordOp::Upsert,
+                org_id: ORG_ID.into(),
+                authority: subject.clone(),
+                email: String::new(),
+                role: "admin".into(),
+                status: MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    let wb = Workbench::new(store).with_identity_provider(idp);
     let app = enterprise_control_plane(Arc::new(Mutex::new(wb)));
-
-    // Bootstrap: an empty directory is ungated, so provision the token's subject as an
-    // active admin without a bearer. Once it is active the directory is provisioned and
-    // the gate goes live.
-    let invite = format!(r#"{{"authority":"{subject}","role":"admin","status":"active"}}"#);
-    assert_eq!(
-        status(&app, "POST", "/admin/members", Some(&invite), None).await,
-        StatusCode::OK,
-        "bootstrap provision of the member should succeed",
-    );
 
     // The gate is now live (provisioned directory + attached verifier):
     assert_eq!(
-        status(&app, "GET", "/admin/org", None, Some(&token)).await,
+        status(&app, "GET", "/admin/capabilities", None, Some(&token)).await,
         StatusCode::OK,
         "a real member's id-token is admitted",
     );
     assert_eq!(
-        status(&app, "GET", "/admin/org", None, None).await,
+        status(&app, "GET", "/admin/capabilities", None, None).await,
         StatusCode::UNAUTHORIZED,
         "an anonymous request is refused (fail-closed)",
     );
     assert_eq!(
-        status(&app, "GET", "/admin/org", None, Some("not.a.real.token")).await,
+        status(
+            &app,
+            "GET",
+            "/admin/capabilities",
+            None,
+            Some("not.a.real.token"),
+        )
+        .await,
         StatusCode::UNAUTHORIZED,
         "a bogus bearer is refused",
     );

@@ -7,13 +7,12 @@ Feature: Content viewer opens on View unless a review is open
 
   Scenario: a fresh chat with nothing to review opens on View
     Given the workbench is open
-    When I switch to the "Chats" facet
-    And I start a new chat from All chats
+    When I start a new chat in Personal
     Then the content viewer is on the "view" tab
 
   Scenario: after a turn finishes, the Changes review surface leads
     Given the workbench is open
-    When I switch to the "Chats" facet
-    And I start a new chat from All chats
+    When I start a new chat in Personal
+    And I request review for the next change
     And I task the agent with "make a small change"
     Then the content viewer is on the "diff" tab

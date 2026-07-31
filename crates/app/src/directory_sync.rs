@@ -17,37 +17,14 @@
 //! person via OIDC and holds no sovereign keypair, so it does not publish). The facility flag in
 //! the person's account scope says whether sync is on.
 
-use serde::{Deserialize, Serialize};
+use gaugewright_core::signature::SigningKey;
+pub use gaugewright_directory_protocol::{
+    put_verifies, signing_bytes, DirectoryEntry, SignedDirectoryPut,
+};
 
-use gaugewright_core::ids::PublicKey;
-use gaugewright_core::signature::{verify_signature, Signature, SigningKey};
-
-use crate::account::{directory_record, seal_account_blob, Account, DirectoryRecord};
+use crate::account::{directory_record, seal_account_blob, Account};
 use crate::key_store::KeyStore; // brings the `signing_key` trait method into scope
 use crate::net_http::HttpClient;
-
-/// What the blind directory holds for one account root: the readable routing record + the opaque
-/// sealed [`AccountBlob`](crate::account::AccountBlob) (hex ciphertext the directory never opens).
-/// The wire shape the directory service stores; identical field order → identical [`signing_bytes`].
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DirectoryEntry {
-    pub directory: DirectoryRecord,
-    /// Opaque hex ciphertext (`INV-10`) — the sealed account blob. Never opened by the directory.
-    pub sealed_blob: String,
-}
-
-/// The canonical bytes a root signs to authorize publishing `entry` — the same function feeds the
-/// signer here and the service's verifier, so they always agree.
-pub fn signing_bytes(entry: &DirectoryEntry) -> Vec<u8> {
-    serde_json::to_vec(entry).unwrap_or_default()
-}
-
-/// A signed publish request: the entry + the root key's signature over [`signing_bytes`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SignedDirectoryPut {
-    pub entry: DirectoryEntry,
-    pub signature: Signature,
-}
 
 /// Build the signed publish for the account rooted at `signing_key`: seal the account blob under
 /// the account `key`, assemble the readable directory record (root pubkey + active device
@@ -57,23 +34,20 @@ pub fn signed_put(
     signing_key: &SigningKey,
     key: [u8; 32],
     acct: &Account,
+    generation: u64,
     placement_pointers: Vec<String>,
+    home_routes: Vec<crate::home::OpaqueHomeRoute>,
 ) -> Option<SignedDirectoryPut> {
+    if generation == 0 {
+        return None;
+    }
     let root_pubkey = signing_key.public_key().as_str().to_string();
     let entry = DirectoryEntry {
-        directory: directory_record(&root_pubkey, acct, placement_pointers),
+        generation,
+        directory: directory_record(&root_pubkey, acct, placement_pointers, home_routes),
         sealed_blob: seal_account_blob(key, acct)?,
     };
-    let signature = signing_key.sign(&signing_bytes(&entry));
-    Some(SignedDirectoryPut { entry, signature })
-}
-
-/// Whether `put` verifies under its own claimed root pubkey — the exact check the directory service
-/// performs at `PUT` (`verify_signature` over [`signing_bytes`] against `entry.directory.root_pubkey`).
-/// The publish path uses this to fail fast; tests use it to prove service-compatibility.
-pub fn put_verifies(put: &SignedDirectoryPut) -> bool {
-    let pubkey = PublicKey::new(put.entry.directory.root_pubkey.clone());
-    verify_signature(&signing_bytes(&put.entry), &put.signature, &pubkey).unwrap_or(false)
+    gaugewright_directory_protocol::sign_entry(entry, signing_key).ok()
 }
 
 /// Publish a signed record to the blind directory (`PUT {base}/directory/:root`). `base` is the
@@ -124,14 +98,22 @@ impl crate::Workbench {
     /// The signed publish for the current account state, **iff** library sync is active — built
     /// under the workbench lock (store + root key), so the caller can then publish it over the
     /// network *off* the lock. `None` when sync is off or the blob fails to seal.
-    pub fn library_sync_signed_put(&self) -> Option<SignedDirectoryPut> {
+    pub fn library_sync_signed_put(&self, generation: u64) -> Option<SignedDirectoryPut> {
         if !self.library_sync_active() {
             return None;
         }
         let signing_key = crate::key_store::FileKeyStore::new(self.root_path().join("keys"))
             .signing_key(self.authority());
         let acct = Account::rebuild(self.store_ref()).ok()?;
-        signed_put(&signing_key, self.account_key(), &acct, vec![])
+        let home_routes = acct.home_routes.values().cloned().map(Into::into).collect();
+        signed_put(
+            &signing_key,
+            self.account_key(),
+            &acct,
+            generation,
+            vec![],
+            home_routes,
+        )
     }
 
     /// Merge a fetched directory entry's sealed blob into the local account scope (the pull half):
@@ -158,6 +140,29 @@ impl crate::Workbench {
                 n += 1;
             }
         }
+        for home in &blob.homes {
+            if self
+                .write_account_record_in(ACCOUNT_SCOPE, "home", home.id.as_str(), home)
+                .is_ok()
+            {
+                n += 1;
+            }
+        }
+        for route in &entry.directory.home_routes {
+            let record = crate::account::HomeRouteRecord {
+                id: route.project.clone(),
+                op: crate::account::RecordOp::Upsert,
+                home_id: route.home_id.clone(),
+                endpoint: route.endpoint.clone(),
+                relay: route.relay.clone(),
+            };
+            if self
+                .write_account_record_in(ACCOUNT_SCOPE, "home_route", &record.id, &record)
+                .is_ok()
+            {
+                n += 1;
+            }
+        }
         for (id, value) in &blob.settings {
             let rec = crate::account::SettingRecord {
                 id: id.clone(),
@@ -175,12 +180,16 @@ impl crate::Workbench {
     }
 }
 
-/// The blind-directory service origin from `GAUGEWRIGHT_DIRECTORY_URL` (e.g. the deployed
-/// `https://…:7901`); `None` when unset (sync is then a no-op — the mechanism needs the service).
-pub fn directory_url_from_env() -> Option<String> {
+/// Canonical public blind-directory origin. Development and hermetic tests may
+/// override it with `GAUGEWRIGHT_DIRECTORY_URL`; a release never silently
+/// disables account sync because an environment variable was omitted.
+pub const DIRECTORY_URL: &str = "https://directory.gaugewright.com";
+
+pub fn directory_url_from_env() -> String {
     std::env::var("GAUGEWRIGHT_DIRECTORY_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DIRECTORY_URL.to_string())
 }
 
 #[cfg(test)]
@@ -198,6 +207,7 @@ mod tests {
                 label: "My phone".into(),
                 subkey_pubkey: "dev-pub-1".into(),
                 status: DeviceStatus::Active,
+                enrolled_at: 1_700_000_000,
             },
         );
         a.settings.insert(
@@ -209,6 +219,11 @@ mod tests {
             },
         );
         a
+    }
+
+    #[test]
+    fn canonical_directory_origin_is_public_tls() {
+        assert_eq!(DIRECTORY_URL, "https://directory.gaugewright.com");
     }
 
     fn key() -> SigningKey {
@@ -224,7 +239,8 @@ mod tests {
         // The signature the client produces passes the exact check the directory service runs at
         // PUT — so a real publish would be accepted (and a forged one rejected).
         let k = key();
-        let put = signed_put(&k, AKEY, &seeded_account(), vec![]).expect("seals");
+        let put = signed_put(&k, AKEY, &seeded_account(), 1, vec![], vec![]).expect("seals");
+        assert_eq!(put.entry.generation, 1);
         assert_eq!(put.entry.directory.root_pubkey, k.public_key().as_str());
         assert!(put_verifies(&put), "verifies under its own root key");
 
@@ -232,14 +248,25 @@ mod tests {
         let mut forged = put.clone();
         forged.entry.directory.device_pubkeys = vec!["attacker".into()];
         assert!(!put_verifies(&forged));
+        assert!(
+            signed_put(&k, AKEY, &seeded_account(), 0, vec![], vec![]).is_none(),
+            "generation zero is reserved for reading legacy entries"
+        );
     }
 
     #[test]
     fn the_directory_record_carries_no_secrets_and_the_blob_round_trips() {
         // The readable record is routing-only (root + device pubkeys); the settings/credentials
         // live only inside the sealed blob, which opens only under the same account key.
-        let put =
-            signed_put(&key(), AKEY, &seeded_account(), vec!["relay://x".into()]).expect("seals");
+        let put = signed_put(
+            &key(),
+            AKEY,
+            &seeded_account(),
+            7,
+            vec!["relay://x".into()],
+            vec![],
+        )
+        .expect("seals");
         assert_eq!(
             put.entry.directory.device_pubkeys,
             vec!["dev-pub-1".to_string()]

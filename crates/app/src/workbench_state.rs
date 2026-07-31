@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use gaugewright_core::ids::AuthorityId;
+use gaugewright_core::ids::{AuthorityId, HomeId};
 use gaugewright_store::Store;
 use gaugewright_tracker::WhipTrackerHandle;
 use gaugewright_workspace::{
@@ -36,10 +36,8 @@ const WHIPPLE_SUBSTRATE: &str = "whipplescript";
 /// Per-project boundaries (which key by `project::<id>`) are deferred to Phase 4.
 pub(crate) const ACCOUNT_GLOBAL_BOUNDARY: &str = "account::global";
 
-/// Every instance now resolves to the native WhippleScript workspace. The
-/// provider writes a durable per-instance stamp and migrates a legacy checked-
-/// out instance snapshot on first open.
-pub(crate) fn instance_substrate_id(_inst_id: &str) -> &'static str {
+/// Every managed target resolves to the native WhippleScript workspace.
+pub(crate) fn target_substrate_id(_target_id: &str) -> &'static str {
     WHIPPLE_SUBSTRATE
 }
 
@@ -52,32 +50,38 @@ pub(crate) fn default_workspace_providers() -> WorkspaceProviders {
 }
 
 /// Resolve the provider that constructs/opens an instance's workspace. The
-/// registry always carries every id `instance_substrate_id` mints.
+/// registry always carries every id `target_substrate_id` mints.
 pub(crate) fn provider_for(
     providers: &WorkspaceProviders,
-    inst_id: &str,
+    target_id: &str,
 ) -> Arc<dyn WorkspaceProvider> {
     providers
-        .get(instance_substrate_id(inst_id))
+        .get(target_substrate_id(target_id))
         .cloned()
         .expect("a workspace provider is registered for every substrate id")
 }
 
 pub struct Workbench {
-    pub(crate) instances: BTreeMap<String, Box<dyn Workspace>>,
-    /// Workspace construction providers, keyed by substrate id; instances
-    /// resolve theirs via [`instance_substrate_id`].
+    /// Open GaugeDesk-managed work-target stores, keyed only by target id.
+    pub(crate) targets: BTreeMap<String, Box<dyn Workspace>>,
+    /// Workspace construction providers, keyed by substrate id; managed targets
+    /// resolve theirs via [`target_substrate_id`].
     pub(crate) providers: WorkspaceProviders,
-    /// Where the legacy `POST /chats` route creates (the seed builder live;
-    /// the single registered instance in tests).
+    /// The default logical placement selected by the zero-setup chat route.
     pub(crate) default_instance: String,
-    pub(crate) engagement_index: BTreeMap<String, String>, // chat id -> instance id
+    pub(crate) engagement_index: BTreeMap<String, String>, // chat id -> target id
     pub(crate) library: Library,
     pub(crate) store: Store,
     pub(crate) engagements: BTreeMap<String, Box<dyn ChatWorkspace>>,
     pub(crate) streams: BTreeMap<String, broadcast::Sender<ServerEvent>>,
-    /// One agent harness per engagement (ADR 0031).
-    pub(crate) sessions: BTreeMap<String, Box<dyn gaugewright_harness::Harness>>,
+    /// One agent harness per engagement (ADR 0031), each behind **its own** lock.
+    ///
+    /// A turn needs exclusive access to one chat's harness for as long as the model
+    /// call takes. Holding the workbench lock for that would serialize every other
+    /// chat behind it, so a turn instead clones the `Arc` out under a brief lock and
+    /// then locks only the harness. "This harness is locked" is therefore the same
+    /// fact as "this chat is busy" — one representation, not two.
+    pub(crate) sessions: BTreeMap<String, SharedHarness>,
     /// One remote harness per remotely placed engagement (ADR 0020/0031).
     pub(crate) remote_sessions: BTreeMap<String, Box<dyn gaugewright_harness::RemoteHarness>>,
     /// One embedded WhippleScript tracker runtime per trust boundary (ADR 0075),
@@ -99,13 +103,22 @@ pub struct Workbench {
     pub(crate) attestation_enabled: bool,
     /// The on-disk state root this workbench was opened from.
     pub(crate) root: std::path::PathBuf,
-    /// Where instance state dirs live (`<instances_root>/<instance-id>`),
-    /// recorded at build instead of reverse-derived from an open repo handle.
-    pub(crate) instances_root: std::path::PathBuf,
+    /// Where managed target state dirs live (`<targets_root>/<target-id>`).
+    pub(crate) targets_root: std::path::PathBuf,
     /// This control plane's network federation state (`SERVE-1`/D-REMOTE).
     pub(crate) federation: Option<federation::Federation>,
     /// This control plane's own authority identity (`SERVE-1`/D-REMOTE).
     pub(crate) authority: AuthorityId,
+    /// The stable logical Home this workbench realizes (`HOME-1`). Physical
+    /// process/root/runtime placement may change without changing this identity.
+    pub(crate) home_id: HomeId,
+    /// True only when the private hosted Home router has claimed this
+    /// workbench. This is composition-bound state, never inferred from a
+    /// process-global environment variable or from ordinary account login.
+    pub(crate) hosted_home_mode: bool,
+    /// Replaceable per-identity Home sessions. Account login alone never appears
+    /// here; the target Home mints these only after admission.
+    pub(crate) home_admissions: crate::home_admission::HomeAdmissionStore,
     /// The identity adapter that authenticates bearer credentials.
     pub(crate) idp: Option<Arc<dyn identity::IdentityProvider + Send + Sync>>,
     /// Optional streaming audit sink (`AUD-4`).
@@ -128,18 +141,39 @@ pub struct Workbench {
     /// run the broker legs (which await) without holding the workbench mutex.
     pub(crate) enroll_drive: Arc<crate::device_enroll_drive::EnrollDrive>,
     /// The rendezvous broker this workbench dials / advertises for enrollment
-    /// (`ACCT-1`); `None` falls back to `GAUGEWRIGHT_BROKER_ADDR` / the default.
+    /// (`ACCT-1`); `None` falls back to `GAUGEWRIGHT_RELAY_ENDPOINT` / the default.
     pub(crate) enroll_broker: Option<String>,
     /// The account key a newly-enrolled device recovered over the handshake
     /// (`ACCT-1`), held in memory — never returned over HTTP (`INV-10`).
     pub(crate) recovered_account_key: Option<[u8; 32]>,
+    /// Machine-scoped controller invitations, challenges, and short-lived
+    /// sessions. Durable grant records live in `store`; raw credentials do not.
+    pub(crate) machine_controllers: crate::mobile_machine_session::MachineControllerRuntime,
+    /// Carrier-neutral installation/wake state plus the in-process mock carrier.
+    pub(crate) mobile_wakes: crate::mobile_wake_runtime::MobileWakeRuntime,
 }
 
 pub type SharedWorkbench = Arc<Mutex<Workbench>>;
 
+/// One chat's agent harness, independently lockable so a turn can hold it without
+/// holding the workbench (ADR 0031 + the per-chat serialization unit).
+pub(crate) type SharedHarness = Arc<Mutex<Box<dyn gaugewright_harness::Harness>>>;
+
+/// Shut a harness down, but only if this is the last reference to it. A harness a
+/// turn still holds is left to that turn, which drops the final reference when it
+/// finishes — a running agent is never killed by a bookkeeping path.
+pub(crate) fn shutdown_shared_harness(harness: SharedHarness) {
+    if let Ok(harness) = Arc::try_unwrap(harness) {
+        let harness = harness
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = harness.shutdown();
+    }
+}
+
 /// Open (or initialize) the local workbench under `root`. Agents/projects/chats
-/// are rehydrated from the library records + native workspace (ADR 0027): for each instance
-/// record we open its repo and reconcile its engagements. A fresh root is seeded
+/// are rehydrated from target/chat records + native workspaces (ADR 0100): for each
+/// target we open its store and reconcile its candidates. A fresh root is seeded
 /// with a default agent so the user can chat immediately.
 pub fn open_workbench(root: &std::path::Path) -> std::io::Result<SharedWorkbench> {
     let wb = build_workbench(root)?
@@ -152,9 +186,30 @@ pub fn open_workbench_with_content_keywrap(
     root: &std::path::Path,
     content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
 ) -> std::io::Result<SharedWorkbench> {
-    let wb = build_workbench_with_content_keywrap(root, content_keywrap)?
+    let wb = build_workbench_with_content_keywrap_for_home(root, None, content_keywrap)?
         .with_attestation_mode(attestation_mode_from_env())
         .with_attestation_enabled(attestation_enabled());
+    Ok(Arc::new(Mutex::new(wb)))
+}
+
+/// Open a workbench whose logical Home and signing-authority identities are
+/// supplied by the hosting registry rather than process-global environment. The explicit identity is
+/// applied before startup state validation and re-applied after optional local
+/// authority activation, so a pooled host cannot accidentally bind a tenant's
+/// store to another Home because an environment variable changed.
+pub fn open_workbench_for_home_with_content_keywrap(
+    root: &std::path::Path,
+    home_id: HomeId,
+    authority_id: AuthorityId,
+    content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
+) -> std::io::Result<SharedWorkbench> {
+    let wb = build_workbench_with_content_keywrap_for_home(
+        root,
+        Some((home_id, authority_id)),
+        content_keywrap,
+    )?
+    .with_attestation_mode(attestation_mode_from_env())
+    .with_attestation_enabled(attestation_enabled());
     Ok(Arc::new(Mutex::new(wb)))
 }
 
@@ -170,22 +225,38 @@ pub(crate) fn build_workbench_with_content_keywrap(
     root: &std::path::Path,
     content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
 ) -> std::io::Result<Workbench> {
-    let (root, instances_dir) = prepare_workbench_root(root)?;
+    build_workbench_with_content_keywrap_for_home(root, None, content_keywrap)
+}
+
+fn build_workbench_with_content_keywrap_for_home(
+    root: &std::path::Path,
+    explicit_identity: Option<(HomeId, AuthorityId)>,
+    content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
+) -> std::io::Result<Workbench> {
+    let (root, targets_dir) = prepare_workbench_root(root)?;
 
     let (mut store, content_vault) = content_vault::open_startup_store(&root, content_keywrap)?;
     let providers = default_workspace_providers();
+    let home_id = explicit_identity
+        .as_ref()
+        .map(|(home_id, _)| home_id.clone())
+        .unwrap_or_else(Workbench::configured_home_id);
     let startup_state =
-        library_state::load_startup_library_state(&mut store, &instances_dir, &providers)?;
+        library_state::load_startup_library_state(&mut store, &targets_dir, &providers, &home_id)?;
 
-    let mut wb = Workbench::new(store);
+    let mut wb = Workbench::new(store).with_home_id(home_id);
     wb.providers = providers;
-    wb.instances_root = instances_dir;
+    wb.targets_root = targets_dir;
     wb.apply_startup_library_state(startup_state);
     wb.apply_startup_audit(&root);
     wb.apply_startup_content_vault(content_vault);
     wb.restore_startup_local_projections();
     wb.apply_startup_root(root);
     wb.activate_configured_authority();
+    if let Some((home_id, authority_id)) = explicit_identity {
+        wb.authority = authority_id;
+        wb = wb.with_home_id(home_id);
+    }
     // ACCT-1 / ADR 0053 §4: re-adopt a previously-recovered account key (an enrolled
     // device that joined another root) from its at-rest wrap, so restarts keep opening
     // the sealed account state. No-op on a holder / seed-recovered device (none stored).
@@ -203,10 +274,10 @@ pub(crate) fn build_workbench_with_content_keywrap(
 
 impl Workbench {
     /// An empty workbench (no instances). Startup registers instances from the
-    /// library; tests use [`Workbench::with_instance`].
+    /// library; tests use [`Workbench::with_target`].
     pub fn new(store: Store) -> Self {
         Self {
-            instances: BTreeMap::new(),
+            targets: BTreeMap::new(),
             providers: default_workspace_providers(),
             default_instance: String::new(),
             engagement_index: BTreeMap::new(),
@@ -223,11 +294,13 @@ impl Workbench {
             real_verifier_factory: None,
             attestation_enabled: false,
             root: std::path::PathBuf::new(),
-            // The bare-workbench default mirrors the old derived fallback; the
-            // build path and `with_instance` record the real root.
-            instances_root: std::path::PathBuf::from(".gaugewright/instances"),
+            // The build path and test constructor replace this bare default.
+            targets_root: std::path::PathBuf::from(".gaugewright/targets"),
             federation: None,
             authority: AuthorityId::new(LOCAL_AUTHORITY),
+            home_id: HomeId::new(format!("home:{LOCAL_AUTHORITY}")),
+            hosted_home_mode: false,
+            home_admissions: crate::home_admission::HomeAdmissionStore::new(),
             idp: None,
             audit_sink: None,
             audit_signer: None,
@@ -246,6 +319,8 @@ impl Workbench {
             enroll_drive: Arc::new(crate::device_enroll_drive::EnrollDrive::new()),
             enroll_broker: None,
             recovered_account_key: None,
+            machine_controllers: crate::mobile_machine_session::MachineControllerRuntime::default(),
+            mobile_wakes: crate::mobile_wake_runtime::MobileWakeRuntime::default(),
         }
     }
 

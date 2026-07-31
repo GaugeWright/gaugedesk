@@ -11,6 +11,7 @@
 //! the core trusts its types rather than re-validating strings.
 
 pub mod abac;
+pub mod agent_release;
 pub mod agent_version;
 pub mod attestation;
 pub mod billing;
@@ -29,10 +30,12 @@ pub mod handoff;
 pub mod ids;
 pub mod instance;
 pub mod key_release;
+pub mod managed_machine_execution;
 pub mod merge;
+pub mod mobile_machine_session;
+pub mod mobile_wake;
 pub mod package_distribution;
 pub mod pinned_tls;
-pub mod public_session;
 pub mod rbac;
 pub mod recovery;
 pub mod remote_call;

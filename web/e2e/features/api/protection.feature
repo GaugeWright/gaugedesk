@@ -10,9 +10,10 @@ Feature: Export & review derive from the resource (M1)
     Then "exp1" has an "output" resource
     When export of the output in "exp1" is proposed
     Then the export's required consent includes "local-user"
-    And the export does not clear without consent in "exp1"
-    When the owner consents and the target admits the export in "exp1"
-    Then the output of "exp1" is exported
+    And the export remains requested before source consent in "exp1"
+    When the owner consents to export in "exp1"
+    Then export of "exp1" waits for target admission
+    And raw scope lifecycle commands are absent for "exp1"
 
   Scenario: reviewing an output derives its required consenters from the resource
     Given an engagement "rev1"

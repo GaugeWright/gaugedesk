@@ -26,7 +26,35 @@ pub async fn open_serve(addr: &str, root: &std::path::Path) -> std::io::Result<(
         );
     }
     let listener = open_listener(addr).await?;
+    if let Some(endpoint) = configured_relay_endpoint() {
+        let local = listener.local_addr()?;
+        let directory = root.join("relay");
+        let identity = gaugewright_relay_transport::TlsIdentity::load_or_generate(&directory)?;
+        let config =
+            gaugewright_relay_transport::HomeRelayConfig::load_or_mint(&directory, &endpoint)?;
+        let route = config.relay_route(&identity)?;
+        eprintln!(
+            "[home-relay] supervised endpoint={} epoch={} tls_pin={}",
+            config.endpoint,
+            config.route_epoch,
+            gaugewright_relay_transport::HomeRelayConfig::fingerprint_hex(&identity),
+        );
+        tokio::spawn(async move {
+            if let Err(error) =
+                gaugewright_relay_transport::serve_home_forever(route, local, identity).await
+            {
+                eprintln!("[home-relay] availability loop stopped: {error}");
+            }
+        });
+    }
     axum::serve(listener, open_control_plane(wb)).await
+}
+
+pub(crate) fn configured_relay_endpoint() -> Option<String> {
+    std::env::var("GAUGEWRIGHT_HOME_RELAY_ENDPOINT")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 /// Bind the local control-plane listener with the fail-closed loopback guard

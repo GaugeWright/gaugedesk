@@ -7,7 +7,8 @@ Feature: Honest discard, reachable settings, grouped chats (round 3)
 
   Scenario: discarding work shows one honest, plain-language end-state
     Given a new engagement
-    When I task the agent with "make a change"
+    When I request review for the next change
+    And I task the agent with "make a change"
     And I open the "diff" tab
     And I discard the work
     Then the changes show an honest discarded state

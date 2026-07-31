@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use gaugewright_core::ids::{AuthorityId, PublicKey};
 use gaugewright_core::signature::{verify_signature, Signature};
-use gaugewright_store::{AdmitError, Store};
+use gaugewright_store::{AdmitError, ChainedRecordFact, Store};
 
 use crate::content_vault;
 use crate::key_store::{FileKeyStore, KeyStore};
@@ -28,6 +28,25 @@ pub const AUDIT_SCOPE: &str = "audit";
 
 /// The reserved scope holding the signed head checkpoints (`SECAUD-2`).
 pub const AUDIT_CHECKPOINT_SCOPE: &str = "audit_checkpoint";
+
+/// Resolve the audit chain belonging to one organization store scope. The default
+/// singleton retains the historical scope; named hosted tenants receive disjoint
+/// chains so admission to one tenant can never reveal another tenant's metadata.
+pub fn scope_for(store_scope: &str) -> String {
+    if store_scope == crate::org::ORG_SCOPE {
+        AUDIT_SCOPE.to_string()
+    } else {
+        format!("{AUDIT_SCOPE}::{store_scope}")
+    }
+}
+
+fn checkpoint_scope_for(store_scope: &str) -> String {
+    if store_scope == crate::org::ORG_SCOPE {
+        AUDIT_CHECKPOINT_SCOPE.to_string()
+    } else {
+        format!("{AUDIT_CHECKPOINT_SCOPE}::{store_scope}")
+    }
+}
 
 /// One governance action: who did it, what they did, and the affected target id.
 /// No payload, ever (`INV-10`).
@@ -76,8 +95,18 @@ fn entry_hash(e: &AuditEntry) -> String {
 /// [`GENESIS`] for an empty log. Anchor this externally (or sign it) to also detect
 /// a tail truncation / last-entry edit, which an unanchored chain cannot self-detect
 /// (the SECAUD-2 follow-on).
+///
+/// **Read-only inspection.** Never use this to build the next entry's link: that
+/// reads the head outside the transaction that appends, and two writers observing
+/// the same head both link to it, forking the chain. Use [`link`] with
+/// [`Store::append_chained_record`] or [`chained`], which resolve the predecessor
+/// inside the appending transaction.
 pub fn head_hash(store: &Store) -> String {
-    match list(store).last() {
+    head_hash_in(store, crate::org::ORG_SCOPE)
+}
+
+pub fn head_hash_in(store: &Store, store_scope: &str) -> String {
+    match list_in(store, store_scope).last() {
         Some(last) => entry_hash(last),
         None => GENESIS.to_string(),
     }
@@ -105,7 +134,16 @@ fn checkpoint_msg(count: usize, head: &str) -> Vec<u8> {
 /// (`SECAUD-2`). Called on each append, so the latest checkpoint always pins the full
 /// current chain — any later edit or truncation is then detectable by [`verify`].
 pub fn sign_checkpoint(store: &mut Store, signer: &dyn KeyStore, authority: &AuthorityId) {
-    let entries = list(store);
+    sign_checkpoint_in(store, crate::org::ORG_SCOPE, signer, authority);
+}
+
+pub fn sign_checkpoint_in(
+    store: &mut Store,
+    store_scope: &str,
+    signer: &dyn KeyStore,
+    authority: &AuthorityId,
+) {
+    let entries = list_in(store, store_scope);
     let count = entries.len();
     let head = entries
         .last()
@@ -121,16 +159,16 @@ pub fn sign_checkpoint(store: &mut Store, signer: &dyn KeyStore, authority: &Aut
         sig,
     };
     let _ = store.append_record(
-        AUDIT_CHECKPOINT_SCOPE,
+        &checkpoint_scope_for(store_scope),
         "checkpoint",
         &serde_json::to_string(&cp).expect("checkpoint serializes"),
     );
 }
 
 /// The most recent signed checkpoint, if any (latest-wins over the append-only scope).
-fn latest_checkpoint(store: &Store) -> Option<Checkpoint> {
+fn latest_checkpoint_in(store: &Store, store_scope: &str) -> Option<Checkpoint> {
     store
-        .records(AUDIT_CHECKPOINT_SCOPE, "checkpoint")
+        .records(&checkpoint_scope_for(store_scope), "checkpoint")
         .ok()?
         .iter()
         .filter_map(|r| serde_json::from_str(r).ok())
@@ -165,7 +203,15 @@ pub struct AuditIntegrity {
 /// present it must verify under this key and stay consistent with the current chain —
 /// catching the tail truncation / last-entry edit the bare chain cannot.
 pub fn verify(store: &Store, expected_pubkey: Option<&PublicKey>) -> AuditIntegrity {
-    let entries = list(store);
+    verify_in(store, crate::org::ORG_SCOPE, expected_pubkey)
+}
+
+pub fn verify_in(
+    store: &Store,
+    store_scope: &str,
+    expected_pubkey: Option<&PublicKey>,
+) -> AuditIntegrity {
+    let entries = list_in(store, store_scope);
     let mut prev = GENESIS.to_string();
     let mut broken_at = None;
     for (i, e) in entries.iter().enumerate() {
@@ -179,7 +225,7 @@ pub fn verify(store: &Store, expected_pubkey: Option<&PublicKey>) -> AuditIntegr
     // SECAUD-2: a signed checkpoint anchors the head against truncation / last-entry edits.
     let mut anchored = false;
     let mut anchor_ok = true;
-    if let Some(cp) = latest_checkpoint(store) {
+    if let Some(cp) = latest_checkpoint_in(store, store_scope) {
         anchored = true;
         let sig_valid = expected_pubkey
             .map(|pk| {
@@ -504,39 +550,107 @@ impl<P: HttpPost> AuditSink for HttpAuditSink<P> {
     }
 }
 
-/// Append an audit entry and fan it out to the streaming sink (`AUD-4`), if one is
-/// configured. Best-effort: a failed append never blocks the governed action (the
-/// action's own event is the source of truth; this is the pivoted view).
-pub fn record(wb: &mut Workbench, actor: &str, action: &str, target: &str) {
-    // Chain this entry to the current head (`SECAUD-2`). Per-scope single-writer
-    // (`INV-7`, serialized through the workbench lock) makes read-head-then-append
-    // race-free.
-    let entry = AuditEntry {
-        actor: actor.to_string(),
-        action: action.to_string(),
-        target: target.to_string(),
-        prev: head_hash(wb.store_ref()),
-    };
-    let _ = wb.store_mut().append_record(
-        AUDIT_SCOPE,
-        "entry",
-        &serde_json::to_string(&entry).unwrap(),
-    );
+/// The chain-link function for one governed action, to be resolved *inside* the
+/// write transaction that appends it (`SECAUD-2`).
+///
+/// The link is a function rather than a prepared row because the predecessor is
+/// not knowable until the transaction holds the write lock. An earlier version
+/// read the head first and appended afterwards, relying on the process-wide
+/// workbench mutex to keep the pair atomic; two writers on separate connections
+/// would then link to the same predecessor and silently fork the chain. The store
+/// owns *when* this runs; this owns *how* the link is computed.
+pub fn link<'a>(
+    actor: &'a str,
+    action: &'a str,
+    target: &'a str,
+) -> impl Fn(Option<&str>) -> String + 'a {
+    move |previous| {
+        let prev = previous
+            .and_then(|row| serde_json::from_str::<AuditEntry>(row).ok())
+            .map(|entry| entry_hash(&entry))
+            .unwrap_or_else(|| GENESIS.to_string());
+        serde_json::to_string(&AuditEntry {
+            actor: actor.to_string(),
+            action: action.to_string(),
+            target: target.to_string(),
+            prev,
+        })
+        .expect("audit entry serializes")
+    }
+}
+
+/// Name the audit scope/kind a [`link`] appends into, for a caller committing the
+/// entry alongside its own domain facts.
+pub fn chained<'a>(link: &'a dyn Fn(Option<&str>) -> String) -> ChainedRecordFact<'a> {
+    chained_in(AUDIT_SCOPE, link)
+}
+
+pub fn chained_in<'a>(
+    audit_scope: &'a str,
+    link: &'a dyn Fn(Option<&str>) -> String,
+) -> ChainedRecordFact<'a> {
+    ChainedRecordFact {
+        scope_id: audit_scope,
+        kind: "entry",
+        link,
+    }
+}
+
+/// The entry a chained append actually committed, recovered from the payload the
+/// store resolved. `None` when the command replayed and appended nothing.
+pub fn committed_entry(chained_payload: Option<&str>) -> Option<AuditEntry> {
+    chained_payload.and_then(|payload| serde_json::from_str(payload).ok())
+}
+
+/// Complete non-authoritative audit side effects after an entry has committed.
+/// The durable row itself must already be present; this method only refreshes
+/// the signed checkpoint and fans the reference-only row out to a sink.
+pub fn finish_committed(wb: &mut Workbench, entry: &AuditEntry) {
+    finish_committed_in(wb, crate::org::ORG_SCOPE, entry);
+}
+
+pub fn finish_committed_in(wb: &mut Workbench, store_scope: &str, entry: &AuditEntry) {
     // SECAUD-2: anchor the new head with a governance-signed checkpoint, if a signer is
     // configured (production sets one; unit tests without one stay chain-only).
     if let Some(signer) = wb.audit_signer() {
         let authority = wb.authority().clone();
-        sign_checkpoint(wb.store_mut(), signer.as_ref(), &authority);
+        sign_checkpoint_in(wb.store_mut(), store_scope, signer.as_ref(), &authority);
     }
     if let Some(sink) = wb.audit_sink() {
-        sink.emit(&entry);
+        sink.emit(entry);
+    }
+}
+
+/// Append an audit entry and fan it out to the streaming sink (`AUD-4`), if one is
+/// configured. Command paths with no domain facts of their own use this helper;
+/// admitted Environment commands instead commit [`chained`] atomically with their
+/// domain facts and receipt. Either way the chain link is resolved inside the
+/// appending transaction.
+pub fn record(wb: &mut Workbench, actor: &str, action: &str, target: &str) {
+    record_in(wb, crate::org::ORG_SCOPE, actor, action, target);
+}
+
+pub fn record_in(wb: &mut Workbench, store_scope: &str, actor: &str, action: &str, target: &str) {
+    let link = link(actor, action, target);
+    let audit_scope = scope_for(store_scope);
+    let appended = wb
+        .store_mut()
+        .append_chained_record(&audit_scope, "entry", &link);
+    if let Ok((_, payload)) = appended {
+        if let Some(entry) = committed_entry(Some(&payload)) {
+            finish_committed_in(wb, store_scope, &entry);
+        }
     }
 }
 
 /// The full timeline in position order (oldest first).
 pub fn list(store: &Store) -> Vec<AuditEntry> {
+    list_in(store, crate::org::ORG_SCOPE)
+}
+
+pub fn list_in(store: &Store, store_scope: &str) -> Vec<AuditEntry> {
     store
-        .records(AUDIT_SCOPE, "entry")
+        .records(&scope_for(store_scope), "entry")
         .unwrap_or_default()
         .iter()
         .filter_map(|row| serde_json::from_str(row).ok())
@@ -565,6 +679,53 @@ fn csv_field(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SECAUD-2 under REAL contention: the governance chain, appended from many
+    /// connections at once, must still verify as one unbroken sequence.
+    ///
+    /// This is the property the workbench mutex used to supply by accident. The
+    /// link is now resolved inside the appending transaction, so it holds without
+    /// any process-wide lock — which is what lets a turn stop holding one.
+    #[test]
+    fn the_audit_chain_verifies_under_concurrent_appends() {
+        const THREADS: usize = 6;
+        const APPENDS: usize = 15;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.db");
+        let path = path.to_str().unwrap().to_string();
+        let _prime = Store::open(&path).unwrap();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let mut store = Store::open(&p).unwrap();
+                    for i in 0..APPENDS {
+                        let actor = format!("actor-{t}");
+                        let target = format!("target-{t}-{i}");
+                        let entry = link(&actor, "member.role", &target);
+                        store
+                            .append_chained_record(AUDIT_SCOPE, "entry", &entry)
+                            .expect("a contended audit append must wait, not fail");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(list(&store).len(), THREADS * APPENDS);
+        let integrity = verify(&store, None);
+        assert!(
+            integrity.broken_at.is_none(),
+            "the chain forked at {:?} under contention",
+            integrity.broken_at
+        );
+        assert!(integrity.ok, "the contended chain must verify");
+    }
 
     #[test]
     fn record_fans_out_to_the_configured_sink() {

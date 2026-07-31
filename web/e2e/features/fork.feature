@@ -12,7 +12,7 @@ Feature: Fork (ADR 0035/0038)
 
   Scenario: forking a chat clones it into a linked new chat
     Given a new engagement
-    When I switch to the "Chats" facet
+    When I switch to the "Projects" facet
     And I fork the first chat
     Then I see a forked chat
 
@@ -20,14 +20,14 @@ Feature: Fork (ADR 0035/0038)
   Scenario: a forked chat remembers the parent's conversation
     Given a new engagement
     When I task the agent with "Remember the number 8351. Acknowledge only, do not use tools."
-    And I switch to the "Chats" facet
+    And I switch to the "Projects" facet
     And I fork the first chat
     And I task the agent with "What number did I ask you to remember? Reply with just the number and use no tools."
     Then the transcript shows "8351"
 
   Scenario: the fork tree shows a chat's lineage
     Given a new engagement
-    When I switch to the "Chats" facet
+    When I switch to the "Projects" facet
     And I fork the first chat
     And I open the fork tree for the first chat
     Then the fork tree shows at least 2 chats

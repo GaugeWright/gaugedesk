@@ -1,13 +1,18 @@
-Feature: All-chats "just start typing" quick-start
+Feature: Personal-project "just start typing" quick-start
 
-  The All chats facet is rootless, so its "+ new chat" affordance roots the chat
-  on the hidden Personal default placement (ADR 0036) — a work chat (ADR 0035)
-  with no project or method setup. The "just start typing" entry point.
+  Personal is the explicit zero-setup project (ADR 0097). Its "+ new chat"
+  affordance roots a work chat on its default placement (ADR 0035) without setup.
 
-  Scenario: a new chat from All chats opens a work chat with no setup
+  Scenario: the empty chat pane starts a Personal chat with the first message
     Given the workbench is open
-    When I switch to the "Chats" facet
-    And I start a new chat from All chats
+    Then the empty chat composer is ready
+    When I task the agent with "draft a welcome note"
+    Then the active chat is a work chat
+    And I see a chat in Personal
+
+  Scenario: a new chat in Personal opens a work chat with no setup
+    Given the workbench is open
+    When I start a new chat in Personal
     Then the run phase is "Init"
     And the active chat is a work chat
-    And I see a chat in All chats
+    And I see a chat in Personal

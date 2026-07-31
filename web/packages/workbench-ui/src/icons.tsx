@@ -16,7 +16,11 @@ export type IconName =
     | "pull-latest"
     | "send"
     | "queue"
-    | "filter";
+    | "filter"
+    | "git-branch"
+    | "robot"
+    | "kebab"
+    | "pencil";
 
 // Each entry is a *factory*, not a stored element: Solid evaluates JSX into real
 // DOM nodes eagerly, and a node can only live under one parent. An icon used by
@@ -91,6 +95,41 @@ const PATHS: Record<IconName, () => JSX.Element> = {
             <path d="M18 9v6" />
             <path d="M21 12h-6" />
         </>
+    ),
+    // A branching commit graph — a workstream is a shared line of work branching
+    // from, and eventually promoting back into, its project mainline.
+    "git-branch": () => (
+        <>
+            <circle cx="6" cy="4" r="2" />
+            <circle cx="18" cy="6" r="2" />
+            <circle cx="6" cy="20" r="2" />
+            <path d="M6 6v12" />
+            <path d="M18 8c0 5.5-3.5 9-10 9" />
+        </>
+    ),
+    // A small robot face — chats are conversations with an agent, regardless of
+    // whether their root edits an archetype or works in a project placement.
+    robot: () => (
+        <>
+            <rect x="4" y="7" width="16" height="13" rx="2" />
+            <path d="M12 3v4" />
+            <path d="M8 12h.01" />
+            <path d="M16 12h.01" />
+            <path d="M8 16h8" />
+        </>
+    ),
+    // Three dots — a row's "more actions" menu affordance (ADR 0112). Filled,
+    // not stroked: 1.6px outline circles read as specks at row size.
+    kebab: () => (
+        <>
+            <circle cx="12" cy="5" r="1.9" fill="currentColor" stroke="none" />
+            <circle cx="12" cy="12" r="1.9" fill="currentColor" stroke="none" />
+            <circle cx="12" cy="19" r="1.9" fill="currentColor" stroke="none" />
+        </>
+    ),
+    // A pencil — edit this archetype (the Library row's primary action).
+    pencil: () => (
+        <path d="M4 20l1.2-4.2L16.5 4.5a1.9 1.9 0 0 1 2.7 0l.3.3a1.9 1.9 0 0 1 0 2.7L8.2 18.8 4 20Z" />
     ),
 };
 

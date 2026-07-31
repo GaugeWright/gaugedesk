@@ -17,7 +17,7 @@ Feature: Choosing what to place, and quieter power controls (round 2)
 
   Scenario: an archetype is usable with no placement — a chat in Personal
     Given the workbench is open
-    When I use the archetype "assistant" from its menu
+    When I use the archetype "Default" from its menu
     Then a work chat opens
 
   Scenario: a new chat is titled from its first message

@@ -3,7 +3,7 @@ import { defineBddConfig } from "playwright-bdd";
 // Single source of truth for the harness ports (concurrency-safety). `e2e/run.mjs`
 // resolves a free set per run and exports them; here we just read the resolved values.
 import {
-    adminAppURL,
+    enterpriseAppURL,
     aliceState,
     bobState,
     brokerAddr,
@@ -40,7 +40,7 @@ export default defineConfig({
         trace: "retain-on-failure",
     },
     webServer: [
-        // The rendezvous broker both authorities dial out to (M8 federation).
+        // The hermetic WSS relay both authorities dial out to (M8 federation).
         {
             command: "bash e2e/broker.sh",
             port: ports.broker,
@@ -59,7 +59,7 @@ export default defineConfig({
             timeout: 30_000,
             env: {
                 FED_PORT: String(ports.alice),
-                GAUGEWRIGHT_BROKER_ADDR: brokerAddr,
+                GAUGEWRIGHT_RELAY_ENDPOINT: brokerAddr,
                 GAUGEWRIGHT_E2E_STATE: aliceState,
                 GAUGEWRIGHT_ALLOWED_ORIGINS: previewURL,
             },
@@ -74,7 +74,7 @@ export default defineConfig({
             env: {
                 FED_PORT: String(ports.bob),
                 GAUGEWRIGHT_AUTHORITY: "bob",
-                GAUGEWRIGHT_BROKER_ADDR: brokerAddr,
+                GAUGEWRIGHT_RELAY_ENDPOINT: brokerAddr,
                 GAUGEWRIGHT_E2E_STATE: bobState,
                 GAUGEWRIGHT_ALLOWED_ORIGINS: previewURL,
             },
@@ -87,7 +87,7 @@ export default defineConfig({
         },
         // The SELF-HOSTED enterprise composition (`gaugewright-enterprise-server`,
         // ee/): the /admin/* + SSO surface without the managed planes. The
-        // standalone admin-console scenarios point at it via `?cp=` — enterprise
+        // combined enterprise-workbench scenarios point at it via `?cp=` — enterprise
         // coverage runs against ee code only, never the private cloud repo.
         {
             command: "bash e2e/enterprise-control-plane.sh",
@@ -99,17 +99,16 @@ export default defineConfig({
                 GAUGEWRIGHT_E2E_STATE: enterpriseState,
                 GAUGEWRIGHT_ALLOWED_ORIGINS: [
                     previewURL,
-                    new URL(adminAppURL).origin,
+                    new URL(enterpriseAppURL).origin,
                 ].join(","),
             },
         },
-        // Static preview of the standalone admin-console bundle (SPLIT-2), built by
-        // e2e/run.mjs in its own workspace. The vite preview serves the whole dist,
-        // so the app page sits at /apps/admin-console/ (the ports.mjs URL).
+        // Static preview of the combined enterprise workbench, built by e2e/run.mjs
+        // in its owning workspace. The preview serves the whole dist.
         {
-            command: `npx vite preview --config apps/admin-console/vite.config.ts --port ${ports.adminApp} --strictPort`,
+            command: `npx vite preview --config apps/enterprise-workbench/vite.config.ts --port ${ports.enterpriseApp} --strictPort`,
             cwd: "../ee/web",
-            url: adminAppURL,
+            url: enterpriseAppURL,
             reuseExistingServer: false,
             timeout: 30_000,
         },

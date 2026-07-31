@@ -11,7 +11,7 @@ Feature: Placement version upgrade (UX-9, ADR 0063)
     Given the workbench is open
     When I create a project named "site"
     And I place an archetype on the project "site"
-    And I publish a new version of the archetype "assistant"
+    And I publish a new version of the archetype "Default"
     Then the placement on "site" shows an upgrade is available
     When I upgrade the placement on "site"
     Then the placement on "site" is up to date

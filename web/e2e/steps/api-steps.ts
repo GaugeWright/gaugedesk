@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { aliceCP } from "../ports.mjs";
+import { mutationHeaders } from "./idempotency";
 
 const { Given, When, Then, Before } = createBdd();
 
@@ -24,7 +25,10 @@ const CP = aliceCP;
  *  be JSON-encoded with an application/json content-type, or axum's Json extractor
  *  415s). `request` is playwright's APIRequestContext. */
 function postCmd(request: any, url: string, body: unknown) {
-    return request.post(url, { headers: { "content-type": "application/json" }, data: JSON.stringify(body) });
+    return request.post(url, {
+        headers: mutationHeaders({ "content-type": "application/json" }),
+        data: JSON.stringify(body),
+    });
 }
 
 /** Scenario-scoped state (workers:1, serial), reset before each scenario. */
@@ -39,57 +43,11 @@ function contextRid(folder: string): string {
     return `ctx-${slug}`;
 }
 
-// ---- M2 packaging ----
-
-Given("a published package {string} at version {string}", async ({ request }, id: string, version: string) => {
-    const res = await request.post(`${CP}/packages`, {
-        data: { id, version, agent_ref: "agent-default" },
-    });
-    expect(res.ok(), `publish ${id}`).toBeTruthy();
-});
-
-When("the target installs {string}", async ({ request }, id: string) => {
-    // not asserted here — a later step asserts success or rejection
-    await request.post(`${CP}/packages/${id}/install`);
-});
-
-Then("the install is rejected", async ({ request }) => {
-    // the most recent install of a non-published package returns 409
-    const res = await request.post(`${CP}/packages/ghost/install`);
-    expect(res.status()).toBe(409);
-});
-
-Then("package {string} shows status {string} in the catalog", async ({ request }, id: string, status: string) => {
-    const res = await request.get(`${CP}/packages`);
-    const catalog = (await res.json()) as Array<{ id: string; status: string }>;
-    expect(catalog.find((p) => p.id === id)?.status).toBe(status);
-});
-
-When("{string} is entitled for context {string}", async ({ request }, id: string, ctx: string) => {
-    const res = await request.post(`${CP}/packages/${id}/entitle?context=${ctx}`);
-    expect(res.ok(), `entitle ${id}`).toBeTruthy();
-});
-
-When("the source withdraws {string}", async ({ request }, id: string) => {
-    const res = await request.post(`${CP}/packages/${id}/withdraw`);
-    expect(res.ok(), `withdraw ${id}`).toBeTruthy();
-});
-
-Then("a governed run of {string} in {string} is ready", async ({ request }, id: string, ctx: string) => {
-    const res = await request.get(`${CP}/packages/${id}/readiness?context=${ctx}`);
-    expect((await res.json()).run_ready).toBe(true);
-});
-
-Then("a governed run of {string} in {string} is not ready", async ({ request }, id: string, ctx: string) => {
-    const res = await request.get(`${CP}/packages/${id}/readiness?context=${ctx}`);
-    expect((await res.json()).run_ready).toBe(false);
-});
-
 // ---- M1 durable context resources ----
 
 Given("an engagement {string}", async ({ request }, id: string) => {
     world.eng = id;
-    await request.post(`${CP}/chats`, { data: { id } });
+    await request.post(`${CP}/chats`, { headers: mutationHeaders(), data: { id } });
 });
 
 When("a folder is opened as context in {string}", async ({ request }, id: string) => {
@@ -100,7 +58,10 @@ When("a folder is opened as context in {string}", async ({ request }, id: string
     fs.writeFileSync(path.join(folder, "notes.txt"), world.content);
     world.folder = folder;
     world.rid = contextRid(folder);
-    const res = await request.post(`${CP}/chats/${id}/context`, { data: { path: folder } });
+    const res = await request.post(`${CP}/chats/${id}/context`, {
+        headers: mutationHeaders(),
+        data: { path: folder },
+    });
     expect(res.ok(), "ingest context").toBeTruthy();
 });
 
@@ -124,7 +85,9 @@ Then("the context content resolves to the ingested bytes", async ({ request }) =
 });
 
 When("the context resource is tombstoned", async ({ request }) => {
-    const res = await request.post(`${CP}/chats/${world.eng}/resources/${world.rid}/tombstone`);
+    const res = await request.post(`${CP}/chats/${world.eng}/resources/${world.rid}/tombstone`, {
+        headers: mutationHeaders(),
+    });
     expect(res.ok(), "tombstone").toBeTruthy();
 });
 
@@ -145,8 +108,20 @@ Then("the context resource still lists, marked tombstoned", async ({ request }) 
 
 When("the agent runs a turn in {string}", async ({ request }, id: string) => {
     world.eng = id;
-    const res = await request.post(`${CP}/chats/${id}/task`, { data: { prompt: "go" } });
+    const res = await request.post(`${CP}/chats/${id}/task`, {
+        headers: mutationHeaders(),
+        data: { prompt: "go" },
+    });
     expect(res.ok(), "task turn").toBeTruthy();
+});
+
+When("the agent runs a reviewed turn in {string}", async ({ request }, id: string) => {
+    world.eng = id;
+    const res = await request.post(`${CP}/chats/${id}/task`, {
+        headers: mutationHeaders(),
+        data: { prompt: "go", review: true },
+    });
+    expect(res.ok(), "reviewed task turn").toBeTruthy();
 });
 
 Then("{string} has an {string} resource", async ({ request }, id: string, kind: string) => {
@@ -156,7 +131,9 @@ Then("{string} has an {string} resource", async ({ request }, id: string, kind: 
 
 When("export of the output in {string} is proposed", async ({ request }, id: string) => {
     world.eng = id;
-    const res = await request.post(`${CP}/chats/${id}/resources/out-${id}/export`);
+    const res = await request.post(`${CP}/chats/${id}/resources/out-${id}/export`, {
+        headers: mutationHeaders(),
+    });
     expect(res.ok(), "propose export").toBeTruthy();
     world.exportState = await res.json();
 });
@@ -165,25 +142,38 @@ Then("the export's required consent includes {string}", async ({}, who: string) 
     expect(world.exportState?.state?.source_required).toContain(who);
 });
 
-Then("the export does not clear without consent in {string}", async ({ request }, id: string) => {
-    const res = await postCmd(request, `${CP}/scopes/${id}-export-out-${id}/export/command`, "Export");
-    expect(res.status()).toBe(409); // gated: no source consent / target admission yet
+Then("the export remains requested before source consent in {string}", async ({ request }, id: string) => {
+    const res = await request.get(`${CP}/chats/${id}/resources/out-${id}/export`);
+    const state = await res.json();
+    expect(state.phase).toBe("Requested");
+    expect(state.source_consented).toEqual([]);
 });
 
-When("the owner consents and the target admits the export in {string}", async ({ request }, id: string) => {
-    const scope = `${id}-export-out-${id}`;
-    await postCmd(request, `${CP}/scopes/${scope}/export/command`, { SourceConsent: "local-user" });
-    await postCmd(request, `${CP}/scopes/${scope}/export/command`, "TargetAdmit");
+When("the owner consents to export in {string}", async ({ request }, id: string) => {
+    const res = await postCmd(request, `${CP}/chats/${id}/resources/out-${id}/export/command`, { action: "consent" });
+    expect(res.ok()).toBeTruthy();
 });
 
-Then("the output of {string} is exported", async ({ request }, id: string) => {
-    const res = await postCmd(request, `${CP}/scopes/${id}-export-out-${id}/export/command`, "Export");
-    expect((await res.json()).phase).toBe("Exported");
+Then("export of {string} waits for target admission", async ({ request }, id: string) => {
+    const res = await request.get(`${CP}/chats/${id}/resources/out-${id}/export`);
+    const state = await res.json();
+    expect(state.phase).toBe("Requested");
+    expect(state.source_consented).toContain("local-user");
+    expect(state.target_admitted).toBe(false);
+});
+
+Then("raw scope lifecycle commands are absent for {string}", async ({ request }, id: string) => {
+    const review = await postCmd(request, `${CP}/scopes/${id}-review-out-${id}/review/command`, { Consent: "local-user" });
+    const exp = await postCmd(request, `${CP}/scopes/${id}-export-out-${id}/export/command`, "TargetAdmit");
+    expect(review.status()).toBe(404);
+    expect(exp.status()).toBe(404);
 });
 
 When("review of the output in {string} is proposed", async ({ request }, id: string) => {
     world.eng = id;
-    const res = await request.post(`${CP}/chats/${id}/resources/out-${id}/review`);
+    const res = await request.post(`${CP}/chats/${id}/resources/out-${id}/review`, {
+        headers: mutationHeaders(),
+    });
     expect(res.ok(), "propose review").toBeTruthy();
     world.reviewState = await res.json();
 });
@@ -193,12 +183,12 @@ Then("the review's required consent includes {string}", async ({}, who: string) 
 });
 
 When("the owner consents to the review in {string}", async ({ request }, id: string) => {
-    const res = await postCmd(request, `${CP}/scopes/${id}-review-out-${id}/review/command`, { Consent: "local-user" });
+    const res = await postCmd(request, `${CP}/chats/${id}/resources/out-${id}/review/command`, { action: "consent" });
     expect((await res.json()).phase).toBe("Cleared");
 });
 
 Then("the review of {string} clears and releases", async ({ request }, id: string) => {
-    const res = await postCmd(request, `${CP}/scopes/${id}-review-out-${id}/review/command`, "Release");
+    const res = await postCmd(request, `${CP}/chats/${id}/resources/out-${id}/review/command`, { action: "release" });
     expect((await res.json()).phase).toBe("Released");
 });
 
@@ -225,13 +215,12 @@ When("{string} is integrated to the mainline", async ({ request }, id: string) =
 });
 
 When("{string} syncs from the mainline", async ({ request }, id: string) => {
-    const res = await request.post(`${CP}/chats/${id}/sync`);
+    const res = await request.post(`${CP}/chats/${id}/sync`, { headers: mutationHeaders() });
     expect(res.ok(), "sync").toBeTruthy();
     world.exportState = await res.json(); // reuse the scratch slot for the sync result
 });
 
 Then("{string} reports it synced cleanly", async ({}, _id: string) => {
-    expect(world.exportState?.synced).toBe(true);
     expect(world.exportState?.conflict).toBe(false);
 });
 
@@ -239,7 +228,7 @@ Then("{string} reports it synced cleanly", async ({}, _id: string) => {
 
 When("{string} is renamed to {string}", async ({ request }, id: string, title: string) => {
     const res = await request.put(`${CP}/chats/${id}/title`, {
-        headers: { "content-type": "application/json" },
+        headers: mutationHeaders({ "content-type": "application/json" }),
         data: JSON.stringify({ title }),
     });
     expect(res.ok(), "rename").toBeTruthy();

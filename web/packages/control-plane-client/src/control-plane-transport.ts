@@ -1,4 +1,20 @@
-export type RouteJson = (method: string, path: string, body?: unknown) => Promise<unknown>;
+export interface RouteOptions {
+    /** Stable across retries of one logical command. */
+    readonly idempotencyKey?: string;
+}
+
+export type RouteJson = (
+    method: string,
+    path: string,
+    body?: unknown,
+    options?: RouteOptions,
+) => Promise<unknown>;
+
+/** Mint the caller-owned key before a command is sent. Keeping key creation at
+ *  the edge lets a retry reuse it instead of asking the server to guess identity. */
+export function newIdempotencyKey(): string {
+    return globalThis.crypto.randomUUID();
+}
 
 /**
  * The control-plane base URL for this client. A multi-machine session points two
@@ -55,29 +71,6 @@ export function controlPlaneBase(): string {
         }
     }
     return SOLO_CONTROL_PLANE;
-}
-
-/** Whether this client is pointed at an **explicit org control plane** — an enrolled
- *  enterprise endpoint (persisted via {@link setControlPlaneBase}) or a per-load `?cp=`
- *  override — rather than the bare co-resident **solo** default (DEPLOY-7, ADR 0059 §6).
- *  Solo is the degenerate case: "you are not an org", so the tenant admin console is hidden.
- *  Pure (args are the page's search string + a storage), so the gate is unit-testable. */
-export function isProvisionedTenant(
-    search: string,
-    storage: Pick<Storage, "getItem"> | null,
-): boolean {
-    if (new URLSearchParams(search).get("cp")) return true;
-    return storage?.getItem(CP_KEY) != null;
-}
-
-/** {@link isProvisionedTenant} for the live page — false (solo) when there is no `window`. */
-export function isProvisionedTenantContext(): boolean {
-    if (typeof window === "undefined") return false;
-    try {
-        return isProvisionedTenant(window.location.search, window.localStorage);
-    } catch {
-        return isProvisionedTenant(window.location.search, null);
-    }
 }
 
 /** Persist the **enterprise** org control-plane endpoint (DEPLOY-5): the enrolled app then

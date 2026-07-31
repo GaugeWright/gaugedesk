@@ -78,6 +78,12 @@ pub struct PendingAuth {
     /// client (Google "Web application" clients do, even with PKCE). `None` for a public PKCE
     /// client (Okta/Entra). Held [`Secret`](gaugewright_app::secret::Secret) so it never logs.
     pub client_secret: Option<gaugewright_app::secret::Secret>,
+    /// Exact allowlisted native return URI selected on the login leg. The
+    /// callback trusts only this server-side value, never callback input.
+    pub native_return: Option<String>,
+    /// App-generated S256 challenge binding a native handoff to the GaugeDesk
+    /// instance that initiated it. Required whenever `native_return` is set.
+    pub native_handoff_challenge: Option<String>,
 }
 
 /// In-flight `/auth/login` → `/auth/callback` PKCE state, keyed by CSRF `state`
@@ -130,6 +136,7 @@ impl PendingAuthStore {
 #[derive(Clone, Default)]
 pub struct EnterpriseAuthState {
     pending_auth: Arc<Mutex<PendingAuthStore>>,
+    mobile_handoffs: Arc<Mutex<MobileHandoffStore>>,
 }
 
 impl EnterpriseAuthState {
@@ -143,6 +150,50 @@ impl EnterpriseAuthState {
     /// operation — the store's single-use `take` stays atomic).
     pub fn pending_auth_mut(&self) -> MutexGuard<'_, PendingAuthStore> {
         self.pending_auth.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn mobile_handoffs_mut(&self) -> MutexGuard<'_, MobileHandoffStore> {
+        self.mobile_handoffs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+struct MobileHandoff {
+    id_token: gaugewright_app::secret::Secret,
+    challenge: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct MobileHandoffStore {
+    by_code: BTreeMap<String, MobileHandoff>,
+}
+
+impl MobileHandoffStore {
+    fn issue(&mut self, id_token: String, challenge: String, now: Instant) -> String {
+        self.by_code.retain(|_, handoff| handoff.expires_at > now);
+        let code = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(gaugewright_app::session::random_bytes::<32>());
+        self.by_code.insert(
+            code.clone(),
+            MobileHandoff {
+                id_token: id_token.into(),
+                challenge,
+                expires_at: now + Duration::from_secs(5 * 60),
+            },
+        );
+        code
+    }
+
+    fn redeem(&mut self, code: &str, verifier: &str, now: Instant) -> Option<String> {
+        let handoff = self.by_code.remove(code)?;
+        if handoff.expires_at <= now
+            || crate::identity_oidc::s256_challenge(verifier) != handoff.challenge
+        {
+            return None;
+        }
+        Some(handoff.id_token.expose().to_string())
     }
 }
 
@@ -211,6 +262,8 @@ pub fn start_login(
         // The pure login leg carries no secret; the handler injects one from env for a
         // confidential OP (Google). Public PKCE clients leave it `None`.
         client_secret: None,
+        native_return: None,
+        native_handoff_challenge: None,
     };
     Ok((url, state, pending))
 }
@@ -543,6 +596,52 @@ pub fn activate_configured_idp(wb: &mut Workbench) {
     }
 }
 
+/// Runtime activation outcome after an admitted SSO reconfiguration. The
+/// connection is durable even when an unreachable IdP leaves the prior verifier
+/// in place; this result is operational evidence only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeIdpActivation {
+    pub oidc_active: bool,
+    pub activation_error: Option<String>,
+}
+
+/// Activate an admitted SSO connection without blocking the async runtime. Only
+/// a warm OIDC provider replaces an existing verifier, so a bad runtime edit
+/// cannot lock current administrators out.
+pub async fn activate_updated_idp(
+    wb: &SharedWorkbench,
+    sso: SsoConnectionRecord,
+) -> RuntimeIdpActivation {
+    let built = tokio::task::spawn_blocking(move || build_oidc_idp(Some(&sso))).await;
+    match built {
+        Ok(None) => {
+            wb.lock_unpoisoned().set_identity_provider(None);
+            RuntimeIdpActivation {
+                oidc_active: false,
+                activation_error: None,
+            }
+        }
+        Ok(Some((idp, true))) => {
+            wb.lock_unpoisoned().set_identity_provider(Some(idp));
+            RuntimeIdpActivation {
+                oidc_active: true,
+                activation_error: None,
+            }
+        }
+        Ok(Some((_idp, false))) => RuntimeIdpActivation {
+            oidc_active: wb.lock_unpoisoned().has_idp(),
+            activation_error: Some(
+                "OIDC discovery failed (issuer unreachable?); connection saved but not activated — the existing verifier is unchanged"
+                    .to_string(),
+            ),
+        },
+        Err(_) => RuntimeIdpActivation {
+            oidc_active: wb.lock_unpoisoned().has_idp(),
+            activation_error: Some("activation task panicked".to_string()),
+        },
+    }
+}
+
 /// Extract the `email` claim from an **already-verified** id-token (the caller verified
 /// signature + claims via [`finish_callback`]) — used only for JIT domain matching, so
 /// decoding the payload without re-checking the signature is safe here. `None` if the
@@ -592,7 +691,7 @@ pub fn jit_provision(wb: &mut Workbench, scope: &str, authority: &str, id_token:
         team: None,
     };
     crate::org_routes::write_membership(wb, scope, &record);
-    gaugewright_app::audit::record(wb, authority, "member.jit-provision", authority);
+    gaugewright_app::audit::record_in(wb, scope, authority, "member.jit-provision", authority);
     true
 }
 
@@ -682,6 +781,57 @@ pub fn google_sso(issuer: &str, client_id: &str) -> SsoConnectionRecord {
     }
 }
 
+/// A safe label for the already-authenticated sign-in session. This is a
+/// session projection, not a durable linked-method or recovery declaration.
+fn session_method(sso: Option<&SsoConnectionRecord>) -> (&'static str, &'static str) {
+    let Some(sso) = sso else {
+        return ("local", "Local account");
+    };
+    match sso.protocol {
+        SsoProtocol::Oidc
+            if sso.issuer.contains("accounts.google.com")
+                || sso.issuer.contains("googleusercontent.com") =>
+        {
+            ("google", "Google")
+        }
+        SsoProtocol::Oidc => ("oidc", "Single sign-on (OIDC)"),
+        SsoProtocol::Saml => ("saml", "Single sign-on (SAML)"),
+    }
+}
+
+/// `GET /auth/session` — the currently authenticated session's sign-in method.
+/// It exposes no token, email, subject, refresh state, or tenant membership and
+/// must not be rendered as a durable linked-method/custody fact.
+pub async fn get_session(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    if wb.actor(gaugewright_app::net_http::bearer(&headers)) == "anonymous" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "authenticate to view this session",
+        )
+            .into_response();
+    }
+    // The hosted person account is authenticated by its account-level Google/OIDC
+    // connection, never by whichever tenant the Console currently has selected.
+    // Enterprise/desktop keeps its tenant-scoped connection projection.
+    let sso = if web_account_mode() {
+        web_account_sso_from_env()
+    } else {
+        Org::rebuild_in(wb.store_ref(), &crate::org_routes::req_scope(&headers))
+            .ok()
+            .and_then(|org| org.sso)
+    };
+    let (method, label) = session_method(sso.as_ref());
+    (
+        StatusCode::OK,
+        Json(json!({ "method": method, "label": label })),
+    )
+        .into_response()
+}
+
 /// The shared web-account session cookie (`ADR 0077`) carrying the verified id-token as its
 /// value (the same credential the control plane accepts, `net_http::bearer`). Pure; the env
 /// wrapper is [`session_cookie_header`]. `domain` (e.g. `.gaugewright.com`) makes one sign-in
@@ -703,6 +853,16 @@ pub fn session_cookie_value(id_token: &str, domain: Option<&str>, secure: bool) 
     c
 }
 
+/// Expire the shared web-account cookie using the same path/domain/security attributes used
+/// when it was issued. Matching those attributes matters: clearing a host-only cookie would
+/// leave the production `Domain=.gaugewright.com` cookie alive and the next request would appear
+/// to sign the person straight back in.
+pub fn expired_session_cookie_value(domain: Option<&str>, secure: bool) -> String {
+    let mut c = session_cookie_value("", domain, secure);
+    c.push_str("; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+    c
+}
+
 /// The OAuth **client secret** for a confidential OP (Google), from `GAUGEWRIGHT_GOOGLE_CLIENT_SECRET`.
 /// `None` when unset — a public PKCE client (Okta/Entra) needs no secret at exchange.
 fn google_client_secret_from_env() -> Option<gaugewright_app::secret::Secret> {
@@ -721,6 +881,14 @@ fn session_cookie_header(id_token: &str) -> String {
         .map(|v| v == "1")
         .unwrap_or(false);
     session_cookie_value(id_token, domain.as_deref(), !insecure)
+}
+
+fn expired_session_cookie_header() -> String {
+    let domain = std::env::var("GAUGEWRIGHT_SESSION_COOKIE_DOMAIN").ok();
+    let insecure = std::env::var("GAUGEWRIGHT_SESSION_COOKIE_INSECURE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    expired_session_cookie_value(domain.as_deref(), !insecure)
 }
 
 // ---- axum handlers -------------------------------------------------------
@@ -771,7 +939,15 @@ pub async fn get_login(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<EnterpriseAuthState>,
     headers: HeaderMap,
+    Query(query): Query<LoginQuery>,
 ) -> impl IntoResponse {
+    let native_return = match native_return_uri(
+        query.return_to.as_deref(),
+        query.handoff_challenge.as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     let sso = {
         let wb = wb.lock_unpoisoned();
         match Org::rebuild_in(wb.store_ref(), &crate::org_routes::req_scope(&headers)) {
@@ -808,9 +984,40 @@ pub async fn get_login(
     };
     // Inject the confidential-client secret (Google) for the token exchange, if configured.
     pending.client_secret = google_client_secret_from_env();
+    pending.native_return = native_return;
+    pending.native_handoff_challenge = query.handoff_challenge;
 
     auth.pending_auth_mut().begin(state, pending);
     Redirect::to(&url).into_response()
+}
+
+#[derive(Default, Deserialize)]
+pub struct LoginQuery {
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    handoff_challenge: Option<String>,
+}
+
+fn native_return_uri(
+    raw: Option<&str>,
+    challenge: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    match (raw, challenge) {
+        (None | Some(""), None) => Ok(None),
+        (Some("gaugewright://auth/callback"), Some(challenge))
+            if challenge.len() == 43
+                && challenge
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') =>
+        {
+            Ok(Some("gaugewright://auth/callback".to_string()))
+        }
+        (Some("gaugewright://auth/callback"), _) => {
+            Err("native login requires a valid handoff challenge")
+        }
+        _ => Err("unsupported login return URI"),
+    }
 }
 
 /// The OP's redirect-back query: a success carries `code` + `state`; a denial carries
@@ -888,6 +1095,8 @@ pub async fn get_callback(
         throttle.record_failure(&tenant, now);
         return (StatusCode::BAD_REQUEST, "unknown or expired state").into_response();
     };
+    let native_return = pending.native_return.clone();
+    let native_handoff_challenge = pending.native_handoff_challenge.clone();
 
     let finished = tokio::task::spawn_blocking(move || {
         let http = HttpClient::new();
@@ -913,13 +1122,15 @@ pub async fn get_callback(
     {
         let mut wb = wb.lock_unpoisoned();
         let actor = authority.as_str().to_string();
-        gaugewright_app::audit::record(&mut wb, &actor, "auth.login", authority.as_str());
-        jit_provision(
+        let store_scope = crate::org_routes::req_scope(&headers);
+        gaugewright_app::audit::record_in(
             &mut wb,
-            &crate::org_routes::req_scope(&headers),
+            &store_scope,
+            &actor,
+            "auth.login",
             authority.as_str(),
-            &id_token,
         );
+        jit_provision(&mut wb, &store_scope, authority.as_str(), &id_token);
         // Hosted web account (ADR 0077 §9): a successful login provisions the person's personal
         // tenant-of-one (idempotent) so they land in the Console with their own space. No-op on
         // the enterprise/desktop paths (web-account mode off).
@@ -932,6 +1143,24 @@ pub async fn get_callback(
                 store_refresh_token(&mut wb, authority.as_str(), rt);
             }
         }
+    }
+
+    // The custom-scheme redirect carries only a one-time opaque code. The app
+    // must redeem it with the verifier whose challenge was pinned to the login
+    // state; an app that intercepts the scheme cannot obtain the id-token.
+    if let Some(native_return) = native_return {
+        let Some(challenge) = native_handoff_challenge else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "native handoff challenge was lost",
+            )
+                .into_response();
+        };
+        let code = auth
+            .mobile_handoffs_mut()
+            .issue(id_token, challenge, Instant::now());
+        let target = format!("{native_return}#code={code}");
+        return Redirect::to(&target).into_response();
     }
 
     // Hosted web account (ADR 0077): deliver the session as the shared `Domain=.gaugewright.com`
@@ -1040,6 +1269,115 @@ pub async fn get_refresh(
     )
         .into_response();
     if let Ok(cookie) = axum::http::HeaderValue::from_str(&session_cookie_header(&new_id)) {
+        resp.headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
+    }
+    resp
+}
+
+/// Refresh a native GaugeDesk account session. A still-valid short-lived
+/// id-token identifies the person; the platform uses the refresh token sealed
+/// in that person's account scope and returns only a replacement id-token.
+pub async fn post_mobile_refresh(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !web_account_mode() {
+        return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
+    }
+    let bearer = gaugewright_app::net_http::bearer(&headers).map(str::to_string);
+    let (person, refresh_token) = {
+        let g = wb.lock_unpoisoned();
+        let person = g.actor(bearer.as_deref());
+        if person == "anonymous" {
+            return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
+        }
+        match resolve_refresh_token(&g, &person) {
+            Some(token) => (person, token),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "no refresh token on file; sign in again",
+                )
+                    .into_response()
+            }
+        }
+    };
+    let Some(sso) = web_account_sso_from_env() else {
+        return (StatusCode::CONFLICT, "web-account SSO not configured").into_response();
+    };
+    let client_id = sso.audiences.first().cloned().unwrap_or_default();
+    let client_secret = google_client_secret_from_env().map(|secret| secret.expose().to_string());
+    let issuer = sso.issuer.clone();
+    let refreshed = tokio::task::spawn_blocking(move || {
+        let http = HttpClient::new();
+        let endpoints =
+            discover_endpoints(&issuer, &http).map_err(|error| format!("discovery: {error}"))?;
+        refresh_id_token(
+            &endpoints.token_endpoint,
+            &client_id,
+            client_secret.as_deref(),
+            &refresh_token,
+            &http,
+        )
+    })
+    .await;
+    match refreshed {
+        Ok(Ok(id_token)) => (
+            StatusCode::OK,
+            Json(json!({
+                "person": person,
+                "id_token": id_token,
+                "token_type": "Bearer",
+            })),
+        )
+            .into_response(),
+        Ok(Err(error)) => {
+            (StatusCode::BAD_GATEWAY, format!("refresh failed: {error}")).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "refresh task panicked").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MobileHandoffExchange {
+    code: String,
+    verifier: String,
+}
+
+/// Redeem a single-use native login handoff. Neither the OIDC id-token nor its
+/// refresh authority rides the custom-scheme URL.
+pub async fn post_mobile_exchange(
+    Extension(auth): Extension<EnterpriseAuthState>,
+    Json(request): Json<MobileHandoffExchange>,
+) -> impl IntoResponse {
+    if !web_account_mode() {
+        return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
+    }
+    let token = auth
+        .mobile_handoffs_mut()
+        .redeem(&request.code, &request.verifier, Instant::now());
+    match token {
+        Some(id_token) => (
+            StatusCode::OK,
+            Json(json!({ "id_token": id_token, "token_type": "Bearer" })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            "unknown, expired, or incorrectly bound native handoff",
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /auth/logout` — end the browser's hosted account session. The OIDC id-token is
+/// self-contained and naturally expires server-side; logout removes the browser's only copy of
+/// it. The handler is intentionally idempotent and does not require a still-valid session, so an
+/// expired user can always return to a clean signed-out state.
+pub async fn post_logout() -> impl IntoResponse {
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    if let Ok(cookie) = axum::http::HeaderValue::from_str(&expired_session_cookie_header()) {
         resp.headers_mut()
             .append(axum::http::header::SET_COOKIE, cookie);
     }
@@ -1193,6 +1531,8 @@ iqlTEKVISscuchxZtKQJ4k8=
             redirect_uri: "http://localhost/auth/callback".into(),
             mapping: ClaimMapping::default(),
             client_secret: None,
+            native_return: None,
+            native_handoff_challenge: None,
         };
         store.begin("state-1", pending);
         assert_eq!(store.len(), 1);
@@ -1202,6 +1542,52 @@ iqlTEKVISscuchxZtKQJ4k8=
             "second take is empty (single-use)"
         );
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn native_login_return_is_exactly_allowlisted() {
+        let challenge =
+            crate::identity_oidc::s256_challenge("0123456789012345678901234567890123456789012");
+        assert_eq!(native_return_uri(None, None), Ok(None));
+        assert_eq!(
+            native_return_uri(Some("gaugewright://auth/callback"), Some(&challenge)),
+            Ok(Some("gaugewright://auth/callback".to_string()))
+        );
+        assert!(native_return_uri(Some("gaugewright://auth/callback"), None).is_err());
+        assert!(
+            native_return_uri(Some("https://attacker.example/callback"), Some(&challenge)).is_err()
+        );
+        assert!(
+            native_return_uri(Some("gaugewright://auth/callback/extra"), Some(&challenge)).is_err()
+        );
+    }
+
+    #[test]
+    fn native_handoff_is_pkce_bound_single_use_and_expires() {
+        let verifier = "0123456789012345678901234567890123456789012";
+        let challenge = crate::identity_oidc::s256_challenge(verifier);
+        let now = Instant::now();
+        let mut store = MobileHandoffStore::default();
+        let code = store.issue("id-token".to_string(), challenge.clone(), now);
+        assert_eq!(store.redeem(&code, "wrong-verifier", now), None);
+        assert_eq!(
+            store.redeem(&code, verifier, now),
+            None,
+            "a failed proof consumes the code"
+        );
+
+        let code = store.issue("id-token".to_string(), challenge.clone(), now);
+        assert_eq!(
+            store.redeem(&code, verifier, now),
+            Some("id-token".to_string())
+        );
+        assert_eq!(store.redeem(&code, verifier, now), None);
+
+        let code = store.issue("id-token".to_string(), challenge, now);
+        assert_eq!(
+            store.redeem(&code, verifier, now + Duration::from_secs(301)),
+            None,
+        );
     }
 
     #[test]
@@ -1359,6 +1745,16 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(!dev.contains("Domain="));
         assert!(!dev.contains("Secure"));
         assert!(dev.contains("HttpOnly"));
+    }
+
+    #[test]
+    fn expired_session_cookie_clears_the_same_shared_cookie() {
+        let c = expired_session_cookie_value(Some(".gaugewright.com"), true);
+        assert!(c.starts_with("gw_session=;"));
+        assert!(c.contains("Domain=.gaugewright.com"));
+        assert!(c.contains("Path=/") && c.contains("HttpOnly") && c.contains("Secure"));
+        assert!(c.contains("Max-Age=0"));
+        assert!(c.contains("Expires=Thu, 01 Jan 1970 00:00:00 GMT"));
     }
 
     #[test]
@@ -1638,5 +2034,23 @@ iqlTEKVISscuchxZtKQJ4k8=
             finish_callback(&pending, "code", &op),
             Err(CallbackError::Exchange(_))
         ));
+    }
+
+    #[test]
+    fn session_method_is_a_safe_current_connection_label() {
+        assert_eq!(session_method(None), ("local", "Local account"));
+        let google = google_sso("https://accounts.google.com", "client");
+        assert_eq!(session_method(Some(&google)), ("google", "Google"));
+        let mut oidc = google.clone();
+        oidc.issuer = "https://login.example.test".into();
+        assert_eq!(
+            session_method(Some(&oidc)),
+            ("oidc", "Single sign-on (OIDC)")
+        );
+        oidc.protocol = SsoProtocol::Saml;
+        assert_eq!(
+            session_method(Some(&oidc)),
+            ("saml", "Single sign-on (SAML)")
+        );
     }
 }

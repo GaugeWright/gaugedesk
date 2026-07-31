@@ -161,14 +161,15 @@ pub async fn post_scim_user(
         .iter()
         .filter_map(|g| g.value.clone().or_else(|| g.display.clone()))
         .collect();
-    if let Ok(org) = Org::rebuild_in(wb.store_ref(), &crate::org_routes::req_scope(&headers)) {
+    let store_scope = crate::org_routes::req_scope(&headers);
+    if let Ok(org) = Org::rebuild_in(wb.store_ref(), &store_scope) {
         if let Some((role, team)) = org.role_for_groups(&group_names) {
             rec.role = role;
             rec.team = team;
         }
     }
-    write_membership(&mut wb, &crate::org_routes::req_scope(&headers), &rec);
-    gaugewright_app::audit::record(&mut wb, "scim", "scim.provision", &rec.id);
+    write_membership(&mut wb, &store_scope, &rec);
+    gaugewright_app::audit::record_in(&mut wb, &store_scope, "scim", "scim.provision", &rec.id);
     (StatusCode::CREATED, Json(scim_user(&rec))).into_response()
 }
 
@@ -297,7 +298,7 @@ fn set_active(wb: &mut Workbench, scope: &str, id: &str, active: bool) -> axum::
     } else {
         "scim.deprovision"
     };
-    gaugewright_app::audit::record(wb, "scim", action, &rec.id);
+    gaugewright_app::audit::record_in(wb, scope, "scim", action, &rec.id);
     (StatusCode::OK, Json(scim_user(&rec))).into_response()
 }
 

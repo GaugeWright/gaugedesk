@@ -12,73 +12,105 @@
 pub mod account;
 pub mod account_routes;
 pub mod advancement;
+pub mod agent_question;
+pub mod agent_release;
 pub mod app_support;
 pub mod at_rest;
 pub mod attention;
 pub mod attestation_verifier;
 pub mod audit;
+pub mod backup_keyring;
 pub mod boundary_keeper;
 pub mod challenge;
+pub mod client_admission;
 pub mod codex_oauth;
+pub mod collection_recipient;
+pub mod command_idempotency;
+pub mod console_routes;
 pub mod content_vault;
 pub mod crypto_erasure;
+pub mod deployment_pricing;
 pub mod device_enroll;
 pub mod device_enroll_drive;
 pub mod directory_sync;
+pub mod discipline;
 pub mod engagement_routes;
 pub mod engine;
+pub mod environment_agent;
+pub mod environment_contract;
 pub mod facility;
 pub mod facility_routes;
-pub mod fed_harness;
 pub mod federation;
 pub mod federation_relay;
+pub mod gate;
+pub mod gate_service;
 pub mod harness_select;
+pub mod home;
+pub mod home_admission;
+pub mod home_backup;
+pub mod home_invitation;
+pub mod home_routes;
 pub mod identity;
 pub mod key_store;
 pub mod library;
 pub mod library_routes;
 pub mod library_state;
 pub mod lifecycle_routes;
+pub mod local_model_broker;
 pub mod local_routes;
+pub mod managed_inference;
 pub mod measurement_store;
 pub mod mobile_bridge;
+pub mod mobile_machine_session;
+pub mod mobile_wake_runtime;
 pub mod net_http;
 pub mod net_relay;
 pub mod net_server;
 pub mod net_tls;
+pub mod official_skills;
 pub mod onboarding;
 pub mod open_api;
 pub mod open_route_stack;
 pub mod open_runtime;
 pub mod org;
 pub mod package_flow;
-pub mod package_routes;
 pub mod package_store;
 pub mod policy_compiler;
 pub mod project_credential_routes;
+pub mod publisher_routes;
+pub mod quarantine;
 pub mod remote_runtime;
 pub mod resource_store;
+pub mod roster;
 pub mod secret;
 pub mod session;
 pub mod session_activity;
 pub mod stream;
+pub mod target_adapter;
 pub mod tenancy;
 pub mod throttle;
+pub mod turn_summary;
 pub mod workbench_auth;
 pub mod workbench_state;
 pub mod workstream_routes;
 pub(crate) use app_support::io;
 pub use app_support::LockUnpoisoned;
 pub use app_support::{
-    AttestationMode, DEFAULT_AGENT, DEFAULT_INSTANCE, DEFAULT_PLACEMENT, DEFAULT_PROJECT,
-    LOCAL_AUTHORITY,
+    AttestationMode, RuntimePackageDescriptor, DEFAULT_AGENT, DEFAULT_INSTANCE, DEFAULT_PLACEMENT,
+    DEFAULT_PROJECT, LOCAL_AUTHORITY,
 };
-pub use gaugewright_whip_runtime::{AdmittedPolicyEpoch, PolicyAdmissionError, PolicyEpoch};
+pub use gaugewright_whip_runtime::{
+    AdmittedPolicyEpoch, DoHostConfig, DoHostRequest, DoHostResponse, DoHostTransport,
+    PolicyAdmissionError, PolicyEpoch, WhipHarnessFactory,
+};
 pub use open_route_stack::open_control_plane;
 pub use open_runtime::{open_control_plane_root, open_serve};
+// The test-only reset route is this alias's only consumer (DR-0054 Phase A).
+#[cfg(debug_assertions)]
 pub(crate) use workbench_state::build_workbench;
 pub use workbench_state::{
-    open_workbench, open_workbench_with_content_keywrap, SharedWorkbench, Workbench,
+    open_workbench, open_workbench_for_home_with_content_keywrap,
+    open_workbench_with_content_keywrap, SharedWorkbench, Workbench,
 };
 
 #[cfg(test)]

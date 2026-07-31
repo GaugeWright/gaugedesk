@@ -8,7 +8,10 @@
 use std::collections::VecDeque;
 use std::io;
 
-use crate::{EgressGate, GateDecision, Harness, ImageContent, Observation, ToolInfo, TurnOutcome};
+use crate::{
+    EgressGate, GateDecision, Harness, ImageContent, Observation, RuntimePosition, ToolInfo,
+    TurnOutcome,
+};
 
 /// One neutral scripted tool call. The double asks the supplied [`EgressGate`]
 /// for the decision at turn time, just like a real adapter, then projects the
@@ -29,6 +32,8 @@ pub struct ScriptedTurn {
     pub assistant_text: String,
     pub observations: Vec<Observation>,
     pub tool_calls: Vec<ScriptedToolCall>,
+    pub runtime_start_position: Option<RuntimePosition>,
+    pub runtime_terminal_position: Option<RuntimePosition>,
 }
 
 enum TurnScript {
@@ -94,6 +99,8 @@ fn project_neutral_turn(turn: ScriptedTurn, gate: &dyn EgressGate) -> TurnOutcom
     let mut outcome = TurnOutcome {
         assistant_text: turn.assistant_text,
         observations: turn.observations,
+        runtime_start_position: turn.runtime_start_position,
+        runtime_terminal_position: turn.runtime_terminal_position,
         ..TurnOutcome::default()
     };
     for call in turn.tool_calls {

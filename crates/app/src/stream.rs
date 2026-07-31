@@ -59,10 +59,11 @@ pub enum ServerEvent {
     /// Run truth the lifecycle admitted (durable; shown as admitted tier).
     Admitted { kind: String, text: String },
     /// A **library/workspace change** on the workspace event stream — a *reference*
-    /// to what changed (the record kind `archetype|project|placement|chat`, its id,
-    /// and the op `upsert|tombstone`), never protected content (`INV-10`). Per the
-    /// ADR 0037 push model the client resolves the workspace **projection** (through
-    /// the freshness carriage) on receipt; the event carries only the pointer.
+    /// to what changed (the record kind
+    /// `archetype|project|placement|chat|workstream`, its id, and the op
+    /// `upsert|tombstone`), never protected content (`INV-10`). Per the ADR 0037
+    /// push model the client resolves the affected workspace **delta projection**
+    /// (through the freshness carriage) on receipt; the event carries only the pointer.
     WorkspaceChanged {
         record: String,
         id: String,
@@ -114,9 +115,8 @@ impl ServerEvent {
 }
 
 impl Workbench {
-    /// The broadcast sender for an engagement's live stream, created on demand.
-    /// `pub` for the hosted embed plane (`cloud/embed-host`), whose public turn
-    /// route streams over the same engagement channel.
+    /// The broadcast sender for a private engagement's live stream, created on
+    /// demand.
     pub fn sender(&mut self, id: &str) -> broadcast::Sender<ServerEvent> {
         self.streams
             .entry(id.to_string())
@@ -132,9 +132,10 @@ impl Workbench {
 
     /// Push a **library change reference** on the workspace event stream (the
     /// sibling of the per-chat SSE) so every connected client resolves the affected
-    /// workspace projection through the freshness carriage live (ADR 0037's
+    /// workspace delta projection through the freshness carriage live (ADR 0037's
     /// push-a-reference model). `record` is the changed kind
-    /// (`archetype|project|placement|chat`), `id` its id, `op` `upsert|tombstone`;
+    /// (`archetype|project|placement|chat|workstream`), `id` its id, `op`
+    /// `upsert|tombstone`;
     /// no protected content crosses (`INV-10`). Called from every library mutation;
     /// the library scope is the reserved stream key (chat ids are `chat-...`, never
     /// `library`). A send with no subscribers is a no-op (safe during seeding).

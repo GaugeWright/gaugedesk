@@ -2,7 +2,7 @@
 //!
 //! Turns the proven seams — [`net_tls`](crate::net_tls) (cert-pinned TLS),
 //! [`net_server`](crate::net_server) (the TOFU pin registry), the rendezvous broker
-//! ([`fed_harness`](crate::fed_harness)), and the verified
+//! (the WSS crossing integration tests), and the verified
 //! [`gaugewright_core::federation`] crossing reducer — into a runnable surface a person
 //! and Playwright can drive between two machines:
 //!
@@ -37,8 +37,8 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 
 use gaugewright_core::bridge_grant::BridgeGrant;
@@ -48,12 +48,16 @@ use gaugewright_core::federated_delivery::{
 };
 use gaugewright_core::federation::{CrossingCommand, CrossingEnvelope, CrossingState};
 use gaugewright_core::handoff::{self, HandoffCommand, HandoffEvent, HandoffPhase, HandoffState};
-use gaugewright_core::ids::{AuthorityId, BridgeGrantId, DeviceId, KeyId, Nonce, PublicKey};
+use gaugewright_core::ids::{
+    AuthorityId, BridgeGrantId, DeviceId, HomeId, KeyId, Nonce, PublicKey,
+};
 use gaugewright_core::review::{ReviewCommand, ReviewState};
 use gaugewright_core::run::{RunCommand, RunState};
 use gaugewright_core::signature::{verify_signature, SigningKey};
+use gaugewright_relay_transport::{connect_one_shot, BoxedRelayByteStream, OneShotLeg};
 use gaugewright_store::Store;
 
+use crate::device_enroll::{open_sealed, seal_to_subkey, SealedKey};
 use crate::key_store::{FileKeyStore, KeyStore};
 use crate::library::LIBRARY_SCOPE;
 use crate::net_server::{CertFingerprint, PinnedTlsClientConfig};
@@ -74,6 +78,7 @@ impl Workbench {
     /// and fixtures set it explicitly so two in-process workbenches can stand in
     /// for two machines.
     pub fn with_authority(mut self, authority: AuthorityId) -> Self {
+        self.home_id = HomeId::new(format!("home:{}", authority.as_str()));
         self.authority = authority;
         self
     }
@@ -107,18 +112,18 @@ impl Workbench {
         self.federation.as_mut()
     }
 
-    pub(crate) fn create_default_instance_engagement(
+    pub(crate) fn create_default_target_engagement(
         &mut self,
         id: &str,
     ) -> Option<std::path::PathBuf> {
-        let inst_id = self.default_instance.clone();
-        if inst_id.is_empty() {
+        let target_id = self.default_instance.clone();
+        if target_id.is_empty() {
             return None;
         }
-        let inst = self.instances.get(&inst_id)?;
-        let eng = inst.create_engagement(id).ok()?;
+        let target = self.targets.get(&target_id)?;
+        let eng = target.create_engagement(id).ok()?;
         let worktree = eng.path().to_path_buf();
-        self.register_engagement(id, &inst_id, eng);
+        self.register_engagement(id, &target_id, eng);
         Some(worktree)
     }
 
@@ -126,33 +131,33 @@ impl Workbench {
         self.library_project_display_name(project_id)
     }
 
-    /// Register a live instance repo handle under its id. Federation relocation
+    /// Register a live managed-target store under its id. Federation relocation
     /// uses this after materializing a handoff content bundle.
-    pub fn register_instance(
+    pub fn register_target(
         &mut self,
-        inst_id: impl Into<String>,
-        instance: Box<dyn gaugewright_workspace::Workspace>,
+        target_id: impl Into<String>,
+        target: Box<dyn gaugewright_workspace::Workspace>,
     ) {
-        self.instances.insert(inst_id.into(), instance);
+        self.targets.insert(target_id.into(), target);
     }
 
-    /// Whether an instance repo is registered under this id after local creation
+    /// Whether a managed target is registered under this id after local creation
     /// or federation relocation.
-    pub fn has_instance(&self, inst_id: &str) -> bool {
-        self.instances.contains_key(inst_id)
+    pub fn has_target(&self, target_id: &str) -> bool {
+        self.targets.contains_key(target_id)
     }
 
-    /// Re-materialize a relocated instance from its handoff content bundle: lay
-    /// its repo down under `instances/<id>`, register the instance, and rehydrate
+    /// Re-materialize a relocated target from its handoff content bundle: lay
+    /// its store down under `targets/<id>`, register it, and rehydrate
     /// its engagement worktrees before the home commit lands.
-    pub fn materialize_instance(
+    pub fn materialize_target(
         &mut self,
-        inst_id: &str,
+        target_id: &str,
         format: &str,
         bundle: &[u8],
     ) -> std::io::Result<()> {
-        let dir = self.root.join("instances").join(inst_id);
-        let provider = self.workspace_provider(inst_id);
+        let dir = self.root.join("targets").join(target_id);
+        let provider = self.workspace_provider(target_id);
         if format != provider.export_format() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -162,15 +167,15 @@ impl Workbench {
                 ),
             ));
         }
-        let inst = provider.from_export_at(&dir, bundle).map_err(io)?;
-        for (chat_id, eng) in inst.reconcile_engagements().map_err(io)? {
-            self.register_engagement(chat_id, inst_id.to_string(), eng);
+        let target = provider.from_export_at(&dir, bundle).map_err(io)?;
+        for (chat_id, eng) in target.reconcile_engagements().map_err(io)? {
+            self.register_engagement(chat_id, target_id.to_string(), eng);
         }
-        self.register_instance(inst_id.to_string(), inst);
+        self.register_target(target_id.to_string(), target);
         Ok(())
     }
 
-    /// Collect the content bundles for every live using-instance bound into a
+    /// Collect the content bundles for every live managed target owned by a
     /// project relocation. Federation owns the wire shape and uses this helper to
     /// produce the opaque bytes behind relocated handles.
     pub(crate) fn project_relocation_content_bundles(
@@ -185,8 +190,8 @@ pub(crate) fn activate_configured_federation(wb: &mut Workbench) -> std::io::Res
     if !crate::app_support::federation_enabled() {
         return Ok(());
     }
-    let broker_addr =
-        std::env::var("GAUGEWRIGHT_BROKER_ADDR").unwrap_or_else(|_| "127.0.0.1:7900".to_string());
+    let broker_addr = std::env::var("GAUGEWRIGHT_RELAY_ENDPOINT")
+        .unwrap_or_else(|_| "wss://relay.gaugewright.com".to_string());
     let mut fed = Federation::open(wb.authority().clone(), &wb.root_path(), broker_addr)?;
     fed.restore_bridges(&folded_bridges(wb.store_ref()));
     wb.apply_startup_federation(fed);
@@ -235,10 +240,11 @@ pub(crate) fn routes() -> axum::Router<SharedWorkbench> {
         .route("/federation/recovery-code", post(post_recovery_code))
         .route("/federation/restore", post(post_restore))
         .route("/federation/inbox", get(get_inbox))
-        // Project handoff / authority relocation (FED-6): offer -> sync -> commit (abort rollback).
-        .route("/federation/handoff/offer", post(post_handoff_offer))
-        .route("/federation/handoff/sync", post(post_handoff_sync))
-        .route("/federation/handoff/commit", post(post_handoff_commit))
+        // Project handoff / authority relocation (FED-6): the shipped control
+        // surface is relocate/consent/abort/status. The reducer's former raw
+        // offer -> sync -> commit HTTP steps were retired because no product
+        // client consumed them and exposing them allowed bypassing the atomic
+        // cross-machine orchestration.
         .route("/federation/handoff/abort", post(post_handoff_abort))
         .route("/federation/handoff/status", get(get_handoff_status))
         .route("/federation/handoff/relocate", post(post_handoff_relocate))
@@ -406,7 +412,7 @@ impl Federation {
             target_route: ticket.scope.clone(),
             // The device key the crossing presents — reuse the bound device of the
             // single-key slice; per-device subkeys are the deferred Model-A upgrade.
-            device_key: crate::fed_harness::bound_device(),
+            device_key: PublicKey::new("04dev1ce0ke7"),
             governance_scope: ticket.scope.clone(),
             expiry: ticket.expiry,
             active: true,
@@ -532,11 +538,15 @@ fn inbox_token(source: &str, target: &str) -> String {
 }
 
 fn token_bytes(token: &str) -> [u8; TOKEN_LEN] {
-    let mut buf = [0u8; TOKEN_LEN];
-    let src = token.as_bytes();
-    let n = src.len().min(TOKEN_LEN);
-    buf[..n].copy_from_slice(&src[..n]);
-    buf
+    Sha256::digest(token.as_bytes()).into()
+}
+
+async fn park_relay(broker: &str, token: &str) -> std::io::Result<BoxedRelayByteStream> {
+    connect_one_shot(broker, token_bytes(token), OneShotLeg::Initializer).await
+}
+
+async fn join_relay(broker: &str, token: &str) -> std::io::Result<BoxedRelayByteStream> {
+    connect_one_shot(broker, token_bytes(token), OneShotLeg::Joiner).await
 }
 
 /// The signed crossing as it travels the TLS leg: the handle + the canonical bytes
@@ -754,8 +764,7 @@ async fn receive_once(
     identity: &TlsIdentity,
     token: &str,
 ) -> std::io::Result<()> {
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(token)).await?;
+    let tcp = park_relay(broker, token).await?;
     // This side presents its pinned certificate (TLS server); the sender pins it.
     let mut tls = tls_accept(tcp, identity).await?;
     let bytes = read_frame(&mut tls).await?;
@@ -796,8 +805,7 @@ async fn send_crossing(
         delegation: Some(delegation.clone()),
     };
     let token = inbox_token(me.as_str(), peer.as_str());
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(&token)).await?;
+    let tcp = join_relay(broker, &token).await?;
     // This side is the TLS client; it pins the peer's certificate.
     let mut tls = tls_connect(tcp, peer, pins).await?;
     let bytes = serde_json::to_vec(&wire)
@@ -868,6 +876,8 @@ fn execute_peer_turn(
     wb: &SharedWorkbench,
     prompt: &str,
     run_scope: &str,
+    target_chat: Option<&str>,
+    contribution_by: Option<&str>,
     subkey: &SigningKey,
     delegation: &DeviceDelegation,
 ) -> RunResp {
@@ -876,27 +886,28 @@ fn execute_peer_turn(
     // inspectable + keep/merge-able by the peer's operator — the "you are the
     // operating host" trust model). A minimal workbench with no instance falls back
     // to the in-process turn. Either way the observations federate to the owner.
-    let (observations, assistant_text) = match engine_peer_turn(wb, prompt) {
-        Some((count, text)) => (
-            // Per-observation detail isn't surfaced through the engine's TaskResult
-            // (the durable transcript on the peer has it); only the handle crosses
-            // (INV-10), so the owner admits `count` signed observation handles.
-            (0..count)
-                .map(|_| ("text".to_string(), String::new()))
-                .collect::<Vec<_>>(),
-            text,
-        ),
-        None => {
-            let o = run_peer_outcome(prompt, run_scope);
-            (
-                o.observations
-                    .iter()
-                    .map(|o| (o.kind.to_string(), o.detail.clone()))
-                    .collect(),
-                o.assistant_text,
-            )
-        }
-    };
+    let (observations, assistant_text) =
+        match engine_peer_turn(wb, prompt, target_chat, contribution_by) {
+            Some((count, text)) => (
+                // Per-observation detail isn't surfaced through the engine's TaskResult
+                // (the durable transcript on the peer has it); only the handle crosses
+                // (INV-10), so the owner admits `count` signed observation handles.
+                (0..count)
+                    .map(|_| ("text".to_string(), String::new()))
+                    .collect::<Vec<_>>(),
+                text,
+            ),
+            None => {
+                let o = run_peer_outcome(prompt, run_scope);
+                (
+                    o.observations
+                        .iter()
+                        .map(|o| (o.kind.to_string(), o.detail.clone()))
+                        .collect(),
+                    o.assistant_text,
+                )
+            }
+        };
 
     let source_pubkey = subkey.public_key().as_str().to_string();
     RunResp {
@@ -930,13 +941,23 @@ fn execute_peer_turn(
 /// WhippleScript otherwise), and return the run's admitted-observation count + assistant text.
 /// `None` when the peer has no instance (a minimal/test workbench) — the caller
 /// then falls back to the in-process turn.
-fn engine_peer_turn(wb: &SharedWorkbench, prompt: &str) -> Option<(u32, String)> {
+fn engine_peer_turn(
+    wb: &SharedWorkbench,
+    prompt: &str,
+    target_chat: Option<&str>,
+    contribution_by: Option<&str>,
+) -> Option<(u32, String)> {
     use gaugewright_core::run::RunState;
     let (eng_id, worktree) = {
         let mut g = wb.lock_unpoisoned();
-        let eng_id = crate::library::gen_id("remote-run");
-        let worktree = g.create_default_instance_engagement(&eng_id)?;
-        (eng_id, worktree)
+        if let Some(target_chat) = target_chat {
+            let worktree = g.engagements.get(target_chat)?.path().to_path_buf();
+            (target_chat.to_owned(), worktree)
+        } else {
+            let eng_id = crate::library::gen_id("remote-run");
+            let worktree = g.create_default_target_engagement(&eng_id)?;
+            (eng_id, worktree)
+        }
     };
     // A throwaway sink: the peer's durable transcript is the record; the owner gets
     // the federated observations separately. run_engagement_turn locks the workbench
@@ -952,6 +973,12 @@ fn engine_peer_turn(wb: &SharedWorkbench, prompt: &str) -> Option<(u32, String)>
             images: &[], // remote/federated runs are text-only (no image attachments yet)
             mode: crate::library::ChatMode::Use,
             authenticated_actor: None,
+            contribution_by,
+            account_scope: crate::account::ACCOUNT_SCOPE,
+            tenant_scope: crate::org::ORG_SCOPE,
+            runtime_command_id: None,
+            harness_factory: None,
+            review_requested: false,
         },
     ) {
         Ok(r) => r.assistant_text,
@@ -983,6 +1010,7 @@ fn run_peer_outcome(prompt: &str, run_scope: &str) -> gaugewright_harness::TurnO
                 tool: None,
             }],
             tool_calls: Vec::new(),
+            ..ScriptedTurn::default()
         }])
         .run_turn(&AllowAllGate, prompt, &[], &mut |_| {})
         .unwrap_or_default();
@@ -1046,13 +1074,20 @@ async fn runtime_serve_once(
     delegation: &DeviceDelegation,
     token: &str,
 ) -> std::io::Result<()> {
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(token)).await?;
+    let tcp = park_relay(broker, token).await?;
     let mut tls = tls_accept(tcp, identity).await?;
     let bytes = read_frame(&mut tls).await?;
     let req: RunReq = serde_json::from_slice(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let resp = execute_peer_turn(wb, &req.prompt, &req.run_scope, subkey, delegation);
+    let resp = execute_peer_turn(
+        wb,
+        &req.prompt,
+        &req.run_scope,
+        None,
+        None,
+        subkey,
+        delegation,
+    );
     let out = serde_json::to_vec(&resp)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     write_frame(&mut tls, &out).await?;
@@ -1076,8 +1111,7 @@ async fn remote_run_rpc(
         prompt: prompt.to_string(),
     };
     let token = runtime_token(me.as_str(), peer.as_str());
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(&token)).await?;
+    let tcp = join_relay(broker, &token).await?;
     let mut tls = tls_connect(tcp, peer, pins).await?;
     let bytes = serde_json::to_vec(&req)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1330,8 +1364,7 @@ async fn consent_serve_once(
     identity: &TlsIdentity,
     token: &str,
 ) -> std::io::Result<()> {
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(token)).await?;
+    let tcp = park_relay(broker, token).await?;
     let mut tls = tls_accept(tcp, identity).await?;
     let bytes = read_frame(&mut tls).await?;
     let req: ConsentReq = serde_json::from_slice(&bytes)
@@ -1368,8 +1401,7 @@ async fn send_consent(
         delegation: Some(delegation.clone()),
     };
     let token = consent_token(me.as_str(), owner.as_str());
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(&token)).await?;
+    let tcp = join_relay(broker, &token).await?;
     let mut tls = tls_connect(tcp, owner, pins).await?;
     let bytes = serde_json::to_vec(&req)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1453,8 +1485,7 @@ async fn revocation_serve_once(
     revoker: &AuthorityId,
     token: &str,
 ) -> std::io::Result<()> {
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(token)).await?;
+    let tcp = park_relay(broker, token).await?;
     let mut tls = tls_accept(tcp, identity).await?;
     let bytes = read_frame(&mut tls).await?;
     let rev: SubkeyRevocation = serde_json::from_slice(&bytes)
@@ -1475,8 +1506,7 @@ async fn send_revocation(
     rev: &SubkeyRevocation,
 ) -> std::io::Result<bool> {
     let token = revocation_token(me.as_str(), peer.as_str());
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(&token)).await?;
+    let tcp = join_relay(broker, &token).await?;
     let mut tls = tls_connect(tcp, peer, pins).await?;
     let bytes = serde_json::to_vec(rev)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1865,6 +1895,7 @@ fn record_pending_run(store: &mut Store, wire: &RunPlaceWire) {
         "archetype": wire.archetype,
         "data_handle": wire.data_handle,
         "prompt": wire.prompt,
+        "target_chat": wire.target_chat,
     });
     let _ = store.append_record(RUN_QUEUE_SCOPE, "event", &rec.to_string());
 }
@@ -1919,6 +1950,10 @@ struct RunPlaceWire {
     archetype: String,
     data_handle: String,
     prompt: String,
+    /// Existing hub-resident workstream member to drive. Older generic co-drive
+    /// callers omit this and retain the legacy isolated-run behavior.
+    #[serde(default)]
+    target_chat: Option<String>,
     source: String,
     target: String,
     signed_bytes: Vec<u8>,
@@ -2172,6 +2207,44 @@ fn apply_handoff(
     Ok(state)
 }
 
+/// Commit the reducer's Home flip and the concrete project→Home binding in one
+/// SQLite transaction. A crash exposes both facts or neither, never split-brain.
+fn commit_handoff_and_rebind(
+    wb: &mut Workbench,
+    project: &str,
+    home: HomeId,
+) -> Result<HandoffState, &'static str> {
+    let mut state = load_handoff(wb.store_ref(), project);
+    let events = handoff::decide(&state, HandoffCommand::CommitHandoff).map_err(|r| r.reason)?;
+    let project_record = wb
+        .project_record_for_home_rebind(project, home)
+        .ok_or("handoff: project binding missing")?;
+    let scope = handoff_scope(project);
+    let event_payloads: Vec<String> = events
+        .iter()
+        .map(|event| serde_json::to_string(event).expect("handoff event serializes"))
+        .collect();
+    let project_payload =
+        serde_json::to_string(&project_record).map_err(|_| "handoff: project serialize failed")?;
+    let mut records: Vec<(&str, &str, &str)> = event_payloads
+        .iter()
+        .map(|payload| (scope.as_str(), HANDOFF_KIND, payload.as_str()))
+        .collect();
+    records.push((
+        crate::library::LIBRARY_SCOPE,
+        "project",
+        project_payload.as_str(),
+    ));
+    wb.store_mut()
+        .append_records_atomically(&records)
+        .map_err(|_| "handoff: atomic Home commit failed")?;
+    for event in events {
+        state = handoff::evolve(&state, event);
+    }
+    wb.apply_atomic_project_home_rebind(project_record);
+    Ok(state)
+}
+
 fn handoff_response(
     wb: &SharedWorkbench,
     project: &str,
@@ -2190,40 +2263,93 @@ pub struct HandoffProjectRequest {
     pub project: String,
 }
 
-/// `POST /federation/handoff/offer` — origin offers the handoff and begins shipping
-/// the log. The origin stays home (an offer is not a transfer, `INV-13`).
-pub async fn post_handoff_offer(
-    State(wb): State<SharedWorkbench>,
-    Json(req): Json<HandoffProjectRequest>,
-) -> impl IntoResponse {
-    handoff_response(&wb, &req.project, HandoffCommand::OfferHandoff)
-}
-
-/// `POST /federation/handoff/sync` — the target acknowledges it holds the full log
-/// (still not home; `LOG_BEFORE_HOME`).
-pub async fn post_handoff_sync(
-    State(wb): State<SharedWorkbench>,
-    Json(req): Json<HandoffProjectRequest>,
-) -> impl IntoResponse {
-    handoff_response(&wb, &req.project, HandoffCommand::SyncLog)
-}
-
-/// `POST /federation/handoff/commit` — the single relocation fact: home moves to the
-/// target. Admitted only once the target holds the full log.
-pub async fn post_handoff_commit(
-    State(wb): State<SharedWorkbench>,
-    Json(req): Json<HandoffProjectRequest>,
-) -> impl IntoResponse {
-    handoff_response(&wb, &req.project, HandoffCommand::CommitHandoff)
-}
-
 /// `POST /federation/handoff/abort` — abandon the in-flight handoff; home rolls back
-/// to the origin (the `INV-23` escape).
+/// to the origin (the `INV-23` escape). A cross-machine pending offer is cancelled
+/// on the target before the origin records its terminal abort, so a stale consent
+/// cannot later promote the target after the origin has rolled back.
 pub async fn post_handoff_abort(
     State(wb): State<SharedWorkbench>,
     Json(req): Json<HandoffProjectRequest>,
 ) -> impl IntoResponse {
-    handoff_response(&wb, &req.project, HandoffCommand::AbortHandoff)
+    let peer = {
+        let guard = wb.lock_unpoisoned();
+        pending_outgoing_peer(guard.store_ref(), &req.project)
+    };
+    let Some(peer) = peer else {
+        return handoff_response(&wb, &req.project, HandoffCommand::AbortHandoff);
+    };
+    let peer = AuthorityId::new(peer);
+    let (broker, me, source_home, subkey, delegation, pins) = {
+        let guard = wb.lock_unpoisoned();
+        let me = guard.authority().clone();
+        let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
+        let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
+        let Some(fed) = guard.federation_ref() else {
+            return (StatusCode::SERVICE_UNAVAILABLE, "federation not configured").into_response();
+        };
+        (
+            fed.broker_addr.clone(),
+            me,
+            guard.home_id().clone(),
+            subkey,
+            delegation,
+            fed.pins_arc(),
+        )
+    };
+    let verdict = match send_handoff(
+        &broker,
+        &me,
+        &source_home,
+        &subkey,
+        &delegation,
+        &peer,
+        pins,
+        HandoffMsgKind::Cancelled,
+        &req.project,
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+    .await
+    {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("handoff cancellation transport failed: {error}"),
+            )
+                .into_response();
+        }
+    };
+    if !verdict
+        .get("cancelled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::CONFLICT,
+            "target no longer holds a pending handoff",
+        )
+            .into_response();
+    }
+    let mut guard = wb.lock_unpoisoned();
+    let response = match apply_handoff(
+        guard.store_mut(),
+        &req.project,
+        HandoffCommand::AbortHandoff,
+    ) {
+        Ok(state) => {
+            let _ =
+                record_outgoing_handoff(guard.store_mut(), "resolved", &req.project, peer.as_str());
+            (
+                StatusCode::OK,
+                Json(handoff_state_json(&req.project, &state)),
+            )
+                .into_response()
+        }
+        Err(reason) => (StatusCode::CONFLICT, reason).into_response(),
+    };
+    response
 }
 
 #[derive(Deserialize)]
@@ -2258,8 +2384,8 @@ fn project_log_scope(project: &str) -> String {
 
 /// The canonical bytes a handoff offer signs — binds the offer to its project so a
 /// captured offer cannot be replayed against a different project (no-replay).
-fn handoff_bytes(project: &str) -> Vec<u8> {
-    format!("handoff-offer::{project}").into_bytes()
+fn handoff_bytes(project: &str, source_home: &HomeId) -> Vec<u8> {
+    format!("handoff-offer::{project}::{}", source_home.as_str()).into_bytes()
 }
 
 /// The derived rendezvous token a `source → target` handoff uses (a namespace
@@ -2276,7 +2402,7 @@ struct HandoffLogRecord {
     payload: String,
 }
 
-/// One relocated instance's versioned-workspace export. The format tag prevents a
+/// One relocated target's versioned-workspace export. The format tag prevents a
 /// mixed-substrate target from interpreting opaque bytes under the wrong provider.
 /// The bytes are opaque to
 /// the relay (`INV-14`); they re-derive no state (the log is authority, `INV-5`), they
@@ -2284,7 +2410,7 @@ struct HandoffLogRecord {
 /// home commits (`STATE_BEFORE_HOME`, FED-6).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HandoffContentBundle {
-    inst_id: String,
+    target_id: String,
     format: String,
     bundle: Vec<u8>,
 }
@@ -2300,6 +2426,9 @@ enum HandoffMsgKind {
     Committed,
     /// target → origin: the target declined; the origin rolls back (stays home).
     Declined,
+    /// origin → target: the origin cancelled an offer that is still pending target
+    /// consent. The target removes the held offer without importing or committing it.
+    Cancelled,
 }
 
 /// A handoff message as it travels the TLS leg: the kind, the project, the log
@@ -2311,11 +2440,19 @@ struct HandoffWire {
     project: String,
     source: String,
     target: String,
+    /// The sender's actual logical Home. On a committed target→origin
+    /// notification this is the new authoritative project binding.
+    source_home: HomeId,
     #[serde(default)]
     log: Vec<HandoffLogRecord>,
     /// The project's content bytes — one bundle per bound instance (on `Offer`).
     #[serde(default)]
     content: Vec<HandoffContentBundle>,
+    /// The project credential data key, sealed to the target authority's
+    /// pinned governance key. The relay and source log see ciphertext only;
+    /// the target re-wraps the opened key inside its Home boundary.
+    #[serde(default)]
+    credential_key: Option<SealedKey>,
     signed_bytes: Vec<u8>,
     signature: gaugewright_core::signature::Signature,
     source_pubkey: String,
@@ -2341,11 +2478,20 @@ fn latest_library_records(
     kind: &str,
     keep: impl Fn(&serde_json::Value) -> bool,
 ) -> Vec<HandoffLogRecord> {
+    latest_library_records_by(store, kind, "id", keep)
+}
+
+fn latest_library_records_by(
+    store: &Store,
+    kind: &str,
+    key: &str,
+    keep: impl Fn(&serde_json::Value) -> bool,
+) -> Vec<HandoffLogRecord> {
     let mut by_id: BTreeMap<String, String> = BTreeMap::new();
     for payload in store.records(LIBRARY_SCOPE, kind).unwrap_or_default() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
             if keep(&v) {
-                if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
+                if let Some(id) = v.get(key).and_then(|i| i.as_str()) {
                     by_id.insert(id.to_string(), payload);
                 }
             }
@@ -2364,11 +2510,9 @@ fn latest_library_records(
 /// The origin's snapshot of a project's relocatable log: **every** record under
 /// **every** scope the project owns (`project_log::<id>` and `project::<id>::*`),
 /// across all kinds, plus the project's `library` nouns (its `ProjectRecord`, the
-/// using-`InstanceRecord`s bound into it, those instances' `ChatRecord`s, and the
-/// `AgentRecord`s they reference) so the target's library registers the project as a
-/// usable whole. Records cross verbatim; payloads referenced by handle stay behind
-/// their handles (`INV-10`) — the bytes behind those handles travel separately as
-/// content bundles ([`collect_project_content`]).
+/// placements, targets, chats, workstreams, and referenced archetypes required to
+/// register the project as a usable whole. Records cross verbatim; protected bytes
+/// behind handles travel separately as content bundles ([`collect_project_content`]).
 fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
     let mut out = Vec::new();
     for scope in store.scope_ids().unwrap_or_default() {
@@ -2407,29 +2551,151 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
                 .map(str::to_string)
         })
         .collect();
-    out.extend(instances);
-    out.extend(latest_library_records(store, "chat", |v| {
-        v.get("instance_id")
-            .and_then(|i| i.as_str())
-            .is_some_and(|i| inst_ids.contains(i))
-    }));
-    out.extend(latest_library_records(store, "agent", |v| {
+    let agents = latest_library_records(store, "agent", |v| {
         v.get("id")
             .and_then(|i| i.as_str())
             .is_some_and(|i| agent_ids.contains(i))
-    }));
+    });
+    let authoring_instance_ids: std::collections::BTreeSet<String> = agents
+        .iter()
+        .filter_map(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+        .filter_map(|value| {
+            value
+                .get("instance_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    let authoring_instances = latest_library_records(store, "instance", |v| {
+        v.get("id")
+            .and_then(|id| id.as_str())
+            .is_some_and(|id| authoring_instance_ids.contains(id))
+    });
+    out.extend(instances);
+    out.extend(authoring_instances);
+    // Instance lifecycle is reduced under the instance id, outside the
+    // `project::<id>::*` namespace. Carry both using and referenced authoring
+    // instance scopes so the target receives runnable placements and a usable
+    // archetype definition rather than library nouns with missing state.
+    for instance_id in inst_ids.iter().chain(authoring_instance_ids.iter()) {
+        for (_position, kind, payload) in store.events(instance_id).unwrap_or_default() {
+            out.push(HandoffLogRecord {
+                scope: instance_id.clone(),
+                kind,
+                payload,
+            });
+        }
+    }
+    out.extend(latest_library_records_by(
+        store,
+        "placement_targets",
+        "placement_id",
+        |v| {
+            v.get("placement_id")
+                .and_then(|i| i.as_str())
+                .is_some_and(|i| inst_ids.contains(i))
+        },
+    ));
+    let targets = latest_library_records(store, "work_target", |v| {
+        let owner = v.get("owner");
+        let project_owned = owner
+            .and_then(|owner| owner.get("kind"))
+            .and_then(|kind| kind.as_str())
+            == Some("project")
+            && owner
+                .and_then(|owner| owner.get("project_id"))
+                .and_then(|id| id.as_str())
+                == Some(project);
+        let referenced_archetype = owner
+            .and_then(|owner| owner.get("kind"))
+            .and_then(|kind| kind.as_str())
+            == Some("archetype")
+            && owner
+                .and_then(|owner| owner.get("archetype_id"))
+                .and_then(|id| id.as_str())
+                .is_some_and(|id| agent_ids.contains(id));
+        project_owned || referenced_archetype
+    });
+    out.extend(targets);
+    let chats = latest_library_records(store, "chat", |v| {
+        v.get("instance_id")
+            .and_then(|i| i.as_str())
+            .is_some_and(|i| inst_ids.contains(i))
+    });
+    let chat_ids: std::collections::BTreeSet<String> = chats
+        .iter()
+        .filter_map(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+        .filter_map(|value| {
+            value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    out.extend(chats);
+    out.extend(latest_library_records_by(
+        store,
+        "chat_target",
+        "chat_id",
+        |v| {
+            v.get("chat_id")
+                .and_then(|id| id.as_str())
+                .is_some_and(|id| chat_ids.contains(id))
+        },
+    ));
+    let workstreams = latest_library_records(store, "workstream", |v| {
+        v.get("instance_id")
+            .and_then(|id| id.as_str())
+            .is_some_and(|id| inst_ids.contains(id))
+    });
+    let workstream_ids: std::collections::BTreeSet<String> = workstreams
+        .iter()
+        .filter_map(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+        .filter_map(|value| {
+            value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    out.extend(workstreams);
+    // A workstream's library record names and roots the line, but its active
+    // membership is authoritative in the reducer log under the workstream id
+    // itself. Carry those related scopes as part of the project subtree;
+    // otherwise relocation renders the line with zero members and the new Home
+    // refuses a production co-drive run aimed at the relocated chat.
+    for workstream_id in &workstream_ids {
+        for (_position, kind, payload) in store.events(workstream_id).unwrap_or_default() {
+            out.push(HandoffLogRecord {
+                scope: workstream_id.clone(),
+                kind,
+                payload,
+            });
+        }
+    }
+    out.extend(latest_library_records_by(
+        store,
+        "workstream_root",
+        "workstream_id",
+        |v| {
+            v.get("workstream_id")
+                .and_then(|id| id.as_str())
+                .is_some_and(|id| workstream_ids.contains(id))
+        },
+    ));
+    out.extend(agents);
     out
 }
 
 /// The origin's snapshot of a project's content: one tagged, erasure-respecting
-/// workspace export per using-instance. This is the bytes behind every relocated handle; the target
+/// workspace export per managed target. This is the bytes behind every relocated handle; the target
 /// re-materializes each before its home commits (`STATE_BEFORE_HOME`, FED-6). An
 /// instance whose repo cannot be bundled is skipped (logged), not silently dropped.
 fn collect_project_content(wb: &Workbench, project: &str) -> Vec<HandoffContentBundle> {
     wb.project_relocation_content_bundles(project)
         .into_iter()
-        .map(|(inst_id, format, bundle)| HandoffContentBundle {
-            inst_id,
+        .map(|(target_id, format, bundle)| HandoffContentBundle {
+            target_id,
             format,
             bundle,
         })
@@ -2442,6 +2708,7 @@ fn collect_project_content(wb: &Workbench, project: &str) -> Vec<HandoffContentB
 async fn send_handoff(
     broker: &str,
     me: &AuthorityId,
+    source_home: &HomeId,
     subkey: &SigningKey,
     delegation: &DeviceDelegation,
     peer: &AuthorityId,
@@ -2450,23 +2717,25 @@ async fn send_handoff(
     project: &str,
     log: Vec<HandoffLogRecord>,
     content: Vec<HandoffContentBundle>,
+    credential_key: Option<SealedKey>,
 ) -> std::io::Result<serde_json::Value> {
-    let signed_bytes = handoff_bytes(project);
+    let signed_bytes = handoff_bytes(project, source_home);
     let wire = HandoffWire {
         kind,
         project: project.to_string(),
         source: me.as_str().to_string(),
         target: peer.as_str().to_string(),
+        source_home: source_home.clone(),
         log,
         content,
+        credential_key,
         signature: subkey.sign(&signed_bytes),
         source_pubkey: subkey.public_key().as_str().to_string(),
         signed_bytes,
         delegation: Some(delegation.clone()),
     };
     let token = handoff_inbox_token(me.as_str(), peer.as_str());
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(&token)).await?;
+    let tcp = join_relay(broker, &token).await?;
     let mut tls = tls_connect(tcp, peer, pins).await?;
     let bytes = serde_json::to_vec(&wire)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -2483,6 +2752,49 @@ async fn send_handoff(
 /// pre-authorizations that auto-accept, both live in this authority's store.
 const HANDOFF_INCOMING_SCOPE: &str = "handoff::incoming";
 const HANDOFF_PREAUTH_SCOPE: &str = "handoff::preauth";
+const HANDOFF_OUTGOING_SCOPE: &str = "handoff::outgoing";
+
+fn record_outgoing_handoff(
+    store: &mut Store,
+    op: &str,
+    project: &str,
+    peer: &str,
+) -> Result<(), &'static str> {
+    store
+        .append_record(
+            HANDOFF_OUTGOING_SCOPE,
+            "event",
+            &serde_json::json!({ "op": op, "project": project, "peer": peer }).to_string(),
+        )
+        .map(|_| ())
+        .map_err(|_| "handoff: outgoing state append failed")
+}
+
+fn pending_outgoing_peer(store: &Store, project: &str) -> Option<String> {
+    let mut peer = None;
+    for payload in store
+        .records(HANDOFF_OUTGOING_SCOPE, "event")
+        .unwrap_or_default()
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if value.get("project").and_then(|v| v.as_str()) != Some(project) {
+            continue;
+        }
+        match value.get("op").and_then(|v| v.as_str()) {
+            Some("offer") => {
+                peer = value
+                    .get("peer")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+            }
+            Some("resolved") => peer = None,
+            _ => {}
+        }
+    }
+    peer
+}
 
 /// Peers this authority will **auto-accept** handoffs from (standing pre-auth). Folded
 /// latest-wins per peer: an `allow` record grants, a `revoke` record withdraws.
@@ -2628,8 +2940,7 @@ async fn handoff_receive_once(
     identity: &TlsIdentity,
     token: &str,
 ) -> std::io::Result<()> {
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(token)).await?;
+    let tcp = park_relay(broker, token).await?;
     let mut tls = tls_accept(tcp, identity).await?;
     let bytes = read_frame(&mut tls).await?;
     let wire: HandoffWire = serde_json::from_slice(&bytes)
@@ -2650,7 +2961,33 @@ fn commit_incoming_handoff(
     project: &str,
     log: &[HandoffLogRecord],
     content: &[HandoffContentBundle],
+    credential_key: Option<&SealedKey>,
 ) -> bool {
+    let carries_project_credentials = log
+        .iter()
+        .any(|record| record.scope == format!("project::{project}") && record.kind == "credential");
+    let project_credential_key = match credential_key {
+        Some(sealed) => {
+            let target = guard.authority().clone();
+            let target_key = FileKeyStore::new(guard_root(guard).join("keys")).signing_key(&target);
+            let Some(bytes) = open_sealed(&target_key, sealed) else {
+                tracing::warn!("handoff commit: project credential key did not open for target");
+                return false;
+            };
+            let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+                tracing::warn!("handoff commit: project credential key has invalid length");
+                return false;
+            };
+            Some(key)
+        }
+        None if carries_project_credentials => {
+            tracing::warn!(
+                "handoff commit: project carries credentials without a target-sealed key"
+            );
+            return false;
+        }
+        None => None,
+    };
     // 1. Import the relocated log (the authority — INV-5), and open the handoff.
     {
         let store = guard.store_mut();
@@ -2672,20 +3009,30 @@ fn commit_incoming_handoff(
     // 2. Materialize the content bytes behind the project's handles BEFORE the home can
     //    commit (STATE_BEFORE_HOME). A bundle that will not lay down blocks the commit.
     for b in content {
-        if let Err(e) = guard.materialize_instance(&b.inst_id, &b.format, &b.bundle) {
+        if let Err(e) = guard.materialize_target(&b.target_id, &b.format, &b.bundle) {
             tracing::warn!(
                 "handoff commit: materialize instance {} failed: {e:?}",
-                b.inst_id
+                b.target_id
             );
             return false;
         }
     }
-    // 3. Full state present (log + content): sync, then flip home to the target.
-    for cmd in [HandoffCommand::SyncLog, HandoffCommand::CommitHandoff] {
-        if let Err(e) = apply_handoff(guard.store_mut(), project, cmd) {
-            tracing::warn!("handoff commit: {cmd:?} failed for {project}: {e:?}");
+    if let Some(key) = project_credential_key {
+        if guard.install_project_credential_key(project, key).is_none() {
+            tracing::warn!("handoff commit: target could not persist project credential key");
             return false;
         }
+    }
+    // 3. Full state present (log + content): sync, then flip home to the target.
+    if let Err(e) = apply_handoff(guard.store_mut(), project, HandoffCommand::SyncLog) {
+        tracing::warn!("handoff commit: SyncLog failed for {project}: {e:?}");
+        return false;
+    }
+    let home = guard.home_id().clone();
+    guard.rebuild_library();
+    if let Err(e) = commit_handoff_and_rebind(guard, project, home) {
+        tracing::warn!("handoff commit: atomic Home flip failed for {project}: {e:?}");
+        return false;
     }
     true
 }
@@ -2717,7 +3064,7 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
         return serde_json::json!({ "ok": false, "reason": "bad source key" });
     };
     if !grant.is_valid(now_secs())
-        || wire.signed_bytes != handoff_bytes(&wire.project)
+        || wire.signed_bytes != handoff_bytes(&wire.project, &wire.source_home)
         || verify_signature(&wire.signed_bytes, &wire.signature, &verify_key) != Ok(true)
     {
         return serde_json::json!({ "ok": false, "reason": "verification failed" });
@@ -2733,8 +3080,13 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
             let oneshot =
                 !preauth && handoff_oneshot_take(guard.store_mut(), &wire.source, &wire.project);
             if preauth || oneshot {
-                let committed =
-                    commit_incoming_handoff(&mut guard, &wire.project, &wire.log, &wire.content);
+                let committed = commit_incoming_handoff(
+                    &mut guard,
+                    &wire.project,
+                    &wire.log,
+                    &wire.content,
+                    wire.credential_key.as_ref(),
+                );
                 if committed {
                     // host = this authority (the target), operator = the origin.
                     record_participants(
@@ -2745,7 +3097,12 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                     );
                 }
                 (
-                    serde_json::json!({ "ok": committed, "committed": committed, "pending": false }),
+                    serde_json::json!({
+                        "ok": committed,
+                        "committed": committed,
+                        "pending": false,
+                        "home": committed.then(|| guard.home_id().as_str()),
+                    }),
                     committed,
                 )
             } else {
@@ -2757,6 +3114,7 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                     "source": wire.source,
                     "log": wire.log,
                     "content": wire.content,
+                    "credential_key": wire.credential_key,
                 });
                 let _ = guard.store_mut().append_record(
                     HANDOFF_INCOMING_SCOPE,
@@ -2771,13 +3129,22 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
         }
         HandoffMsgKind::Committed => {
             let _ = apply_handoff(guard.store_mut(), &wire.project, HandoffCommand::SyncLog);
-            let ok = apply_handoff(
-                guard.store_mut(),
-                &wire.project,
-                HandoffCommand::CommitHandoff,
-            )
-            .is_ok();
+            let ok = commit_handoff_and_rebind(&mut guard, &wire.project, wire.source_home.clone())
+                .is_ok();
             if ok {
+                let _ = record_outgoing_handoff(
+                    guard.store_mut(),
+                    "resolved",
+                    &wire.project,
+                    &wire.source,
+                );
+                if let Err(error) = guard.remove_project_credential_key(&wire.project) {
+                    tracing::error!(
+                        project = %wire.project,
+                        error = %error,
+                        "handoff committed but former Home could not remove its project credential key"
+                    );
+                }
                 // origin side: host = the target who notified us, operator = self.
                 record_participants(guard.store_mut(), &wire.project, &wire.source, &wire.target);
             }
@@ -2790,7 +3157,38 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                 HandoffCommand::AbortHandoff,
             )
             .is_ok();
+            if ok {
+                let _ = record_outgoing_handoff(
+                    guard.store_mut(),
+                    "resolved",
+                    &wire.project,
+                    &wire.source,
+                );
+            }
             (serde_json::json!({ "ok": ok }), false)
+        }
+        HandoffMsgKind::Cancelled => {
+            let pending = pending_incoming(guard.store_ref())
+                .into_iter()
+                .any(|offer| {
+                    offer["project"].as_str() == Some(wire.project.as_str())
+                        && offer["source"].as_str() == Some(wire.source.as_str())
+                });
+            if pending {
+                let _ = guard.store_mut().append_record(
+                    HANDOFF_INCOMING_SCOPE,
+                    "event",
+                    &serde_json::json!({
+                        "op": "resolved",
+                        "project": wire.project,
+                    })
+                    .to_string(),
+                );
+            }
+            (
+                serde_json::json!({ "ok": pending, "cancelled": pending }),
+                false,
+            )
         }
     };
     if registered {
@@ -2817,7 +3215,18 @@ async fn drive_relocate(
     project: &str,
     peer: &AuthorityId,
 ) -> (StatusCode, serde_json::Value) {
-    let (broker, me, subkey, delegation, pins, paired, log, content) = {
+    let (
+        broker,
+        me,
+        source_home,
+        subkey,
+        delegation,
+        pins,
+        peer_key,
+        project_credential_key,
+        log,
+        content,
+    ) = {
         let guard = wb.lock_unpoisoned();
         let me = guard.authority().clone();
         let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
@@ -2825,16 +3234,23 @@ async fn drive_relocate(
         let log = collect_project_log(guard.store_ref(), project);
         let content = collect_project_content(&guard, project);
         match guard.federation_ref() {
-            Some(fed) => (
-                fed.broker_addr.clone(),
-                me,
-                subkey,
-                delegation,
-                fed.pins_arc(),
-                fed.grant_for(peer.as_str()).is_some(),
-                log,
-                content,
-            ),
+            Some(fed) => {
+                let peer_key = fed
+                    .grant_for(peer.as_str())
+                    .map(|grant| grant.source_authority_root_pubkey);
+                (
+                    fed.broker_addr.clone(),
+                    me,
+                    guard.home_id().clone(),
+                    subkey,
+                    delegation,
+                    fed.pins_arc(),
+                    peer_key,
+                    guard.project_credential_key_for_handoff(project),
+                    log,
+                    content,
+                )
+            }
             None => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2843,12 +3259,24 @@ async fn drive_relocate(
             }
         }
     };
-    if !paired {
+    let Some(peer_key) = peer_key else {
         return (
             StatusCode::BAD_REQUEST,
             serde_json::json!({ "error": format!("not paired with {}", peer.as_str()) }),
         );
-    }
+    };
+    let credential_key = match project_credential_key {
+        Some(key) => match seal_to_subkey(&peer_key, &key) {
+            Some(sealed) => Some(sealed),
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "could not seal project credential key to target" }),
+                )
+            }
+        },
+        None => None,
+    };
     // Origin offers — it stays home until the peer commits (INV-13).
     {
         let mut guard = wb.lock_unpoisoned();
@@ -2858,10 +3286,20 @@ async fn drive_relocate(
                 serde_json::json!({ "error": format!("handoff offer: {e}") }),
             );
         }
+        if let Err(error) =
+            record_outgoing_handoff(guard.store_mut(), "offer", project, peer.as_str())
+        {
+            let _ = apply_handoff(guard.store_mut(), project, HandoffCommand::AbortHandoff);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": error }),
+            );
+        }
     }
     match send_handoff(
         &broker,
         &me,
+        &source_home,
         &subkey,
         &delegation,
         peer,
@@ -2870,6 +3308,7 @@ async fn drive_relocate(
         project,
         log,
         content,
+        credential_key,
     )
     .await
     {
@@ -2883,26 +3322,43 @@ async fn drive_relocate(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let mut guard = wb.lock_unpoisoned();
-            let store = guard.store_mut();
             if committed {
+                let _ =
+                    record_outgoing_handoff(guard.store_mut(), "resolved", project, peer.as_str());
                 // Peer committed immediately (pre-auth / one-shot); origin commits its side.
-                let _ = apply_handoff(store, project, HandoffCommand::SyncLog);
-                match apply_handoff(store, project, HandoffCommand::CommitHandoff) {
+                let _ = apply_handoff(guard.store_mut(), project, HandoffCommand::SyncLog);
+                let target_home = verdict
+                    .get("home")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| HomeId::parse(value).ok());
+                match target_home
+                    .ok_or("target omitted its Home binding")
+                    .and_then(|home| commit_handoff_and_rebind(&mut guard, project, home))
+                {
                     Ok(s) => {
-                        record_participants(store, project, peer.as_str(), me.as_str());
+                        if let Err(error) = guard.remove_project_credential_key(project) {
+                            tracing::error!(
+                                project,
+                                error = %error,
+                                "handoff committed but former Home could not remove its project credential key"
+                            );
+                        }
+                        record_participants(guard.store_mut(), project, peer.as_str(), me.as_str());
                         (StatusCode::OK, handoff_state_json(project, &s))
                     }
                     Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        StatusCode::BAD_GATEWAY,
                         serde_json::json!({ "error": format!("origin commit: {e}") }),
                     ),
                 }
             } else if pending {
                 // The peer must consent; the origin stays home (offered) until it does.
-                let s = load_handoff(store, project);
+                let s = load_handoff(guard.store_ref(), project);
                 (StatusCode::ACCEPTED, handoff_state_json(project, &s))
             } else {
-                let _ = apply_handoff(store, project, HandoffCommand::AbortHandoff);
+                let _ =
+                    record_outgoing_handoff(guard.store_mut(), "resolved", project, peer.as_str());
+                let _ = apply_handoff(guard.store_mut(), project, HandoffCommand::AbortHandoff);
                 (
                     StatusCode::BAD_GATEWAY,
                     serde_json::json!({ "error": "peer did not admit the handoff" }),
@@ -2911,6 +3367,7 @@ async fn drive_relocate(
         }
         Err(e) => {
             let mut guard = wb.lock_unpoisoned();
+            let _ = record_outgoing_handoff(guard.store_mut(), "resolved", project, peer.as_str());
             let _ = apply_handoff(guard.store_mut(), project, HandoffCommand::AbortHandoff);
             (
                 StatusCode::BAD_GATEWAY,
@@ -3191,8 +3648,7 @@ async fn invite_receive_once(
     identity: &TlsIdentity,
     token: &str,
 ) -> std::io::Result<()> {
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(token)).await?;
+    let tcp = park_relay(broker, token).await?;
     let mut tls = tls_accept(tcp, identity).await?;
     let bytes = read_frame(&mut tls).await?;
     let wire: InviteAcceptWire = serde_json::from_slice(&bytes)
@@ -3320,8 +3776,7 @@ pub async fn post_invite_accept(
     // Send the acceptance to the origin's invite-response receiver.
     let token = invite_inbox_token(&invite.invite_id);
     let send = async {
-        let mut tcp = TcpStream::connect(&broker).await?;
-        tcp.write_all(&token_bytes(&token)).await?;
+        let tcp = join_relay(&broker, &token).await?;
         let mut tls = tls_connect(tcp, &origin, pins).await?;
         let bytes = serde_json::to_vec(&accept_wire)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -3413,8 +3868,7 @@ async fn run_place_serve_once(
     delegation: &DeviceDelegation,
     token: &str,
 ) -> std::io::Result<()> {
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(token)).await?;
+    let tcp = park_relay(broker, token).await?;
     let mut tls = tls_accept(tcp, identity).await?;
     let bytes = read_frame(&mut tls).await?;
     let wire: RunPlaceWire = serde_json::from_slice(&bytes)
@@ -3463,6 +3917,27 @@ fn admit_run_place(
         {
             return refused("verification failed");
         }
+        if let Some(target_chat) = wire.target_chat.as_deref() {
+            use gaugewright_core::workstream::{WorkstreamPhase, WorkstreamState};
+
+            let target_is_member = guard.library.project_of_chat(target_chat)
+                == Some(wire.project.as_str())
+                && guard.engagements.contains_key(target_chat)
+                && guard.library.workstreams.values().any(|workstream| {
+                    guard
+                        .store_ref()
+                        .fold::<WorkstreamState>(&workstream.id)
+                        .is_ok_and(|state| {
+                            state.phase == WorkstreamPhase::Active
+                                && state.members.contains(target_chat)
+                        })
+                });
+            if !target_is_member {
+                return refused(
+                    "target_chat is not an active hub-resident workstream member in the project",
+                );
+            }
+        }
         let allowed = run_allowed(guard.store_ref(), &wire.project, &wire.source);
         if allowed {
             // ITGOV-3(b) / ADR 0074: the continuous placement floor (ADR 0061 entry-point #2).
@@ -3482,7 +3957,15 @@ fn admit_run_place(
         allowed
     };
     if allowed {
-        let resp = execute_peer_turn(wb, &wire.prompt, &wire.project, subkey, delegation);
+        let resp = execute_peer_turn(
+            wb,
+            &wire.prompt,
+            &wire.project,
+            wire.target_chat.as_deref(),
+            wire.target_chat.as_ref().map(|_| wire.source.as_str()),
+            subkey,
+            delegation,
+        );
         RunPlaceVerdict {
             status: "admitted".into(),
             resp: Some(resp),
@@ -3504,6 +3987,8 @@ pub struct RunPlaceRequest {
     pub archetype: String,
     pub data_handle: String,
     pub prompt: String,
+    #[serde(default)]
+    pub target_chat: Option<String>,
 }
 
 /// `POST /federation/run/place` — the operator places a project-scoped run on the host.
@@ -3549,6 +4034,7 @@ pub async fn post_run_place(
         archetype: req.archetype.clone(),
         data_handle: req.data_handle.clone(),
         prompt: req.prompt.clone(),
+        target_chat: req.target_chat.clone(),
         source: me.as_str().to_string(),
         target: peer.as_str().to_string(),
         signature: subkey.sign(&signed_bytes),
@@ -3559,8 +4045,7 @@ pub async fn post_run_place(
     let run_scope = format!("project::{}::observations", req.project);
     let token = run_place_token(me.as_str(), peer.as_str());
     let send = async {
-        let mut tcp = TcpStream::connect(&broker).await?;
-        tcp.write_all(&token_bytes(&token)).await?;
+        let tcp = join_relay(&broker, &token).await?;
         let mut tls = tls_connect(tcp, &peer, pins).await?;
         write_frame(&mut tls, &serde_json::to_vec(&wire).unwrap()).await?;
         let vbytes = read_frame(&mut tls).await?;
@@ -3816,8 +4301,7 @@ async fn erasure_serve_once(
     identity: &TlsIdentity,
     token: &str,
 ) -> std::io::Result<()> {
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(token)).await?;
+    let tcp = park_relay(broker, token).await?;
     let mut tls = tls_accept(tcp, identity).await?;
     let bytes = read_frame(&mut tls).await?;
     let wire: EraseWire = serde_json::from_slice(&bytes)
@@ -3891,8 +4375,7 @@ pub async fn post_erase(
     };
     let token = erase_token(me.as_str(), peer.as_str());
     let send = async {
-        let mut tcp = TcpStream::connect(&broker).await?;
-        tcp.write_all(&token_bytes(&token)).await?;
+        let tcp = join_relay(&broker, &token).await?;
         let mut tls = tls_connect(tcp, &peer, pins).await?;
         write_frame(&mut tls, &serde_json::to_vec(&wire).unwrap()).await?;
         let vbytes = read_frame(&mut tls).await?;
@@ -4017,8 +4500,12 @@ struct RunResultWire {
     resp: RunResp,
 }
 
-/// The pending queued run for `correlation`, as `(operator, project, prompt)`.
-fn pending_run_by(store: &Store, correlation: &str) -> Option<(String, String, String)> {
+/// The pending queued run for `correlation`, as
+/// `(operator, project, prompt, target_chat)`.
+fn pending_run_by(
+    store: &Store,
+    correlation: &str,
+) -> Option<(String, String, String, Option<String>)> {
     pending_runs(store).into_iter().find_map(|r| {
         if r.get("correlation").and_then(|c| c.as_str()) == Some(correlation) {
             Some((
@@ -4034,6 +4521,9 @@ fn pending_run_by(store: &Store, correlation: &str) -> Option<(String, String, S
                     .and_then(|p| p.as_str())
                     .unwrap_or("")
                     .to_string(),
+                r.get("target_chat")
+                    .and_then(|chat| chat.as_str())
+                    .map(str::to_owned),
             ))
         } else {
             None
@@ -4054,9 +4544,10 @@ pub async fn post_run_admit_once(
     Json(req): Json<RunAdmitOnceRequest>,
 ) -> impl IntoResponse {
     // Find the queued run + this host's signing identity.
-    let (operator, project, prompt, broker, me, subkey, delegation, pins) = {
+    let (operator, project, prompt, target_chat, broker, me, subkey, delegation, pins) = {
         let guard = wb.lock_unpoisoned();
-        let Some((operator, project, prompt)) = pending_run_by(guard.store_ref(), &req.correlation)
+        let Some((operator, project, prompt, target_chat)) =
+            pending_run_by(guard.store_ref(), &req.correlation)
         else {
             return (StatusCode::NOT_FOUND, "no such queued run").into_response();
         };
@@ -4068,6 +4559,7 @@ pub async fn post_run_admit_once(
                 operator,
                 project,
                 prompt,
+                target_chat,
                 fed.broker_addr.clone(),
                 me,
                 subkey,
@@ -4081,7 +4573,15 @@ pub async fn post_run_admit_once(
         }
     };
     // Execute the run on the host (it is the project's home), then resolve the queue.
-    let resp = execute_peer_turn(&wb, &prompt, &project, &subkey, &delegation);
+    let resp = execute_peer_turn(
+        &wb,
+        &prompt,
+        &project,
+        target_chat.as_deref(),
+        target_chat.as_ref().map(|_| operator.as_str()),
+        &subkey,
+        &delegation,
+    );
     {
         let mut guard = wb.lock_unpoisoned();
         resolve_run(guard.store_mut(), &req.correlation, "admitted-once");
@@ -4111,8 +4611,7 @@ async fn push_run_result(
     token: &str,
     wire: &RunResultWire,
 ) -> std::io::Result<()> {
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(token)).await?;
+    let tcp = join_relay(broker, token).await?;
     let mut tls = tls_connect(tcp, operator, pins).await?;
     write_frame(&mut tls, &serde_json::to_vec(wire).unwrap()).await?;
     let _ = read_frame(&mut tls).await; // ack
@@ -4155,8 +4654,7 @@ async fn run_result_serve_once(
     host: &AuthorityId,
     token: &str,
 ) -> std::io::Result<()> {
-    let mut tcp = TcpStream::connect(broker).await?;
-    tcp.write_all(&token_bytes(token)).await?;
+    let tcp = park_relay(broker, token).await?;
     let mut tls = tls_accept(tcp, identity).await?;
     let bytes = read_frame(&mut tls).await?;
     let wire: RunResultWire = serde_json::from_slice(&bytes)
@@ -4295,6 +4793,10 @@ pub async fn post_handoff_accept(
             serde_json::from_value(offer["log"].clone()).unwrap_or_default();
         let content: Vec<HandoffContentBundle> =
             serde_json::from_value(offer["content"].clone()).unwrap_or_default();
+        let credential_key: Option<SealedKey> =
+            serde_json::from_value(offer["credential_key"].clone())
+                .ok()
+                .flatten();
         let me = guard.authority().as_str().to_string();
         // ITGOV-3(a): a relocated project's declared deployment mode must satisfy this org's
         // placement policy before the target admits it — the handoff analog of the
@@ -4312,7 +4814,13 @@ pub async fn post_handoff_accept(
             )
                 .into_response();
         }
-        let committed = commit_incoming_handoff(&mut guard, &req.project, &log, &content);
+        let committed = commit_incoming_handoff(
+            &mut guard,
+            &req.project,
+            &log,
+            &content,
+            credential_key.as_ref(),
+        );
         if committed {
             // host = this authority (consented), operator = the origin.
             record_participants(guard.store_mut(), &req.project, &me, &req.source);
@@ -4404,12 +4912,22 @@ pub async fn post_handoff_accept_all(
                 serde_json::from_value(offer["log"].clone()).unwrap_or_default();
             let content: Vec<HandoffContentBundle> =
                 serde_json::from_value(offer["content"].clone()).unwrap_or_default();
+            let credential_key: Option<SealedKey> =
+                serde_json::from_value(offer["credential_key"].clone())
+                    .ok()
+                    .flatten();
             // Fail-closed: a project whose declared deployment mode the org policy won't admit is
             // not committed and not marked resolved — it stays pending (`INV-20`).
             if !handoff_placement_admitted(&placement_policy, &log, &project) {
                 continue;
             }
-            let committed = commit_incoming_handoff(&mut guard, &project, &log, &content);
+            let committed = commit_incoming_handoff(
+                &mut guard,
+                &project,
+                &log,
+                &content,
+                credential_key.as_ref(),
+            );
             if committed {
                 record_participants(guard.store_mut(), &project, &me, &source);
             }
@@ -4644,6 +5162,7 @@ pub async fn get_handoff_data(
 struct HandoffNotify {
     broker: String,
     me: AuthorityId,
+    home: HomeId,
     origin: AuthorityId,
     subkey: SigningKey,
     delegation: DeviceDelegation,
@@ -4667,6 +5186,7 @@ fn handoff_notify_material(guard: &crate::Workbench, source: &str) -> HandoffNot
     HandoffNotify {
         broker,
         me,
+        home: guard.home_id().clone(),
         origin: AuthorityId::new(source),
         subkey,
         delegation,
@@ -4681,6 +5201,7 @@ async fn notify_origin(n: HandoffNotify, kind: HandoffMsgKind, project: &str) {
     let _ = send_handoff(
         &n.broker,
         &n.me,
+        &n.home,
         &n.subkey,
         &n.delegation,
         &n.origin,
@@ -4689,6 +5210,7 @@ async fn notify_origin(n: HandoffNotify, kind: HandoffMsgKind, project: &str) {
         project,
         vec![],
         vec![], // Committed/Declined carry no content — the origin already holds it.
+        None,
     )
     .await;
 }
@@ -4764,7 +5286,7 @@ mod bridge_roster_tests {
             authority: authority.into(),
             governance_pubkey: "gov-pub".into(),
             cert_fingerprint: hex::encode([7u8; 32]),
-            broker_addr: "127.0.0.1:7900".into(),
+            broker_addr: "ws://127.0.0.1:7900".into(),
             scope: "project::p1".into(),
             expiry: 9_999_999_999,
         }
@@ -4777,7 +5299,7 @@ mod bridge_roster_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open_in_memory().unwrap();
         let auth = AuthorityId::new("local-user");
-        let broker = "127.0.0.1:7900".to_string();
+        let broker = "ws://127.0.0.1:7900".to_string();
 
         // Pair a peer and persist the bridge (what `post_pair` does).
         let mut fed = Federation::open(auth.clone(), dir.path(), broker.clone()).unwrap();
@@ -4859,10 +5381,13 @@ mod handoff_routes_tests {
     fn incoming_deployment_mode_reads_the_relocated_project_ceiling() {
         use gaugewright_core::boundary_lifecycle::{Operator, Placement};
         let project = crate::library::ProjectRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: "p1".into(),
             op: crate::library::RecordOp::Upsert,
             name: "Acme".into(),
             is_default: false,
+            home_id: gaugewright_core::ids::HomeId::new("home:local-user"),
             network_isolated: false,
             run_purpose: None,
             deployment_mode: Some(Placement {
@@ -5098,10 +5623,13 @@ mod run_place_floor_tests {
     fn lib_with(project: &str, mode: Option<Placement>) -> Library {
         let mut lib = Library::default();
         lib.apply_project(ProjectRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
             id: project.into(),
             op: RecordOp::Upsert,
             name: project.into(),
             is_default: false,
+            home_id: gaugewright_core::ids::HomeId::new("home:local-user"),
             network_isolated: false,
             run_purpose: None,
             deployment_mode: mode,

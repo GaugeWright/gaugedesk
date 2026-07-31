@@ -4,10 +4,11 @@
 //! so the loopback double, a file-backed dev impl, and a future secure-enclave /
 //! TPM impl are interchangeable with no change to the signing path.
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use gaugewright_core::ids::{AuthorityId, PublicKey};
-use gaugewright_core::signature::SigningKey;
+use gaugewright_core::signature::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
 
 use crate::workbench_state::Workbench;
@@ -35,10 +36,10 @@ impl KeyStore for LoopbackKeyStore {
     }
 }
 
-/// File-backed dev store: persists each authority's 32-byte seed under
-/// `dir/<authority>.key`, deriving + writing one on first use. The on-disk format
-/// is the bare seed (the secure-enclave impl replaces *where* the bytes live, not
-/// the trait). Not for production secrets — a real install seals these.
+/// File-backed store: persists each authority's unguessable 32-byte seed under
+/// `dir/<authority>.key`, generating it from the operating-system CSPRNG on first
+/// use. The on-disk format is the bare seed; production packaging can replace
+/// this boundary with secure-enclave custody without changing signing callers.
 #[derive(Clone)]
 pub struct FileKeyStore {
     dir: PathBuf,
@@ -60,24 +61,77 @@ impl FileKeyStore {
     /// out-of-band key import.
     pub fn enroll(&self, authority: &AuthorityId, key: &SigningKey) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(self.path(authority), key.to_seed_bytes())
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(self.path(authority))?;
+        file.write_all(&key.to_seed_bytes())?;
+        file.sync_all()
     }
+
+    /// Load or create an unguessable key for a real external authority.
+    ///
+    /// Unlike [`KeyStore::signing_key`], this never derives private material
+    /// from the public authority id and never falls back after an I/O failure.
+    pub fn random_signing_key(&self, authority: &AuthorityId) -> io::Result<SigningKey> {
+        let path = self.path(authority);
+        if path.exists() {
+            return read_signing_key(&path);
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let key = loop {
+            let mut seed = [0_u8; 32];
+            getrandom::getrandom(&mut seed).map_err(io::Error::other)?;
+            if let Ok(key) = SigningKey::from_seed(&seed) {
+                break key;
+            }
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                file.write_all(&key.to_seed_bytes())?;
+                file.sync_all()?;
+                Ok(key)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => read_signing_key(&path),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn read_signing_key(path: &std::path::Path) -> io::Result<SigningKey> {
+    let bytes = std::fs::read(path)?;
+    let seed = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "signing key has invalid length")
+    })?;
+    SigningKey::from_seed(&seed)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.reason))
 }
 
 impl KeyStore for FileKeyStore {
     fn signing_key(&self, authority: &AuthorityId) -> SigningKey {
-        if let Ok(bytes) = std::fs::read(self.path(authority)) {
-            if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                if let Ok(key) = SigningKey::from_seed(&seed) {
-                    return key;
-                }
-            }
-        }
-        // First use (or unreadable): derive deterministically and persist it, so
-        // the same authority gets a stable key across restarts.
-        let key = LoopbackKeyStore.signing_key(authority);
-        let _ = self.enroll(authority, &key);
-        key
+        self.random_signing_key(authority)
+            .expect("file-backed signing key must load or enroll securely")
     }
 }
 
@@ -89,14 +143,33 @@ fn seed_from(s: &str) -> [u8; 32] {
 }
 
 impl Workbench {
+    fn governance_signing_key(&self) -> SigningKey {
+        let root = self.root_path();
+        if root.as_os_str().is_empty() {
+            LoopbackKeyStore.signing_key(self.authority())
+        } else {
+            FileKeyStore::new(root.join("keys")).signing_key(self.authority())
+        }
+    }
+
     /// This authority's P-256 governance **public** key, resolved (deriving +
     /// persisting on first use) through the file-backed [`FileKeyStore`] under
     /// `root/keys`. This is the value pinned in a peer's bridge grant at pairing
     /// (`SERVE-1`/ADR 0042). The private half never leaves the key store.
     pub fn governance_public_key(&self) -> PublicKey {
-        FileKeyStore::new(self.root_path().join("keys"))
-            .signing_key(self.authority())
-            .public_key()
+        self.governance_signing_key().public_key()
+    }
+
+    /// Sign an already-canonical protocol payload with this Home authority's
+    /// governance key. The private seed remains behind the key-store boundary.
+    pub fn sign_governance_payload(&self, payload: &[u8]) -> Signature {
+        self.governance_signing_key().sign(payload)
+    }
+
+    /// Public P-256 point for protocols that need JWK `x`/`y` coordinates.
+    pub fn governance_public_key_uncompressed_bytes(&self) -> [u8; 65] {
+        self.governance_signing_key()
+            .public_key_uncompressed_bytes()
     }
 }
 
@@ -146,6 +219,32 @@ mod tests {
             .signing_key(&authority)
             .to_seed_bytes();
         assert_eq!(first, reloaded);
+        assert_ne!(
+            first,
+            LoopbackKeyStore.signing_key(&authority).to_seed_bytes(),
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn random_file_keys_are_stable_per_root_and_unlinkable_across_roots() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let authority = AuthorityId::new("local-user::public-publisher");
+        let first = FileKeyStore::new(left.path())
+            .random_signing_key(&authority)
+            .unwrap();
+        let reloaded = FileKeyStore::new(left.path())
+            .random_signing_key(&authority)
+            .unwrap();
+        let independent = FileKeyStore::new(right.path())
+            .random_signing_key(&authority)
+            .unwrap();
+        assert_eq!(first.public_key(), reloaded.public_key());
+        assert_ne!(first.public_key(), independent.public_key());
+        assert_ne!(
+            first.public_key(),
+            LoopbackKeyStore.signing_key(&authority).public_key(),
+        );
     }
 }

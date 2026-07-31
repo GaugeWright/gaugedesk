@@ -6,15 +6,19 @@ export { initialAccessRequest, presentAccessRequest, reduceAccessRequest } from 
 export type { AccessRequestEvent, AccessRequestPresentation, AccessRequestState } from "./access-request";
 export { AccountPanel } from "./AccountPanel";
 export type { AccountPanelApi } from "./AccountPanel";
-export { ConsoleShell } from "./ConsoleShell";
-export type { ConsoleApi } from "./ConsoleShell";
 export { FirstRunOverlay } from "./FirstRunOverlay";
 export type { FirstRunApi } from "./FirstRunOverlay";
 export { AgentSettings, plainConfigError, readFormConfig, writeFormConfig } from "./AgentSettings";
 export type { AgentSettingsApi, AgentSettingsProps } from "./AgentSettings";
-export { buildOutgoing, classifyAttachment, fileToBase64 } from "./attachments";
-export type { Attachment, ImageRef } from "./attachments";
+export { buildOutgoing, classifyAttachment, documentFileType, extractDocumentAttachment, fileToBase64 } from "./attachments";
+export type { Attachment, DocumentFileType, ImageRef } from "./attachments";
 export { Carousel, applySelection } from "./CarouselIsland";
+export { ChatPanel } from "./ChatPanel";
+export type { ChatPanelProps } from "./ChatPanel";
+export { ChatPaneHeader } from "./ChatPaneHeader";
+export type { ChatPaneHeaderProps, ChatPaneStatusTone } from "./ChatPaneHeader";
+export { ChatComposer } from "./ChatComposer";
+export type { ChatComposerProps, ComposerQueueItem } from "./ChatComposer";
 export { ChatApprovalCard } from "./ChatApprovalCard";
 export type { ChatApprovalCardProps } from "./ChatApprovalCard";
 export { ConfigEditor } from "./ConfigEditor";
@@ -40,6 +44,41 @@ export type { BannerSeverity, ConnectionBannerView } from "./connection-banner";
 export { canCommand, deriveStatus, initialConnection, reduce as reduceConnection } from "./connection";
 export type { ConnectionEvent, ConnectionState, ConnectionStatus } from "./connection";
 export { ContentViewer } from "./ContentViewer";
+export type { ContentViewerProps, SpecialFileRenderer } from "./ContentViewer";
+export { QuarantineIndex } from "./QuarantineIndex";
+export {
+    collectionBlockerFor,
+    collectionInputFrom,
+    exportablePathsOf,
+    retentionSeconds,
+} from "./deployment-collection";
+export type { CollectionDraft } from "./deployment-collection";
+export {
+    fundingBlockerFor,
+    fundingFieldsFrom,
+    isManagedPlanRef,
+    MANAGED_PLAN_PREFIX,
+} from "./deployment-funding";
+export type { FundingDraft, FundingFields, FundingMode } from "./deployment-funding";
+export { EnvironmentDocumentView } from "./EnvironmentDocumentView";
+export type {
+    EnvironmentComplexView,
+    EnvironmentComplexViewProps,
+    EnvironmentViewCommand,
+    EnvironmentViewRegistry,
+} from "./EnvironmentDocumentView";
+export {
+    EnvironmentViewError,
+    manifestDocumentForPath,
+    parseEnvironmentManifest,
+    parseEnvironmentView,
+    resolveDocumentPath,
+} from "./environment-view";
+export type {
+    EnvironmentDocumentBinding,
+    EnvironmentManifest,
+    EnvironmentViewNode,
+} from "./environment-view";
 export { defaultContentMode, isSettledPhase, keptLabel, phaseLabel, shouldShowViewOnSelect } from "./content-view";
 export type { ChatKind as ContentChatKind } from "./content-view";
 export { ContextMenu } from "./ContextMenu";
@@ -55,6 +94,14 @@ export type { AccessBasisLookup, DeepLinkResolution, ResolvedRoute } from "./dee
 export { isDevMode, readDevMode } from "./dev-mode";
 export { EngagementPane } from "./EngagementPane";
 export type { EngagementPaneApi } from "./EngagementPane";
+export { Environment, PANEL_IDS, panelManifest } from "./environment";
+export type {
+    EnvironmentIdentity,
+    EnvironmentSessionFactory,
+    PanelId,
+    PanelManifest,
+    SessionBinding,
+} from "./environment";
 export { ProjectModelAccessPanel } from "./ProjectModelAccessPanel";
 export type { ProjectModelAccessApi } from "./ProjectModelAccessPanel";
 export { ProjectHomePanel } from "./ProjectHomePanel";
@@ -67,6 +114,8 @@ export { archetypeVisible, childrenFor, groupChatsByArchetype, hit, lineageVarie
 export type { ChatGroup, FilterArchetype, FilterChat, FilterPlacement, FilterProject, MatchSplit, RecentChat } from "./facet-filter";
 export { forkSource, isFork } from "./fork-lineage";
 export { FreshnessBanner } from "./FreshnessBanner";
+export { EnvironmentContentViewer } from "./EnvironmentContentViewer";
+export type { EnvironmentContentViewerProps } from "./EnvironmentContentViewer";
 export { Icon } from "./icons";
 export type { IconName } from "./icons";
 export { LoadError } from "./LoadError";
@@ -102,12 +151,15 @@ export type { PolicyNote, PolicyReading } from "./policy-diff";
 export { DEFAULT_DECAY, ProjectionCache, cacheKey, decayFreshness } from "./projection-cache";
 export type { CacheStorage, DecayPolicy } from "./projection-cache";
 export { qrSvg } from "./qr-code";
-export { availabilityLabel, availabilityOf, contextSources, exportPhaseLabel, isContextSource, isOutput, kindLabel, outputProtectionLabel, outputs, resourceExportScope, resourceReviewScope, resourceTitle, reviewPhaseLabel } from "./resource-catalog";
+export { availabilityLabel, availabilityOf, contextSources, exportPhaseLabel, isContextSource, isOutput, kindLabel, outputProtectionLabel, outputs, resourceTitle, reviewPhaseLabel } from "./resource-catalog";
 export type { Availability } from "./resource-catalog";
-export { ReviewShelf } from "./ReviewShelf";
-export type { ReviewShelfApi } from "./ReviewShelf";
 export { DevicesModal } from "./DevicesModal";
 export type { DevicesModalApi } from "./DevicesModal";
+export { DeploymentPanel } from "./DeploymentPanel";
+export type {
+    DeploymentPanelApi,
+    DeploymentSelection,
+} from "./DeploymentPanel";
 export { SessionProvider, useSession } from "./session-context";
 export type { Session, SessionApi } from "./session-context";
 export { Shelf } from "./Shelf";
@@ -119,7 +171,7 @@ export { TopBar } from "./TopBar";
 export type { TopBarProps } from "./TopBar";
 export { contextHeader, dotState, dotView, nextTaskBadge, topBarView } from "./top-bar";
 export type { ContextHeader, DotState, DotView, NextTaskBadge, TopBarInputs, TopBarView } from "./top-bar";
-export { empty as emptyTranscript, fromSnapshot, groupTurns, reduce as reduceTranscript } from "./transcript";
+export { empty as emptyTranscript, fromSnapshot, groupTurns, pendingUserAfterSnapshot, reduce as reduceTranscript } from "./transcript";
 export type { StreamEvent, Tier, ToolLine, Transcript, TranscriptLine, TranscriptSegment } from "./transcript";
 export { TranscriptFilterMenu } from "./TranscriptFilterMenu";
 export { chatIdFromSearch, fileFromSearch, searchWithChat, searchWithFile } from "./chat-url";
@@ -133,3 +185,9 @@ export type { ToolGroup, ToolId } from "./tool-verb";
 export { groupChatsByWorkstream, hasWorkstreams } from "./workstream-grouping";
 export type { ChatLike, GroupedChats, WorkstreamGroup } from "./workstream-grouping";
 export { Workspace } from "./Workspace";
+export { WorkbenchShell, createWorkbenchShellState } from "./WorkbenchShell";
+export type {
+    WorkbenchShellOptions,
+    WorkbenchShellProps,
+    WorkbenchShellState,
+} from "./WorkbenchShell";

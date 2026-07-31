@@ -1,0 +1,29 @@
+[package]
+name = "gaugewright-relay-transport"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Blind role-aware rendezvous and cert-pinned Home/client tunnel."
+
+[features]
+test-relay = []
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "test-wss-relay"
+required-features = ["test-relay"]

@@ -10,6 +10,7 @@ Feature: Tuning the chat log
     Given a new engagement
     When I task the agent with "make a change"
     Then a mediated tool line is shown
+    And the chat log does not show "Finished this turn"
     When I collapse the first turn
     Then the first turn is collapsed
     And no tool line is shown
@@ -35,7 +36,7 @@ Feature: Tuning the chat log
     When I hide "write" tool calls from the chat log
     And I save the filter as default
     And I reload the workbench
-    And I switch to the "Chats" facet
+    And I switch to the "Projects" facet
     And I reopen the chat
     Then no "write" tool line is shown
     And a mediated tool line is shown

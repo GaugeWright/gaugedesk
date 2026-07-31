@@ -37,7 +37,11 @@ pub fn is_method_surface_path(path: &str) -> bool {
 
 pub fn is_control_surface_path(path: &str) -> bool {
     let p = path.trim_start_matches("./");
-    p == ".agent-config.json" || p.ends_with("/.agent-config.json")
+    p == ".agent-config.json"
+        || p.ends_with("/.agent-config.json")
+        || p == definition::RUNTIME_MOUNT_ROOT
+        || p.starts_with(concat!(".gaugedesk-runtime", "/"))
+        || p.contains(concat!("/", ".gaugedesk-runtime", "/"))
 }
 
 /// Pi's built-in file-mutating tools. This membrane gate gives a fast, clean
@@ -60,26 +64,30 @@ pub mod definition {
     pub const PACKAGE_ROOT: &str = ".whipple";
     pub const DRAFT_ROOT: &str = ".whipple/draft";
     pub const VERSIONS_ROOT: &str = ".whipple/versions";
+    pub const DISCIPLINE_VERSIONS_ROOT: &str = ".whipple/discipline/versions";
     pub const MANIFEST_FILE: &str = "package.json";
     pub const SOURCE_FILE: &str = "method.whip";
     pub const PERSONA_FILE: &str = "persona.md";
     /// GaugeDesk-owned provider/model/thinking selection. Authentication and
     /// credentials never enter the authored package.
     pub const CONFIG_PATH: &str = ".agent-config.json";
+    /// Ephemeral, host-materialized view of immutable discipline assets. It is
+    /// readable by a run, excluded from target history, and never user/model writable.
+    pub const RUNTIME_MOUNT_ROOT: &str = ".gaugedesk-runtime";
+    pub const DISCIPLINE_MOUNT_ROOT: &str = ".gaugedesk-runtime/discipline";
     /// Package bytes are read-only in work chats. The OS sandbox is
     /// defense-in-depth; WhippleScript package selection is the authority.
     pub const READONLY_ROOTS: &[&str] = &[PACKAGE_ROOT];
-    pub const EDIT_READONLY_ROOTS: &[&str] = &[VERSIONS_ROOT];
+    pub const EDIT_READONLY_ROOTS: &[&str] = &[VERSIONS_ROOT, DISCIPLINE_VERSIONS_ROOT];
     /// GaugeDesk control files are never writable by a model, including in an
     /// edit chat.
-    pub const CONTROL_READONLY_ROOTS: &[&str] = &[CONFIG_PATH];
+    pub const CONTROL_READONLY_ROOTS: &[&str] = &[RUNTIME_MOUNT_ROOT];
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct PackageCapabilities {
         pub workspace_read: bool,
         pub workspace_write: bool,
         pub command_run: bool,
-        pub human_ask: bool,
     }
 
     impl Default for PackageCapabilities {
@@ -88,13 +96,12 @@ pub mod definition {
                 workspace_read: true,
                 workspace_write: true,
                 command_run: true,
-                human_ask: true,
             }
         }
     }
 
     impl PackageCapabilities {
-        fn names(self) -> Vec<&'static str> {
+        pub fn names(self) -> Vec<&'static str> {
             let mut names = Vec::new();
             if self.workspace_read {
                 names.push("workspace.read");
@@ -104,9 +111,6 @@ pub mod definition {
             }
             if self.command_run {
                 names.push("command.run");
-            }
-            if self.human_ask {
-                names.push("human.ask");
             }
             names
         }
@@ -136,7 +140,7 @@ pub mod definition {
             .collect::<Vec<_>>()
             .join(", ");
         let manifest = format!(
-            "{{\n  \"schema\": \"whipplescript.agent_package.v0\",\n  \"source\": \"method.whip\",\n  \"workflow\": \"GaugeDeskMethod\",\n  \"agent\": \"assistant\",\n  \"system_prompt\": \"persona.md\",\n  \"capabilities\": [{json_names}],\n  \"max_steps\": 32\n}}\n"
+            "{{\n  \"schema\": \"whipplescript.agent_package.v0\",\n  \"source\": \"method.whip\",\n  \"workflow\": \"GaugeDeskMethod\",\n  \"agent\": \"assistant\",\n  \"system_prompt\": \"persona.md\",\n  \"capabilities\": [{json_names}],\n  \"agent_abilities\": [{json_names}],\n  \"max_steps\": 32\n}}\n"
         );
         let capability_list = format!("[{}]", json_names);
         let requires = if names.is_empty() {
@@ -161,9 +165,6 @@ pub mod definition {
         if capabilities.command_run {
             grants.push_str("\n      with access to command {\n        run\n      }");
         }
-        if capabilities.human_ask {
-            grants.push_str("\n      with access to human {\n        ask\n      }");
-        }
         let source = format!(
             "{resources}workflow GaugeDeskMethod {{\n  agent assistant {{\n    provider owned\n    profile \"repo-writer\"\n    capacity 1\n    capabilities {capability_list}\n  }}\n\n  rule converse\n    when started\n  => {{\n    tell assistant{requires}{grants}\n      \"Run the selected GaugeDesk method.\"\n  }}\n}}\n"
         );
@@ -185,22 +186,19 @@ workflow GaugeDeskMethod {
     provider owned
     profile "repo-writer"
     capacity 1
-    capabilities ["workspace.read", "workspace.write", "command.run", "human.ask"]
+    capabilities ["workspace.read", "workspace.write", "command.run"]
   }
 
   rule converse
     when started
   => {
-    tell assistant requires ["workspace.read", "workspace.write", "command.run", "human.ask"]
+    tell assistant requires ["workspace.read", "workspace.write", "command.run"]
       with access to project {
         read ["**"]
         write ["**"]
       }
       with access to command {
         run
-      }
-      with access to human {
-        ask
       }
       "Run the selected GaugeDesk method."
   }
@@ -216,8 +214,12 @@ workflow GaugeDeskMethod {
   "capabilities": [
     "workspace.read",
     "workspace.write",
-    "command.run",
-    "human.ask"
+    "command.run"
+  ],
+  "agent_abilities": [
+    "workspace.read",
+    "workspace.write",
+    "command.run"
   ],
   "max_steps": 32
 }
@@ -352,7 +354,6 @@ impl AgentConfig {
             workspace_read: admits(&["read"]) || workspace_write,
             workspace_write,
             command_run: admits(&["bash", "command"]),
-            human_ask: admits(&["ask_human", "human"]),
         }
     }
 }

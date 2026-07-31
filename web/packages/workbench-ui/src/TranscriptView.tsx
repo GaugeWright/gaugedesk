@@ -158,6 +158,7 @@ function LineView(props: {
     prefs: FilterPrefs;
     /** Fired by the action on a `code: "no_credential"` error line — opens settings. */
     onResolveCredential?: () => void;
+    onFork?: (entryId: number) => void;
 }): JSX.Element {
     // A model-credential refusal (LLM-1) carries a machine-readable code: render the
     // reason *with* an action into settings, so the user can act from the chat log
@@ -172,7 +173,18 @@ function LineView(props: {
                     when={isCredentialError()}
                     fallback={
                         <div class={`line ${props.line.tier} ${props.line.kind}`} data-line-text={props.line.text}>
-                            {friendlyLine(props.line.kind, props.line.text)}
+                            <span>{friendlyLine(props.line.kind, props.line.text)}</span>
+                            <Show when={props.line.forkable && props.line.entryId !== undefined && props.onFork}>
+                                <button
+                                    type="button"
+                                    class="line-action fork-action"
+                                    data-fork-entry={props.line.entryId}
+                                    title={props.line.kind === "user" ? "Fork before this message" : "Fork after this message"}
+                                    onClick={() => props.onFork?.(props.line.entryId!)}
+                                >
+                                    Fork here
+                                </button>
+                            </Show>
                         </div>
                     }
                 >
@@ -216,6 +228,7 @@ function TurnView(props: {
     prefs: FilterPrefs;
     onOpen: (path: string) => void;
     onResolveCredential?: () => void;
+    onFork?: (entryId: number) => void;
 }): JSX.Element {
     const [collapsed, setCollapsed] = createSignal(false);
     return (
@@ -240,6 +253,7 @@ function TurnView(props: {
                                 onOpen={props.onOpen}
                                 prefs={props.prefs}
                                 onResolveCredential={props.onResolveCredential}
+                                onFork={props.onFork}
                             />
                         )}
                     </For>
@@ -261,6 +275,8 @@ export function TranscriptView(props: {
     fallback?: JSX.Element;
     /** Fired by the in-log action on a model-credential refusal (LLM-1) — opens settings. */
     onResolveCredential?: () => void;
+    /** Owner-only exact point fork. Omit in audience environments. */
+    onFork?: (entryId: number) => void;
 }): JSX.Element {
     const prefs = () => props.prefs ?? defaultPrefs;
     const segments = () => groupTurns(props.lines.filter((l) => lineVisible(l, prefs())));
@@ -273,6 +289,7 @@ export function TranscriptView(props: {
                         prefs={prefs()}
                         onOpen={props.onOpen}
                         onResolveCredential={props.onResolveCredential}
+                        onFork={props.onFork}
                     />
                 ) : (
                     <LineView
@@ -280,6 +297,7 @@ export function TranscriptView(props: {
                         onOpen={props.onOpen}
                         prefs={prefs()}
                         onResolveCredential={props.onResolveCredential}
+                        onFork={props.onFork}
                     />
                 )
             }

@@ -1,0 +1,22 @@
+[package]
+name = "gaugewright-directory-protocol"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Canonical Wasm-compatible wire and signing contract for the blind account directory."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+gaugewright-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = { version = "0.2", optional = true }
+
+[dev-dependencies]
+serde_json = "1"

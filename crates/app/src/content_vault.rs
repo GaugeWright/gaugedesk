@@ -156,26 +156,19 @@ impl ContentVault {
 }
 
 impl ContentCodec for ContentVault {
-    fn encode(&self, scope: &str, kind: &str, payload: &str) -> String {
+    fn encode(&self, scope: &str, kind: &str, payload: &str) -> Result<String, String> {
         if !self.is_content(kind) {
-            return payload.to_string();
+            return Ok(payload.to_string());
         }
         match self.dek_for(scope, true).and_then(|dek| {
             LocalAeadEncryptor::new(dek)
                 .encrypt(payload.as_bytes())
                 .ok()
         }) {
-            Some(ct) => format!("{MARKER}{}", hex::encode(ct)),
-            None => {
-                // The KEK/keyring was unavailable (loopback never hits this; a prod KMS
-                // outage would). Fail loud rather than silently persisting plaintext.
-                tracing::error!(
-                    target: "security",
-                    scope,
-                    "content encryption unavailable — storing a non-resolvable placeholder (SECAUD-9)",
-                );
-                format!("{MARKER}UNENCRYPTABLE")
-            }
+            Some(ct) => Ok(format!("{MARKER}{}", hex::encode(ct))),
+            None => Err(format!(
+                "content encryption unavailable for scope {scope}; append refused (SECAUD-9)"
+            )),
         }
     }
 
@@ -209,7 +202,9 @@ mod tests {
     fn content_is_encrypted_at_rest_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let v = vault(dir.path());
-        let stored = v.encode("eng-1", "transcript", "a private question");
+        let stored = v
+            .encode("eng-1", "transcript", "a private question")
+            .unwrap();
         // The stored form is ciphertext, not the plaintext.
         assert!(stored.starts_with(MARKER));
         assert!(!stored.contains("a private question"));
@@ -224,7 +219,10 @@ mod tests {
     fn non_content_kinds_pass_through() {
         let dir = tempfile::tempdir().unwrap();
         let v = vault(dir.path());
-        assert_eq!(v.encode("eng-1", "membership", "role=admin"), "role=admin");
+        assert_eq!(
+            v.encode("eng-1", "membership", "role=admin").unwrap(),
+            "role=admin"
+        );
         assert_eq!(
             v.decode("eng-1", "membership", "role=admin").as_deref(),
             Some("role=admin")
@@ -235,8 +233,8 @@ mod tests {
     fn crypto_erase_makes_a_scopes_content_unrecoverable_others_intact() {
         let dir = tempfile::tempdir().unwrap();
         let v = vault(dir.path());
-        let a = v.encode("eng-a", "transcript", "alice data");
-        let b = v.encode("eng-b", "transcript", "bob data");
+        let a = v.encode("eng-a", "transcript", "alice data").unwrap();
+        let b = v.encode("eng-b", "transcript", "bob data").unwrap();
         assert!(v.decode("eng-a", "transcript", &a).is_some());
 
         assert!(v.crypto_erase("eng-a"), "the key existed and is destroyed");
@@ -268,7 +266,9 @@ mod tests {
         // A fresh vault over the same keyring dir decrypts what the first wrote
         // (keys survive a restart — the wrapped DEK is on disk).
         let dir = tempfile::tempdir().unwrap();
-        let stored = vault(dir.path()).encode("eng-1", "transcript", "persisted");
+        let stored = vault(dir.path())
+            .encode("eng-1", "transcript", "persisted")
+            .unwrap();
         let reopened = vault(dir.path());
         assert_eq!(
             reopened.decode("eng-1", "transcript", &stored).as_deref(),

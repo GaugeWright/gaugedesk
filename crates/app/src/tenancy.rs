@@ -59,6 +59,19 @@ pub struct TenantRef {
     pub personal: bool,
 }
 
+/// A metadata-only pointer to one tenant invitation for the signed-in person.
+///
+/// This is a derived account-shell projection: the invitation itself remains the
+/// [`MembershipRecord`] in the tenant's directory. In particular, no email,
+/// invitation token, member id, project, or Home address is copied into the
+/// person's account scope.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct PendingTenantInvitation {
+    pub tenant_id: String,
+    pub display_name: String,
+    pub role: String,
+}
+
 /// The folded person→tenants index (the switcher), derived from [`ACCOUNT_SCOPE`] — rebuildable
 /// (`INV-5`).
 #[derive(Default, Clone, Debug)]
@@ -105,6 +118,111 @@ impl Tenancy {
     pub fn personal(&self) -> Option<&TenantRef> {
         self.tenants.values().find(|t| t.personal)
     }
+}
+
+/// Derive the signed-in person's outstanding tenant invitations. Only named
+/// tenant scopes are considered: the singleton local `org` scope is not a
+/// hosted workspace and must never appear in the account shell.
+pub fn pending_tenant_invitations_in(
+    store: &Store,
+    authority: &str,
+) -> Result<Vec<PendingTenantInvitation>, AdmitError> {
+    let mut invitations = Vec::new();
+    for scope in store.scope_ids()? {
+        let Some(tenant_id) = scope.strip_prefix("org::") else {
+            continue;
+        };
+        // Keep the inverse mapping exact even if a malformed scope somehow
+        // reaches the store; no alternate string representation selects a tenant.
+        if tenant_scope(tenant_id) != scope {
+            continue;
+        }
+        let org = Org::rebuild_in(store, &scope)?;
+        let invitation_role = org
+            .member_by_authority(authority)
+            .filter(|member| member.status == MembershipStatus::Invited)
+            .map(|member| member.role.clone());
+        let Some(org_record) = org.org else {
+            continue;
+        };
+        if let Some(role) = invitation_role {
+            invitations.push(PendingTenantInvitation {
+                tenant_id: tenant_id.to_owned(),
+                display_name: org_record.display_name,
+                role,
+            });
+        }
+    }
+    Ok(invitations)
+}
+
+/// Accept the current person's invitation to exactly `tenant_id`.
+///
+/// The browser supplies only the tenant id. This command re-reads the tenant
+/// directory, verifies the matching authority, then atomically promotes the
+/// invited membership and writes the ordinary switcher entry. It is idempotent
+/// for an already-active member, including repair of a missing switcher entry.
+/// `Ok(None)` deliberately reveals no distinction between a missing tenant and
+/// a tenant to which this person was not invited.
+pub fn accept_tenant_invitation_in(
+    store: &mut Store,
+    authority: &str,
+    tenant_id: &str,
+) -> Result<Option<TenantRef>, AdmitError> {
+    let scope = tenant_scope(tenant_id);
+    // The Hub has no invitation flow for its singleton desktop directory.
+    if scope == crate::org::ORG_SCOPE {
+        return Ok(None);
+    }
+    let org = Org::rebuild_in(store, &scope)?;
+    let Some(member) = org.member_by_authority(authority).cloned() else {
+        return Ok(None);
+    };
+    let Some(org_record) = org.org else {
+        return Ok(None);
+    };
+    if member.status == MembershipStatus::Deprovisioned {
+        return Ok(None);
+    }
+
+    let tenant = TenantRef {
+        id: tenant_id.to_owned(),
+        op: RecordOp::Upsert,
+        display_name: org_record.display_name,
+        role: member.role.clone(),
+        personal: false,
+    };
+    let account_scope = crate::account::account_scope(authority);
+    let indexed = Tenancy::rebuild_in(store, &account_scope)?
+        .tenants
+        .get(tenant_id)
+        .is_some_and(|existing| {
+            existing.display_name == tenant.display_name
+                && existing.role == tenant.role
+                && !existing.personal
+        });
+
+    let mut payloads: Vec<(&str, &str, String)> = Vec::new();
+    if member.status == MembershipStatus::Invited {
+        let mut active = member;
+        active.status = MembershipStatus::Active;
+        payloads.push((&scope, "membership", serde_json::to_string(&active)?));
+    }
+    if !indexed {
+        payloads.push((
+            &account_scope,
+            TENANT_REF_KIND,
+            serde_json::to_string(&tenant)?,
+        ));
+    }
+    if !payloads.is_empty() {
+        let records: Vec<(&str, &str, &str)> = payloads
+            .iter()
+            .map(|(scope, kind, payload)| (*scope, *kind, payload.as_str()))
+            .collect();
+        store.append_records_atomically(&records)?;
+    }
+    Ok(Some(tenant))
 }
 
 /// Auto-provision the person's **personal tenant-of-one** (`ADR 0077` §9), idempotently, and index
@@ -176,6 +294,58 @@ pub fn provision_personal_tenant(
     Ok(tid)
 }
 
+/// Provision one named organization for `root` and index its single owner membership in that
+/// person's switcher. The tenant id is server-generated so a caller can name an organization
+/// without choosing, probing, or colliding with another tenant's isolation scope.
+pub fn provision_organization(
+    store: &mut Store,
+    root: &str,
+    account_scope: &str,
+    display: &str,
+) -> Result<TenantRef, AdmitError> {
+    let id = format!(
+        "organization:{}",
+        hex::encode(crate::session::random_bytes::<16>())
+    );
+    let scope = tenant_scope(&id);
+    let display_name = display.trim().to_string();
+
+    let org = OrgRecord {
+        id: ORG_ID.into(),
+        op: RecordOp::Upsert,
+        display_name: display_name.clone(),
+        ..Default::default()
+    };
+    store.append_record(&scope, "org", &serde_json::to_string(&org)?)?;
+
+    let owner = MembershipRecord {
+        id: root.to_string(),
+        op: RecordOp::Upsert,
+        org_id: id.clone(),
+        authority: root.to_string(),
+        email: String::new(),
+        role: "owner".to_string(),
+        status: MembershipStatus::Active,
+        managed_by_scim: false,
+        team: None,
+    };
+    store.append_record(&scope, "membership", &serde_json::to_string(&owner)?)?;
+
+    let tenant = TenantRef {
+        id,
+        op: RecordOp::Upsert,
+        display_name,
+        role: "owner".to_string(),
+        personal: false,
+    };
+    store.append_record(
+        account_scope,
+        TENANT_REF_KIND,
+        &serde_json::to_string(&tenant)?,
+    )?;
+    Ok(tenant)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +407,28 @@ mod tests {
     }
 
     #[test]
+    fn organization_provisioning_creates_an_isolated_owner_workspace() {
+        let mut s = Store::open_in_memory().unwrap();
+        let account_scope = crate::account::account_scope(ROOT);
+        let created = provision_organization(&mut s, ROOT, &account_scope, "Acme Studio").unwrap();
+        assert!(created.id.starts_with("organization:"));
+        assert_eq!(created.display_name, "Acme Studio");
+        assert_eq!(created.role, "owner");
+        assert!(!created.personal);
+
+        let org = Org::rebuild_in(&s, &tenant_scope(&created.id)).unwrap();
+        assert_eq!(org.org.as_ref().unwrap().display_name, "Acme Studio");
+        assert_eq!(
+            org.role_of(ROOT),
+            Some(gaugewright_core::abac::Role::owner())
+        );
+
+        let tenancy = Tenancy::rebuild_in(&s, &crate::account::account_scope(ROOT)).unwrap();
+        assert_eq!(tenancy.list().count(), 1);
+        assert!(tenancy.contains(&created.id));
+    }
+
+    #[test]
     fn provision_self_heals_a_missing_index_entry() {
         // If the tenant was written but the switcher entry was lost (partial write), a re-run
         // completes it rather than duplicating the tenant.
@@ -289,6 +481,85 @@ mod tests {
                 .unwrap()
                 .role_of("root-b"),
             None
+        );
+    }
+
+    #[test]
+    fn tenant_invitation_is_metadata_only_and_acceptance_is_atomic_and_idempotent() {
+        let mut s = Store::open_in_memory().unwrap();
+        let owner_scope = crate::account::account_scope(ROOT);
+        let tenant = provision_organization(&mut s, ROOT, &owner_scope, "Acme Studio").unwrap();
+        let invited = MembershipRecord {
+            id: "invitee-record".into(),
+            op: RecordOp::Upsert,
+            org_id: ORG_ID.into(),
+            authority: "person:invitee".into(),
+            email: "private@example.test".into(),
+            role: "member".into(),
+            status: MembershipStatus::Invited,
+            managed_by_scim: false,
+            team: None,
+        };
+        let tenant_scope = tenant_scope(&tenant.id);
+        s.append_record(
+            &tenant_scope,
+            "membership",
+            &serde_json::to_string(&invited).unwrap(),
+        )
+        .unwrap();
+
+        // The shell sees only the tenant pointer and role; neither email nor
+        // directory record id are duplicated into account state.
+        assert_eq!(
+            pending_tenant_invitations_in(&s, "person:invitee").unwrap(),
+            vec![PendingTenantInvitation {
+                tenant_id: tenant.id.clone(),
+                display_name: "Acme Studio".into(),
+                role: "member".into(),
+            }]
+        );
+        assert!(pending_tenant_invitations_in(&s, "person:other")
+            .unwrap()
+            .is_empty());
+
+        let accepted = accept_tenant_invitation_in(&mut s, "person:invitee", &tenant.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.role, "member");
+        assert!(
+            Tenancy::rebuild_in(&s, &crate::account::account_scope("person:invitee"))
+                .unwrap()
+                .contains(&tenant.id)
+        );
+        assert_eq!(
+            Org::rebuild_in(&s, &tenant_scope)
+                .unwrap()
+                .role_of("person:invitee"),
+            Some(gaugewright_core::abac::Role::member())
+        );
+        assert!(pending_tenant_invitations_in(&s, "person:invitee")
+            .unwrap()
+            .is_empty());
+
+        // A retry adds no second promotion record and returns the same safe pointer.
+        let before = s.records(&tenant_scope, "membership").unwrap().len();
+        assert_eq!(
+            accept_tenant_invitation_in(&mut s, "person:invitee", &tenant.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            tenant.id
+        );
+        assert_eq!(
+            s.records(&tenant_scope, "membership").unwrap().len(),
+            before
+        );
+
+        // Guessing a tenant id never reveals or changes its directory.
+        assert!(
+            accept_tenant_invitation_in(&mut s, "person:other", &tenant.id)
+                .unwrap()
+                .is_none()
         );
     }
 }

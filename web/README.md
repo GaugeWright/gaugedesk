@@ -41,7 +41,7 @@ npm install          # Solid 1.x — peer deps resolve cleanly
 npm run typecheck     # all app + package roots (api + state + shell)
 npm run build         # vite production bundle
 npm run build:apps:open        # staged standalone workbench + mobile entries
-npm run build:apps:enterprise  # staged standalone admin entry
+cd ../ee/web && npm run build  # combined enterprise Work + Administration entry
 npm run build:apps:managed     # staged standalone managed-service entries
 npm test              # transcript reduction unit tests
 ```

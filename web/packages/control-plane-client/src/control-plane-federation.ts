@@ -71,6 +71,7 @@ export interface QueuedRun {
     readonly archetype: string;
     readonly data_handle: string;
     readonly prompt: string;
+    readonly target_chat?: string;
 }
 /** A minted combined engagement invite (FED-7 Slice 2): the deep link + confirm code. */
 export interface EngagementInvite {
@@ -243,6 +244,7 @@ function parseQueuedRun(raw: unknown): QueuedRun {
         archetype: fStr(o, "archetype"),
         data_handle: fStr(o, "data_handle"),
         prompt: fStr(o, "prompt"),
+        target_chat: fOptStr(o, "target_chat"),
     };
 }
 function parseEngagementInvite(raw: unknown): EngagementInvite {
@@ -306,6 +308,12 @@ export async function listPeers(json: RouteJson): Promise<FederationPeer[]> {
     return fArr(o, "peers").map(parseFederationPeer);
 }
 
+/** Revoke one paired authority. The durable roster keeps its inactive audit
+ *  record, while its grant and transport pin stop authorizing future work. */
+export async function revokePeer(json: RouteJson, authority: string): Promise<void> {
+    await json("DELETE", `/federation/peers/${encodeURIComponent(authority)}`);
+}
+
 /** Hand-drive one crossing of a handle to a paired peer; returns admission. */
 export async function cross(
     json: RouteJson,
@@ -344,21 +352,6 @@ export async function federationInbox(json: RouteJson): Promise<FederatedFact[]>
     return fArr(o, "federated").map(parseFederatedFact);
 }
 
-/** Offer to hand off a project's home to a peer (origin stays home until commit). */
-export async function handoffOffer(json: RouteJson, project: ProjectId): Promise<HandoffStatus> {
-    return parseHandoffStatus(await json("POST", "/federation/handoff/offer", { project }));
-}
-
-/** Acknowledge the full log has arrived on the target (still not home). */
-export async function handoffSync(json: RouteJson, project: ProjectId): Promise<HandoffStatus> {
-    return parseHandoffStatus(await json("POST", "/federation/handoff/sync", { project }));
-}
-
-/** Commit the relocation — the single fact that moves home to the target. */
-export async function handoffCommit(json: RouteJson, project: ProjectId): Promise<HandoffStatus> {
-    return parseHandoffStatus(await json("POST", "/federation/handoff/commit", { project }));
-}
-
 /** Abort an in-flight handoff; home rolls back to the origin. */
 export async function handoffAbort(json: RouteJson, project: ProjectId): Promise<HandoffStatus> {
     return parseHandoffStatus(await json("POST", "/federation/handoff/abort", { project }));
@@ -390,6 +383,7 @@ export async function placeRun(
     archetype: string,
     dataHandle: string,
     prompt: string,
+    targetChat?: string,
 ): Promise<PlacedRun> {
     return parsePlacedRun(
         await json("POST", "/federation/run/place", {
@@ -398,6 +392,7 @@ export async function placeRun(
             archetype,
             data_handle: dataHandle,
             prompt,
+            target_chat: targetChat,
         }),
     );
 }

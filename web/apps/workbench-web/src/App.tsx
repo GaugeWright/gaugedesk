@@ -13,12 +13,15 @@
  * the human admits (advance `main`) or rejects (isolate) the turn (D1).
  */
 
-import { createEffect, createMemo, createResource, createSignal, For, type JSX, on, onCleanup, Show, untrack } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, on, onCleanup, Show, untrack, type Accessor } from "solid-js";
 import {
     bearer,
+    beginLogin,
     clientRequestId,
     consumeCallbackToken,
+    endSession,
     startSessionRefresh,
+    reportedClientBuild,
     type ArchetypeId,
     describeFailure,
     type EngagementId,
@@ -29,26 +32,36 @@ import {
     type MergePhase,
     type MergeState,
     type ClientRequestId,
+    parseHomeInvitation,
+    type HomeInvitationPreview,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
+import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
+import { desktopUpdateAllowed } from "./desktop-update";
+import "@gaugewright/gw-embed";
 import {
     AgentSettings,
     type Attachment,
     buildOutgoing,
-    Carousel,
-    applySelection,
+    ChatPanel,
+    ChatPaneHeader,
     classifyAttachment,
     changedUserFiles,
     chatIdFromSearch,
     ContentViewer,
+    QuarantineIndex,
     ContextPanel,
+    DeploymentPanel,
+    ChatComposer,
     deriveFreshness,
     displayChatTitle,
     emptyTranscript as empty,
     EngagementPane,
+    Environment,
     ENABLED_MODELS_SETTING,
     fileFromSearch,
     fileToBase64,
+    extractDocumentAttachment,
     freshnessEventForMarker,
     FacetBrowser,
     forkSource,
@@ -56,7 +69,6 @@ import {
     fromSnapshot,
     type ImageRef,
     Icon,
-    initialCarousel,
     initialFreshness,
     isPlaceholderTitle,
     loadTranscriptFilterPrefs as loadPrefs,
@@ -69,12 +81,13 @@ import {
     ProjectHomePanel,
     ProjectModelAccessPanel,
     parseEnabledModels,
+    panelManifest,
+    pendingUserAfterSnapshot,
     readChatModel,
     readChatProvider,
     readChatThinking,
     readPolicyDiff,
     reduceFreshness,
-    reduceCarousel,
     reduceTranscript as reduce,
     saveTranscriptFilterPrefs as savePrefs,
     searchWithChat,
@@ -83,28 +96,26 @@ import {
     Shelf,
     FirstRunOverlay,
     TaskBar,
-    tapGesture,
     thinkingLevelsFor,
     titleFromPrompt,
-    type CarouselState,
     type ChatRunTone,
     type FreshnessState,
-    type PaneKind,
     type Session,
     type Transcript,
     TranscriptFilterMenu,
-    TranscriptView,
     Workspace,
+    WorkbenchShell,
+    createWorkbenchShellState,
     writeChatModelPin,
     writeChatThinking,
 } from "@gaugewright/workbench-ui";
 import { isMobileHarness, MobileApp } from "@gaugewright/mobile-web";
 
 const api = new WorkbenchControlPlane(controlPlaneBase());
-// The Codex helper owns a localhost callback listener, which only works when the
-// workbench and helper run on the same machine. Hosted Console builds set this
-// false so they never offer a dead-end sign-in action.
+// Desktop chooses the local callback flow; a hosted Home chooses the device-code
+// flow. Builds can still suppress the action if their runtime ships neither.
 const codexLoginAvailable = import.meta.env.VITE_CODEX_LOGIN !== "false";
+const localDevLogin = import.meta.env.VITE_LOCAL_DEV_LOGIN === "true";
 // OIDC login (ID-3): if we just returned from `/auth/callback`, capture the id-token
 // from the URL fragment before the first request, then hand the bearer to the
 // transport so gated `/admin/*` calls carry it. Signed-out / single-user local is the
@@ -115,26 +126,176 @@ api.setBearer(bearer());
 // `/auth/refresh` on a timer under the id-token's ~1h life. No-op on the loopback desktop.
 startSessionRefresh(controlPlaneBase());
 
+/** Read an ordinary project invitation into memory, then immediately remove its
+ * capability from the address bar/history. It is never copied into storage. */
+/** The public edge's custom domain.
+ *
+ * Not a `workers.dev` subdomain: the previous default named the founder's
+ * *personal* Cloudflare account, which the DR-0044 migration moved away from, so
+ * it would have pointed every new deployment at an account being decommissioned.
+ * A custom domain survives the account it is served from.
+ */
+const PUBLIC_EDGE_ORIGIN = "https://panels.gaugewright.com";
+
+function consumeHomeInvitation(): string {
+    if (typeof window === "undefined") return "";
+    try {
+        const url = new URL(window.location.href);
+        if (url.pathname !== "/invite") return "";
+        const invite = url.searchParams.get("d") ?? "";
+        url.searchParams.delete("d");
+        url.pathname = "/";
+        window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+        return invite;
+    } catch {
+        return "";
+    }
+}
+
+const initialHomeInvitation = consumeHomeInvitation();
+
 /** A message the human typed while a turn was in flight. Queued messages stack on
  *  top of the composer and drain in order when each turn settles. The `id` is a
  *  stable client key so edits/reorders/removals don't churn the DOM. `images` are
  *  the message's native image blocks (text attachments are already folded into
  *  `text` by composeOutgoing). */
-type QueuedMsg = { id: number; text: string; images: ImageRef[] };
+type QueuedMsg = { id: number; text: string; images: ImageRef[]; review: boolean };
 
 /** True inside the Tauri desktop shell (v2 injects this), false in a plain
  *  browser / e2e build — gates native-only affordances like the folder picker. */
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-export function App() {
+export interface WorkbenchAppProps {
+    /** Optional Environment supplied by a higher source-band composition. */
+    readonly environmentAction?: {
+        readonly label: string;
+        readonly available: Accessor<boolean>;
+        readonly open: () => void;
+    };
+    /** Hosted higher-band compositions receive the current tenant as routing
+     * context only; the Hub remains responsible for membership/capability
+     * admission. */
+    readonly onTenantContextChange?: (tenant: string | null) => void;
+    /** Account and managed-service dashboard. Hosted GaugeDesk sends missing-
+     * Home setup here instead of becoming a second management surface. */
+    readonly hubUrl?: string;
+}
+
+function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // The mobile projection-client flow harness (MOB-029) is addressed directly at
     // `?mobile=1` / `#mobile`, composing the committed D-MOBILE islands (pairing,
     // carousel, composer, connection banner) over the real control plane. It is a
     // sibling entry to the desktop workbench, not a media-query variant of it.
     if (isMobileHarness()) return <MobileApp />;
 
+    const [homeState, { refetch: refetchHome }] = createResource(() =>
+        captureHomeDiscovery(() => api.bootstrapHome()),
+    );
+    const homeFailure = createMemo<HomeDiscoveryFailure | null>(() => {
+        const state = homeState();
+        return state?.kind === "failure" ? state : null;
+    });
+    const homeNeedsLogin = createMemo(() => homeFailure()?.authentication ?? false);
+    const [homeEndpoint, setHomeEndpoint] = createSignal("");
+    const [homeError, setHomeError] = createSignal("");
+    const [homeBusy, setHomeBusy] = createSignal(false);
+    const [homeInvite, setHomeInvite] = createSignal(initialHomeInvitation);
+    const signOutAccount = async () => {
+        await endSession(controlPlaneBase());
+        // A reload drops every memory-only Home admission and authenticated projection along
+        // with the now-expired account cookie, returning the shell to Home discovery/login.
+        window.location.replace("/");
+    };
+    const invitationPreview = createMemo<HomeInvitationPreview | null>(() => {
+        const invite = homeInvite();
+        if (!invite) return null;
+        try {
+            return parseHomeInvitation(invite);
+        } catch {
+            return null;
+        }
+    });
+    const connectHome = async () => {
+        setHomeBusy(true);
+        setHomeError("");
+        try {
+            await api.connectHome(homeEndpoint());
+            await refetchHome();
+        } catch (error) {
+            setHomeError(String(error));
+        } finally {
+            setHomeBusy(false);
+        }
+    };
+    const acceptHomeInvite = async () => {
+        if (!homeInvite()) return;
+        setHomeBusy(true);
+        setHomeError("");
+        try {
+            await api.acceptHomeInvitation(homeInvite());
+            setHomeInvite("");
+            await refetchHome();
+        } catch (error) {
+            setHomeError(String(error));
+        } finally {
+            setHomeBusy(false);
+        }
+    };
+
     const [selected, setSelected] = createSignal<EngagementId | null>(null);
     const [status, setStatus] = createSignal("ready");
+    const clientBuild = reportedClientBuild();
+    const [desktopUpdate, setDesktopUpdate] = createSignal<{
+        readonly kind: "checking" | "current" | "available" | "restricted" | "error" | "installing";
+        readonly version?: string;
+        readonly update?: import("@tauri-apps/plugin-updater").Update;
+    } | null>(isTauri() ? { kind: "checking" } : null);
+
+    async function checkDesktopUpdate() {
+        if (!isTauri()) return;
+        setDesktopUpdate({ kind: "checking" });
+        try {
+            const [policy, updater] = await Promise.all([
+                api.softwareUpdatePolicy(),
+                import("@tauri-apps/plugin-updater"),
+            ]);
+            const update = await updater.check();
+            if (!update) {
+                setDesktopUpdate({ kind: "current" });
+            } else if (desktopUpdateAllowed(policy)) {
+                setDesktopUpdate({ kind: "available", version: update.version, update });
+            } else {
+                await update.close();
+                setDesktopUpdate({ kind: "restricted", version: update.version });
+            }
+        } catch {
+            // Version information remains useful even when release discovery is
+            // unavailable. Do not turn an unreachable update service into a warning.
+            setDesktopUpdate({ kind: "error" });
+        }
+    }
+
+    async function installDesktopUpdate() {
+        const candidate = desktopUpdate();
+        if (candidate?.kind !== "available" || !candidate.update) return;
+        setDesktopUpdate({ kind: "installing", version: candidate.version });
+        try {
+            // Re-read policy at the moment of installation: a stale discovery
+            // result must never outlive a newly tightened organization ceiling.
+            if (!desktopUpdateAllowed(await api.softwareUpdatePolicy())) {
+                await candidate.update.close();
+                setDesktopUpdate({ kind: "restricted", version: candidate.version });
+                return;
+            }
+            await candidate.update.downloadAndInstall();
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("restart_app");
+        } catch {
+            setDesktopUpdate({ kind: "error" });
+        }
+    }
+
+    if (isTauri()) void checkDesktopUpdate();
     // A pulse the in-chat "no model attached" action bumps to open the Account panel
     // (LLM-1): the transcript surfaces the refusal, this opens where you fix it.
     const [accountRequest, setAccountRequest] = createSignal(0);
@@ -161,6 +322,14 @@ export function App() {
     const [projectHome, setProjectHome] = createSignal<{ id: ProjectId; name: string } | null>(null);
     // UX-8: the fork-tree panel (chat fork lineage); holds the chat that opened it.
     const [forkTreeFor, setForkTreeFor] = createSignal<EngagementId | null>(null);
+    const [deployment, setDeployment] = createSignal<{
+        // Carried so a drain knows which project's quarantine it lands in. The
+        // facet browser already produced it; the signal used to drop it.
+        projectId: string;
+        projectName: string;
+        placementId: import("@gaugewright/control-plane-client").PlacementId;
+        archetypeName: string;
+    } | null>(null);
 
     // Mirror the workspace *live* across clients over the workspace event stream
     // (the sibling of the per-chat SSE): the server pushes a "changed" ping whenever
@@ -176,6 +345,8 @@ export function App() {
     const [navTick, setNavTick] = createSignal(0);
     const bumpNav = () => setNavTick((k) => k + 1);
     createEffect(() => {
+        const home = homeState();
+        if (!home || home.kind === "none" || home.kind === "failure") return;
         const stop = api.subscribeWorkspace(bumpNav);
         onCleanup(stop);
     });
@@ -222,7 +393,7 @@ export function App() {
     // on its last-known view with a staleness caveat, not crash the render or blank
     // the panel. A `throw` here would put the resource into an error state and reads
     // like `merge()?.phase` would re-throw; returning the prior value avoids that.
-    const [diff, { refetch: refetchDiff }] = createResource<string, EngagementId>(
+    const [diff, { refetch: refetchDiff, mutate: setDiff }] = createResource<string, EngagementId>(
         selected,
         async (id, info) => {
             try {
@@ -282,8 +453,12 @@ export function App() {
     // Keyed on `selected` so opening/switching a chat — the only time the picker shows —
     // re-reads the linked providers (a key linked or the codex OAuth signed in elsewhere
     // shows up on the next chat open). Failures degrade to "nothing linked" → just Default.
-    const [linkedCreds] = createResource(selected, () => api.accountCredentials().catch(() => []));
-    const [codexCred] = createResource(selected, () => api.codexStatus().catch(() => null));
+    // Keyed on selected-or-startup: the picker also serves the no-selection
+    // quick-start composer (same component, same commands — ADR 0112 doctrine),
+    // so the linked providers load before any chat exists and still refresh on
+    // every chat switch.
+    const [linkedCreds] = createResource(() => selected() ?? "startup", () => api.accountCredentials().catch(() => []));
+    const [codexCred] = createResource(() => selected() ?? "startup", () => api.codexStatus().catch(() => null));
     // First-run credential gate (ADR 0075 Phase 0): a startup-time (not selection-
     // keyed) read of whether *any* LLM credential is linked. `undefined` while
     // loading — we never flash the welcome before we know. `refetch*` re-check
@@ -311,7 +486,7 @@ export function App() {
         credentialRequired() === true && hasAnyCredential() === false && !firstRunDismissed();
     // The operator's curated "which models show" preference (managed in the Account panel,
     // persisted in the account-settings KV). `null` = never curated → default-visible subset.
-    const [acctSettings] = createResource(selected, () => api.accountSettings().catch((): Record<string, string> => ({})));
+    const [acctSettings] = createResource(() => selected() ?? "startup", () => api.accountSettings().catch((): Record<string, string> => ({})));
     const linkedAccounts = createMemo(() => {
         const ps = (linkedCreds() ?? []).filter((c) => c.linked).map((c) => c.provider);
         if (codexCred()?.linked) ps.push("openai-codex");
@@ -323,29 +498,53 @@ export function App() {
     // changes only with host config); a failed probe degrades to the blind
     // "Default" label rather than blocking the picker.
     const [resolvedDefault] = createResource(() => api.defaultModel().catch(() => null));
+    // With no chat open, the same picker pins the model/effort the FIRST message
+    // will run with — held here, applied to the new chat's config by
+    // startNewChat, then cleared. The composer is one component either way.
+    const [pendingPin, setPendingPin] = createSignal<{ id: string; provider: string } | null>(null);
+    const [pendingThinking, setPendingThinking] = createSignal("");
+    const paneModel = () =>
+        selected()
+            ? { id: chatModel(), provider: chatProvider() }
+            : pendingPin() ?? { id: "", provider: "" };
     const modelChoices = createMemo<ModelOption[]>(() =>
         modelOptions(
             linkedAccounts(),
             enabledModels(),
-            { id: chatModel(), provider: chatProvider() },
+            paneModel(),
             undefined,
             resolvedDefault() ?? null,
         ),
     );
     // The current pin as the `<select>` value: `provider:id`, or "" for Default.
-    const modelValue = () => (chatModel() ? modelKey({ id: chatModel(), provider: chatProvider() }) : "");
+    const modelValue = () => (paneModel().id ? modelKey(paneModel()) : "");
     // The reasoning-effort options follow the pinned model; the toggle only shows when the
     // model supports thinking (more than just "off"). "" = the model's own default effort.
-    const effortLevels = createMemo(() => thinkingLevelsFor(linkedAccounts(), chatModel(), chatProvider()));
+    const effortLevels = createMemo(() => thinkingLevelsFor(linkedAccounts(), paneModel().id, paneModel().provider));
     const showEffort = createMemo(() => effortLevels().some((l) => l !== "off"));
+    // openai-generic (ADR 0083) has no catalog — its model id is free-text. Offer the
+    // entry when such an account is linked; typing one pins `openai-generic:<id>`.
+    const showCustomModel = createMemo(() => linkedAccounts().includes("openai-generic"));
+    const [customModel, setCustomModel] = createSignal("");
+    async function pinCustomModel(value: string) {
+        const id = value.trim();
+        if (!id) return;
+        await pickModel(`openai-generic:${id}`);
+        setCustomModel("");
+    }
 
     // Pin a model for this chat: the picker's option value is `provider:id` (empty =
     // Default → clear the override). Writes `model`+`provider`, preserving every other key.
+    // With no chat open, the choice is held as the pending pin for the chat the
+    // quick-start composer is about to mint.
     async function pickModel(value: string) {
-        const id = selected();
-        if (!id) return;
         const i = value.indexOf(":");
         const pin = value === "" ? { id: "", provider: "" } : { id: value.slice(i + 1), provider: value.slice(0, i) };
+        const id = selected();
+        if (!id) {
+            setPendingPin(value === "" ? null : pin);
+            return;
+        }
         try {
             await api.putConfig(id, writeChatModelPin(chatConfig() ?? "{}", pin));
             await refetchChatConfig();
@@ -356,7 +555,10 @@ export function App() {
     // Pin the reasoning effort for this chat; "" clears it (model default).
     async function pickThinking(level: string) {
         const id = selected();
-        if (!id) return;
+        if (!id) {
+            setPendingThinking(level);
+            return;
+        }
         try {
             await api.putConfig(id, writeChatThinking(chatConfig() ?? "{}", level));
             await refetchChatConfig();
@@ -397,10 +599,17 @@ export function App() {
             for (const pl of p.placements) {
                 const c = pl.chats.find((c) => c.id === id);
                 if (c) {
+                    const target = p.targets.find((target) => target.id === c.targetId);
                     return {
                         kind: c.kind,
                         lineage: `${pl.archetypeName} · ${p.name}`,
                         title: c.title,
+                        target: target?.name ?? String(c.targetId),
+                        targetKind: c.targetKind,
+                        targetConcurrency: target?.concurrency,
+                        basis: c.targetBasis,
+                        candidate: c.candidateRevision,
+                        acts: c.availableActs,
                         // The project this chat lives in drives the network-egress
                         // bar (RF-B3): only a project-rooted (work) chat has one.
                         project: { id: p.id, name: p.name, networkIsolated: p.networkIsolated },
@@ -412,7 +621,18 @@ export function App() {
         for (const a of ws.archetypes) {
             const c = a.chats.find((c) => c.id === id);
             if (c) {
-                return { kind: c.kind, lineage: `${a.name} · Library`, title: c.title };
+                const target = ws.workTargets.find((target) => target.id === c.targetId);
+                return {
+                    kind: c.kind,
+                    lineage: `${a.name} · Library`,
+                    title: c.title,
+                    target: target?.name ?? String(c.targetId),
+                    targetKind: c.targetKind,
+                    targetConcurrency: target?.concurrency,
+                    basis: c.targetBasis,
+                    candidate: c.candidateRevision,
+                    acts: c.availableActs,
+                };
             }
         }
         // Fallback to the flat recent list (archetype name only).
@@ -421,6 +641,12 @@ export function App() {
             kind: r?.kind ?? "work",
             lineage: r?.archetype ?? "",
             title: r?.title ?? "",
+            target: r ? (ws.workTargets.find((target) => target.id === r.targetId)?.name ?? String(r.targetId)) : "",
+            targetKind: r?.targetKind,
+            targetConcurrency: r ? ws.workTargets.find((target) => target.id === r.targetId)?.concurrency : undefined,
+            basis: r?.targetBasis,
+            candidate: r?.candidateRevision,
+            acts: r?.availableActs,
         };
         },
     );
@@ -431,6 +657,21 @@ export function App() {
     // chat's title to tell them apart. Reuse the shared placeholder rule so a
     // still-unnamed chat reads "Untitled" rather than the raw "new chat" token.
     const chatTitle = () => displayChatTitle(chatInfo()?.title ?? "");
+    const shortRevision = (revision: string | undefined) => revision
+        ? revision.replace(/^sha256:/, "").slice(0, 10)
+        : "—";
+    const targetLabel = () => {
+        const info = chatInfo();
+        return info?.target
+            ? `${info.target} · ${shortRevision(info.basis)} → ${shortRevision(info.candidate)}`
+            : "";
+    };
+    const targetTitle = () => {
+        const info = chatInfo();
+        return info?.target
+            ? `${info.targetKind}; concurrency: ${info.targetConcurrency}; basis ${info.basis}; candidate ${info.candidate}; available acts: ${(info.acts ?? []).join(", ")}`
+            : "";
+    };
     // Fork lineage (#3): the source this chat was copied from (from the "(fork)"
     // suffix), so the empty state can explain what a fork is and what carried over.
     const forkOf = () => forkSource(chatInfo()?.title ?? "");
@@ -490,14 +731,26 @@ export function App() {
     // **live** SSE reduction of the in-progress turn. No client-only history.
     const [snapshot, setSnapshot] = createSignal<Transcript>(empty);
     const [live, setLive] = createSignal<Transcript>(empty);
+    const [pendingSend, setPendingSend] = createSignal<{
+        id: EngagementId;
+        rid: ClientRequestId;
+        text: string;
+        baselineLines: number;
+    } | null>(null);
     const transcript = (): Transcript => ({
         lines: [...snapshot().lines, ...live().lines],
         openText: live().openText,
     });
     async function loadSnapshot(id: EngagementId) {
         try {
-            setSnapshot(fromSnapshot(await api.getTranscript(id)));
-            setLive(empty);
+            const repaired = fromSnapshot(await api.getTranscript(id));
+            setSnapshot(repaired);
+            const pending = pendingSend();
+            setLive(
+                pending?.id === id
+                    ? pendingUserAfterSnapshot(repaired, pending.text, pending.baselineLines)
+                    : empty,
+            );
         } catch {
             /* a fresh engagement has no snapshot */
         }
@@ -509,11 +762,19 @@ export function App() {
     // model (the doctrine's named transcript mechanism): on settle OR rejection we
     // re-read the durable snapshot, which retires the optimistic echo — a kept turn
     // shows the admitted line, a failed/rejected turn drops it (no dangling echo).
-    const [pendingSend, setPendingSend] = createSignal<{ id: EngagementId; rid: ClientRequestId } | null>(null);
     let nextRid = 1;
     const retireSend = (rid: ClientRequestId) =>
         setPendingSend((p) => (p?.rid === rid ? null : p));
     const [draft, setDraft] = createSignal("");
+    // The unselected Chat pane is a real quick-start surface, not a dead-end
+    // status message. Keep its draft distinct from an open chat's composer so
+    // switching or opening a chat never carries text across conversations.
+    const [emptyChatDraft, setEmptyChatDraft] = createSignal("");
+    // The pane's draft, routed to whichever backing signal applies: ONE composer
+    // component serves both the open-chat and quick-start states (same controls,
+    // same commands where they're meaningful — no second, lesser UI).
+    const paneDraft = () => (selected() ? draft() : emptyChatDraft());
+    const setPaneDraft = (value: string) => (selected() ? setDraft(value) : setEmptyChatDraft(value));
     // Per-chat agent run state (round-13): one global `busy` can't represent
     // concurrent agents. `runTones` is the *live, local* state of turns this client
     // started (working / error). The needs-review state is server truth from the
@@ -542,6 +803,9 @@ export function App() {
     // records what actually ran (run-chat.md). `nextQid` mints stable list keys.
     const [queue, setQueue] = createSignal<QueuedMsg[]>([]);
     let nextQid = 1;
+    // Per-change opt-in review (ADR 0096). It is captured into the queued message,
+    // then reset so the next turn returns to the shared-line auto-sync default.
+    const [reviewNext, setReviewNext] = createSignal(false);
     // The queue **gate** (#24): when gated, typed messages *stage* in the thread
     // without draining into turns — the user can line up several, then release them.
     // Default open (ungated) = the prior immediate/queue-and-run behaviour.
@@ -551,7 +815,6 @@ export function App() {
     // (see composeOutgoing) — message-scoped, cleared on send, never workspace
     // context. Uniform across browser and the Tauri webview; no backend.
     const [attachments, setAttachments] = createSignal<Attachment[]>([]);
-    let attachInput: HTMLInputElement | undefined;
     const [activity, setActivity] = createSignal(""); // what the agent is doing now
     // The agent's pending approvals from the last turn (UX-3): an `extension_ui_request`
     // the runtime surfaced but did not auto-confirm — answered out-of-band via the
@@ -575,6 +838,25 @@ export function App() {
     // action). Reverting to it is just re-seeding from storage.
     const saveFilterDefault = () => savePrefs(filterStorage, filterPrefs());
     const [selectedFile, setSelectedFile] = createSignal<string | null>(null);
+    // The inbound queue the content pane is showing (ADR 0110 §7). The queue is
+    // the *project's*; the chat is only where a reviewer acts from — so both are
+    // held, and the surface closes when you navigate away from that chat rather
+    // than lingering over an unrelated one.
+    const [reviewing, setReviewing] = createSignal<{ project: string; chat: EngagementId } | null>(null);
+    const reviewingProject = () => reviewing()?.project ?? null;
+    // `chat` is passed explicitly rather than read from `selected()`: the top bar
+    // opens the chat and the surface in one gesture, and the selection signal may
+    // not have settled on the new chat yet when this runs.
+    const setReviewingProject = (project: string | null, chat?: EngagementId | null) => {
+        const on = chat ?? selected();
+        setReviewing(project && on ? { project, chat: on } : null);
+    };
+    const workbenchShell = createWorkbenchShellState({
+        selection: () => ({
+            chatSelected: selected() !== null,
+            fileSelected: selectedFile() !== null,
+        }),
+    });
     const [showShelf, setShowShelf] = createSignal(false);
     // "Add files"/"Add a file" in the browser open native OS pickers via these hidden
     // inputs; their contents are uploaded (UX-14 / UX-1 / ENTSEC-5). The desktop shell
@@ -592,10 +874,15 @@ export function App() {
         if (!id) return;
         setStreamReady(false);
         setSelectedFile(null);
+        // Leaving the chat a review was opened from closes the surface: an inbound
+        // queue shown over an unrelated chat reads as that chat's, and the verdict
+        // is submitted from whichever chat is open.
+        if (reviewing() && reviewing()!.chat !== id) setReviewing(null);
         setSnapshot(empty);
         setLive(empty);
         setQueue([]); // the queue is per-engagement and client-only
         setGated(false); // the stage-gate resets with the thread
+        setReviewNext(false);
         void loadSnapshot(id);
         const unsubscribe = api.subscribe(
             id,
@@ -628,27 +915,15 @@ export function App() {
     // composer. Every entry point calls this — there is no per-facet variation.
     // (Microtask-deferred so the composer, mounted by <Show> on first selection,
     // exists before we focus it.)
-    let composerEl: HTMLInputElement | undefined;
+    let composerEl: HTMLTextAreaElement | undefined;
     function openChat(id: EngagementId) {
         setSelected(id);
         // UX-4: mirror the selection into the URL (`?chat=<id>`) so it's deep-linkable.
         if (typeof window !== "undefined") {
             window.history.replaceState(null, "", searchWithChat(window.location.search, id));
         }
-        setChatOff(false); // a folded chat reopens when you open a chat — no dead click
-        // On the mobile carousel, opening a chat must bring the chat pane on-screen.
-        // Selecting it alone strands the user on Browse: Browse stays reachable, so the
-        // selection-repair effect never moves them, and the top toggle's Chat/Files
-        // segments only un-grey — they don't navigate on their own. Mirror the mobile
-        // harness: mark the chat reachable, then jump straight to it.
-        if (isMobile()) {
-            setCarousel((c) =>
-                reduceCarousel(
-                    applySelection(c, { chatSelected: true, fileSelected: false }),
-                    tapGesture("chat"),
-                ),
-            );
-        }
+        // A folded chat reopens, and a narrow shell navigates straight to it.
+        workbenchShell.openPane("chat", { chatSelected: true, fileSelected: false });
         queueMicrotask(() => composerEl?.focus());
     }
 
@@ -680,16 +955,40 @@ export function App() {
     // Start a fresh chat on the hidden Personal default placement (ADR 0036) — the
     // same "just start typing" path as the nav's "+ new chat". Wired to the mobile
     // carousel's Chat tab so it's never a dead control when no chat is open yet.
-    async function startNewChat() {
+    async function startNewChat(initialPrompt?: string, images: ImageRef[] = [], review = false) {
+        const prompt = initialPrompt?.trim();
         try {
             const eng = await api.createEngagement();
+            // The quick-start composer's model/effort choices were held as pending
+            // pins (no chat existed to own them); write them into the new chat's
+            // config before its first turn so the first message runs with them.
+            const pin = pendingPin();
+            const thinking = pendingThinking();
+            if (pin || thinking) {
+                try {
+                    let cfg = "{}";
+                    if (pin) cfg = writeChatModelPin(cfg, pin);
+                    if (thinking) cfg = writeChatThinking(cfg, thinking);
+                    await api.putConfig(eng.id, cfg);
+                } catch {
+                    setStatus("couldn't carry the model choice onto the new chat");
+                }
+                setPendingPin(null);
+                setPendingThinking("");
+            }
             setStatus("new chat");
             bumpNav(); // surface the new chat in the nav (the event stream also will)
             openChat(eng.id); // selects it and (on mobile) brings the chat pane on-screen
+            if (prompt) {
+                // Let the selected-chat effect subscribe before the first turn starts;
+                // otherwise an eager turn can race the fresh transcript reset.
+                queueMicrotask(() => void runPrompt(eng.id, prompt, images, review));
+            }
         } catch (e) {
             setStatus(`couldn't start a chat — ${String(e)}`);
         }
     }
+
 
     // Stop a running turn (run-chat.md): requests WhippleScript cancellation; the in-flight
     // task POST then resolves as failed and the composer re-enables.
@@ -708,7 +1007,12 @@ export function App() {
     // immediate send and a queue drain. On settle it swaps the live operational
     // stream for the now-durable transcript, then pumps the queue so the next
     // queued message runs automatically — turns chain without a round-trip to the human.
-    async function runPrompt(id: EngagementId, prompt: string, images: ImageRef[] = []) {
+    async function runPrompt(
+        id: EngagementId,
+        prompt: string,
+        images: ImageRef[] = [],
+        review = false,
+    ) {
         // This turn may run in the background while the user looks at a different
         // chat, so every *display-mutating* side effect is gated on `isCurrent()` —
         // the running chat's transcript/diff/status must never clobber whatever chat
@@ -724,17 +1028,17 @@ export function App() {
             // transcript the instant the turn starts — only when this chat is the one
             // on screen, else we'd inject it into the displayed chat's transcript. The
             // echo is an optimistic pending command, retired by snapshot-repair below.
-            setPendingSend({ id, rid });
+            setPendingSend({ id, rid, text: prompt, baselineLines: snapshot().lines.length });
             setLive((t) => reduce(t, { type: "user", text: prompt }));
         }
         // Adopt the first message as the chat's title before the transcript fills.
         await maybeAutoTitle(id, prompt);
         setPendingApprovals([]); // a fresh turn clears the prior turn's pending approvals
-        let awaitingHuman = false;
         try {
-            const res = (await api.runTask(id, prompt, images)) as {
+            const res = (await api.runTask(id, prompt, images, review)) as {
                 pending_approvals?: string[];
                 run_phase?: string;
+                diff?: string;
                 error?: string;
             };
             if (isCurrent()) setPendingApprovals(res?.pending_approvals ?? []);
@@ -743,18 +1047,20 @@ export function App() {
             // status. Report it honestly instead of a blanket "turn complete" — the
             // reason itself is also a durable transcript line (loadSnapshot shows it).
             const failed = res?.run_phase === "Failed";
-            awaitingHuman = res?.run_phase === "AwaitingHuman";
             setRunTone(id, failed ? "error" : null);
             bumpNav(); // refresh nav + tasks (auto-title, review dot)
             if (isCurrent()) {
                 setStatus(
                     failed
                         ? `turn failed${res?.error ? ` — ${res.error}` : ""}`
-                        : awaitingHuman
-                          ? "waiting for your answer"
-                          : "turn complete",
+                        : "turn complete",
                 );
                 await Promise.all([loadSnapshot(id), refetchRun(), refetchDiff(), refetchMerge()]);
+                // A default clean turn has already synchronized by the time the
+                // projections refresh, so the branch-vs-line diff is empty. Keep
+                // the response's turn diff on screen for this settled turn: it is
+                // evidence of what just happened, not unresolved merge state.
+                if (typeof res?.diff === "string") setDiff(res.diff);
             }
         } catch (e) {
             setRunTone(id, "error");
@@ -763,12 +1069,15 @@ export function App() {
                 // durable snapshot so a failed turn leaves no dangling optimistic echo.
                 setStatus(describeFailure("run that turn", e));
                 await loadSnapshot(id);
+                // A rejected command will never acquire a later admitted user event,
+                // so do not carry the pending echo beyond this repair.
+                setLive(empty);
             }
         } finally {
             retireSend(rid);
             if (isCurrent()) {
                 setActivity("");
-                if (!awaitingHuman) pump();
+                pump();
             }
         }
     }
@@ -782,7 +1091,7 @@ export function App() {
         const next = queue()[0];
         if (!next) return;
         setQueue((q) => q.slice(1));
-        void runPrompt(id, next.text, next.images);
+        void runPrompt(id, next.text, next.images, next.review);
     }
 
     // Toggle the stage-gate (#24). Opening it releases whatever's staged into the
@@ -798,16 +1107,17 @@ export function App() {
     // The send *primitive* (the Session's `send`, EMBED-1): enqueue a message and
     // pump the queue — start a turn on the current engagement. An embed composer
     // rides this directly; the desktop's draft/queue/steer controls layer on top.
-    function sendText(text: string, images: ImageRef[] = []) {
+    function sendText(text: string, images: ImageRef[] = [], review = reviewNext()) {
         const id = selected();
         const t = text.trim();
         if (!id || (!t && images.length === 0)) return;
-        setQueue((q) => [...q, { id: nextQid++, text: t, images }]);
+        setQueue((q) => [...q, { id: nextQid++, text: t, images, review }]);
+        setReviewNext(false);
         pump();
     }
 
     // There's something to send when the draft has text OR a file is attached.
-    const hasOutgoing = () => draft().trim().length > 0 || attachments().length > 0;
+    const hasOutgoing = () => paneDraft().trim().length > 0 || attachments().length > 0;
 
     // Build the outgoing turn from the draft + pending attachments, then clear them
     // (attachments are message-scoped). Text files inline into the prompt as delimited
@@ -816,16 +1126,33 @@ export function App() {
     // durable transcript honestly shows one rode along (run-chat.md "Message
     // attachments"; base64 never enters the log — INV-10).
     function composeOutgoing(): { message: string; images: ImageRef[] } {
-        const out = buildOutgoing(draft(), attachments());
+        const out = buildOutgoing(paneDraft(), attachments());
         setAttachments([]); // attachments are message-scoped — cleared on send
         return out;
     }
 
     function submitDraft() {
         if (!selected() || !hasOutgoing()) return;
+        const review = reviewNext();
         const { message, images } = composeOutgoing();
         setDraft("");
-        sendText(message, images);
+        sendText(message, images, review);
+    }
+
+    // Quick-start submit (no chat open): the same composer contract — draft +
+    // attachments + review flag — minting the chat on first send.
+    function submitQuickStart() {
+        if (!hasOutgoing()) return;
+        const { message, images } = composeOutgoing();
+        setEmptyChatDraft("");
+        const review = reviewNext();
+        setReviewNext(false);
+        void startNewChat(message, images, review);
+    }
+
+    function submitPane() {
+        if (selected()) submitDraft();
+        else submitQuickStart();
     }
 
     // Steer: redirect the agent *now*. With one blocking turn at a time, "now" means
@@ -837,21 +1164,24 @@ export function App() {
         if (!id || !hasOutgoing()) return;
         const { message, images } = composeOutgoing();
         setDraft("");
-        setQueue((q) => [{ id: nextQid++, text: message, images }, ...q]);
+        const review = reviewNext();
+        setReviewNext(false);
+        setQueue((q) => [{ id: nextQid++, text: message, images, review }, ...q]);
         if (busy()) void stopTurn();
         else pump();
     }
 
     // Paperclip attach (UX-14): a plain <input type=file> (works in the browser and
-    // the Tauri webview — no plugin, no backend). Images go to WhippleScript as native image
-    // blocks; text files inline into the prompt. PDF/Office aren't supported yet — the
-    // classify() seam is where future client-side extraction (text + images) lands.
+    // the Tauri webview — no plugin, no backend). Images go to WhippleScript as native
+    // image blocks; text files inline into the prompt; PDF/Office text is extracted
+    // locally before entering that same inline path.
     async function onAttachInput(e: Event) {
         const input = e.currentTarget as HTMLInputElement;
         const picked = Array.from(input.files ?? []);
         input.value = ""; // let the same file be picked again later
         const next: Attachment[] = [];
         const rejected: string[] = [];
+        const unreadable: string[] = [];
         // UX-14 vision pre-check: block an image attach up front on a KNOWN non-vision
         // model (rather than letting the turn fail at send). The default/unknown model
         // stays permissive — we take the runtime's word.
@@ -867,6 +1197,12 @@ export function App() {
                 next.push({ kind: "image", name: f.name, mimeType: f.type, data: await fileToBase64(f) });
             } else if (kind === "text") {
                 next.push({ kind: "text", name: f.name, text: await f.text() });
+            } else if (kind === "document") {
+                try {
+                    next.push(await extractDocumentAttachment(f));
+                } catch {
+                    unreadable.push(f.name);
+                }
             } else {
                 rejected.push(f.name);
             }
@@ -874,8 +1210,10 @@ export function App() {
         if (next.length) setAttachments((a) => [...a, ...next]);
         if (visionBlocked.length) {
             setStatus(`this chat's model can't read images — pick a vision-capable model to attach ${visionBlocked.join(", ")}`);
+        } else if (unreadable.length) {
+            setStatus(`couldn't extract readable text from ${unreadable.join(", ")}`);
         } else if (rejected.length) {
-            setStatus(`can't attach ${rejected.join(", ")} yet — images and text files only (PDF/Office coming soon)`);
+            setStatus(`can't attach ${rejected.join(", ")} — choose text, image, PDF, docx, xlsx, or pptx`);
         }
     }
     const removeAttachment = (i: number) => setAttachments((a) => a.filter((_, n) => n !== i));
@@ -912,7 +1250,7 @@ export function App() {
             void stopTurn(); // on settle, pump drains the front (this message)
         } else {
             setQueue((q) => q.filter((m) => m.id !== qid));
-            void runPrompt(id, item.text, item.images);
+            void runPrompt(id, item.text, item.images, item.review);
         }
     }
 
@@ -1028,6 +1366,21 @@ export function App() {
         if (typeof file === "string") await ingestPath(file);
     }
 
+    async function saveOutputToDisk(resourceId: string) {
+        const id = selected();
+        if (!id || !isTauri()) return null;
+        const { open } = await import("@tauri-apps/plugin-dialog");
+        const dest = await open({
+            directory: true,
+            multiple: false,
+            title: "Save this output to a folder",
+        });
+        if (typeof dest !== "string") return null;
+        const result = await api.exportResourceToDisk(id, resourceId, dest);
+        setStatus(`saved ${result.exported.length} output file(s) to ${result.dest}`);
+        return result;
+    }
+
     const phase = createMemo(() => run()?.phase ?? "—");
 
     // The chat-status badge (#4): a real, coloured badge separated from the
@@ -1039,171 +1392,44 @@ export function App() {
         // The selected chat's own state: a conflict is the most urgent — it is a
         // decision the human must make (WS-H c) — then working / needs-review / ready.
         const t = runToneOf(selected());
-        if (merge()?.phase === "Repairing") return { tone: "conflict", label: "Conflict" };
-        if (phase() === "AwaitingHuman") return { tone: "review", label: "Needs answer" };
+        if (
+            merge()?.phase === "Repairing"
+            || (merge()?.phase === "Rejected" && merge()?.git_outcome === "Conflict")
+        ) return { tone: "conflict", label: "Conflict" };
         if (t === "working") return { tone: "working", label: "Working" };
-        if (t === "review" || merge()?.phase === "Clean") return { tone: "review", label: "Needs review" };
+        if (t === "review" || (merge()?.phase === "Clean" && merge()?.review_requested)) {
+            return { tone: "review", label: "Needs review" };
+        }
         return { tone: "ready", label: "Ready" };
     });
 
-    // --- resizable panels ---------------------------------------------------
-    // Sidebars (nav, workspace) are draggable px widths; the two middle panels
-    // (run, content) share the remaining space via a draggable fraction. Widths
-    // persist across reloads. The grid columns are: nav | ↔ | run | ↔ | content | ↔ | workspace.
-    const stored = (k: string, fallback: number) => {
-        const v = Number(localStorage.getItem(k));
-        return Number.isFinite(v) && v > 0 ? v : fallback;
-    };
-    const [navW, setNavW] = createSignal(stored("ui.navW", 190));
-    const [wsW, setWsW] = createSignal(stored("ui.wsW", 230));
-    const [runFr, setRunFr] = createSignal(stored("ui.runFr", 0.5));
-    createEffect(() => localStorage.setItem("ui.navW", String(navW())));
-    createEffect(() => localStorage.setItem("ui.wsW", String(wsW())));
-    createEffect(() => localStorage.setItem("ui.runFr", String(runFr())));
-
-    // Collapse: every panel — including the chat (`run`) — folds to a thin rail to
-    // give the rest of the workbench more room; a collapsed panel donates its space
-    // to its neighbours. (The chat's collapse button lives in its own header, so
-    // opening a chat re-expands it — see openChat — to avoid a dead click.)
-    //
-    // Each panel's collapse is a single browser-local boolean (persisted, §4) and
-    // is the ONLY thing a chevron/rail click changes — it is purely the user's
-    // intent, fully independent per panel. There is deliberately NO width-driven
-    // auto-folding: that conflated "the user hid this" with "this didn't fit",
-    // recomputed globally, so collapsing one panel could silently reopen another.
-    // Instead, when the window is too narrow to hold the four-panel grid the shell
-    // hands off wholesale to the mobile carousel (see `mobileQuery`) — one reflow,
-    // never spooky action at a distance.
-    const RAIL = 30; // a folded panel's rail width, px
-    const storedCollapsed = (k: string) => localStorage.getItem(k) === "collapsed";
-    const [navOff, setNavOff] = createSignal(storedCollapsed("ui.navPanel"));
-    const [chatOff, setChatOff] = createSignal(storedCollapsed("ui.chatPanel"));
-    const [contentOff, setContentOff] = createSignal(storedCollapsed("ui.contentPanel"));
-    const [wsOff, setWsOff] = createSignal(storedCollapsed("ui.filesPanel"));
-    createEffect(() => localStorage.setItem("ui.navPanel", navOff() ? "collapsed" : "open"));
-    createEffect(() => localStorage.setItem("ui.chatPanel", chatOff() ? "collapsed" : "open"));
-    createEffect(() => localStorage.setItem("ui.contentPanel", contentOff() ? "collapsed" : "open"));
-    createEffect(() => localStorage.setItem("ui.filesPanel", wsOff() ? "collapsed" : "open"));
-    // A chevron collapses (want=true); a rail click reopens (want=false). Each
-    // call touches exactly one panel — no neighbour is ever affected.
-    const pinPanel = (set: (v: boolean) => void, want: boolean) => set(want);
-
-    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-    const RSZ = 5; // resizer column width, px
-    // The *effective* sidebar widths: a folded panel is a rail, not its stored
-    // width — the resize math and the grid both reason from these.
-    const effNavW = () => (navOff() ? RAIL : navW());
-    const effWsW = () => (wsOff() ? RAIL : wsW());
-    let shellEl: HTMLDivElement | undefined;
-    // Capture the grid element so the resizer drag math (onResize) can read its
-    // live geometry. The desktop grid only mounts above the mobile breakpoint.
-    const observeShell = (el: HTMLDivElement) => {
-        shellEl = el;
-    };
-    function onResize(which: "nav" | "mid" | "ws", clientX: number) {
-        if (!shellEl) return;
-        const r = shellEl.getBoundingClientRect();
-        if (which === "nav") setNavW(clamp(clientX - r.left, 120, r.width - effWsW() - 240));
-        else if (which === "ws") setWsW(clamp(r.right - clientX, 150, r.width - effNavW() - 240));
-        else {
-            const midLeft = r.left + effNavW() + RSZ;
-            const afterContent = wsOff() ? RAIL : wsW() + RSZ;
-            const midRight = r.right - afterContent;
-            setRunFr(clamp((clientX - midLeft) / (midRight - midLeft), 0.15, 0.85));
+    async function attachTarget(
+        projectId: import("@gaugewright/control-plane-client").ProjectId,
+        _projectName: string,
+        kind: "external-vcs" | "external-folder",
+    ) {
+        if (!isTauri()) {
+            setStatus("attaching an existing machine folder is available in the desktop app");
+            return;
+        }
+        const { open } = await import("@tauri-apps/plugin-dialog");
+        const path = await open({
+            directory: true,
+            multiple: false,
+            title: kind === "external-vcs" ? "Attach a Git repository" : "Attach a folder",
+        });
+        if (typeof path !== "string") return;
+        const name = path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "Attached files";
+        try {
+            await api.attachTarget(projectId, name, kind, path);
+            setStatus(kind === "external-vcs"
+                ? `attached ${name} with native Git authority`
+                : `attached ${name} with compare-before-write concurrency`);
+            bumpNav();
+        } catch (error) {
+            setStatus(`couldn't attach ${name} — ${String(error)}`);
         }
     }
-    // The chat lane carries the primary action (send) and the content panel the
-    // review diff, so neither may be squeezed below a usable width (round-7 #1).
-    // Give each middle column a hard floor; if the window is too narrow to honour
-    // both, the whole shell scrolls horizontally rather than clipping `send`.
-    //
-    // Content always stays between chat and files, even as a folded rail.
-    //
-    // Exactly one open track must carry a full `1fr` so the grid always fills the
-    // window: a lone fr factor < 1 (CSS Grid spec) would leave an empty gap. When
-    // chat AND content are both open they SPLIT the middle via `runFr` (factors sum
-    // to 1 — fills); otherwise the highest-priority open panel (chat → content →
-    // files → nav) is the "filler" and takes the slack.
-    const cols = () => {
-        const bothMiddleOpen = !chatOff() && !contentOff();
-
-        const nav = navOff()
-            ? `${RAIL}px`
-            : chatOff() && contentOff() && wsOff() // only nav left open → it fills
-                ? `minmax(${navW()}px,1fr)`
-                : `${navW()}px`;
-        const r1 = navOff() ? "0px" : `${RSZ}px`;
-
-        const run = chatOff()
-            ? `${RAIL}px`
-            : bothMiddleOpen ? `minmax(280px,${runFr()}fr)` : "minmax(280px,1fr)";
-
-        // Each right-hand panel is "rail" OR "leading resizer + track". The track
-        // counts/order match the rightPanels() children one-for-one.
-        const content = contentOff()
-            ? `${RAIL}px`
-            : bothMiddleOpen
-                ? `${RSZ}px minmax(240px,${1 - runFr()}fr)`
-                : `${RSZ}px minmax(240px,1fr)`; // chat folded → content fills
-        const files = wsOff()
-            ? `${RAIL}px`
-            : chatOff() && contentOff() // both middle folded → files fills
-                ? `${RSZ}px minmax(${wsW()}px,1fr)`
-                : `${RSZ}px ${wsW()}px`;
-
-        return `${nav} ${r1} ${run} ${content} ${files}`;
-    };
-
-    // --- mobile variant (MOB-021) -------------------------------------------
-    // On a narrow viewport the same four projections render through the mobile
-    // Carousel island (MOB-014), one pane at a time, reusing the *identical* pane
-    // bodies the desktop grid renders — the shell is a thin renderer either way,
-    // so the only difference is layout. The media query is a reactive signal so a
-    // rotate / resize swaps shells live; the `matchMedia` guard keeps it SSR- and
-    // test-safe (a plain non-DOM environment renders the desktop grid).
-    //
-    // The breakpoint is the four-panel grid's comfortable floor, not a phone width:
-    // nav + chat + content + files at their minimums need ~955px, so below ~1024px
-    // the desktop grid would clip or scroll. Since panels no longer auto-fold to
-    // absorb that pressure, the carousel IS the narrow-window layout — we hand off
-    // to it well before things get cramped rather than railing panels behind the
-    // user's back. (Was 720px, which left a broken auto-folding band above it.)
-    const mobileQuery = "(max-width: 1024px)";
-    const matchMobile = () =>
-        typeof window !== "undefined" && typeof window.matchMedia === "function"
-            ? window.matchMedia(mobileQuery).matches
-            : false;
-    const [isMobile, setIsMobile] = createSignal(matchMobile());
-    createEffect(() => {
-        if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-        const mql = window.matchMedia(mobileQuery);
-        const onChange = () => setIsMobile(mql.matches);
-        onChange();
-        // Listen to BOTH the media-query change and a plain window resize. The
-        // matchMedia "change" event alone proved unreliable across DevTools device
-        // emulation / programmatic resizes (it didn't fire, so the shell never
-        // flipped between the desktop grid and the mobile carousel until a reload).
-        // `resize` always fires on a viewport change; re-reading `mql.matches` on it
-        // keeps `isMobile` honest. Both funnel through the same idempotent setter.
-        mql.addEventListener("change", onChange);
-        window.addEventListener("resize", onChange);
-        onCleanup(() => {
-            mql.removeEventListener("change", onChange);
-            window.removeEventListener("resize", onChange);
-        });
-    });
-
-    // The carousel's pure navigation state (MOB-009): which pane is on screen and
-    // the selection that gates reachability. The island owns no truth — it routes
-    // every gesture back through `setCarousel`. We keep the gating selection in
-    // lockstep with `selected` / `selectedFile` so a chat opened or a file picked
-    // (from any pane) repairs the carousel onto a still-reachable pane rather than
-    // stranding the user on an empty stop.
-    const [carousel, setCarousel] = createSignal<CarouselState>(initialCarousel);
-    createEffect(() => {
-        const selection = { chatSelected: selected() !== null, fileSelected: selectedFile() !== null };
-        setCarousel((c) => applySelection(c, selection));
-    });
 
     // The four pane bodies, defined once and reused by both shells (the desktop
     // grid and the mobile Carousel). They are plain accessors so the island stays
@@ -1218,6 +1444,8 @@ export function App() {
             onOpenEngagement={(id, name) => setEngagement({ id, name })}
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}
             onOpenProjectHome={(id, name) => setProjectHome({ id, name })}
+            onDeployPlacement={setDeployment}
+            onAttachTarget={(id, name, kind) => void attachTarget(id, name, kind)}
             onOpenForkTree={(chat) => setForkTreeFor(chat)}
             onChatDeleted={(id) => selected() === id && setSelected(null)}
             onStatus={setStatus}
@@ -1234,48 +1462,171 @@ export function App() {
     // it shows a muted, read-only hint.
     const networkBar = () => (
         <div class="network-bar" classList={{ isolated: !!currentProject()?.networkIsolated }}>
-            <Show
-                when={currentProject()}
-                fallback={
-                    <span class="network-bar-label" title="Open a project's work chat to manage its network egress.">
-                        <span class="network-bar-dot" /> Network · open
-                    </span>
-                }
-            >
-                {(p) => (
-                    <button
-                        type="button"
-                        class="network-bar-toggle"
-                        data-testid="network-toggle"
-                        disabled={networkBusy()}
-                        title={
-                            p().networkIsolated
-                                ? `“${p().name}” is network-isolated — the agent can't reach the model. Click to open egress.`
-                                : `“${p().name}” has open network egress — the agent can reach any host. Click to isolate (fail-closed).`
-                        }
-                        onClick={toggleNetworkIsolated}
-                    >
-                        <span class="network-bar-dot" />
-                        {p().networkIsolated ? "Network · isolated" : "Network · open"}
+            <div class="network-bar-status">
+                <Show
+                    when={currentProject()}
+                    fallback={
+                        <span class="network-bar-label" title="Open a project's work chat to manage its network egress.">
+                            <span class="network-bar-dot" /> Network · open
+                        </span>
+                    }
+                >
+                    {(p) => (
+                        <button
+                            type="button"
+                            class="network-bar-toggle"
+                            data-testid="network-toggle"
+                            disabled={networkBusy()}
+                            title={
+                                p().networkIsolated
+                                    ? `“${p().name}” is network-isolated — the agent can't reach the model. Click to open egress.`
+                                    : `“${p().name}” has open network egress — the agent can reach any host. Click to isolate (fail-closed).`
+                            }
+                            onClick={toggleNetworkIsolated}
+                        >
+                            <span class="network-bar-dot" />
+                            {p().networkIsolated ? "Network · isolated" : "Network · open"}
+                        </button>
+                    )}
+                </Show>
+                <span class="network-version" data-app-version>GaugeDesk v{clientBuild.version}</span>
+                <Show when={desktopUpdate()?.kind === "available"}>
+                    <button class="desktop-update" data-desktop-update type="button" onClick={() => void installDesktopUpdate()}>
+                        Update to v{desktopUpdate()?.version}
                     </button>
-                )}
-            </Show>
+                </Show>
+                <Show when={desktopUpdate()?.kind === "checking" || desktopUpdate()?.kind === "installing"}>
+                    <span class="network-version" data-update-state>{desktopUpdate()?.kind === "installing" ? "Installing update…" : "Checking for updates…"}</span>
+                </Show>
+                <Show when={desktopUpdate()?.kind === "restricted"}>
+                    <span class="network-version" data-update-restricted title="The available stable release is outside this organization's allowed release channels.">
+                        Update v{desktopUpdate()?.version} is managed by your organization
+                    </span>
+                </Show>
+            </div>
             {/* Settings (FED-7): a gear to the right of the network toggle; opens the
                 settings menu → Devices, the single device-management modal. */}
             <SettingsMenu
                 api={api}
                 codexLoginAvailable={codexLoginAvailable}
+                managedInferenceEditable={import.meta.env.VITE_HOME_SPLIT !== "true"}
                 openAccount={accountRequest}
                 openInvite={inviteDeepLink}
+                onSignOut={signOutAccount}
+                environmentAction={props.environmentAction}
             />
         </div>
+    );
+
+    // ONE composer for both pane states (open chat and quick-start): the same
+    // component with the same commands; handlers that need a live chat are
+    // simply absent until one exists, which is how this composer removes
+    // controls (its own doctrine) rather than swapping in a lesser UI.
+    const paneComposer = () => (
+        <ChatComposer
+            draft={paneDraft()}
+            placeholder={selected() && chatKind() === "edit"
+                ? `Describe what to change about ${methodName() || "this archetype"}…`
+                : "task the agent…"}
+            queue={selected() ? queue() : []}
+            attachments={attachments()}
+            busy={selected() ? busy() : false}
+            gated={selected() ? gated() : false}
+            reviewNext={reviewNext()}
+            canSubmit={hasOutgoing()}
+            modelToolbar={
+                <>
+                    <label class="model-picker" title="Model for this chat — overrides the archetype's default for this conversation only">
+                        <select
+                            data-model-picker
+                            aria-label="Model for this chat"
+                            value={modelValue()}
+                            onChange={(event) => void pickModel(event.currentTarget.value)}
+                        >
+                            <For each={modelChoices()}>
+                                {(model) => <option value={model.id ? modelKey(model) : ""}>{model.label}</option>}
+                            </For>
+                        </select>
+                    </label>
+                    <Show when={showCustomModel()}>
+                        <label class="model-picker" title="Model id for your OpenAI-compatible endpoint — press Enter to pin it for this chat">
+                            <span class="model-picker-tag" aria-hidden="true">custom</span>
+                            <input
+                                data-custom-model
+                                aria-label="Custom model id for this chat"
+                                placeholder="model id (e.g. llama-3.3-70b)"
+                                value={customModel()}
+                                onInput={(event) => setCustomModel(event.currentTarget.value)}
+                                onKeyDown={(event) => event.key === "Enter" && void pinCustomModel(event.currentTarget.value)}
+                            />
+                        </label>
+                    </Show>
+                    <Show when={showEffort()}>
+                        <label class="model-picker effort-picker" title="Reasoning effort for this chat — higher is more deliberate (slower, costlier); Default uses the model's own setting">
+                            <span class="model-picker-tag" aria-hidden="true">effort</span>
+                            <select
+                                data-effort-picker
+                                aria-label="Reasoning effort for this chat"
+                                value={selected() ? chatThinking() : pendingThinking()}
+                                onChange={(event) => void pickThinking(event.currentTarget.value)}
+                            >
+                                <option value="">Default</option>
+                                <For each={effortLevels()}>
+                                    {(level) => <option value={level}>{level}</option>}
+                                </For>
+                            </select>
+                        </label>
+                    </Show>
+                </>
+            }
+            onDraft={setPaneDraft}
+            onSubmit={submitPane}
+            onSteer={selected() ? steerDraft : undefined}
+            onToggleGate={selected() ? toggleGate : undefined}
+            onToggleReview={() => setReviewNext((value) => !value)}
+            onAttachInput={onAttachInput}
+            onRemoveAttachment={removeAttachment}
+            onReorderQueue={selected() ? reorderQueue : undefined}
+            onEditQueue={selected() ? editQueued : undefined}
+            onRemoveQueue={selected() ? removeQueued : undefined}
+            onSendNow={selected() ? sendNowQueued : undefined}
+            quickStart={!selected()}
+            inputRef={(element) => { composerEl = element; if (!selected()) queueMicrotask(() => element.focus()); }}
+        />
     );
 
     const contentPane = () => (
         <>
             <h2>Content</h2>
-            <Show when={selected()} fallback={<div class="status">Open a chat to view its files and changes here.</div>}>
-                <ContentViewer />
+            <Show when={selected()} keyed fallback={<div class="status">Open a chat, then pick a file to read it — and review changes — here.</div>}>
+                {(id) => (
+                    <SessionProvider value={desktopEnvironment.openSession(id).session}>
+                        {/* The review surface takes the pane rather than a fourth tab
+                            inside the viewer (ADR 0110 §7, GATE-6). A tab would imply
+                            inbound material is another view of the selected workspace
+                            file; it is the one kind of content no agent can reach, and
+                            putting it in that tab strip would place it in the file
+                            namespace the protection is stated over. */}
+                        <Show when={reviewingProject()} keyed fallback={<ContentViewer />}>
+                            {(project) => (
+                                <div class="viewer">
+                                    <div class="tabs" data-viewer-tabs>
+                                        <span class="tab active" data-tab="inbound">inbound</span>
+                                        <span class="status viewer-filename">awaiting your review</span>
+                                        <button
+                                            class="ghost"
+                                            data-inbound-close
+                                            onClick={() => setReviewingProject(null)}
+                                        >
+                                            back to files
+                                        </button>
+                                    </div>
+                                    <QuarantineIndex project={project} />
+                                </div>
+                            )}
+                        </Show>
+                    </SessionProvider>
+                )}
             </Show>
         </>
     );
@@ -1332,69 +1683,41 @@ export function App() {
                 style={{ display: "none" }}
                 onChange={() => void uploadPickedFiles(addFileInput)}
             />
-            <Show when={selected()} fallback={<div class="status">Open a chat to see the files it's working with.</div>}>
-                <Workspace />
+            <Show when={selected()} keyed fallback={<div class="status">Each chat's working files are listed here.</div>}>
+                {(id) => (
+                    <SessionProvider value={desktopEnvironment.openSession(id).session}>
+                        <Workspace />
+                    </SessionProvider>
+                )}
             </Show>
         </>
     );
 
     const chatPane = () => (
         <>
-            <h2>
-                {/* The chat's own collapse control (desktop only): folds the chat
-                    panel to a rail, like every other panel. Floated into the chat
-                    panel's top-right corner (CSS) so it lines up with the nav /
-                    content / files chevrons. `data-collapse="run"` is the same
-                    hook the other panels expose; the rail reopens it. */}
-                <Show when={!isMobile()}>
-                    <button
-                        class="panel-collapse left"
-                        data-collapse="run"
-                        title="Hide Chat"
-                        aria-label="Hide Chat"
-                        onClick={() => setChatOff(true)}
-                    >
-                        ‹
-                    </button>
-                </Show>
-                {/* The chat's own name leads the header (round-6 #6) so two chats
-                    under one method are distinguishable; "Chat" is the fallback
-                    when nothing is selected. */}
-                <Show when={selected()} fallback="Chat">
-                    <span class="chat-title" data-chat-title>{chatTitle()}</span>
-                </Show>
-                {/* The chat's lineage (ADR 0035): `archetype · project` for a work
-                    chat, `archetype · Library` for an edit chat — secondary to the name. */}
-                <Show when={selected() && lineage()}>
-                    <span class="chat-lineage" data-chat-lineage data-kind={chatKind()} title={`what this chat is working on: ${lineage()}`}>
-                        {lineage()}
-                    </span>
-                </Show>
-                <Show when={selected()}>
-                    {/* A real status badge (#4), not a word wedged in the title. */}
-                    <span
-                        class="status-badge"
-                        data-testid="run-phase"
-                        data-status={statusBadge().tone}
-                        data-run-phase={phase()}
-                        title={
-                            statusBadge().tone === "conflict"
-                                ? "This chat hit a sync conflict — resolve it in the Changes view"
-                                : statusBadge().tone === "working"
-                                    ? "The agent is working on your request now"
-                                    : statusBadge().tone === "review"
-                                        ? "The agent finished — review what changed and keep or discard it"
-                                        : "Ready for your next request"
-                        }
-                    >
-                        <Show when={statusBadge().tone === "working"}><span class="status-dot" /></Show>
-                        {statusBadge().label}
-                    </span>
-                </Show>
-                <Show when={selected()}>
-                    {/* Icon-driven action cluster: each button is icon-only with its
-                        label carried by aria-label + a title tooltip. */}
-                    <span class="header-actions">
+            <ChatPaneHeader
+                title={selected() ? chatTitle() : undefined}
+                lineage={selected() ? lineage() : undefined}
+                lineageKind={selected() ? chatKind() : undefined}
+                targetLabel={selected() ? targetLabel() : undefined}
+                targetTitle={selected() ? targetTitle() : undefined}
+                statusLabel={selected() ? statusBadge().label : undefined}
+                statusTone={selected() ? statusBadge().tone : undefined}
+                statusPhase={selected() ? phase() : undefined}
+                statusTitle={selected()
+                    ? statusBadge().tone === "conflict"
+                        ? "This chat hit a sync conflict — resolve it in the Changes view"
+                        : statusBadge().tone === "working"
+                            ? "The agent is working on your request now"
+                            : statusBadge().tone === "review"
+                                ? "The agent finished — review what changed and keep or discard it"
+                                : "Ready for your next request"
+                    : undefined}
+                mobile={workbenchShell.isMobile()}
+                onCollapse={() => workbenchShell.setCollapsed("chat", true)}
+                actions={
+                    <Show when={selected()}>
+                        <span class="header-actions">
                         <TranscriptFilterMenu
                             prefs={filterPrefs()}
                             onChange={setFilterPrefs}
@@ -1417,9 +1740,10 @@ export function App() {
                         >
                             <Icon name="history" />
                         </button>
-                    </span>
-                </Show>
-            </h2>
+                        </span>
+                    </Show>
+                }
+            />
             <Show when={selected()}>
                 {/* WS-H: the chat header carries no permanent "private draft" caption
                     and no manual pull/discard buttons — a chat targets one shared line
@@ -1440,7 +1764,24 @@ export function App() {
                     </div>
                 </Show>
             </Show>
-            <Show when={selected()} fallback={<div class="status">Open a chat to get started.</div>}>
+            <Show
+                when={selected()}
+                fallback={
+                    <>
+                        {/* The pane keeps its normal anatomy with no chat open: an
+                            empty transcript area absorbing the slack (with one quiet
+                            line of guidance) and THE SAME composer component docked
+                            at the bottom — not a second, lesser input at the top. */}
+                        <div class="transcript empty-chat-welcome" data-empty-chat-welcome>
+                            <p class="empty-chat-hint">
+                                No chat is open. Task the agent below — your first
+                                message starts a chat in Personal.
+                            </p>
+                        </div>
+                        {paneComposer()}
+                    </>
+                }
+            >
                 {/* Desktop projection-freshness notice (RF-E4): chromeless while
                     fresh; on a failed refresh it surfaces the staleness + a retry
                     that re-runs the failed loads. */}
@@ -1460,207 +1801,28 @@ export function App() {
                         Started as a copy of <strong>{forkOf()}</strong> — its files came along, the conversation starts fresh here.
                     </div>
                 </Show>
-                <div
-                    class="transcript"
-                    data-pending-send={pendingSend()?.id === selected() ? pendingSend()?.rid : undefined}
-                >
-                    <TranscriptView
-                        lines={transcript().lines}
-                        onOpen={setSelectedFile}
-                        prefs={filterPrefs()}
-                        onResolveCredential={() => setAccountRequest((n) => n + 1)}
-                    />
-                    <Show when={busy()}>
-                        <div class="working" data-testid="agent-working">
-                            <span class="pulse" />
-                            agent working{activity() ? ` — ${activity()}` : ""}
-                            <button class="stop-btn" data-testid="stop-turn" onClick={stopTurn}>
-                                stop
-                            </button>
-                        </div>
-                    </Show>
-                </div>
-                {/* The composer dock (run-chat.md B4): one bottom unit — the
-                    chat-kind indicator, the stack of queued messages, and the
-                    input. A chat's kind is fixed by its root (ADR 0035): an edit
-                    chat improves the archetype, a work chat does the job. Shown
-                    read-only — there is no toggle. */}
-                <div class="composer-dock">
-                    {/* The chat's kind (edit vs work) is fixed by its root (ADR 0035)
-                        and surfaced read-only in the lineage header — no separate
-                        composer caption (it was static filler). */}
-
-                    {/* Queued messages stack directly on top of the box, next-to-run
-                        first. Each is draggable to reorder, click-to-edit, cancellable. */}
-                    <Show when={queue().length > 0}>
-                        <QueueStack
-                            items={queue()}
-                            onReorder={reorderQueue}
-                            onEdit={editQueued}
-                            onRemove={removeQueued}
-                            onSendNow={sendNowQueued}
-                        />
-                    </Show>
-
-                    {/* Pending message attachments (UX-14): chips above the box, each
-                        removable before send. Cleared once the message is sent. */}
-                    <Show when={attachments().length > 0}>
-                        <div class="composer-attachments" data-attachments>
-                            <For each={attachments()}>
-                                {(a, i) => (
-                                    <span class="attachment-chip" data-attachment data-kind={a.kind}>
-                                        {a.kind === "image" ? (
-                                            <img class="chip-thumb" src={`data:${a.mimeType};base64,${a.data}`} alt="" />
-                                        ) : (
-                                            <Icon name="paperclip" />
-                                        )}
-                                        {a.name}
-                                        <button
-                                            class="chip-x"
-                                            type="button"
-                                            aria-label={`Remove ${a.name}`}
-                                            onClick={() => removeAttachment(i())}
-                                        >
-                                            ×
-                                        </button>
-                                    </span>
-                                )}
-                            </For>
-                        </div>
-                    </Show>
-
-                    {/* Paperclip attach (UX-14): a plain file input (works in the browser
-                        and the Tauri webview), kept OUTSIDE `.composer` so the existing
-                        `.composer input` steps still match only the text box. */}
-                    <input
-                        ref={attachInput}
-                        type="file"
-                        multiple
-                        data-attach-input
-                        style={{ display: "none" }}
-                        onChange={onAttachInput}
-                    />
-                    {/* The per-chat model picker + reasoning-effort toggle (LLM-1, ADR 0062):
-                        a thin toolbar above the input. The picker lists the models the
-                        linked accounts provide (from the GaugeDesk catalog); the effort toggle
-                        appears only for models that support reasoning, and its options are
-                        that model's `--thinking` levels. Both write the chat's config
-                        (model+provider / thinking) — the global→archetype→chat axis; the
-                        empty model choice clears the override so the default resolves. */}
-                    <div class="composer-toolbar">
-                        <label class="model-picker" title="Model for this chat — overrides the archetype's default for this conversation only">
-                            <span class="model-picker-tag" aria-hidden="true">model</span>
-                            <select
-                                data-model-picker
-                                aria-label="Model for this chat"
-                                value={modelValue()}
-                                onChange={(e) => void pickModel(e.currentTarget.value)}
-                            >
-                                <For each={modelChoices()}>
-                                    {(m) => <option value={m.id ? modelKey(m) : ""}>{m.label}</option>}
-                                </For>
-                            </select>
-                        </label>
-                        <Show when={showEffort()}>
-                            <label class="model-picker effort-picker" title="Reasoning effort for this chat — higher is more deliberate (slower, costlier); Default uses the model's own setting">
-                                <span class="model-picker-tag" aria-hidden="true">effort</span>
-                                <select
-                                    data-effort-picker
-                                    aria-label="Reasoning effort for this chat"
-                                    value={chatThinking()}
-                                    onChange={(e) => void pickThinking(e.currentTarget.value)}
-                                >
-                                    <option value="">Default</option>
-                                    <For each={effortLevels()}>
-                                        {(lvl) => <option value={lvl}>{lvl}</option>}
-                                    </For>
-                                </select>
-                            </label>
-                        </Show>
-                    </div>
-                    <div class="composer">
-                        <input
-                            ref={composerEl}
-                            placeholder={chatKind() === "edit" ? `Describe what to change about ${methodName() || "this archetype"}…` : "task the agent…"}
-                            value={draft()}
-                            onInput={(e) => setDraft(e.currentTarget.value)}
-                            onKeyDown={(e) => e.key === "Enter" && submitDraft()}
-                        />
-                        {/* The paperclip sits left of the stage-gate; it opens the file
-                            input above. No backend — the file's text rides the prompt. */}
-                        <button
-                            class="icon-btn attach-btn"
-                            type="button"
-                            data-attach
-                            aria-label="Attach files"
-                            title="Attach file(s) to this message — their text rides along with the agent (not saved to the workspace)"
-                            onClick={() => attachInput?.click()}
-                        >
-                            <Icon name="paperclip" />
-                        </button>
-                        {/* The stage-gate (#24) lives right of the input, left of the
-                            primary action: ⏸ hold lines messages up without running them;
-                            ▶ release·N drains them in order. While held, `send` reads
-                            `queue` so it's honest that nothing runs until release. Hidden
-                            mid-turn — staging is an idle affordance. */}
-                        <Show when={!busy()}>
-                            <button
-                                class="queue-gate"
-                                classList={{ gated: gated() }}
-                                data-queue-gate
-                                title={
-                                    gated()
-                                        ? "Release held messages — they run in order"
-                                        : "Hold messages: line several up, then release them to run in order"
-                                }
-                                onClick={toggleGate}
-                            >
-                                {gated() ? `▶ release${queue().length ? `·${queue().length}` : ""}` : "⏸ hold"}
-                            </button>
-                        </Show>
-                        <Show
-                            when={busy()}
-                            fallback={
-                                <button class="send-btn" onClick={submitDraft}>
-                                    <Icon name={gated() ? "queue" : "send"} />
-                                    {gated() ? "queue" : "send"}
+                <ChatPanel
+                    session={activeDesktopSession()!}
+                    bare
+                    prefs={filterPrefs()}
+                    pendingSend={pendingSend()?.id === selected() ? pendingSend()?.rid : undefined}
+                    onResolveCredential={() => setAccountRequest((n) => n + 1)}
+                    transcriptTail={
+                        <Show when={busy()}>
+                            <div class="working" data-testid="agent-working">
+                                <span class="pulse" />
+                                agent working{activity() ? ` — ${activity()}` : ""}
+                                <button class="stop-btn" data-testid="stop-turn" onClick={stopTurn}>
+                                    stop
                                 </button>
-                            }
-                        >
-                            <button
-                                class="steer-btn"
-                                data-testid="steer-turn"
-                                title="Send now — interrupts the running turn and redirects the agent"
-                                disabled={!hasOutgoing()}
-                                onClick={steerDraft}
-                            >
-                                steer
-                            </button>
-                            <button
-                                class="queue-btn"
-                                data-testid="queue-msg"
-                                title="Queue this message — runs after the current turn finishes"
-                                disabled={!hasOutgoing()}
-                                onClick={submitDraft}
-                            >
-                                <Icon name="queue" />
-                                queue ⏎
-                            </button>
+                            </div>
                         </Show>
-                    </div>
-                </div>
+                    }
+                    composer={paneComposer()}
+                />
             </Show>
         </>
     );
-
-    // The four panes keyed for the Carousel island. The chat body is the same
-    // chatPane() the desktop grid renders.
-    const carouselPanes = (): Record<PaneKind, JSX.Element> => ({
-        nav: navPane(),
-        chat: chatPane(),
-        files: filesPane(),
-        content: contentPane(),
-    });
 
     // The shared overlays (archetype settings, history shelf) sit above whichever
     // shell is active, so both the desktop grid and the mobile carousel mount them.
@@ -1732,8 +1894,28 @@ export function App() {
                 )}
             </Show>
 
+            <Show when={deployment()}>{(selectedDeployment) => (
+                <DeploymentPanel
+                    api={api}
+                    selection={selectedDeployment()}
+                    defaultEdgeOrigin={import.meta.env.VITE_PUBLIC_EDGE_ORIGIN
+                        || PUBLIC_EDGE_ORIGIN}
+                    defaultFundingRef={import.meta.env.VITE_PUBLIC_FUNDING_REF
+                        || ""}
+                    defaultCredentialRef={import.meta.env.VITE_PUBLIC_CREDENTIAL_REF
+                        || "credential:production:openai:v1"}
+                    onClose={() => setDeployment(null)}
+                />
+            )}</Show>
+
             <Show when={selected() && showShelf()}>
-                <Shelf api={api} scope={scopeId(selected()!)} id={selected()!} onClose={() => setShowShelf(false)} />
+                <Shelf
+                    api={api}
+                    scope={scopeId(selected()!)}
+                    id={selected()!}
+                    onSaveOutputToDisk={isTauri() ? saveOutputToDisk : undefined}
+                    onClose={() => setShowShelf(false)}
+                />
             </Show>
 
             <Show when={selected() && showSources()}>
@@ -1747,147 +1929,18 @@ export function App() {
         </>
     );
 
-    // The mobile shell: the Carousel island reused as-is, fed the same pane bodies.
-    // The island owns no navigation truth — it reduces gestures into `carousel` and
-    // we render only the current pane, with the shared overlays above it.
-    const MobileShell = () => (
-        <div class="workbench mobile" data-mobile>
-            <Carousel
-                state={carousel()}
-                onState={setCarousel}
-                panes={carouselPanes()}
-                onNewChat={() => void startNewChat()}
-            />
-            {overlays()}
-        </div>
-    );
-
-    const rightPanels = () => (
-        <>
-            <Show when={!contentOff()}>
-                <Resizer onMove={(x) => onResize("mid", x)} />
-                <CollapsiblePanel
-                    cls="content"
-                    fold="right"
-                    title="Content"
-                    collapsed={false}
-                    onToggle={(v) => pinPanel(setContentOff, v)}
-                >
-                    {contentPane()}
-                </CollapsiblePanel>
-            </Show>
-
-            <Show when={contentOff()}>
-                <CollapsiblePanel
-                    cls="content"
-                    fold="right"
-                    title="Content"
-                    collapsed={true}
-                    onToggle={(v) => pinPanel(setContentOff, v)}
-                >
-                    {contentPane()}
-                </CollapsiblePanel>
-            </Show>
-
-            <Show when={!wsOff()}>
-                <Resizer onMove={(x) => onResize("ws", x)} />
-                <CollapsiblePanel
-                    cls="workspace"
-                    fold="right"
-                    title="Files"
-                    collapsed={false}
-                    onToggle={(v) => pinPanel(setWsOff, v)}
-                >
-                    {filesPane()}
-                </CollapsiblePanel>
-            </Show>
-
-            <Show when={wsOff()}>
-                <CollapsiblePanel
-                    cls="workspace"
-                    fold="right"
-                    title="Files"
-                    collapsed={true}
-                    onToggle={(v) => pinPanel(setWsOff, v)}
-                >
-                    {filesPane()}
-                </CollapsiblePanel>
-            </Show>
-        </>
-    );
-
-    // The desktop grid: the four panels under the task bar (the original layout),
-    // each rendering the same pane body the carousel reuses.
-    const DesktopShell = () => (
-        <div class="workbench" ref={observeShell} style={{ "grid-template-columns": cols() }}>
-            <footer class="tasks">
-                {/* Tasks are a projection over chats (incl. their titles), so the
-                    queue tracks the workspace event stream (navRefresh), not just
-                    local turn status — a rename re-titles the task live. */}
-                <TaskBar
-                    api={api}
-                    selected={selected()}
-                    refreshKey={navRefresh()}
-                    selectedLoosening={selectedLoosening()}
-                    onSelect={openChat}
-                    onComplete={(id) => onMerge("admit", id)}
-                />
-            </footer>
-
-            <CollapsiblePanel
-                cls="nav"
-                fold="left"
-                title="Browse"
-                collapsed={navOff()}
-                onToggle={(v) => pinPanel(setNavOff, v)}
-            >
-                <div class="nav-stack">
-                    <div class="nav-scroll">{navPane()}</div>
-                    {networkBar()}
-                </div>
-            </CollapsiblePanel>
-
-            <Resizer onMove={(x) => onResize("nav", x)} />
-
-            {/* The chat lane. Its collapse button lives in its own header (chatPane),
-                so when open it is a plain section; when folded it becomes a rail that
-                reopens it — matching the other panels' rail behaviour. */}
-            <Show
-                when={!chatOff()}
-                fallback={
-                    <div
-                        class="panel run rail"
-                        data-rail="run"
-                        role="button"
-                        tabindex="0"
-                        title="Show Chat"
-                        onClick={() => setChatOff(false)}
-                        onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && setChatOff(false)}
-                    >
-                        <span class="rail-chevron">›</span>
-                        <span class="rail-label">Chat</span>
-                    </div>
-                }
-            >
-                <section class="panel run">{chatPane()}</section>
-            </Show>
-
-            {rightPanels()}
-
-            {overlays()}
-        </div>
-    );
-
-    // The desktop Session (EMBED-1): the panel-facing seam built over the shell's
-    // own signals. Panels read addressing/projections/commands from here, never
-    // from these globals directly, so the same panel renders unchanged inside a
-    // remote, scoped embedded session. Grows as each panel is migrated.
-    const desktopSession: Session = {
+    // The local Environment (ADR 0076) owns the desktop's identity, placement
+    // adapter, and panel manifest. It mints a fixed-id Session leaf whenever the
+    // active engagement changes; the shell no longer hand-builds a mutable-id
+    // Session as a second producer.
+    const desktopSessionFor = (id: EngagementId): Session => ({
         api,
-        engagementId: selected,
+        engagementId: () => id,
         worktreeRev: status,
         selectedFile,
         selectFile: (path) => setSelectedFile(path),
+        reviewingProject,
+        reviewProject: (project) => setReviewingProject(project),
         diff: () => diff() ?? "",
         mergePhase: () => merge()?.phase ?? null,
         mergeConflicted: () => merge()?.phase === "Rejected" && merge()?.git_outcome === "Conflict",
@@ -1896,16 +1949,226 @@ export function App() {
         transcript,
         merge: (action) => void onMerge(action),
         onContentSaved: () => void Promise.all([refetchDiff(), refetchMerge()]),
-        send: sendText,
-    };
+        send: (text) => {
+            // A leaf may outlive one render turn during a selection change. Refuse
+            // to route its command to a different engagement.
+            if (selected() === id) sendText(text);
+        },
+        forkAt: (entryId) => {
+            if (selected() !== id) return;
+            void api.forkChatAt(id, entryId).then(openChat);
+        },
+    });
+    const desktopEnvironment = new Environment({
+        identity: { kind: "local", subject: "local:personal" },
+        controlPlane: api,
+        manifest: panelManifest(["chat", "viewer", "files"]),
+        sessionFactory: (_controlPlane, id) => ({
+            session: desktopSessionFor(id),
+            dispose: () => undefined,
+        }),
+    });
+    const activeDesktopSession = createMemo(() => {
+        const id = selected();
+        return id ? desktopEnvironment.openSession(id).session : undefined;
+    });
+    const noHomeState = createMemo(() => {
+        const state = homeState();
+        return state?.kind === "none" ? state : null;
+    });
+    const HomeSetup = () => {
+        if (import.meta.env.VITE_HOME_SPLIT === "true" && !homeInvite()) {
+            const openHub = () => {
+                const base = props.hubUrl
+                    || import.meta.env.VITE_HUB_URL
+                    || "https://hub.gaugewright.com/";
+                const url = new URL(base, window.location.href);
+                const tenant = new URLSearchParams(window.location.search).get("tenant");
+                if (tenant) url.searchParams.set("setup", tenant);
+                window.location.assign(url.toString());
+            };
+            return (
+                <Show when={noHomeState()}>
+                    <div class="homegate-scrim" data-home-setup>
+                        <section class="homegate-card" aria-labelledby="homegate-title">
+                            <p class="homegate-kicker">GaugeWright Hub</p>
+                            <h1 id="homegate-title">Choose a Home before opening GaugeDesk</h1>
+                            <p class="homegate-lede">
+                                Your account has no selected reachable Home. Manage computers and
+                                Cloud Home in Hub, then return here to work.
+                            </p>
+                            <button class="firstrun-connect" type="button" onClick={openHub}>
+                                Open GaugeWright Hub
+                            </button>
+                        </section>
+                    </div>
+                </Show>
+            );
+        }
+        return (
+            <Show when={noHomeState()}>
+                {(state) => <div class="homegate-scrim" data-home-setup>
+                    <section class="homegate-card" aria-labelledby="homegate-title">
+                    <p class="homegate-kicker">Free account</p>
+                    <h1 id="homegate-title">Choose where your projects run</h1>
+                    <p class="homegate-lede">
+                        Your account and invitations live here. Project files, event logs, and
+                        agents stay on the Home you choose—your computer, another team’s Home,
+                        or a paid Cloud Home.
+                    </p>
 
+                    <Show when={homeInvite()}>
+                        <Show
+                            when={invitationPreview()}
+                            fallback={<div class="homegate-notice homegate-error" role="alert">
+                                This project invitation is malformed or uses an unsafe Home endpoint.
+                            </div>}
+                        >
+                            {(invite) => <div class="homegate-invite">
+                                <div>
+                                    <strong>Project invitation</strong>
+                                    <span>
+                                        Join {invite().project} on {invite().homeId}. Your free account
+                                        uses the owner’s Home; it does not create hosted work here.
+                                    </span>
+                                    <small>{invite().endpoint}</small>
+                                </div>
+                                <button
+                                    type="button"
+                                    disabled={homeBusy()}
+                                    onClick={() => void acceptHomeInvite()}
+                                >
+                                    {homeBusy() ? "Joining…" : "Accept invitation"}
+                                </button>
+                            </div>}
+                        </Show>
+                    </Show>
+
+                    <Show when={state().routes.length > 0}>
+                        <div class="homegate-notice">
+                            You have {state().routes.length} shared project route
+                            {state().routes.length === 1 ? "" : "s"}. Opening one connects to its
+                            owner’s Home; it does not use hosted storage from your free account.
+                        </div>
+                    </Show>
+
+                    <Show when={state().homes.length > 0}>
+                        <div class="homegate-homes">
+                            <span class="homegate-label">Registered Homes</span>
+                            <For each={state().homes}>
+                                {(home) => (
+                                    <button
+                                        type="button"
+                                        class="homegate-home"
+                                        disabled={homeBusy()}
+                                        onClick={() => void api.selectHome(home.id).then(() => refetchHome())}
+                                    >
+                                        <span>{home.id}</span>
+                                        <small>{home.endpoint}</small>
+                                    </button>
+                                )}
+                            </For>
+                        </div>
+                    </Show>
+
+                    <label class="homegate-field">
+                        <span class="homegate-label">Connect a computer or private Home</span>
+                        <div class="homegate-connect-row">
+                            <input
+                                value={homeEndpoint()}
+                                onInput={(event) => setHomeEndpoint(event.currentTarget.value)}
+                                placeholder="https://home.example.com"
+                                aria-label="Home endpoint"
+                            />
+                            <button
+                                type="button"
+                                disabled={homeBusy() || !homeEndpoint().trim()}
+                                onClick={() => void connectHome()}
+                            >
+                                {homeBusy() ? "Connecting…" : "Connect"}
+                            </button>
+                        </div>
+                    </label>
+
+                    <Show when={props.environmentAction?.available()}>
+                        <div class="homegate-cloud">
+                            <div>
+                                <strong>Manage machines</strong>
+                                <span>Connect a self-managed machine or add a managed machine in Administration.</span>
+                            </div>
+                            <button type="button" onClick={() => props.environmentAction?.open()}>
+                                Open Administration
+                            </button>
+                        </div>
+                    </Show>
+                    <p class="homegate-auth-note">
+                        {localDevLogin
+                            ? "This isolated local account never contacts Google or the production GaugeWright Hub."
+                            : "Google sign-in identifies your GaugeWright account. Connecting OpenAI or another model provider is a separate authorization in Account settings."}
+                    </p>
+                    <Show when={homeError()}>
+                        <p class="homegate-error" role="alert">{homeError()}</p>
+                    </Show>
+                    </section>
+                </div>}
+            </Show>
+        );
+    };
     // One shell at a time: `<Show>` lazily mounts only the active branch, so the
     // inactive layout never builds (no double-mounted FacetBrowser / Workspace).
     return (
-        <SessionProvider value={desktopSession}>
+        <>
+            <Show when={homeState.loading}>
+                <div class="homegate-scrim" data-home-loading>
+                    <section class="homegate-card"><p class="homegate-lede">Finding your Home…</p></section>
+                </div>
+            </Show>
+            <Show when={homeFailure()}>
+                <div class="homegate-scrim" data-home-error>
+                    <section class="homegate-card">
+                        <h1>{homeNeedsLogin() ? "Sign in to find your Home" : "We couldn’t load your Homes"}</h1>
+                        <p class="homegate-lede">
+                            {homeNeedsLogin()
+                                ? localDevLogin
+                                    ? "Enter the isolated local account, then Home discovery will continue automatically."
+                                    : "Your GaugeWright session is missing or expired. Sign in with Google, then Home discovery will continue automatically."
+                                : "The account Hub could not be reached. Retry when the connection is available."}
+                        </p>
+                        <div class="homegate-connect-row">
+                            <Show when={homeNeedsLogin()}>
+                                <button
+                                    class="firstrun-connect"
+                                    data-home-sign-in
+                                    type="button"
+                                    onClick={() => beginLogin(controlPlaneBase())}
+                                >
+                                    {localDevLogin ? "Enter local dev account" : "Sign in with Google"}
+                                </button>
+                            </Show>
+                            <button
+                                class="firstrun-connect"
+                                type="button"
+                                onClick={() => void refetchHome()}
+                            >
+                                Retry
+                            </button>
+                        </div>
+                    </section>
+                </div>
+            </Show>
+            <Show when={!homeState.loading && !homeFailure()}>
+                <HomeSetup />
+            </Show>
             {/* First-run credential gate (ADR 0075 Phase 0): overlays both shells
                 until a model is connected, then dismisses itself. */}
-            <Show when={showFirstRun()}>
+            <Show
+                when={
+                    !homeState.loading &&
+                    !homeFailure() &&
+                    homeState()?.kind !== "none" &&
+                    showFirstRun()
+                }
+            >
                 <FirstRunOverlay
                     api={api}
                     productName="GaugeDesk"
@@ -1917,200 +2180,42 @@ export function App() {
                     onDismiss={() => setFirstRunDismissed(true)}
                 />
             </Show>
-            <Show when={isMobile()} fallback={<DesktopShell />}>
-                <MobileShell />
+            <Show when={!homeState.loading && !homeFailure() && homeState()?.kind !== "none"}>
+                <WorkbenchShell
+                    state={workbenchShell}
+                    taskBar={() => (
+                        <TaskBar
+                            api={api}
+                            selected={selected()}
+                            refreshKey={navRefresh()}
+                            selectedLoosening={selectedLoosening()}
+                            onSelect={openChat}
+                            onComplete={(id) => onMerge("admit", id)}
+                            onReviewInbound={(project, id) => setReviewingProject(project, id)}
+                        />
+                    )}
+                    nav={navPane}
+                    navFooter={networkBar}
+                    chat={chatPane}
+                    content={contentPane}
+                    files={filesPane}
+                    overlays={overlays}
+                    onNewChat={() => void startNewChat()}
+                />
             </Show>
-        </SessionProvider>
+        </>
     );
 }
 
-/** The stack of queued messages sitting on top of the composer (run-chat.md B4).
- *  The top card is the next to run when the current turn settles. Each card is
- *  HTML5-draggable to reorder, click-to-edit in place (clearing it cancels), and
- *  removable. Drag is disabled on the card being edited so text selection works. */
-function QueueStack(props: {
-    items: QueuedMsg[];
-    onReorder: (from: number, to: number) => void;
-    onEdit: (id: number, text: string) => void;
-    onRemove: (id: number) => void;
-    onSendNow: (id: number) => void;
-}) {
-    const [dragIdx, setDragIdx] = createSignal<number | null>(null);
-    const [overIdx, setOverIdx] = createSignal<number | null>(null);
-    const [editId, setEditId] = createSignal<number | null>(null);
-
-    function commitDrop() {
-        const from = dragIdx();
-        const to = overIdx();
-        if (from !== null && to !== null && from !== to) props.onReorder(from, to);
-        setDragIdx(null);
-        setOverIdx(null);
-    }
-
-    return (
-        <div class="queue-stack" data-testid="queue-stack">
-            <span class="queue-cap">queued · runs after this turn</span>
-            <For each={props.items}>
-                {(m, i) => (
-                    <div
-                        class="queue-item"
-                        data-testid="queue-item"
-                        classList={{
-                            dragging: dragIdx() === i(),
-                            over: overIdx() === i() && dragIdx() !== null && dragIdx() !== i(),
-                        }}
-                        draggable={editId() !== m.id}
-                        onDragStart={(e) => {
-                            setDragIdx(i());
-                            e.dataTransfer!.effectAllowed = "move";
-                            e.dataTransfer!.setData("text/plain", String(m.id)); // Firefox needs payload
-                        }}
-                        onDragOver={(e) => {
-                            e.preventDefault();
-                            setOverIdx(i());
-                        }}
-                        onDrop={(e) => {
-                            e.preventDefault();
-                            commitDrop();
-                        }}
-                        onDragEnd={commitDrop}
-                    >
-                        <span class="queue-grip" title="Drag to reorder">⠿</span>
-                        <span class="queue-pos">{i() + 1}</span>
-                        <Show
-                            when={editId() === m.id}
-                            fallback={
-                                <span
-                                    class="queue-text"
-                                    title="Click to edit"
-                                    onClick={() => setEditId(m.id)}
-                                >
-                                    {m.text}
-                                </span>
-                            }
-                        >
-                            <input
-                                class="queue-edit"
-                                value={m.text}
-                                ref={(el) => queueMicrotask(() => el.focus())}
-                                onKeyDown={(e) => {
-                                    if (e.key === "Enter") {
-                                        props.onEdit(m.id, e.currentTarget.value);
-                                        setEditId(null);
-                                    } else if (e.key === "Escape") {
-                                        setEditId(null);
-                                    }
-                                }}
-                                onBlur={(e) => {
-                                    props.onEdit(m.id, e.currentTarget.value);
-                                    setEditId(null);
-                                }}
-                            />
-                        </Show>
-                        <button
-                            class="queue-send-now"
-                            data-testid="queue-send-now"
-                            title="Send this one now — runs immediately, ahead of the rest"
-                            onClick={() => props.onSendNow(m.id)}
-                        >
-                            ▶
-                        </button>
-                        <button
-                            class="queue-remove"
-                            title="Cancel this queued message"
-                            onClick={() => props.onRemove(m.id)}
-                        >
-                            ✕
-                        </button>
-                    </div>
-                )}
-            </For>
-        </div>
-    );
-}
-
-/** One workbench panel that can fold to a thin rail (legacy `13-chrome-ui.md` §6).
- *  Expanded, a single collapse chevron floats in the panel's top inner edge (the
- *  side facing chat), over the body's heading — it no longer occupies a row of its
- *  own. Folded, the panel becomes a clickable rail with a vertical label and an
- *  outward chevron that restores it. `fold` is the screen edge the panel tucks
- *  toward; the chevrons point that way (collapse) and back (expand). Chat is never
- *  wrapped in this — it does not collapse. */
-function CollapsiblePanel(props: {
-    cls: string; // "nav" | "content" | "workspace" — also the panel's grid class
-    fold: "left" | "right";
-    title: string;
-    collapsed: boolean;
-    onToggle: (v: boolean) => void;
-    children: JSX.Element;
-}) {
-    const collapseGlyph = () => (props.fold === "left" ? "‹" : "›");
-    const expandGlyph = () => (props.fold === "left" ? "›" : "‹");
-    return (
-        <Show
-            when={!props.collapsed}
-            fallback={
-                <div
-                    class={`panel ${props.cls} rail`}
-                    data-rail={props.cls}
-                    role="button"
-                    tabindex="0"
-                    title={`Show ${props.title}`}
-                    onClick={() => props.onToggle(false)}
-                    onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && props.onToggle(false)}
-                >
-                    <span class="rail-chevron">{expandGlyph()}</span>
-                    <span class="rail-label">{props.title}</span>
-                </div>
-            }
-        >
-            <div class={`panel ${props.cls} collapsible`}>
-                {/* The collapse chevron no longer owns a row of its own — it floats
-                    in the panel's top inner corner (over the body's heading), so the
-                    panel body starts at the very top. `fold` puts it on the inner
-                    edge (right for a left-folding nav, left for right-folding panels). */}
-                <button
-                    class={`panel-collapse ${props.fold}`}
-                    data-collapse={props.cls}
-                    title={`Hide ${props.title}`}
-                    aria-label={`Hide ${props.title}`}
-                    onClick={() => props.onToggle(true)}
-                >
-                    {collapseGlyph()}
-                </button>
-                <div class="panel-body">{props.children}</div>
-            </div>
-        </Show>
-    );
-}
-
-/** A vertical drag handle between two panels. Reports the live pointer x so the
- *  parent recomputes widths from geometry (no accumulation drift). */
-function Resizer(props: { onMove: (clientX: number) => void }) {
-    const [dragging, setDragging] = createSignal(false);
-    function down(e: PointerEvent) {
-        e.preventDefault();
-        setDragging(true);
-        document.body.style.cursor = "col-resize";
-        document.body.style.userSelect = "none";
-        const move = (m: PointerEvent) => props.onMove(m.clientX);
-        const up = () => {
-            setDragging(false);
-            document.body.style.cursor = "";
-            document.body.style.userSelect = "";
-            window.removeEventListener("pointermove", move);
-            window.removeEventListener("pointerup", up);
-        };
-        window.addEventListener("pointermove", move);
-        window.addEventListener("pointerup", up);
-    }
-    return (
-        <div
-            class="resizer"
-            classList={{ dragging: dragging() }}
-            role="separator"
-            aria-orientation="vertical"
-            onPointerDown={down}
-        />
-    );
+/** GaugeDesk is the workbench on both desktop and web. Account, organization,
+ * Home, billing, backup, and deployment management live in GaugeWright Hub;
+ * the hosted transport flag changes routing only, never the application shell.
+ */
+export function App(props: WorkbenchAppProps = {}) {
+    if (isMobileHarness()) return <MobileApp />;
+    const tenant = typeof window === "undefined"
+        ? null
+        : new URLSearchParams(window.location.search).get("tenant");
+    createEffect(() => props.onTenantContextChange?.(tenant));
+    return <WorkbenchApp {...props} />;
 }

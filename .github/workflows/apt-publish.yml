@@ -1,0 +1,143 @@
+name: publish apt repository
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published GaugeDesk release tag to promote
+        required: true
+        type: string
+
+concurrency:
+  group: apt-repository-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: promote Debian release
+    runs-on: ubuntu-22.04
+    environment: production
+    env:
+      AWS_REGION: auto
+      AWS_DEFAULT_REGION: auto
+      APT_R2_BUCKET: ${{ vars.APT_R2_BUCKET }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install archive tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli dpkg-dev gnupg lintian
+
+      - name: fetch production publication secrets through OIDC
+        uses: Infisical/secrets-action@v1.0.9
+        with:
+          method: oidc
+          identity-id: ${{ vars.INFISICAL_PRODUCTION_IDENTITY_ID }}
+          project-slug: ${{ vars.INFISICAL_PRODUCTION_PROJECT_SLUG }}
+          env-slug: ${{ vars.INFISICAL_PRODUCTION_ENV_SLUG || 'prod' }}
+          secret-path: /publication/apt
+
+      - name: validate publication contract
+        shell: bash
+        run: |
+          required=(
+            APT_SIGNING_PRIVATE_KEY APT_SIGNING_PASSPHRASE APT_R2_BUCKET
+            CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_R2_ACCESS_KEY_ID
+            CLOUDFLARE_R2_SECRET_ACCESS_KEY
+          )
+          for name in "${required[@]}"; do
+            if [ -z "${!name:-}" ]; then
+              echo "missing required production value: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: download and validate the published Debian artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/incoming"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.deb' --dir "$RUNNER_TEMP/incoming"
+          shopt -s nullglob
+          debs=("$RUNNER_TEMP"/incoming/*.deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "expected exactly one Debian release asset, found ${#debs[@]}" >&2
+            exit 1
+          fi
+          scripts/check-deb-package.sh "${debs[0]}"
+
+      - name: build and sign the repository locally
+        shell: bash
+        run: |
+          export AWS_ACCESS_KEY_ID="$CLOUDFLARE_R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+          endpoint="https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          repo="$RUNNER_TEMP/apt-repository"
+          mkdir -p "$repo"
+          aws --endpoint-url "$endpoint" s3 sync \
+            "s3://$APT_R2_BUCKET" "$repo" --no-progress
+
+          shopt -s nullglob
+          debs=("$RUNNER_TEMP"/incoming/*.deb)
+          scripts/build-apt-repository.sh "$repo" "${debs[@]}"
+
+          export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          printf '%s' "$APT_SIGNING_PRIVATE_KEY" | gpg --batch --import
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys \
+            | awk -F: '$1 == "fpr" { print $10; exit }')"
+          [ -n "$fingerprint" ] || { echo 'no APT signing key imported' >&2; exit 1; }
+          scripts/sign-apt-repository.sh "$repo" "$fingerprint"
+          gpgv --keyring "$repo/gaugewright-archive-keyring.gpg" \
+            "$repo/dists/stable/InRelease"
+
+      - name: publish immutable objects then signed metadata
+        shell: bash
+        run: |
+          export AWS_ACCESS_KEY_ID="$CLOUDFLARE_R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+          endpoint="https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          repo="$RUNNER_TEMP/apt-repository"
+          bucket="s3://$APT_R2_BUCKET"
+
+          aws --endpoint-url "$endpoint" s3 sync "$repo/pool" "$bucket/pool" \
+            --no-progress --cache-control 'public,max-age=31536000,immutable'
+          while IFS= read -r -d '' file; do
+            relative="${file#"$repo/"}"
+            aws --endpoint-url "$endpoint" s3 cp "$file" "$bucket/$relative" \
+              --no-progress --cache-control 'public,max-age=31536000,immutable'
+          done < <(find "$repo/dists" -path '*/by-hash/*' -type f -print0)
+          aws --endpoint-url "$endpoint" s3 sync \
+            "$repo/dists/stable/main" "$bucket/dists/stable/main" \
+            --exclude '*/by-hash/*' --no-progress \
+            --cache-control 'public,max-age=300,must-revalidate'
+          aws --endpoint-url "$endpoint" s3 cp \
+            "$repo/gaugewright-archive-keyring.gpg" \
+            "$bucket/gaugewright-archive-keyring.gpg" --no-progress \
+            --cache-control 'public,max-age=3600,must-revalidate'
+          for metadata in Release Release.gpg InRelease; do
+            aws --endpoint-url "$endpoint" s3 cp \
+              "$repo/dists/stable/$metadata" "$bucket/dists/stable/$metadata" \
+              --no-progress --cache-control 'public,max-age=60,must-revalidate'
+          done
+
+      - name: verify the public signed release
+        shell: bash
+        run: |
+          repo="$RUNNER_TEMP/apt-repository"
+          curl --fail --silent --show-error --retry 6 --retry-all-errors \
+            --output "$RUNNER_TEMP/public-InRelease" \
+            https://packages.gaugewright.com/dists/stable/InRelease
+          gpgv --keyring "$repo/gaugewright-archive-keyring.gpg" \
+            "$RUNNER_TEMP/public-InRelease"

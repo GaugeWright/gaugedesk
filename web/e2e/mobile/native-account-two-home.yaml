@@ -1,0 +1,52 @@
+appId: ${APP_ID}
+name: Signed-in account follows projects across two Homes
+---
+- launchApp
+- extendedWaitUntil:
+    visible: "Sign in to open your projects.*"
+    timeout: 30000
+- tapOn: "sign in"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          text: "Use without an account"
+          optional: true
+          label: "Complete Chrome first-run setup on a clean emulator"
+      - tapOn:
+          text: "No thanks"
+          optional: true
+          label: "Decline Chrome notifications on a clean emulator"
+- runFlow:
+    when:
+      platform: IOS
+    commands:
+      # Safari's first-run teaching overlay hides the custom-scheme alert from
+      # XCTest's accessibility tree even though the alert is visible. Wait for
+      # the redirect to settle, dismiss that optional overlay, then accept the
+      # alert at the stable position it occupies without the overlay.
+      - waitForAnimationToEnd:
+          timeout: 15000
+      - tapOn:
+          point: "91%,71%"
+          label: "Dismiss Safari's first-run teaching overlay if present"
+      - tapOn:
+          text: "Open"
+          label: "Accept the iOS account callback handoff"
+- extendedWaitUntil:
+    visible: "Projects"
+    timeout: 60000
+- assertVisible: "Alpha"
+- assertVisible: "Beta"
+- assertNotVisible: "Wrong Home"
+- tapOn: "Alpha"
+- extendedWaitUntil:
+    visible: "home:one"
+    timeout: 30000
+- tapOn: "projects"
+- tapOn: "Beta"
+- extendedWaitUntil:
+    visible: "home:two"
+    timeout: 30000
+- tapOn: "projects"

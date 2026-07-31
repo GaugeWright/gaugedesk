@@ -9,27 +9,123 @@ import type {
     ProjectId,
     SearchHit,
     StreamEvent,
+    WorkTargetId,
     WorkstreamId,
     WorkstreamNode,
     Workspace,
     WorkspaceChange,
+    WorkspaceDelta,
     ProjectionCarriage,
 } from "@gaugewright/control-plane-client";
 import {
     browserRouteJson,
     controlPlaneBase,
+    type BrowserRouteJsonOptions,
     type RouteJson,
 } from "@gaugewright/control-plane-client";
 import type { FacetBrowserApi } from "@gaugewright/workbench-ui";
 
 export { controlPlaneBase };
 
+export const MOBILE_CONTROL_PLANE_INVENTORY = {
+    getWorkspaceCarriage: "projection",
+    getWorkspaceDeltaCarriage: "projection",
+    getTasks: "projection",
+    search: "projection",
+    getPlacementConfig: "projection",
+    setPlacementConfig: "command",
+    createArchetype: "command",
+    renameArchetype: "command",
+    deleteArchetype: "command",
+    forkArchetype: "command",
+    pullFromSource: "command",
+    publishArchetype: "command",
+    upgradePlacement: "command",
+    acceptPlacement: "command",
+    createProject: "command",
+    renameProject: "command",
+    deleteProject: "command",
+    placeArchetype: "command",
+    removePlacement: "command",
+    createChatUnderArchetype: "command",
+    createChatUnderPlacement: "command",
+    useArchetype: "command",
+    createEngagement: "command",
+    forkChat: "command",
+    renameChat: "command",
+    deleteChat: "command",
+    createWorkstream: "command",
+    joinWorkstream: "command",
+    leaveWorkstream: "command",
+    promoteWorkstream: "command",
+    archiveWorkstream: "command",
+    runTask: "command",
+    stopTurn: "command",
+    getTranscript: "projection",
+    getTree: "projection",
+    getFile: "projection",
+    subscribe: "reference-stream",
+    subscribeWorkspace: "reference-stream",
+    openPairing: "direct-admission",
+    acceptBoundary: "direct-admission",
+    pairingStatus: "direct-admission",
+    claimMachineInvitation: "direct-admission",
+    proveMachineDevice: "direct-admission",
+    machineEnrollmentStatus: "direct-admission",
+    machineSessionChallenge: "direct-admission",
+    openMachineSession: "direct-admission",
+    revokeMachineController: "direct-admission",
+} as const;
+
 /** App-owned control-plane edge for the mobile web harness. */
 export class MobileControlPlane implements FacetBrowserApi {
     private readonly route: RouteJson;
 
-    constructor(private readonly base = controlPlaneBase()) {
-        this.route = browserRouteJson(this.base);
+    constructor(
+        private readonly base = controlPlaneBase(),
+        config: {
+            readonly routeJson?: RouteJson;
+            readonly machineSession?: BrowserRouteJsonOptions["machineSession"];
+            readonly bearer?: BrowserRouteJsonOptions["bearer"];
+            readonly homeAdmission?: BrowserRouteJsonOptions["homeAdmission"];
+            readonly onSessionRejected?: () => void;
+            readonly onAuthorizationRejected?: (
+                status: 401 | 403 | 421,
+                detail: string,
+            ) => void;
+            readonly onTransportUnavailable?: (detail: string) => void;
+        } = {},
+    ) {
+        const configuredSession = config.machineSession;
+        const session: () => string | null =
+            typeof configuredSession === "function"
+                ? configuredSession
+                : () => configuredSession ?? null;
+        const route =
+            config.routeJson
+            ?? browserRouteJson(this.base, {
+                machineSession: session,
+                bearer: config.bearer,
+                homeAdmission: config.homeAdmission,
+            });
+        this.route = async (method, path, body, requestOptions) => {
+            try {
+                return await route(method, path, body, requestOptions);
+            } catch (error) {
+                if (session() && /\b401\b/.test(String(error))) {
+                    config.onSessionRejected?.();
+                } else if (/\b401\b/.test(String(error))) {
+                    config.onAuthorizationRejected?.(401, String(error));
+                } else if (/\b403\b/.test(String(error))) {
+                    config.onAuthorizationRejected?.(403, String(error));
+                } else if (/\b421\b/.test(String(error))) {
+                    config.onAuthorizationRejected?.(421, String(error));
+                } else {
+                    config.onTransportUnavailable?.(String(error));
+                }
+                throw error;
+            }
+        };
     }
 
     private routeJson(): RouteJson {
@@ -42,6 +138,10 @@ export class MobileControlPlane implements FacetBrowserApi {
 
     getWorkspaceCarriage(): Promise<ProjectionCarriage<Workspace>> {
         return workbenchClient.getWorkspaceCarriage(this.workbenchTransport());
+    }
+
+    getWorkspaceDeltaCarriage(change: WorkspaceChange): Promise<ProjectionCarriage<WorkspaceDelta>> {
+        return workbenchClient.getWorkspaceDeltaCarriage(this.workbenchTransport(), change);
     }
 
     getTasks(): Promise<HumanTask[]> {
@@ -123,8 +223,9 @@ export class MobileControlPlane implements FacetBrowserApi {
         pid: ProjectId,
         placementId: PlacementId,
         title: string,
+        targetId: WorkTargetId,
     ): Promise<EngagementId> {
-        return workbenchClient.createChatUnderPlacement(this.workbenchTransport(), pid, placementId, title);
+        return workbenchClient.createChatUnderPlacement(this.workbenchTransport(), pid, placementId, title, targetId);
     }
 
     useArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId> {
@@ -147,8 +248,8 @@ export class MobileControlPlane implements FacetBrowserApi {
         return workbenchClient.deleteChat(this.workbenchTransport(), id);
     }
 
-    createWorkstream(placementId: PlacementId, name: string): Promise<WorkstreamNode> {
-        return workbenchClient.createWorkstream(this.workbenchTransport(), placementId, name);
+    createWorkstream(placementId: PlacementId, name: string, targetId: WorkTargetId): Promise<WorkstreamNode> {
+        return workbenchClient.createWorkstream(this.workbenchTransport(), placementId, name, targetId);
     }
 
     joinWorkstream(ws: WorkstreamId, chat: EngagementId): Promise<void> {
@@ -171,8 +272,9 @@ export class MobileControlPlane implements FacetBrowserApi {
         id: EngagementId,
         prompt: string,
         images: { data: string; mimeType: string }[] = [],
+        review = false,
     ): Promise<unknown> {
-        return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images);
+        return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images, review);
     }
 
     stopTurn(id: EngagementId): Promise<{ stopped: boolean }> {
@@ -185,6 +287,10 @@ export class MobileControlPlane implements FacetBrowserApi {
 
     getTree(id: EngagementId): Promise<FileEntry[]> {
         return workbenchClient.getTree(this.workbenchTransport(), id);
+    }
+
+    getFile(id: EngagementId, path: string): Promise<string> {
+        return workbenchClient.getFile(this.workbenchTransport(), id, path);
     }
 
     subscribe(id: EngagementId, onEvent: (ev: StreamEvent) => void, onOpen?: () => void): () => void {
@@ -205,5 +311,73 @@ export class MobileControlPlane implements FacetBrowserApi {
 
     pairingStatus(boundaryId: string): Promise<unknown> {
         return workbenchClient.pairingStatus(this.workbenchTransport(), boundaryId);
+    }
+
+    claimMachineInvitation(invitation: {
+        invitationId: string;
+        secret: string;
+        machine: string;
+        endpoint: string;
+    }, device: string, publicKey: string, label: string): Promise<{
+        requestId: string;
+        challenge: string;
+        expiresAt: number;
+    }> {
+        return this.routeJson()("POST", "/mobile/enrollment/claim", {
+            ...invitation,
+            device,
+            publicKey,
+            label,
+        }) as Promise<{ requestId: string; challenge: string; expiresAt: number }>;
+    }
+
+    proveMachineDevice(requestId: string, signature: string): Promise<void> {
+        return this.routeJson()("POST", "/mobile/enrollment/prove", {
+            requestId,
+            signature,
+        }) as Promise<void>;
+    }
+
+    machineEnrollmentStatus(requestId: string, secret: string): Promise<{
+        status: string;
+        grantId: string | null;
+        credential: string | null;
+    }> {
+        return this.routeJson()("POST", "/mobile/enrollment/status", {
+            requestId,
+            secret,
+        }) as Promise<{ status: string; grantId: string | null; credential: string | null }>;
+    }
+
+    machineSessionChallenge(grantId: string, device: string): Promise<{
+        challengeId: string;
+        challenge: string;
+        expiresAt: number;
+    }> {
+        return this.routeJson()("POST", "/mobile/sessions/challenge", {
+            grantId,
+            device,
+        }) as Promise<{ challengeId: string; challenge: string; expiresAt: number }>;
+    }
+
+    openMachineSession(input: {
+        challengeId: string;
+        grantId: string;
+        device: string;
+        credential: string;
+        signature: string;
+    }): Promise<{ session: string; expiresAt: number; machine: string }> {
+        return this.routeJson()("POST", "/mobile/sessions", input) as Promise<{
+            session: string;
+            expiresAt: number;
+            machine: string;
+        }>;
+    }
+
+    revokeMachineController(grantId: string): Promise<void> {
+        return this.routeJson()(
+            "POST",
+            `/mobile/controllers/${encodeURIComponent(grantId)}/revoke`,
+        ) as Promise<void>;
     }
 }

@@ -87,6 +87,7 @@ impl Workbench {
         if !onboarding_enabled() {
             return;
         }
+        let default_assignee = self.authority().as_str().to_owned();
         let tracker = match self.account_tracker() {
             Ok(tracker) => tracker,
             Err(err) => {
@@ -105,7 +106,7 @@ impl Workbench {
         let labels = [ONBOARDING_LABEL.to_owned()];
         for step in ONBOARDING_STEPS {
             let metadata = serde_json::json!({ "step": step.step });
-            if let Err(err) = tracker.file_item(
+            match tracker.file_item(
                 ONBOARDING_QUEUE,
                 step.title,
                 step.body,
@@ -113,7 +114,14 @@ impl Workbench {
                 &metadata,
                 Some(ONBOARDING_FILER),
             ) {
-                tracing::warn!(step = step.step, error = %err, "onboarding: failed to file step");
+                Ok(item) => {
+                    if let Err(err) = tracker.assign_item(&item.id, Some(&default_assignee)) {
+                        tracing::warn!(step = step.step, error = %err, "onboarding: failed to assign step");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(step = step.step, error = %err, "onboarding: failed to file step");
+                }
             }
         }
     }

@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -11,12 +11,13 @@ use gaugewright_core::merge::MergeState;
 use gaugewright_core::resource_export::{ExportCommand, ExportState};
 use gaugewright_core::review::{ReviewCommand, ReviewState};
 use gaugewright_core::run::{RunCommand, RunState};
-use gaugewright_store::AdmitError;
+use gaugewright_store::{AdmitError, MaterializedAdmission};
 use serde::Deserialize;
 
 use crate::stream::ServerEvent;
 use crate::{
-    err_response, library, library_routes, net_http, LockUnpoisoned, SharedWorkbench, Workbench,
+    command_idempotency::caller_idempotency_key, err_response, library, library_routes,
+    LockUnpoisoned, SharedWorkbench, Workbench,
 };
 
 impl Workbench {
@@ -43,9 +44,11 @@ impl Workbench {
     pub(crate) fn admit_instance_lifecycle(
         &mut self,
         id: &str,
+        idempotency_key: &str,
         command: InstanceCommand,
-    ) -> Result<InstanceState, AdmitError> {
-        self.store_mut().admit::<InstanceState>(id, command)
+    ) -> Result<MaterializedAdmission<InstanceState>, AdmitError> {
+        self.store_mut()
+            .admit_materialized::<InstanceState>(id, idempotency_key, command)
     }
 
     pub(crate) fn run_state(&self, scope: &str) -> Result<RunState, AdmitError> {
@@ -55,17 +58,22 @@ impl Workbench {
     pub(crate) fn admit_run_command(
         &mut self,
         scope: &str,
+        idempotency_key: &str,
         command: RunCommand,
-    ) -> Result<RunState, AdmitError> {
-        let state = self.store_mut().admit::<RunState>(scope, command)?;
-        self.publish(
-            scope,
-            ServerEvent::Admitted {
-                kind: "run".into(),
-                text: format!("run → {:?}", state.phase),
-            },
-        );
-        Ok(state)
+    ) -> Result<MaterializedAdmission<RunState>, AdmitError> {
+        let admission =
+            self.store_mut()
+                .admit_materialized::<RunState>(scope, idempotency_key, command)?;
+        if !admission.replayed {
+            self.publish(
+                scope,
+                ServerEvent::Admitted {
+                    kind: "run".into(),
+                    text: format!("run → {:?}", admission.state.phase),
+                },
+            );
+        }
+        Ok(admission)
     }
 
     pub(crate) fn review_state(&self, scope: &str) -> Result<ReviewState, AdmitError> {
@@ -75,17 +83,22 @@ impl Workbench {
     pub(crate) fn admit_review_command(
         &mut self,
         scope: &str,
+        idempotency_key: &str,
         command: ReviewCommand,
-    ) -> Result<ReviewState, AdmitError> {
-        let state = self.store_mut().admit::<ReviewState>(scope, command)?;
-        self.publish(
-            scope,
-            ServerEvent::Admitted {
-                kind: "review".into(),
-                text: format!("review → {:?}", state.phase),
-            },
-        );
-        Ok(state)
+    ) -> Result<MaterializedAdmission<ReviewState>, AdmitError> {
+        let admission =
+            self.store_mut()
+                .admit_materialized::<ReviewState>(scope, idempotency_key, command)?;
+        if !admission.replayed {
+            self.publish(
+                scope,
+                ServerEvent::Admitted {
+                    kind: "review".into(),
+                    text: format!("review → {:?}", admission.state.phase),
+                },
+            );
+        }
+        Ok(admission)
     }
 
     pub(crate) fn export_state(&self, scope: &str) -> Result<ExportState, AdmitError> {
@@ -95,17 +108,22 @@ impl Workbench {
     pub(crate) fn admit_export_command(
         &mut self,
         scope: &str,
+        idempotency_key: &str,
         command: ExportCommand,
-    ) -> Result<ExportState, AdmitError> {
-        let state = self.store_mut().admit::<ExportState>(scope, command)?;
-        self.publish(
-            scope,
-            ServerEvent::Admitted {
-                kind: "export".into(),
-                text: format!("export → {:?}", state.phase),
-            },
-        );
-        Ok(state)
+    ) -> Result<MaterializedAdmission<ExportState>, AdmitError> {
+        let admission =
+            self.store_mut()
+                .admit_materialized::<ExportState>(scope, idempotency_key, command)?;
+        if !admission.replayed {
+            self.publish(
+                scope,
+                ServerEvent::Admitted {
+                    kind: "export".into(),
+                    text: format!("export → {:?}", admission.state.phase),
+                },
+            );
+        }
+        Ok(admission)
     }
 
     pub(crate) fn fork_forest_value(&self) -> serde_json::Value {
@@ -154,18 +172,6 @@ pub(crate) async fn get_audit(
     }
 }
 
-/// The boundary-lifecycle state for an engagement (M1).
-pub(crate) async fn get_boundary(
-    State(wb): State<SharedWorkbench>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let wb = wb.lock_unpoisoned();
-    match wb.boundary_projection_value(&id) {
-        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-        Err(e) => err_response(e),
-    }
-}
-
 /// The instance/deployment lifecycle state (M1, DL-1): fold the instance scope.
 pub(crate) async fn get_instance(
     State(wb): State<SharedWorkbench>,
@@ -186,14 +192,32 @@ pub(crate) async fn get_instance(
 pub(crate) async fn post_instance_command(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(command): Json<InstanceCommand>,
 ) -> impl IntoResponse {
+    if let InstanceCommand::SetLocalConfig { config, .. } = &command {
+        if !config.trim().is_empty() {
+            if let Err(error) =
+                gaugewright_boundary::AgentConfig::runtime_settings_from_json(config)
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid placement config: {error}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let key = match caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
     let mut wb = wb.lock_unpoisoned();
     if !wb.has_instance_record(&id) {
         return (StatusCode::NOT_FOUND, "no such instance").into_response();
     }
-    match wb.admit_instance_lifecycle(&id, command) {
-        Ok(state) => (StatusCode::OK, Json(state)).into_response(),
+    match wb.admit_instance_lifecycle(&id, &key, command) {
+        Ok(admission) => (StatusCode::OK, Json(admission.state)).into_response(),
         Err(AdmitError::Rejected(r)) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "rejected": r.reason })),
@@ -219,77 +243,16 @@ pub(crate) async fn get_run(
 pub(crate) async fn post_run_command(
     State(wb): State<SharedWorkbench>,
     Path(scope): Path<String>,
+    headers: HeaderMap,
     Json(command): Json<RunCommand>,
 ) -> impl IntoResponse {
+    let key = match caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
     let mut wb = wb.lock_unpoisoned();
-    match wb.admit_run_command(&scope, command) {
-        Ok(state) => (StatusCode::OK, Json(state)).into_response(),
-        Err(AdmitError::Rejected(r)) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "rejected": r.reason })),
-        )
-            .into_response(),
-        Err(e) => err_response(e),
-    }
-}
-
-// Review shelf: the protection lifecycles, surfaced over the same admission
-// spine as `run`. These drive the verified `review` / `resource_export` reducers
-// (conjunctive consent -> clear -> release/export).
-
-pub(crate) async fn get_review(
-    State(wb): State<SharedWorkbench>,
-    Path(scope): Path<String>,
-) -> impl IntoResponse {
-    let wb = wb.lock_unpoisoned();
-    match wb.review_state(&scope) {
-        Ok(state) => (StatusCode::OK, Json(state)).into_response(),
-        Err(e) => err_response(e),
-    }
-}
-
-pub(crate) async fn post_review_command(
-    State(wb): State<SharedWorkbench>,
-    Path(scope): Path<String>,
-    Json(command): Json<ReviewCommand>,
-) -> impl IntoResponse {
-    let mut wb = wb.lock_unpoisoned();
-    match wb.admit_review_command(&scope, command) {
-        Ok(state) => (StatusCode::OK, Json(state)).into_response(),
-        Err(AdmitError::Rejected(r)) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "rejected": r.reason })),
-        )
-            .into_response(),
-        Err(e) => err_response(e),
-    }
-}
-
-pub(crate) async fn get_export(
-    State(wb): State<SharedWorkbench>,
-    Path(scope): Path<String>,
-) -> impl IntoResponse {
-    let wb = wb.lock_unpoisoned();
-    match wb.export_state(&scope) {
-        Ok(state) => (StatusCode::OK, Json(state)).into_response(),
-        Err(e) => err_response(e),
-    }
-}
-
-pub(crate) async fn post_export_command(
-    State(wb): State<SharedWorkbench>,
-    Path(scope): Path<String>,
-    headers: axum::http::HeaderMap,
-    Json(command): Json<ExportCommand>,
-) -> impl IntoResponse {
-    let mut wb = wb.lock_unpoisoned();
-    // RBAC export gate (RBAC-5/RBAC-6): in enterprise mode the actor's role must be
-    // permitted to export by the org policy (viewer => no export). Ungated single-user.
-    if let Err((code, msg)) = wb.authorize_export(net_http::bearer(&headers)) {
-        return (code, msg).into_response();
-    }
-    match wb.admit_export_command(&scope, command) {
-        Ok(state) => (StatusCode::OK, Json(state)).into_response(),
+    match wb.admit_run_command(&scope, &key, command) {
+        Ok(admission) => (StatusCode::OK, Json(admission.state)).into_response(),
         Err(AdmitError::Rejected(r)) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "rejected": r.reason })),
@@ -319,6 +282,58 @@ impl FreshnessQuery {
             Some(other) => Err(format!("unknown freshness marker: {other}")),
         }
     }
+}
+
+/// `GET /projections/library/workspace/:record/:id`: resolve the reference-only
+/// workspace event into a freshness-carried delta projection. This preserves the
+/// ADR 0037 protection boundary while avoiding a full workspace transfer on every
+/// mobile update.
+pub(crate) async fn get_workspace_delta(
+    State(wb): State<SharedWorkbench>,
+    Path((record, id)): Path<(String, String)>,
+    Query(q): Query<FreshnessQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let marker = match q.marker() {
+        Ok(marker) => marker,
+        Err(reason) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": reason })),
+            )
+                .into_response()
+        }
+    };
+    let wb = wb.lock_unpoisoned();
+    let vis = wb.project_visibility(crate::net_http::bearer(&headers));
+    let workspace =
+        library_routes::scope_workspace_value(&wb, library_routes::workspace_value(&wb), &vis);
+    let Some(value) = library_routes::workspace_delta_value(&workspace, &record, &id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("unknown workspace record: {record}") })),
+        )
+            .into_response();
+    };
+    let generated_at = wb.lifecycle_projection_generated_at(library::LIBRARY_SCOPE);
+    let freshness = if marker.is_current() {
+        Freshness::live(generated_at)
+    } else {
+        Freshness::stale(
+            marker,
+            generated_at,
+            Some(format!("refresh {record} {id} for workspace")),
+        )
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "value": value,
+            "freshness": freshness,
+            "client_request_id": serde_json::Value::Null,
+        })),
+    )
+        .into_response()
 }
 
 /// The chat fork forest (`UX-8`): live chats nested by `forked_from`, a derived

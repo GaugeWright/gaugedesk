@@ -81,6 +81,12 @@ id_newtype!(
     AuthorityId
 );
 id_newtype!(
+    /// The one authoritative Home that owns and admits a project's GaugeDesk
+    /// log/content (`ADR 0084`). A Home is a durable service identity, never a
+    /// browser session, process, VM, or runtime object id.
+    HomeId
+);
+id_newtype!(
     /// A single-writer ordered event stream owned by one authority (ADR 0005).
     ScopeId
 );
@@ -151,10 +157,12 @@ mod tests {
     #[test]
     fn authority_pubkey_keyid_serde_round_trip() {
         let authority = AuthorityId::new("did:gaugewright:acme");
+        let home = HomeId::new("home:acme");
         let pubkey = PublicKey::new("04a1b2c3d4e5f6");
         let key_id = KeyId::new("root");
 
         assert_eq!(cbor_round_trip(&authority), authority);
+        assert_eq!(cbor_round_trip(&home), home);
         assert_eq!(cbor_round_trip(&pubkey), pubkey);
         assert_eq!(cbor_round_trip(&key_id), key_id);
     }

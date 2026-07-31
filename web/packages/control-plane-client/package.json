@@ -13,14 +13,19 @@
     "./auth-session": "./src/auth-session.ts",
     "./bridge": "./src/bridge.ts",
     "./browser-route-json": "./src/browser-route-json.ts",
+    "./client-build": "./src/client-build.ts",
     "./control-plane-account": "./src/control-plane-account.ts",
+    "./cloud-home": "./src/cloud-home.ts",
+    "./background": "./src/background.ts",
     "./control-plane-domain": "./src/control-plane-domain.ts",
-    "./control-plane-embed": "./src/control-plane-embed.ts",
     "./control-plane-federation": "./src/control-plane-federation.ts",
     "./control-plane-transport": "./src/control-plane-transport.ts",
     "./control-plane-workbench": "./src/control-plane-workbench.ts",
+    "./home-routing": "./src/home-routing.ts",
+    "./home-invitation": "./src/home-invitation.ts",
     "./project-home": "./src/project-home.ts",
-    "./projection-carriage": "./src/projection-carriage.ts"
+    "./projection-carriage": "./src/projection-carriage.ts",
+    "./workspace-delta": "./src/workspace-delta.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p ../../tsconfig.open-client.json"

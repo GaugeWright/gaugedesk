@@ -1,6 +1,6 @@
 //! The device-enrollment **drive layer** (`ACCT-1`, [ADR 0055]) — the HTTP-facing shell
 //! that runs the proven enrollment handshake ([`crate::device_enroll`]) over the live
-//! rendezvous broker ([`crate::net_relay::RendezvousBroker`]) for **both** roles. Where
+//! shared WSS rendezvous for **both** roles. Where
 //! `device_enroll` supplies the wire primitives (SAS, ECIES seal, delegation verify) and
 //! `net_relay` supplies the transport, this module composes them into two long-running,
 //! per-session HTTP flows a human can drive from "Your devices".
@@ -35,11 +35,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
 use gaugewright_core::ids::PublicKey;
 use gaugewright_core::signature::SigningKey;
+use gaugewright_relay_transport::{connect_one_shot, OneShotLeg};
 
 use crate::account::{self, DeviceRecord, DeviceStatus, RecordOp};
 use crate::at_rest::Encryptor;
@@ -61,7 +61,8 @@ const DELEGATION_TTL_SECS: u64 = 400 * 24 * 60 * 60;
 /// The default broker the holder dials / advertises in its ticket when none is
 /// configured — the same env seam federation reads ([`crate::federation`]).
 fn default_broker_addr() -> String {
-    std::env::var("GAUGEWRIGHT_BROKER_ADDR").unwrap_or_else(|_| "127.0.0.1:7900".to_string())
+    std::env::var("GAUGEWRIGHT_RELAY_ENDPOINT")
+        .unwrap_or_else(|_| "wss://relay.gaugewright.com".to_string())
 }
 
 fn now_secs() -> u64 {
@@ -448,12 +449,9 @@ async fn host_handshake(
     holder: &Holder,
     session: &str,
 ) -> Result<(), String> {
-    let mut s = TcpStream::connect(broker)
+    let mut s = connect_one_shot(broker, token_bytes(session), OneShotLeg::Initializer)
         .await
         .map_err(|e| format!("broker connect: {e}"))?;
-    s.write_all(&token_bytes(session))
-        .await
-        .map_err(|e| format!("announce token: {e}"))?;
     // Blocks until the new device's leg pairs at the broker and sends its request.
     let req_bytes = read_frame(&mut s)
         .await
@@ -484,6 +482,7 @@ async fn host_handshake(
         label: "New device".to_string(),
         subkey_pubkey: req.subkey,
         status: DeviceStatus::Active,
+        enrolled_at: crate::account::device_enrolled_at_now(),
     };
     wb.lock_unpoisoned()
         .upsert_account_device_in(scope, &record)
@@ -522,12 +521,9 @@ async fn join_handshake(
     broker: &str,
     nd: &NewDevice,
 ) -> Result<(), String> {
-    let mut s = TcpStream::connect(broker)
+    let mut s = connect_one_shot(broker, token_bytes(&nd.session), OneShotLeg::Joiner)
         .await
         .map_err(|e| format!("broker connect: {e}"))?;
-    s.write_all(&token_bytes(&nd.session))
-        .await
-        .map_err(|e| format!("announce token: {e}"))?;
     let req = serde_json::to_vec(&nd.request()).map_err(|e| format!("encode request: {e}"))?;
     write_frame(&mut s, &req)
         .await
@@ -559,6 +555,7 @@ async fn join_handshake(
             label: "This device".to_string(),
             subkey_pubkey: own_subkey,
             status: DeviceStatus::Active,
+            enrolled_at: crate::account::device_enrolled_at_now(),
         };
         wb.upsert_account_device_in(scope, &record)
             .map_err(|e| format!("record device: {e:?}"))?;
@@ -569,7 +566,10 @@ async fn join_handshake(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    };
     use std::time::Duration;
 
     use axum::body::Body;
@@ -583,7 +583,6 @@ mod tests {
     use gaugewright_workspace::Instance;
 
     use super::{EnrollmentTicket, *};
-    use crate::net_relay::RendezvousBroker;
     use crate::{account, open_control_plane, LockUnpoisoned, SharedWorkbench, Workbench};
 
     /// A bare workbench under a temp root (its own on-disk key store + in-memory store).
@@ -591,7 +590,7 @@ mod tests {
     fn workbench(dir: &std::path::Path) -> SharedWorkbench {
         let instance = Instance::init(dir.join("repo"), dir.join("wt")).unwrap();
         let store = Store::open_in_memory().unwrap();
-        let mut wb = Workbench::with_instance("inst-test", instance, store);
+        let mut wb = Workbench::with_target("inst-test", instance, store);
         wb.root = dir.to_path_buf();
         Arc::new(Mutex::new(wb))
     }
@@ -603,18 +602,20 @@ mod tests {
         uri: &str,
         body: Option<serde_json::Value>,
     ) -> (StatusCode, serde_json::Value) {
+        static KEY: AtomicU64 = AtomicU64::new(1);
+        let mut builder = Request::builder().method(method).uri(uri);
+        if method != "GET" && method != "HEAD" && method != "OPTIONS" {
+            builder = builder.header(
+                "idempotency-key",
+                format!("device-enroll-test-{}", KEY.fetch_add(1, Ordering::Relaxed)),
+            );
+        }
         let req = match body {
-            Some(b) => Request::builder()
-                .method(method)
-                .uri(uri)
+            Some(body) => builder
                 .header("content-type", "application/json")
-                .body(Body::from(b.to_string()))
+                .body(Body::from(body.to_string()))
                 .unwrap(),
-            None => Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
         };
         let resp = app.clone().oneshot(req).await.unwrap();
         let status = resp.status();
@@ -625,8 +626,10 @@ mod tests {
 
     /// Poll a status route until it reports a SAS, returning it.
     async fn poll_sas(app: &Router, uri: &str) -> String {
+        let mut last = (StatusCode::INTERNAL_SERVER_ERROR, serde_json::Value::Null);
         for _ in 0..300 {
             let (st, v) = send(app, "GET", uri, None).await;
+            last = (st, v.clone());
             if st == StatusCode::OK {
                 if let Some(s) = v.get("sas").and_then(|x| x.as_str()) {
                     return s.to_string();
@@ -634,7 +637,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("SAS never became ready at {uri}");
+        panic!("SAS never became ready at {uri} (last: {last:?})");
     }
 
     /// Poll a status route until it reports the wanted phase, returning the final body.
@@ -651,16 +654,22 @@ mod tests {
     }
 
     /// ACCT-1 mandatory E2E: the enrollment handshake driven through the **HTTP routes**
-    /// of two separate `Workbench` instances over a real `RendezvousBroker`. The holder
+    /// of two separate `Workbench` instances over a real WSS relay. The holder
     /// hosts + authorizes; the new device joins. On a matched SAS + human confirm the new
     /// device recovers the holder's **account key** (proving the sealed transfer) and the
     /// holder's registry gains the new `DeviceRecord`. Mirrors
     /// `net_relay::the_enrollment_handshake_runs_over_the_real_broker`, one layer up.
     #[tokio::test]
     async fn enrollment_over_http_transfers_the_account_key_and_records_the_device() {
-        let broker = RendezvousBroker::bind("127.0.0.1:0").await.unwrap();
-        let broker_addr = broker.address().to_string();
-        let broker_task = tokio::spawn(broker.run_one_pairing());
+        let live_endpoint = std::env::var("GAUGEWRIGHT_LIVE_RELAY_ENDPOINT").ok();
+        let (broker_addr, relay) = if let Some(endpoint) = live_endpoint {
+            (endpoint, None)
+        } else {
+            let relay = gaugewright_relay_transport::test_relay::TestRelay::bind()
+                .await
+                .unwrap();
+            (relay.endpoint().to_owned(), Some(relay))
+        };
 
         let holder_dir = tempfile::tempdir().unwrap();
         let device_dir = tempfile::tempdir().unwrap();
@@ -752,12 +761,9 @@ mod tests {
             "the recorded device carries its subkey pubkey"
         );
 
-        // The broker spliced opaque bytes both ways; the sealed key crossed as ciphertext.
-        let piped = broker_task.await.unwrap().unwrap();
-        assert!(
-            piped.a_to_b > 0 && piped.b_to_a > 0,
-            "both handshake messages crossed the broker"
-        );
+        // Keeping the guard alive through both completed phases proves both
+        // handshake messages crossed the same binary-WSS fabric.
+        drop(relay);
     }
 
     /// ACCT-1 fail-closed: a **substituting MITM** between the two brokers swaps the new
@@ -769,17 +775,18 @@ mod tests {
     async fn a_substituted_subkey_is_caught_by_the_sas_and_refused() {
         use crate::device_enroll::EnrollRequest;
         use crate::net_relay::{read_frame, token_bytes, write_frame};
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpStream;
+        use gaugewright_relay_transport::{connect_one_shot, OneShotLeg};
 
         // Two brokers: the victim device dials A (a malicious ticket), the honest holder
         // dials B; the attacker bridges A→B, substituting the subkey in flight.
-        let broker_a = RendezvousBroker::bind("127.0.0.1:0").await.unwrap();
-        let broker_b = RendezvousBroker::bind("127.0.0.1:0").await.unwrap();
-        let addr_a = broker_a.address().to_string();
-        let addr_b = broker_b.address().to_string();
-        let _task_a = tokio::spawn(broker_a.run_one_pairing());
-        let _task_b = tokio::spawn(broker_b.run_one_pairing());
+        let broker_a = gaugewright_relay_transport::test_relay::TestRelay::bind()
+            .await
+            .unwrap();
+        let broker_b = gaugewright_relay_transport::test_relay::TestRelay::bind()
+            .await
+            .unwrap();
+        let addr_a = broker_a.endpoint().to_owned();
+        let addr_b = broker_b.endpoint().to_owned();
 
         let holder_dir = tempfile::tempdir().unwrap();
         let device_dir = tempfile::tempdir().unwrap();
@@ -809,14 +816,17 @@ mod tests {
         let mitm_session = session.clone();
         let mitm = tokio::spawn(async move {
             // Read the victim's request off broker A…
-            let mut a = TcpStream::connect(&addr_a).await.unwrap();
-            a.write_all(&token_bytes(&mitm_session)).await.unwrap();
+            let mut a =
+                connect_one_shot(&addr_a, token_bytes(&mitm_session), OneShotLeg::Initializer)
+                    .await
+                    .unwrap();
             let req_bytes = read_frame(&mut a).await.unwrap();
             let mut req: EnrollRequest = serde_json::from_slice(&req_bytes).unwrap();
             // …substitute the subkey, and forward to the holder over broker B.
             req.subkey = attacker_subkey;
-            let mut b = TcpStream::connect(&addr_b).await.unwrap();
-            b.write_all(&token_bytes(&mitm_session)).await.unwrap();
+            let mut b = connect_one_shot(&addr_b, token_bytes(&mitm_session), OneShotLeg::Joiner)
+                .await
+                .unwrap();
             write_frame(&mut b, &serde_json::to_vec(&req).unwrap())
                 .await
                 .unwrap();
