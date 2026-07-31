@@ -137,17 +137,39 @@ jobs:
           npm --prefix ee/web ci
           npm --prefix ee/web run build
 
+      - name: fetch Apple publication secrets through OIDC
+        if: matrix.os-label == 'macos' && vars.INFISICAL_PRODUCTION_IDENTITY_ID != ''
+        uses: Infisical/secrets-action@v1.0.9
+        with:
+          method: oidc
+          identity-id: ${{ vars.INFISICAL_PRODUCTION_IDENTITY_ID }}
+          project-slug: ${{ vars.INFISICAL_PRODUCTION_PROJECT_SLUG }}
+          env-slug: ${{ vars.INFISICAL_PRODUCTION_ENV_SLUG || 'prod' }}
+          secret-path: /publication/mobile
+
+      - name: stage repository Apple secrets
+        if: matrix.os-label == 'macos' && vars.INFISICAL_PRODUCTION_IDENTITY_ID == ''
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_SOURCE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD_SOURCE: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_PRIVATE_KEY_SOURCE: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'APPLE_CERTIFICATE=%s\n' "$APPLE_CERTIFICATE_SOURCE"
+            printf 'APPLE_CERTIFICATE_PASSWORD=%s\n' "$APPLE_CERTIFICATE_PASSWORD_SOURCE"
+            printf 'APPLE_API_PRIVATE_KEY=%s\n' "$APPLE_API_PRIVATE_KEY_SOURCE"
+          } >> "$GITHUB_ENV"
+
       - name: verify Apple signing inputs
         if: matrix.os-label == 'macos'
         shell: bash
         env:
           APPLE_DEVELOPMENT_TEAM: ${{ vars.APPLE_DEVELOPMENT_TEAM }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
-          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           test -n "$APPLE_DEVELOPMENT_TEAM"
@@ -163,7 +185,6 @@ jobs:
         shell: bash
         env:
           APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
-          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
@@ -265,10 +286,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # macOS Developer ID signing + notarization. The certificate and .p8
-          # private key remain production-environment secrets; only the p8 path
-          # exists on the ephemeral runner.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # private key are staged through the protected publication boundary;
+          # only the p8 path exists on the ephemeral runner.
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
           APPLE_DEVELOPMENT_TEAM: ${{ vars.APPLE_DEVELOPMENT_TEAM }}
           APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
