@@ -26,10 +26,10 @@ make_deb() {
     'Conflicts: gauge-bench, gaugebench' \
     'Replaces: gauge-bench, gaugebench' \
     'Description: GaugeDesk test package' >"$apply_control"
-  printf '#!/bin/sh\nexit 0\n' >"$package_root/usr/bin/gauge-desk"
-  chmod 755 "$package_root/usr/bin/gauge-desk"
+  printf '#!/bin/sh\nexit 0\n' >"$package_root/usr/bin/gaugedesk"
+  chmod 755 "$package_root/usr/bin/gaugedesk"
   printf '%s\n' \
-    '[Desktop Entry]' 'Name=GaugeDesk' 'Exec=gauge-desk' \
+    '[Desktop Entry]' 'Name=GaugeDesk' 'Exec=gaugedesk' \
     'Type=Application' >"$package_root/usr/share/applications/gauge-desk.desktop"
   printf 'test changelog\n' \
     | gzip -9 -n >"$package_root/usr/share/doc/gauge-desk/changelog.gz"

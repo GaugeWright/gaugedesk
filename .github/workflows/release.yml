@@ -293,7 +293,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $executables = @(Get-ChildItem `
-            'src-tauri/target/release/gaugedesk-desktop.exe')
+            'src-tauri/target/release/gaugedesk.exe')
           $installers = @(Get-ChildItem `
             'src-tauri/target/release/bundle/msi/*.msi')
           if ($executables.Count -ne 1) {

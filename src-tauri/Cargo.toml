@@ -5,11 +5,16 @@
 name = "gaugedesk-desktop"
 version = "0.4.5"
 edition = "2021"
+autobins = false
 authors = ["GaugeWright <support@gaugewright.com>"]
 license = "Apache-2.0"
 description = "GaugeDesk desktop workbench (Tauri v2 shell + co-resident control plane)."
 homepage = "https://gaugewright.com/gaugedesk"
 repository = "https://github.com/GaugeWright/gaugedesk"
+
+[[bin]]
+name = "gaugedesk"
+path = "src/main.rs"
 
 [workspace]
 

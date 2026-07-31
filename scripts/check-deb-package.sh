@@ -42,8 +42,8 @@ for legacy in gauge-bench gaugebench; do
 done
 
 contents="$(dpkg-deb --contents "$DEB")"
-grep -Eq 'usr/(bin|lib)/' <<<"$contents" || {
-  echo "package contains no executable/runtime path" >&2
+grep -Eq 'usr/bin/gaugedesk$' <<<"$contents" || {
+  echo "package must install the gaugedesk command at /usr/bin/gaugedesk" >&2
   exit 1
 }
 grep -Eq 'usr/share/applications/[^/]+\.desktop$' <<<"$contents" || {
