@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gaugewright_app::agent_release::{
@@ -35,6 +35,13 @@ fn usage() -> io::Error {
          gaugedesk-agent-release credential-list <workbench-root> <edge-origin>\n  \
          gaugedesk-agent-release credential-provision <workbench-root> <request.json>\n  \
          gaugedesk-agent-release credential-revoke <workbench-root> <request.json>\n  \
+         gaugedesk-agent-release credential-export <workbench-root> <edge-origin> <output.json>\n  \
+         gaugedesk-agent-release credential-import <workbench-root> <edge-origin> <export.json> \
+           [--replace]\n  \
+         gaugedesk-agent-release deployment-export <workbench-root> <edge-origin> \
+           <deployment-id> <output.json>\n  \
+         gaugedesk-agent-release deployment-import <workbench-root> <edge-origin> \
+           <deployment-id> <export.json> [--replace]\n  \
          gaugedesk-agent-release collection-recipient <workbench-root> <recipient-id>\n  \
          gaugedesk-agent-release collections-drain <workbench-root> <request.json>\n  \
          gaugedesk-agent-release collections-acknowledge <workbench-root> <request.json>",
@@ -234,6 +241,94 @@ fn main() -> io::Result<()> {
                     .revoke_public_credential(request)?,
             );
         }
+        Some("credential-export") => {
+            let root = path_arg(args.next())?;
+            let edge = string_arg(args.next())?;
+            let output = path_arg(args.next())?;
+            no_more(args)?;
+            let workbench = open_workbench(&root)?;
+            let response = send(
+                &workbench.lock_unpoisoned(),
+                &edge,
+                "GET",
+                "/v1/public-credentials/export",
+                &[],
+                "application/octet-stream",
+            )?;
+            write_export(
+                &output,
+                &response,
+                "gaugewright.credential-registry-export",
+                None,
+            )?;
+            println!("{}", output.display());
+        }
+        Some("credential-import") => {
+            let root = path_arg(args.next())?;
+            let edge = string_arg(args.next())?;
+            let input = path_arg(args.next())?;
+            let replace = replace_arg(args.next())?;
+            no_more(args)?;
+            let export = read_export(&input, "gaugewright.credential-registry-export", None)?;
+            let body = import_body(export, replace)?;
+            let workbench = open_workbench(&root)?;
+            println!(
+                "{}",
+                send(
+                    &workbench.lock_unpoisoned(),
+                    &edge,
+                    "POST",
+                    "/v1/public-credentials/import",
+                    &body,
+                    "application/json",
+                )?,
+            );
+        }
+        Some("deployment-export") => {
+            let root = path_arg(args.next())?;
+            let edge = string_arg(args.next())?;
+            let deployment = deployment_arg(args.next())?;
+            let output = path_arg(args.next())?;
+            no_more(args)?;
+            let workbench = open_workbench(&root)?;
+            let response = send(
+                &workbench.lock_unpoisoned(),
+                &edge,
+                "GET",
+                &format!("/v1/deployments/{deployment}/export"),
+                &[],
+                "application/octet-stream",
+            )?;
+            write_export(
+                &output,
+                &response,
+                "gaugewright.deployment-export",
+                Some(&deployment),
+            )?;
+            println!("{}", output.display());
+        }
+        Some("deployment-import") => {
+            let root = path_arg(args.next())?;
+            let edge = string_arg(args.next())?;
+            let deployment = deployment_arg(args.next())?;
+            let input = path_arg(args.next())?;
+            let replace = replace_arg(args.next())?;
+            no_more(args)?;
+            let export = read_export(&input, "gaugewright.deployment-export", Some(&deployment))?;
+            let body = import_body(export, replace)?;
+            let workbench = open_workbench(&root)?;
+            println!(
+                "{}",
+                send(
+                    &workbench.lock_unpoisoned(),
+                    &edge,
+                    "POST",
+                    &format!("/v1/deployments/{deployment}/import"),
+                    &body,
+                    "application/json",
+                )?,
+            );
+        }
         Some("collection-recipient") => {
             let root = path_arg(args.next())?;
             let recipient_id = string_arg(args.next())?;
@@ -378,6 +473,83 @@ fn send(
     }
 }
 
+fn write_export(
+    output: &Path,
+    response: &str,
+    expected_kind: &str,
+    expected_deployment: Option<&str>,
+) -> io::Result<()> {
+    let export = validated_export(response.as_bytes(), expected_kind, expected_deployment)?;
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temporary, &export).map_err(invalid)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(output)
+        .map_err(|error| io::Error::new(error.error.kind(), error.to_string()))?;
+    Ok(())
+}
+
+fn read_export(
+    input: &Path,
+    expected_kind: &str,
+    expected_deployment: Option<&str>,
+) -> io::Result<serde_json::Value> {
+    validated_export(&fs::read(input)?, expected_kind, expected_deployment)
+}
+
+fn validated_export(
+    bytes: &[u8],
+    expected_kind: &str,
+    expected_deployment: Option<&str>,
+) -> io::Result<serde_json::Value> {
+    let export: serde_json::Value = serde_json::from_slice(bytes).map_err(invalid)?;
+    if export.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(invalid("recovery export must use schema version 1"));
+    }
+    if export.get("kind").and_then(serde_json::Value::as_str) != Some(expected_kind) {
+        return Err(invalid(format!(
+            "recovery export kind must be {expected_kind}"
+        )));
+    }
+    if !export
+        .get("entries")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(invalid("recovery export entries must be an object"));
+    }
+    if let Some(deployment) = expected_deployment {
+        if export
+            .get("deployment_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(deployment)
+        {
+            return Err(invalid("recovery export belongs to another deployment"));
+        }
+    }
+    Ok(export)
+}
+
+fn import_body(export: serde_json::Value, replace: bool) -> io::Result<Vec<u8>> {
+    let mut body = serde_json::Map::from_iter([("export".to_owned(), export)]);
+    if replace {
+        body.insert("replace".to_owned(), serde_json::Value::Bool(true));
+    }
+    serde_json::to_vec(&body).map_err(invalid)
+}
+
+fn replace_arg(value: Option<String>) -> io::Result<bool> {
+    match value.as_deref() {
+        None => Ok(false),
+        Some("--replace") => Ok(true),
+        Some(_) => Err(usage()),
+    }
+}
+
 fn normalized_edge(value: &str) -> io::Result<String> {
     let edge = value.trim().trim_end_matches('/');
     if (!edge.starts_with("https://")
@@ -437,4 +609,82 @@ fn default_model() -> String {
 
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deployment_export(deployment: &str) -> String {
+        serde_json::json!({
+            "version": 1,
+            "kind": "gaugewright.deployment-export",
+            "deployment_id": deployment,
+            "entries": {"record": {"revision": 1}},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn recovery_export_validation_is_kind_version_and_deployment_bound() {
+        let bytes = deployment_export("theory-a");
+        assert!(validated_export(
+            bytes.as_bytes(),
+            "gaugewright.deployment-export",
+            Some("theory-a")
+        )
+        .is_ok());
+        for (kind, deployment) in [
+            ("gaugewright.credential-registry-export", Some("theory-a")),
+            ("gaugewright.deployment-export", Some("another")),
+        ] {
+            assert!(validated_export(bytes.as_bytes(), kind, deployment).is_err());
+        }
+        assert!(validated_export(
+            br#"{"version":2,"kind":"gaugewright.deployment-export","deployment_id":"theory-a","entries":{}}"#,
+            "gaugewright.deployment-export",
+            Some("theory-a")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn export_file_is_atomic_and_never_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("deployment.json");
+        write_export(
+            &output,
+            &deployment_export("theory-a"),
+            "gaugewright.deployment-export",
+            Some("theory-a"),
+        )
+        .unwrap();
+        assert!(read_export(&output, "gaugewright.deployment-export", Some("theory-a")).is_ok());
+        assert!(write_export(
+            &output,
+            &deployment_export("theory-a"),
+            "gaugewright.deployment-export",
+            Some("theory-a"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn replacement_is_only_sent_when_explicit() {
+        let export = validated_export(
+            deployment_export("theory-a").as_bytes(),
+            "gaugewright.deployment-export",
+            Some("theory-a"),
+        )
+        .unwrap();
+        let ordinary: serde_json::Value =
+            serde_json::from_slice(&import_body(export.clone(), false).unwrap()).unwrap();
+        assert!(ordinary.get("replace").is_none());
+        let replacement: serde_json::Value =
+            serde_json::from_slice(&import_body(export, true).unwrap()).unwrap();
+        assert_eq!(
+            replacement.get("replace"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
 }
