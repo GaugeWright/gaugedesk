@@ -16,6 +16,7 @@ use gaugewright_core::agent_release::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use whipplescript_store::skill_frontmatter::parse_skill_frontmatter;
 
 use crate::app_support::LockUnpoisoned;
 use crate::key_store::FileKeyStore;
@@ -28,6 +29,65 @@ pub const DIRECT_PROVIDER_STREAM: &str = "direct_provider_stream";
 pub const HIBERNATABLE_WEBSOCKET: &str = "hibernatable_websocket";
 pub const PUBLISHER_PROTOCOL: &str = "gaugewright.publisher.v1";
 const PUBLIC_PUBLISHER_KEY_SUFFIX: &str = "::public-publisher";
+
+fn discipline_media_type(path: &str) -> &'static str {
+    if path.ends_with(".json") {
+        "application/json"
+    } else if path.ends_with(".md") {
+        "text/markdown"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// Turn one immutable discipline bundle into the two release channels the
+/// public runtime understands. A standards-compliant top-level `SKILL.md`
+/// makes the bundle an Agent Skill: its instructions and relative resources
+/// are seeded under `.agents/skills/<name>/` for metadata-first discovery and
+/// on-demand reads. Explicit `workspace/` assets remain ordinary session files;
+/// bundles without a skill retain the legacy always-on instruction treatment.
+fn release_discipline_files(
+    files: Vec<(String, String)>,
+) -> io::Result<(Vec<ReleaseFile>, Vec<ReleaseFile>)> {
+    let skill_name = files
+        .iter()
+        .find(|(path, _)| path == "SKILL.md")
+        .map(|(_, body)| {
+            parse_skill_frontmatter(body)
+                .map(|frontmatter| frontmatter.name)
+                .map_err(invalid)
+        })
+        .transpose()?;
+    let mut workspace = Vec::new();
+    let mut instructions = Vec::new();
+    for (path, body) in files {
+        let media_type = discipline_media_type(&path);
+        if path.starts_with("workspace/") {
+            workspace.push(ReleaseFile::new(path, media_type, body.into_bytes()));
+        } else if let Some(name) = &skill_name {
+            if path == crate::discipline::DISCIPLINE_MANIFEST {
+                instructions.push(ReleaseFile::new(
+                    format!("discipline/{path}"),
+                    media_type,
+                    body.into_bytes(),
+                ));
+            } else {
+                workspace.push(ReleaseFile::new(
+                    format!("workspace/.agents/skills/{name}/{path}"),
+                    media_type,
+                    body.into_bytes(),
+                ));
+            }
+        } else {
+            instructions.push(ReleaseFile::new(
+                format!("discipline/{path}"),
+                media_type,
+                body.into_bytes(),
+            ));
+        }
+    }
+    Ok((workspace, instructions))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublisherAuthorization {
@@ -573,34 +633,9 @@ impl Workbench {
         // Discipline assets under `workspace/` fork into each session's private
         // workspace; everything else is persona instruction. The public host
         // strips the prefix when it seeds, so the release carries it verbatim.
-        fn discipline_media_type(path: &str) -> &'static str {
-            if path.ends_with(".json") {
-                "application/json"
-            } else if path.ends_with(".md") {
-                "text/markdown"
-            } else {
-                "application/octet-stream"
-            }
-        }
-        let (workspace_assets, instruction_assets): (Vec<_>, Vec<_>) = discipline
-            .files
-            .into_iter()
-            .partition(|(path, _)| path.starts_with("workspace/"));
-        let instructions = instruction_assets
-            .into_iter()
-            .map(|(path, body)| {
-                ReleaseFile::new(
-                    format!("discipline/{path}"),
-                    discipline_media_type(&path),
-                    body.into_bytes(),
-                )
-            })
-            .collect();
+        let (workspace_assets, instructions) = release_discipline_files(discipline.files)?;
         let mut initial_workspace = spec.initial_workspace;
-        initial_workspace.extend(workspace_assets.into_iter().map(|(path, body)| {
-            let media_type = discipline_media_type(&path);
-            ReleaseFile::new(path, media_type, body.into_bytes())
-        }));
+        initial_workspace.extend(workspace_assets);
 
         let release = AgentRelease {
             schema: AGENT_RELEASE_SCHEMA.to_owned(),
@@ -1696,5 +1731,43 @@ mod publisher_tests {
                 }
             }),
         );
+    }
+
+    #[test]
+    fn agent_skill_bundle_is_seeded_for_progressive_disclosure() {
+        let (workspace, instructions) = release_discipline_files(vec![
+            (
+                "discipline.json".to_owned(),
+                r#"{"schema":"gaugedesk.discipline.v1"}"#.to_owned(),
+            ),
+            (
+                "SKILL.md".to_owned(),
+                "---\nname: theory-a\ndescription: Explain Theory A.\n---\n# Theory A\n".to_owned(),
+            ),
+            (
+                "references/core.md".to_owned(),
+                "# Core reference\n".to_owned(),
+            ),
+            (
+                "workspace/brief.md".to_owned(),
+                "# Client brief\n".to_owned(),
+            ),
+        ])
+        .unwrap();
+
+        let paths = workspace
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                "workspace/.agents/skills/theory-a/SKILL.md",
+                "workspace/.agents/skills/theory-a/references/core.md",
+                "workspace/brief.md",
+            ])
+        );
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].path, "discipline/discipline.json");
     }
 }
