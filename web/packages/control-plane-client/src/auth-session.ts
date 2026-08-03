@@ -131,7 +131,8 @@ export function signOut(): void {
  * token expires, giving every account menu a reliable path back to the signed-out screen. */
 export async function endSession(controlPlaneBase: string): Promise<void> {
     const base = controlPlaneBase.replace(/\/+$/, "");
-    const response = await fetch(`${base}/auth/logout`, {
+    const request = browserRouteRequest(base);
+    const response = await request("/auth/logout", {
         method: "POST",
         credentials: "include",
         headers: { "idempotency-key": newIdempotencyKey() },
@@ -151,14 +152,12 @@ export async function exchangeMobileAccountHandoff(
     code: string,
     verifier: string,
 ): Promise<string> {
-    const response = await browserRouteRequest(controlPlaneBase)(
-        "/auth/mobile/exchange",
-        {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ code, verifier }),
-        },
-    );
+    const request = browserRouteRequest(controlPlaneBase);
+    const response = await request("/auth/mobile/exchange", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code, verifier }),
+    });
     if (!response.ok) {
         throw new Error(`Mobile sign-in handoff failed (${response.status})`);
     }
@@ -175,9 +174,10 @@ export async function refreshMobileAccountToken(
     controlPlaneBase: string,
     token: string,
 ): Promise<string> {
-    const response = await browserRouteRequest(controlPlaneBase, {
+    const request = browserRouteRequest(controlPlaneBase, {
         bearer: () => token,
-    })("/auth/mobile/refresh", { method: "POST" });
+    });
+    const response = await request("/auth/mobile/refresh", { method: "POST" });
     if (!response.ok) {
         throw new Error(`Mobile account refresh failed (${response.status})`);
     }
@@ -195,7 +195,8 @@ export async function refreshHostedAccountSession(
     controlPlaneBase: string,
 ): Promise<boolean> {
     const base = controlPlaneBase.replace(/\/+$/, "");
-    const response = await fetch(`${base}/auth/refresh`, {
+    const request = browserRouteRequest(base);
+    const response = await request("/auth/refresh", {
         method: "GET",
         credentials: "include",
     });

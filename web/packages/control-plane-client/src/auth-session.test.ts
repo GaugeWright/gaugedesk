@@ -174,10 +174,11 @@ describe("hosted account session refresh", () => {
         vi.stubGlobal("fetch", fetch);
 
         await expect(refreshHostedAccountSession("https://auth.example/")).resolves.toBe(true);
-        expect(fetch).toHaveBeenCalledWith("https://auth.example/auth/refresh", {
-            method: "GET",
-            credentials: "include",
-        });
+        expect(fetch.mock.calls[0]?.[0]).toBe("https://auth.example/auth/refresh");
+        const init = fetch.mock.calls[0]?.[1];
+        expect(init?.method).toBe("GET");
+        expect(init?.credentials).toBe("include");
+        expect(new Headers(init?.headers).has("authorization")).toBe(false);
 
         fetch.mockResolvedValueOnce(new Response(null, { status: 401 }));
         await expect(refreshHostedAccountSession("https://auth.example")).resolves.toBe(false);
