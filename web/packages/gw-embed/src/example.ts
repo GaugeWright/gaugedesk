@@ -57,6 +57,10 @@ function fixtureApi(): EmbedSessionApi {
         },
         getTree: async () => [] as FileEntry[],
         embedMyChats: async () => [],
+        embedAudience: true,
+        embedNewChat: async () => undefined,
+        embedOpenChat: async () => undefined,
+        embedEraseChat: async () => undefined,
         embedGetConfig: async () => ({ white_label: false }),
     };
 }

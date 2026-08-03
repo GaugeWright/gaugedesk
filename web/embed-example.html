@@ -8,10 +8,12 @@
             body { font-family: system-ui, sans-serif; margin: 0; background: #f6f7f9; }
             main { max-width: 880px; margin: 2rem auto; padding: 0 1rem; }
             h1 { font-size: 1.25rem; }
-            /* The host page sizes the panels; their internals are shadow-isolated. */
+            /* Layout is intentional host composition. Panel sizing, framing,
+               typography, and colour all have resilient built-in defaults. */
             gw-session { display: grid; gap: 1rem; grid-template-columns: 1fr 1fr; }
-            gw-chat { grid-column: 1 / 2; min-height: 320px; }
-            gw-viewer, gw-files { grid-column: 2 / 3; min-height: 150px; }
+            gw-chat { grid-column: 1 / 2; grid-row: 1 / 3; }
+            gw-viewer, gw-files { grid-column: 2 / 3; }
+            gw-chats { grid-column: 1 / 2; }
         </style>
     </head>
     <body>

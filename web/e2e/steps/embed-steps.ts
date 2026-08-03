@@ -25,7 +25,7 @@ Given("the chat-only embed Environment is open", async ({ page }) => {
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
 });
 
-Given("a block embedded chat sized by min-height is open", async ({ page }) => {
+Given("a block embedded chat sized by the panel min-height token is open", async ({ page }) => {
     await page.goto("/embed-example.html?fixture=1&panels=chat");
     await page.locator("gw-session").evaluate((element) => {
         element.style.display = "block";
@@ -33,9 +33,41 @@ Given("a block embedded chat sized by min-height is open", async ({ page }) => {
     await page.locator("gw-chat").evaluate((element) => {
         element.style.display = "block";
         element.style.height = "auto";
-        element.style.minHeight = "420px";
+        element.style.setProperty("--gw-panel-min-height", "420px");
     });
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
+});
+
+Given("all embedded panels are open under broad hostile host styles", async ({ page }) => {
+    await page.goto("/embed-example.html?fixture=1&panels=chat,viewer,files,chats");
+    await page.locator("gw-session").evaluate((session) => {
+        session.style.display = "block";
+        const style = document.createElement("style");
+        style.dataset.hostilePanelStyles = "";
+        style.textContent = `
+            gw-chat, gw-viewer, gw-files, gw-chats {
+                display: inline !important;
+                box-sizing: content-box !important;
+                width: 24px !important;
+                max-width: none !important;
+                height: 4px !important;
+                min-height: 0 !important;
+                margin: 70px !important;
+                padding: 64px !important;
+                border: 32px solid magenta !important;
+                overflow: hidden !important;
+                background: lime !important;
+                color: red !important;
+                font: 40px serif !important;
+            }
+            gw-chat::part(panel) { box-shadow: none; }
+        `;
+        document.head.appendChild(style);
+    });
+    await expect(page.locator("gw-chat [data-chat-composer]")).toBeVisible();
+    await expect(page.locator("gw-viewer [data-viewer-tabs]")).toBeVisible();
+    await expect(page.locator("gw-files .status")).toBeVisible();
+    await expect(page.locator("gw-chats [data-audience-chats]")).toBeVisible();
 });
 
 Then("the embedded chat shows a composer", async ({ page }) => {
@@ -87,7 +119,7 @@ Then("the embedded transcript shows {string}", async ({ page }, text: string) =>
 Then("the embedded chat is themed by the workbench palette", async ({ page }) => {
     // The :host theme bridge defines the workbench palette inside the shadow root
     // (styles.css's :root block is inert there) — the default --gw-bg (#0f1115).
-    await expect(page.locator("gw-chat")).toHaveCSS("background-color", "rgb(15, 17, 21)");
+    await expect(page.locator('gw-chat [part~="panel"]')).toHaveCSS("background-color", "rgb(15, 17, 21)");
 });
 
 Then("a {string} override cascades into the panel's shadow root", async ({ page }, token: string) => {
@@ -96,5 +128,86 @@ Then("a {string} override cascades into the panel's shadow root", async ({ page 
     }, token);
     // A consultant-set --gw-* token on the ancestor cascades across the shadow
     // boundary into the panel host (custom properties inherit through shadow DOM).
-    await expect(page.locator("gw-chat")).toHaveCSS("background-color", "rgb(20, 0, 40)");
+    await expect(page.locator('gw-chat [part~="panel"]')).toHaveCSS("background-color", "rgb(20, 0, 40)");
+});
+
+Then("every embedded panel keeps its structural defaults", async ({ page }) => {
+    const expectations = new Map([
+        ["gw-chat", 520],
+        ["gw-viewer", 320],
+        ["gw-files", 280],
+        ["gw-chats", 280],
+    ]);
+    for (const [tag, minimum] of expectations) {
+        const metrics = await page.locator(tag).evaluate((element) => {
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return {
+                display: style.display,
+                boxSizing: style.boxSizing,
+                width: rect.width,
+                height: rect.height,
+                margin: style.margin,
+                padding: style.padding,
+                borderWidth: style.borderTopWidth,
+                background: style.backgroundColor,
+                fontSize: style.fontSize,
+            };
+        });
+        expect(metrics.display).toBe("block");
+        expect(metrics.boxSizing).toBe("border-box");
+        expect(metrics.width).toBeGreaterThan(500);
+        expect(metrics.height).toBeGreaterThanOrEqual(minimum);
+        expect(metrics.margin).toBe("0px");
+        expect(metrics.padding).toBe("0px");
+        expect(metrics.borderWidth).toBe("0px");
+        expect(metrics.background).toBe("rgba(0, 0, 0, 0)");
+        expect(metrics.fontSize).toBe("13px");
+    }
+});
+
+Then("every embedded panel exposes intentional styling hooks", async ({ page }) => {
+    await page.locator("gw-session").evaluate((session) => {
+        session.style.setProperty("--gw-bg", "rgb(20, 0, 40)");
+        session.style.setProperty("--gw-panel-padding", "20px");
+        session.style.setProperty("--gw-panel-radius", "24px");
+        session.style.setProperty("--gw-panel-border", "3px solid rgb(1, 2, 3)");
+        session.style.setProperty("--gw-font-size-body", "17px");
+    });
+    for (const tag of ["gw-chat", "gw-viewer", "gw-files", "gw-chats"]) {
+        const panel = page.locator(`${tag} [part~="panel"]`);
+        await expect(panel).toHaveCSS("background-color", "rgb(20, 0, 40)");
+        await expect(panel).toHaveCSS("padding-top", "20px");
+        await expect(panel).toHaveCSS("border-radius", "24px");
+        await expect(panel).toHaveCSS("border-top-width", "3px");
+        await expect(page.locator(tag)).toHaveCSS("font-size", "17px");
+    }
+    await expect(page.locator('gw-chat [part~="panel"]')).toHaveCSS("box-shadow", "none");
+    await expect(page.locator('gw-chat [part~="attribution"]')).toHaveCount(1);
+});
+
+When("the embedded panel host is mobile width", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+});
+
+Then("every embedded panel fits without horizontal overflow", async ({ page }) => {
+    const viewport = page.viewportSize()!;
+    for (const tag of ["gw-chat", "gw-viewer", "gw-files", "gw-chats"]) {
+        const metrics = await page.locator(tag).evaluate((element) => {
+            const rect = element.getBoundingClientRect();
+            const panel = element.shadowRoot!.querySelector<HTMLElement>("[part~=panel]")!;
+            return {
+                left: rect.left,
+                right: rect.right,
+                hostScrollWidth: element.scrollWidth,
+                hostClientWidth: element.clientWidth,
+                panelScrollWidth: panel.scrollWidth,
+                panelClientWidth: panel.clientWidth,
+            };
+        });
+        expect(metrics.left).toBeGreaterThanOrEqual(0);
+        expect(metrics.right).toBeLessThanOrEqual(viewport.width);
+        expect(metrics.hostScrollWidth).toBeLessThanOrEqual(metrics.hostClientWidth);
+        expect(metrics.panelScrollWidth).toBeLessThanOrEqual(metrics.panelClientWidth);
+    }
 });

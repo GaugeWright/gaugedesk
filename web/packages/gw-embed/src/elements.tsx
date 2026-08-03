@@ -49,23 +49,51 @@ import appCss from "@gaugewright/workbench-ui/styles.css?inline";
  * setting any `--gw-*` on `<gw-session>` (or any ancestor); it cascades into every
  * panel's shadow root. Injected before `styles.css` so its `var(--bg)` etc. resolve.
  */
-const EMBED_THEME_CSS = `
+const embedThemeCss = (defaultMinHeight: string) => `
 :host {
+  /* Public theme tokens. Internal aliases are declared here so unrelated host
+     variables with generic names such as --panel or --muted cannot leak in. */
+  --gw-navy: var(--gw-brand-navy, #0e2d50);
   --bg: var(--gw-bg, #0f1115);
   --panel: var(--gw-panel, #161922);
   --edge: var(--gw-edge, #262b36);
   --ink: var(--gw-ink, #d8dee9);
   --muted: var(--gw-muted, #7d869c);
   --accent: var(--gw-accent, #6aa3ff);
+  --accent-strong: var(--gw-accent-strong, #2a6fce);
+  --accent-hover: var(--gw-accent-hover, #8ab8ff);
+  --accent-contrast: var(--gw-accent-contrast, #08111e);
   --warn: var(--gw-warn, #e0a35a);
   --bad: var(--gw-bad, #e06a6a);
   --ui: var(--gw-font, "Manrope", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+  --serif: var(--gw-serif, "STIX Two Text", "Iowan Old Style", Georgia, ui-serif, serif);
   --mono: var(--gw-mono, "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
-  display: block;
-  height: 100%;
-  background: var(--bg);
-  color: var(--ink);
-  font-family: var(--ui);
+  --fs-label: var(--gw-font-size-label, 10px);
+  --fs-small: var(--gw-font-size-small, 11px);
+  --fs-ui: var(--gw-font-size-ui, 12px);
+  --fs-body: var(--gw-font-size-body, 13px);
+  --fs-title: var(--gw-font-size-title, 15px);
+
+  /* Structural rules are deliberately protected at the shadow boundary. A
+     host page customizes them through --gw-panel-* instead of accidentally
+     breaking a panel through broad element or universal selectors. */
+  display: block !important;
+  box-sizing: border-box !important;
+  width: var(--gw-panel-width, 100%) !important;
+  max-width: 100% !important;
+  height: var(--gw-panel-height, auto) !important;
+  min-width: 0 !important;
+  min-height: var(--gw-panel-min-height, ${defaultMinHeight}) !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  overflow: visible !important;
+  background: transparent !important;
+  color: var(--ink) !important;
+  font-family: var(--ui) !important;
+  font-size: var(--fs-body) !important;
+  color-scheme: var(--gw-color-scheme, dark);
+  isolation: isolate;
 }
 /* Powered-by attribution (EMBED-7): a quiet mark on every embedded panel. */
 .gw-powered-by {
@@ -80,6 +108,7 @@ const EMBED_THEME_CSS = `
 }
 .gw-powered-by:hover { color: var(--accent); }
 .gw-embed-panel {
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -88,6 +117,12 @@ const EMBED_THEME_CSS = `
      first panel can absorb its slack and keep its composer docked. */
   min-height: inherit;
   overflow: hidden;
+  padding: var(--gw-panel-padding, 12px);
+  border: var(--gw-panel-border, 1px solid var(--edge));
+  border-radius: var(--gw-panel-radius, 12px);
+  background: var(--bg);
+  color: var(--ink);
+  box-shadow: var(--gw-panel-shadow, 0 14px 36px rgb(0 0 0 / 22%));
 }
 .gw-embed-panel > :first-child {
   flex: 1 1 auto;
@@ -105,6 +140,7 @@ function PoweredBy(props: { session: Session }) {
         <Show when={config()?.white_label !== true}>
             <a
                 class="gw-powered-by"
+                part="attribution"
                 data-embed-powered-by
                 href="https://gaugewright.com"
                 target="_blank"
@@ -146,6 +182,9 @@ export class GwSessionElement extends HTMLElement {
     }
 
     connectedCallback() {
+        // Custom elements are inline by default. Make the provider a useful
+        // zero-config block without replacing an intentional grid/flex layout.
+        if (getComputedStyle(this).display === "inline") this.style.display = "block";
         if (this.session || this._teardown) return; // already built, or injected via handle
         const host = this.getAttribute("host");
         if (host) void this.bootstrap(host);
@@ -409,6 +448,7 @@ abstract class GwPanelElement extends HTMLElement {
     session?: Session;
     private _disposeRender?: () => void;
     protected abstract readonly panelId: PanelId;
+    protected readonly defaultMinHeight: string = "320px";
 
     /** The Solid view this element renders against the resolved Session. */
     protected abstract view(session: Session): JSX.Element;
@@ -434,7 +474,7 @@ abstract class GwPanelElement extends HTMLElement {
         // Theme bridge first (defines the palette on :host), then the workbench
         // stylesheet (consumes it via var(--bg)… — its own :root block is inert here).
         const theme = document.createElement("style");
-        theme.textContent = EMBED_THEME_CSS;
+        theme.textContent = embedThemeCss(this.defaultMinHeight);
         root.appendChild(theme);
         const style = document.createElement("style");
         style.textContent = appCss;
@@ -442,7 +482,11 @@ abstract class GwPanelElement extends HTMLElement {
         this._disposeRender = render(
             () => (
                 <SessionProvider value={session}>
-                    <div class="gw-embed-panel">
+                    <div
+                        class="gw-embed-panel"
+                        part={`panel panel-${this.panelId}`}
+                        data-gw-panel={this.panelId}
+                    >
                         {this.view(session)}
                         <Show when={attributionOwner}>
                             <PoweredBy session={session} />
@@ -469,6 +513,7 @@ abstract class GwPanelElement extends HTMLElement {
 
 export class GwChatElement extends GwPanelElement {
     protected readonly panelId = "chat" as const;
+    protected override readonly defaultMinHeight = "520px";
 
     protected view(session: Session): JSX.Element {
         return <ChatPanel session={session} audience />;
@@ -477,6 +522,7 @@ export class GwChatElement extends GwPanelElement {
 
 export class GwViewerElement extends GwPanelElement {
     protected readonly panelId = "viewer" as const;
+    protected override readonly defaultMinHeight = "320px";
 
     protected view(): JSX.Element {
         return <ContentViewer />;
@@ -485,6 +531,7 @@ export class GwViewerElement extends GwPanelElement {
 
 export class GwFilesElement extends GwPanelElement {
     protected readonly panelId = "files" as const;
+    protected override readonly defaultMinHeight = "280px";
 
     protected view(): JSX.Element {
         return <Workspace />;
@@ -493,6 +540,7 @@ export class GwFilesElement extends GwPanelElement {
 
 export class GwChatsElement extends GwPanelElement {
     protected readonly panelId = "chats" as const;
+    protected override readonly defaultMinHeight = "280px";
 
     protected view(session: Session): JSX.Element {
         return <AudienceChats session={session} standalone />;

@@ -25,7 +25,14 @@ Feature: Embedded panels (EMBED-2)
     Then the embedded chat shows a composer
     And the unselected files and viewer panels are not composed
 
-  Scenario: a block embed honors host min-height and grows its shared composer
-    Given a block embedded chat sized by min-height is open
+  Scenario: a block embed honors intentional sizing and grows its shared composer
+    Given a block embedded chat sized by the panel min-height token is open
     Then the embedded chat uses the shared docked composer
     And the embedded message field grows with multiline text
+
+  Scenario: every panel has resilient drop-in styling with deliberate overrides
+    Given all embedded panels are open under broad hostile host styles
+    Then every embedded panel keeps its structural defaults
+    And every embedded panel exposes intentional styling hooks
+    When the embedded panel host is mobile width
+    Then every embedded panel fits without horizontal overflow
