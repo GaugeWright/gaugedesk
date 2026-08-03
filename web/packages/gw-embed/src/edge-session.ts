@@ -49,6 +49,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
     private readonly listeners = new Set<(event: StreamEvent) => void>();
     private readonly pendingTurns = new Map<string, PendingTurn>();
     private readonly pendingStops = new Map<string, PendingAck>();
+    private readonly stoppedRequests = new Set<string>();
     private readonly assistantText = new Map<string, string>();
     private readonly acceptedMessages = new Set<string>();
     private readonly receivedRequests = new Set<string>();
@@ -307,6 +308,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
                     : typeof message.command_id === "string"
                       ? message.command_id
                       : "active-turn";
+            if (this.stoppedRequests.has(textRequestId)) return "text_delta";
             if (!this.receivedFirstText.has(textRequestId)) {
                 this.receivedFirstText.add(textRequestId);
                 this.awaitingFirstTextRender.push(textRequestId);
@@ -328,6 +330,17 @@ export class EdgeSessionApi implements EmbedSessionApi {
             message.type === "turn_stopped" &&
             typeof message.request_id === "string"
         ) {
+            this.stoppedRequests.add(message.request_id);
+            this.observeLatency("terminal_received", {
+                request_id: message.request_id,
+                ...(Number.isSafeInteger(sequence) ? { sequence } : {}),
+            });
+            this.assistantText.delete(message.request_id);
+            const turn = this.pendingTurns.get(message.request_id);
+            if (turn) {
+                this.pendingTurns.delete(message.request_id);
+                turn.resolve({ outcome: "interrupted" });
+            }
             this.pendingStops.get(message.request_id)?.resolve();
             this.pendingStops.delete(message.request_id);
             return "turn_stopped";

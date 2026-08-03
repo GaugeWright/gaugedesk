@@ -262,16 +262,24 @@ describe("EdgeSessionApi", () => {
             }),
         });
         await expect(stop).resolves.toBeUndefined();
+        await expect(turn).resolves.toEqual({ outcome: "interrupted" });
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "text_delta",
+                sequence: 8,
+                request_id: sent.request_id,
+                delta: "must be ignored",
+            }),
+        });
         sockets[0]!.emit("message", {
             data: JSON.stringify({
                 type: "turn_terminal",
-                sequence: 8,
+                sequence: 9,
                 request_id: sent.request_id,
                 status: 200,
                 body: { outcome: "completed" },
             }),
         });
-        await expect(turn).resolves.toEqual({ outcome: "completed" });
         expect(deltas).toEqual([
             { type: "text", delta: "hi" },
             {
@@ -292,7 +300,6 @@ describe("EdgeSessionApi", () => {
         expect(await api.getTranscript("ignored" as EngagementId)).toEqual([
             { type: "assistant", text: "ready" },
             { type: "user", text: "hello" },
-            { type: "assistant", text: "hi" },
         ]);
         expect(await api.getTree("ignored" as EngagementId)).toEqual([
             { path: "answer.md", isDir: false },
