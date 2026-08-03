@@ -300,14 +300,16 @@ export class GwSessionElement extends HTMLElement {
             audienceAssertion,
             payload.white_label === true,
             this._latencyObserver,
-            audienceAssertion
-                ? {
-                      open: (chat) =>
-                          this.activateAudience({ requested_session_id: chat }),
-                      create: () => this.activateAudience({ new_session: true }),
-                      erase: (chat) => this.eraseAudienceChat(chat),
-                  }
-                : undefined,
+            {
+                create: () => this.activateSession({ new_session: true }),
+                ...(audienceAssertion
+                    ? {
+                          open: (chat: string) =>
+                              this.activateSession({ requested_session_id: chat }),
+                          erase: (chat: string) => this.eraseAudienceChat(chat),
+                      }
+                    : {}),
+            },
         );
         await api.ready();
         if (!this.isConnected) {
@@ -324,14 +326,12 @@ export class GwSessionElement extends HTMLElement {
         this.bindSession(payload.session_id, granted, api);
     }
 
-    private async activateAudience(
+    private async activateSession(
         selection: { requested_session_id: string } | { new_session: true },
     ): Promise<void> {
         const base = this._base;
         const audienceAssertion = this._audienceAssertion;
-        if (!base || !audienceAssertion) {
-            throw new Error("authenticated audience is required");
-        }
+        if (!base) throw new Error("hosted session is unavailable");
         const traceId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
         this.observeLatency("bootstrap_start", { trace_id: traceId });
         const response = await fetch(`${base}/bootstrap`, {
@@ -339,14 +339,16 @@ export class GwSessionElement extends HTMLElement {
             headers: { "content-type": "application/json" },
             credentials: "omit",
             body: JSON.stringify({
-                audience_assertion: audienceAssertion,
+                ...(audienceAssertion
+                    ? { audience_assertion: audienceAssertion }
+                    : {}),
                 ...selection,
                 trace_id: traceId,
             }),
         });
         this.observeLatency("bootstrap_response", { trace_id: traceId });
         if (!response.ok) {
-            throw new Error(`audience chat activation: ${response.status}`);
+            throw new Error(`session activation: ${response.status}`);
         }
         await this.adoptBootstrap(
             base,
@@ -385,7 +387,7 @@ export class GwSessionElement extends HTMLElement {
             sessions?: { session_id: string }[];
         };
         const next = value.sessions?.[0]?.session_id;
-        await this.activateAudience(
+        await this.activateSession(
             next ? { requested_session_id: next } : { new_session: true },
         );
     }

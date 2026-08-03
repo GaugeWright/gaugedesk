@@ -36,10 +36,10 @@ type PendingAck = {
     reject: (reason: unknown) => void;
 };
 
-export interface AudienceChatControls {
-    open(chat: string): Promise<void>;
+export interface EmbedChatControls {
     create(): Promise<void>;
-    erase(chat: string): Promise<void>;
+    open?(chat: string): Promise<void>;
+    erase?(chat: string): Promise<void>;
 }
 
 /** One canonical, cursor-resumable WebSocket to the engagement's Session DO. */
@@ -73,7 +73,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
         private readonly audienceAssertion: string | null,
         private readonly whiteLabel: boolean,
         private readonly latencyObserver?: LatencyObserver,
-        private readonly audienceControls?: AudienceChatControls,
+        private readonly chatControls?: EmbedChatControls,
     ) {
         this.scheduleCapabilityRefresh();
     }
@@ -603,24 +603,24 @@ export class EdgeSessionApi implements EmbedSessionApi {
     }
 
     embedOpenChat(chat: string): Promise<void> {
-        if (!this.audienceAssertion || !this.audienceControls) {
+        if (!this.audienceAssertion || !this.chatControls?.open) {
             return Promise.reject(new Error("authenticated audience is required"));
         }
-        return this.audienceControls.open(chat);
+        return this.chatControls.open(chat);
     }
 
     embedNewChat(): Promise<void> {
-        if (!this.audienceAssertion || !this.audienceControls) {
-            return Promise.reject(new Error("authenticated audience is required"));
+        if (!this.chatControls) {
+            return Promise.reject(new Error("session lifecycle is unavailable"));
         }
-        return this.audienceControls.create();
+        return this.chatControls.create();
     }
 
     embedEraseChat(chat: string): Promise<void> {
-        if (!this.audienceAssertion || !this.audienceControls) {
+        if (!this.audienceAssertion || !this.chatControls?.erase) {
             return Promise.reject(new Error("authenticated audience is required"));
         }
-        return this.audienceControls.erase(chat);
+        return this.chatControls.erase(chat);
     }
 
     embedGetConfig(): Promise<{ white_label: boolean }> {

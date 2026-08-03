@@ -25,6 +25,11 @@ Given("the chat-only embed Environment is open", async ({ page }) => {
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
 });
 
+Given("an anonymous embedded chat is open", async ({ page }) => {
+    await page.goto("/embed-example.html?fixture=1&panels=chat&audience=anonymous");
+    await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
+});
+
 Given("a block embedded chat sized by the panel min-height token is open", async ({ page }) => {
     await page.goto("/embed-example.html?fixture=1&panels=chat");
     await page.locator("gw-session").evaluate((element) => {
@@ -72,6 +77,18 @@ Given("all embedded panels are open under broad hostile host styles", async ({ p
 
 Then("the embedded chat shows a composer", async ({ page }) => {
     await expect(page.locator("[data-embed-send]")).toBeVisible();
+});
+
+Then("the embedded chat shows a new session action", async ({ page }) => {
+    await expect(page.locator("[data-new-embed-session]")).toHaveText("New session");
+});
+
+When("I start a new embedded session", async ({ page }) => {
+    await page.locator("[data-new-embed-session]").click();
+});
+
+Then("the embedded chat requests a fresh session", async ({ page }) => {
+    await expect(page.locator("body")).toHaveAttribute("data-fixture-new-session", "started");
 });
 
 Then("the embedded chat uses the shared docked composer", async ({ page }) => {

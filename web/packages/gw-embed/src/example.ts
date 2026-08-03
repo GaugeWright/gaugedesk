@@ -57,8 +57,10 @@ function fixtureApi(): EmbedSessionApi {
         },
         getTree: async () => [] as FileEntry[],
         embedMyChats: async () => [],
-        embedAudience: true,
-        embedNewChat: async () => undefined,
+        embedAudience: params.get("audience") !== "anonymous",
+        embedNewChat: async () => {
+            document.body.dataset.fixtureNewSession = "started";
+        },
         embedOpenChat: async () => undefined,
         embedEraseChat: async () => undefined,
         embedGetConfig: async () => ({ white_label: false }),

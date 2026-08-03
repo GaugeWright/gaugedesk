@@ -44,7 +44,7 @@ afterEach(() => {
 });
 
 describe("EdgeSessionApi", () => {
-    it("delegates authenticated chat lifecycle commands and refuses them anonymously", async () => {
+    it("starts fresh sessions anonymously while keeping history commands authenticated", async () => {
         vi.stubGlobal("fetch", vi.fn());
         const controls = {
             open: vi.fn(async () => undefined),
@@ -79,6 +79,9 @@ describe("EdgeSessionApi", () => {
         );
         authenticated.dispose();
 
+        const anonymousControls = {
+            create: vi.fn(async () => undefined),
+        };
         const anonymous = new EdgeSessionApi(
             "https://panels.gaugewright.com/d/theory-a",
             "sess_0123456789abcdef0123456789abcdef" as EngagementId,
@@ -87,9 +90,15 @@ describe("EdgeSessionApi", () => {
             Date.now() + 15 * 60 * 1000,
             null,
             false,
+            undefined,
+            anonymousControls,
         );
         expect(anonymous.embedAudience).toBe(false);
-        await expect(anonymous.embedNewChat()).rejects.toThrow(
+        await anonymous.embedNewChat();
+        expect(anonymousControls.create).toHaveBeenCalledOnce();
+        await expect(anonymous.embedOpenChat(
+            "sess_11111111111111111111111111111111",
+        )).rejects.toThrow(
             "authenticated audience is required",
         );
         anonymous.dispose();

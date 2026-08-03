@@ -63,6 +63,41 @@ function SessionComposer(props: { session: Session; audience: boolean }): JSX.El
     );
 }
 
+function NewSessionButton(props: { session: Session }): JSX.Element {
+    const [starting, setStarting] = createSignal(false);
+    const [failed, setFailed] = createSignal(false);
+    const start = async () => {
+        if (starting() || props.session.busy?.()) return;
+        setFailed(false);
+        setStarting(true);
+        try {
+            await props.session.api.embedNewChat?.();
+        } catch {
+            setFailed(true);
+        } finally {
+            setStarting(false);
+        }
+    };
+    return (
+        <Show when={props.session.api.embedNewChat}>
+            <button
+                type="button"
+                class="embed-new-session"
+                data-new-embed-session
+                disabled={starting() || props.session.busy?.() === true}
+                onClick={() => void start()}
+            >
+                {starting() ? "Starting…" : "New session"}
+            </button>
+            <Show when={failed()}>
+                <span class="embed-new-session-error" role="status">
+                    Could not start a new session.
+                </span>
+            </Show>
+        </Show>
+    );
+}
+
 export function ChatPanel(props: ChatPanelProps): JSX.Element {
     // Solid has no hook-order restriction; short-circuiting lets direct-handle
     // hosts pass a leaf while normal panel mounts consume SessionProvider.
@@ -71,7 +106,10 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
     const body = () => (
         <>
             <Show when={props.audience === true}>
-                <AudienceChats session={session()} />
+                <div class="embed-chat-toolbar" data-embed-chat-toolbar>
+                    <AudienceChats session={session()} />
+                    <NewSessionButton session={session()} />
+                </div>
             </Show>
             <div
                 class="transcript"

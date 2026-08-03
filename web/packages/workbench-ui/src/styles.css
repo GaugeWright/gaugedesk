@@ -509,6 +509,15 @@ code, pre, textarea {
 .embed-chat { display: flex; flex-direction: column; height: 100%; min-height: 0;
     min-width: 0; overflow: hidden; }
 .embed-chat > .transcript { flex: 1 1 auto; overflow: auto; min-height: 0; }
+.embed-chat-toolbar { display: flex; align-items: center; justify-content: flex-end;
+    gap: 6px; flex: 0 0 auto; padding: 0 2px 8px; border-bottom: 1px solid var(--edge); }
+.embed-chat-toolbar .audience-chats { min-width: 0; margin-right: auto; border-bottom: 0; }
+.embed-chat-toolbar .audience-chats-toggle { width: auto; padding: 5px 8px; }
+.embed-new-session { flex: 0 0 auto; padding: 5px 9px; border: 1px solid var(--edge);
+    border-radius: 6px; background: transparent; color: var(--muted); font: 600 var(--fs-small) var(--ui); }
+.embed-new-session:hover:not(:disabled) { border-color: var(--accent); color: var(--ink); }
+.embed-new-session:disabled { opacity: 0.55; cursor: default; }
+.embed-new-session-error { color: var(--bad); font-size: var(--fs-small); }
 .audience-chats { flex: 0 0 auto; border-bottom: 1px solid var(--edge); }
 .audience-chats-toggle { width: 100%; padding: 6px 10px; border: 0; background: transparent;
     color: var(--muted); text-align: left; font: inherit; cursor: pointer; }

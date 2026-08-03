@@ -12,6 +12,10 @@ only needs to choose how multiple panels are arranged.
 </gw-session>
 ```
 
+`<gw-chat>` includes a **New session** action. It replaces the panel's current
+conversation with a fresh deployment session; authenticated visitors can still
+reopen their owned earlier conversations through **Chats**.
+
 ## Customize the CSS
 
 Customization is optional. The default panel styles are complete and isolated

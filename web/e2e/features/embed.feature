@@ -15,6 +15,12 @@ Feature: Embedded panels (EMBED-2)
     When I send "hello from the embed" in the embedded chat
     Then the embedded transcript shows "hello from the embed"
 
+  Scenario: an anonymous embedded chat can start a fresh session
+    Given an anonymous embedded chat is open
+    Then the embedded chat shows a new session action
+    When I start a new embedded session
+    Then the embedded chat requests a fresh session
+
   Scenario: conversational prose renders safe GitHub-flavored Markdown
     Given the embed example page is open
     When I send a Markdown message in the embedded chat

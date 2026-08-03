@@ -33,22 +33,24 @@ export function AudienceChats(props: AudienceChatsProps) {
     };
     const body = () => (
         <div class="audience-chats-list" data-audience-chats-list>
-            <div class="audience-chats-actions">
-                <button
-                    type="button"
-                    disabled={busy()}
-                    data-new-audience-chat
-                    onClick={() =>
-                        void run(
-                            () =>
-                                props.session.api.embedNewChat?.() ??
-                                Promise.resolve(),
-                        )
-                    }
-                >
-                    New chat
-                </button>
-            </div>
+            <Show when={props.standalone}>
+                <div class="audience-chats-actions">
+                    <button
+                        type="button"
+                        disabled={busy()}
+                        data-new-audience-chat
+                        onClick={() =>
+                            void run(
+                                () =>
+                                    props.session.api.embedNewChat?.() ??
+                                    Promise.resolve(),
+                            )
+                        }
+                    >
+                        New session
+                    </button>
+                </div>
+            </Show>
             <Show when={chats()} fallback={<div class="status">loading…</div>}>
                 <Show
                     when={chats()!.length}
