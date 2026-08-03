@@ -28,6 +28,13 @@ Feature: Embedded panels (EMBED-2)
     When I send a Markdown message in the embedded chat
     Then the embedded transcript renders its formatting without page overflow
 
+  Scenario: a pasted image becomes native model input
+    Given the embed example page is open
+    When I paste a PNG image into the embedded chat
+    Then the embedded composer shows the pasted image
+    When I send the pasted image in the embedded chat
+    Then the embedded turn carries the pasted image bytes
+
   Scenario: the embedded panels carry the workbench theme and accept --gw-* overrides
     Given the embed example page is open
     Then the embedded chat is themed by the workbench palette

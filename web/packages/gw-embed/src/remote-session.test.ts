@@ -17,7 +17,7 @@ function fakeApi() {
         onEvent: undefined as ((ev: StreamEvent) => void) | undefined,
         closed: false,
         runTask: vi.fn(async () => undefined),
-        runEmbedTurn: vi.fn<() => Promise<void>>(async () => undefined),
+        runEmbedTurn: vi.fn<EmbedSessionApi["runEmbedTurn"]>(async () => undefined),
         mergeCommand: vi.fn(async () => idleMerge),
         recordFirstTextRendered: vi.fn(),
     };
@@ -90,7 +90,22 @@ describe("createRemoteSession", () => {
             const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
             session.send("do the thing");
             expect(session.transcript().lines.at(-1)?.text).toBe("do the thing");
-            expect(f.calls.runEmbedTurn).toHaveBeenCalledWith(ENG, "do the thing");
+            expect(f.calls.runEmbedTurn).toHaveBeenCalledWith(ENG, "do the thing", []);
+            dispose();
+        });
+    });
+
+    it("carries native image input through the scoped turn command", () => {
+        createRoot((dispose) => {
+            const f = fakeApi();
+            const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
+            const image = { name: "pasted.png", mimeType: "image/png", data: "aGVsbG8=" };
+            session.send("[attached image: pasted.png]", [image]);
+            expect(f.calls.runEmbedTurn).toHaveBeenCalledWith(
+                ENG,
+                "[attached image: pasted.png]",
+                [image],
+            );
             dispose();
         });
     });

@@ -8,6 +8,12 @@
  */
 import {createSignal, Show, type JSX} from "solid-js";
 import { ChatComposer } from "./ChatComposer";
+import {
+    buildOutgoing,
+    classifyAttachment,
+    fileToBase64,
+    type Attachment,
+} from "./attachments";
 import { AudienceChats } from "./AudienceChats";
 import { type FilterPrefs } from "./transcript-filter";
 import { type TranscriptLine } from "./transcript";
@@ -34,26 +40,46 @@ export interface ChatPanelProps {
 
 function SessionComposer(props: { session: Session; audience: boolean }): JSX.Element {
     const [draft, setDraft] = createSignal("");
+    const [attachments, setAttachments] = createSignal<Attachment[]>([]);
     // WhippleScript 0.3.1 (DR-0050) removed `ask_human`: no turn parks waiting
     // for a person, so the composer has one mode. An agent that needs something
     // sends on a channel or files a task; the reply is an ordinary message.
     const submit = () => {
-        const text = draft().trim();
-        if (!text) return;
+        const outgoing = buildOutgoing(draft(), attachments());
+        if (!outgoing.message.trim()) return;
         if (props.session.busy?.()) return;
         setDraft("");
-        props.session.send(text);
+        setAttachments([]);
+        props.session.send(outgoing.message, outgoing.images);
+    };
+    const pasteImages = async (files: readonly File[]) => {
+        const images: Attachment[] = [];
+        for (const file of files) {
+            if (classifyAttachment(file) !== "image") continue;
+            images.push({
+                kind: "image",
+                name: file.name || "pasted image",
+                mimeType: file.type,
+                data: await fileToBase64(file),
+            });
+        }
+        if (images.length > 0) setAttachments((current) => [...current, ...images]);
     };
     return (
         <>
             <ChatComposer
                     draft={draft()}
                     placeholder="task the agent…"
+                    attachments={attachments()}
                     busy={props.session.busy?.() ?? false}
-                    canSubmit={draft().trim().length > 0}
+                    canSubmit={draft().trim().length > 0 || attachments().length > 0}
                     audience={props.audience}
                     onDraft={setDraft}
                     onSubmit={() => submit()}
+                    onPasteFiles={pasteImages}
+                    onRemoveAttachment={(index) =>
+                        setAttachments((current) => current.filter((_, at) => at !== index))
+                    }
                     onStop={
                         props.session.stop
                             ? () => {

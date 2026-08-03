@@ -1180,10 +1180,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // the Tauri webview — no plugin, no backend). Images go to WhippleScript as native
     // image blocks; text files inline into the prompt; PDF/Office text is extracted
     // locally before entering that same inline path.
-    async function onAttachInput(e: Event) {
-        const input = e.currentTarget as HTMLInputElement;
-        const picked = Array.from(input.files ?? []);
-        input.value = ""; // let the same file be picked again later
+    async function attachFiles(picked: readonly File[]) {
         const next: Attachment[] = [];
         const rejected: string[] = [];
         const unreadable: string[] = [];
@@ -1220,6 +1217,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         } else if (rejected.length) {
             setStatus(`can't attach ${rejected.join(", ")} — choose text, image, PDF, docx, xlsx, or pptx`);
         }
+    }
+    async function onAttachInput(e: Event) {
+        const input = e.currentTarget as HTMLInputElement;
+        const picked = Array.from(input.files ?? []);
+        input.value = ""; // let the same file be picked again later
+        await attachFiles(picked);
     }
     const removeAttachment = (i: number) => setAttachments((a) => a.filter((_, n) => n !== i));
 
@@ -1592,6 +1595,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onToggleGate={selected() ? toggleGate : undefined}
             onToggleReview={() => setReviewNext((value) => !value)}
             onAttachInput={onAttachInput}
+            onPasteFiles={attachFiles}
             onRemoveAttachment={removeAttachment}
             onReorderQueue={selected() ? reorderQueue : undefined}
             onEditQueue={selected() ? editQueued : undefined}

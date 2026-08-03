@@ -977,6 +977,24 @@ When("I attach a PNG image {string}", async ({ page }, name: string) => {
     });
 });
 
+When("I paste a PNG image {string}", async ({ page }, name: string) => {
+    await page.locator("[data-desktop-composer] textarea").evaluate(
+        (composer, image) => {
+            const bytes = Uint8Array.from(atob(image.base64), (character) =>
+                character.charCodeAt(0),
+            );
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([bytes], image.name, { type: "image/png" }));
+            composer.dispatchEvent(new ClipboardEvent("paste", {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: transfer,
+            }));
+        },
+        { name, base64: TINY_PNG.toString("base64") },
+    );
+});
+
 Then("the composer shows an image attachment {string}", async ({ page }, name: string) => {
     await expect(page.locator(`[data-attachment][data-kind="image"]`, { hasText: name })).toBeVisible();
 });

@@ -49,7 +49,10 @@ function fixtureApi(): EmbedSessionApi {
         // Keep the hermetic browser fixture in-flight so the shared panel's
         // optimistic user projection remains visible without fabricating a
         // terminal runtime response.
-        runEmbedTurn: () => new Promise<never>(() => undefined),
+        runEmbedTurn: (_id, prompt, images = []) => {
+            document.body.dataset.fixtureTurn = JSON.stringify({ prompt, images });
+            return new Promise<never>(() => undefined);
+        },
         runTask: () => new Promise<never>(() => undefined),
         mergeCommand: async (_id: EngagementId, _action: MergeAction) =>
             emptyMerge,

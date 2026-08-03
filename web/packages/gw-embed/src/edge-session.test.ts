@@ -178,14 +178,21 @@ describe("EdgeSessionApi", () => {
 
         const deltas: StreamEvent[] = [];
         api.subscribe("ignored" as EngagementId, (event) => deltas.push(event));
-        const turn = api.runEmbedTurn("ignored" as EngagementId, "hello");
+        const turn = api.runEmbedTurn("ignored" as EngagementId, "hello", [
+            { mimeType: "image/png", data: "aGVsbG8=" },
+        ]);
         await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(1));
         const sent = JSON.parse(sockets[0]!.sent[0]!) as {
             request_id: string;
             type: string;
             text: string;
+            images: { media_type: string; data_base64: string }[];
         };
-        expect(sent).toMatchObject({ type: "send_message", text: "hello" });
+        expect(sent).toMatchObject({
+            type: "send_message",
+            text: "hello",
+            images: [{ media_type: "image/png", data_base64: "aGVsbG8=" }],
+        });
         sockets[0]!.emit("message", {
             data: JSON.stringify({
                 type: "message_accepted",

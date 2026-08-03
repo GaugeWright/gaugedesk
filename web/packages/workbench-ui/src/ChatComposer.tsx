@@ -7,7 +7,7 @@
  * shared composer instead of selecting a second, lesser UI.
  */
 import { createEffect, createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
-import type { Attachment } from "./attachments";
+import { IMAGE_MIMES, type Attachment } from "./attachments";
 import { Icon } from "./icons";
 
 export interface ComposerQueueItem {
@@ -37,6 +37,8 @@ export interface ChatComposerProps {
     readonly onToggleGate?: () => void;
     readonly onToggleReview?: () => void;
     readonly onAttachInput?: JSX.EventHandler<HTMLInputElement, Event>;
+    /** Image files pasted into the textarea. Text paste remains native. */
+    readonly onPasteFiles?: (files: readonly File[]) => void | Promise<void>;
     readonly onRemoveAttachment?: (index: number) => void;
     readonly onReorderQueue?: (from: number, to: number) => void;
     readonly onEditQueue?: (id: number, text: string) => void;
@@ -147,6 +149,22 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                     value={props.draft}
                     disabled={audienceBusy()}
                     onInput={(event) => props.onDraft(event.currentTarget.value)}
+                    onPaste={(event) => {
+                        if (!props.onPasteFiles) return;
+                        const clipboard = event.clipboardData;
+                        if (!clipboard) return;
+                        const clipboardFiles = Array.from(clipboard.files);
+                        const files = clipboardFiles.length > 0
+                            ? clipboardFiles
+                            : Array.from(clipboard.items)
+                                  .filter((item) => item.kind === "file")
+                                  .map((item) => item.getAsFile())
+                                  .filter((file): file is File => file !== null);
+                        const images = files.filter((file) => IMAGE_MIMES.has(file.type));
+                        if (images.length === 0) return;
+                        event.preventDefault();
+                        void props.onPasteFiles(images);
+                    }}
                     onKeyDown={(event) => {
                         if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
                         event.preventDefault();

@@ -150,6 +150,53 @@ When("I send a Markdown message in the embedded chat", async ({ page }) => {
     await page.locator("[data-embed-send]").click();
 });
 
+const TINY_PASTED_PNG =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+When("I paste a PNG image into the embedded chat", async ({ page }) => {
+    await page.locator("[data-embed-composer]").evaluate((composer, base64) => {
+        const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+        const transfer = new DataTransfer();
+        transfer.items.add(new File([bytes], "pasted-image.png", { type: "image/png" }));
+        composer.dispatchEvent(new ClipboardEvent("paste", {
+            bubbles: true,
+            cancelable: true,
+            clipboardData: transfer,
+        }));
+    }, TINY_PASTED_PNG);
+});
+
+Then("the embedded composer shows the pasted image", async ({ page }) => {
+    const attachment = page.locator('[data-attachment][data-kind="image"]');
+    await expect(attachment).toContainText("pasted-image.png");
+    await expect(attachment.locator("img")).toHaveAttribute(
+        "src",
+        `data:image/png;base64,${TINY_PASTED_PNG}`,
+    );
+});
+
+When("I send the pasted image in the embedded chat", async ({ page }) => {
+    await page.locator("[data-embed-send]").click();
+});
+
+Then("the embedded turn carries the pasted image bytes", async ({ page }) => {
+    await expect.poll(async () => page.locator("body").getAttribute("data-fixture-turn"))
+        .not.toBeNull();
+    const turn = JSON.parse(
+        (await page.locator("body").getAttribute("data-fixture-turn"))!,
+    ) as {
+        prompt: string;
+        images: { name: string; mimeType: string; data: string }[];
+    };
+    expect(turn.prompt).toContain("[attached image: pasted-image.png]");
+    expect(turn.images).toEqual([{
+        name: "pasted-image.png",
+        mimeType: "image/png",
+        data: TINY_PASTED_PNG,
+    }]);
+    await expect(page.locator("[data-attachment]")).toHaveCount(0);
+});
+
 Then("the embedded transcript renders its formatting without page overflow", async ({ page }) => {
     const message = page.locator("[data-embed-transcript] .line.user .message-markdown");
     await expect(message.locator("strong")).toHaveText("Important");

@@ -27,6 +27,7 @@ interface EdgeState {
 
 type PendingTurn = {
     text: string;
+    images: { media_type: string; data_base64: string }[];
     resolve: (value: unknown) => void;
     reject: (reason: unknown) => void;
 };
@@ -459,6 +460,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
                 request_id: requestId,
                 after: this.cursor,
                 text: turn.text,
+                ...(turn.images.length > 0 ? { images: turn.images } : {}),
             }),
         );
         if (!this.sentRequests.has(requestId)) {
@@ -517,12 +519,24 @@ export class EdgeSessionApi implements EmbedSessionApi {
         return () => this.listeners.delete(onEvent);
     }
 
-    async runEmbedTurn(_id: EngagementId, prompt: string): Promise<unknown> {
+    async runEmbedTurn(
+        _id: EngagementId,
+        prompt: string,
+        images: { data: string; mimeType: string }[] = [],
+    ): Promise<unknown> {
         const requestId = newIdempotencyKey().replaceAll("-", "_");
         this.observeLatency("prompt_submitted", { request_id: requestId });
         const socket = await this.connect();
         const result = new Promise<unknown>((resolve, reject) => {
-            this.pendingTurns.set(requestId, { text: prompt, resolve, reject });
+            this.pendingTurns.set(requestId, {
+                text: prompt,
+                images: images.map((image) => ({
+                    media_type: image.mimeType,
+                    data_base64: image.data,
+                })),
+                resolve,
+                reject,
+            });
         });
         this.sendTurn(socket, requestId, this.pendingTurns.get(requestId)!);
         return result;
@@ -535,8 +549,12 @@ export class EdgeSessionApi implements EmbedSessionApi {
         this.observeLatency("first_text_rendered", { request_id: requestId });
     }
 
-    runTask(id: EngagementId, prompt: string): Promise<unknown> {
-        return this.runEmbedTurn(id, prompt);
+    runTask(
+        id: EngagementId,
+        prompt: string,
+        images: { data: string; mimeType: string }[] = [],
+    ): Promise<unknown> {
+        return this.runEmbedTurn(id, prompt, images);
     }
 
     async getTree(_id: EngagementId): Promise<FileEntry[]> {

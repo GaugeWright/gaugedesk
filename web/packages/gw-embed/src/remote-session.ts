@@ -22,6 +22,7 @@ import {
     type Transcript,
 } from "@gaugewright/workbench-ui/transcript";
 import { type Session } from "@gaugewright/workbench-ui/session-context";
+import { type ImageRef } from "@gaugewright/workbench-ui/attachments";
 import { type EmbedSessionApi } from "./session-api";
 
 export interface RemoteSessionOptions {
@@ -84,7 +85,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         bumpWorktree();
     }
 
-    function send(text: string) {
+    function send(text: string, images: ImageRef[] = []) {
         const t = text.trim();
         if (!t || busy()) return;
         setBusy(true);
@@ -93,7 +94,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         setLive((tr) => reduce(tr, { type: "user", text: t }));
         // The Session DO admits the stable command and streams its durable
         // observations over the same WebSocket while this promise is pending.
-        void api.runEmbedTurn(id, t)
+        void api.runEmbedTurn(id, t, images)
             .then(settle)
             .catch(() => void loadSnapshot())
             .finally(() => setBusy(false));

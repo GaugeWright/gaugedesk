@@ -20,6 +20,14 @@ Feature: Message attachments
     Then the run phase is "Completed"
     And the composer has no pending attachments
 
+  Scenario: paste an image into a message
+    Given a new engagement
+    When I paste a PNG image "clipboard.png"
+    Then the composer shows an image attachment "clipboard.png"
+    When I task the agent with "describe the pasted image"
+    Then the run phase is "Completed"
+    And the composer has no pending attachments
+
   Scenario: extract an Office document in the browser
     Given a new engagement
     When I attach a DOCX document "sample.docx"

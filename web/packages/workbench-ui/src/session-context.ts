@@ -27,6 +27,7 @@ import {
     type SaveFileResult,
 } from "@gaugewright/control-plane-client";
 import { type Transcript } from "./transcript";
+import { type ImageRef } from "./attachments";
 
 export interface SessionApi {
     getFile(id: EngagementId, path: string): Promise<string>;
@@ -147,7 +148,7 @@ export interface Session {
     readonly onContentSaved: () => void;
     /** Send a message — start a turn on this engagement. The primitive a composer
      *  rides; the desktop layers its draft/queue/steer controls on top. */
-    readonly send: (text: string) => void;
+    readonly send: (text: string, images?: ImageRef[]) => void;
     /** Cooperatively cancel the current durable turn. */
     readonly stop?: () => Promise<void>;
     /** Fork at an exact durable user/assistant boundary. Owner environments
