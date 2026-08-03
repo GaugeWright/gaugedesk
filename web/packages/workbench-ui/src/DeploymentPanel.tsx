@@ -818,6 +818,13 @@ export function DeploymentPanel(props: {
                         </a>
                         <pre class="embed-snippet">{published().embed_html}</pre>
                         <button type="button" onClick={() => void copy()}>Copy embed HTML</button>
+                        <p class="settings-hint">
+                            Want to change the colors, type, spacing, or panel height? Open the
+                            readable <a href="https://embed.gaugewright.com/embed.css"
+                                target="_blank" rel="noreferrer">embed.css starter</a>, save a copy
+                            with your site's CSS, and edit the plainly named <code>--gw-*</code> values.
+                            The stylesheet is optional; the panels are fully styled without it.
+                        </p>
                         <h4>Preview</h4>
                         <div class="deployment-preview" ref={preview} />
                     </section>
