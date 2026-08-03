@@ -54,10 +54,9 @@ function parse(tenant: string, raw: unknown): CloudHomeProjection {
     };
 }
 
-function path(tenant: string, suffix = ""): string {
-    return `/account/tenants/${encodeURIComponent(tenant)}/cloud-home${suffix}`;
-}
-
 export async function getCloudHome(json: RouteJson, tenant: string): Promise<CloudHomeProjection> {
-    return parse(tenant, await json("GET", path(tenant)));
+    return parse(
+        tenant,
+        await json("GET", `/account/tenants/${encodeURIComponent(tenant)}/cloud-home`),
+    );
 }

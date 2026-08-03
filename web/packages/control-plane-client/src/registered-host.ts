@@ -35,11 +35,11 @@ function parse(value: unknown): TenantHost {
     };
 }
 
-const path = (tenant: string, suffix = "") =>
-    `/account/tenants/${encodeURIComponent(tenant)}/hosts${suffix}`;
-
 export async function tenantHosts(json: RouteJson, tenant: string): Promise<TenantHost[]> {
-    const body = (await json("GET", path(tenant))) as { hosts?: unknown };
+    const body = (await json(
+        "GET",
+        `/account/tenants/${encodeURIComponent(tenant)}/hosts`,
+    )) as { hosts?: unknown };
     if (!Array.isArray(body.hosts)) return [];
     return body.hosts.map(parse);
 }

@@ -4,10 +4,6 @@ export interface BackupCiphertext { readonly bytes: readonly number[]; }
 export interface BackupKeyWrap { readonly recipient_id: string; readonly ephemeral_pubkey: string; readonly ciphertext: string; }
 export interface RestoreMaterial { readonly ciphertext: BackupCiphertext; readonly wrap: BackupKeyWrap; }
 
-function path(tenant: string, suffix = ""): string {
-    return `/account/tenants/${encodeURIComponent(tenant)}/backups${suffix}`;
-}
-
 function object(value: unknown, message: string): Record<string, unknown> {
     if (!value || typeof value !== "object") throw new Error(message);
     return value as Record<string, unknown>;
@@ -23,7 +19,10 @@ export async function restoreMaterial(
     recipientId: string,
 ): Promise<RestoreMaterial> {
     const row = object(
-        await json("GET", path(tenant, `/points/${encodeURIComponent(pointHandle)}/restore-material/${encodeURIComponent(recipientId)}`)),
+        await json(
+            "GET",
+            `/account/tenants/${encodeURIComponent(tenant)}/backups/points/${encodeURIComponent(pointHandle)}/restore-material/${encodeURIComponent(recipientId)}`,
+        ),
         "Restore material response is malformed",
     );
     const ciphertext = object(row.ciphertext, "Restore material response is malformed");
