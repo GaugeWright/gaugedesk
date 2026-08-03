@@ -9,10 +9,12 @@ Feature: Embedded panels (EMBED-2)
 
   Scenario: the embedded chat renders and sends against a scoped session
     Given the embed example page is open
+    Then the embedded chat shows its configured opening message
     Then the embedded chat shows a composer
     And the embedded chat uses the shared docked composer
     And the embedded panel set owns one attribution mark
     When I send "hello from the embed" in the embedded chat
+    Then the embedded chat still shows its configured opening message
     Then the embedded transcript shows "hello from the embed"
 
   Scenario: an anonymous embedded chat can start a fresh session

@@ -23,7 +23,9 @@ const mount = document.getElementById("mount");
 function panelMarkup(): string {
     return requestedPanels
         .filter((panel) => ["chat", "viewer", "files", "chats"].includes(panel))
-        .map((panel) => `<gw-${panel}></gw-${panel}>`)
+        .map((panel) => panel === "chat"
+            ? '<gw-chat opening-message="Welcome to the embedded assistant."></gw-chat>'
+            : `<gw-${panel}></gw-${panel}>`)
         .join("");
 }
 

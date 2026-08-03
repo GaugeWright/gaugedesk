@@ -79,6 +79,18 @@ Then("the embedded chat shows a composer", async ({ page }) => {
     await expect(page.locator("[data-embed-send]")).toBeVisible();
 });
 
+Then("the embedded chat shows its configured opening message", async ({ page }) => {
+    await expect(page.locator("[data-embed-transcript]")).toContainText(
+        "Welcome to the embedded assistant.",
+    );
+});
+
+Then("the embedded chat still shows its configured opening message", async ({ page }) => {
+    await expect(page.locator("[data-embed-transcript]")).toContainText(
+        "Welcome to the embedded assistant.",
+    );
+});
+
 Then("the embedded chat shows a new session action", async ({ page }) => {
     await expect(page.locator("[data-new-embed-session]")).toHaveText("New session");
 });

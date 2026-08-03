@@ -10,6 +10,7 @@ import {createSignal, Show, type JSX} from "solid-js";
 import { ChatComposer } from "./ChatComposer";
 import { AudienceChats } from "./AudienceChats";
 import { type FilterPrefs } from "./transcript-filter";
+import { type TranscriptLine } from "./transcript";
 import { TranscriptView } from "./TranscriptView";
 import { type Session, useSession } from "./session-context";
 
@@ -25,6 +26,8 @@ export interface ChatPanelProps {
     readonly pendingSend?: string;
     /** Audience presentation carries deployment-controlled attribution. */
     readonly audience?: boolean;
+    /** Host-authored first assistant line; presentation-only, never runtime truth. */
+    readonly openingMessage?: string;
     /** Desktop already owns the panel container; preserve direct flex children. */
     readonly bare?: boolean;
 }
@@ -103,6 +106,20 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
     // hosts pass a leaf while normal panel mounts consume SessionProvider.
     const ambient = props.session ? undefined : useSession();
     const session = () => props.session ?? ambient!;
+    const lines = (): readonly TranscriptLine[] => {
+        const opening = props.openingMessage?.trim();
+        const transcript = session().transcript().lines;
+        if (!opening) return transcript;
+        return [
+            {
+                seq: -1,
+                tier: "operational",
+                kind: "assistant",
+                text: opening,
+            },
+            ...transcript,
+        ];
+    };
     const body = () => (
         <>
             <Show when={props.audience === true}>
@@ -117,7 +134,7 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                 data-pending-send={props.pendingSend}
             >
                 <TranscriptView
-                    lines={session().transcript().lines}
+                    lines={lines()}
                     onOpen={session().selectFile}
                     prefs={props.prefs}
                     onResolveCredential={props.onResolveCredential}

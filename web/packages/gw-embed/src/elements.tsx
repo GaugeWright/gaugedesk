@@ -518,7 +518,13 @@ export class GwChatElement extends GwPanelElement {
     protected override readonly defaultMinHeight = "520px";
 
     protected view(session: Session): JSX.Element {
-        return <ChatPanel session={session} audience />;
+        return (
+            <ChatPanel
+                session={session}
+                audience
+                openingMessage={this.getAttribute("opening-message") ?? undefined}
+            />
+        );
     }
 }
 

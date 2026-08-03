@@ -16,6 +16,18 @@ only needs to choose how multiple panels are arranged.
 conversation with a fresh deployment session; authenticated visitors can still
 reopen their owned earlier conversations through **Chats**.
 
+Add an optional, pre-filled first assistant line directly in the markup:
+
+```html
+<gw-chat
+  opening-message="Hi, I’m your advisor. What would you like to explore?"
+></gw-chat>
+```
+
+The opening message costs no model turn. It remains visible as the first line of
+the conversation and appears again when the visitor starts a new session. It is
+host-authored presentation content, not a retained model response.
+
 ## Customize the CSS
 
 Customization is optional. The default panel styles are complete and isolated
