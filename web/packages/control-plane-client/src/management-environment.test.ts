@@ -42,6 +42,39 @@ describe("management Environment client", () => {
         expect(route.calls[0]?.[1]).toBe("/environments/administration/changes");
         expect(route.calls[0]?.[3]).toEqual({ idempotencyKey: "edit-1" });
     });
+    it("resolves Hub and Vend through exact served operation tables", async () => {
+        const route = fakeJson({ session });
+        await openManagementEnvironment(route.json, "hub");
+        await openManagementEnvironment(route.json, "vend", {
+            kind: "provider-tenant",
+            id: "provider:one",
+        });
+        expect(route.calls).toEqual([
+            ["POST", "/environments/hub/sessions", {}, undefined],
+            [
+                "POST",
+                "/environments/vend/sessions",
+                { scope: { kind: "provider-tenant", id: "provider:one" } },
+                undefined,
+            ],
+        ]);
+    });
+    it("refuses an unserved Hub or Vend literal-change route before transport", async () => {
+        const route = fakeJson({ receipt: { id: "never" } });
+        const hubSession = { ...session, environment: "hub" as const };
+        await expect(proposeManagementDocumentChange(
+            route.json,
+            {
+                session: hubSession,
+                documentId: "account",
+                baseRevision: "7",
+                content: {},
+                client: "edit",
+            },
+            "edit-unsupported",
+        )).rejects.toThrow("available only in Administration");
+        expect(route.calls).toEqual([]);
+    });
     it("lists and reviews changes through the same scoped session", async () => {
         const route = fakeJson({ changes: [], receipt: { id: "stable" }, change: { id: "change-1" } });
         await listManagementChanges(route.json, session);

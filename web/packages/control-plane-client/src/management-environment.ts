@@ -61,19 +61,73 @@ export interface ManagementAgentMessage {
     readonly text: string;
 }
 
-const root = (environment: ManagementEnvironmentKind) => `/environments/${encodeURIComponent(environment)}`;
+type ManagementRoute = { readonly method: "GET" | "POST"; readonly path: string };
+
+function controlPlaneOperation<M extends ManagementRoute["method"], P extends string>(
+    method: M,
+    path: P,
+): { readonly method: M; readonly path: P } {
+    return { method, path };
+}
+
+const managementRoutes = {
+    hub: {
+        session: controlPlaneOperation("POST", "/environments/hub/sessions"),
+        document: controlPlaneOperation("GET", "/environments/hub/documents/:id"),
+        command: controlPlaneOperation("POST", "/environments/hub/commands"),
+        changes: controlPlaneOperation("GET", "/environments/hub/changes"),
+        agentRead: controlPlaneOperation("GET", "/environments/hub/agent/messages"),
+        agentSend: controlPlaneOperation("POST", "/environments/hub/agent/messages"),
+        review: controlPlaneOperation("POST", "/environments/hub/changes/:id/review"),
+    },
+    administration: {
+        session: controlPlaneOperation("POST", "/environments/administration/sessions"),
+        document: controlPlaneOperation("GET", "/environments/administration/documents/:id"),
+        command: controlPlaneOperation("POST", "/environments/administration/commands"),
+        changes: controlPlaneOperation("GET", "/environments/administration/changes"),
+        agentRead: controlPlaneOperation("GET", "/environments/administration/agent/messages"),
+        agentSend: controlPlaneOperation("POST", "/environments/administration/agent/messages"),
+        review: controlPlaneOperation("POST", "/environments/administration/changes/:id/review"),
+        propose: controlPlaneOperation("POST", "/environments/administration/changes"),
+    },
+    vend: {
+        session: controlPlaneOperation("POST", "/environments/vend/sessions"),
+        document: controlPlaneOperation("GET", "/environments/vend/documents/:id"),
+        command: controlPlaneOperation("POST", "/environments/vend/commands"),
+        changes: controlPlaneOperation("GET", "/environments/vend/changes"),
+        agentRead: controlPlaneOperation("GET", "/environments/vend/agent/messages"),
+        agentSend: controlPlaneOperation("POST", "/environments/vend/agent/messages"),
+        review: controlPlaneOperation("POST", "/environments/vend/changes/:id/review"),
+    },
+} as const;
+
+type CommonManagementRoute = "session" | "document" | "command" | "changes" | "agentRead" | "agentSend" | "review";
+
+function managementRoute(
+    environment: ManagementEnvironmentKind,
+    route: CommonManagementRoute,
+): ManagementRoute {
+    return managementRoutes[environment][route];
+}
+
+function bindRoute(route: ManagementRoute, id: string): string {
+    return route.path.replace(":id", encodeURIComponent(id));
+}
 
 export async function openManagementEnvironment(json: RouteJson, environment: ManagementEnvironmentKind, scope?: ManagementEnvironmentScope): Promise<ManagementEnvironmentSession> {
-    const value = await json("POST", `${root(environment)}/sessions`, scope ? { scope } : {});
+    const route = managementRoute(environment, "session");
+    const value = await json(route.method, route.path, scope ? { scope } : {});
     return (value as { session: ManagementEnvironmentSession }).session;
 }
 export async function readManagementDocument(json: RouteJson, session: ManagementEnvironmentSession, documentId: string): Promise<ManagementDocumentProjection> {
     const query = new URLSearchParams({ session: session.id, scope: session.scope.id });
-    const value = await json("GET", `${root(session.environment)}/documents/${encodeURIComponent(documentId)}?${query}`);
+    const route = managementRoute(session.environment, "document");
+    const value = await json(route.method, `${bindRoute(route, documentId)}?${query}`);
     return (value as { document: ManagementDocumentProjection }).document;
 }
 export async function submitManagementCommand(json: RouteJson, envelope: ManagementCommandEnvelope, idempotencyKey: string): Promise<ManagementEnvironmentReceipt> {
-    const value = await json("POST", `${root(envelope.environment)}/commands`, envelope, { idempotencyKey });
+    const route = managementRoute(envelope.environment, "command");
+    const value = await json(route.method, route.path, envelope, { idempotencyKey });
     return (value as { receipt: ManagementEnvironmentReceipt }).receipt;
 }
 export async function proposeManagementDocumentChange(
@@ -81,7 +135,11 @@ export async function proposeManagementDocumentChange(
     input: { readonly session: ManagementEnvironmentSession; readonly documentId: string; readonly baseRevision: string; readonly content: unknown; readonly client: ManagementEnvironmentClient },
     idempotencyKey: string,
 ): Promise<ManagementEnvironmentReceipt> {
-    const value = await json("POST", `${root(input.session.environment)}/changes`, {
+    if (input.session.environment !== "administration") {
+        throw new Error("literal document changes are available only in Administration");
+    }
+    const route = managementRoutes.administration.propose;
+    const value = await json(route.method, route.path, {
         session_id: input.session.id, environment: input.session.environment, scope: input.session.scope,
         document_id: input.documentId, base_revision: input.baseRevision, content: input.content, client: input.client,
     }, { idempotencyKey });
@@ -90,7 +148,8 @@ export async function proposeManagementDocumentChange(
 
 export async function listManagementChanges(json: RouteJson, session: ManagementEnvironmentSession): Promise<readonly ManagementEnvironmentChange[]> {
     const query = new URLSearchParams({ session: session.id, scope: session.scope.id });
-    const value = await json("GET", `${root(session.environment)}/changes?${query}`);
+    const route = managementRoute(session.environment, "changes");
+    const value = await json(route.method, `${route.path}?${query}`);
     return (value as { changes: readonly ManagementEnvironmentChange[] }).changes;
 }
 
@@ -99,7 +158,8 @@ export async function sendManagementAgentMessage(
     session: ManagementEnvironmentSession,
     message: string,
 ): Promise<ManagementAgentTurn> {
-    const value = await json("POST", `${root(session.environment)}/agent/messages`, {
+    const route = managementRoute(session.environment, "agentSend");
+    const value = await json(route.method, route.path, {
         session_id: session.id,
         scope: session.scope,
         message,
@@ -112,7 +172,8 @@ export async function listManagementAgentMessages(
     session: ManagementEnvironmentSession,
 ): Promise<readonly ManagementAgentMessage[]> {
     const query = new URLSearchParams({ session: session.id, scope: session.scope.id });
-    const value = await json("GET", `${root(session.environment)}/agent/messages?${query}`);
+    const route = managementRoute(session.environment, "agentRead");
+    const value = await json(route.method, `${route.path}?${query}`);
     return (value as { transcript: readonly ManagementAgentMessage[] }).transcript;
 }
 
@@ -124,7 +185,8 @@ export async function reviewManagementChange(
     idempotencyKey: string,
     client: ManagementEnvironmentClient = "browser",
 ): Promise<{ readonly receipt: ManagementEnvironmentReceipt; readonly change: ManagementEnvironmentChange; readonly result?: unknown }> {
-    return await json("POST", `${root(session.environment)}/changes/${encodeURIComponent(changeId)}/review`, {
+    const route = managementRoute(session.environment, "review");
+    return await json(route.method, bindRoute(route, changeId), {
         session_id: session.id, environment: session.environment, scope: session.scope, decision, client,
     }, { idempotencyKey }) as { readonly receipt: ManagementEnvironmentReceipt; readonly change: ManagementEnvironmentChange; readonly result?: unknown };
 }
