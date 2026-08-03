@@ -53,7 +53,11 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
         .merge(gaugewright_app::local_routes::routes(federation_on))
         .merge(gaugewright_app::home_routes::routes())
         .merge(routes())
-        .merge(gaugewright_app::account_routes::routes())
+        // A shared authenticated process may expose person-scoped account
+        // records and runtime credentials, but not sovereign library sync: that
+        // operation signs/opens with the co-resident desktop's root key.
+        .merge(gaugewright_app::account_routes::hub_routes())
+        .merge(gaugewright_app::account_routes::runtime_credential_routes())
         .merge(gaugewright_app::facility_routes::routes())
         .merge(gaugewright_app::mobile_machine_session::routes())
         // Materialize non-environment mutation idempotency inside the

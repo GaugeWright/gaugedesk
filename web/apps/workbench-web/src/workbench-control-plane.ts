@@ -936,6 +936,15 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.readQuarantinedItem(this.workbenchTransport(), project, item);
     }
 
+    screenQuarantinedItem(project: string, item: string, chat: EngagementId) {
+        return workbenchClient.screenQuarantinedItem(
+            this.workbenchTransport(),
+            project,
+            item,
+            chat,
+        );
+    }
+
     reviewQuarantinedItem(
         project: string,
         item: string,

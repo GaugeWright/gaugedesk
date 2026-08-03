@@ -1206,7 +1206,7 @@ pub struct AttestationPayload {
     pub nonce: String,
     /// The freshness challenge the verifier issued and requires the report to echo
     /// (anti-replay). Defaults to `nonce` when the caller does not separate them —
-    /// a real flow carries the challenge from a separate `/challenge` issue; the
+    /// a real flow carries a server-issued challenge from the attestation client; the
     /// loopback route lets a test supply a mismatching pair to exercise `StaleNonce`.
     #[serde(default)]
     pub expected_nonce: Option<String>,
@@ -1232,35 +1232,6 @@ pub struct AcceptBoundary {
     /// Present iff this is an *attested* acceptance; absent ⇒ unattested.
     #[serde(default)]
     pub attestation: Option<AttestationPayload>,
-}
-
-/// Body for `POST /boundaries/:bid/challenge`.
-#[derive(Deserialize)]
-pub struct ChallengeRequest {
-    /// The participant the challenge is minted for — it must bind this nonce into its
-    /// attestation report before accepting.
-    pub participant: String,
-}
-
-/// `POST /boundaries/:bid/challenge` — mint a fresh, server-chosen freshness nonce for
-/// `participant` and record it (ADR 0049, real anti-replay). The host must bind **this**
-/// nonce into its attestation `report_data`; [`accept_boundary`] then checks the quote
-/// against the recorded challenge, never a caller-supplied value, so a replayed stale
-/// quote (carrying an old nonce) can never satisfy freshness. Returns `{ "nonce": … }`.
-pub async fn issue_boundary_challenge(
-    State(wb): State<SharedWorkbench>,
-    Path(bid): Path<String>,
-    Json(body): Json<ChallengeRequest>,
-) -> impl IntoResponse {
-    let mut wb = wb.lock_unpoisoned();
-    match wb.issue_boundary_challenge(&bid, &body.participant) {
-        Ok(nonce) => (StatusCode::OK, Json(json!({ "nonce": nonce }))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("{e:?}") })),
-        )
-            .into_response(),
-    }
 }
 
 fn boundary_accept_err(e: BoundaryAcceptError) -> axum::response::Response {

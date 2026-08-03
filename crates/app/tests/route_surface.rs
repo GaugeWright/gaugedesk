@@ -232,6 +232,26 @@ async fn test_only_harness_routes_refuse_without_activation_guard() {
     }
 }
 
+/// Library sync is intentionally part of the co-resident desktop surface: the
+/// handler must be reachable there even when no facility has been activated.
+/// A 409 is the real handler's fail-closed answer; 404/405 would mean the UI and
+/// router have drifted apart again.
+#[tokio::test]
+async fn local_library_sync_routes_reach_the_desktop_handler() {
+    let (_dir, app) = control_plane();
+    for path in ["/account/library-sync", "/account/library-sync/pull"] {
+        let (status, response) = send(&app, "POST", path, Some(json!({}).to_string())).await;
+        assert_eq!(
+            status, 409,
+            "{path} did not reach its inactive-facility guard: {response}"
+        );
+        assert!(
+            response.contains("library sync") && response.contains("not active"),
+            "{path} did not return the library-sync authority refusal: {response}",
+        );
+    }
+}
+
 /// DR-0051 retires provisional federation drivers once the shipped Engagement
 /// operations subsume them. They must remain absent instead of silently returning
 /// as undocumented compatibility surface or browser-test shortcuts.
@@ -258,6 +278,65 @@ async fn dormant_federation_facades_are_unreachable() {
             Some(json!({}).to_string()),
         ),
         ("POST", "/federation/restore", Some(json!({}).to_string())),
+        ("POST", "/federation/erase", Some(json!({}).to_string())),
+        ("GET", "/federation/erase/queue", None),
+        (
+            "POST",
+            "/federation/erase/term",
+            Some(json!({}).to_string()),
+        ),
+    ] {
+        let (status, response) = send(&app, method, path, body).await;
+        assert_eq!(status, 404, "{method} {path} unexpectedly remained routed");
+        assert!(
+            response.trim().is_empty(),
+            "{method} {path} reached a handler: {response}",
+        );
+    }
+}
+
+/// Attested boundary acceptance remains a deferred internal primitive until a
+/// shipped attestation client can bind a server nonce into a real quote. The
+/// former handler-only challenge route must not survive as compatibility API.
+#[tokio::test]
+async fn unconsumed_attestation_challenge_facade_is_unreachable() {
+    let (_dir, app) = control_plane();
+    let (status, response) = send(
+        &app,
+        "POST",
+        "/boundaries/boundary-1/challenge",
+        Some(json!({ "participant": "device-1" }).to_string()),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "attestation challenge unexpectedly remained routed"
+    );
+    assert!(
+        response.trim().is_empty(),
+        "challenge reached a handler: {response}"
+    );
+}
+
+/// The carrier-neutral reducer remains, but the former mock-carrier HTTP
+/// service had no native client or APNs/FCM adapter. Release routers must not
+/// expose that test driver while the real provider slice is deferred.
+#[tokio::test]
+async fn unconsumed_mobile_wake_facades_are_unreachable() {
+    let (_dir, app) = control_plane();
+    for (method, path, body) in [
+        (
+            "POST",
+            "/account/mobile/installations",
+            Some(json!({}).to_string()),
+        ),
+        (
+            "DELETE",
+            "/account/mobile/installations/device-1",
+            Some(json!({}).to_string()),
+        ),
+        ("GET", "/account/mobile/wakes", None),
+        ("POST", "/mobile/wakes", Some(json!({}).to_string())),
     ] {
         let (status, response) = send(&app, method, path, body).await;
         assert_eq!(status, 404, "{method} {path} unexpectedly remained routed");

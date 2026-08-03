@@ -249,9 +249,6 @@ pub(crate) fn routes() -> axum::Router<SharedWorkbench> {
         .route("/federation/run/place", post(post_run_place))
         .route("/federation/run/queue", get(get_run_queue))
         // Cross-authority erasure-on-revocation (ERASE-1, ADR 0067).
-        .route("/federation/erase", post(post_erase))
-        .route("/federation/erase/queue", get(get_erase_queue))
-        .route("/federation/erase/term", post(post_erase_term))
         .route("/federation/run/allow", post(post_run_allow))
         .route("/federation/run/deny", post(post_run_deny))
         .route("/federation/run/admit-once", post(post_run_admit_once))
@@ -4146,6 +4143,7 @@ fn erase_term_granted(store: &Store, peer: &str) -> bool {
 
 /// Grant/withdraw the standing erasure term for `peer` (the pre-agreed term, recorded at
 /// pairing or by the home's operator). `allow=false` withdraws it.
+#[cfg(test)]
 fn set_erase_term(store: &mut Store, peer: &str, allow: bool) {
     let rec = serde_json::json!({ "peer": peer, "allow": allow });
     let _ = store.append_record(ERASE_TERM_SCOPE, "peer", &rec.to_string());
@@ -4172,6 +4170,7 @@ fn record_pending_erase(
 
 /// The pending (un-honored) erasure requests — the home's "an upstream asked to erase this"
 /// list, for the operator to act on. Handles + basis only, never payload.
+#[cfg(test)]
 fn pending_erasures(store: &Store) -> Vec<serde_json::Value> {
     store
         .records(ERASE_QUEUE_SCOPE, "event")
@@ -4339,123 +4338,6 @@ async fn erasure_serve_once(
     write_frame(&mut tls, &out).await?;
     let _ = tls.shutdown().await;
     Ok(())
-}
-
-#[derive(Deserialize)]
-pub struct EraseRequest {
-    pub peer: String,
-    pub engagement: String,
-    pub resource: String,
-    #[serde(default)]
-    pub basis: String,
-}
-
-/// `POST /federation/erase` — the upstream places an erasure request on a paired home:
-/// erase the named resource. Returns `erased` if the home holds a standing erasure term
-/// (its local lifecycle tombstoned the payload), else `pending` (queued, request-only —
-/// fail-closed, no auto-erase). Future-only; already-exported copies are final (`INV-18`).
-pub async fn post_erase(
-    State(wb): State<SharedWorkbench>,
-    Json(req): Json<EraseRequest>,
-) -> impl IntoResponse {
-    let peer = AuthorityId::new(&req.peer);
-    let correlation = crate::library::gen_id("erase");
-    let (broker, me, subkey, delegation, pins, paired) = {
-        let guard = wb.lock_unpoisoned();
-        let me = guard.authority().clone();
-        let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
-        let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
-        match guard.federation_ref() {
-            Some(fed) => (
-                fed.broker_addr.clone(),
-                me,
-                subkey,
-                delegation,
-                fed.pins_arc(),
-                fed.grant_for(peer.as_str()).is_some(),
-            ),
-            None => {
-                return (StatusCode::SERVICE_UNAVAILABLE, "federation not configured")
-                    .into_response()
-            }
-        }
-    };
-    if !paired {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("not paired with {}", req.peer),
-        )
-            .into_response();
-    }
-    let signed_bytes = erase_bytes(&correlation);
-    let wire = EraseWire {
-        correlation: correlation.clone(),
-        engagement: req.engagement.clone(),
-        resource: req.resource.clone(),
-        basis: req.basis.clone(),
-        source: me.as_str().to_string(),
-        target: peer.as_str().to_string(),
-        signature: subkey.sign(&signed_bytes),
-        source_pubkey: subkey.public_key().as_str().to_string(),
-        signed_bytes,
-        delegation: Some(delegation.clone()),
-    };
-    let token = erase_token(me.as_str(), peer.as_str());
-    let send = async {
-        let tcp = join_relay(&broker, &token).await?;
-        let mut tls = tls_connect(tcp, &peer, pins).await?;
-        write_frame(&mut tls, &serde_json::to_vec(&wire).unwrap()).await?;
-        let vbytes = read_frame(&mut tls).await?;
-        let _ = tls.shutdown().await;
-        serde_json::from_slice::<EraseVerdict>(&vbytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-    };
-    match send.await {
-        Ok(v) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": v.status,
-                "correlation": correlation,
-                "reason": v.reason,
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            format!("erase request failed: {e}"),
-        )
-            .into_response(),
-    }
-}
-
-/// `GET /federation/erase/queue` — the home's request-only erasure queue (upstream asks it
-/// has not auto-honored): source + engagement + resource + basis (`INV-10`).
-pub async fn get_erase_queue(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
-    let guard = wb.lock_unpoisoned();
-    Json(serde_json::json!({ "queue": pending_erasures(guard.store_ref()) }))
-}
-
-#[derive(Deserialize)]
-pub struct EraseTermRequest {
-    pub peer: String,
-    #[serde(default)]
-    pub allow: bool,
-}
-
-/// `POST /federation/erase/term` — the home grants/withdraws a standing erasure term for a
-/// peer (the pre-agreed "policy-authorized erasure authority"). With it, the peer's erasure
-/// crossings are auto-honored; without it they are queued request-only.
-pub async fn post_erase_term(
-    State(wb): State<SharedWorkbench>,
-    Json(req): Json<EraseTermRequest>,
-) -> impl IntoResponse {
-    let mut guard = wb.lock_unpoisoned();
-    set_erase_term(guard.store_mut(), &req.peer, req.allow);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "peer": req.peer, "allow": req.allow })),
-    )
-        .into_response()
 }
 
 /// `GET /federation/run/queue` — the host's admission queue: operator runs awaiting a

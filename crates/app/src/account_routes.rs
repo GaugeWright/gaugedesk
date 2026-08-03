@@ -73,10 +73,14 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
         )
         .route("/account/home-routes/:project", delete(delete_home_route))
         .merge(managed_inference_routes())
-        .merge(crate::mobile_wake_runtime::hub_routes())
-        // Library sync (ADR 0054 / the library_sync facility, ADR 0077): publish this account's
-        // sealed state to the blind directory / pull + merge from it. No-op unless the facility is
-        // active and GAUGEWRIGHT_DIRECTORY_URL is set. Signs with the workbench's root key (desktop).
+}
+
+/// Library sync is a sovereign-desktop operation: it signs and opens account
+/// state with the root key held by this exact Workbench process. A shared Hub
+/// must not mount these routes under a person session and accidentally use its
+/// process-default key for an unrelated person.
+fn library_sync_routes() -> Router<SharedWorkbench> {
+    Router::new()
         .route("/account/library-sync", post(post_library_sync_publish))
         .route("/account/library-sync/pull", post(post_library_sync_pull))
 }
@@ -84,7 +88,9 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
 /// Complete co-resident/local account surface. Hosted compositions choose the
 /// blind Hub and runtime-credential subsets independently.
 pub fn routes() -> Router<SharedWorkbench> {
-    hub_routes().merge(runtime_credential_routes())
+    hub_routes()
+        .merge(runtime_credential_routes())
+        .merge(library_sync_routes())
 }
 
 /// Runtime credential subset. A hosted Home mounts this so provider material

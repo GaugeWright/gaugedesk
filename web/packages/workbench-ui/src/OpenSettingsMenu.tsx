@@ -26,6 +26,9 @@ export function SettingsMenu(props: {
     codexLoginAvailable?: boolean;
     /** Whether this composition owns managed-plan mutations locally. */
     managedInferenceEditable?: boolean;
+    /** Whether this composition holds the sovereign desktop root key needed
+     * for library publish/pull. */
+    librarySyncAvailable?: boolean;
     /** A monotonically increasing counter; each increment opens the Account panel.
      *  Lets another surface (e.g. an in-chat "no model" prompt) open settings. */
     openAccount?: Accessor<number>;
@@ -194,6 +197,7 @@ export function SettingsMenu(props: {
                     api={props.api}
                     codexLoginAvailable={props.codexLoginAvailable}
                     managedInferenceEditable={props.managedInferenceEditable}
+                    librarySyncAvailable={props.librarySyncAvailable}
                     onClose={() => setAccountOpen(false)}
                 />
             </Show>

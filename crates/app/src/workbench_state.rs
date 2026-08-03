@@ -149,8 +149,6 @@ pub struct Workbench {
     /// Machine-scoped controller invitations, challenges, and short-lived
     /// sessions. Durable grant records live in `store`; raw credentials do not.
     pub(crate) machine_controllers: crate::mobile_machine_session::MachineControllerRuntime,
-    /// Carrier-neutral installation/wake state plus the in-process mock carrier.
-    pub(crate) mobile_wakes: crate::mobile_wake_runtime::MobileWakeRuntime,
 }
 
 pub type SharedWorkbench = Arc<Mutex<Workbench>>;
@@ -320,7 +318,6 @@ impl Workbench {
             enroll_broker: None,
             recovered_account_key: None,
             machine_controllers: crate::mobile_machine_session::MachineControllerRuntime::default(),
-            mobile_wakes: crate::mobile_wake_runtime::MobileWakeRuntime::default(),
         }
     }
 

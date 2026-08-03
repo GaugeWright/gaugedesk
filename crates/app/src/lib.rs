@@ -62,7 +62,6 @@ pub mod managed_inference;
 pub mod measurement_store;
 pub mod mobile_bridge;
 pub mod mobile_machine_session;
-pub mod mobile_wake_runtime;
 pub mod net_http;
 pub mod net_relay;
 pub mod net_server;

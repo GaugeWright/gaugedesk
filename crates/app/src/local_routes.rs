@@ -146,10 +146,6 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         )
         .route("/placements/:id", get(life::get_instance))
         .route("/placements/:id/command", post(life::post_instance_command))
-        .route(
-            "/boundaries/:bid/challenge",
-            post(lr::issue_boundary_challenge),
-        )
         .route("/boundaries/:bid/accept", post(lr::accept_boundary))
         .route("/pairing-requests", post(lr::create_pairing_request))
         .route("/pairing-status/:id", get(lr::get_pairing_status))

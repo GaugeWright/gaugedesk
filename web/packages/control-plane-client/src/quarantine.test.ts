@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
     listQuarantine,
     parseQuarantinedItem,
+    screenQuarantinedItem,
     type WorkbenchTransport,
 } from "./control-plane-workbench";
 
@@ -65,5 +66,22 @@ describe("quarantine transport boundary", () => {
             ],
         });
         expect(json).toHaveBeenCalledWith("GET", "/projects/project-a/quarantine");
+    });
+
+    it("starts the gate through the exact production screen route", async () => {
+        const json = vi.fn(async () => ({ workspace_path: null, parked: true }));
+        const transport = { base: "", json } as unknown as WorkbenchTransport;
+
+        await expect(screenQuarantinedItem(
+            transport,
+            "project/a",
+            "session:1",
+            "chat-review",
+        )).resolves.toEqual({ workspacePath: null, parked: true });
+        expect(json).toHaveBeenCalledWith(
+            "POST",
+            "/projects/project%2Fa/quarantine/session%3A1/screen",
+            { chat_id: "chat-review" },
+        );
     });
 });

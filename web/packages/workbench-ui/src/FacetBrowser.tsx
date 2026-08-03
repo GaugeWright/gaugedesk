@@ -155,6 +155,7 @@ export function FacetBrowser(props: {
         projectName: string;
         placementId: PlacementId;
         archetypeName: string;
+        reviewChatId?: EngagementId;
     }) => void;
     onAttachTarget?: (id: ProjectId, name: string, kind: "external-vcs" | "external-folder") => void;
     onOpenForkTree: (chat: EngagementId) => void;
@@ -901,6 +902,7 @@ export function FacetBrowser(props: {
                     projectName: p.name,
                     placementId: pl.placementId,
                     archetypeName: pl.archetypeName,
+                    reviewChatId: pl.chats[0]?.id,
                 }),
             }]
             : []),

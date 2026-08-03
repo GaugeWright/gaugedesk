@@ -333,6 +333,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         projectName: string;
         placementId: import("@gaugewright/control-plane-client").PlacementId;
         archetypeName: string;
+        reviewChatId?: EngagementId;
     } | null>(null);
 
     // Mirror the workspace *live* across clients over the workspace event stream
@@ -1515,6 +1516,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 placementPolicy={props.placementPolicy}
                 codexLoginAvailable={codexLoginAvailable}
                 managedInferenceEditable={import.meta.env.VITE_HOME_SPLIT !== "true"}
+                librarySyncAvailable={import.meta.env.VITE_HOME_SPLIT !== "true"}
                 openAccount={accountRequest}
                 openInvite={inviteDeepLink}
                 onSignOut={signOutAccount}

@@ -3954,16 +3954,6 @@ impl Workbench {
         Ok(Some(Self::pairing_status_json(&state)))
     }
 
-    pub(crate) fn issue_boundary_challenge(
-        &mut self,
-        boundary_id: &str,
-        participant: &str,
-    ) -> Result<String, AdmitError> {
-        let nonce = crate::challenge::fresh_nonce();
-        crate::challenge::issue(self.store_mut(), boundary_id, participant, &nonce)?;
-        Ok(nonce)
-    }
-
     fn boundary_accept_value(
         state: &BoundaryState,
         participant: &str,

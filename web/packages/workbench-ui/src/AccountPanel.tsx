@@ -102,6 +102,9 @@ export function AccountPanel(props: {
     /** Hosted billing owns managed-plan writes; those compositions project the
      * plan and usage here but must not offer the local self-managed editor. */
     managedInferenceEditable?: boolean;
+    /** Library sync requires the sovereign root key held by the co-resident
+     * desktop. Shared hosted sessions must not offer this process-local action. */
+    librarySyncAvailable?: boolean;
     onClose: () => void;
 }): JSX.Element {
     const [tick, setTick] = createSignal(0);
@@ -706,38 +709,40 @@ export function AccountPanel(props: {
                     </div>
                 </section>
 
-                <section class="admin-section" data-library-sync>
-                    <h4>Library sync</h4>
-                    <p class="muted">
-                        Keep sealed account settings and opaque Home routes available when this
-                        device is offline. GaugeWright's blind directory can route and store the
-                        ciphertext, but cannot open it.
-                    </p>
-                    <Show
-                        when={librarySync()}
-                        fallback={<button
-                            type="button"
-                            class="tree-action"
-                            data-library-sync-enable
-                            onClick={() => void enableLibrarySync()}
+                <Show when={props.librarySyncAvailable}>
+                    <section class="admin-section" data-library-sync>
+                        <h4>Library sync</h4>
+                        <p class="muted">
+                            Keep sealed account settings and opaque Home routes available when this
+                            device is offline. GaugeWright's blind directory can route and store the
+                            ciphertext, but cannot open it.
+                        </p>
+                        <Show
+                            when={librarySync()}
+                            fallback={<button
+                                type="button"
+                                class="tree-action"
+                                data-library-sync-enable
+                                onClick={() => void enableLibrarySync()}
+                            >
+                                enable and publish
+                            </button>}
                         >
-                            enable and publish
-                        </button>}
-                    >
-                        <div class="member-row">
-                            <span><span class="badge">active</span></span>
-                            <button type="button" class="tree-action" data-library-sync-publish onClick={() => void publishLibrarySync()}>
-                                publish now
-                            </button>
-                            <button type="button" class="tree-action" data-library-sync-pull onClick={() => void pullLibrarySync()}>
-                                pull now
-                            </button>
-                            <button type="button" class="tree-action" data-library-sync-disable onClick={() => void disableLibrarySync()}>
-                                disable
-                            </button>
-                        </div>
-                    </Show>
-                </section>
+                            <div class="member-row">
+                                <span><span class="badge">active</span></span>
+                                <button type="button" class="tree-action" data-library-sync-publish onClick={() => void publishLibrarySync()}>
+                                    publish now
+                                </button>
+                                <button type="button" class="tree-action" data-library-sync-pull onClick={() => void pullLibrarySync()}>
+                                    pull now
+                                </button>
+                                <button type="button" class="tree-action" data-library-sync-disable onClick={() => void disableLibrarySync()}>
+                                    disable
+                                </button>
+                            </div>
+                        </Show>
+                    </section>
+                </Show>
 
                 {/* Trusted devices */}
                 <section class="admin-section">

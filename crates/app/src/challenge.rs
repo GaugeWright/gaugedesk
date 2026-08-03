@@ -6,8 +6,8 @@
 //! `gaugewright-cloud-attestation`). For that to actually prevent replay, the nonce must be
 //! chosen by the **server**, not supplied by the caller — otherwise an attacker simply
 //! replays an old quote and claims its own "expected" nonce. So the accept flow is:
-//! the client first `POST`s `/boundaries/:bid/challenge`, the server mints an
-//! unpredictable nonce and records it per `(boundary, participant)`, the host produces
+//! an attestation client must first ask the server to mint an unpredictable nonce
+//! and record it per `(boundary, participant)`, then the host produces
 //! a quote binding *that* nonce, and the accept route checks the quote against the
 //! recorded challenge — never a caller-claimed value. A stale quote carries an old
 //! nonce and can never match the current challenge.
@@ -15,6 +15,9 @@
 //! The challenge is a store record (latest-wins per participant); issuing/looking up is
 //! pure over the store, so the nonce is passed in here and the route supplies a fresh
 //! random one ([`fresh_nonce`]) — keeping this module deterministic and unit-testable.
+//! The primitive is intentionally not routed until a shipped attestation client owns
+//! the complete challenge/quote/accept ceremony; the former handler-only route was
+//! removed under DR-0051 rather than retained as compatibility surface.
 
 use gaugewright_store::{AdmitError, Store};
 

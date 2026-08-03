@@ -151,7 +151,6 @@ pub fn routes() -> Router<SharedWorkbench> {
         .route("/mobile/sessions", post(post_session))
         .route("/mobile/controllers", get(get_controllers))
         .route("/mobile/controllers/:id/revoke", post(post_revoke))
-        .merge(crate::mobile_wake_runtime::home_routes())
 }
 
 #[derive(Deserialize)]

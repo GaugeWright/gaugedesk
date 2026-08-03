@@ -2,6 +2,7 @@ import { createEffect, createSignal, For, onCleanup, onMount, Show, type JSX } f
 import type {
     AgentAbility,
     CollectionRecipient,
+    EngagementId,
     ManagedInferenceBilling,
     PlacementId,
     ProvisionPublicCredentialInput,
@@ -49,6 +50,12 @@ export interface DeploymentPanelApi {
         schema_ref: string;
         admission_scope: string;
     }): Promise<{ landed: readonly string[]; refused: readonly unknown[] }>;
+    /** Start the installed project gate for one newly landed item. */
+    screenQuarantinedItem?(
+        project: string,
+        item: string,
+        chat: EngagementId,
+    ): Promise<{ workspacePath: string | null; parked: boolean }>;
 }
 
 export interface DeploymentSelection {
@@ -57,6 +64,10 @@ export interface DeploymentSelection {
     readonly projectName: string;
     readonly placementId: PlacementId;
     readonly archetypeName: string;
+    /** An existing chat on the deployed placement that owns gate execution and
+     * receives approved material. Absent means publishing is available but a
+     * collection cannot yet be drained. */
+    readonly reviewChatId?: EngagementId;
 }
 
 const allPanels = ["gw-chat", "gw-viewer", "gw-files", "gw-chats"] as const;
@@ -190,7 +201,9 @@ export function DeploymentPanel(props: {
     async function drain() {
         const published = outcome();
         const recipient = selectedRecipient();
-        if (!published || !recipient || !props.api.drainCollections) return;
+        const reviewChat = props.selection.reviewChatId;
+        if (!published || !recipient || !props.api.drainCollections || !reviewChat
+            || !props.api.screenQuarantinedItem) return;
         setDrainBusy(true);
         setDrainResult("");
         try {
@@ -213,10 +226,20 @@ export function DeploymentPanel(props: {
             // one protection the whole path exists for.
             const landed = result.landed.length;
             const refused = result.refused.length;
+            const screened = await Promise.allSettled(result.landed.map((item) =>
+                props.api.screenQuarantinedItem!(
+                    props.selection.projectId,
+                    item,
+                    reviewChat,
+                )));
+            const screenFailures = screened.filter((entry) => entry.status === "rejected").length;
             setDrainResult(
                 landed === 0 && refused === 0
                     ? "Nothing was waiting."
-                    : `${landed} item(s) into quarantine, awaiting the project's gate.`
+                    : `${landed} item(s) into quarantine; the project's gate started.`
+                        + (screenFailures > 0
+                            ? ` ${screenFailures} gate start(s) failed; the items remain quarantined.`
+                            : "")
                         + (refused > 0 ? ` ${refused} refused and left with the deployment.` : ""),
             );
         } catch (reason) {
@@ -855,12 +878,18 @@ export function DeploymentPanel(props: {
                                 can read it there; it reaches the workspace only through the
                                 project's gate.
                             </p>
+                            <Show when={props.selection.reviewChatId && props.api.screenQuarantinedItem}
+                                fallback={<p class="settings-hint" data-drain-blocked>
+                                    Start a chat on this placement before draining so the project's
+                                    gate has an explicit review destination.
+                                </p>}>
                             <div class="deployment-actions">
                                 <button type="button" disabled={drainBusy() || busy()}
                                     onClick={() => void drain()}>
                                     {drainBusy() ? "Draining…" : "Drain into quarantine"}
                                 </button>
                             </div>
+                            </Show>
                             <Show when={drainResult()}>
                                 <p class="settings-hint" data-drain-result>{drainResult()}</p>
                             </Show>

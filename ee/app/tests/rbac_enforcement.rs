@@ -448,6 +448,29 @@ async fn enterprise_mode_gates_admin_routes_by_role() {
     assert!(body["members"].as_array().unwrap().len() >= 2);
 }
 
+/// The hosted enterprise router authenticates people into one shared process.
+/// Library sync signs and opens with a sovereign account root held by one local
+/// Workbench, so mounting it here would let any accepted person operate on the
+/// process-default account instead of their own. It is desktop-only until a
+/// person-bound custody mechanism exists.
+#[tokio::test]
+async fn hosted_account_session_cannot_reach_process_default_library_sync_key() {
+    let (_dir, app) = workbench_with_idp();
+    for path in ["/account/library-sync", "/account/library-sync/pull"] {
+        let (status, body) = send(&app, "POST", path, Some("{}"), Some("owner-token")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{path} reached hosted state: {body}"
+        );
+        assert_eq!(
+            body,
+            Value::Null,
+            "{path} returned a hosted handler response"
+        );
+    }
+}
+
 #[tokio::test]
 async fn capability_discovery_is_tenant_scoped_and_role_derived() {
     let (_dir, app) = workbench_with_idp();

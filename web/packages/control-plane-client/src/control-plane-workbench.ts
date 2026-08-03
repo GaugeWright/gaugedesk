@@ -1447,6 +1447,32 @@ export async function readQuarantinedItem(
     return res.text();
 }
 
+/** Start the project's installed gate over one quarantined item.
+ *
+ * This is deliberately separate from review: the first pass may settle the
+ * item or park a question on a person. Sending a human verdict before this
+ * call creates no vouched queue and therefore cannot settle anything.
+ */
+export async function screenQuarantinedItem(
+    transport: WorkbenchTransport,
+    project: string,
+    item: string,
+    chat: string,
+): Promise<{ workspacePath: string | null; parked: boolean }> {
+    const o = (await transport.json(
+        "POST",
+        `/projects/${encodeURIComponent(project)}/quarantine/${encodeURIComponent(item)}/screen`,
+        { chat_id: chat },
+    )) as { workspace_path?: unknown; parked?: unknown };
+    if (typeof o.parked !== "boolean") {
+        throw new Error("quarantine screening result was malformed");
+    }
+    return {
+        workspacePath: typeof o.workspace_path === "string" ? o.workspace_path : null,
+        parked: o.parked,
+    };
+}
+
 /** A reviewer's verdict on one item. The route hands it to the project's gate,
  *  which is the only producer of a verdict (ADR 0117 §1) — this client never
  *  decides, it carries the answer. */
