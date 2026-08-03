@@ -1,12 +1,12 @@
 import { createBdd } from "playwright-bdd";
 import {
-    installAuthenticatedTransportProof,
-    type AuthenticatedTransportProof,
+    installTransportProof,
+    type TransportProof,
 } from "../authenticated-transport-proof";
 import { installTransportFidelityGuards } from "../fidelity-guard";
 
 const { Before, After } = createBdd();
-const authenticatedProofs = new WeakMap<object, AuthenticatedTransportProof>();
+const transportProofs = new WeakMap<object, TransportProof>();
 
 Before(
     {
@@ -20,27 +20,30 @@ Before(
 
 Before(
     {
-        name: "observe authenticated transport",
-        tags: "@authenticated",
+        name: "observe application transport",
+        tags: "@transport or @staging or @production",
     },
     async ({ page, request }) => {
-        authenticatedProofs.set(page, installAuthenticatedTransportProof(page, request));
+        transportProofs.set(page, installTransportProof(page, request));
     },
 );
 
 After(
     {
-        name: "require successful authenticated transport",
-        tags: "@authenticated",
+        name: "require declared application transport",
+        tags: "@transport or @staging or @production",
     },
-    async ({ page }) => {
-        const proof = authenticatedProofs.get(page);
-        if (!proof) throw new Error("@authenticated scenario did not install its transport proof");
+    async ({ page, $tags }) => {
+        const proof = transportProofs.get(page);
+        if (!proof) throw new Error("real-transport scenario did not install its proof");
         try {
-            await proof.assertSuccessfulCredentialedRequest();
+            await proof.assertSuccessfulApplicationRequest();
+            if ($tags.includes("@authenticated")) {
+                await proof.assertSuccessfulCredentialedRequest();
+            }
         } finally {
             proof.restore();
-            authenticatedProofs.delete(page);
+            transportProofs.delete(page);
         }
     },
 );

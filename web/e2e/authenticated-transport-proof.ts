@@ -1,9 +1,8 @@
 import type { APIRequestContext, APIResponse, Page, Response } from "@playwright/test";
-import { aliceCP, bobCP, enterpriseAppURL, enterpriseCP, previewURL } from "./ports.mjs";
+import { aliceCP, bobCP, enterpriseCP } from "./ports.mjs";
 
-const APPLICATION_ORIGINS = new Set(
-    [aliceCP, bobCP, enterpriseCP, enterpriseAppURL, previewURL]
-        .map((value) => new URL(value).origin),
+const APPLICATION_SERVICE_ORIGINS = new Set(
+    [aliceCP, bobCP, enterpriseCP].map((value) => new URL(value).origin),
 );
 const API_METHODS = ["fetch", "get", "post", "put", "patch", "delete", "head"] as const;
 
@@ -14,7 +13,8 @@ type HeaderInput =
 
 type ApiMethod = (...args: unknown[]) => Promise<APIResponse>;
 
-export type AuthenticatedTransportProof = {
+export type TransportProof = {
+    assertSuccessfulApplicationRequest(): Promise<void>;
     assertSuccessfulCredentialedRequest(): Promise<void>;
     restore(): void;
 };
@@ -40,7 +40,7 @@ function isApplicationUrl(input: unknown): boolean {
         const value = typeof input === "string" || input instanceof URL
             ? String(input)
             : (input as { url(): string }).url();
-        return APPLICATION_ORIGINS.has(new URL(value).origin);
+        return APPLICATION_SERVICE_ORIGINS.has(new URL(value).origin);
     } catch {
         return false;
     }
@@ -55,20 +55,23 @@ function successful(status: number): boolean {
  * A credential-shaped setup is not enough: at least one application response
  * must succeed after the request crossed transport with the credential.
  */
-export function installAuthenticatedTransportProof(
+export function installTransportProof(
     page: Page,
     request: APIRequestContext,
-): AuthenticatedTransportProof {
-    const successfulRequests = new Set<string>();
+): TransportProof {
+    const successfulApplicationRequests = new Set<string>();
+    const successfulCredentialedRequests = new Set<string>();
     const pending: Array<Promise<void>> = [];
     const originals = new Map<string, ApiMethod>();
 
     const observeBrowserResponse = (response: Response) => {
         const observed = (async () => {
             if (!successful(response.status()) || !isApplicationUrl(response.url())) return;
+            const operation = `${response.request().method()} ${response.url()}`;
+            successfulApplicationRequests.add(operation);
             const headers = await response.request().allHeaders();
             if (hasProductionCredential(headers)) {
-                successfulRequests.add(`${response.request().method()} ${response.url()}`);
+                successfulCredentialedRequests.add(operation);
             }
         })();
         pending.push(observed);
@@ -86,12 +89,12 @@ export function installAuthenticatedTransportProof(
             value: async (...args: unknown[]) => {
                 const response = await callable.apply(request, args);
                 const options = args[1] as { headers?: HeaderInput } | undefined;
-                if (
-                    successful(response.status())
-                    && isApplicationUrl(args[0])
-                    && hasProductionCredential(options?.headers)
-                ) {
-                    successfulRequests.add(`${method.toUpperCase()} ${String(args[0])}`);
+                if (successful(response.status()) && isApplicationUrl(args[0])) {
+                    const operation = `${method.toUpperCase()} ${String(args[0])}`;
+                    successfulApplicationRequests.add(operation);
+                    if (hasProductionCredential(options?.headers)) {
+                        successfulCredentialedRequests.add(operation);
+                    }
                 }
                 return response;
             },
@@ -99,9 +102,18 @@ export function installAuthenticatedTransportProof(
     }
 
     return {
+        async assertSuccessfulApplicationRequest() {
+            await Promise.all(pending);
+            if (successfulApplicationRequests.size === 0) {
+                throw new Error(
+                    "real-transport scenario completed without a successful "
+                    + "control-plane request",
+                );
+            }
+        },
         async assertSuccessfulCredentialedRequest() {
             await Promise.all(pending);
-            if (successfulRequests.size === 0) {
+            if (successfulCredentialedRequests.size === 0) {
                 throw new Error(
                     "@authenticated scenario completed without a successful application "
                     + "request carrying gw_session or Authorization",
