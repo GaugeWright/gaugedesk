@@ -323,7 +323,7 @@ export class MobileControlPlane implements FacetBrowserApi {
         challenge: string;
         expiresAt: number;
     }> {
-        return this.routeJson()("POST", "/mobile/enrollment/claim", {
+        return this.route("POST", "/mobile/enrollment/claim", {
             ...invitation,
             device,
             publicKey,
@@ -332,7 +332,7 @@ export class MobileControlPlane implements FacetBrowserApi {
     }
 
     proveMachineDevice(requestId: string, signature: string): Promise<void> {
-        return this.routeJson()("POST", "/mobile/enrollment/prove", {
+        return this.route("POST", "/mobile/enrollment/prove", {
             requestId,
             signature,
         }) as Promise<void>;
@@ -343,7 +343,7 @@ export class MobileControlPlane implements FacetBrowserApi {
         grantId: string | null;
         credential: string | null;
     }> {
-        return this.routeJson()("POST", "/mobile/enrollment/status", {
+        return this.route("POST", "/mobile/enrollment/status", {
             requestId,
             secret,
         }) as Promise<{ status: string; grantId: string | null; credential: string | null }>;
@@ -354,7 +354,7 @@ export class MobileControlPlane implements FacetBrowserApi {
         challenge: string;
         expiresAt: number;
     }> {
-        return this.routeJson()("POST", "/mobile/sessions/challenge", {
+        return this.route("POST", "/mobile/sessions/challenge", {
             grantId,
             device,
         }) as Promise<{ challengeId: string; challenge: string; expiresAt: number }>;
@@ -367,7 +367,7 @@ export class MobileControlPlane implements FacetBrowserApi {
         credential: string;
         signature: string;
     }): Promise<{ session: string; expiresAt: number; machine: string }> {
-        return this.routeJson()("POST", "/mobile/sessions", input) as Promise<{
+        return this.route("POST", "/mobile/sessions", input) as Promise<{
             session: string;
             expiresAt: number;
             machine: string;
@@ -375,7 +375,7 @@ export class MobileControlPlane implements FacetBrowserApi {
     }
 
     revokeMachineController(grantId: string): Promise<void> {
-        return this.routeJson()(
+        return this.route(
             "POST",
             `/mobile/controllers/${encodeURIComponent(grantId)}/revoke`,
         ) as Promise<void>;
