@@ -42,5 +42,7 @@ describe("renderMarkdown", () => {
         const html = renderMarkdown("see https://example.com and [docs](https://docs.rs)");
         expect(html).toContain('href="https://example.com"');
         expect(html).toContain('href="https://docs.rs"');
+        expect(html.match(/target="_blank"/g)).toHaveLength(2);
+        expect(html.match(/rel="noopener noreferrer"/g)).toHaveLength(2);
     });
 });

@@ -10,7 +10,7 @@
  * rather than a second, drifting copy.
  */
 
-import { createSignal, For, Show, type JSX } from "solid-js";
+import { createSignal, For, lazy, Show, Suspense, type JSX } from "solid-js";
 import { groupTurns, type TranscriptLine } from "./transcript";
 import {
     defaultPrefs,
@@ -21,6 +21,18 @@ import {
 } from "./transcript-filter";
 import { friendlyToolVerb, toolTargetOpensViewer } from "./tool-verb";
 import { isBoilerplateResult, toolDetail, toolHeaderTarget } from "./tool-detail";
+
+// Markdown and its GFM parser load only when conversational prose is present;
+// the empty panel and tool/status-only transcripts keep the initial bundle lean.
+const MarkdownBody = lazy(() =>
+    import("./MarkdownView").then((module) => ({ default: module.MarkdownBody })),
+);
+
+/** User and agent prose is Markdown. Operational and lifecycle rows remain
+ * literal text so punctuation in commands, errors, and status is never restyled. */
+export function lineRendersMarkdown(kind: string): boolean {
+    return kind === "user" || kind === "assistant" || kind === "text";
+}
 
 /** Translate a lifecycle status line ("run → Completed", "merge → Advanced") into
  *  plain language. These leak the internal state-machine vocabulary; a layperson
@@ -173,7 +185,17 @@ function LineView(props: {
                     when={isCredentialError()}
                     fallback={
                         <div class={`line ${props.line.tier} ${props.line.kind}`} data-line-text={props.line.text}>
-                            <span>{friendlyLine(props.line.kind, props.line.text)}</span>
+                            <Show
+                                when={lineRendersMarkdown(props.line.kind)}
+                                fallback={<span>{friendlyLine(props.line.kind, props.line.text)}</span>}
+                            >
+                                <Suspense fallback={<span>{friendlyLine(props.line.kind, props.line.text)}</span>}>
+                                    <MarkdownBody
+                                        class="message-markdown"
+                                        text={friendlyLine(props.line.kind, props.line.text)}
+                                    />
+                                </Suspense>
+                            </Show>
                             <Show when={props.line.forkable && props.line.entryId !== undefined && props.onFork}>
                                 <button
                                     type="button"

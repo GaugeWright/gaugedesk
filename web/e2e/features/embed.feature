@@ -15,6 +15,11 @@ Feature: Embedded panels (EMBED-2)
     When I send "hello from the embed" in the embedded chat
     Then the embedded transcript shows "hello from the embed"
 
+  Scenario: conversational prose renders safe GitHub-flavored Markdown
+    Given the embed example page is open
+    When I send a Markdown message in the embedded chat
+    Then the embedded transcript renders its formatting without page overflow
+
   Scenario: the embedded panels carry the workbench theme and accept --gw-* overrides
     Given the embed example page is open
     Then the embedded chat is themed by the workbench palette

@@ -725,6 +725,16 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 .line.user::before { content: "you"; color: var(--muted); }
 .line.assistant::before { content: "agent"; color: var(--accent); }
 
+/* Message prose uses the same safe GFM renderer as Markdown files. Keep its
+   block rhythm compact inside a chat row, and let wide tables scroll inside the
+   message rather than widening the panel or the embedding page. */
+.message-markdown { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.message-markdown > :first-child { margin-top: 0; }
+.message-markdown > :last-child { margin-bottom: 0; }
+.message-markdown table { display: block; max-width: 100%; overflow-x: auto; }
+.message-markdown a { overflow-wrap: anywhere; text-underline-offset: 2px; }
+.message-markdown img { max-width: 100%; height: auto; }
+
 /* System / lifecycle notes (turn finished, kept into the shared copy, pulled in
    latest): quiet status lines, not first-class messages — demote them so the
    conversation reads above the plumbing (round-11 #7). Placed after the role

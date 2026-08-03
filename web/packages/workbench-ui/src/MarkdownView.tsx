@@ -1,6 +1,7 @@
 /**
- * Rendered markdown for the content viewer's View tab. Agent-written files are
- * UNTRUSTED input, so safety comes from micromark's defaults: raw HTML inside
+ * Shared rendered Markdown for document views and conversational prose.
+ * Agent-written content is UNTRUSTED input, so safety comes from micromark's
+ * defaults: raw HTML inside
  * the markdown is escaped (never executed) and dangerous link protocols are
  * refused — there is no sanitizer to forget because nothing dangerous is
  * emitted. GFM (tables, task lists, strikethrough, autolinks) is on because
@@ -17,15 +18,33 @@ export function isMarkdownPath(path: string): boolean {
 }
 
 export function renderMarkdown(text: string): string {
-    return micromark(text, {
+    const html = micromark(text, {
         extensions: [gfm()],
         htmlExtensions: [gfmHtml()],
     });
+    // A link in an embedded conversation must not navigate the host page away
+    // from its current state. micromark owns all emitted markup here, so adding
+    // inert browsing-context attributes to its anchor tags is safe and exact.
+    return html.replaceAll(
+        "<a href=",
+        '<a target="_blank" rel="noopener noreferrer" href=',
+    );
 }
 
-export function MarkdownView(props: { text: string }) {
+/** Safe rendered Markdown without assumptions about which surface contains it. */
+export function MarkdownBody(props: { text: string; class?: string; fileView?: boolean }) {
     const html = createMemo(() => renderMarkdown(props.text));
     // innerHTML is safe here by construction: micromark escapes embedded HTML
     // and refuses javascript:/data: link destinations by default.
-    return <div class="filebody markdown-body" data-file-view innerHTML={html()} />;
+    return (
+        <div
+            class={`markdown-body${props.class ? ` ${props.class}` : ""}`}
+            data-file-view={props.fileView ? "" : undefined}
+            innerHTML={html()}
+        />
+    );
+}
+
+export function MarkdownView(props: { text: string }) {
+    return <MarkdownBody text={props.text} class="filebody" fileView />;
 }

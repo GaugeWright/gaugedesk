@@ -110,6 +110,30 @@ When("I send {string} in the embedded chat", async ({ page }, msg: string) => {
     await page.locator("[data-embed-send]").click();
 });
 
+When("I send a Markdown message in the embedded chat", async ({ page }) => {
+    await page.locator("[data-embed-composer]").fill([
+        "**Important**: read the [documentation](https://example.com/docs).",
+        "",
+        "| Item | Status |",
+        "| --- | --- |",
+        "| Markdown | working |",
+    ].join("\n"));
+    await page.locator("[data-embed-send]").click();
+});
+
+Then("the embedded transcript renders its formatting without page overflow", async ({ page }) => {
+    const message = page.locator("[data-embed-transcript] .line.user .message-markdown");
+    await expect(message.locator("strong")).toHaveText("Important");
+    await expect(message.locator("table")).toContainText("Markdown");
+    const link = message.locator('a[href="https://example.com/docs"]');
+    await expect(link).toHaveText("documentation");
+    await expect(link).toHaveAttribute("target", "_blank");
+    await expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    expect(await page.evaluate(() =>
+        document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    )).toBe(0);
+});
+
 Then("the embedded transcript shows {string}", async ({ page }, text: string) => {
     // The optimistic echo lands the instant the turn starts — end-to-end proof that
     // the embedded composer drives the remote Session's send.
