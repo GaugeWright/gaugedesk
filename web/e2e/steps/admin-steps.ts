@@ -97,7 +97,10 @@ Given("the authenticated enterprise workbench has an assignable onboarding task"
     expect((await taskResponse.json()).tasks).toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: "issue", boundary: "account::global" }),
     ]));
-    await expect(page.locator('[data-task-kind="issue"] [data-task-assignee]')).toBeVisible();
+    await expect(page.getByRole("combobox", {
+        name: "assign Assign this onboarding step",
+        exact: true,
+    })).toBeVisible();
 });
 
 Given("the authenticated enterprise workbench has a withheld context source", async ({ page, request }) => {

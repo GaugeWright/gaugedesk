@@ -96,6 +96,7 @@ BDD_SUPPORT_ROOTS = (
 )
 BDD_STEPS_ROOT = ROOT / "web/e2e/steps"
 BDD_FIDELITY_GUARD = BDD_STEPS_ROOT / "fidelity-guard.ts"
+BDD_AUTHENTICATED_PROOF = ROOT / "web/e2e/authenticated-transport-proof.ts"
 BDD_FIDELITY_TAGS = {
     "@ui-mocked",
     "@contract",
@@ -271,6 +272,11 @@ def check_bdd_fidelity(errors: list[str]) -> tuple[int, dict[str, int]]:
     if not BDD_FIDELITY_GUARD.is_file():
         errors.append(
             "missing BDD runtime fidelity guard: web/e2e/steps/fidelity-guard.ts"
+        )
+    if not BDD_AUTHENTICATED_PROOF.is_file():
+        errors.append(
+            "missing authenticated request proof: "
+            "web/e2e/authenticated-transport-proof.ts"
         )
 
     for support_root in BDD_SUPPORT_ROOTS:

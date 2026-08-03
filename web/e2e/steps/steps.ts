@@ -184,7 +184,10 @@ Given("an assignable onboarding task", async ({ page, request }) => {
     expect((await taskResponse.json()).tasks).toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: "issue", boundary: "account::global" }),
     ]));
-    await expect(page.locator('[data-task-kind="issue"] [data-task-assignee]')).toBeVisible();
+    await expect(page.getByRole("combobox", {
+        name: "assign Assign this onboarding step",
+        exact: true,
+    })).toBeVisible();
 });
 
 When("I assign the onboarding task to the active owner", async ({ page }) => {
@@ -193,12 +196,18 @@ When("I assign the onboarding task to the active owner", async ({ page }) => {
         return candidate.request().method() === "POST"
             && /^\/work-items\/[^/]+\/assign$/.test(url.pathname);
     });
-    await page.locator('[data-task-kind="issue"] [data-task-assignee]').selectOption("local-user");
+    await page.getByRole("combobox", {
+        name: "assign Assign this onboarding step",
+        exact: true,
+    }).selectOption("local-user");
     expect((await assigned).status()).toBe(200);
 });
 
 Then("the onboarding task shows the active owner", async ({ page }) => {
-    await expect(page.locator('[data-task-kind="issue"] [data-task-assignee]')).toHaveValue("local-user");
+    await expect(page.getByRole("combobox", {
+        name: "assign Assign this onboarding step",
+        exact: true,
+    })).toHaveValue("local-user");
 });
 
 // Only tool lines with additive detail (a command's full text / output, a file's

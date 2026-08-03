@@ -40,6 +40,7 @@ Feature: Admin Environment
     And I approve access to the withheld context source
     Then the withheld context source is available
 
+  @authenticated
   Scenario: an admitted administrator switches between Work and Administration
     Given the enterprise workbench is open for an administered tenant
     When I return to work
@@ -87,10 +88,12 @@ Feature: Admin Environment
     When I apply the pending Administration change
     Then the member "agent@acme.com" appears in the directory
 
+  @authenticated
   Scenario: canonical configuration documents are secret-free records
     Given the enterprise workbench is open for an administered tenant
     Then the Admin Environment exposes canonical configuration documents
 
+  @authenticated
   Scenario: a special Admin file owns both its derived and raw views
     Given the enterprise workbench is open for an administered tenant
     When I open the "policy.json" configuration file
@@ -98,6 +101,7 @@ Feature: Admin Environment
     When I open the raw configuration editor
     Then the editor shows the canonical policy JSON
 
+  @authenticated
   Scenario: Admin help and agent boundaries are inspectable workspace files
     Given the enterprise workbench is open for an administered tenant
     When I open help for the selected Admin file
@@ -108,11 +112,13 @@ Feature: Admin Environment
     When I open the Admin agent tool manifest
     Then it contains only governance tools and no shell or web tools
 
+  @authenticated
   Scenario: the Admin session admits no upload capability
     Given the enterprise workbench is open for an administered tenant
     Then the Admin composer offers no attachment control
     And the Admin agent upload API is unavailable
 
+  @authenticated
   Scenario: software admission and reported clients are ordinary Admin files
     Given the enterprise workbench is open for an administered tenant
     When I open the "software-policy.json" configuration file
@@ -159,10 +165,12 @@ Feature: Admin Environment
     When I issue a SCIM credential through Administration review
     Then the external SCIM provider provisions, suspends, restores, and deletes a member
 
+  @authenticated
   Scenario: the Admin Environment shows the active-sessions roster
     Given the enterprise workbench is open for an administered tenant
     Then the admin console shows the active sessions roster
 
+  @authenticated
   Scenario: Machines use target-admitted Home projections
     Given the enterprise workbench is open for an administered tenant
     Then the Admin Environment shows the serving machine as live

@@ -11,7 +11,6 @@ Feature: Your account (ACCT-1)
     And I link the "openai" account with token "sk-test-secret"
     Then "openai" shows as a linked account
 
-  @transport @authenticated
   Scenario: configure the local managed-inference plan through the shipped Account client
     Given the workbench is open
     When I open my account

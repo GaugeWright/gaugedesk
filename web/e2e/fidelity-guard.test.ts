@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Page } from "@playwright/test";
+import { hasProductionCredential } from "./authenticated-transport-proof";
 import { installTransportFidelityGuards } from "./fidelity-guard";
 
 function guardedPage() {
@@ -28,5 +29,15 @@ describe("transport fidelity guard", () => {
                 );
             }
         }
+    });
+
+    it("recognizes only the production session credential shapes", () => {
+        expect(hasProductionCredential({ cookie: "theme=dark; gw_session=session-1" }))
+            .toBe(true);
+        expect(hasProductionCredential([{ name: "Authorization", value: "Bearer token-1" }]))
+            .toBe(true);
+        expect(hasProductionCredential({ cookie: "gw_session=", "x-actor": "owner" }))
+            .toBe(false);
+        expect(hasProductionCredential({ "x-actor": "owner" })).toBe(false);
     });
 });
