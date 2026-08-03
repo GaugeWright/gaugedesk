@@ -1779,51 +1779,6 @@ Then("the production export-to-disk route writes the deliverable", async () => {
         .resolves.toBe("desktop export proof\n");
 });
 
-// ---- RF-E4: projection freshness + retry (error path) ----------------------
-
-// Force the desktop projection loads to fail by aborting the diff/merge/run
-// fetches at the network edge. The freshness reducer folds the failure into a
-// `stale`/`stuck` status and the FreshnessBanner surfaces it; this is the only
-// error-path that exercises a dropped projection call end to end in the browser.
-// Fail every per-chat projection the desktop freshness signal folds — run, diff,
-// AND merge (RF-E4, App.tsx markLoadOk/Fail). Aborting only some would let a
-// successful load clear the staleness (the signal is shared), so a refresh could
-// race back to `fresh`; failing all of them makes the banner deterministic. The
-// merge review reads through the freshness carriage (UX-13), so its route is the
-// carriage projection `/projections/:id/merge` (with a `?freshness=` query), not
-// the bare `/chats/:id/merge`.
-const FAILING_PROJECTIONS = /\/(chats\/[^/]+\/diff|scopes\/[^/]+\/run|projections\/[^/]+\/merge)(\?|$)/;
-When("the projection refresh starts failing", async ({ page }) => {
-    await page.route(FAILING_PROJECTIONS, (route) => route.abort());
-});
-
-When("the projection refresh recovers", async ({ page }) => {
-    await page.unroute(FAILING_PROJECTIONS);
-});
-
-// WS-H removed the manual "pull in latest" button; the per-chat projections now
-// re-fetch on chat selection, so reloading (the chat re-selects from the URL)
-// re-runs them all against the failing routes — a deterministic projection refresh.
-When("I trigger a projection refresh", async ({ page }) => {
-    await page.reload();
-});
-
-When("I retry the projection refresh", async ({ page }) => {
-    await page.locator("[data-freshness-retry]").click();
-});
-
-Then("the freshness banner is shown", async ({ page }) => {
-    await expect(page.locator("[data-freshness-banner]")).toBeVisible();
-});
-
-Then("the freshness banner offers a retry", async ({ page }) => {
-    await expect(page.locator("[data-freshness-retry]")).toBeVisible();
-});
-
-Then("the freshness banner clears", async ({ page }) => {
-    await expect(page.locator("[data-freshness-banner]")).toHaveCount(0);
-});
-
 // ---- multi-agent concurrency (round-13): per-chat run state + Browse dots ----
 
 Given("a placement I can open more chats under", async ({ page }) => {

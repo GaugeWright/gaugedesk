@@ -1,3 +1,4 @@
+@transport
 Feature: Archetype settings
 
   GaugeDesk owns runtime selection; the WhippleScript package owns behavior and

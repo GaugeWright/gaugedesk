@@ -1,6 +1,6 @@
 # @open-only: the `?mobile=1` entry exists only in the open bundle — the
 # enterprise-composition lane (GW_E2E_COMPOSITION=enterprise) skips it.
-@open-only
+@open-only @transport
 Feature: Mobile projection client — pair, navigate, send (offline + online)
 
   The mobile flow harness (MOB-029) composes the committed D-MOBILE islands into

@@ -1,4 +1,4 @@
-@api
+@api @contract
 Feature: Export & review derive from the resource (M1)
   An output's egress/declassification is gated by the output resource's own
   stakeholders — the owners of the context it derived from — not by the caller.

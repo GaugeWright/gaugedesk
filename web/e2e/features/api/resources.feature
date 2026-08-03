@@ -1,4 +1,4 @@
-@api
+@api @contract
 Feature: Durable context resources (M1)
   Opening a folder mints a durable, access-gated context resource; its content
   resolves through the handle only with a granted basis; tombstoning blocks future

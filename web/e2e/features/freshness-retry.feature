@@ -1,3 +1,4 @@
+@ui-mocked
 Feature: Projection freshness and retry (RF-E4, error path)
 
   As a user, when a projection fetch fails the desktop shell must surface an

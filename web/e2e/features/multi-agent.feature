@@ -1,3 +1,4 @@
+@transport
 Feature: Multiple agents run concurrently with per-chat state (round-13)
 
   The workbench drives each chat independently, so two chats can run turns at the

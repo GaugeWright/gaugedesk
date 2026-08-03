@@ -1,3 +1,4 @@
+@transport
 Feature: Send queue & steering
 
   While the agent is working I can stack follow-up messages on top of the

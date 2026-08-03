@@ -1,3 +1,4 @@
+@transport
 Feature: Output catalog (O-4)
 
   As a user I can see the deliverables this chat has produced and their review

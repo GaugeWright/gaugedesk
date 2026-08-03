@@ -1,3 +1,4 @@
+@transport
 Feature: The archetype & project library
 
   As a user I browse and manage archetypes (the Library of methods), projects,

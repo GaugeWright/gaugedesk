@@ -1,3 +1,4 @@
+@transport
 Feature: Context ingestion
 
   As a user I can open a folder of context into the engagement, so the agent

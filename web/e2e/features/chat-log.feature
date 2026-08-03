@@ -1,3 +1,4 @@
+@transport
 Feature: Tuning the chat log
 
   The chat log brackets each agent turn (its prose + the tool calls it made) into

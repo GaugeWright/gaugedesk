@@ -1,3 +1,4 @@
+@transport
 Feature: Project Home rollup panel (UX-2)
 
   A project's home panel summarises the project from data (INV-5): its audit rollup

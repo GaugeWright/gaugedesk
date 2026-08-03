@@ -1,3 +1,4 @@
+@transport
 Feature: The human task queue (top bar)
 
   As a user, finished agent work that needs my review surfaces in the top bar as

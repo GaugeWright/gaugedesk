@@ -1,3 +1,4 @@
+@transport
 Feature: Fork (ADR 0035/0038)
 
   Forking gives you a copy to branch from. An archetype fork copies the method into a
@@ -16,7 +17,7 @@ Feature: Fork (ADR 0035/0038)
     And I fork the first chat
     Then I see a forked chat
 
-  @live
+  @live-provider
   Scenario: a forked chat remembers the parent's conversation
     Given a new engagement
     When I task the agent with "Remember the number 8351. Acknowledge only, do not use tools."

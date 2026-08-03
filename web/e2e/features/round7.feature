@@ -1,3 +1,4 @@
+@transport
 Feature: Round 7 — a layout that fits, a pinned composer, and immediate feedback
 
   The round-7 review found the shell broke at ordinary laptop sizes (the SEND

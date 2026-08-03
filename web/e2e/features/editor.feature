@@ -1,3 +1,4 @@
+@transport
 Feature: File editor
 
   Editing a worktree file in the content viewer's Edit tab and saving it commits

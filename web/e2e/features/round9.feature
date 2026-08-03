@@ -1,3 +1,4 @@
+@transport
 Feature: Round 9 — honest banners, legible search, one honest improve entry
 
   The round-9 review found the discard banner pinned over an unrelated, unchanged

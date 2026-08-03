@@ -1,3 +1,4 @@
+@transport
 Feature: Multi-turn conversation
 
   An engagement is a persistent conversation, not one-shot tasks: it holds one
@@ -13,7 +14,7 @@ Feature: Multi-turn conversation
     Then the file view shows "first task"
     And the file view shows "second task"
 
-  @live
+  @live-provider
   Scenario: the conversation remembers across turns
     Given a new engagement
     When I task the agent with "Remember the number 4273. Acknowledge only, do not use tools."

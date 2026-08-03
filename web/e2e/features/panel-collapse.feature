@@ -1,3 +1,4 @@
+@transport
 Feature: Collapsible workbench panels
 
   Every panel — browse, chat, content, and files — folds to a thin rail to

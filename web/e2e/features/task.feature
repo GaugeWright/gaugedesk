@@ -1,3 +1,4 @@
+@transport
 Feature: Tasking the agent
 
   As a user I task the agent and watch it work live; effects route through the

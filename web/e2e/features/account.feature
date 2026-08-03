@@ -1,3 +1,4 @@
+@transport
 Feature: Your account (ACCT-1)
 
   The operator's own surface (ADR 0053), reached from Settings ▸ Your account: link an

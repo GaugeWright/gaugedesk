@@ -1,3 +1,4 @@
+@transport
 Feature: Round 6 — plain-language history, a keep guard, and consistent archetype wording
 
   The round-6 review found the "history" overlay dumped the raw event-sourcing

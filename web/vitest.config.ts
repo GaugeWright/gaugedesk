@@ -9,7 +9,7 @@ import { defineConfig } from "vitest/config";
 // the embed custom elements, is exercised in a real browser via e2e instead.)
 export default defineConfig({
     test: {
-        include: ["packages/**/*.test.ts", "apps/**/*.test.ts"],
+        include: ["packages/**/*.test.ts", "apps/**/*.test.ts", "e2e/**/*.test.ts"],
     },
     // Tests import `.tsx` modules only for their pure exports (the components are
     // never invoked), so JSX just needs to compile to valid-but-unexecuted JS.

@@ -1,3 +1,4 @@
+@transport
 Feature: Honest discard, reachable settings, grouped chats (round 3)
 
   Round 3 closes feedback inconsistencies: discarding work tells the honest truth

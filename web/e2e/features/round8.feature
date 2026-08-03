@@ -1,3 +1,4 @@
+@transport
 Feature: Round 8 — plain-language tool detail and legible fork lineage
 
   The round-8 review found that expanding a tool-call row revealed the raw

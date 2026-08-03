@@ -1,3 +1,4 @@
+@transport
 Feature: The workbench shell
 
   As a user I see the four-panel workbench with a project-first facet browser,

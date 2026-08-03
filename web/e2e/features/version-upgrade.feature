@@ -1,3 +1,4 @@
+@transport
 Feature: Placement version upgrade (UX-9, ADR 0063)
 
   Publishing a new version of an archetype gives its placements an "upgrade

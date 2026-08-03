@@ -1,3 +1,4 @@
+@transport
 Feature: Content viewer opens on View unless a review is open
 
   The third-column content viewer defaults to the file View. The Changes (diff)

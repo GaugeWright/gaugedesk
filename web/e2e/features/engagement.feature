@@ -1,3 +1,4 @@
+@transport
 Feature: Engagements
 
   As a user I can open a new engagement — a *work* chat rooted on a placement (an

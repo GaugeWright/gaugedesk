@@ -1,3 +1,4 @@
+@transport
 Feature: Choosing what to place, and quieter power controls (round 2)
 
   Adding a method to a *named* project lets the user CHOOSE which method (a picker),

@@ -1,4 +1,4 @@
-@api
+@api @contract
 Feature: Merge to mainline (M0 keep + M2 WS-1 integrate)
   A turn's diff is kept by admitting it (the standing ref advances), then integrated
   into the shared mainline through the boundary-gated WS-1 hop.

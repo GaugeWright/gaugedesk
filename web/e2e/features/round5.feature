@@ -1,3 +1,4 @@
+@transport
 Feature: Round 5 — honest View after discard, plain chat types, reachable nav, a real settings form
 
   The round-5 review found the deepest honest-feedback violation yet (the View tab

@@ -9,7 +9,8 @@
  * disjoint set and the two never collide. `VITE_CP_BASE` points the built client at this run's
  * control plane; the playwright config derives CORS + state dirs from the same vars.
  *
- * Pass extra args straight through to `playwright test`, e.g. `npm run e2e -- --grep @live`.
+ * Pass extra args straight through to `playwright test`, e.g.
+ * `npm run e2e -- --grep @live-provider`.
  */
 
 import { execSync, spawn } from "node:child_process";
@@ -83,13 +84,13 @@ console.log(
 );
 
 const passthrough = process.argv.slice(2);
-// Default run skips real-model @live scenarios; `GW_E2E_LIVE=1` runs only those.
+// Default run skips real-model @live-provider scenarios; `GW_E2E_LIVE=1` runs only those.
 const invert = [
-    ...(process.env.GW_E2E_LIVE ? [] : ["@live"]),
+    ...(process.env.GW_E2E_LIVE ? [] : ["@live-provider"]),
     ...(enterpriseLane ? ["@open-only"] : []),
 ];
 const grep = [
-    ...(process.env.GW_E2E_LIVE ? ["--grep", "@live"] : []),
+    ...(process.env.GW_E2E_LIVE ? ["--grep", "@live-provider"] : []),
     ...(invert.length ? ["--grep-invert", invert.join("|")] : []),
 ];
 

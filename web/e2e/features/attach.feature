@@ -1,3 +1,4 @@
+@transport
 Feature: Message attachments
 
   The composer's paperclip clips file(s) to the message being composed: text files

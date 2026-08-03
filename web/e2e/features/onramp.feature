@@ -1,3 +1,4 @@
+@transport
 Feature: On-ramps and plain language (round 1)
 
   A brand-new project must never dead-end: it comes with a built-in general placement

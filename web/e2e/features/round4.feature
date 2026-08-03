@@ -1,3 +1,4 @@
+@transport
 Feature: Round 4 — ownership-safe editing, legible diffs, and one canonical chat title
 
   GaugeDesk runtime settings are changed through Settings, while authored

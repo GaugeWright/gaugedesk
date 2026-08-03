@@ -1,4 +1,5 @@
 # authenticated-production-bundle
+@transport
 Feature: Admin Environment
 
   Administration is an enterprise Environment in the same workbench shell as the

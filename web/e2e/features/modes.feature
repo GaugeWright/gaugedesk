@@ -1,3 +1,4 @@
+@transport
 Feature: Edit vs work chats (chat rooting)
 
   A chat's kind is fixed at creation by what it is rooted on (ADR 0035): a chat

@@ -1,3 +1,4 @@
+@transport
 Feature: Per-project model access (LLM-2)
 
   A project may pin its own BYOK provider key in its coordination scope, overriding the

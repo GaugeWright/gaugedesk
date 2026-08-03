@@ -1,3 +1,4 @@
+@transport
 Feature: Audit timeline
 
   As a user I can inspect the ordered, append-only event log for a scope, so I

@@ -1,3 +1,4 @@
+@transport
 Feature: Merge conflict repair (UX-7, INV-24)
 
   A definition-write that conflicts on merge must **isolate** the engagement with a

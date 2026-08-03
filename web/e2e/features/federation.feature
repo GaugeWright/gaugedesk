@@ -1,4 +1,5 @@
 # pair-two-machines-and-collaborate-both-ways
+@transport
 Feature: Cross-machine federation
 
   Two authorities on two control planes pair over the network and collaborate

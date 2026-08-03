@@ -1,3 +1,4 @@
+@transport
 Feature: Content search reaches into the chat log and worktree files (SEARCH-1/2)
 
   Search matches not only chat titles but the chat's content: its transcript (the

@@ -1,3 +1,4 @@
+@transport
 Feature: Context sources panel (O-1)
 
   As a user I can see the context this chat is working with — the folders I

@@ -1,4 +1,4 @@
-@live
+@transport @live-provider
 Feature: Real agent end-to-end (opt-in)
 
   The cases where the real model's behavior drives the app: the agent actually
