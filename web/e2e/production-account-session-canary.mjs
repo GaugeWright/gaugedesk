@@ -6,7 +6,7 @@ function required(environment, name) {
     return value;
 }
 
-function exactOrigin(environment, name) {
+export function exactOrigin(environment, name) {
     const url = new URL(required(environment, name));
     assert.equal(url.protocol, "https:", `${name} must use HTTPS`);
     assert.equal(url.pathname, "/", `${name} must not contain a path`);
@@ -15,7 +15,7 @@ function exactOrigin(environment, name) {
     return url.href.replace(/\/$/, "");
 }
 
-function providerStorageState(environment) {
+export function providerStorageState(environment) {
     let state;
     const text = required(environment, "GW_SYNTHETIC_OIDC_STORAGE_STATE");
     assert(text.length <= 1_000_000, "OIDC browser storage state is oversized");
@@ -42,7 +42,7 @@ function providerStorageState(environment) {
     };
 }
 
-async function defaultBrowserType() {
+export async function defaultBrowserType() {
     const { chromium } = await import("playwright");
     return chromium;
 }
