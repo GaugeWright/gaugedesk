@@ -12,7 +12,26 @@ only needs to choose how multiple panels are arranged.
 </gw-session>
 ```
 
-## Intentional customization
+## Customize the CSS
+
+Customization is optional. The default panel styles are complete and isolated
+inside the components.
+
+For an editable starting point, open the unminified
+[`embed.css`](https://embed.gaugewright.com/embed.css), save it with your site's
+CSS, and load your copy after the rest of your site styles:
+
+```html
+<link rel="stylesheet" href="/css/gaugedesk-embed.css">
+```
+
+The file contains every public setting, its default value, and comments saying
+what it changes. Edit the values directly; no build tool or JavaScript is
+needed. Because your site owns the copied file, upgrades to `embed.js` will not
+overwrite your choices.
+
+For a small change, skip the file and put only the setting you need in your
+existing stylesheet:
 
 Set public `--gw-*` properties on `<gw-session>` to theme every child panel, or
 on one panel to change it alone. Structural host rules are protected inside the
@@ -41,16 +60,11 @@ gw-chat::part(panel) {
 }
 ```
 
-Geometry tokens are `--gw-panel-width`, `--gw-panel-height`,
-`--gw-panel-min-height`, `--gw-panel-padding`, `--gw-panel-border`,
-`--gw-panel-radius`, and `--gw-panel-shadow`. Theme tokens are `--gw-bg`,
-`--gw-panel`, `--gw-edge`, `--gw-ink`, `--gw-muted`, `--gw-brand-navy`, `--gw-accent`,
-`--gw-accent-strong`, `--gw-accent-hover`, `--gw-accent-contrast`, `--gw-warn`,
-`--gw-bad`, `--gw-font`, `--gw-serif`, `--gw-mono`, `--gw-font-size-label`,
-`--gw-font-size-small`, `--gw-font-size-ui`, `--gw-font-size-body`,
-`--gw-font-size-title`, and `--gw-color-scheme`.
+The public settings are grouped plainly in `embed.css`: colors, actions and
+status, panel frame, typography, and the default height of each panel.
 
 Every panel exposes `::part(panel)` plus a panel-specific alias such as
 `::part(panel-chat)` or `::part(panel-files)`. The single branding owner also
-exposes `::part(attribution)`. Use these parts for deliberate exceptions; use a
-wrapper or `<gw-session>` itself for multi-panel grid and page-level spacing.
+exposes `::part(attribution)`. Use parts for deliberate one-off CSS rules. Use a
+wrapper or `<gw-session>` itself only for multi-panel layout and page-level
+spacing.

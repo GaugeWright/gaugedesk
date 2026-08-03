@@ -1,0 +1,82 @@
+/**
+ * GaugeDesk Embeddable Panels — optional editable theme
+ *
+ * The panels already include complete default styling. You do not need this
+ * file to use them. Copy this file into your site only when you want to change
+ * their appearance, then load your copy after the rest of your site CSS:
+ *
+ *   <link rel="stylesheet" href="/css/gaugedesk-embed.css">
+ *
+ * Change the values below; do not remove the `--gw-` prefixes. Variables set on
+ * `gw-session` apply to every panel inside it. A value set directly on one panel
+ * changes only that panel.
+ */
+
+gw-session {
+  /* Main colors */
+  --gw-bg: #0f1115;                 /* Panel background */
+  --gw-panel: #161922;              /* Raised controls and composer */
+  --gw-edge: #262b36;               /* Borders and dividers */
+  --gw-ink: #d8dee9;                /* Primary text */
+  --gw-muted: #7d869c;              /* Secondary text */
+  --gw-brand-navy: #0e2d50;         /* GaugeDesk brand detail */
+
+  /* Actions and status */
+  --gw-accent: #6aa3ff;
+  --gw-accent-strong: #2a6fce;
+  --gw-accent-hover: #8ab8ff;
+  --gw-accent-contrast: #08111e;
+  --gw-warn: #e0a35a;
+  --gw-bad: #e06a6a;
+
+  /* Panel frame */
+  --gw-panel-width: 100%;
+  --gw-panel-height: auto;
+  --gw-panel-padding: 12px;
+  --gw-panel-border: 1px solid var(--gw-edge);
+  --gw-panel-radius: 12px;
+  --gw-panel-shadow: 0 14px 36px rgb(0 0 0 / 22%);
+
+  /* Typography */
+  --gw-font: "Manrope", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --gw-serif: "STIX Two Text", "Iowan Old Style", Georgia, ui-serif, serif;
+  --gw-mono: "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --gw-font-size-label: 10px;
+  --gw-font-size-small: 11px;
+  --gw-font-size-ui: 12px;
+  --gw-font-size-body: 13px;
+  --gw-font-size-title: 15px;
+  --gw-color-scheme: dark;
+}
+
+/* Each panel has a useful minimum height out of the box. Edit these independently. */
+gw-chat {
+  --gw-panel-min-height: 520px;
+}
+
+gw-viewer {
+  --gw-panel-min-height: 320px;
+}
+
+gw-files,
+gw-chats {
+  --gw-panel-min-height: 280px;
+}
+
+/**
+ * Need one special exception?
+ *
+ * Every component exposes its outer frame as `::part(panel)`. More specific
+ * names are also available: panel-chat, panel-viewer, panel-files, and
+ * panel-chats. The GaugeDesk credit link is `::part(attribution)`.
+ *
+ * Uncomment and edit examples like these:
+ *
+ * gw-chat::part(panel) {
+ *   box-shadow: none;
+ * }
+ *
+ * gw-chat::part(attribution) {
+ *   font-size: 12px;
+ * }
+ */
