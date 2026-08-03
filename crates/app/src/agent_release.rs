@@ -237,6 +237,31 @@ pub struct PublishDeploymentOutcome {
     pub deployment: serde_json::Value,
 }
 
+const PUBLIC_EMBED_LOADER_URL: &str = "https://embed.gaugewright.com/embed.js";
+
+fn customer_embed_html(
+    edge_origin: &str,
+    deployment_id: &str,
+    panel_ceiling: &BTreeSet<String>,
+) -> String {
+    let panels = ["chat", "viewer", "files", "chats"]
+        .into_iter()
+        .filter(|panel| panel_ceiling.contains(&format!("gw-{panel}")))
+        .collect::<Vec<_>>();
+    let children = panels
+        .iter()
+        .map(|panel| format!("  <gw-{panel}></gw-{panel}>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "<script type=\"module\" src=\"{PUBLIC_EMBED_LOADER_URL}\"></script>\n\
+<gw-session host=\"{edge_origin}/d/{deployment_id}\" panels=\"{}\">\n\
+{children}\n\
+</gw-session>",
+        panels.join(",")
+    )
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InspectDeploymentRequest {
@@ -953,16 +978,14 @@ impl Workbench {
         };
         let deployment: serde_json::Value = serde_json::from_str(&response).map_err(invalid)?;
         let deployment_url = format!("{edge}/d/{}", request.deployment_id);
+        let embed_html =
+            customer_embed_html(&edge, &request.deployment_id, &request.panel_ceiling);
         Ok(PublishDeploymentOutcome {
             deployment_id: request.deployment_id.clone(),
             release_id: release.release_id().to_owned(),
             edge_origin: edge,
             deployment_url,
-            embed_html: format!(
-                "<gw-session host=\"{}/d/{}\"></gw-session>",
-                request.edge_origin.trim().trim_end_matches('/'),
-                request.deployment_id
-            ),
+            embed_html,
             deployment,
         })
     }
@@ -1731,6 +1754,28 @@ mod publisher_tests {
                 }
             }),
         );
+    }
+
+    #[test]
+    fn customer_embed_html_uses_stable_urls_and_renders_selected_panels() {
+        let html = customer_embed_html(
+            "https://panels.gaugewright.com",
+            "theo",
+            &BTreeSet::from(["gw-chat".to_owned(), "gw-files".to_owned()]),
+        );
+
+        assert_eq!(
+            html,
+            concat!(
+                "<script type=\"module\" src=\"https://embed.gaugewright.com/embed.js\"></script>\n",
+                "<gw-session host=\"https://panels.gaugewright.com/d/theo\" panels=\"chat,files\">\n",
+                "  <gw-chat></gw-chat>\n",
+                "  <gw-files></gw-files>\n",
+                "</gw-session>"
+            )
+        );
+        assert!(!html.contains("?v="));
+        assert!(!html.contains("sha256:"));
     }
 
     #[test]

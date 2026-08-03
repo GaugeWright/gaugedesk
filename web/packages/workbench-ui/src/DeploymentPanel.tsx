@@ -819,6 +819,10 @@ export function DeploymentPanel(props: {
                         <pre class="embed-snippet">{published().embed_html}</pre>
                         <button type="button" onClick={() => void copy()}>Copy embed HTML</button>
                         <p class="settings-hint">
+                            This embed HTML is permanent. Publishing agent updates or panel-runtime
+                            improvements does not require changing your site's markup.
+                        </p>
+                        <p class="settings-hint">
                             Want to change the colors, type, spacing, or panel height? Open the
                             readable <a href="https://embed.gaugewright.com/embed.css"
                                 target="_blank" rel="noreferrer">embed.css starter</a>, save a copy
