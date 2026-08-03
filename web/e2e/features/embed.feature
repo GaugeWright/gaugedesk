@@ -24,3 +24,8 @@ Feature: Embedded panels (EMBED-2)
     Given the chat-only embed Environment is open
     Then the embedded chat shows a composer
     And the unselected files and viewer panels are not composed
+
+  Scenario: a block embed honors host min-height and grows its shared composer
+    Given a block embedded chat sized by min-height is open
+    Then the embedded chat uses the shared docked composer
+    And the embedded message field grows with multiline text

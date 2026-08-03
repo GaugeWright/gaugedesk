@@ -55,7 +55,10 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
     const audienceBusy = () => props.busy && !props.onSteer;
     const resizeMessage = () => {
         const element = messageInput;
-        const panel = element?.closest<HTMLElement>(".panel.run");
+        // ChatPanel marks its own sizing boundary for embedded/audience mounts.
+        // Desktop mounts the panel body bare, so retain the workbench shell as a
+        // fallback without making every shared composer depend on that shell.
+        const panel = element?.closest<HTMLElement>("[data-chat-panel], .panel.run");
         if (!element || !panel) return;
         const maximum = Math.floor(panel.clientHeight / 2);
         element.style.height = "auto";
@@ -68,7 +71,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
         queueMicrotask(resizeMessage);
     });
     onMount(() => {
-        const panel = messageInput?.closest<HTMLElement>(".panel.run");
+        const panel = messageInput?.closest<HTMLElement>("[data-chat-panel], .panel.run");
         const observer = panel ? new ResizeObserver(resizeMessage) : undefined;
         if (panel) observer?.observe(panel);
         resizeMessage();

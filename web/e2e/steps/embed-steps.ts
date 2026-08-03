@@ -25,6 +25,19 @@ Given("the chat-only embed Environment is open", async ({ page }) => {
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
 });
 
+Given("a block embedded chat sized by min-height is open", async ({ page }) => {
+    await page.goto("/embed-example.html?fixture=1&panels=chat");
+    await page.locator("gw-session").evaluate((element) => {
+        element.style.display = "block";
+    });
+    await page.locator("gw-chat").evaluate((element) => {
+        element.style.display = "block";
+        element.style.height = "auto";
+        element.style.minHeight = "420px";
+    });
+    await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
+});
+
 Then("the embedded chat shows a composer", async ({ page }) => {
     await expect(page.locator("[data-embed-send]")).toBeVisible();
 });
@@ -37,6 +50,18 @@ Then("the embedded chat uses the shared docked composer", async ({ page }) => {
     expect(composer).not.toBeNull();
     // The only content below the shared dock is the compact attribution line.
     expect(panel!.y + panel!.height - (composer!.y + composer!.height)).toBeLessThan(40);
+});
+
+Then("the embedded message field grows with multiline text", async ({ page }) => {
+    const composer = page.locator("[data-embed-composer]");
+    const panel = page.locator("[data-chat-panel]");
+    const initial = await composer.boundingBox();
+    await composer.fill("first line\nsecond line\nthird line\nfourth line");
+    await expect.poll(async () => (await composer.boundingBox())?.height).toBeGreaterThan(initial!.height);
+    const [grown, panelBox] = await Promise.all([composer.boundingBox(), panel.boundingBox()]);
+    expect(grown).not.toBeNull();
+    expect(panelBox).not.toBeNull();
+    expect(grown!.height).toBeLessThanOrEqual(panelBox!.height / 2 + 1);
 });
 
 Then("the embedded panel set owns one attribution mark", async ({ page }) => {

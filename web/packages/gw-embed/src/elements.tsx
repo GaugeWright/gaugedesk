@@ -83,7 +83,10 @@ const EMBED_THEME_CSS = `
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-height: 0;
+  /* Host pages commonly size a custom element with min-height rather than a
+     definite height. Inherit that used contract into the shadow tree so the
+     first panel can absorb its slack and keep its composer docked. */
+  min-height: inherit;
   overflow: hidden;
 }
 .gw-embed-panel > :first-child {
