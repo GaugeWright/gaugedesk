@@ -17,6 +17,15 @@ import {
 // Enterprise features live with their owning workspace (ee/web); this harness stays
 // the one repo-wide runner until that package runs independently, so its discovery
 // spans both roots (featuresRoot = the repo root).
+// Which composition the browser drives at the preview origin: the open
+// workbench (default) or the combined enterprise workbench
+// (`GW_E2E_COMPOSITION=enterprise`). Every shipped surface — desktop packaging
+// and the hosted desk — runs the enterprise composition (ADR 0098), so the
+// full suite must be runnable against it; the open dev loop alone let an
+// enterprise-only crash ship (the Devices modal, 2026-07-31). Features that
+// exist only in the open bundle are tagged @open-only and skipped by the lane.
+const enterpriseLane = process.env.GW_E2E_COMPOSITION === "enterprise";
+
 const testDir = defineBddConfig({
     features: [
         "e2e/features/**/*.feature",
@@ -79,12 +88,24 @@ export default defineConfig({
                 GAUGEWRIGHT_ALLOWED_ORIGINS: previewURL,
             },
         },
-        {
-            command: `npm run preview -- --port ${ports.preview} --strictPort`,
-            url: previewURL,
-            reuseExistingServer: false,
-            timeout: 30_000,
-        },
+        // The composition under test at the preview origin. Both bundles bake
+        // this run's `VITE_CP_BASE`, so either one drives the alice control
+        // plane; the enterprise dist serves its workbench at `/` with SPA
+        // fallback, so the suite's relative navigation works unchanged.
+        enterpriseLane
+            ? {
+                command: `npx vite preview --config apps/enterprise-workbench/vite.config.ts --port ${ports.preview} --strictPort`,
+                cwd: "../ee/web",
+                url: previewURL,
+                reuseExistingServer: false,
+                timeout: 30_000,
+            }
+            : {
+                command: `npm run preview -- --port ${ports.preview} --strictPort`,
+                url: previewURL,
+                reuseExistingServer: false,
+                timeout: 30_000,
+            },
         // The SELF-HOSTED enterprise composition (`gaugewright-enterprise-server`,
         // ee/): the /admin/* + SSO surface without the managed planes. The
         // combined enterprise-workbench scenarios point at it via `?cp=` — enterprise

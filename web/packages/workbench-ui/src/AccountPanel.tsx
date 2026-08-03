@@ -111,16 +111,28 @@ export function AccountPanel(props: {
     const refresh = () => setTick((t) => t + 1);
     const [status, setStatus] = createSignal("");
 
-    const [credentials] = createResource(tick, () => props.api.accountCredentials());
-    const [signInMethod] = createResource(tick, () => props.api.accountSignInMethod());
-    const [devices] = createResource(tick, () => props.api.accountDevices());
-    const [invitations] = createResource(tick, () => props.api.accountInvitations());
-    const [managed] = createResource(tick, () => props.api.accountManagedInference());
-    const [facilities] = createResource(tick, () => props.api.accountFacilities());
+    // Projection reads settle to undefined on failure instead of erroring the
+    // resource: reading an errored resource throws mid-render (the Devices
+    // crash class, 2026-07-31), and a control plane may not serve every
+    // account facade (e.g. /auth/session is hosted-only) — each section
+    // already renders its absent-value fallback for undefined.
+    const soft = <T,>(read: () => Promise<T>) => async (): Promise<T | undefined> => {
+        try {
+            return await read();
+        } catch {
+            return undefined;
+        }
+    };
+    const [credentials] = createResource(tick, soft(() => props.api.accountCredentials()));
+    const [signInMethod] = createResource(tick, soft(() => props.api.accountSignInMethod()));
+    const [devices] = createResource(tick, soft(() => props.api.accountDevices()));
+    const [invitations] = createResource(tick, soft(() => props.api.accountInvitations()));
+    const [managed] = createResource(tick, soft(() => props.api.accountManagedInference()));
+    const [facilities] = createResource(tick, soft(() => props.api.accountFacilities()));
     // Codex OAuth (LLM-1, ADR 0062): presence + expiry in GaugeDesk's sealed
     // account store. `authUrl` holds the link as a manual
     // fallback if the popup is blocked.
-    const [codex] = createResource(tick, () => props.api.codexStatus());
+    const [codex] = createResource(tick, soft(() => props.api.codexStatus()));
     const [authUrl, setAuthUrl] = createSignal("");
     const [deviceCode, setDeviceCode] = createSignal("");
     const codexExpiry = () => {
@@ -320,7 +332,10 @@ export function AccountPanel(props: {
     // operator choose which of them show in the per-chat picker. The choice persists in
     // the account-settings KV; absent → the default-visible subset (so the checklist is
     // pre-ticked with what the picker shows today).
-    const [modelSettings, { refetch: refetchModelSettings }] = createResource(tick, () => props.api.accountSettings());
+    const [modelSettings, { refetch: refetchModelSettings }] = createResource(
+        tick,
+        soft(() => props.api.accountSettings()),
+    );
     const linkedAccounts = () => {
         const ps = (credentials() ?? []).filter((c) => c.linked).map((c) => c.provider);
         if (codex()?.linked) ps.push("openai-codex");

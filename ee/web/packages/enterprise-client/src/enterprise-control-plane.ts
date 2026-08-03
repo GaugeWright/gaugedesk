@@ -8,6 +8,7 @@ import {
     openManagementEnvironment,
     proposeManagementDocumentChange,
     readManagementDocument,
+    readPlacementGovernance,
     reviewManagementChange,
     sendManagementAgentMessage,
     submitManagementCommand,
@@ -48,6 +49,11 @@ export class EnterpriseControlPlane implements EnterpriseAdminApi {
 
     placementPolicy() {
         return enterprise.placementPolicy(this.json);
+    }
+
+    /** Never-throwing governance read (solo control planes have no org routes). */
+    placementGovernance() {
+        return readPlacementGovernance(this.request);
     }
 
     openAdministration(scope?: { readonly kind: "tenant"; readonly id: string }) {

@@ -1,3 +1,6 @@
+# @open-only: drives embed-example.html, which ships only in the open bundle —
+# the enterprise-composition lane (GW_E2E_COMPOSITION=enterprise) skips it.
+@open-only
 Feature: Embedded panels (EMBED-2)
 
   As a consultant I embed the workbench panels as web components on my own page,

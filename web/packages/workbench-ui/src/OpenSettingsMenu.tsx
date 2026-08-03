@@ -4,7 +4,7 @@
  * modules from the open bundle.
  */
 
-import { createEffect, createSignal, on, Show, type Accessor, type JSX } from "solid-js";
+import { createEffect, createSignal, ErrorBoundary, on, Show, type Accessor, type JSX } from "solid-js";
 import type { PlacementPolicy } from "@gaugewright/control-plane-client";
 import { AccountPanel, type AccountPanelApi } from "./AccountPanel";
 import { DevicesModal, type DevicesModalApi } from "./DevicesModal";
@@ -17,6 +17,35 @@ export interface SettingsEnvironmentAction {
     readonly label: string;
     readonly available: Accessor<boolean>;
     readonly open: () => void;
+}
+
+/** A settings modal that throws during render must degrade to a visible,
+ *  closable failure notice — a silent dead click is indistinguishable from a
+ *  broken button and leaves no way back (the Devices crash of 2026-07-31). */
+function SettingsModalBoundary(props: {
+    surface: string;
+    onClose: () => void;
+    children: JSX.Element;
+}): JSX.Element {
+    return (
+        <ErrorBoundary
+            fallback={(error) => (
+                <div class="modal-overlay" onClick={() => props.onClose()}>
+                    <div class="modal" onClick={(e) => e.stopPropagation()}>
+                        <div class="modal-head">
+                            <h3>{props.surface}</h3>
+                            <button type="button" onClick={() => props.onClose()}>close</button>
+                        </div>
+                        <p class="status" role="alert" data-settings-modal-error>
+                            This panel failed to render: {String(error)}
+                        </p>
+                    </div>
+                </div>
+            )}
+        >
+            {props.children}
+        </ErrorBoundary>
+    );
 }
 
 export function SettingsMenu(props: {
@@ -180,26 +209,36 @@ export function SettingsMenu(props: {
             </Show>
 
             <Show when={devicesOpen()}>
-                <DevicesModal
-                    api={props.api}
-                    environment={props.environment}
-                    placementPolicy={props.placementPolicy}
-                    initialInviteLink={inviteSeed()}
+                <SettingsModalBoundary
+                    surface="Devices"
                     onClose={() => {
                         setDevicesOpen(false);
                         setInviteSeed("");
                     }}
-                />
+                >
+                    <DevicesModal
+                        api={props.api}
+                        environment={props.environment}
+                        placementPolicy={props.placementPolicy}
+                        initialInviteLink={inviteSeed()}
+                        onClose={() => {
+                            setDevicesOpen(false);
+                            setInviteSeed("");
+                        }}
+                    />
+                </SettingsModalBoundary>
             </Show>
 
             <Show when={accountOpen()}>
-                <AccountPanel
-                    api={props.api}
-                    codexLoginAvailable={props.codexLoginAvailable}
-                    managedInferenceEditable={props.managedInferenceEditable}
-                    librarySyncAvailable={props.librarySyncAvailable}
-                    onClose={() => setAccountOpen(false)}
-                />
+                <SettingsModalBoundary surface="Your account" onClose={() => setAccountOpen(false)}>
+                    <AccountPanel
+                        api={props.api}
+                        codexLoginAvailable={props.codexLoginAvailable}
+                        managedInferenceEditable={props.managedInferenceEditable}
+                        librarySyncAvailable={props.librarySyncAvailable}
+                        onClose={() => setAccountOpen(false)}
+                    />
+                </SettingsModalBoundary>
             </Show>
         </div>
     );

@@ -83,9 +83,19 @@ export function DevicesModal(props: {
         createSignal<MachineControllerInvitation | null>(null);
 
     const managedByPlacementPolicy = () => props.placementPolicy !== undefined;
+    // A policy read must degrade to undefined (fail closed), never throw: an
+    // errored-resource accessor throws on read, and an exception here kills the
+    // whole modal render.
+    const orgPolicy = (): PlacementPolicy | undefined => {
+        try {
+            return props.placementPolicy?.();
+        } catch {
+            return undefined;
+        }
+    };
     const deploymentAdmitted = (deployment: DeploymentPlacement): boolean => {
         if (!managedByPlacementPolicy()) return true;
-        const policy = props.placementPolicy?.();
+        const policy = orgPolicy();
         return policy !== undefined && placementPolicyAdmits(policy, deployment, false);
     };
     const deploymentLabel = (deployment: DeploymentPlacement) =>
@@ -171,15 +181,29 @@ export function DevicesModal(props: {
         }
     };
 
-    const [peers, { refetch: refetchPeers }] = createResource(() => props.api.listPeers());
-    const [incoming, { refetch: refetchIncoming }] = createResource(() =>
-        props.api.handoffIncoming(),
+    // Projection reads degrade to empty on failure instead of erroring the
+    // resource: reading an errored resource throws mid-render (the same class
+    // as the placement-policy crash of 2026-07-31), and a control plane may
+    // legitimately not serve a facade (e.g. dormant federation routes on a
+    // solo build). Mutations below still report their failures via status.
+    const emptyOnFailure = <T,>(read: () => Promise<T[]>) => async (): Promise<T[]> => {
+        try {
+            return await read();
+        } catch {
+            return [];
+        }
+    };
+    const [peers, { refetch: refetchPeers }] = createResource(
+        emptyOnFailure(() => props.api.listPeers()),
+    );
+    const [incoming, { refetch: refetchIncoming }] = createResource(
+        emptyOnFailure(() => props.api.handoffIncoming()),
     );
     const [controllerRequests, { refetch: refetchControllerRequests }] = createResource(
-        () => props.api.listMachineControllerRequests(),
+        emptyOnFailure(() => props.api.listMachineControllerRequests()),
     );
     const [controllers, { refetch: refetchControllers }] = createResource(
-        () => props.api.listMachineControllers(),
+        emptyOnFailure(() => props.api.listMachineControllers()),
     );
 
     const mintControllerInvitation = async () => {
@@ -392,7 +416,7 @@ export function DevicesModal(props: {
                 <Show when={managedByPlacementPolicy()}>
                     <div class="status" data-placement-policy>
                         <Show
-                            when={props.placementPolicy?.()}
+                            when={orgPolicy()}
                             fallback={<>Organization placement policy unavailable — engagement acceptance is blocked.</>}
                         >
                             {(policy) => (

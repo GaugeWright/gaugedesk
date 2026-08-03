@@ -25,7 +25,8 @@
     "typecheck:split": "npm run typecheck:open-client && npm run typecheck:workbench-web && npm run typecheck:workbench-ui && npm run typecheck:mobile-client && npm run typecheck:embed-client",
     "test": "vitest run",
     "e2e": "node e2e/run.mjs",
-    "e2e:live": "GW_E2E_LIVE=1 node e2e/run.mjs"
+    "e2e:live": "GW_E2E_LIVE=1 node e2e/run.mjs",
+    "e2e:enterprise": "GW_E2E_COMPOSITION=enterprise node e2e/run.mjs"
   },
   "dependencies": {
     "@git-diff-view/file": "^0.1.5",

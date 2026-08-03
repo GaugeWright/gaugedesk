@@ -1,4 +1,5 @@
 import type { RouteJson } from "./control-plane-transport";
+import type { RouteRequest } from "./browser-route-json";
 
 export type PlacementOperator = "local" | "counterparty" | "neutral";
 
@@ -76,4 +77,38 @@ export function placementPolicyAdmits(
 export async function readPlacementPolicy(json: RouteJson): Promise<PlacementPolicy> {
     const response = object(await json("GET", "/admin/placement-policy"), "placement response");
     return parsePlacementPolicy(response.placement_policy);
+}
+
+/** Whether an organization placement floor governs this control plane at all,
+ * and the policy when it does. `managed: false` means the control plane serves
+ * no org-governance surface (the solo/local case) and the client renders
+ * unmanaged controls. `managed: true` with no policy is a governed control
+ * plane whose policy could not be read; the UI fails closed on it. */
+export type PlacementGovernance =
+    | { readonly managed: false }
+    | { readonly managed: true; readonly policy?: PlacementPolicy };
+
+/** Resolve governance from the placement-policy route without ever throwing.
+ * This exists because the read runs in every enterprise composition, including
+ * against a solo control plane where the route does not exist: a 404 is the
+ * unmanaged signal, and every failure mode must land as a value — a rejection
+ * here once reached the UI as an errored resource whose read threw mid-render
+ * and killed the Devices modal (2026-07-31). */
+export async function readPlacementGovernance(
+    request: RouteRequest,
+): Promise<PlacementGovernance> {
+    let response: Response;
+    try {
+        response = await request("/admin/placement-policy");
+    } catch {
+        return { managed: true };
+    }
+    if (response.status === 404) return { managed: false };
+    if (!response.ok) return { managed: true };
+    try {
+        const value = (await response.json()) as { placement_policy?: unknown };
+        return { managed: true, policy: parsePlacementPolicy(value.placement_policy) };
+    } catch {
+        return { managed: true };
+    }
 }

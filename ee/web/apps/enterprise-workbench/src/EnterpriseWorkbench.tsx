@@ -47,10 +47,21 @@ export function EnterpriseWorkbench(): JSX.Element {
             }
         },
     );
-    const [placementPolicy] = createResource(
+    // The governance read resolves to a value on every failure mode, so this
+    // resource never lands errored — an errored resource throws on read, and
+    // this accessor is read inside the Devices modal's render.
+    const [governance] = createResource(
         () => ({ tenant: tenant() }),
-        async (): Promise<PlacementPolicy> => api.placementPolicy(),
+        () => api.placementGovernance(),
     );
+    // Loading still counts as managed so policy-gated surfaces fail closed
+    // until the read lands; a solo control plane (no governance route) then
+    // resolves unmanaged and the App receives no policy accessor at all.
+    const orgManaged = () => governance()?.managed !== false;
+    const placementPolicy = (): PlacementPolicy | undefined => {
+        const value = governance();
+        return value?.managed === true ? value.policy : undefined;
+    };
     const adminAvailable = () => (discovery()?.capabilities.length ?? 0) > 0;
     const adminVisible = () => requestedMode() === "admin" && adminAvailable();
 
@@ -79,7 +90,7 @@ export function EnterpriseWorkbench(): JSX.Element {
             <div hidden={adminVisible()} data-work-environment>
                 <App
                     onTenantContextChange={setTenant}
-                    placementPolicy={placementPolicy}
+                    placementPolicy={orgManaged() ? placementPolicy : undefined}
                     environmentAction={{
                         label: "Administration",
                         available: adminAvailable,

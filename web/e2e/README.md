@@ -22,6 +22,14 @@ broker.sh            launches the rendezvous broker (federation scenarios)
 - **Live suite** (`npm run e2e:live`) — opt-in. Runs only `@live` scenarios against
   **WhippleScript with a real model** (the OpenAI Codex endpoint via OAuth). Slow, costs tokens — for the
   cases where the model's actual behavior drives the app (real tool-use → diff).
+- **Enterprise-composition lane** (`npm run e2e:enterprise`) — the same default
+  suite, but the preview origin serves the **combined enterprise workbench**
+  (`ee/web`) instead of the open bundle. Every shipped surface — desktop
+  packaging and the hosted desk — runs the enterprise composition (ADR 0098),
+  and the open dev loop alone let an enterprise-only crash ship (the Devices
+  modal, 2026-07-31), so this lane is how the suite exercises what actually
+  ships. Features that exist only in the open bundle (the embed example page,
+  the `?mobile=1` entry) carry the `@open-only` tag and are skipped here.
 
 Both manage their own servers via Playwright `webServer`. `run.mjs` resolves a free
 port set per run (control plane, federation peer, broker, `vite preview`) and exports

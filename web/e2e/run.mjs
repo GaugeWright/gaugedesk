@@ -69,14 +69,29 @@ if (process.env.GW_E2E_LIVE) {
         process.env.GAUGEWRIGHT_FAKE_MANAGEMENT_AGENT ?? "1";
 }
 
+// The enterprise lane (`GW_E2E_COMPOSITION=enterprise`, `npm run e2e:enterprise`)
+// serves the combined enterprise workbench at the preview origin and skips the
+// @open-only features (surfaces that ship only in the open bundle).
+const enterpriseLane = process.env.GW_E2E_COMPOSITION === "enterprise";
+
 console.log(
     `[e2e] ports → alice:${alice} bob:${bob} broker:${broker} preview:${preview} ` +
         `enterprise:${enterprise} enterpriseApp:${enterpriseApp}`,
 );
+console.log(
+    `[e2e] composition at preview origin → ${enterpriseLane ? "enterprise workbench" : "open workbench"}`,
+);
 
 const passthrough = process.argv.slice(2);
 // Default run skips real-model @live scenarios; `GW_E2E_LIVE=1` runs only those.
-const grep = process.env.GW_E2E_LIVE ? ["--grep", "@live"] : ["--grep-invert", "@live"];
+const invert = [
+    ...(process.env.GW_E2E_LIVE ? [] : ["@live"]),
+    ...(enterpriseLane ? ["@open-only"] : []),
+];
+const grep = [
+    ...(process.env.GW_E2E_LIVE ? ["--grep", "@live"] : []),
+    ...(invert.length ? ["--grep-invert", invert.join("|")] : []),
+];
 
 // The standalone app workspaces (each its own npm workspace consuming the platform
 // packages via file: deps). Their bundles are built here so Playwright's static
