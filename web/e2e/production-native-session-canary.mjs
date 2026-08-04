@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import {
+    advanceProviderStates,
     defaultBrowserType,
     exactOrigin,
+    providerOriginFor,
     providerStorageState,
 } from "./production-account-session-canary.mjs";
 
@@ -39,6 +41,7 @@ export async function runNativeAccountSession(
     fetchImpl = fetch,
 ) {
     const apiOrigin = exactOrigin(environment, "GW_SYNTHETIC_API_ORIGIN");
+    const providerOrigin = providerOriginFor(environment);
     const storageState = providerStorageState(environment);
     const chromium = browserType ?? await defaultBrowserType();
     const browser = await chromium.launch({ headless: true });
@@ -54,7 +57,21 @@ export async function runNativeAccountSession(
                 (response) => response.url().startsWith(`${apiOrigin}/auth/callback?`),
                 { timeout: 60_000 },
             );
+            let callbackSettled = false;
+            callbackPromise.then(() => { callbackSettled = true; }, () => {});
             await page.goto(login.toString(), { waitUntil: "commit" }).catch(() => {});
+            await Promise.race([
+                page.waitForURL(
+                    (url) => url.origin === providerOrigin,
+                    { timeout: 30_000 },
+                ),
+                callbackPromise,
+            ]).catch(() => {});
+            await advanceProviderStates(
+                page,
+                { provider: providerOrigin, api: apiOrigin },
+                () => callbackSettled,
+            );
             const callback = await callbackPromise;
             const location = callback.headers().location;
             assert(

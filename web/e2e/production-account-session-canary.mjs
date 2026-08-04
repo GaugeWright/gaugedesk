@@ -76,7 +76,7 @@ function expectedSessionMethod(providerOrigin) {
         : "oidc";
 }
 
-function providerOriginFor(environment) {
+export function providerOriginFor(environment) {
     const raw = environment.GW_SYNTHETIC_OIDC_PROVIDER_ORIGIN?.trim()
         || "https://accounts.google.com";
     const url = new URL(raw);
