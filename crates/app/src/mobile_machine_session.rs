@@ -164,16 +164,15 @@ async fn post_invitation(
     Json(body): Json<InvitationRequest>,
 ) -> axum::response::Response {
     let endpoint = body.endpoint.trim().trim_end_matches('/').to_string();
-    let authority = endpoint.strip_prefix("https://").unwrap_or_default();
-    if authority.is_empty()
-        || authority.chars().any(|character| {
-            matches!(character, '/' | '?' | '#' | '@') || character.is_whitespace()
-        })
-    {
+    let endpoint_uri = endpoint.parse::<axum::http::Uri>().ok();
+    let endpoint_valid = endpoint_uri.as_ref().is_some_and(|uri| {
+        uri.scheme_str() == Some("https") && uri.host().is_some() && uri.query().is_none()
+    });
+    if !endpoint_valid {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "Machine controller invitations require an HTTPS origin without a path"
+                "error": "Machine controller invitations require an HTTPS Home endpoint without a query"
             })),
         )
             .into_response();
@@ -932,11 +931,23 @@ mod tests {
         )
         .await;
         assert_eq!(invitation["endpoint"], "https://machine.example.test");
-        let (invalid_endpoint, _) = json_call(
+        let (path_endpoint, path_invitation) = json_call(
             &app,
             "POST",
             "/mobile/enrollment/invitations",
             json!({ "endpoint": "https://machine.example.test/control-plane" }),
+        )
+        .await;
+        assert_eq!(path_endpoint, StatusCode::CREATED);
+        assert_eq!(
+            path_invitation["endpoint"],
+            "https://machine.example.test/control-plane"
+        );
+        let (invalid_endpoint, _) = json_call(
+            &app,
+            "POST",
+            "/mobile/enrollment/invitations",
+            json!({ "endpoint": "https://machine.example.test/control-plane?wrong=route" }),
         )
         .await;
         assert_eq!(invalid_endpoint, StatusCode::BAD_REQUEST);
