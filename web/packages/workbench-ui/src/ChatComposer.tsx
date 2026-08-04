@@ -25,6 +25,8 @@ export interface ChatComposerProps {
     readonly gated?: boolean;
     readonly reviewNext?: boolean;
     readonly canSubmit: boolean;
+    readonly error?: string;
+    readonly attaching?: boolean;
     /** Marks the public custom-element contract without changing presentation. */
     readonly audience?: boolean;
     /** The no-selection desktop on-ramp that mints a chat on first send. */
@@ -54,7 +56,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
     const attachments = () => props.attachments ?? [];
     const hasQueueCommands = () =>
         props.onReorderQueue && props.onEditQueue && props.onRemoveQueue && props.onSendNow;
-    const audienceBusy = () => props.busy && !props.onSteer;
+    const audienceBusy = () => props.busy && !props.onSteer && !hasQueueCommands();
     const resizeMessage = () => {
         const element = messageInput;
         // ChatPanel marks its own sizing boundary for embedded/audience mounts.
@@ -125,6 +127,12 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                 </div>
             </Show>
 
+            <Show when={props.error}>
+                <div class="composer-error" data-composer-error role="status">
+                    {props.error}
+                </div>
+            </Show>
+
             <Show when={props.onAttachInput}>
                 <input
                     ref={attachInput}
@@ -184,6 +192,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                         type="button"
                         data-attach
                         aria-label="Attach files"
+                        disabled={props.attaching}
                         title="Attach file(s) to this message — their text rides along with the agent (not saved to the workspace)"
                         onClick={() => attachInput?.click()}
                     >
@@ -236,21 +245,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                         </button>
                     }
                 >
-                    <Show
-                        when={props.onSteer}
-                        fallback={
-                            <button
-                                class="composer-primary send-btn"
-                                type="button"
-                                data-embed-send={props.audience ? "" : undefined}
-                                classList={{ "stop-btn": Boolean(props.onStop) }}
-                                disabled={!props.onStop}
-                                onClick={() => props.onStop?.()}
-                            >
-                                {props.onStop ? "Stop" : "Working…"}
-                            </button>
-                        }
-                    >
+                    <Show when={props.onSteer}>
                         <button
                             class="composer-primary steer-btn"
                             type="button"
@@ -261,6 +256,8 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                         >
                             Steer
                         </button>
+                    </Show>
+                    <Show when={hasQueueCommands()}>
                         <button
                             class="composer-action queue-btn"
                             type="button"
@@ -271,6 +268,26 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                         >
                             <Icon name="queue" />
                             Queue ⏎
+                        </button>
+                    </Show>
+                    <Show when={props.onStop}>
+                        <button
+                            class="composer-action stop-btn"
+                            type="button"
+                            data-testid="stop-turn"
+                            title="Stop the running turn"
+                            onClick={() => props.onStop?.()}
+                        >
+                            Stop
+                        </button>
+                    </Show>
+                    <Show when={!props.onSteer && !hasQueueCommands() && !props.onStop}>
+                        <button
+                            class="composer-primary send-btn"
+                            type="button"
+                            disabled
+                        >
+                            Working…
                         </button>
                     </Show>
                 </Show>

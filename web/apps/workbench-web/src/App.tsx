@@ -42,18 +42,16 @@ import { desktopUpdateAllowed } from "./desktop-update";
 import "@gaugewright/gw-embed";
 import {
     AgentSettings,
-    type Attachment,
-    buildOutgoing,
+    BASIC_COMPOSER_CAPABILITIES,
     ChatPanel,
     ChatPaneHeader,
-    classifyAttachment,
     changedUserFiles,
     chatIdFromSearch,
     ContentViewer,
     QuarantineIndex,
     ContextPanel,
     DeploymentPanel,
-    ChatComposer,
+    createSessionComposerController,
     deriveFreshness,
     displayChatTitle,
     emptyTranscript as empty,
@@ -61,8 +59,6 @@ import {
     Environment,
     ENABLED_MODELS_SETTING,
     fileFromSearch,
-    fileToBase64,
-    extractDocumentAttachment,
     freshnessEventForMarker,
     FacetBrowser,
     forkSource,
@@ -94,6 +90,7 @@ import {
     searchWithChat,
     searchWithFile,
     SessionProvider,
+    SessionComposer,
     Shelf,
     FirstRunOverlay,
     TaskBar,
@@ -108,6 +105,7 @@ import {
     WorkbenchShell,
     createWorkbenchShellState,
     writeChatModelPin,
+    UNIVERSAL_COMPOSER_CAPABILITIES,
     writeChatThinking,
 } from "@gaugewright/workbench-ui";
 import { isMobileHarness, MobileApp } from "@gaugewright/mobile-web";
@@ -154,13 +152,6 @@ function consumeHomeInvitation(): string {
 }
 
 const initialHomeInvitation = consumeHomeInvitation();
-
-/** A message the human typed while a turn was in flight. Queued messages stack on
- *  top of the composer and drain in order when each turn settles. The `id` is a
- *  stable client key so edits/reorders/removals don't churn the DOM. `images` are
- *  the message's native image blocks (text attachments are already folded into
- *  `text` by composeOutgoing). */
-type QueuedMsg = { id: number; text: string; images: ImageRef[]; review: boolean };
 
 /** True inside the Tauri desktop shell (v2 injects this), false in a plain
  *  browser / e2e build — gates native-only affordances like the folder picker. */
@@ -803,23 +794,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         return undefined;
     };
     const busy = () => runToneOf(selected()) === "working";
-    // Client-only send queue: messages typed while a turn runs. It is per-engagement
-    // (cleared on switch) and never durable — the durable transcript only ever
-    // records what actually ran (run-chat.md). `nextQid` mints stable list keys.
-    const [queue, setQueue] = createSignal<QueuedMsg[]>([]);
-    let nextQid = 1;
     // Per-change opt-in review (ADR 0096). It is captured into the queued message,
     // then reset so the next turn returns to the shared-line auto-sync default.
     const [reviewNext, setReviewNext] = createSignal(false);
-    // The queue **gate** (#24): when gated, typed messages *stage* in the thread
-    // without draining into turns — the user can line up several, then release them.
-    // Default open (ungated) = the prior immediate/queue-and-run behaviour.
-    const [gated, setGated] = createSignal(false);
-    // Message attachments (UX-14): file(s) the user clips to the message being
-    // composed. Their text is read client-side and inlined into the turn's prompt
-    // (see composeOutgoing) — message-scoped, cleared on send, never workspace
-    // context. Uniform across browser and the Tauri webview; no backend.
-    const [attachments, setAttachments] = createSignal<Attachment[]>([]);
     const [activity, setActivity] = createSignal(""); // what the agent is doing now
     // The agent's pending approvals from the last turn (UX-3): an `extension_ui_request`
     // the runtime surfaced but did not auto-confirm — answered out-of-band via the
@@ -885,8 +862,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (reviewing() && reviewing()!.chat !== id) setReviewing(null);
         setSnapshot(empty);
         setLive(empty);
-        setQueue([]); // the queue is per-engagement and client-only
-        setGated(false); // the stage-gate resets with the thread
         setReviewNext(false);
         void loadSnapshot(id);
         const unsubscribe = api.subscribe(
@@ -987,7 +962,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             if (prompt) {
                 // Let the selected-chat effect subscribe before the first turn starts;
                 // otherwise an eager turn can race the fresh transcript reset.
-                queueMicrotask(() => void runPrompt(eng.id, prompt, images, review));
+                queueMicrotask(() => void runPrompt(eng.id, prompt, images, review).catch(() => undefined));
             }
         } catch (e) {
             setStatus(`couldn't start a chat — ${String(e)}`);
@@ -1067,6 +1042,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 // evidence of what just happened, not unresolved merge state.
                 if (typeof res?.diff === "string") setDiff(res.diff);
             }
+            if (failed) throw new Error(res?.error || "The turn failed.");
         } catch (e) {
             setRunTone(id, "error");
             if (isCurrent()) {
@@ -1078,187 +1054,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 // so do not carry the pending echo beyond this repair.
                 setLive(empty);
             }
+            throw e;
         } finally {
             retireSend(rid);
             if (isCurrent()) {
                 setActivity("");
-                pump();
             }
-        }
-    }
-
-    // Drain the head of the queue if idle. A no-op while a turn is in flight or the
-    // queue is empty; runPrompt() calls it again on settle, so the queue chains itself.
-    function pump() {
-        if (busy() || gated()) return; // a gated queue stages; it does not drain
-        const id = selected();
-        if (!id) return;
-        const next = queue()[0];
-        if (!next) return;
-        setQueue((q) => q.slice(1));
-        void runPrompt(id, next.text, next.images, next.review);
-    }
-
-    // Toggle the stage-gate (#24). Opening it releases whatever's staged into the
-    // running queue (pump drains the front, and each settle chains the rest).
-    function toggleGate() {
-        const opening = gated();
-        setGated((g) => !g);
-        if (opening) pump();
-    }
-
-    // The composer's primary action. Idle → send now; busy → append to the queue
-    // (it runs when the current turn settles). One path either way: enqueue + pump.
-    // The send *primitive* (the Session's `send`, EMBED-1): enqueue a message and
-    // pump the queue — start a turn on the current engagement. An embed composer
-    // rides this directly; the desktop's draft/queue/steer controls layer on top.
-    function sendText(text: string, images: ImageRef[] = [], review = reviewNext()) {
-        const id = selected();
-        const t = text.trim();
-        if (!id || (!t && images.length === 0)) return;
-        setQueue((q) => [...q, { id: nextQid++, text: t, images, review }]);
-        setReviewNext(false);
-        pump();
-    }
-
-    // There's something to send when the draft has text OR a file is attached.
-    const hasOutgoing = () => paneDraft().trim().length > 0 || attachments().length > 0;
-
-    // Build the outgoing turn from the draft + pending attachments, then clear them
-    // (attachments are message-scoped). Text files inline into the prompt as delimited
-    // blocks; images become native `images[]` (resolved as WhippleScript resources, not
-    // inlined) with only a byte-free `[attached image: …]` note left in the text so the
-    // durable transcript honestly shows one rode along (run-chat.md "Message
-    // attachments"; base64 never enters the log — INV-10).
-    function composeOutgoing(): { message: string; images: ImageRef[] } {
-        const out = buildOutgoing(paneDraft(), attachments());
-        setAttachments([]); // attachments are message-scoped — cleared on send
-        return out;
-    }
-
-    function submitDraft() {
-        if (!selected() || !hasOutgoing()) return;
-        const review = reviewNext();
-        const { message, images } = composeOutgoing();
-        setDraft("");
-        sendText(message, images, review);
-    }
-
-    // Quick-start submit (no chat open): the same composer contract — draft +
-    // attachments + review flag — minting the chat on first send.
-    function submitQuickStart() {
-        if (!hasOutgoing()) return;
-        const { message, images } = composeOutgoing();
-        setEmptyChatDraft("");
-        const review = reviewNext();
-        setReviewNext(false);
-        void startNewChat(message, images, review);
-    }
-
-    function submitPane() {
-        if (selected()) submitDraft();
-        else submitQuickStart();
-    }
-
-    // Steer: redirect the agent *now*. With one blocking turn at a time, "now" means
-    // jump the queue and abort the in-flight turn — the steer message is the next
-    // thing the agent runs (the stop settles → pump() drains the front). Idle steer
-    // is just an immediate send.
-    function steerDraft() {
-        const id = selected();
-        if (!id || !hasOutgoing()) return;
-        const { message, images } = composeOutgoing();
-        setDraft("");
-        const review = reviewNext();
-        setReviewNext(false);
-        setQueue((q) => [{ id: nextQid++, text: message, images, review }, ...q]);
-        if (busy()) void stopTurn();
-        else pump();
-    }
-
-    // Paperclip attach (UX-14): a plain <input type=file> (works in the browser and
-    // the Tauri webview — no plugin, no backend). Images go to WhippleScript as native
-    // image blocks; text files inline into the prompt; PDF/Office text is extracted
-    // locally before entering that same inline path.
-    async function attachFiles(picked: readonly File[]) {
-        const next: Attachment[] = [];
-        const rejected: string[] = [];
-        const unreadable: string[] = [];
-        // UX-14 vision pre-check: block an image attach up front on a KNOWN non-vision
-        // model (rather than letting the turn fail at send). The default/unknown model
-        // stays permissive — we take the runtime's word.
-        const canSeeImages = modelAcceptsImages({ id: chatModel(), provider: chatProvider() });
-        const visionBlocked: string[] = [];
-        for (const f of picked) {
-            const kind = classifyAttachment(f);
-            if (kind === "image") {
-                if (!canSeeImages) {
-                    visionBlocked.push(f.name);
-                    continue;
-                }
-                next.push({ kind: "image", name: f.name, mimeType: f.type, data: await fileToBase64(f) });
-            } else if (kind === "text") {
-                next.push({ kind: "text", name: f.name, text: await f.text() });
-            } else if (kind === "document") {
-                try {
-                    next.push(await extractDocumentAttachment(f));
-                } catch {
-                    unreadable.push(f.name);
-                }
-            } else {
-                rejected.push(f.name);
-            }
-        }
-        if (next.length) setAttachments((a) => [...a, ...next]);
-        if (visionBlocked.length) {
-            setStatus(`this chat's model can't read images — pick a vision-capable model to attach ${visionBlocked.join(", ")}`);
-        } else if (unreadable.length) {
-            setStatus(`couldn't extract readable text from ${unreadable.join(", ")}`);
-        } else if (rejected.length) {
-            setStatus(`can't attach ${rejected.join(", ")} — choose text, image, PDF, docx, xlsx, or pptx`);
-        }
-    }
-    async function onAttachInput(e: Event) {
-        const input = e.currentTarget as HTMLInputElement;
-        const picked = Array.from(input.files ?? []);
-        input.value = ""; // let the same file be picked again later
-        await attachFiles(picked);
-    }
-    const removeAttachment = (i: number) => setAttachments((a) => a.filter((_, n) => n !== i));
-
-    // Queue edits: reorder (drag), edit-in-place (empty text removes), and cancel.
-    function reorderQueue(from: number, to: number) {
-        setQueue((q) => {
-            const next = q.slice();
-            const [m] = next.splice(from, 1);
-            next.splice(to, 0, m);
-            return next;
-        });
-    }
-    function editQueued(qid: number, text: string) {
-        const t = text.trim();
-        setQueue((q) =>
-            t ? q.map((m) => (m.id === qid ? { ...m, text: t } : m)) : q.filter((m) => m.id !== qid),
-        );
-    }
-    function removeQueued(qid: number) {
-        setQueue((q) => q.filter((m) => m.id !== qid));
-    }
-    // Run one queued message NOW, jumping ahead of the rest and overriding a hold
-    // for just that message. Idle (incl. held) → run it immediately; mid-turn →
-    // move it to the front and interrupt, so it runs next (steer semantics). The
-    // remaining queue keeps its order and hold.
-    function sendNowQueued(qid: number) {
-        const id = selected();
-        if (!id) return;
-        const item = queue().find((m) => m.id === qid);
-        if (!item) return;
-        if (busy()) {
-            setQueue((q) => [item, ...q.filter((m) => m.id !== qid)]);
-            void stopTurn(); // on settle, pump drains the front (this message)
-        } else {
-            setQueue((q) => q.filter((m) => m.id !== qid));
-            void runPrompt(id, item.text, item.images, item.review);
         }
     }
 
@@ -1528,81 +1329,89 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         </div>
     );
 
-    // ONE composer for both pane states (open chat and quick-start): the same
-    // component with the same commands; handlers that need a live chat are
-    // simply absent until one exists, which is how this composer removes
-    // controls (its own doctrine) rather than swapping in a lesser UI.
+    const composerModelToolbar = () => (
+        <>
+            <label class="model-picker" title="Model for this chat — overrides the archetype's default for this conversation only">
+                <select
+                    data-model-picker
+                    aria-label="Model for this chat"
+                    value={modelValue()}
+                    onChange={(event) => void pickModel(event.currentTarget.value)}
+                >
+                    <For each={modelChoices()}>
+                        {(model) => <option value={model.id ? modelKey(model) : ""}>{model.label}</option>}
+                    </For>
+                </select>
+            </label>
+            <Show when={showCustomModel()}>
+                <label class="model-picker" title="Model id for your OpenAI-compatible endpoint — press Enter to pin it for this chat">
+                    <span class="model-picker-tag" aria-hidden="true">custom</span>
+                    <input
+                        data-custom-model
+                        aria-label="Custom model id for this chat"
+                        placeholder="model id (e.g. llama-3.3-70b)"
+                        value={customModel()}
+                        onInput={(event) => setCustomModel(event.currentTarget.value)}
+                        onKeyDown={(event) => event.key === "Enter" && void pinCustomModel(event.currentTarget.value)}
+                    />
+                </label>
+            </Show>
+            <Show when={showEffort()}>
+                <label class="model-picker effort-picker" title="Reasoning effort for this chat — higher is more deliberate (slower, costlier); Default uses the model's own setting">
+                    <span class="model-picker-tag" aria-hidden="true">effort</span>
+                    <select
+                        data-effort-picker
+                        aria-label="Reasoning effort for this chat"
+                        value={selected() ? chatThinking() : pendingThinking()}
+                        onChange={(event) => void pickThinking(event.currentTarget.value)}
+                    >
+                        <option value="">Default</option>
+                        <For each={effortLevels()}>
+                            {(level) => <option value={level}>{level}</option>}
+                        </For>
+                    </select>
+                </label>
+            </Show>
+        </>
+    );
+
+    // One controller drives both the selected Session and quick-start. The
+    // Environment changes only its explicit capabilities and turn primitive.
+    const desktopComposerController = createSessionComposerController({
+        scope: () => selected() ? String(selected()) : "quick-start",
+        busy: () => selected() ? busy() : false,
+        capabilities: () => selected()
+            ? UNIVERSAL_COMPOSER_CAPABILITIES
+            : BASIC_COMPOSER_CAPABILITIES,
+        send: async (text, images, options) => {
+            const id = selected();
+            if (id) {
+                await runPrompt(id, text, [...images], options.review ?? false);
+            } else {
+                await startNewChat(text, [...images], options.review ?? false);
+            }
+        },
+        stop: stopTurn,
+        draft: { value: paneDraft, set: setPaneDraft },
+        retainDraftOnScopeChange: true,
+        review: { value: reviewNext, set: setReviewNext },
+        modelToolbar: composerModelToolbar,
+        acceptsImages: () => modelAcceptsImages({ id: chatModel(), provider: chatProvider() }),
+        onStatus: setStatus,
+    });
+
     const paneComposer = () => (
-        <ChatComposer
-            draft={paneDraft()}
+        <SessionComposer
+            audience={false}
+            controller={desktopComposerController}
+            quickStart={!selected()}
             placeholder={selected() && chatKind() === "edit"
                 ? `Describe what to change about ${methodName() || "this archetype"}…`
                 : "task the agent…"}
-            queue={selected() ? queue() : []}
-            attachments={attachments()}
-            busy={selected() ? busy() : false}
-            gated={selected() ? gated() : false}
-            reviewNext={reviewNext()}
-            canSubmit={hasOutgoing()}
-            modelToolbar={
-                <>
-                    <label class="model-picker" title="Model for this chat — overrides the archetype's default for this conversation only">
-                        <select
-                            data-model-picker
-                            aria-label="Model for this chat"
-                            value={modelValue()}
-                            onChange={(event) => void pickModel(event.currentTarget.value)}
-                        >
-                            <For each={modelChoices()}>
-                                {(model) => <option value={model.id ? modelKey(model) : ""}>{model.label}</option>}
-                            </For>
-                        </select>
-                    </label>
-                    <Show when={showCustomModel()}>
-                        <label class="model-picker" title="Model id for your OpenAI-compatible endpoint — press Enter to pin it for this chat">
-                            <span class="model-picker-tag" aria-hidden="true">custom</span>
-                            <input
-                                data-custom-model
-                                aria-label="Custom model id for this chat"
-                                placeholder="model id (e.g. llama-3.3-70b)"
-                                value={customModel()}
-                                onInput={(event) => setCustomModel(event.currentTarget.value)}
-                                onKeyDown={(event) => event.key === "Enter" && void pinCustomModel(event.currentTarget.value)}
-                            />
-                        </label>
-                    </Show>
-                    <Show when={showEffort()}>
-                        <label class="model-picker effort-picker" title="Reasoning effort for this chat — higher is more deliberate (slower, costlier); Default uses the model's own setting">
-                            <span class="model-picker-tag" aria-hidden="true">effort</span>
-                            <select
-                                data-effort-picker
-                                aria-label="Reasoning effort for this chat"
-                                value={selected() ? chatThinking() : pendingThinking()}
-                                onChange={(event) => void pickThinking(event.currentTarget.value)}
-                            >
-                                <option value="">Default</option>
-                                <For each={effortLevels()}>
-                                    {(level) => <option value={level}>{level}</option>}
-                                </For>
-                            </select>
-                        </label>
-                    </Show>
-                </>
-            }
-            onDraft={setPaneDraft}
-            onSubmit={submitPane}
-            onSteer={selected() ? steerDraft : undefined}
-            onToggleGate={selected() ? toggleGate : undefined}
-            onToggleReview={() => setReviewNext((value) => !value)}
-            onAttachInput={onAttachInput}
-            onPasteFiles={attachFiles}
-            onRemoveAttachment={removeAttachment}
-            onReorderQueue={selected() ? reorderQueue : undefined}
-            onEditQueue={selected() ? editQueued : undefined}
-            onRemoveQueue={selected() ? removeQueued : undefined}
-            onSendNow={selected() ? sendNowQueued : undefined}
-            quickStart={!selected()}
-            inputRef={(element) => { composerEl = element; if (!selected()) queueMicrotask(() => element.focus()); }}
+            inputRef={(element) => {
+                composerEl = element;
+                if (!selected()) queueMicrotask(() => element.focus());
+            }}
         />
     );
 
@@ -1823,13 +1632,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             <div class="working" data-testid="agent-working">
                                 <span class="pulse" />
                                 agent working{activity() ? ` — ${activity()}` : ""}
-                                <button class="stop-btn" data-testid="stop-turn" onClick={stopTurn}>
-                                    stop
-                                </button>
                             </div>
                         </Show>
                     }
-                    composer={paneComposer()}
+                    composerController={desktopComposerController}
+                    composerInputRef={(element) => { composerEl = element; }}
                 />
             </Show>
         </>
@@ -1958,12 +1765,19 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         chatKind,
         methodName,
         transcript,
+        busy: () => selected() === id && busy(),
+        composerCapabilities: () => UNIVERSAL_COMPOSER_CAPABILITIES,
         merge: (action) => void onMerge(action),
         onContentSaved: () => void Promise.all([refetchDiff(), refetchMerge()]),
-        send: (text) => {
+        send: async (text, images = [], options = {}) => {
             // A leaf may outlive one render turn during a selection change. Refuse
             // to route its command to a different engagement.
-            if (selected() === id) sendText(text);
+            if (selected() !== id) throw new Error("This chat is no longer selected.");
+            await runPrompt(id, text, [...images], options.review ?? false);
+        },
+        stop: async () => {
+            if (selected() !== id) throw new Error("This chat is no longer selected.");
+            await stopTurn();
         },
         forkAt: (entryId) => {
             if (selected() !== id) return;

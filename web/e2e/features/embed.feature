@@ -36,6 +36,24 @@ Feature: Embedded panels (EMBED-2)
     When I send the pasted image in the embedded chat
     Then the embedded turn carries the pasted image bytes
 
+  Scenario: the paperclip admits supported files through the shared controller
+    Given the embed example page is open
+    When I attach a text file with the embedded paperclip
+    Then the embedded composer shows the attached text file
+    When I send the attached text file in the embedded chat
+    Then the embedded turn carries the attached text
+
+  Scenario: an embedded visitor can queue, steer, and stop through the shared controller
+    Given a delayed embedded chat is open
+    When I send "first request" in the embedded chat
+    Then the embedded composer offers steer, queue, and stop
+    When I queue "second request" in the embedded chat
+    Then the embedded queue shows "second request"
+    When I steer the embedded chat with "urgent correction"
+    Then the embedded turn is interrupted
+    And the embedded turns begin in the order "first request,urgent correction"
+    And the embedded queue eventually drains in the order "first request,urgent correction,second request"
+
   Scenario: the embedded panels carry the workbench theme and accept --gw-* overrides
     Given the embed example page is open
     Then the embedded chat is themed by the workbench palette

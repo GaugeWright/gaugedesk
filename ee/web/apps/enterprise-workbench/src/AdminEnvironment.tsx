@@ -38,7 +38,6 @@ import {
     ChatPanel,
     ContentViewer,
     createWorkbenchShellState,
-    ChatComposer,
     emptyTranscript,
     SessionProvider,
     TaskBar,
@@ -66,7 +65,6 @@ type AdminDocument =
     | AdminConfigDocument
     | { readonly path: Exclude<AdminWorkspacePath, AdminConfigPath>; readonly raw: string };
 type AttentionItem = { readonly id: string; readonly path: AdminConfigPath; readonly title: string };
-type QueuedMessage = { readonly id: number; readonly text: string };
 type ResourcePolicy = { readonly rules: readonly unknown[] };
 type AutomationProjection = {
     readonly automations?: readonly {
@@ -362,7 +360,9 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
             openText: null,
             lines: [...current.lines, { seq: current.lines.length, tier: "admitted", kind, text }],
         }));
+    const [agentBusy, setAgentBusy] = createSignal(false);
     const answer = async (text: string) => {
+        setAgentBusy(true);
         appendLine("user", text);
         try {
             const session = environmentSession();
@@ -389,6 +389,9 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
             }
         } catch (error) {
             appendLine("assistant", `I could not complete that governed agent turn: ${messageOf(error)}`);
+            throw error;
+        } finally {
+            setAgentBusy(false);
         }
     };
 
@@ -416,6 +419,14 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
         chatKind: () => "work",
         methodName: () => "Administration",
         transcript,
+        busy: agentBusy,
+        composerCapabilities: () => ({
+            queue: true,
+            steer: false,
+            stop: false,
+            stage: true,
+            attachments: [],
+        }),
         merge: () => undefined,
         onContentSaved: refresh,
         send: answer,
@@ -423,55 +434,7 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
         readOnlyFileReason: () => "This Administration file is read-only. Use its rendered controls or ask the agent to prepare a declared typed proposal.",
     };
 
-    const [draft, setDraft] = createSignal("");
-    const [gated, setGated] = createSignal(false);
-    const [queue, setQueue] = createSignal<QueuedMessage[]>([]);
-    let nextQueueId = 1;
     let composerInput: HTMLTextAreaElement | undefined;
-
-    const hasOutgoing = () => draft().trim().length > 0;
-    const compose = () => {
-        const outgoing = draft().trim();
-        setDraft("");
-        return outgoing;
-    };
-    const submit = () => {
-        if (!hasOutgoing()) return;
-        const outgoing = compose();
-        if (gated()) {
-            setQueue((current) => [...current, { id: nextQueueId++, text: outgoing }]);
-        } else {
-            answer(outgoing);
-        }
-    };
-    const release = () => {
-        if (!gated()) {
-            setGated(true);
-            return;
-        }
-        setGated(false);
-        const held = queue();
-        setQueue([]);
-        for (const item of held) answer(item.text);
-    };
-    const editQueue = (id: number, text: string) => setQueue((current) =>
-        text.trim()
-            ? current.map((item) => item.id === id ? { ...item, text: text.trim() } : item)
-            : current.filter((item) => item.id !== id),
-    );
-    const removeQueue = (id: number) => setQueue((current) => current.filter((item) => item.id !== id));
-    const reorderQueue = (from: number, to: number) => setQueue((current) => {
-        const next = current.slice();
-        const [item] = next.splice(from, 1);
-        if (item) next.splice(to, 0, item);
-        return next;
-    });
-    const sendNow = (id: number) => {
-        const item = queue().find((candidate) => candidate.id === id);
-        if (!item) return;
-        removeQueue(id);
-        answer(item.text);
-    };
     const attention = createMemo<AttentionItem[]>(() => {
         if (!fullAdmin()) return [];
         const items: AttentionItem[] = [];
@@ -618,29 +581,8 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
                         <ChatPanel
                             session={adminSession}
                             bare
-                            composer={
-                                <ChatComposer
-                                    draft={draft()}
-                                    placeholder="task the admin agent…"
-                                    queue={queue()}
-                                    attachments={[]}
-                                    busy={false}
-                                    gated={gated()}
-                                    reviewNext={false}
-                                    canSubmit={hasOutgoing()}
-                                    onDraft={setDraft}
-                                    onSubmit={submit}
-                                    onSteer={submit}
-                                    onToggleGate={release}
-                                    onToggleReview={() => undefined}
-                                    onRemoveAttachment={() => undefined}
-                                    onReorderQueue={reorderQueue}
-                                    onEditQueue={editQueue}
-                                    onRemoveQueue={removeQueue}
-                                    onSendNow={sendNow}
-                                    inputRef={(element) => (composerInput = element)}
-                                />
-                            }
+                            composerPlaceholder="task the admin agent…"
+                            composerInputRef={(element) => (composerInput = element)}
                         />
                     </>
                 )}

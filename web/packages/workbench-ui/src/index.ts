@@ -13,12 +13,24 @@ export type { AgentSettingsApi, AgentSettingsProps } from "./AgentSettings";
 export { buildOutgoing, classifyAttachment, documentFileType, extractDocumentAttachment, fileToBase64 } from "./attachments";
 export type { Attachment, DocumentFileType, ImageRef } from "./attachments";
 export { Carousel, applySelection } from "./CarouselIsland";
-export { ChatPanel } from "./ChatPanel";
+export { ChatPanel, SessionComposer } from "./ChatPanel";
 export type { ChatPanelProps } from "./ChatPanel";
 export { ChatPaneHeader } from "./ChatPaneHeader";
 export type { ChatPaneHeaderProps, ChatPaneStatusTone } from "./ChatPaneHeader";
 export { ChatComposer } from "./ChatComposer";
 export type { ChatComposerProps, ComposerQueueItem } from "./ChatComposer";
+export {
+    BASIC_COMPOSER_CAPABILITIES,
+    UNIVERSAL_COMPOSER_CAPABILITIES,
+    createSessionComposerController,
+} from "./session-composer-controller";
+export type {
+    ComposerAttachmentCapability,
+    ComposerCapabilities,
+    ComposerTurnOptions,
+    SessionComposerController,
+    SessionComposerControllerOptions,
+} from "./session-composer-controller";
 export { ChatApprovalCard } from "./ChatApprovalCard";
 export type { ChatApprovalCardProps } from "./ChatApprovalCard";
 export { ConfigEditor } from "./ConfigEditor";

@@ -87,6 +87,7 @@
     "./qr-code": "./src/qr-code.ts",
     "./resource-catalog": "./src/resource-catalog.ts",
     "./session-context": "./src/session-context.ts",
+    "./session-composer-controller": "./src/session-composer-controller.ts",
     "./tool-detail": "./src/tool-detail.ts",
     "./tool-verb": "./src/tool-verb.ts",
     "./top-bar": "./src/top-bar.ts",

@@ -8,13 +8,11 @@
  */
 import {createSignal, Show, type JSX} from "solid-js";
 import { ChatComposer } from "./ChatComposer";
-import {
-    buildOutgoing,
-    classifyAttachment,
-    fileToBase64,
-    type Attachment,
-} from "./attachments";
 import { AudienceChats } from "./AudienceChats";
+import {
+    createSessionComposerController,
+    type SessionComposerController,
+} from "./session-composer-controller";
 import { type FilterPrefs } from "./transcript-filter";
 import { type TranscriptLine } from "./transcript";
 import { TranscriptView } from "./TranscriptView";
@@ -23,8 +21,10 @@ import { type Session, useSession } from "./session-context";
 export interface ChatPanelProps {
     /** Explicit leaf for hosts that mount without an ambient provider. */
     readonly session?: Session;
-    /** Desktop supplies its owner-grade queue/steer/model composer here. */
-    readonly composer?: JSX.Element;
+    /** Optional pre-bound controller for owner Environments and quick-start. */
+    readonly composerController?: SessionComposerController;
+    readonly composerInputRef?: (element: HTMLTextAreaElement) => void;
+    readonly composerPlaceholder?: string;
     /** Live working/stop row rendered after the shared transcript. */
     readonly transcriptTail?: JSX.Element;
     readonly prefs?: FilterPrefs;
@@ -40,57 +40,64 @@ export interface ChatPanelProps {
     readonly bare?: boolean;
 }
 
-function SessionComposer(props: { session: Session; audience: boolean; agentName?: string }): JSX.Element {
-    const [draft, setDraft] = createSignal("");
-    const [attachments, setAttachments] = createSignal<Attachment[]>([]);
-    // WhippleScript 0.3.1 (DR-0050) removed `ask_human`: no turn parks waiting
-    // for a person, so the composer has one mode. An agent that needs something
-    // sends on a channel or files a task; the reply is an ordinary message.
-    const submit = () => {
-        const outgoing = buildOutgoing(draft(), attachments());
-        if (!outgoing.message.trim()) return;
-        if (props.session.busy?.()) return;
-        setDraft("");
-        setAttachments([]);
-        props.session.send(outgoing.message, outgoing.images);
-    };
-    const pasteImages = async (files: readonly File[]) => {
-        const images: Attachment[] = [];
-        for (const file of files) {
-            if (classifyAttachment(file) !== "image") continue;
-            images.push({
-                kind: "image",
-                name: file.name || "pasted image",
-                mimeType: file.type,
-                data: await fileToBase64(file),
-            });
-        }
-        if (images.length > 0) setAttachments((current) => [...current, ...images]);
-    };
+export function SessionComposer(props: {
+    session?: Session;
+    audience: boolean;
+    agentName?: string;
+    placeholder?: string;
+    controller?: SessionComposerController;
+    inputRef?: (element: HTMLTextAreaElement) => void;
+    quickStart?: boolean;
+}): JSX.Element {
+    if (!props.session && !props.controller) {
+        throw new Error("SessionComposer requires a Session or a bound controller");
+    }
+    const session = props.session;
+    const controller = props.controller ?? createSessionComposerController({
+        scope: () => String(session!.engagementId() ?? "session"),
+        busy: session!.busy,
+        capabilities: session!.composerCapabilities,
+        send: (text, images, options) => session!.send(text, images, options),
+        stop: session!.stop,
+    });
+    const hasAttachments = () => controller.capabilities().attachments.length > 0;
+    const hasQueue = () => controller.capabilities().queue;
+    const canSteer = () => controller.capabilities().steer;
     return (
-        <>
-            <ChatComposer
-                    draft={draft()}
-                    placeholder={props.agentName?.trim() ? `Ask ${props.agentName.trim()}…` : "task the agent…"}
-                    attachments={attachments()}
-                    busy={props.session.busy?.() ?? false}
-                    canSubmit={draft().trim().length > 0 || attachments().length > 0}
-                    audience={props.audience}
-                    onDraft={setDraft}
-                    onSubmit={() => submit()}
-                    onPasteFiles={pasteImages}
-                    onRemoveAttachment={(index) =>
-                        setAttachments((current) => current.filter((_, at) => at !== index))
-                    }
-                    onStop={
-                        props.session.stop
-                            ? () => {
-                                  void props.session.stop!();
-                              }
-                            : undefined
-                    }
-                />
-        </>
+        <ChatComposer
+            draft={controller.draft()}
+            placeholder={props.placeholder ?? (props.agentName?.trim() ? `Ask ${props.agentName.trim()}…` : "task the agent…")}
+            queue={hasQueue() ? controller.queue() : []}
+            attachments={controller.attachments()}
+            busy={controller.busy()}
+            gated={controller.gated()}
+            reviewNext={controller.reviewNext()}
+            canSubmit={controller.canSubmit()}
+            error={controller.error()}
+            attaching={controller.attaching()}
+            audience={props.audience}
+            quickStart={props.quickStart}
+            modelToolbar={controller.modelToolbar?.()}
+            onDraft={controller.setDraft}
+            onSubmit={controller.submit}
+            onSteer={canSteer() ? controller.steer : undefined}
+            onStop={controller.capabilities().stop ? controller.stop : undefined}
+            onToggleGate={controller.capabilities().stage ? controller.toggleGate : undefined}
+            onToggleReview={controller.toggleReview}
+            onAttachInput={hasAttachments() ? (event) => {
+                const input = event.currentTarget;
+                const files = Array.from(input.files ?? []);
+                input.value = "";
+                void controller.attachFiles(files);
+            } : undefined}
+            onPasteFiles={hasAttachments() ? controller.attachFiles : undefined}
+            onRemoveAttachment={controller.removeAttachment}
+            onReorderQueue={hasQueue() ? controller.reorderQueue : undefined}
+            onEditQueue={hasQueue() ? controller.editQueued : undefined}
+            onRemoveQueue={hasQueue() ? controller.removeQueued : undefined}
+            onSendNow={hasQueue() ? controller.sendNowQueued : undefined}
+            inputRef={props.inputRef}
+        />
     );
 }
 
@@ -171,13 +178,14 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                 />
                 {props.transcriptTail}
             </div>
-            {props.composer ?? (
-                <SessionComposer
-                    session={session()}
-                    audience={props.audience === true}
-                    agentName={props.agentName}
-                />
-            )}
+            <SessionComposer
+                session={session()}
+                audience={props.audience === true}
+                agentName={props.agentName}
+                placeholder={props.composerPlaceholder}
+                controller={props.composerController}
+                inputRef={props.composerInputRef}
+            />
         </>
     );
     return props.bare ? body() : (

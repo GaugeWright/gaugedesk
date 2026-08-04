@@ -84,23 +84,26 @@ describe("createRemoteSession", () => {
         disposeRoot();
     });
 
-    it("send() echoes the user line optimistically and starts a turn", () => {
+    it("send() echoes the user line optimistically and starts a turn", async () => {
+        let turn!: Promise<void>;
         createRoot((dispose) => {
             const f = fakeApi();
             const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
-            session.send("do the thing");
+            turn = session.send("do the thing");
             expect(session.transcript().lines.at(-1)?.text).toBe("do the thing");
             expect(f.calls.runEmbedTurn).toHaveBeenCalledWith(ENG, "do the thing", []);
             dispose();
         });
+        await turn;
     });
 
-    it("carries native image input through the scoped turn command", () => {
+    it("carries native image input through the scoped turn command", async () => {
+        let turn!: Promise<void>;
         createRoot((dispose) => {
             const f = fakeApi();
             const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
             const image = { name: "pasted.png", mimeType: "image/png", data: "aGVsbG8=" };
-            session.send("[attached image: pasted.png]", [image]);
+            turn = session.send("[attached image: pasted.png]", [image]);
             expect(f.calls.runEmbedTurn).toHaveBeenCalledWith(
                 ENG,
                 "[attached image: pasted.png]",
@@ -108,17 +111,20 @@ describe("createRemoteSession", () => {
             );
             dispose();
         });
+        await turn;
     });
 
-    it("send() ignores blank input", () => {
+    it("send() rejects blank input", async () => {
+        let turn!: Promise<void>;
         createRoot((dispose) => {
             const f = fakeApi();
             const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
-            session.send("   ");
+            turn = session.send("   ");
             expect(f.calls.runEmbedTurn).not.toHaveBeenCalled();
             expect(session.transcript().lines).toHaveLength(0);
             dispose();
         });
+        await expect(turn).rejects.toThrow("A message is required");
     });
 
     it("projects one in-flight turn so the shared composer shows working and refuses duplicates", async () => {
@@ -138,13 +144,14 @@ describe("createRemoteSession", () => {
             });
         });
 
-        session.send("first");
-        expect(session.busy?.()).toBe(true);
-        session.send("duplicate");
+        const first = session.send("first");
+        expect(session.busy()).toBe(true);
+        await expect(session.send("duplicate")).rejects.toThrow("already running");
         expect(f.calls.runEmbedTurn).toHaveBeenCalledTimes(1);
 
         finish();
-        await vi.waitFor(() => expect(session.busy?.()).toBe(false));
+        await first;
+        await vi.waitFor(() => expect(session.busy()).toBe(false));
         disposeRoot();
     });
 

@@ -28,6 +28,10 @@ import {
 } from "@gaugewright/control-plane-client";
 import { type Transcript } from "./transcript";
 import { type ImageRef } from "./attachments";
+import {
+    type ComposerCapabilities,
+    type ComposerTurnOptions,
+} from "./session-composer-controller";
 
 export interface SessionApi {
     getFile(id: EngagementId, path: string): Promise<string>;
@@ -140,15 +144,23 @@ export interface Session {
     readonly transcript: Accessor<Transcript>;
     /** Whether this session is waiting on an admitted turn. Environments that
      *  can observe it expose the same shared working/composer presentation. */
-    readonly busy?: Accessor<boolean>;
+    readonly busy: Accessor<boolean>;
+    /** Explicit conversation commands admitted by this Environment. Audience is
+     *  presentation identity, not a capability shortcut. */
+    readonly composerCapabilities: Accessor<ComposerCapabilities>;
     // Scoped commands + refetch (the panel issues; the session admits/refetches).
     /** Drive the merge lifecycle for this engagement (keep / discard / …). */
     readonly merge: (action: MergeAction) => void;
     /** Re-read content-derived projections after an in-panel save (diff + merge). */
     readonly onContentSaved: () => void;
-    /** Send a message — start a turn on this engagement. The primitive a composer
-     *  rides; the desktop layers its draft/queue/steer controls on top. */
-    readonly send: (text: string, images?: ImageRef[]) => void;
+    /** Send exactly one message and settle only when the authoritative turn has
+     *  completed, failed, or been interrupted. Queue orchestration lives above
+     *  this primitive in the shared composer controller. */
+    readonly send: (
+        text: string,
+        images?: readonly ImageRef[],
+        options?: ComposerTurnOptions,
+    ) => Promise<void>;
     /** Cooperatively cancel the current durable turn. */
     readonly stop?: () => Promise<void>;
     /** Fork at an exact durable user/assistant boundary. Owner environments

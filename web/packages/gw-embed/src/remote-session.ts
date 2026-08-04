@@ -24,6 +24,7 @@ import {
 import { type Session } from "@gaugewright/workbench-ui/session-context";
 import { type ImageRef } from "@gaugewright/workbench-ui/attachments";
 import { type EmbedSessionApi } from "./session-api";
+import { UNIVERSAL_COMPOSER_CAPABILITIES } from "@gaugewright/workbench-ui/session-composer-controller";
 
 export interface RemoteSessionOptions {
     /** The canonical EDGE-5 client, scoped to one hosted deployment. */
@@ -39,6 +40,11 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
     const [selectedFile, setSelectedFile] = createSignal<string | null>(null);
     const [worktreeRev, setWorktreeRev] = createSignal(0);
     const [busy, setBusy] = createSignal(false);
+    const composerCapabilities = {
+        ...UNIVERSAL_COMPOSER_CAPABILITIES,
+        steer: Boolean(api.stopTurn),
+        stop: Boolean(api.stopTurn),
+    };
     const bumpWorktree = () => setWorktreeRev((n) => n + 1);
 
     // Transcript: durable snapshot of admitted records + live WebSocket events
@@ -85,19 +91,25 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         bumpWorktree();
     }
 
-    function send(text: string, images: ImageRef[] = []) {
+    async function send(text: string, images: readonly ImageRef[] = []): Promise<void> {
         const t = text.trim();
-        if (!t || busy()) return;
+        if (!t) throw new Error("A message is required.");
+        if (busy()) throw new Error("A turn is already running.");
         setBusy(true);
         // Optimistic echo: show the user's line the instant the turn starts; the
         // snapshot re-read in settle() retires it (a failed turn drops it).
         setLive((tr) => reduce(tr, { type: "user", text: t }));
         // The Session DO admits the stable command and streams its durable
         // observations over the same WebSocket while this promise is pending.
-        void api.runEmbedTurn(id, t, images)
-            .then(settle)
-            .catch(() => void loadSnapshot())
-            .finally(() => setBusy(false));
+        try {
+            await api.runEmbedTurn(id, t, [...images]);
+            await settle();
+        } catch (error) {
+            await loadSnapshot();
+            throw error;
+        } finally {
+            setBusy(false);
+        }
     }
 
     const session: Session = {
@@ -115,6 +127,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         methodName: () => "",
         transcript,
         busy,
+        composerCapabilities: () => composerCapabilities,
         merge: (action: MergeAction) => void api.mergeCommand(id, action).then(() => settle()),
         onContentSaved: () => void Promise.allSettled([refetchDiff(), refetchMerge()]),
         send,

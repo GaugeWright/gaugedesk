@@ -41,17 +41,33 @@ function mountHosted(host: string): void {
 
 function fixtureApi(): EmbedSessionApi {
     const emptyMerge = { phase: "Clean" } as MergeState;
+    let onEvent: ((event: StreamEvent) => void) | undefined;
+    let active: { resolve: () => void; timer?: ReturnType<typeof setTimeout> } | undefined;
+    const delayParam = params.get("delay");
+    const delay = delayParam === null ? null : Number(delayParam);
     return {
         getTranscript: async () => [] as StreamEvent[],
-        subscribe: () => () => undefined,
+        subscribe: (_id, listener) => {
+            onEvent = listener;
+            return () => { onEvent = undefined; };
+        },
         engagementDiff: async () => "",
         getMerge: async () => emptyMerge,
-        // Keep the hermetic browser fixture in-flight so the shared panel's
-        // optimistic user projection remains visible without fabricating a
-        // terminal runtime response.
         runEmbedTurn: (_id, prompt, images = []) => {
             document.body.dataset.fixtureTurn = JSON.stringify({ prompt, images });
-            return new Promise<never>(() => undefined);
+            const turns = JSON.parse(document.body.dataset.fixtureTurns ?? "[]") as unknown[];
+            turns.push({ prompt, images });
+            document.body.dataset.fixtureTurns = JSON.stringify(turns);
+            return new Promise<void>((resolve) => {
+                active = { resolve };
+                if (delay !== null && Number.isFinite(delay) && delay >= 0) {
+                    active.timer = setTimeout(() => {
+                        onEvent?.({ type: "text", delta: `Completed: ${prompt}` });
+                        active = undefined;
+                        resolve();
+                    }, delay);
+                }
+            });
         },
         runTask: () => new Promise<never>(() => undefined),
         mergeCommand: async (_id: EngagementId, _action: MergeAction) =>
@@ -69,6 +85,14 @@ function fixtureApi(): EmbedSessionApi {
         embedOpenChat: async () => undefined,
         embedEraseChat: async () => undefined,
         embedGetConfig: async () => ({ white_label: false }),
+        stopTurn: async () => {
+            if (!active) throw new Error("fixture has no active turn");
+            if (active.timer) clearTimeout(active.timer);
+            const { resolve } = active;
+            active = undefined;
+            document.body.dataset.fixtureStopped = "true";
+            resolve();
+        },
     };
 }
 

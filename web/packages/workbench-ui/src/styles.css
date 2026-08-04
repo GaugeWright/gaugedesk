@@ -953,6 +953,9 @@ input {
 
 /* Pending message attachments: removable chips above the composer box. */
 .composer-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.composer-error { margin-bottom: 6px; padding: 6px 8px; border: 1px solid color-mix(in srgb, var(--bad) 55%, var(--edge));
+    border-radius: 5px; color: var(--bad); background: color-mix(in srgb, var(--bad) 9%, transparent);
+    font-size: var(--fs-ui); overflow-wrap: anywhere; }
 .attachment-chip { display: inline-flex; align-items: center; gap: 4px;
     padding: 2px 4px 2px 6px; font-size: var(--fs-ui); border: 1px solid var(--edge);
     border-radius: 12px; color: var(--ink); background: var(--edge); }

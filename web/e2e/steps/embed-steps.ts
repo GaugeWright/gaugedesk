@@ -25,6 +25,11 @@ Given("the chat-only embed Environment is open", async ({ page }) => {
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
 });
 
+Given("a delayed embedded chat is open", async ({ page }) => {
+    await page.goto("/embed-example.html?fixture=1&panels=chat&delay=1200");
+    await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
+});
+
 Given("an anonymous embedded chat is open", async ({ page }) => {
     await page.goto("/embed-example.html?fixture=1&panels=chat&audience=anonymous");
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
@@ -204,6 +209,74 @@ Then("the embedded turn carries the pasted image bytes", async ({ page }) => {
         data: TINY_PASTED_PNG,
     }]);
     await expect(page.locator("[data-attachment]")).toHaveCount(0);
+});
+
+When("I attach a text file with the embedded paperclip", async ({ page }) => {
+    await page.locator("[data-attach-input]").setInputFiles({
+        name: "brief.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("The embedded paperclip works."),
+    });
+});
+
+Then("the embedded composer shows the attached text file", async ({ page }) => {
+    await expect(page.locator('[data-attachment][data-kind="text"]')).toContainText("brief.txt");
+});
+
+When("I send the attached text file in the embedded chat", async ({ page }) => {
+    await page.locator("[data-embed-send]").click();
+});
+
+Then("the embedded turn carries the attached text", async ({ page }) => {
+    await expect.poll(async () => page.locator("body").getAttribute("data-fixture-turn"))
+        .not.toBeNull();
+    const turn = JSON.parse(
+        (await page.locator("body").getAttribute("data-fixture-turn"))!,
+    ) as { prompt: string };
+    expect(turn.prompt).toContain("--- attached: brief.txt ---");
+    expect(turn.prompt).toContain("The embedded paperclip works.");
+});
+
+Then("the embedded composer offers steer, queue, and stop", async ({ page }) => {
+    await expect(page.getByTestId("steer-turn")).toBeVisible();
+    await expect(page.getByTestId("queue-msg")).toBeVisible();
+    await expect(page.getByTestId("stop-turn")).toBeVisible();
+});
+
+When("I queue {string} in the embedded chat", async ({ page }, message: string) => {
+    await page.locator("[data-embed-composer]").fill(message);
+    await page.getByTestId("queue-msg").click();
+});
+
+Then("the embedded queue shows {string}", async ({ page }, message: string) => {
+    await expect(page.getByTestId("queue-item")).toContainText(message);
+});
+
+When("I steer the embedded chat with {string}", async ({ page }, message: string) => {
+    await page.locator("[data-embed-composer]").fill(message);
+    await page.getByTestId("steer-turn").click();
+});
+
+Then("the embedded turn is interrupted", async ({ page }) => {
+    await expect(page.locator("body")).toHaveAttribute("data-fixture-stopped", "true");
+});
+
+async function fixtureTurnPrompts(page: import("@playwright/test").Page): Promise<string[]> {
+    const raw = await page.locator("body").getAttribute("data-fixture-turns");
+    if (!raw) return [];
+    return (JSON.parse(raw) as { prompt: string }[]).map((turn) => turn.prompt);
+}
+
+Then("the embedded turns begin in the order {string}", async ({ page }, order: string) => {
+    const expected = order.split(",");
+    await expect.poll(async () => (await fixtureTurnPrompts(page)).slice(0, expected.length))
+        .toEqual(expected);
+});
+
+Then("the embedded queue eventually drains in the order {string}", async ({ page }, order: string) => {
+    const expected = order.split(",");
+    await expect.poll(() => fixtureTurnPrompts(page), { timeout: 15_000 }).toEqual(expected);
+    await expect(page.getByTestId("queue-stack")).toHaveCount(0, { timeout: 15_000 });
 });
 
 Then("the embedded transcript renders its formatting without page overflow", async ({ page }) => {
