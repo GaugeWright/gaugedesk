@@ -446,6 +446,64 @@ describe("EdgeSessionApi", () => {
         vi.useRealTimers();
     });
 
+    it.each([404, 410])(
+        "replaces a terminally unavailable %i session instead of retrying its socket",
+        async (status) => {
+            vi.useFakeTimers();
+            const sockets: FakeWebSocket[] = [];
+            const create = vi.fn(async () => undefined);
+            const fetchMock = vi.fn().mockResolvedValue(
+                new Response(null, { status }),
+            );
+            vi.stubGlobal("fetch", fetchMock);
+            vi.stubGlobal(
+                "WebSocket",
+                class extends FakeWebSocket {
+                    constructor(url: string) {
+                        super(url);
+                        sockets.push(this);
+                    }
+                },
+            );
+            const api = new EdgeSessionApi(
+                "https://panels.gaugewright.com/d/theory-a",
+                "sess_0123456789abcdef0123456789abcdef" as EngagementId,
+                "resume-capability",
+                "connection-capability",
+                Date.now() + 15 * 60 * 1000,
+                null,
+                false,
+                undefined,
+                { create },
+            );
+            const ready = api.ready();
+            sockets[0]!.emit("open");
+            sockets[0]!.emit("message", {
+                data: JSON.stringify({
+                    type: "session_ready",
+                    snapshot: { cursor: 0, transcript: [], files: [] },
+                }),
+            });
+            await ready;
+            api.subscribe("ignored" as EngagementId, () => undefined);
+
+            sockets[0]!.close();
+            await vi.advanceTimersByTimeAsync(100);
+            await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+
+            expect(fetchMock).toHaveBeenCalledOnce();
+            expect(new URL(String(fetchMock.mock.calls[0]![0])).pathname).toBe(
+                "/d/theory-a/sessions/sess_0123456789abcdef0123456789abcdef/state",
+            );
+            expect(sockets).toHaveLength(1);
+            await vi.advanceTimersByTimeAsync(1_000);
+            expect(create).toHaveBeenCalledOnce();
+            expect(sockets).toHaveLength(1);
+            api.dispose();
+            vi.useRealTimers();
+        },
+    );
+
     it("repairs a cursor gap from the last contiguous event", async () => {
         vi.useFakeTimers();
         const sockets: FakeWebSocket[] = [];

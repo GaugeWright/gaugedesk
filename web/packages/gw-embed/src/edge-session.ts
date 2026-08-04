@@ -64,6 +64,8 @@ export class EdgeSessionApi implements EmbedSessionApi {
     private disposed = false;
     private refreshPromise: Promise<void> | null = null;
     private refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private terminalRecoveryStarted = false;
 
     constructor(
         private readonly deploymentBase: string,
@@ -177,19 +179,58 @@ export class EdgeSessionApi implements EmbedSessionApi {
                     );
                 }
                 this.pendingStops.clear();
-                if (!this.disposed && (this.listeners.size > 0 || this.pendingTurns.size > 0)) {
-                    globalThis.setTimeout(() => {
-                        void this.connect().catch((error) => {
-                            for (const pending of this.pendingTurns.values()) {
-                                pending.reject(error);
-                            }
-                            this.pendingTurns.clear();
-                        });
-                    }, 100);
+                if (
+                    !this.disposed &&
+                    (this.chatControls || this.listeners.size > 0 || this.pendingTurns.size > 0)
+                ) {
+                    this.scheduleReconnect();
                 }
             });
         });
         return this.openPromise;
+    }
+
+    private scheduleReconnect(): void {
+        if (this.reconnectTimer || this.terminalRecoveryStarted) return;
+        this.reconnectTimer = globalThis.setTimeout(() => {
+            this.reconnectTimer = null;
+            void this.recoverOrReconnect();
+        }, 100);
+    }
+
+    /** Distinguish a transient transport loss from a session the deployment has
+     * terminally removed. WebSocket does not expose its failed HTTP upgrade
+     * status, so the scoped state projection is the authoritative probe. */
+    private async recoverOrReconnect(): Promise<void> {
+        let unavailable = false;
+        try {
+            const response = await fetch(this.projection("state"), {
+                credentials: "omit",
+                cache: "no-store",
+            });
+            unavailable = response.status === 404 || response.status === 410;
+        } catch {
+            // A failed probe is transport uncertainty, not terminal authority.
+        }
+        if (this.disposed) return;
+        if (unavailable) {
+            this.terminalRecoveryStarted = true;
+            const error = new Error("public session is no longer available");
+            for (const pending of this.pendingTurns.values()) {
+                pending.reject(error);
+            }
+            this.pendingTurns.clear();
+            if (this.chatControls) {
+                await this.chatControls.create().catch(() => undefined);
+            }
+            return;
+        }
+        void this.connect().catch((error) => {
+            for (const pending of this.pendingTurns.values()) {
+                pending.reject(error);
+            }
+            this.pendingTurns.clear();
+        });
     }
 
     private scheduleCapabilityRefresh(): void {
@@ -649,6 +690,8 @@ export class EdgeSessionApi implements EmbedSessionApi {
         this.disposed = true;
         if (this.refreshTimer) clearTimeout(this.refreshTimer);
         this.refreshTimer = null;
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
         this.socket?.close(1000, "panel disconnected");
         this.socket = null;
     }
