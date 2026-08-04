@@ -16,6 +16,24 @@ only needs to choose how multiple panels are arranged.
 conversation with a fresh deployment session; authenticated visitors can still
 reopen their owned earlier conversations through **Chats**.
 
+Anonymous session creation is protected by Cloudflare Turnstile. The managed
+check appears only when a new engagement is required: a valid resume continues
+without interruption, while **New session** requests a fresh check. No extra
+markup or JavaScript is required.
+
+If your site has a Content Security Policy, admit Turnstile alongside the
+GaugeDesk embed:
+
+```text
+script-src https://embed.gaugewright.com https://challenges.cloudflare.com;
+connect-src https://panels.gaugewright.com wss://panels.gaugewright.com https://challenges.cloudflare.com;
+frame-src https://challenges.cloudflare.com;
+```
+
+Keep any existing sources in those directives. Turnstile's challenge uses the
+same public `--gw-*` color, type, border, and radius settings as the panels and
+is isolated from accidental page-wide CSS overrides.
+
 Add an optional, pre-filled first assistant line directly in the markup:
 
 ```html

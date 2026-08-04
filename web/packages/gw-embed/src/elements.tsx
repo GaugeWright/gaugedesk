@@ -152,6 +152,70 @@ function PoweredBy(props: { session: Session }) {
     );
 }
 
+const TURNSTILE_SCRIPT =
+    "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+
+interface TurnstileApi {
+    render(
+        container: HTMLElement,
+        options: Record<string, unknown>,
+    ): string | number;
+    reset(widgetId: string | number): void;
+    remove(widgetId: string | number): void;
+}
+
+declare global {
+    interface Window {
+        turnstile?: TurnstileApi;
+    }
+}
+
+let turnstileScriptPromise: Promise<TurnstileApi> | undefined;
+
+function loadTurnstile(): Promise<TurnstileApi> {
+    if (window.turnstile) return Promise.resolve(window.turnstile);
+    if (turnstileScriptPromise) return turnstileScriptPromise;
+    const promise = new Promise<TurnstileApi>((resolve, reject) => {
+        const existing = document.querySelector<HTMLScriptElement>(
+            `script[src="${TURNSTILE_SCRIPT}"]`,
+        );
+        const script = existing ?? document.createElement("script");
+        const loaded = () => {
+            if (window.turnstile) resolve(window.turnstile);
+            else {
+                script.remove();
+                reject(new Error("Turnstile did not initialize"));
+            }
+        };
+        script.addEventListener("load", loaded, { once: true });
+        script.addEventListener(
+            "error",
+            () => {
+                script.remove();
+                reject(new Error("Turnstile could not be loaded"));
+            },
+            { once: true },
+        );
+        if (!existing) {
+            script.src = TURNSTILE_SCRIPT;
+            script.async = true;
+            script.defer = true;
+            document.head.appendChild(script);
+        }
+    }).catch((error) => {
+        turnstileScriptPromise = undefined;
+        throw error;
+    });
+    turnstileScriptPromise = promise;
+    return promise;
+}
+
+interface TurnstileRequired {
+    code?: unknown;
+    turnstile_site_key?: unknown;
+    turnstile_action?: unknown;
+}
+
 /** `<gw-session cp="…" engagement="…">`: builds + owns the scoped remote Session. */
 export class GwSessionElement extends HTMLElement {
     /** The Session its panel children render against (also settable directly). */
@@ -162,6 +226,8 @@ export class GwSessionElement extends HTMLElement {
     private _teardown?: () => void;
     private _base: string | null = null;
     private _audienceAssertion: string | null = null;
+    private _turnstileGate?: HTMLElement;
+    private _turnstileWidget?: string | number;
     private readonly _latencyObserver = (
         observation: LatencyObservation,
     ) => {
@@ -179,6 +245,127 @@ export class GwSessionElement extends HTMLElement {
         fields?: Parameters<typeof observeBrowserLatency>[2],
     ): void {
         observeBrowserLatency(this._latencyObserver, phase, fields);
+    }
+
+    /** Render the provider-owned challenge in an isolated shadow tree so a
+     * customer's global CSS cannot accidentally break the security boundary. */
+    private async requestTurnstileToken(
+        siteKey: string,
+        action: string,
+    ): Promise<string> {
+        this.clearTurnstileGate();
+        const gate = document.createElement("div");
+        gate.setAttribute("data-gw-turnstile-gate", "");
+        const root = gate.attachShadow({ mode: "closed" });
+        root.innerHTML = `
+            <style>
+              :host { display: block !important; box-sizing: border-box !important; width: 100% !important; margin: 0 0 10px !important; }
+              .gate { box-sizing: border-box; display: grid; place-items: center; gap: 8px; min-height: 82px; padding: 12px; border: 1px solid var(--gw-edge, #262b36); border-radius: var(--gw-panel-radius, 12px); background: var(--gw-bg, #0f1115); color: var(--gw-ink, #d8dee9); font: 12px/1.45 var(--gw-font, ui-sans-serif, system-ui, sans-serif); text-align: center; color-scheme: var(--gw-color-scheme, dark); }
+              .label { margin: 0; }
+              .widget { width: min(100%, 300px); min-height: 65px; }
+              .retry { padding: 7px 12px; border: 1px solid var(--gw-edge, #262b36); border-radius: 7px; background: var(--gw-panel, #161922); color: inherit; font: inherit; cursor: pointer; }
+              .retry:hover { border-color: var(--gw-accent, #6aa3ff); }
+            </style>
+            <div class="gate" role="status" aria-live="polite">
+              <p class="label">One quick check before starting a new session.</p>
+              <div class="widget"></div>
+              <button class="retry" type="button" hidden>Try again</button>
+            </div>`;
+        const widget = root.querySelector<HTMLElement>(".widget");
+        const label = root.querySelector<HTMLElement>(".label");
+        const retry = root.querySelector<HTMLButtonElement>(".retry");
+        if (!widget || !label || !retry) {
+            throw new Error("Turnstile gate could not be created");
+        }
+        this.prepend(gate);
+        this._turnstileGate = gate;
+        const showFailure = (message: string) => {
+            label.textContent = message;
+            widget.hidden = true;
+            retry.hidden = false;
+            retry.onclick = () => {
+                const base = this._base;
+                this.clearTurnstileGate();
+                if (base) void this.bootstrap(base);
+            };
+        };
+        let api: TurnstileApi;
+        try {
+            api = await loadTurnstile();
+        } catch (error) {
+            showFailure(
+                "Verification could not load. Check this site's Content Security Policy, then try again.",
+            );
+            throw error;
+        }
+        return new Promise<string>((resolve, reject) => {
+            let settled = false;
+            const fail = (message: string) => {
+                if (settled) return;
+                settled = true;
+                showFailure(message);
+                reject(new Error(message));
+            };
+            try {
+                this._turnstileWidget = api.render(widget, {
+                    sitekey: siteKey,
+                    action,
+                    theme: "auto",
+                    size: "flexible",
+                    appearance: "always",
+                    retry: "auto",
+                    callback: (token: string) => {
+                        if (settled) return;
+                        settled = true;
+                        this.clearTurnstileGate();
+                        resolve(token);
+                    },
+                    "error-callback": () =>
+                        fail("Verification failed. Please try again."),
+                    "expired-callback": () => {
+                        if (this._turnstileWidget !== undefined) {
+                            api.reset(this._turnstileWidget);
+                        }
+                    },
+                    "timeout-callback": () => {
+                        if (this._turnstileWidget !== undefined) {
+                            api.reset(this._turnstileWidget);
+                        }
+                    },
+                });
+            } catch {
+                fail("Verification could not start. Please try again.");
+            }
+        });
+    }
+
+    private clearTurnstileGate(): void {
+        if (this._turnstileWidget !== undefined && window.turnstile) {
+            window.turnstile.remove(this._turnstileWidget);
+        }
+        this._turnstileWidget = undefined;
+        this._turnstileGate?.remove();
+        this._turnstileGate = undefined;
+    }
+
+    private async satisfyTurnstile(
+        response: Response,
+        retry: (token: string) => Promise<Response>,
+    ): Promise<Response> {
+        if (response.status !== 428) return response;
+        const required = (await response.json()) as TurnstileRequired;
+        if (
+            required.code !== "turnstile_required" ||
+            typeof required.turnstile_site_key !== "string" ||
+            typeof required.turnstile_action !== "string"
+        ) {
+            return response;
+        }
+        const token = await this.requestTurnstileToken(
+            required.turnstile_site_key,
+            required.turnstile_action,
+        );
+        return retry(token);
     }
 
     connectedCallback() {
@@ -203,7 +390,7 @@ export class GwSessionElement extends HTMLElement {
             const audienceAssertion = this.getAttribute("token")?.trim() || null;
             this._audienceAssertion = audienceAssertion;
             let resumeCapability = localStorage.getItem(resumeStorageKey);
-            const activate = (resume: string | null) =>
+            const activate = (resume: string | null, turnstileToken?: string) =>
                 fetch(`${base}/bootstrap`, {
                     method: "POST",
                     headers: { "content-type": "application/json" },
@@ -221,6 +408,9 @@ export class GwSessionElement extends HTMLElement {
                                   }
                                 : {}),
                             trace_id: traceId,
+                            ...(turnstileToken
+                                ? { turnstile_token: turnstileToken }
+                                : {}),
                         },
                     ),
                 });
@@ -230,6 +420,9 @@ export class GwSessionElement extends HTMLElement {
                 resumeCapability = null;
                 res = await activate(null);
             }
+            res = await this.satisfyTurnstile(res, (token) =>
+                activate(null, token),
+            );
             this.observeLatency("bootstrap_response", { trace_id: traceId });
             if (!res.ok) return;
             await this.adoptBootstrap(
@@ -334,7 +527,7 @@ export class GwSessionElement extends HTMLElement {
         if (!base) throw new Error("hosted session is unavailable");
         const traceId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
         this.observeLatency("bootstrap_start", { trace_id: traceId });
-        const response = await fetch(`${base}/bootstrap`, {
+        const activate = (turnstileToken?: string) => fetch(`${base}/bootstrap`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             credentials: "omit",
@@ -344,8 +537,15 @@ export class GwSessionElement extends HTMLElement {
                     : {}),
                 ...selection,
                 trace_id: traceId,
+                ...(turnstileToken
+                    ? { turnstile_token: turnstileToken }
+                    : {}),
             }),
         });
+        const response = await this.satisfyTurnstile(
+            await activate(),
+            activate,
+        );
         this.observeLatency("bootstrap_response", { trace_id: traceId });
         if (!response.ok) {
             throw new Error(`session activation: ${response.status}`);
@@ -435,6 +635,7 @@ export class GwSessionElement extends HTMLElement {
     }
 
     disconnectedCallback() {
+        this.clearTurnstileGate();
         this._teardown?.();
         this._teardown = undefined;
         this.session = undefined;
