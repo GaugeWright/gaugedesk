@@ -85,6 +85,12 @@ Then("the embedded chat shows its configured opening message", async ({ page }) 
     );
 });
 
+Then("the embedded chat shows its configured agent name", async ({ page }) => {
+    await expect(page.locator("[data-embed-transcript] .turn-label").first()).toHaveText(
+        "Example Assistant",
+    );
+});
+
 Then("the embedded chat still shows its configured opening message", async ({ page }) => {
     await expect(page.locator("[data-embed-transcript]")).toContainText(
         "Welcome to the embedded assistant.",

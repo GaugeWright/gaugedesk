@@ -523,6 +523,7 @@ export class GwChatElement extends GwPanelElement {
                 session={session}
                 audience
                 openingMessage={this.getAttribute("opening-message") ?? undefined}
+                agentName={this.getAttribute("agent-name") ?? undefined}
             />
         );
     }

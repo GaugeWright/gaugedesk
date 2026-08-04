@@ -34,11 +34,13 @@ export interface ChatPanelProps {
     readonly audience?: boolean;
     /** Host-authored first assistant line; presentation-only, never runtime truth. */
     readonly openingMessage?: string;
+    /** Human-readable assistant name used in transcript labels and the composer. */
+    readonly agentName?: string;
     /** Desktop already owns the panel container; preserve direct flex children. */
     readonly bare?: boolean;
 }
 
-function SessionComposer(props: { session: Session; audience: boolean }): JSX.Element {
+function SessionComposer(props: { session: Session; audience: boolean; agentName?: string }): JSX.Element {
     const [draft, setDraft] = createSignal("");
     const [attachments, setAttachments] = createSignal<Attachment[]>([]);
     // WhippleScript 0.3.1 (DR-0050) removed `ask_human`: no turn parks waiting
@@ -69,7 +71,7 @@ function SessionComposer(props: { session: Session; audience: boolean }): JSX.El
         <>
             <ChatComposer
                     draft={draft()}
-                    placeholder="task the agent…"
+                    placeholder={props.agentName?.trim() ? `Ask ${props.agentName.trim()}…` : "task the agent…"}
                     attachments={attachments()}
                     busy={props.session.busy?.() ?? false}
                     canSubmit={draft().trim().length > 0 || attachments().length > 0}
@@ -161,6 +163,7 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
             >
                 <TranscriptView
                     lines={lines()}
+                    agentName={props.agentName}
                     onOpen={session().selectFile}
                     prefs={props.prefs}
                     onResolveCredential={props.onResolveCredential}
@@ -169,7 +172,11 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                 {props.transcriptTail}
             </div>
             {props.composer ?? (
-                <SessionComposer session={session()} audience={props.audience === true} />
+                <SessionComposer
+                    session={session()}
+                    audience={props.audience === true}
+                    agentName={props.agentName}
+                />
             )}
         </>
     );

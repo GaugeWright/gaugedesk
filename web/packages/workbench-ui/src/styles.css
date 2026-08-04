@@ -732,7 +732,7 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 .line.user::before, .line.assistant::before { display: block; margin-bottom: 2px;
     font-size: var(--fs-label); font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; }
 .line.user::before { content: "you"; color: var(--muted); }
-.line.assistant::before { content: "agent"; color: var(--accent); }
+.line.assistant::before { content: attr(data-agent-label); color: var(--accent); }
 
 /* Message prose uses the same safe GFM renderer as Markdown files. Keep its
    block rhythm compact inside a chat row, and let wide tables scroll inside the

@@ -34,6 +34,12 @@ export function lineRendersMarkdown(kind: string): boolean {
     return kind === "user" || kind === "assistant" || kind === "text";
 }
 
+/** The public panel may name its assistant; blank or absent values retain the
+ * workbench's generic label for existing hosts. */
+export function displayAgentName(value?: string): string {
+    return value?.trim() || "Agent";
+}
+
 /** Translate a lifecycle status line ("run → Completed", "merge → Advanced") into
  *  plain language. These leak the internal state-machine vocabulary; a layperson
  *  should read what happened, not the phase token. The raw text is kept on
@@ -166,6 +172,7 @@ export function ToolLineView(props: {
  *  command / write / read), everything else a friendly-language row. */
 function LineView(props: {
     line: TranscriptLine;
+    agentName: string;
     onOpen: (path: string) => void;
     prefs: FilterPrefs;
     /** Fired by the action on a `code: "no_credential"` error line — opens settings. */
@@ -184,7 +191,11 @@ function LineView(props: {
                 <Show
                     when={isCredentialError()}
                     fallback={
-                        <div class={`line ${props.line.tier} ${props.line.kind}`} data-line-text={props.line.text}>
+                        <div
+                            class={`line ${props.line.tier} ${props.line.kind}`}
+                            data-line-text={props.line.text}
+                            data-agent-label={props.line.kind === "assistant" ? props.agentName : undefined}
+                        >
                             <Show
                                 when={lineRendersMarkdown(props.line.kind)}
                                 fallback={<span>{friendlyLine(props.line.kind, props.line.text)}</span>}
@@ -247,6 +258,7 @@ function turnSummary(lines: readonly TranscriptLine[]): string {
  *  by one accent rail and a header that collapses the whole turn to its gist. */
 function TurnView(props: {
     lines: readonly TranscriptLine[];
+    agentName: string;
     prefs: FilterPrefs;
     onOpen: (path: string) => void;
     onResolveCredential?: () => void;
@@ -261,7 +273,7 @@ function TurnView(props: {
                 title={collapsed() ? "Expand this turn" : "Collapse this turn"}
             >
                 <span class="turn-caret">{collapsed() ? "▸" : "▾"}</span>
-                <span class="turn-label">agent</span>
+                <span class="turn-label">{props.agentName}</span>
                 <Show when={collapsed()}>
                     <span class="turn-summary">{turnSummary(props.lines)}</span>
                 </Show>
@@ -272,6 +284,7 @@ function TurnView(props: {
                         {(line) => (
                             <LineView
                                 line={line}
+                                agentName={props.agentName}
                                 onOpen={props.onOpen}
                                 prefs={props.prefs}
                                 onResolveCredential={props.onResolveCredential}
@@ -292,6 +305,8 @@ function TurnView(props: {
  *  Empty (after filtering) renders the supplied `fallback`. */
 export function TranscriptView(props: {
     lines: readonly TranscriptLine[];
+    /** Human-readable assistant name. Defaults to the generic "Agent" label. */
+    agentName?: string;
     onOpen: (path: string) => void;
     prefs?: FilterPrefs;
     fallback?: JSX.Element;
@@ -301,6 +316,7 @@ export function TranscriptView(props: {
     onFork?: (entryId: number) => void;
 }): JSX.Element {
     const prefs = () => props.prefs ?? defaultPrefs;
+    const agentName = () => displayAgentName(props.agentName);
     const segments = () => groupTurns(props.lines.filter((l) => lineVisible(l, prefs())));
     return (
         <For each={segments()} fallback={props.fallback ?? <div class="status">no activity yet</div>}>
@@ -308,6 +324,7 @@ export function TranscriptView(props: {
                 seg.type === "turn" ? (
                     <TurnView
                         lines={seg.lines}
+                        agentName={agentName()}
                         prefs={prefs()}
                         onOpen={props.onOpen}
                         onResolveCredential={props.onResolveCredential}
@@ -316,6 +333,7 @@ export function TranscriptView(props: {
                 ) : (
                     <LineView
                         line={seg.line}
+                        agentName={agentName()}
                         onOpen={props.onOpen}
                         prefs={prefs()}
                         onResolveCredential={props.onResolveCredential}

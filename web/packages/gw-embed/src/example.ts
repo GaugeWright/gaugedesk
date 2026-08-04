@@ -24,7 +24,7 @@ function panelMarkup(): string {
     return requestedPanels
         .filter((panel) => ["chat", "viewer", "files", "chats"].includes(panel))
         .map((panel) => panel === "chat"
-            ? '<gw-chat opening-message="Welcome to the embedded assistant."></gw-chat>'
+            ? '<gw-chat agent-name="Example Assistant" opening-message="Welcome to the embedded assistant."></gw-chat>'
             : `<gw-${panel}></gw-${panel}>`)
         .join("");
 }

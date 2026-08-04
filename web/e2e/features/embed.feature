@@ -10,6 +10,7 @@ Feature: Embedded panels (EMBED-2)
   Scenario: the embedded chat renders and sends against a scoped session
     Given the embed example page is open
     Then the embedded chat shows its configured opening message
+    And the embedded chat shows its configured agent name
     Then the embedded chat shows a composer
     And the embedded chat uses the shared docked composer
     And the embedded panel set owns one attribution mark

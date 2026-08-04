@@ -20,9 +20,15 @@ Add an optional, pre-filled first assistant line directly in the markup:
 
 ```html
 <gw-chat
+  agent-name="Avery"
   opening-message="Hi, I’m your advisor. What would you like to explore?"
 ></gw-chat>
 ```
+
+`agent-name` replaces the generic **Agent** transcript label and gives the
+composer a matching **Ask Avery…** prompt. Leave it out to keep the generic
+label. The attribute is ordinary, visible HTML and can be changed without CSS
+or JavaScript.
 
 The opening message costs no model turn. It remains visible as the first line of
 the conversation and appears again when the visitor starts a new session. It is
