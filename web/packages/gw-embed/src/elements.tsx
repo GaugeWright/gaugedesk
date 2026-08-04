@@ -146,7 +146,7 @@ function PoweredBy(props: { session: Session }) {
                 target="_blank"
                 rel="noreferrer"
             >
-                Powered by GaugeDesk
+                Powered by GaugeWright
             </a>
         </Show>
     );

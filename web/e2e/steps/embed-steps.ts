@@ -132,7 +132,10 @@ Then("the embedded message field grows with multiline text", async ({ page }) =>
 });
 
 Then("the embedded panel set owns one attribution mark", async ({ page }) => {
-    await expect(page.locator("[data-embed-powered-by]")).toHaveCount(1);
+    const attribution = page.locator("[data-embed-powered-by]");
+    await expect(attribution).toHaveCount(1);
+    await expect(attribution).toHaveText("Powered by GaugeWright");
+    await expect(attribution).toHaveAttribute("href", "https://gaugewright.com");
 });
 
 Then("the unselected files and viewer panels are not composed", async ({ page }) => {
