@@ -3427,6 +3427,47 @@ async fn workstream_sync_route_is_clean_with_nothing_to_pull() {
 }
 
 #[tokio::test]
+async fn unbinding_a_placement_tombstones_its_workstream_roots() {
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb.clone());
+    let target_id = library_state::managed_project_target_id(DEFAULT_PROJECT);
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/placements/{DEFAULT_PLACEMENT}/workstreams"),
+        Some(
+            &serde_json::json!({
+                "name": "retired with placement",
+                "target_id": target_id,
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create workstream: {body}");
+    let workstream_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (status, body) = send(
+        &app,
+        "DELETE",
+        &format!("/projects/{DEFAULT_PROJECT}/placements/{DEFAULT_PLACEMENT}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "unbind placement: {body}");
+
+    let guard = wb.lock_unpoisoned();
+    assert!(!guard.library.workstreams.contains_key(&workstream_id));
+    assert!(!guard.library.workstream_roots.contains_key(&workstream_id));
+    let rebuilt = crate::library::Library::rebuild(guard.store_ref()).expect("rebuild library");
+    assert!(!rebuilt.workstreams.contains_key(&workstream_id));
+    assert!(!rebuilt.workstream_roots.contains_key(&workstream_id));
+}
+
+#[tokio::test]
 async fn instance_lifecycle_suspend_blocks_new_chats_then_resume_allows() {
     let (_d, wb) = seeded_workbench();
     let app = open_control_plane(wb);

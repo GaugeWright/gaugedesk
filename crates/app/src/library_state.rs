@@ -1792,6 +1792,31 @@ impl Workbench {
         for chat_id in chat_ids {
             self.destroy_chat(&chat_id);
         }
+        // A workstream declaration and its target root are children of the
+        // placement. Leaving either live while tombstoning the placement makes
+        // the durable library fail closed on its next startup because the root
+        // can no longer be eligible for that placement.
+        let workstream_ids: Vec<String> = self
+            .library
+            .workstreams
+            .values()
+            .filter(|workstream| workstream.instance_id == inst_id)
+            .map(|workstream| workstream.id.clone())
+            .collect();
+        for workstream_id in workstream_ids {
+            if let Some(existing) = self.library.workstreams.get(&workstream_id).cloned() {
+                self.write_workstream_record(WorkstreamRecord {
+                    op: RecordOp::Tombstone,
+                    ..existing
+                });
+            }
+            if let Some(existing) = self.library.workstream_roots.get(&workstream_id).cloned() {
+                self.write_workstream_root_record(WorkstreamRootRecord {
+                    op: RecordOp::Tombstone,
+                    ..existing
+                });
+            }
+        }
         if let Some(existing) = self.library.instances.get(inst_id).cloned() {
             self.write_instance_record(InstanceRecord {
                 op: RecordOp::Tombstone,
