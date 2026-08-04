@@ -29,6 +29,24 @@ pub const DIRECT_PROVIDER_STREAM: &str = "direct_provider_stream";
 pub const HIBERNATABLE_WEBSOCKET: &str = "hibernatable_websocket";
 pub const PUBLISHER_PROTOCOL: &str = "gaugewright.publisher.v1";
 const PUBLIC_PUBLISHER_KEY_SUFFIX: &str = "::public-publisher";
+const DEFAULT_PUBLIC_TURN_RESERVE_CENTS: u64 = 5;
+
+fn reservation_cents_for_spend_guards(
+    max_spend_cents: Option<u64>,
+    max_session_spend_cents: Option<u64>,
+    max_turn_spend_cents: Option<u64>,
+) -> u64 {
+    [
+        max_spend_cents,
+        max_session_spend_cents,
+        max_turn_spend_cents,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .map(|tightest_guard| tightest_guard.min(DEFAULT_PUBLIC_TURN_RESERVE_CENTS))
+    .unwrap_or(0)
+}
 
 fn discipline_media_type(path: &str) -> &'static str {
     if path.ends_with(".json") {
@@ -898,18 +916,14 @@ impl Workbench {
             AGENT_RELEASE_MEDIA_TYPE,
         )?;
 
-        // Reserve the smallest configured guard. That is conservative and
-        // race-safe; an unguarded deployment reserves zero rather than turning
-        // an internal accounting hold into a hidden customer limit.
-        let reserve_cents_per_turn = [
+        // The reservation is an accounting hold, not a per-turn product cap.
+        // Bound the small default estimate by the tightest configured guard;
+        // an unguarded deployment reserves zero.
+        let reserve_cents_per_turn = reservation_cents_for_spend_guards(
             request.max_spend_cents,
             request.max_session_spend_cents,
             max_turn_spend_cents,
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(0);
+        );
         let mut config = serde_json::json!({
             "deployment_id": request.deployment_id.clone(),
             "enabled": true,
@@ -1715,6 +1729,16 @@ fn not_found(message: &'static str) -> io::Error {
 mod publisher_tests {
     use super::*;
     use gaugewright_core::signature::{verify_signature, Signature, SigningKey};
+
+    #[test]
+    fn reservation_is_an_internal_estimate_not_a_turn_limit() {
+        assert_eq!(reservation_cents_for_spend_guards(None, None, None), 0);
+        assert_eq!(
+            reservation_cents_for_spend_guards(Some(1_000), None, None),
+            DEFAULT_PUBLIC_TURN_RESERVE_CENTS,
+        );
+        assert_eq!(reservation_cents_for_spend_guards(None, None, Some(2)), 2);
+    }
 
     #[test]
     fn publisher_signature_binds_every_request_field() {
