@@ -179,8 +179,17 @@ pub struct PublishDeploymentRequest {
     pub edge_origin: String,
     pub allowed_origins: Vec<String>,
     pub panel_ceiling: BTreeSet<String>,
-    pub max_spend_cents: u64,
-    pub reserve_cents_per_turn: u64,
+    /// Optional aggregate, per-session, and per-turn monetary guards. The
+    /// legacy reservation field is accepted as a per-turn guard so an older
+    /// publisher keeps its exact behavior across ADR 0121.
+    #[serde(default)]
+    pub max_spend_cents: Option<u64>,
+    #[serde(default)]
+    pub max_session_spend_cents: Option<u64>,
+    #[serde(default)]
+    pub max_turn_spend_cents: Option<u64>,
+    #[serde(default)]
+    pub reserve_cents_per_turn: Option<u64>,
     pub per_visitor_turn_limit: u64,
     pub max_concurrent_sessions: u64,
     pub funding_ref: String,
@@ -771,9 +780,17 @@ impl Workbench {
                 "deployment retention must be positive, ordered, and within the release ceiling",
             ));
         }
-        if request.max_spend_cents == 0
-            || request.reserve_cents_per_turn == 0
-            || request.reserve_cents_per_turn > request.max_spend_cents
+        let max_turn_spend_cents = request
+            .max_turn_spend_cents
+            .or(request.reserve_cents_per_turn);
+        if [
+            request.max_spend_cents,
+            request.max_session_spend_cents,
+            max_turn_spend_cents,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|cap| cap == 0)
             || request.per_visitor_turn_limit == 0
             || request.max_concurrent_sessions == 0
             || request.funding_ref.trim().is_empty()
@@ -837,8 +854,8 @@ impl Workbench {
                         model: crate::managed_inference::unified_model_name(&request.model),
                         base_url: crate::managed_inference::metered_gateway_base_url(),
                         credential_class: request.credential_class.clone(),
-                        max_input_tokens: 100_000,
-                        max_output_tokens: 8_000,
+                        max_input_tokens: None,
+                        max_output_tokens: None,
                     }
                 } else {
                     ProviderPolicy {
@@ -846,8 +863,8 @@ impl Workbench {
                         model: request.model,
                         base_url: "https://api.openai.com".to_owned(),
                         credential_class: request.credential_class.clone(),
-                        max_input_tokens: 100_000,
-                        max_output_tokens: 8_000,
+                        max_input_tokens: None,
+                        max_output_tokens: None,
                     }
                 },
                 retention: RetentionPolicy {
@@ -881,13 +898,27 @@ impl Workbench {
             AGENT_RELEASE_MEDIA_TYPE,
         )?;
 
+        // Reserve the smallest configured guard. That is conservative and
+        // race-safe; an unguarded deployment reserves zero rather than turning
+        // an internal accounting hold into a hidden customer limit.
+        let reserve_cents_per_turn = [
+            request.max_spend_cents,
+            request.max_session_spend_cents,
+            max_turn_spend_cents,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(0);
         let mut config = serde_json::json!({
             "deployment_id": request.deployment_id.clone(),
             "enabled": true,
             "allowed_origins": request.allowed_origins.clone(),
             "panel_ceiling": request.panel_ceiling.clone(),
             "max_spend_cents": request.max_spend_cents,
-            "reserve_cents_per_turn": request.reserve_cents_per_turn,
+            "max_session_spend_cents": request.max_session_spend_cents,
+            "max_turn_spend_cents": max_turn_spend_cents,
+            "reserve_cents_per_turn": reserve_cents_per_turn,
             "per_visitor_turn_limit": request.per_visitor_turn_limit,
             "max_concurrent_sessions": request.max_concurrent_sessions,
             "funding_ref": request.funding_ref.clone(),
@@ -978,8 +1009,7 @@ impl Workbench {
         };
         let deployment: serde_json::Value = serde_json::from_str(&response).map_err(invalid)?;
         let deployment_url = format!("{edge}/d/{}", request.deployment_id);
-        let embed_html =
-            customer_embed_html(&edge, &request.deployment_id, &request.panel_ceiling);
+        let embed_html = customer_embed_html(&edge, &request.deployment_id, &request.panel_ceiling);
         Ok(PublishDeploymentOutcome {
             deployment_id: request.deployment_id.clone(),
             release_id: release.release_id().to_owned(),

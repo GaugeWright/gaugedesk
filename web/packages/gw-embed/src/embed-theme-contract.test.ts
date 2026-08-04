@@ -22,7 +22,8 @@ describe("editable embed theme", () => {
                 property: match[1],
                 value: match[2].replace(
                     /var\((--[\w-]+)\)/gu,
-                    (reference, property: string) => `var(${publicAliases.get(property) ?? property})`,
+                    (_reference: string, property: string) =>
+                        `var(${publicAliases.get(property) ?? property})`,
                 ),
             }))
             .filter(({ value }) => !value.includes("${defaultMinHeight}"));

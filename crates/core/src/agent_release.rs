@@ -165,8 +165,12 @@ pub struct ProviderPolicy {
     pub base_url: String,
     /// Names a deployment-time credential class; never a credential or secret.
     pub credential_class: String,
-    pub max_input_tokens: u64,
-    pub max_output_tokens: u64,
+    /// Optional authored narrowing. Absence delegates the model capability and
+    /// context policy to WhippleScript (ADR 0121).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,7 +392,7 @@ impl AgentRelease {
             &self.provider.credential_class,
             "provider credential class is required",
         )?;
-        if self.provider.max_input_tokens == 0 || self.provider.max_output_tokens == 0 {
+        if self.provider.max_input_tokens == Some(0) || self.provider.max_output_tokens == Some(0) {
             return Err(AgentReleaseError::Invalid(
                 "provider token ceilings must be non-zero",
             ));
@@ -595,8 +599,8 @@ mod tests {
                 model: "gpt-5.1".to_owned(),
                 base_url: "https://api.openai.com".to_owned(),
                 credential_class: "managed-openai".to_owned(),
-                max_input_tokens: 100_000,
-                max_output_tokens: 8_000,
+                max_input_tokens: None,
+                max_output_tokens: None,
             },
             retention: RetentionPolicy {
                 idle_ttl_seconds: 86_400,

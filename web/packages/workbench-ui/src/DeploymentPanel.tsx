@@ -94,7 +94,12 @@ export function DeploymentPanel(props: {
         typeof window === "undefined" ? "https://example.com" : window.location.origin,
     );
     const [panels, setPanels] = createSignal<PublicDeploymentInput["panel_ceiling"]>(allPanels);
+    const [limitAggregateSpend, setLimitAggregateSpend] = createSignal(true);
     const [maxSpend, setMaxSpend] = createSignal(1_000);
+    const [limitSessionSpend, setLimitSessionSpend] = createSignal(false);
+    const [maxSessionSpend, setMaxSessionSpend] = createSignal(100);
+    const [limitTurnSpend, setLimitTurnSpend] = createSignal(true);
+    const [maxTurnSpend, setMaxTurnSpend] = createSignal(5);
     const [visitorTurns, setVisitorTurns] = createSignal(20);
     const [maxSessions, setMaxSessions] = createSignal(100);
     const [model, setModel] = createSignal("gpt-5-mini");
@@ -404,8 +409,9 @@ export function DeploymentPanel(props: {
                 edge_origin: edgeOrigin().trim().replace(/\/+$/, ""),
                 allowed_origins: [allowedOrigin().trim().replace(/\/+$/, "")],
                 panel_ceiling: panels(),
-                max_spend_cents: maxSpend(),
-                reserve_cents_per_turn: 5,
+                max_spend_cents: limitAggregateSpend() ? maxSpend() : null,
+                max_session_spend_cents: limitSessionSpend() ? maxSessionSpend() : null,
+                max_turn_spend_cents: limitTurnSpend() ? maxTurnSpend() : null,
                 per_visitor_turn_limit: visitorTurns(),
                 max_concurrent_sessions: maxSessions(),
                 // One source of truth for who pays; `fundingFields` refuses to
@@ -567,11 +573,34 @@ export function DeploymentPanel(props: {
                         )}</For>
                     </fieldset>
                     <div class="deployment-field-grid">
-                        <label class="settings-field">
-                            <span class="settings-label">Total budget (cents)</span>
-                            <input class="settings-input" type="number" min="1" value={maxSpend()}
+                        <fieldset class="settings-field">
+                            <legend class="settings-label">Optional spending guards</legend>
+                            <label class="settings-checkbox">
+                                <input type="checkbox" checked={limitTurnSpend()}
+                                    onChange={(event) => setLimitTurnSpend(event.currentTarget.checked)} />
+                                Per turn
+                            </label>
+                            <input class="settings-input" aria-label="Maximum spend per turn in cents"
+                                type="number" min="1" value={maxTurnSpend()} disabled={!limitTurnSpend()}
+                                onInput={(event) => setMaxTurnSpend(event.currentTarget.valueAsNumber)} />
+                            <label class="settings-checkbox">
+                                <input type="checkbox" checked={limitSessionSpend()}
+                                    onChange={(event) => setLimitSessionSpend(event.currentTarget.checked)} />
+                                Per session
+                            </label>
+                            <input class="settings-input" aria-label="Maximum spend per session in cents"
+                                type="number" min="1" value={maxSessionSpend()} disabled={!limitSessionSpend()}
+                                onInput={(event) => setMaxSessionSpend(event.currentTarget.valueAsNumber)} />
+                            <label class="settings-checkbox">
+                                <input type="checkbox" checked={limitAggregateSpend()}
+                                    onChange={(event) => setLimitAggregateSpend(event.currentTarget.checked)} />
+                                Aggregate deployment
+                            </label>
+                            <input class="settings-input" aria-label="Maximum aggregate deployment spend in cents"
+                                type="number" min="1" value={maxSpend()} disabled={!limitAggregateSpend()}
                                 onInput={(event) => setMaxSpend(event.currentTarget.valueAsNumber)} />
-                        </label>
+                            <small>Turn these off when funding should remain metered without a customer-selected ceiling.</small>
+                        </fieldset>
                         <label class="settings-field">
                             <span class="settings-label">Turns per visitor</span>
                             <input class="settings-input" type="number" min="1" value={visitorTurns()}

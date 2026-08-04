@@ -166,7 +166,10 @@ describe("native account session transport", () => {
 
 describe("hosted account session refresh", () => {
     it("uses the credentialed production refresh route without exposing a token", async () => {
-        const fetch = vi.fn(async () =>
+        const fetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            _init?: RequestInit,
+        ) =>
             new Response(JSON.stringify({ refreshed: true, person: "person:one" }), {
                 status: 200,
                 headers: { "content-type": "application/json" },

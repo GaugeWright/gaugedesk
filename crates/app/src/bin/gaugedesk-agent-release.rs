@@ -407,8 +407,8 @@ fn build_release(
                 model,
                 base_url: "https://api.openai.com".to_owned(),
                 credential_class: "managed-openai".to_owned(),
-                max_input_tokens: 100_000,
-                max_output_tokens: 8_000,
+                max_input_tokens: None,
+                max_output_tokens: None,
             },
             retention: RetentionPolicy {
                 idle_ttl_seconds: 86_400,

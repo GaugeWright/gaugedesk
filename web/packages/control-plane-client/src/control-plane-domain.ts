@@ -187,8 +187,11 @@ export interface PublicDeploymentInput {
     readonly edge_origin: string;
     readonly allowed_origins: readonly string[];
     readonly panel_ceiling: readonly ("gw-chat" | "gw-viewer" | "gw-files" | "gw-chats")[];
-    readonly max_spend_cents: number;
-    readonly reserve_cents_per_turn: number;
+    readonly max_spend_cents: number | null;
+    readonly max_session_spend_cents: number | null;
+    readonly max_turn_spend_cents: number | null;
+    /** Legacy publisher compatibility; new callers use max_turn_spend_cents. */
+    readonly reserve_cents_per_turn?: number | null;
     readonly per_visitor_turn_limit: number;
     readonly max_concurrent_sessions: number;
     readonly funding_ref: string;
@@ -265,7 +268,9 @@ export interface PublicDeploymentInspection {
             readonly deployment_id: string;
             readonly allowed_origins: readonly string[];
             readonly panel_ceiling: readonly string[];
-            readonly max_spend_cents: number;
+            readonly max_spend_cents: number | null;
+            readonly max_session_spend_cents: number | null;
+            readonly max_turn_spend_cents: number | null;
             readonly per_visitor_turn_limit: number;
             readonly max_concurrent_sessions: number;
         };
