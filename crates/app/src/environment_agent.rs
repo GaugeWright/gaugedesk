@@ -449,7 +449,12 @@ fn provider_tools() -> Value {
         { "type": "function", "name": "environment_files_list", "description": "List the files admitted in this exact Environment session.", "parameters": { "type": "object", "properties": {}, "additionalProperties": false }, "strict": true },
         { "type": "function", "name": "environment_files_read", "description": "Read one admitted Environment file by path.", "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"], "additionalProperties": false }, "strict": true },
         { "type": "function", "name": "environment_projections_query", "description": "Read one admitted projection by document id.", "parameters": { "type": "object", "properties": { "document_id": { "type": "string" } }, "required": ["document_id"], "additionalProperties": false }, "strict": true },
-        { "type": "function", "name": "environment_changes_propose", "description": "Prepare, but never apply or review, one declared Environment command proposal.", "parameters": { "type": "object", "properties": { "document_id": { "type": "string" }, "command_id": { "type": "string" }, "payload": { "type": "object", "additionalProperties": true } }, "required": ["document_id", "command_id", "payload"], "additionalProperties": false }, "strict": true }
+        // Command payloads are deliberately document-specific and are validated
+        // again by the selected command parser. Responses strict function
+        // schemas forbid an open nested object, so only this proposal tool is
+        // non-strict; the outer arguments remain closed and every read tool
+        // remains strict.
+        { "type": "function", "name": "environment_changes_propose", "description": "Prepare, but never apply or review, one declared Environment command proposal.", "parameters": { "type": "object", "properties": { "document_id": { "type": "string" }, "command_id": { "type": "string" }, "payload": { "type": "object", "additionalProperties": true } }, "required": ["document_id", "command_id", "payload"], "additionalProperties": false }, "strict": false }
     ])
 }
 
@@ -900,6 +905,28 @@ mod tests {
             decide_environment_agent_tool(&session, &request(&session, "shell.exec", json!({}))),
             Err(EnvironmentAgentRejection::UndeclaredTool),
         );
+    }
+
+    #[test]
+    fn provider_tools_are_strict_except_for_the_document_specific_command_payload() {
+        let tools = provider_tools();
+        let tools = tools.as_array().unwrap();
+        assert_eq!(tools.len(), MANAGEMENT_AGENT_TOOLS.len());
+
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let strict = tool["strict"].as_bool().unwrap();
+            if name == "environment_changes_propose" {
+                assert!(!strict, "an open command payload cannot be a strict schema");
+                assert_eq!(
+                    tool["parameters"]["properties"]["payload"]["additionalProperties"],
+                    true,
+                );
+                assert_eq!(tool["parameters"]["additionalProperties"], false);
+            } else {
+                assert!(strict, "read tool {name} must remain strict");
+            }
+        }
     }
 
     #[test]
