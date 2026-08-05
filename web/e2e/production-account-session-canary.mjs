@@ -64,6 +64,39 @@ const CONSENT_CONTROLS = [
     "button:has-text('Continue')",
     "button:has-text('Allow')",
 ].join(", ");
+// Risk-triggered interstitials (e.g. `/v3/signin/challenge/ipp/consent` from a
+// datacenter egress) render their confirm control as a `role="button"` element
+// rather than a `<button>`; the role engine matches both, by accessible name.
+const CONSENT_ROLE_NAME = /^(continue|allow|confirm|next|i agree|i understand)$/i;
+
+function consentControls(page) {
+    return page
+        .locator(CONSENT_CONTROLS)
+        .or(page.getByRole("button", { name: CONSENT_ROLE_NAME }));
+}
+
+// A failure names only structure — tags, roles, ids, input types — never text,
+// so an unrecognised provider screen stays diagnosable without depositing an
+// account address or page content into a job log.
+async function sanitizedControlInventory(page) {
+    try {
+        return await page.evaluate(() => {
+            const controls = [
+                ...document.querySelectorAll("button, [role=button], input[type=submit], input[type=password], input[type=email]"),
+            ];
+            return controls.slice(0, 20).map((control) =>
+                [
+                    control.tagName.toLowerCase(),
+                    control.getAttribute("role") ?? "",
+                    control.id ?? "",
+                    control.getAttribute("type") ?? "",
+                ].join(":"),
+            );
+        });
+    } catch {
+        return ["<inventory unavailable>"];
+    }
+}
 
 // The control plane labels a session by the provider that backs it: a Google
 // issuer reports "google" and any other OIDC issuer reports "oidc". Deriving the
@@ -127,7 +160,7 @@ async function awaitRecognisableScreen(page) {
         .waitForLoadState("domcontentloaded", { timeout: PROVIDER_STEP_TIMEOUT_MS })
         .catch(() => {});
     const anyAccount = page.locator(ACCOUNT_MARKERS.join(", "));
-    const consent = page.locator(CONSENT_CONTROLS);
+    const consent = consentControls(page);
     await Promise.any([
         anyAccount.first().waitFor({ state: "attached", timeout: PROVIDER_SCREEN_TIMEOUT_MS }),
         consent.first().waitFor({ state: "attached", timeout: PROVIDER_SCREEN_TIMEOUT_MS }),
@@ -172,7 +205,11 @@ export async function advanceProviderStates(page, admitted, isSettled) {
             continue;
         }
 
-        assert.fail(`the provider presented an unrecognised screen at ${here.path}`);
+        const inventory = await sanitizedControlInventory(page);
+        assert.fail(
+            `the provider presented an unrecognised screen at ${here.path} `
+                + `(controls: ${inventory.join(", ") || "none"})`,
+        );
     }
     assert(
         isSettled(),

@@ -29,8 +29,11 @@ test("hosted session canary uses shipped sign-in and sign-out with no retained c
             return new Promise((resolve) => waiters.push({ predicate, resolve }));
         },
         locator(selector) {
-            return {
+            const control = {
                 async waitFor() {},
+                async count() { return 0; },
+                first() { return control; },
+                or(other) { return combineControls(control, other); },
                 async click() {
                     if (selector === "[data-home-sign-in]") {
                         emit(response("https://auth.gaugewright.com/auth/login", 302));
@@ -43,6 +46,17 @@ test("hosted session canary uses shipped sign-in and sign-out with no retained c
                     }
                 },
             };
+            return control;
+        },
+        getByRole() {
+            const control = {
+                async waitFor() {},
+                async count() { return 0; },
+                first() { return control; },
+                or(other) { return combineControls(control, other); },
+                async click() {},
+            };
+            return control;
         },
         async evaluate(_callback, { target }) {
             const path = new URL(target).pathname;
@@ -169,6 +183,7 @@ function providerHarness({
                 async waitFor() {},
                 async count() { return count(); },
                 first() { return control; },
+                or(other) { return combineControls(control, other); },
                 async click() {
                     if (selector === "[data-home-sign-in]") {
                         emit(response(`${apiOrigin}/auth/login`, 302));
@@ -176,6 +191,22 @@ function providerHarness({
                         return;
                     }
                     clicked.push(selector);
+                    advance();
+                },
+            };
+            return control;
+        },
+        getByRole(role, options = {}) {
+            const control = {
+                async waitFor() {},
+                async count() {
+                    const current = screen();
+                    return role === "button" && current?.roleConsent ? 1 : 0;
+                },
+                first() { return control; },
+                or(other) { return combineControls(control, other); },
+                async click() {
+                    clicked.push(`role:${role}:${String(options.name ?? "")}`);
                     advance();
                 },
             };
@@ -232,6 +263,22 @@ function providerHarness({
     };
 }
 
+/** Model Playwright's Locator.or(): a combined locator whose matches are the
+ * union, preferring the first operand's control when both match. */
+function combineControls(a, b) {
+    const combined = {
+        async waitFor() {},
+        async count() { return (await a.count()) + (await b.count()); },
+        first() { return combined; },
+        or(other) { return combineControls(combined, other); },
+        async click() {
+            if (await a.count()) return a.click();
+            return b.click();
+        },
+    };
+    return combined;
+}
+
 const PROVIDER = "https://accounts.example.test";
 const API = "https://auth.gaugewright.com";
 const FRONTEND = "https://desk.gaugewright.com";
@@ -247,6 +294,28 @@ function environmentFor() {
         }),
     };
 }
+
+test("a risk interstitial whose confirm is a role-button is advanced to the callback", async () => {
+    // Datacenter egress can draw `/v3/signin/challenge/ipp/consent`, whose
+    // confirm control is a `role=\"button\"` element rather than a `<button>`;
+    // the role engine must advance it like any consent screen.
+    const harness = providerHarness({
+        apiOrigin: API,
+        frontendOrigin: FRONTEND,
+        screens: [
+            { url: `${PROVIDER}/v3/signin/accountchooser`, identifiers: 1 },
+            { url: `${PROVIDER}/v3/signin/challenge/ipp/consent`, roleConsent: true },
+        ],
+    });
+    const result = await runHostedAccountSession(environmentFor(), harness.browserType);
+    assert.equal(result.callbackStatus, 302);
+    assert.equal(result.logoutStatus, 204);
+    assert.deepEqual(
+        harness.clicked,
+        ["[data-identifier]", "role:button:" + String(/^(continue|allow|confirm|next|i agree|i understand)$/i)],
+        "the walk must advance the chooser and then the role-button interstitial",
+    );
+});
 
 test("a sole-account chooser and forced consent are advanced to the callback", async () => {
     const harness = providerHarness({
