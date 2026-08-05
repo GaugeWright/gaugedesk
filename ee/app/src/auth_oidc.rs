@@ -136,7 +136,7 @@ impl PendingAuthStore {
 #[derive(Clone, Default)]
 pub struct EnterpriseAuthState {
     pending_auth: Arc<Mutex<PendingAuthStore>>,
-    mobile_handoffs: Arc<Mutex<MobileHandoffStore>>,
+    native_handoffs: Arc<Mutex<NativeHandoffStore>>,
 }
 
 impl EnterpriseAuthState {
@@ -152,32 +152,32 @@ impl EnterpriseAuthState {
         self.pending_auth.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn mobile_handoffs_mut(&self) -> MutexGuard<'_, MobileHandoffStore> {
-        self.mobile_handoffs
+    fn native_handoffs_mut(&self) -> MutexGuard<'_, NativeHandoffStore> {
+        self.native_handoffs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
 }
 
-struct MobileHandoff {
+struct NativeHandoff {
     id_token: gaugewright_app::secret::Secret,
     challenge: String,
     expires_at: Instant,
 }
 
 #[derive(Default)]
-struct MobileHandoffStore {
-    by_code: BTreeMap<String, MobileHandoff>,
+struct NativeHandoffStore {
+    by_code: BTreeMap<String, NativeHandoff>,
 }
 
-impl MobileHandoffStore {
+impl NativeHandoffStore {
     fn issue(&mut self, id_token: String, challenge: String, now: Instant) -> String {
         self.by_code.retain(|_, handoff| handoff.expires_at > now);
         let code = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(gaugewright_app::session::random_bytes::<32>());
         self.by_code.insert(
             code.clone(),
-            MobileHandoff {
+            NativeHandoff {
                 id_token: id_token.into(),
                 challenge,
                 expires_at: now + Duration::from_secs(5 * 60),
@@ -1157,7 +1157,7 @@ pub async fn get_callback(
                 .into_response();
         };
         let code = auth
-            .mobile_handoffs_mut()
+            .native_handoffs_mut()
             .issue(id_token, challenge, Instant::now());
         let target = format!("{native_return}#code={code}");
         return Redirect::to(&target).into_response();
@@ -1278,7 +1278,7 @@ pub async fn get_refresh(
 /// Refresh a native GaugeDesk account session. A still-valid short-lived
 /// id-token identifies the person; the platform uses the refresh token sealed
 /// in that person's account scope and returns only a replacement id-token.
-pub async fn post_mobile_refresh(
+pub async fn post_native_refresh(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -1340,22 +1340,22 @@ pub async fn post_mobile_refresh(
 }
 
 #[derive(Deserialize)]
-pub struct MobileHandoffExchange {
+pub struct NativeHandoffExchange {
     code: String,
     verifier: String,
 }
 
 /// Redeem a single-use native login handoff. Neither the OIDC id-token nor its
 /// refresh authority rides the custom-scheme URL.
-pub async fn post_mobile_exchange(
+pub async fn post_native_exchange(
     Extension(auth): Extension<EnterpriseAuthState>,
-    Json(request): Json<MobileHandoffExchange>,
+    Json(request): Json<NativeHandoffExchange>,
 ) -> impl IntoResponse {
     if !web_account_mode() {
         return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
     }
     let token = auth
-        .mobile_handoffs_mut()
+        .native_handoffs_mut()
         .redeem(&request.code, &request.verifier, Instant::now());
     match token {
         Some(id_token) => (
@@ -1567,7 +1567,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         let verifier = "0123456789012345678901234567890123456789012";
         let challenge = crate::identity_oidc::s256_challenge(verifier);
         let now = Instant::now();
-        let mut store = MobileHandoffStore::default();
+        let mut store = NativeHandoffStore::default();
         let code = store.issue("id-token".to_string(), challenge.clone(), now);
         assert_eq!(store.redeem(&code, "wrong-verifier", now), None);
         assert_eq!(

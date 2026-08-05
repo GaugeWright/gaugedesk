@@ -11,6 +11,7 @@
 
 pub mod account;
 pub mod account_routes;
+pub mod account_signin;
 pub mod advancement;
 pub mod agent_question;
 pub mod agent_release;

@@ -477,3 +477,72 @@ export async function codexLoginStart(json: RouteJson): Promise<CodexLoginStart>
 export async function codexLoginCancel(json: RouteJson): Promise<void> {
     await json("POST", "/account/oauth/openai-codex/cancel", {});
 }
+
+// ---------------------------------------------------------------------------
+// Desktop → Hub account sign-in: the native device handoff's client half
+// (ADR 0123, LOGIN-2). The local control plane custodies the session; these
+// routes carry only the one-time code and non-secret projections.
+
+/** Non-secret projection of the desktop's Hub account session. `available` is
+ *  false where the runtime has no Hub configured (the UI shows its local-only
+ *  wording instead of a sign-in button). */
+export interface HubSessionStatus {
+    available: boolean;
+    linked: boolean;
+    person: string | null;
+    expires: number | null;
+    expired: boolean;
+}
+
+function hubSessionStatusFrom(value: unknown): HubSessionStatus {
+    const o = value as Record<string, unknown> | null;
+    return {
+        available: Boolean(o?.available),
+        linked: Boolean(o?.linked),
+        person: typeof o?.person === "string" && o.person ? o.person : null,
+        expires: typeof o?.expires === "number" ? o.expires : null,
+        expired: Boolean(o?.expired),
+    };
+}
+
+export async function hubSessionStatus(json: RouteJson): Promise<HubSessionStatus> {
+    return hubSessionStatusFrom(await json("GET", "/account/hub-session"));
+}
+
+/** Begin the native handoff: the control plane mints and holds the verifier and
+ *  returns the Hub login URL to open in the system browser. The flow completes
+ *  when the OS deep-links `gaugewright://auth/callback#code=…` back and the code
+ *  is posted via {@link hubSessionCallback}. */
+export async function hubSessionStart(json: RouteJson): Promise<{ url: string }> {
+    const o = (await json("POST", "/account/hub-session/start", {})) as { url?: string };
+    if (typeof o.url !== "string" || !o.url) {
+        throw new Error("account sign-in returned no login URL");
+    }
+    return { url: o.url };
+}
+
+/** Deliver the deep-linked one-time code; the control plane redeems it with its
+ *  held verifier and seals the session. Returns the resulting status. */
+export async function hubSessionCallback(
+    json: RouteJson,
+    code: string,
+): Promise<HubSessionStatus> {
+    return hubSessionStatusFrom(await json("POST", "/account/hub-session/callback", { code }));
+}
+
+/** Sign out of the GaugeWright account on this desktop. Idempotent. */
+export async function hubSessionSignOut(json: RouteJson): Promise<void> {
+    await json("POST", "/account/hub-session/logout", {});
+}
+
+/** Parse the one-time code out of an OS-delivered native sign-in deep link
+ *  (`gaugewright://auth/callback#code=…`). `null` for every other URL — the
+ *  caller routes those to the invite path unchanged. Pure, for tests. */
+export function parseNativeHandoffCode(url: string): string | null {
+    if (!url.startsWith("gaugewright://auth/callback")) return null;
+    const hash = url.indexOf("#");
+    if (hash < 0) return null;
+    const params = new URLSearchParams(url.slice(hash + 1));
+    const code = params.get("code");
+    return code && code.trim() ? code.trim() : null;
+}

@@ -1315,4 +1315,25 @@ export class WorkbenchControlPlane implements ControlPlane {
     codexLoginCancel(): Promise<void> {
         return this.runtimeAccountJson().then((json) => accountClient.codexLoginCancel(json));
     }
+
+    // Desktop → Hub account sign-in (ADR 0123, LOGIN-2): the local control
+    // plane custodies the session; the client sees only the login URL, the
+    // one-time code, and non-secret status.
+    hubSessionStatus(): Promise<accountClient.HubSessionStatus> {
+        return this.runtimeAccountJson().then((json) => accountClient.hubSessionStatus(json));
+    }
+
+    hubSessionStart(): Promise<{ url: string }> {
+        return this.runtimeAccountJson().then((json) => accountClient.hubSessionStart(json));
+    }
+
+    hubSessionCallback(code: string): Promise<accountClient.HubSessionStatus> {
+        return this.runtimeAccountJson().then((json) =>
+            accountClient.hubSessionCallback(json, code),
+        );
+    }
+
+    hubSessionSignOut(): Promise<void> {
+        return this.runtimeAccountJson().then((json) => accountClient.hubSessionSignOut(json));
+    }
 }

@@ -120,13 +120,17 @@ pub fn routes() -> Router<SharedWorkbench> {
         // Session refresh (ADR 0077): a still-valid session mints a fresh id-token cookie from the
         // stored refresh token, so a hosted session outlives the ~1h id-token without re-login.
         .route("/auth/refresh", get(crate::auth_oidc::get_refresh))
+        // Native device handoff (ADR 0123): mobile and desktop both redeem the
+        // custom-scheme single-use code + verifier here. The `/auth/mobile/*`
+        // wire paths predate the desktop client and are kept verbatim so
+        // existing mobile clients never break.
         .route(
             "/auth/mobile/refresh",
-            post(crate::auth_oidc::post_mobile_refresh),
+            post(crate::auth_oidc::post_native_refresh),
         )
         .route(
             "/auth/mobile/exchange",
-            post(crate::auth_oidc::post_mobile_exchange),
+            post(crate::auth_oidc::post_native_exchange),
         )
         // Sign-out expires the shared HttpOnly account cookie. It remains reachable with an
         // expired/absent session so logout is always a successful, idempotent cleanup.

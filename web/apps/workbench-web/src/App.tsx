@@ -33,6 +33,7 @@ import {
     type MergeState,
     type ClientRequestId,
     parseHomeInvitation,
+    parseNativeHandoffCode,
     type HomeInvitationPreview,
     type PlacementPolicy,
 } from "@gaugewright/control-plane-client";
@@ -301,7 +302,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     if (typeof window !== "undefined") {
         const onDeepLink = (e: Event) => {
             const url = (e as CustomEvent).detail;
-            if (typeof url === "string" && url.startsWith("gaugewright://invite")) {
+            if (typeof url !== "string") return;
+            // ADR 0123 (LOGIN-2): a native account sign-in return. The deep link
+            // carries only the one-time code; the control plane redeems it with
+            // its held verifier and custodies the session — status surfaces read
+            // the result from `/account/hub-session` (server truth).
+            const handoffCode = parseNativeHandoffCode(url);
+            if (handoffCode) {
+                void api.hubSessionCallback(handoffCode).catch(() => {});
+                return;
+            }
+            if (url.startsWith("gaugewright://invite")) {
                 setInviteDeepLink(url);
             }
         };

@@ -109,6 +109,25 @@ pub fn runtime_credential_routes() -> Router<SharedWorkbench> {
             "/account/oauth/openai-codex/start",
             post(codex_oauth::post_codex_login_start),
         )
+        // Desktop → Hub account sign-in: the native device handoff's local half
+        // (ADR 0123, LOGIN-2). Account identity, not a model credential — the
+        // sealed session stays in this control plane; routes carry no token.
+        .route(
+            "/account/hub-session",
+            get(crate::account_signin::get_signin_status),
+        )
+        .route(
+            "/account/hub-session/start",
+            post(crate::account_signin::post_signin_start),
+        )
+        .route(
+            "/account/hub-session/callback",
+            post(crate::account_signin::post_signin_callback),
+        )
+        .route(
+            "/account/hub-session/logout",
+            post(crate::account_signin::post_signin_logout),
+        )
 }
 
 pub fn home_runtime_credential_routes() -> Router<SharedWorkbench> {
