@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { runHostedAccountSession } from "./production-account-session-canary.mjs";
+import { runHostedAccountSession,
+    CONSENT_ROLE_NAME,
+} from "./production-account-session-canary.mjs";
 
 function response(url, status) {
     return { url: () => url, status: () => status };
@@ -312,7 +314,7 @@ test("a risk interstitial whose confirm is a role-button is advanced to the call
     assert.equal(result.logoutStatus, 204);
     assert.deepEqual(
         harness.clicked,
-        ["[data-identifier]", "role:button:" + String(/^(continue|allow|confirm|next|i agree|i understand)$/i)],
+        ["[data-identifier]", "role:button:" + String(CONSENT_ROLE_NAME)],
         "the walk must advance the chooser and then the role-button interstitial",
     );
 });

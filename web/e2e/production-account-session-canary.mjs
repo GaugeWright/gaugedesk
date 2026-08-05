@@ -67,7 +67,8 @@ const CONSENT_CONTROLS = [
 // Risk-triggered interstitials (e.g. `/v3/signin/challenge/ipp/consent` from a
 // datacenter egress) render their confirm control as a `role="button"` element
 // rather than a `<button>`; the role engine matches both, by accessible name.
-const CONSENT_ROLE_NAME = /^(continue|allow|confirm|next|i agree|i understand)$/i;
+export const CONSENT_ROLE_NAME =
+    /^(continue|allow|confirm|next|i agree|i understand|yes|yes,? it'?s me|it'?s me|that was me)$/i;
 
 function consentControls(page) {
     return page
@@ -75,24 +76,36 @@ function consentControls(page) {
         .or(page.getByRole("button", { name: CONSENT_ROLE_NAME }));
 }
 
+// Only Google's own public UI strings may be named in diagnostics; anything
+// else is reported as "other" so a screen's content can never leak.
+const PUBLIC_CONTROL_LABELS = [
+    "continue", "allow", "confirm", "next", "i agree", "i understand", "yes",
+    "yes, it's me", "it's me", "that was me", "no", "no, it's not me", "cancel",
+    "deny", "not now", "try another way", "learn more", "use another account",
+];
+
 // A failure names only structure — tags, roles, ids, input types — never text,
 // so an unrecognised provider screen stays diagnosable without depositing an
 // account address or page content into a job log.
 async function sanitizedControlInventory(page) {
     try {
-        return await page.evaluate(() => {
+        return await page.evaluate((publicLabelsArg) => {
             const controls = [
                 ...document.querySelectorAll("button, [role=button], input[type=submit], input[type=password], input[type=email]"),
             ];
-            return controls.slice(0, 20).map((control) =>
-                [
+            const publicLabels = publicLabelsArg;
+            return controls.slice(0, 20).map((control) => {
+                const text = (control.textContent ?? "").trim().toLowerCase();
+                const label = publicLabels.includes(text) ? text : text ? "other" : "";
+                return [
                     control.tagName.toLowerCase(),
                     control.getAttribute("role") ?? "",
                     control.id ?? "",
                     control.getAttribute("type") ?? "",
-                ].join(":"),
-            );
-        });
+                    label,
+                ].join(":");
+            });
+        }, PUBLIC_CONTROL_LABELS);
     } catch {
         return ["<inventory unavailable>"];
     }
