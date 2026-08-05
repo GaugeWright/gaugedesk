@@ -15,6 +15,7 @@
 
 import { createEffect, createMemo, createResource, createSignal, For, on, onCleanup, Show, untrack, type Accessor } from "solid-js";
 import {
+    authority,
     bearer,
     beginLogin,
     clientRequestId,
@@ -116,6 +117,10 @@ const api = new WorkbenchControlPlane(controlPlaneBase());
 // flow. Builds can still suppress the action if their runtime ships neither.
 const codexLoginAvailable = import.meta.env.VITE_CODEX_LOGIN !== "false";
 const localDevLogin = import.meta.env.VITE_LOCAL_DEV_LOGIN === "true";
+// The welcome overlay's account step is offered only where the composition's
+// control plane serves the OIDC login shell (the hub-split hosted builds and the
+// dev-login harness); the core desktop build has no account plane to sign in to.
+const accountLoginAvailable = import.meta.env.VITE_HOME_SPLIT === "true" || localDevLogin;
 // OIDC login (ID-3): if we just returned from `/auth/callback`, capture the id-token
 // from the URL fragment before the first request, then hand the bearer to the
 // transport so gated `/admin/*` calls carry it. Signed-out / single-user local is the
@@ -2009,6 +2014,15 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     api={api}
                     productName="GaugeDesk"
                     codexLoginAvailable={codexLoginAvailable}
+                    account={accountLoginAvailable ? {
+                        label: localDevLogin ? "Enter local dev account" : "Sign in with Google",
+                        // The overlay renders only after home discovery succeeded, which in
+                        // hub-split mode already required an authenticated session; the
+                        // bearer covers the local-OIDC fragment flow.
+                        signedIn: () => bearer() !== null || import.meta.env.VITE_HOME_SPLIT === "true",
+                        subject: () => authority(),
+                        begin: () => beginLogin(controlPlaneBase()),
+                    } : undefined}
                     onConnected={() => {
                         void refetchStartupCreds();
                         void refetchStartupCodex();

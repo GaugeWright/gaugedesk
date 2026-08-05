@@ -1767,6 +1767,14 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45); }
 .firstrun-title { margin: 0; font-size: 20px; font-weight: 600; color: var(--ink); }
 .firstrun-lede { margin: 0; font-size: var(--fs-body); line-height: 1.5; color: var(--muted); }
+.firstrun-section { display: flex; flex-direction: column; gap: 8px; margin: 0;
+    padding-top: 12px; border-top: 1px solid var(--edge); }
+.firstrun-section-label { margin: 0; font-size: var(--fs-label); font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.firstrun-note { margin: 0; font-size: var(--fs-ui); line-height: 1.5; color: var(--muted); }
+.firstrun-account-state { display: flex; align-items: center; gap: 8px; margin: 0;
+    font-size: var(--fs-body); color: var(--ink); }
+.firstrun-account-check { color: var(--accent); font-weight: 600; }
 .firstrun-key { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
 .firstrun-field { display: flex; flex-direction: column; gap: 4px; }
 .firstrun-label { font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.06em;

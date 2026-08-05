@@ -459,24 +459,25 @@ export function AccountPanel(props: {
                     </section>}
                 >
                     <section class="admin-section" data-codex-oauth>
-                        <h4>OpenAI sign-in (codex)</h4>
+                        <h4>OpenAI model access (codex)</h4>
                         <p class="muted">
-                            Sign in with your OpenAI account so the agent can run on the codex
-                            endpoint — the default. No API key needed.
+                            Connect your OpenAI account so the agent can run on the codex
+                            endpoint — the default. No API key needed. This authorizes model
+                            access only; it is not a GaugeWright sign-in.
                         </p>
                         <div class="member-row" data-codex-status={codex()?.linked ? (codex()?.expired ? "expired" : "linked") : "none"}>
                             <span>
                                 {codex()?.linked
                                     ? codex()?.expired
-                                        ? `signed in — expired${codexExpiry() ? ` (${codexExpiry()})` : ""}`
-                                        : `signed in${codexExpiry() ? ` — valid to ${codexExpiry()}` : ""}`
-                                    : "not signed in"}
+                                        ? `connected — expired${codexExpiry() ? ` (${codexExpiry()})` : ""}`
+                                        : `connected${codexExpiry() ? ` — valid to ${codexExpiry()}` : ""}`
+                                    : "not connected"}
                             </span>
                             <Show when={codex()?.linked && !codex()?.expired}>
                                 <span class="badge">linked</span>
                             </Show>
                             <button type="button" class="tree-action" data-codex-signin onClick={linkCodex}>
-                                {codex()?.linked ? "re-sign in" : "Sign in with OpenAI"}
+                                {codex()?.linked ? "reconnect" : "Connect OpenAI account"}
                             </button>
                         </div>
                         <Show when={authUrl()}>

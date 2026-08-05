@@ -7,7 +7,7 @@ export type { AccessRequestEvent, AccessRequestPresentation, AccessRequestState 
 export { AccountPanel } from "./AccountPanel";
 export type { AccountPanelApi } from "./AccountPanel";
 export { FirstRunOverlay } from "./FirstRunOverlay";
-export type { FirstRunApi } from "./FirstRunOverlay";
+export type { FirstRunAccount, FirstRunApi } from "./FirstRunOverlay";
 export { AgentSettings, plainConfigError, readFormConfig, writeFormConfig } from "./AgentSettings";
 export type { AgentSettingsApi, AgentSettingsProps } from "./AgentSettings";
 export { buildOutgoing, classifyAttachment, documentFileType, extractDocumentAttachment, fileToBase64 } from "./attachments";
