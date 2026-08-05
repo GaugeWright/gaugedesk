@@ -11,7 +11,7 @@
 //! **This is the verified core of `ID-3`** (per the M3 tracker): id-token
 //! verification + claim mapping, **fail-closed** (`INV-20`) — any token that does
 //! not verify, or whose `iss`/`aud`/`exp` do not match, yields **no** authority,
-//! exactly like [`LoopbackIdentityProvider`](gaugewright_app::identity::LoopbackIdentityProvider) rejecting an unknown
+//! exactly like [`LoopbackIdentityProvider`](crate::identity::LoopbackIdentityProvider) rejecting an unknown
 //! credential. It deliberately does **not** speak HTTP: discovery, JWKS fetch +
 //! rotation, and the auth-code + PKCE redirect dance are the follow-on slice — the
 //! signing keys are supplied to the constructor (in production, populated from the
@@ -34,7 +34,7 @@ use gaugewright_core::abac::{AuthorityAttributes, Region, Role, Tenant};
 use gaugewright_core::ids::AuthorityId;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
-use gaugewright_app::identity::IdentityProvider;
+use crate::identity::IdentityProvider;
 
 /// Which token claims carry the attributes the ABAC evaluator reads. IdP-specific:
 /// Entra puts groups in `groups`, Okta roles in a custom `roles` claim, etc. Unset
@@ -317,7 +317,7 @@ pub trait HttpGet {
     fn get(&self, url: &str) -> Result<String, String>;
 }
 
-impl HttpGet for gaugewright_app::net_http::HttpClient {
+impl HttpGet for crate::net_http::HttpClient {
     fn get(&self, url: &str) -> Result<String, String> {
         self.get_string(url)
     }
@@ -380,9 +380,9 @@ pub trait HttpForm {
     fn post_form(&self, url: &str, fields: &[(&str, &str)]) -> Result<String, String>;
 }
 
-impl HttpForm for gaugewright_app::net_http::HttpClient {
+impl HttpForm for crate::net_http::HttpClient {
     fn post_form(&self, url: &str, fields: &[(&str, &str)]) -> Result<String, String> {
-        match gaugewright_app::net_http::HttpClient::post_form(self, url, fields) {
+        match crate::net_http::HttpClient::post_form(self, url, fields) {
             Ok((status, body)) if (200..300).contains(&status) => Ok(body),
             Ok((status, body)) => Err(format!("HTTP {status}: {body}")),
             Err(e) => Err(e),

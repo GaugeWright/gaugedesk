@@ -84,11 +84,15 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
 /// the real routes — the `ee/` crate boundary is a capability boundary (ADR 0121), so
 /// the old `featured_routes()` feature on/off wrapper collapsed with the
 /// extraction. Mints one composition-scoped
-/// [`EnterpriseAuthState`](crate::auth_oidc::EnterpriseAuthState) (the OIDC
+/// [`AuthShellState`](crate::auth_oidc::AuthShellState) (the OIDC
 /// pending-login store) and hands it to the `/auth/*` handlers as an
 /// `Extension`, so the pending-login lifetime spans requests.
 pub fn routes() -> Router<SharedWorkbench> {
-    let enterprise_auth_state = crate::auth_oidc::EnterpriseAuthState::new();
+    // The enterprise composition registers its login fold (ADR 0122 §3):
+    // verified-domain JIT membership. The shell itself carries no membership
+    // consequences.
+    let enterprise_auth_state = crate::auth_oidc::AuthShellState::new()
+        .with_login_fold(crate::login_fold::hub_login_fold());
     Router::new()
         .merge(crate::environment_routes::routes())
         // Capability-gated entry to the Administration Environment (`ADMIN-ENV-2`).
@@ -109,32 +113,9 @@ pub fn routes() -> Router<SharedWorkbench> {
         // Enrolled members must evaluate the tenant placement floor before pairing.
         // This is not an Administration projection: it is a client enforcement input.
         .route("/admin/placement-policy", get(get_placement_policy))
-        // OIDC auth-code + PKCE login shell (M3 ID-3): `/auth/login` redirects the
-        // browser to the configured IdP; `/auth/callback` redeems the code and hands
-        // back the verified id-token (the bearer the admin routes accept).
-        .route("/auth/login", get(crate::auth_oidc::get_login))
-        .route("/auth/callback", get(crate::auth_oidc::get_callback))
-        // Safe current-session projection for the Account menu. This is not a
-        // linked-method or recovery/custody declaration.
-        .route("/auth/session", get(crate::auth_oidc::get_session))
-        // Session refresh (ADR 0077): a still-valid session mints a fresh id-token cookie from the
-        // stored refresh token, so a hosted session outlives the ~1h id-token without re-login.
-        .route("/auth/refresh", get(crate::auth_oidc::get_refresh))
-        // Native device handoff (ADR 0123): mobile and desktop both redeem the
-        // custom-scheme single-use code + verifier here. The `/auth/mobile/*`
-        // wire paths predate the desktop client and are kept verbatim so
-        // existing mobile clients never break.
-        .route(
-            "/auth/mobile/refresh",
-            post(crate::auth_oidc::post_native_refresh),
-        )
-        .route(
-            "/auth/mobile/exchange",
-            post(crate::auth_oidc::post_native_exchange),
-        )
-        // Sign-out expires the shared HttpOnly account cookie. It remains reachable with an
-        // expired/absent session so logout is always a successful, idempotent cleanup.
-        .route("/auth/logout", post(crate::auth_oidc::post_logout))
+        // The consumer login shell is core (ADR 0122); this composition mounts
+        // it with the enterprise login fold registered above.
+        .merge(crate::auth_oidc::auth_routes(enterprise_auth_state))
         // SCIM provisioning is an external protocol actor. Administration issues
         // its token and group mappings only through the shared Environment command path.
         .route("/scim/v2/Users", post(crate::scim_routes::post_scim_user))
@@ -142,7 +123,6 @@ pub fn routes() -> Router<SharedWorkbench> {
             "/scim/v2/Users/:id",
             patch(crate::scim_routes::patch_scim_user).delete(crate::scim_routes::delete_scim_user),
         )
-        .layer(axum::Extension(enterprise_auth_state))
 }
 
 // ---- helpers -------------------------------------------------------------

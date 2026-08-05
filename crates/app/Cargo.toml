@@ -41,6 +41,10 @@ base64 = "0.22"
 getrandom = "0.2"
 sha2 = "0.10"
 hex = "0.4"
+# OIDC login shell (ADR 0122): id-token (JWT) verification for the consumer
+# login the core control plane serves. `ring` backend keeps the build
+# OpenSSL/cmake-free (matches `crypto_nossl`); `use_pem` gives RS256/ES256 PEM keys.
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 # ECDH for the ACCT-1 device-enrollment seal-to-subkey (ECIES: ECDH(subkey) -> HKDF-SHA256
 # -> AES-256-GCM). The subkey is a P-256 keypair; core uses p256/ecdsa, the app adds ecdh.
 p256 = { version = "0.13", features = ["ecdh"] }

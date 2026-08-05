@@ -18,7 +18,7 @@
 //!
 //! The HTTP-touching logic lives in two seam-generic functions ([`start_login`],
 //! [`finish_callback`]) tested against a mock OP; the axum handlers are the thin
-//! wiring that supplies the real [`net_http::HttpClient`](gaugewright_app::net_http)
+//! wiring that supplies the real [`net_http::HttpClient`](crate::net_http)
 //! (off the async runtime via [`tokio::task::spawn_blocking`], since the seam is
 //! blocking) and the server-side [`PendingAuthStore`].
 
@@ -44,12 +44,12 @@ use crate::identity_oidc::{
     ClaimMapping, HttpForm, HttpGet, OidcIdentityProvider, Pkce,
 };
 use base64::Engine as _;
-use gaugewright_app::identity::IdentityProvider;
-use gaugewright_app::net_http::HttpClient;
-use gaugewright_app::org::{
-    MembershipRecord, MembershipStatus, Org, RecordOp, SsoConnectionRecord, SsoProtocol, ORG_ID,
+use crate::identity::IdentityProvider;
+use crate::net_http::HttpClient;
+use crate::org::{
+    Org, RecordOp, SsoConnectionRecord, SsoProtocol, ORG_ID,
 };
-use gaugewright_app::{LockUnpoisoned, SharedWorkbench, Workbench};
+use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
 
 /// Server-side state carried from `/auth/login` to `/auth/callback` for one
 /// auth-code + PKCE exchange, keyed by the CSRF `state` (`ID-3`). Holds the PKCE
@@ -59,9 +59,9 @@ use gaugewright_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 #[derive(Clone, Debug)]
 pub struct PendingAuth {
     /// The PKCE verifier whose S256 challenge went to the OP; presented at exchange.
-    /// Held [`Secret`](gaugewright_app::secret::Secret) so this `Debug`-deriving
+    /// Held [`Secret`](crate::secret::Secret) so this `Debug`-deriving
     /// struct never leaks it to a log (`SECAUD-10`).
-    pub verifier: gaugewright_app::secret::Secret,
+    pub verifier: crate::secret::Secret,
     /// The OP token endpoint the code is redeemed at.
     pub token_endpoint: String,
     /// The OP JWKS endpoint the returned id-token is verified against.
@@ -76,8 +76,8 @@ pub struct PendingAuth {
     pub mapping: ClaimMapping,
     /// The OAuth **client secret** presented at token exchange, if the OP requires a confidential
     /// client (Google "Web application" clients do, even with PKCE). `None` for a public PKCE
-    /// client (Okta/Entra). Held [`Secret`](gaugewright_app::secret::Secret) so it never logs.
-    pub client_secret: Option<gaugewright_app::secret::Secret>,
+    /// client (Okta/Entra). Held [`Secret`](crate::secret::Secret) so it never logs.
+    pub client_secret: Option<crate::secret::Secret>,
     /// Exact allowlisted native return URI selected on the login leg. The
     /// callback trusts only this server-side value, never callback input.
     pub native_return: Option<String>,
@@ -87,12 +87,12 @@ pub struct PendingAuth {
 }
 
 /// In-flight `/auth/login` → `/auth/callback` PKCE state, keyed by CSRF `state`
-/// (`ID-3`). Single-process, held behind the [`EnterpriseAuthState`] mutex. A
+/// (`ID-3`). Single-process, held behind the [`AuthShellState`] mutex. A
 /// `state` authorizes exactly one callback: [`take`](Self::take) removes it,
 /// so a replayed or forged `state` finds nothing (fail-closed, `INV-20`). Loopback
 /// scaffold: a real multi-node deployment backs this with shared, TTL-bounded
 /// storage behind the same seam (mirroring
-/// [`SessionStore`](gaugewright_app::session::SessionStore)).
+/// [`SessionStore`](crate::session::SessionStore)).
 #[derive(Default)]
 pub struct PendingAuthStore {
     by_state: BTreeMap<String, PendingAuth>,
@@ -126,23 +126,74 @@ impl PendingAuthStore {
     }
 }
 
-/// Enterprise-owned OIDC auth-code login state (`ID-3`) — **ee axum state**, not a
-/// [`Workbench`] field. The route builder ([`crate::org_routes::routes`]) mints one
-/// per composition and carries it to the `/auth/login` + `/auth/callback` handlers
-/// as an [`Extension`], so the pending-login store's lifetime spans requests exactly
-/// as the pre-split workbench field did (created once per composition, never
-/// per-request). A cheap-to-clone shared handle; its own mutex keeps
-/// [`PendingAuthStore::take`]'s single-use CSRF consumption atomic.
-#[derive(Clone, Default)]
-pub struct EnterpriseAuthState {
-    pending_auth: Arc<Mutex<PendingAuthStore>>,
-    native_handoffs: Arc<Mutex<NativeHandoffStore>>,
+/// The consumer login shell's route table (ADR 0122): every composition of
+/// the core control plane can serve `/auth/*`. The caller supplies the shell
+/// state — with its composition fold registered (enterprise), or plain for a
+/// solo/open shell. Mounting this unconfigured is safe: `/auth/login` answers
+/// 409 until a connection is configured, and the native handoff + refresh
+/// routes answer 404 outside web-account mode.
+///
+/// The `/auth/mobile/*` wire paths predate the desktop client and are kept
+/// verbatim so existing mobile clients never break (ADR 0123).
+pub fn auth_routes(state: AuthShellState) -> axum::Router<SharedWorkbench> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        // `/auth/login` redirects the browser to the configured IdP;
+        // `/auth/callback` redeems the code and hands back the verified
+        // id-token (the bearer the gated routes accept).
+        .route("/auth/login", get(get_login))
+        .route("/auth/callback", get(get_callback))
+        // Safe current-session projection for the Account menu. This is not a
+        // linked-method or recovery/custody declaration.
+        .route("/auth/session", get(get_session))
+        // Session refresh (ADR 0077): a still-valid session mints a fresh id-token
+        // cookie from the stored refresh token, so a hosted session outlives the
+        // ~1h id-token without re-login.
+        .route("/auth/refresh", get(get_refresh))
+        // Native device handoff (ADR 0123): mobile and desktop both redeem the
+        // custom-scheme single-use code + verifier here.
+        .route("/auth/mobile/refresh", post(post_native_refresh))
+        .route("/auth/mobile/exchange", post(post_native_exchange))
+        // Sign-out expires the shared HttpOnly account cookie. It remains reachable
+        // with an expired/absent session so logout is always idempotent cleanup.
+        .route("/auth/logout", post(post_logout))
+        .layer(Extension(state))
 }
 
-impl EnterpriseAuthState {
-    /// Empty enterprise auth state.
+/// The auth shell's composition-scoped state (`ID-3`, ADR 0122) — **axum
+/// state**, not a [`Workbench`] field. The composition's route builder mints
+/// one and carries it to the `/auth/login` + `/auth/callback` handlers as an
+/// [`Extension`], so the pending-login store's lifetime spans requests
+/// (created once per composition, never per-request). A cheap-to-clone shared
+/// handle; its own mutex keeps [`PendingAuthStore::take`]'s single-use CSRF
+/// consumption atomic. The optional [`LoginFold`] is where a composition
+/// (e.g. enterprise) registers membership consequences.
+#[derive(Clone, Default)]
+pub struct AuthShellState {
+    pending_auth: Arc<Mutex<PendingAuthStore>>,
+    native_handoffs: Arc<Mutex<NativeHandoffStore>>,
+    login_fold: Option<LoginFold>,
+}
+
+/// What the composition folds after a verified login (ADR 0122 §3). The shell
+/// verifies identity, mints the session, audits, and handles the hosted
+/// web-account/session machinery itself; **membership consequences** — folding
+/// the authenticated subject into an org directory (verified-domain JIT) — are
+/// the composition's, registered here. `(workbench, tenant scope, authority,
+/// verified id-token)`. A composition without a fold gets a login with no
+/// membership side effects.
+pub type LoginFold = Arc<dyn Fn(&mut Workbench, &str, &str, &str) + Send + Sync>;
+
+impl AuthShellState {
+    /// Empty shell state (no composition fold).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register the composition's post-login fold (ADR 0122 §3).
+    pub fn with_login_fold(mut self, fold: LoginFold) -> Self {
+        self.login_fold = Some(fold);
+        self
     }
 
     /// In-flight OIDC login store (`ID-3`), mutable: `/auth/login` records a
@@ -160,7 +211,7 @@ impl EnterpriseAuthState {
 }
 
 struct NativeHandoff {
-    id_token: gaugewright_app::secret::Secret,
+    id_token: crate::secret::Secret,
     challenge: String,
     expires_at: Instant,
 }
@@ -174,7 +225,7 @@ impl NativeHandoffStore {
     fn issue(&mut self, id_token: String, challenge: String, now: Instant) -> String {
         self.by_code.retain(|_, handoff| handoff.expires_at > now);
         let code = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(gaugewright_app::session::random_bytes::<32>());
+            .encode(crate::session::random_bytes::<32>());
         self.by_code.insert(
             code.clone(),
             NativeHandoff {
@@ -233,7 +284,7 @@ pub fn start_login(
     let pkce = Pkce::generate().map_err(LoginError::Pkce)?;
     // 16 CSPRNG bytes hex-encoded — unguessable, so a forged `state` cannot collide
     // with a live login (the CSRF binding the OP echoes back).
-    let state = hex::encode(gaugewright_app::session::random_bytes::<16>());
+    let state = hex::encode(crate::session::random_bytes::<16>());
     // Request **offline access** (ADR 0077 session refresh): Google returns a refresh token on the
     // consent grant only with `access_type=offline`. `prompt=consent` (opt-in via env) forces the
     // consent screen so a refresh token is re-issued even for an already-granted account — the hub
@@ -572,7 +623,7 @@ pub fn build_oidc_idp(
 /// and self-heals on the first login once the IdP is reachable.
 ///
 /// Runs at **startup**, matching the pre-split workbench-open activation timing:
-/// the ee composition setup ([`crate::org_routes::enterprise_control_plane`])
+/// the ee composition setup (the ee `org_routes::enterprise_control_plane`)
 /// calls it before serving, and the hosted shell (`gaugewright-cloud-server`)
 /// calls it right after workbench open. Installs the verifier via the open
 /// `Workbench::set_identity_provider` seam.
@@ -642,59 +693,6 @@ pub async fn activate_updated_idp(
     }
 }
 
-/// Extract the `email` claim from an **already-verified** id-token (the caller verified
-/// signature + claims via [`finish_callback`]) — used only for JIT domain matching, so
-/// decoding the payload without re-checking the signature is safe here. `None` if the
-/// token has no readable `email`.
-fn email_claim(id_token: &str) -> Option<String> {
-    let payload = id_token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    claims
-        .get("email")
-        .and_then(|e| e.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-}
-
-/// JIT provisioning (`ONB-2`): a successful SSO login whose verified subject is **not
-/// yet a member** auto-creates an active `member` — *iff* the subject's email domain is
-/// a **verified** org domain (the same basis as domain-capture, `ID-6`). Fail-closed
-/// (`INV-20`): an unverified domain (or no email claim) provisions nothing — the user
-/// must be invited or SCIM-provisioned. No-op if already an active member. Returns
-/// whether a member was newly provisioned. JIT seeds `member`; SCIM/group-mapping or an
-/// admin elevates (the directory stays the role authority).
-pub fn jit_provision(wb: &mut Workbench, scope: &str, authority: &str, id_token: &str) -> bool {
-    let Ok(org) = Org::rebuild_in(wb.store_ref(), scope) else {
-        return false;
-    };
-    if org.role_of(authority).is_some() {
-        return false; // already an active member
-    }
-    let Some(email) = email_claim(id_token) else {
-        return false; // no email ⇒ cannot match a verified domain (fail-closed)
-    };
-    if !org.domain_is_verified(&email) {
-        return false; // unverified domain ⇒ no auto-join (fail-closed)
-    }
-    let record = MembershipRecord {
-        id: authority.to_string(),
-        op: RecordOp::Upsert,
-        org_id: ORG_ID.to_string(),
-        authority: authority.to_string(),
-        email,
-        role: "member".to_string(),
-        status: MembershipStatus::Active,
-        managed_by_scim: false,
-        team: None,
-    };
-    crate::org_routes::write_membership(wb, scope, &record);
-    gaugewright_app::audit::record_in(wb, scope, authority, "member.jit-provision", authority);
-    true
-}
-
 /// Whether this deployment is the **hosted web account** (`ADR 0077`): a successful login
 /// provisions the person their own account (a personal tenant-of-one), rather than only
 /// reconciling them into an enterprise org directory. Off by default — the enterprise SSO and
@@ -721,7 +719,7 @@ pub fn provision_web_account(
     }
     // The personal tenant is the person's own space — displayed as "Personal", never as an org
     // (ADR 0077 §9); the `TenantRef.personal` flag is what the Console keys on.
-    gaugewright_app::tenancy::provision_personal_tenant(wb.store_mut(), authority, "Personal").ok()
+    crate::tenancy::provision_personal_tenant(wb.store_mut(), authority, "Personal").ok()
 }
 
 /// Seal `refresh_token` into `person`'s own account scope (`ADR 0077` session refresh). Sealed at
@@ -732,14 +730,14 @@ fn store_refresh_token(wb: &mut Workbench, person: &str, refresh_token: &str) {
     let Some(sealed) = wb.seal_account_secret(refresh_token) else {
         return;
     };
-    let scope = gaugewright_app::account::account_scope(person);
+    let scope = crate::account::account_scope(person);
     let rec = json!({ "id": "refresh", "sealed": sealed });
     let _ = wb.write_account_record_in(&scope, "refresh", "refresh", &rec);
 }
 
 /// The person's stored refresh token, unsealed — `None` if none is stored or it fails to open.
 fn resolve_refresh_token(wb: &Workbench, person: &str) -> Option<String> {
-    let scope = gaugewright_app::account::account_scope(person);
+    let scope = crate::account::account_scope(person);
     let rows = wb.store_ref().records(&scope, "refresh").ok()?;
     let last = rows.last()?; // latest-wins
     let doc: serde_json::Value = serde_json::from_str(last).ok()?;
@@ -807,7 +805,7 @@ pub async fn get_session(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    if wb.actor(gaugewright_app::net_http::bearer(&headers)) == "anonymous" {
+    if wb.actor(crate::net_http::bearer(&headers)) == "anonymous" {
         return (
             StatusCode::UNAUTHORIZED,
             "authenticate to view this session",
@@ -820,7 +818,7 @@ pub async fn get_session(
     let sso = if web_account_mode() {
         web_account_sso_from_env()
     } else {
-        Org::rebuild_in(wb.store_ref(), &crate::org_routes::req_scope(&headers))
+        Org::rebuild_in(wb.store_ref(), &crate::workbench_auth::req_scope(&headers))
             .ok()
             .and_then(|org| org.sso)
     };
@@ -841,7 +839,7 @@ pub async fn get_session(
 pub fn session_cookie_value(id_token: &str, domain: Option<&str>, secure: bool) -> String {
     let mut c = format!(
         "{}={id_token}; Path=/; HttpOnly; SameSite=Lax",
-        gaugewright_app::net_http::SESSION_COOKIE
+        crate::net_http::SESSION_COOKIE
     );
     if secure {
         c.push_str("; Secure");
@@ -865,7 +863,7 @@ pub fn expired_session_cookie_value(domain: Option<&str>, secure: bool) -> Strin
 
 /// The OAuth **client secret** for a confidential OP (Google), from `GAUGEWRIGHT_GOOGLE_CLIENT_SECRET`.
 /// `None` when unset — a public PKCE client (Okta/Entra) needs no secret at exchange.
-fn google_client_secret_from_env() -> Option<gaugewright_app::secret::Secret> {
+fn google_client_secret_from_env() -> Option<crate::secret::Secret> {
     std::env::var("GAUGEWRIGHT_GOOGLE_CLIENT_SECRET")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -934,10 +932,10 @@ fn login_err(e: LoginError) -> axum::response::Response {
 
 /// `GET /auth/login` — begin OIDC login: discover, mint PKCE + state, stash, and
 /// redirect the browser to the IdP. See the module docs. The pending-login store
-/// arrives as the composition-scoped [`EnterpriseAuthState`] extension.
+/// arrives as the composition-scoped [`AuthShellState`] extension.
 pub async fn get_login(
     State(wb): State<SharedWorkbench>,
-    Extension(auth): Extension<EnterpriseAuthState>,
+    Extension(auth): Extension<AuthShellState>,
     headers: HeaderMap,
     Query(query): Query<LoginQuery>,
 ) -> impl IntoResponse {
@@ -950,7 +948,7 @@ pub async fn get_login(
     };
     let sso = {
         let wb = wb.lock_unpoisoned();
-        match Org::rebuild_in(wb.store_ref(), &crate::org_routes::req_scope(&headers)) {
+        match Org::rebuild_in(wb.store_ref(), &crate::workbench_auth::req_scope(&headers)) {
             Ok(org) => org.sso,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
         }
@@ -1057,14 +1055,14 @@ fn callback_err(e: CallbackError) -> axum::response::Response {
 /// back to the client. See the module docs.
 pub async fn get_callback(
     State(wb): State<SharedWorkbench>,
-    Extension(auth): Extension<EnterpriseAuthState>,
+    Extension(auth): Extension<AuthShellState>,
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> impl IntoResponse {
     // SECAUD-8: per-tenant failed-callback lockout (429 when locked) — defense-in-depth
     // behind the edge rate-limit, mirroring the SCIM guard. A bad/replayed state or a failed
     // token exchange records a failure; a completed login clears the tenant's count.
-    let tenant = crate::org_routes::req_scope(&headers);
+    let tenant = crate::workbench_auth::req_scope(&headers);
     let throttle = wb.lock_unpoisoned().oidc_throttle().clone();
     let now = throttle.now_ms();
     if !throttle.allowed(&tenant, now) {
@@ -1117,20 +1115,23 @@ pub async fn get_callback(
     // A completed exchange clears the tenant's failed-callback count (SECAUD-8).
     throttle.record_success(&tenant);
 
-    // Attribute the login to the authenticated authority (`AUD-1` / `INV-21`), and
-    // JIT-provision a verified-domain newcomer as a member (`ONB-2`, fail-closed).
+    // Attribute the login to the authenticated authority (`AUD-1` / `INV-21`), then
+    // run the composition's registered fold (ADR 0122 §3 — e.g. verified-domain
+    // JIT membership on the enterprise composition; nothing on a solo shell).
     {
         let mut wb = wb.lock_unpoisoned();
         let actor = authority.as_str().to_string();
-        let store_scope = crate::org_routes::req_scope(&headers);
-        gaugewright_app::audit::record_in(
+        let store_scope = crate::workbench_auth::req_scope(&headers);
+        crate::audit::record_in(
             &mut wb,
             &store_scope,
             &actor,
             "auth.login",
             authority.as_str(),
         );
-        jit_provision(&mut wb, &store_scope, authority.as_str(), &id_token);
+        if let Some(fold) = &auth.login_fold {
+            fold(&mut wb, &store_scope, authority.as_str(), &id_token);
+        }
         // Hosted web account (ADR 0077 §9): a successful login provisions the person's personal
         // tenant-of-one (idempotent) so they land in the Console with their own space. No-op on
         // the enterprise/desktop paths (web-account mode off).
@@ -1213,7 +1214,7 @@ pub async fn get_refresh(
     if !web_account_mode() {
         return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
     }
-    let bearer = gaugewright_app::net_http::bearer(&headers).map(str::to_string);
+    let bearer = crate::net_http::bearer(&headers).map(str::to_string);
     // The still-valid session resolves to the person + their sealed refresh token (fail-closed:
     // an expired id-token authenticates to nobody, so it cannot refresh itself).
     let (person, refresh_token) = {
@@ -1285,7 +1286,7 @@ pub async fn post_native_refresh(
     if !web_account_mode() {
         return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
     }
-    let bearer = gaugewright_app::net_http::bearer(&headers).map(str::to_string);
+    let bearer = crate::net_http::bearer(&headers).map(str::to_string);
     let (person, refresh_token) = {
         let g = wb.lock_unpoisoned();
         let person = g.actor(bearer.as_deref());
@@ -1348,7 +1349,7 @@ pub struct NativeHandoffExchange {
 /// Redeem a single-use native login handoff. Neither the OIDC id-token nor its
 /// refresh authority rides the custom-scheme URL.
 pub async fn post_native_exchange(
-    Extension(auth): Extension<EnterpriseAuthState>,
+    Extension(auth): Extension<AuthShellState>,
     Json(request): Json<NativeHandoffExchange>,
 ) -> impl IntoResponse {
     if !web_account_mode() {
@@ -1602,7 +1603,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         // The record is the home (ID-3): its claim names win, and the subject defaults
         // to `sub` when unset — independent of any GAUGEWRIGHT_OIDC_*_CLAIM env fallback.
         let mut sso = oidc_sso();
-        sso.claim_mapping = gaugewright_app::org::SsoClaimMapping {
+        sso.claim_mapping = crate::org::SsoClaimMapping {
             roles_claim: Some("groups".into()),
             region_claim: Some("locale".into()),
             ..Default::default()
@@ -1613,81 +1614,9 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert_eq!(m.subject_claim, "sub");
     }
 
-    /// A JWT-shaped token carrying the given claims (signature irrelevant — JIT decodes
-    /// the payload of an already-verified token).
-    fn token_with_claims(claims: serde_json::Value) -> String {
-        let b64 = |v: &serde_json::Value| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
-        };
-        format!("{}.{}.sig", b64(&json!({ "alg": "none" })), b64(&claims))
-    }
-
-    #[test]
-    fn jit_provisions_a_verified_domain_subject_and_skips_others() {
-        use gaugewright_app::org::{Org, OrgRecord, ORG_ID, ORG_SCOPE};
-        let store = gaugewright_store::Store::open_in_memory().unwrap();
-        let mut wb = Workbench::new(store);
-        // Seed an org with a verified domain (the JIT basis).
-        let org_rec = OrgRecord {
-            id: ORG_ID.to_string(),
-            op: RecordOp::Upsert,
-            display_name: "Acme".into(),
-            verified_domains: vec!["acme.com".into()],
-            default_region: None,
-            kind: Default::default(),
-        };
-        wb.store_mut()
-            .append_record(ORG_SCOPE, "org", &serde_json::to_string(&org_rec).unwrap())
-            .unwrap();
-
-        // Verified-domain subject → provisioned as an active member.
-        let tok = token_with_claims(json!({ "sub": "sub-alice", "email": "alice@acme.com" }));
-        assert!(
-            jit_provision(&mut wb, gaugewright_app::org::ORG_SCOPE, "sub-alice", &tok),
-            "verified domain provisions"
-        );
-        assert!(Org::rebuild(wb.store_ref())
-            .unwrap()
-            .role_of("sub-alice")
-            .is_some());
-        // Idempotent: already a member → no-op.
-        assert!(!jit_provision(
-            &mut wb,
-            gaugewright_app::org::ORG_SCOPE,
-            "sub-alice",
-            &tok
-        ));
-
-        // Unverified domain → fail-closed, no provision.
-        let evil = token_with_claims(json!({ "sub": "sub-eve", "email": "eve@evil.com" }));
-        assert!(!jit_provision(
-            &mut wb,
-            gaugewright_app::org::ORG_SCOPE,
-            "sub-eve",
-            &evil
-        ));
-        assert!(Org::rebuild(wb.store_ref())
-            .unwrap()
-            .role_of("sub-eve")
-            .is_none());
-
-        // No email claim → cannot match a verified domain → no provision.
-        let anon = token_with_claims(json!({ "sub": "sub-anon" }));
-        assert!(!jit_provision(
-            &mut wb,
-            gaugewright_app::org::ORG_SCOPE,
-            "sub-anon",
-            &anon
-        ));
-        assert!(Org::rebuild(wb.store_ref())
-            .unwrap()
-            .role_of("sub-anon")
-            .is_none());
-    }
-
     #[test]
     fn web_account_login_provisions_the_persons_personal_tenant() {
-        use gaugewright_app::tenancy::{personal_tenant_id, Tenancy};
+        use crate::tenancy::{personal_tenant_id, Tenancy};
         let store = gaugewright_store::Store::open_in_memory().unwrap();
         let mut wb = Workbench::new(store);
         let person = "google-sub-123";
@@ -1696,7 +1625,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(provision_web_account(&mut wb, person, false).is_none());
         assert!(Tenancy::rebuild_in(
             wb.store_ref(),
-            &gaugewright_app::account::account_scope(person)
+            &crate::account::account_scope(person)
         )
         .unwrap()
         .tenants
@@ -1708,7 +1637,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert_eq!(tid, personal_tenant_id(person));
         let tenancy = Tenancy::rebuild_in(
             wb.store_ref(),
-            &gaugewright_app::account::account_scope(person),
+            &crate::account::account_scope(person),
         )
         .unwrap();
         let personal = tenancy.personal().expect("a personal tenant is indexed");
@@ -1724,7 +1653,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert_eq!(
             Tenancy::rebuild_in(
                 wb.store_ref(),
-                &gaugewright_app::account::account_scope(person)
+                &crate::account::account_scope(person)
             )
             .unwrap()
             .tenants

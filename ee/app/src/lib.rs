@@ -13,9 +13,12 @@
 //! `Workbench` authorization/actor helpers (`gaugewright_app::workbench_auth`)
 //! that open code also consumes. This crate only *composes* those seams.
 
-pub mod auth_oidc;
+// The auth shell and OIDC protocol client are core (ADR 0122); re-exported
+// so enterprise callers and the conformance lanes keep their paths.
+pub use gaugewright_app::auth_oidc;
 pub mod environment_routes;
-pub mod identity_oidc;
+pub use gaugewright_app::identity_oidc;
+pub mod login_fold;
 pub mod identity_saml;
 pub mod org_routes;
 pub mod scim_routes;

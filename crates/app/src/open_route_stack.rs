@@ -15,6 +15,12 @@ pub fn open_control_plane(wb: SharedWorkbench) -> Router {
     Router::new()
         .merge(local_routes::routes(federation_on))
         .merge(account_routes::routes())
+        // The consumer login shell (ADR 0122): served by every composition of
+        // the core control plane, with no composition fold on the open shell.
+        // Inert until a deployment configures an IdP connection.
+        .merge(crate::auth_oidc::auth_routes(
+            crate::auth_oidc::AuthShellState::new(),
+        ))
         .merge(mobile_machine_session::routes())
         .layer(net_http::cors_layer())
         .with_state(wb.clone())
