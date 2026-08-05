@@ -56,9 +56,11 @@ independent assurance.
 
 ## What are the license and price?
 
-Code outside `ee/` is Apache-2.0. `ee/` uses Business Source License 1.1 with
-the GaugeWright Enterprise Use Grant. GaugeDesk Plus is defined at USD 12 per
-seat monthly; custom work and other services are separate.
+The GaugeDesk platform, including Administration, is AGPL-3.0-only with narrow
+permissions for independent public-interface extensions and the unmodified embed
+client. The two client SDK packages are Apache-2.0. Commercial licenses are
+available from GaugeWright LLC for non-AGPL use. GaugeDesk Plus is defined at USD
+12 per seat monthly; custom work and other services are separate.
 
 ## How do I get help or request a DPA?
 

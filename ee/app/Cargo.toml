@@ -1,22 +1,19 @@
-# gaugewright-ee — the source-available enterprise band (SPLIT-1).
+# gaugewright-ee — GaugeDesk Administration capabilities.
 # Owns the enterprise admin/SSO/SCIM control-plane surface extracted from
 # `crates/app`: the org admin routes + ENTSEC-1 data-route auth middleware
 # (`org_routes`), the OIDC auth-code + PKCE login shell and startup SSO
 # activation (`auth_oidc`), the OIDC id-token verifier core (`identity_oidc`),
 # the SAML sidecar adapter (`identity_saml`), and SCIM provisioning
-# (`scim_routes`). GitLab-style source-available subtree of the platform repo
-# (ADR 0069): it lives at `ee/` and is licensed BUSL-1.1 (the license text
-# itself lands in SPLIT-5), NOT under the workspace's open license. The open
+# (`scim_routes`). The subtree is a capability boundary inside the AGPL platform
+# (ADR 0121), not a separate source-license band. The
 # substrate it composes over (org/audit/workbench_auth/identity records,
 # traits, and Workbench accessors) stays in `crates/app`.
 [package]
 name = "gaugewright-ee"
 edition.workspace = true
 version.workspace = true
-# Deliberately NOT `license.workspace`: this subtree is the future BUSL band
-# (ADR 0069 GitLab-style); the final license text lands in SPLIT-5.
-license = "BUSL-1.1"
-description = "gaugewright source-available enterprise band: org admin, SSO (OIDC/SAML), SCIM, and enterprise data-route auth over the open app substrate (BUSL-1.1 ee/ subtree, ADR 0069)."
+license.workspace = true
+description = "GaugeDesk Administration capabilities: org admin, SSO (OIDC/SAML), SCIM, and enterprise data-route auth over the AGPL platform."
 
 [dependencies]
 gaugewright-core = { path = "../../crates/core" }

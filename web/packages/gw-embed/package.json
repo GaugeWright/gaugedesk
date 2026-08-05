@@ -26,7 +26,6 @@
         "open-source"
       ],
       "mustNotDependOn": [
-        "source-available-enterprise",
         "private-managed-services"
       ]
     },

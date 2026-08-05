@@ -1,10 +1,19 @@
 GaugeDesk
 Copyright 2026 GaugeWright LLC
 
-This product includes software developed for the GaugeWright platform
-(https://gaugewright.com).
+The GaugeDesk platform is licensed under the GNU Affero General Public License,
+version 3 only (AGPL-3.0-only). See `LICENSE`.
 
-Licensed under the Apache License, Version 2.0 (the "License"); you may not
-use the files in this repository except in compliance with the License, with
-the following exception: the contents of the `ee/` directory are licensed
-under the Business Source License 1.1 — see `ee/LICENSE`.
+GaugeWright LLC grants additional permissions under AGPLv3 section 7 for
+independent plugins, archetypes, and extensions using documented public
+extension interfaces, and for embedding the unmodified GaugeDesk Embed Client.
+See `LICENSE-ADDITIONAL-PERMISSIONS`.
+
+The `web/packages/control-plane-client` and `web/packages/gw-embed` packages are
+licensed separately under the Apache License, Version 2.0. Each package carries
+its applicable license text.
+
+Third-party components and assets remain under their respective licenses.
+
+GaugeWright LLC also offers commercial licenses for uses that do not comply
+with the public license. Contact licensing@gaugewright.com.

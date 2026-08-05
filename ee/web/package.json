@@ -2,7 +2,7 @@
   "name": "gaugewright-ee-web",
   "version": "0.0.0",
   "private": true,
-  "license": "BUSL-1.1",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "description": "GaugeDesk enterprise workbench composition and enterprise route client.",
   "workspaces": [

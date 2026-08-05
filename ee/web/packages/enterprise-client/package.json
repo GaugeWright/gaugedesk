@@ -2,9 +2,9 @@
   "name": "@gaugewright/enterprise-client",
   "version": "0.0.0",
   "private": true,
-  "license": "BUSL-1.1",
+  "license": "AGPL-3.0-only",
   "type": "module",
-  "description": "Transitional source-available enterprise client package root.",
+  "description": "GaugeDesk Administration client package root.",
   "dependencies": {
     "@gaugewright/control-plane-client": "0.0.0"
   },
@@ -21,16 +21,15 @@
     "ciTarget": "npm run typecheck:enterprise-client",
     "dependencyPolicy": {
       "mayDependOn": [
-        "open-source",
-        "source-available-enterprise"
+        "open-source"
       ],
       "mustNotDependOn": [
         "private-managed-services"
       ]
     },
     "extractionPhase": "monorepo-transitional",
-    "licenseTarget": "BUSL-1.1",
-    "repoTarget": "source-available-enterprise",
-    "sourcePosture": "source-available-enterprise"
+    "licenseTarget": "AGPL-3.0-only",
+    "repoTarget": "open-source",
+    "sourcePosture": "open-source"
   }
 }

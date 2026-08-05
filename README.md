@@ -4,8 +4,7 @@ GaugeDesk is a free, event-sourced, projection-first desktop workbench for
 governed, multi-party agentic work — a way to apply external expertise to
 private operational context under review, release, and audit controls.
 
-This repository is the open, source-available distribution of the GaugeDesk
-platform.
+This repository is the open-source distribution of the GaugeDesk platform.
 
 ## What is here
 
@@ -29,13 +28,16 @@ Installers are now unsigned.
 
 ## Licensing
 
-Two license bands, split by directory:
+The GaugeDesk platform, including `ee/`, is **AGPL-3.0-only** with recorded
+additional permissions for independent extensions through documented public
+interfaces and for embedding the unmodified GaugeDesk Embed Client. See
+[`LICENSE`](LICENSE),
+[`LICENSE-ADDITIONAL-PERMISSIONS`](LICENSE-ADDITIONAL-PERMISSIONS), and
+[`NOTICE`](NOTICE).
 
-- Everything outside `ee/` is **Apache-2.0** — see [`LICENSE`](LICENSE) and
-  [`NOTICE`](NOTICE).
-- Everything under `ee/` is **Business Source License 1.1** with the GaugeWright
-  Enterprise Use Grant — see [`ee/LICENSE`](ee/LICENSE). It is publicly readable
-  by design. Production use is governed by the BUSL terms.
+The `control-plane-client` and `gw-embed` packages remain **Apache-2.0**.
+GaugeWright LLC also offers commercial licenses for uses that do not comply
+with the public license; contact `licensing@gaugewright.com`.
 
 ## Quick start
 

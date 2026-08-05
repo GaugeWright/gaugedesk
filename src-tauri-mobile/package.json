@@ -2,6 +2,7 @@
   "name": "@gaugewright/mobile-shell",
   "version": "0.4.3",
   "private": true,
+  "license": "AGPL-3.0-only",
   "description": "GaugeDesk native mobile shell build tooling.",
   "scripts": {
     "tauri": "tauri",

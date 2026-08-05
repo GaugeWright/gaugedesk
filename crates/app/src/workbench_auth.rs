@@ -1,6 +1,6 @@
-//! Workbench-local authorization and actor resolution helpers — the **open**
-//! admission substrate the route bands compose over: the source-available
-//! enterprise surface (`gaugewright-ee`) and the private settlement plane
+//! Workbench-local authorization and actor resolution helpers — the shared
+//! admission substrate the route compositions use: the Administration
+//! surface (`gaugewright-ee`) and the private settlement plane
 //! (`gaugewright-cloud-settlement`) both gate their routes through these seams.
 
 use std::collections::BTreeSet;

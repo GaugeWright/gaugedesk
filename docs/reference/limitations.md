@@ -15,6 +15,7 @@ The [status page](status.md) is authoritative for availability.
 | Assurance | GaugeWright has no independent penetration test, SOC 2 report, or ISO 27001 certification. |
 | Mobile | Clients are built, but app-store distribution, production push, and complete physical-device proof remain. |
 
-GaugeDesk uses Apache-2.0 outside `ee/` and Business Source License 1.1 with the
-GaugeWright Enterprise Use Grant inside `ee/`. Check the release for current
+GaugeDesk is AGPL-3.0-only with recorded extension and embed permissions; the
+`control-plane-client` and `gw-embed` packages are Apache-2.0 exceptions.
+Commercial licenses are available separately. Check the release for current
 artifacts, signatures, SBOM, and provenance.

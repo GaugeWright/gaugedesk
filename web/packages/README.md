@@ -18,5 +18,7 @@ roots through declared workspace package names. Reaching into `../*/src` or
 migration. `workbench-ui` now consumes `control-plane-client` through
 `@gaugewright/control-plane-client`.
 
-Each package must keep the open-source posture: no enterprise (`ee/`) or
-managed-cloud source may be imported into these packages (ADR 0069).
+These integration-core packages remain independent of Administration (`ee/`)
+and managed-cloud source. That dependency boundary preserves reuse and the two
+Apache SDK exceptions; it is no longer a separate platform license band
+(ADR 0121).

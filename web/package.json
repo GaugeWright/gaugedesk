@@ -2,7 +2,7 @@
   "name": "gaugedesk-web",
   "version": "0.4.5",
   "private": true,
-  "license": "Apache-2.0",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "description": "GaugeDesk \u2014 the Solid 1.x projection-first island.",
   "workspaces": [

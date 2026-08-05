@@ -1,13 +1,13 @@
-//! gaugewright source-available enterprise band (`gaugewright-ee`, ADR 0069).
+//! GaugeDesk Administration capability crate (`gaugewright-ee`, ADR 0121).
 //!
-//! The enterprise admin/SSO/SCIM control-plane surface over the **open** app
+//! The enterprise admin/SSO/SCIM control-plane surface over the shared app
 //! substrate (`gaugewright-app`): org administration + the ENTSEC-1 data-route
 //! auth middleware, the OIDC auth-code + PKCE login shell and startup SSO
 //! activation, the OIDC id-token verifier core, the SAML sidecar adapter, and
-//! SCIM provisioning. GitLab-style `ee/` subtree — source-available (BUSL-1.1),
-//! not part of the open (Apache-licensed) platform band.
+//! SCIM provisioning. The `ee/` subtree is a capability boundary inside the
+//! AGPL-licensed GaugeDesk platform, not a separate license band.
 //!
-//! The open substrate stays in `crates/app`: the org/membership records and
+//! The shared substrate stays in `crates/app`: the org/membership records and
 //! projection (`gaugewright_app::org`), the audit trail (`gaugewright_app::audit`),
 //! the `IdentityProvider` seam (`gaugewright_app::identity`), and the
 //! `Workbench` authorization/actor helpers (`gaugewright_app::workbench_auth`)

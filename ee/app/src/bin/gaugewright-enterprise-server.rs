@@ -1,12 +1,12 @@
-//! gaugewright self-hosted enterprise server (ADR 0069, ee/ band).
+//! GaugeDesk self-hosted Administration server (ADR 0121, `ee/` capability set).
 //!
-//! The source-available enterprise composition: the open local control plane
+//! The AGPL enterprise composition: the shared local control plane
 //! plus the org governance surface (SSO/OIDC/SAML sign-in, SCIM, RBAC, audit,
 //! admin) behind the ENTSEC-1 enterprise auth middleware — and nothing managed:
 //! no embed host, no settlement, no attested operator routes. This is the
 //! binary an enterprise runs itself; the GaugeWright-operated equivalent is
 //! `gaugewright-cloud-server` (private cloud repo), which layers the managed
-//! planes on the same open substrate.
+//! planes on the same shared substrate.
 //!
 //! Run: `GAUGEWRIGHT_ADDR=127.0.0.1:7878 gaugewright-enterprise-server`
 //! (same env contract as the open binary: `GAUGEWRIGHT_ROOT`, loopback

@@ -1,0 +1,42 @@
+GaugeDesk Additional Permissions
+Version 1, 5 August 2026
+
+Copyright (C) 2026 GaugeWright LLC
+
+These are additional permissions under section 7 of the GNU Affero General
+Public License, version 3 ("AGPLv3"), for the GaugeDesk Program. Capitalized
+terms not defined here have the meanings given in AGPLv3.
+
+1. Independent extensions
+
+A "Public Extension Interface" is an interface that GaugeWright documents in
+the public GaugeDesk source or user documentation for use by third-party
+plugins, archetypes, or extensions.
+
+You may develop, run, and convey an independent plugin, archetype, or extension
+under terms of your choice when it communicates with the Program solely through
+Public Extension Interfaces. Combining or using such an independent work with
+the Program does not, by itself, cause that independent work to be governed by
+AGPLv3.
+
+This permission does not apply to a modification of the Program, to a work based
+on the Program, or to material copied from the Program. Those works remain
+governed by AGPLv3.
+
+2. Unmodified embed client
+
+The "GaugeDesk Embed Client" is an unmodified browser artifact distributed by
+GaugeWright LLC for mounting a GaugeDesk panel in a site or application.
+
+You may reproduce, convey, and embed the unmodified GaugeDesk Embed Client in a
+larger site or application under terms of your choice. That embedding does not,
+by itself, cause the larger site or application to be governed by AGPLv3.
+
+This permission does not apply to a modified GaugeDesk Embed Client or to any
+other modification of or work based on the Program. Those works remain governed
+by AGPLv3.
+
+These permissions make exceptions only to the conditions identified above.
+They impose no additional restriction on rights granted by AGPLv3. Under
+section 7 of AGPLv3, a recipient may remove these additional permissions from a
+copy of the Program or any part of it.

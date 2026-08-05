@@ -18,9 +18,8 @@ exclude = ["src-tauri"]
 [workspace.package]
 edition = "2021"
 version = "0.4.5"
-# The platform default (ADR 0069 / SPLIT-5). Crates that are not Apache
-# override explicitly: ee/app is BUSL-1.1.
-license = "Apache-2.0"
+# The platform default (ADR 0121 / company DR-0056).
+license = "AGPL-3.0-only"
 
 # Dependencies are built without debug info. They dominate target/debug/deps,
 # and debug info measured ~78% of binary size (whipplescript, 2026-07-25).

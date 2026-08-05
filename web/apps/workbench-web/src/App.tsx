@@ -158,7 +158,7 @@ const initialHomeInvitation = consumeHomeInvitation();
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 export interface WorkbenchAppProps {
-    /** Optional Environment supplied by a higher source-band composition. */
+    /** Optional Environment supplied by a higher capability composition. */
     readonly environmentAction?: {
         readonly label: string;
         readonly available: Accessor<boolean>;

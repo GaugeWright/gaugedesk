@@ -4,6 +4,9 @@ Source: https://github.com/GaugeWright/gaugedesk
 
 Files: *
 Copyright: 2026 GaugeWright
-License: Apache-2.0
- On Debian systems, the complete text of the Apache License, Version 2.0 can be
- found in /usr/share/common-licenses/Apache-2.0.
+License: AGPL-3
+ On Debian systems, the complete text of the GNU Affero General Public License,
+ Version 3 can be found in /usr/share/common-licenses/AGPL-3.
+ .
+ GaugeDesk is licensed as AGPL-3.0-only; the package source also records
+ additional permissions in LICENSE-ADDITIONAL-PERMISSIONS.

@@ -79,9 +79,9 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
         ))
 }
 
-/// Source-available enterprise governance route surface: SSO/OIDC/SAML, SCIM,
+/// Enterprise governance route surface: SSO/OIDC/SAML, SCIM,
 /// RBAC, org policy, audit, security, and billing-seat administration. Always
-/// the real routes — the `ee/` crate boundary is the band gate (ADR 0069), so
+/// the real routes — the `ee/` crate boundary is a capability boundary (ADR 0121), so
 /// the old `featured_routes()` feature on/off wrapper collapsed with the
 /// extraction. Mints one composition-scoped
 /// [`EnterpriseAuthState`](crate::auth_oidc::EnterpriseAuthState) (the OIDC

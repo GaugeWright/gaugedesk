@@ -33,7 +33,7 @@ make_deb() {
     'Type=Application' >"$package_root/usr/share/applications/gauge-desk.desktop"
   printf 'test changelog\n' \
     | gzip -9 -n >"$package_root/usr/share/doc/gauge-desk/changelog.gz"
-  printf 'Copyright 2026 GaugeWright\nLicense: Apache-2.0\n' \
+  printf 'Copyright 2026 GaugeWright\nLicense: AGPL-3\n' \
     >"$package_root/usr/share/doc/gauge-desk/copyright"
   dpkg-deb --build --root-owner-group "$package_root" \
     "$TMP/gauge-desk_${version}_amd64.deb" >/dev/null

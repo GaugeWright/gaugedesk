@@ -44,6 +44,8 @@ jobs:
           python-version: '3.12'
       - name: enforce crate and transport boundaries
         run: python3 scripts/architecture-check.py
+      - name: enforce license boundary
+        run: python3 scripts/check-license-boundary.py
 
   web:
     if: ${{ github.event.repository.private == false }}
