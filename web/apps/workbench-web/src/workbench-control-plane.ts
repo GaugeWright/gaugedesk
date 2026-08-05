@@ -1336,4 +1336,8 @@ export class WorkbenchControlPlane implements ControlPlane {
     hubSessionSignOut(): Promise<void> {
         return this.runtimeAccountJson().then((json) => accountClient.hubSessionSignOut(json));
     }
+
+    hubSessionReach(): Promise<accountClient.HubSessionReach> {
+        return this.runtimeAccountJson().then((json) => accountClient.hubSessionReach(json));
+    }
 }

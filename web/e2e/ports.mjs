@@ -38,6 +38,8 @@ export const ports = {
     enterprise: num("GW_E2E_ENTERPRISE", 7882),
     // Static preview of the combined enterprise workbench bundle (ee/web).
     enterpriseApp: num("GW_E2E_ENTERPRISE_APP", 4174),
+    // The stand-in Hub for the desktop account handoff (LOGIN-5, ADR 0123).
+    hub: num("GW_E2E_HUB", 7910),
 };
 
 export const aliceCP = `http://127.0.0.1:${ports.alice}`;
@@ -45,6 +47,7 @@ export const bobCP = `http://127.0.0.1:${ports.bob}`;
 export const brokerAddr = `ws://127.0.0.1:${ports.broker}`;
 export const previewURL = `http://127.0.0.1:${ports.preview}`;
 export const enterpriseCP = `http://127.0.0.1:${ports.enterprise}`;
+export const hubURL = `http://127.0.0.1:${ports.hub}`;
 /** The combined enterprise workbench (ee/web's built bundle, served whole-dist). */
 export const enterpriseAppURL = `http://127.0.0.1:${ports.enterpriseApp}/apps/enterprise-workbench/`;
 

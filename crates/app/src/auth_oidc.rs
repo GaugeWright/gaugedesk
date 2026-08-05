@@ -1293,6 +1293,19 @@ pub async fn post_native_refresh(
         if person == "anonymous" {
             return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
         }
+        // LOGIN-3 (ADR 0123 §4): a client that presents its device id binds
+        // this refresh to the trusted-devices registry — a revoked or unknown
+        // device is refused. Clients predating device binding present none and
+        // keep the bearer-only contract.
+        if let Some(device_id) = headers.get("x-gw-device").and_then(|v| v.to_str().ok()) {
+            if !native_device_admitted(&g, &person, device_id) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "this device's account session was revoked",
+                )
+                    .into_response();
+            }
+        }
         match resolve_refresh_token(&g, &person) {
             Some(token) => (person, token),
             None => {
@@ -1344,11 +1357,71 @@ pub async fn post_native_refresh(
 pub struct NativeHandoffExchange {
     code: String,
     verifier: String,
+    /// Optional device label (LOGIN-3, ADR 0123 §4): a client that names
+    /// itself gets that name in the trusted-devices registry. Absent on
+    /// pre-existing mobile clients — the wire contract is unchanged for them.
+    #[serde(default)]
+    device_label: Option<String>,
+}
+
+/// The `sub` claim of an **already-verified** id-token (the callback verified
+/// signature + claims before the handoff stored it) — projection, not
+/// verification.
+fn subject_claim(id_token: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .get("sub")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Record the redeeming native client in the person's trusted-devices registry
+/// (ADR 0123 §4 / ADR 0053): the handoff session is device-bound, so the
+/// account surface can see and revoke it. Returns the minted device id.
+pub fn record_native_device(wb: &SharedWorkbench, person: &str, label: &str) -> Option<String> {
+    let id = format!("native-{}", hex::encode(crate::session::random_bytes::<8>()));
+    let record = crate::account::DeviceRecord {
+        id: id.clone(),
+        op: RecordOp::Upsert,
+        label: label.chars().take(64).collect(),
+        subkey_pubkey: String::new(),
+        status: crate::account::DeviceStatus::Active,
+        enrolled_at: crate::account::device_enrolled_at_now(),
+    };
+    let scope = crate::account::account_scope(person);
+    wb.lock_unpoisoned()
+        .upsert_account_device_in(&scope, &record)
+        .ok()?;
+    Some(id)
+}
+
+/// Whether `device_id` may continue this person's account session: it must be
+/// a known, **unrevoked** device in their registry. Revocation flips the
+/// record's status — it stops refresh and future use without rewriting
+/// history (`INV-18`).
+pub fn native_device_admitted(wb: &Workbench, person: &str, device_id: &str) -> bool {
+    let scope = crate::account::account_scope(person);
+    let Ok(account) = crate::account::Account::rebuild_in(wb.store_ref(), &scope) else {
+        return false; // fail closed: an unreadable registry admits nothing
+    };
+    account
+        .devices
+        .get(device_id)
+        .is_some_and(|device| device.status == crate::account::DeviceStatus::Active)
 }
 
 /// Redeem a single-use native login handoff. Neither the OIDC id-token nor its
-/// refresh authority rides the custom-scheme URL.
+/// refresh authority rides the custom-scheme URL. The redeeming client is
+/// recorded in the person's trusted-devices registry and receives its
+/// `device_id` — presenting it on refresh binds the session to the device
+/// (LOGIN-3); revoking the device from the account surface stops refresh.
 pub async fn post_native_exchange(
+    State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
     Json(request): Json<NativeHandoffExchange>,
 ) -> impl IntoResponse {
@@ -1359,11 +1432,26 @@ pub async fn post_native_exchange(
         .native_handoffs_mut()
         .redeem(&request.code, &request.verifier, Instant::now());
     match token {
-        Some(id_token) => (
-            StatusCode::OK,
-            Json(json!({ "id_token": id_token, "token_type": "Bearer" })),
-        )
-            .into_response(),
+        Some(id_token) => {
+            let device_id = subject_claim(&id_token).and_then(|person| {
+                let label = request
+                    .device_label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or("Native device");
+                record_native_device(&wb, &person, label)
+            });
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id_token": id_token,
+                    "token_type": "Bearer",
+                    "device_id": device_id,
+                })),
+            )
+                .into_response()
+        }
         None => (
             StatusCode::UNAUTHORIZED,
             "unknown, expired, or incorrectly bound native handoff",
@@ -1963,6 +2051,64 @@ iqlTEKVISscuchxZtKQJ4k8=
             finish_callback(&pending, "code", &op),
             Err(CallbackError::Exchange(_))
         ));
+    }
+
+    #[test]
+    fn native_exchange_binds_the_session_to_a_registry_device() {
+        use crate::account::{Account, DeviceStatus};
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let person = "google-sub-777";
+        let token = {
+            use base64::Engine as _;
+            let b64 = |v: &serde_json::Value| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(v).unwrap())
+            };
+            format!(
+                "{}.{}.sig",
+                b64(&json!({ "alg": "none" })),
+                b64(&json!({ "sub": person }))
+            )
+        };
+        assert_eq!(subject_claim(&token).as_deref(), Some(person));
+
+        // The exchange path records the device in the person's own scope…
+        let device_id = record_native_device(&wb, person, "GaugeDesk on testhost").unwrap();
+        assert!(device_id.starts_with("native-"));
+        let scope = crate::account::account_scope(person);
+        {
+            let g = wb.lock_unpoisoned();
+            let account = Account::rebuild_in(g.store_ref(), &scope).unwrap();
+            let device = account.devices.get(&device_id).unwrap();
+            assert_eq!(device.label, "GaugeDesk on testhost");
+            assert_eq!(device.status, DeviceStatus::Active);
+            assert!(device.enrolled_at > 0);
+            // …and the session is admitted while the device is active.
+            assert!(native_device_admitted(&g, person, &device_id));
+            assert!(!native_device_admitted(&g, person, "native-unknown"));
+            assert!(
+                !native_device_admitted(&g, "someone-else", &device_id),
+                "another person's registry never admits this device"
+            );
+        }
+
+        // Revoking from the account surface stops future admission (INV-18)
+        // without erasing the record.
+        {
+            let mut g = wb.lock_unpoisoned();
+            g.revoke_account_device_in(&scope, &device_id).unwrap();
+        }
+        {
+            let g = wb.lock_unpoisoned();
+            assert!(!native_device_admitted(&g, person, &device_id));
+            let account = Account::rebuild_in(g.store_ref(), &scope).unwrap();
+            assert_eq!(
+                account.devices.get(&device_id).unwrap().status,
+                DeviceStatus::Revoked,
+                "history is preserved, not rewritten"
+            );
+        }
     }
 
     #[test]

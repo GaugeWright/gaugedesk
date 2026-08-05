@@ -49,6 +49,8 @@ const preview = await resolve("GW_E2E_PREVIEW", 4173);
 // The combined enterprise workbench preview and its enterprise control plane.
 const enterprise = await resolve("GW_E2E_ENTERPRISE", 7882);
 const enterpriseApp = await resolve("GW_E2E_ENTERPRISE_APP", 4174);
+// The stand-in Hub the desktop account handoff redeems against (LOGIN-5).
+const hub = await resolve("GW_E2E_HUB", 7910);
 
 const env = {
     ...process.env,
@@ -58,6 +60,7 @@ const env = {
     GW_E2E_PREVIEW: String(preview),
     GW_E2E_ENTERPRISE: String(enterprise),
     GW_E2E_ENTERPRISE_APP: String(enterpriseApp),
+    GW_E2E_HUB: String(hub),
     // The built client talks to THIS run's control plane (overrides SOLO_CONTROL_PLANE).
     VITE_CP_BASE: `http://127.0.0.1:${alice}`,
 };
@@ -133,6 +136,12 @@ const steps = [
             "--example",
             "test-wss-relay",
         ],
+        { cwd: repoRoot },
+    ],
+    // The stand-in Hub for the desktop account handoff (LOGIN-5).
+    [
+        "cargo",
+        ["build", "-p", "gaugewright-app", "--example", "test-account-hub"],
         { cwd: repoRoot },
     ],
     ["npx", ["vite", "build"]],

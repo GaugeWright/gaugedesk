@@ -131,6 +131,10 @@ struct SessionRecord {
     sealed: String,
     person: String,
     expires: i64,
+    /// The Hub-minted trusted-device id this session is bound to (LOGIN-3);
+    /// presented on refresh so revocation from the account surface bites.
+    #[serde(default)]
+    device: String,
 }
 
 fn write_session(wb: &SharedWorkbench, record: &SessionRecord) -> Result<(), String> {
@@ -158,7 +162,7 @@ pub fn hub_session_token(wb: &SharedWorkbench) -> Option<String> {
     workbench.unseal_account_secret(&record.sealed)
 }
 
-fn seal_session(wb: &SharedWorkbench, id_token: &str) -> Result<SessionRecord, String> {
+fn seal_session(wb: &SharedWorkbench, id_token: &str, device: &str) -> Result<SessionRecord, String> {
     let person = jwt_subject(id_token).unwrap_or_default();
     let expires = jwt_expiry_ms(id_token).unwrap_or(0);
     let sealed = {
@@ -172,6 +176,7 @@ fn seal_session(wb: &SharedWorkbench, id_token: &str) -> Result<SessionRecord, S
         sealed,
         person,
         expires,
+        device: device.to_string(),
     };
     write_session(wb, &record)?;
     Ok(record)
@@ -179,9 +184,14 @@ fn seal_session(wb: &SharedWorkbench, id_token: &str) -> Result<SessionRecord, S
 
 /// Redeem the deep-linked single-use code at the Hub. Blocking (ureq) — run off
 /// the async runtime.
-fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<String, String> {
+fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<(String, String), String> {
     let http = HttpClient::new();
-    let body = json!({ "code": code, "verifier": verifier }).to_string();
+    let body = json!({
+        "code": code,
+        "verifier": verifier,
+        "device_label": device_label(),
+    })
+    .to_string();
     let (status, response) = http
         .post_json_headers(&format!("{hub}/auth/mobile/exchange"), &[], &body)
         .map_err(|error| format!("the Hub was unreachable: {error}"))?;
@@ -190,21 +200,41 @@ fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<String, String
     }
     let parsed: Value =
         serde_json::from_str(&response).map_err(|_| "malformed Hub response".to_string())?;
-    parsed
+    let id_token = parsed
         .get("id_token")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "malformed Hub response".to_string())
+        .ok_or_else(|| "malformed Hub response".to_string())?;
+    let device = parsed
+        .get("device_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok((id_token, device))
+}
+
+/// How this desktop names itself in the person's trusted-devices registry.
+fn device_label() -> String {
+    match std::env::var("HOSTNAME").ok().filter(|h| !h.trim().is_empty()) {
+        Some(host) => format!("GaugeDesk on {host}"),
+        None => "GaugeDesk desktop".to_string(),
+    }
 }
 
 /// Refresh a still-valid session at the Hub. Blocking — run off the async runtime.
-fn refresh_at_hub(hub: &str, bearer: &str) -> Result<String, String> {
+fn refresh_at_hub(hub: &str, bearer: &str, device: &str) -> Result<String, String> {
     let http = HttpClient::new();
+    let mut headers = vec![("authorization".to_string(), format!("Bearer {bearer}"))];
+    if !device.is_empty() {
+        // LOGIN-3: bind the refresh to the registered device, so revoking it
+        // from the account surface stops this session's renewal.
+        headers.push(("x-gw-device".to_string(), device.to_string()));
+    }
     let (status, response) = http
         .post_json_headers(
             &format!("{hub}/auth/mobile/refresh"),
-            &[("authorization".to_string(), format!("Bearer {bearer}"))],
+            &headers,
             "{}",
         )
         .map_err(|error| format!("the Hub was unreachable: {error}"))?;
@@ -231,6 +261,7 @@ fn status_json(record: Option<&SessionRecord>, available: bool) -> Value {
             "person": record.person,
             "expires": record.expires,
             "expired": record.expires <= now_ms(),
+            "device": record.device,
         }),
         None => json!({ "available": available, "linked": false }),
     }
@@ -301,14 +332,14 @@ pub async fn post_signin_callback(
     let code = request.code.trim().to_string();
     let redeemed =
         tokio::task::spawn_blocking(move || redeem_at_hub(&hub, &code, &taken.verifier)).await;
-    let id_token = match redeemed {
+    let (id_token, device) = match redeemed {
         Ok(Ok(token)) => token,
         Ok(Err(message)) => return (StatusCode::BAD_GATEWAY, message).into_response(),
         Err(_) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, "sign-in task panicked").into_response()
         }
     };
-    match seal_session(&wb, &id_token) {
+    match seal_session(&wb, &id_token, &device) {
         Ok(record) => Json(status_json(Some(&record), true)).into_response(),
         Err(message) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
     }
@@ -325,10 +356,11 @@ pub async fn get_signin_status(State(wb): State<SharedWorkbench>) -> impl IntoRe
     let due = record.expires > now_ms() && record.expires - now_ms() < REFRESH_SKEW_MS;
     if available && due {
         if let (Some(hub), Some(bearer)) = (hub_base(), hub_session_token(&wb)) {
+            let device = record.device.clone();
             let refreshed =
-                tokio::task::spawn_blocking(move || refresh_at_hub(&hub, &bearer)).await;
+                tokio::task::spawn_blocking(move || refresh_at_hub(&hub, &bearer, &device)).await;
             if let Ok(Ok(token)) = refreshed {
-                if let Ok(updated) = seal_session(&wb, &token) {
+                if let Ok(updated) = seal_session(&wb, &token, &record.device) {
                     return Json(status_json(Some(&updated), available)).into_response();
                 }
             }
@@ -337,6 +369,56 @@ pub async fn get_signin_status(State(wb): State<SharedWorkbench>) -> impl IntoRe
         }
     }
     Json(status_json(Some(&record), available)).into_response()
+}
+
+/// Fetch one Hub account projection with the sealed bearer. Blocking — run off
+/// the async runtime. Returns the parsed JSON body, or `null` on any failure
+/// (reach is a read-only convenience view; a partial Hub answer is not an
+/// error surface).
+fn fetch_hub_projection(http: &HttpClient, hub: &str, path: &str, bearer: &str) -> Value {
+    let headers = [("authorization".to_string(), format!("Bearer {bearer}"))];
+    match http.get_string_headers(&format!("{hub}{path}"), &headers) {
+        Ok((200, body)) => serde_json::from_str(&body).unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+/// `GET /account/hub-session/reach` — what the signed-in account can reach
+/// (the ADR 0114 composition): the person, their registered Homes, and the
+/// opaque project-to-Home routes, fetched from the Hub with the sealed bearer.
+/// The bearer never rides this route; reach carries only what the Hub itself
+/// projects as non-secret. 409 unconfigured, 401 signed out.
+pub async fn get_signin_reach(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+    let Some(hub) = hub_base() else {
+        return (
+            StatusCode::CONFLICT,
+            "account sign-in is not configured for this runtime",
+        )
+            .into_response();
+    };
+    let Some(record) = latest_session(&wb) else {
+        return (StatusCode::UNAUTHORIZED, "sign in to read account reach").into_response();
+    };
+    let Some(bearer) = hub_session_token(&wb) else {
+        return (StatusCode::UNAUTHORIZED, "sign in to read account reach").into_response();
+    };
+    let fetched = tokio::task::spawn_blocking(move || {
+        let http = HttpClient::new();
+        let homes = fetch_hub_projection(&http, &hub, "/account/homes", &bearer);
+        let routes = fetch_hub_projection(&http, &hub, "/account/home-routes", &bearer);
+        (homes, routes)
+    })
+    .await;
+    let Ok((homes, routes)) = fetched else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "reach task panicked").into_response();
+    };
+    Json(json!({
+        "person": record.person,
+        "device": record.device,
+        "homes": homes,
+        "routes": routes,
+    }))
+    .into_response()
 }
 
 /// `POST /account/hub-session/logout` — append the signed-out tombstone.
@@ -350,6 +432,7 @@ pub async fn post_signin_logout(State(wb): State<SharedWorkbench>) -> impl IntoR
         sealed: String::new(),
         person: String::new(),
         expires: 0,
+        device: String::new(),
     };
     match write_session(&wb, &cleared) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -418,9 +501,10 @@ mod tests {
         let wb = crate::open_workbench(root.path()).unwrap();
         let token = test_jwt(json!({ "sub": "alice@example.test", "exp": 4_102_444_800i64 }));
 
-        let record = seal_session(&wb, &token).unwrap();
+        let record = seal_session(&wb, &token, "native-abc123").unwrap();
         assert_eq!(record.person, "alice@example.test");
         assert_eq!(record.expires, 4_102_444_800_000);
+        assert_eq!(record.device, "native-abc123");
         assert!(
             !record.sealed.contains(&token),
             "the stored form is sealed, not plaintext"
@@ -431,6 +515,7 @@ mod tests {
         assert_eq!(projection["linked"], true);
         assert_eq!(projection["person"], "alice@example.test");
         assert_eq!(projection["expired"], false);
+        assert_eq!(projection["device"], "native-abc123");
         assert!(
             !projection.to_string().contains("sealed"),
             "status never carries token material"
@@ -442,6 +527,7 @@ mod tests {
             sealed: String::new(),
             person: String::new(),
             expires: 0,
+            device: String::new(),
         };
         write_session(&wb, &cleared).unwrap();
         assert!(latest_session(&wb).is_none());
@@ -459,6 +545,7 @@ mod tests {
             sealed: "sealed".to_string(),
             person: "alice".to_string(),
             expires: 1,
+            device: String::new(),
         };
         let projection = status_json(Some(&record), true);
         assert_eq!(projection["linked"], true);

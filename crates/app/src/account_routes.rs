@@ -125,6 +125,10 @@ pub fn runtime_credential_routes() -> Router<SharedWorkbench> {
             post(crate::account_signin::post_signin_callback),
         )
         .route(
+            "/account/hub-session/reach",
+            get(crate::account_signin::get_signin_reach),
+        )
+        .route(
             "/account/hub-session/logout",
             post(crate::account_signin::post_signin_logout),
         )

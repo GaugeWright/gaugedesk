@@ -304,6 +304,24 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // `gw-deep-link` DOM CustomEvent (plain event, not IPC), which we route into the Devices
     // consent flow. A browser build simply never receives one.
     const [inviteDeepLink, setInviteDeepLink] = createSignal("");
+    // Desktop → Hub account session (ADR 0123, LOGIN-4): the local control
+    // plane custodies the session; this resource is the surfaces' non-secret
+    // view. Reading status also lets the control plane refresh a session
+    // nearing expiry, so the periodic read keeps an open desktop signed in.
+    const [hubSession, { refetch: refetchHubSession }] = createResource(() =>
+        api.hubSessionStatus().catch(() => null),
+    );
+    if (typeof window !== "undefined") {
+        const keepAlive = window.setInterval(() => void refetchHubSession(), 5 * 60 * 1000);
+        onCleanup(() => window.clearInterval(keepAlive));
+    }
+    // What the signed-in account reaches (ADR 0114): Homes and opaque
+    // project-to-Home routes, proxied by the control plane with its sealed
+    // bearer. Only fetched while a live session exists.
+    const [hubReach] = createResource(
+        () => hubSession()?.linked === true && !hubSession()?.expired,
+        () => api.hubSessionReach().catch(() => null),
+    );
     if (typeof window !== "undefined") {
         const onDeepLink = (e: Event) => {
             const url = (e as CustomEvent).detail;
@@ -314,7 +332,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             // the result from `/account/hub-session` (server truth).
             const handoffCode = parseNativeHandoffCode(url);
             if (handoffCode) {
-                void api.hubSessionCallback(handoffCode).catch(() => {});
+                void api
+                    .hubSessionCallback(handoffCode)
+                    .then(() => refetchHubSession())
+                    .catch(() => {});
                 return;
             }
             if (url.startsWith("gaugewright://invite")) {
@@ -1912,6 +1933,47 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         </div>
                     </Show>
 
+                    <Show when={(hubReach()?.homes.length ?? 0) + (hubReach()?.routes.length ?? 0) > 0}>
+                        <div class="homegate-homes" data-hub-reach>
+                            <span class="homegate-label">
+                                Through your GaugeWright account
+                                {hubReach()?.person ? ` — ${hubReach()?.person}` : ""}
+                            </span>
+                            <For each={hubReach()?.homes ?? []}>
+                                {(home) => (
+                                    <button
+                                        type="button"
+                                        class="homegate-home"
+                                        disabled={homeBusy()}
+                                        onClick={() => {
+                                            setHomeEndpoint(home.endpoint);
+                                            void connectHome();
+                                        }}
+                                    >
+                                        <span>{home.id}</span>
+                                        <small>{home.endpoint}</small>
+                                    </button>
+                                )}
+                            </For>
+                            <For each={hubReach()?.routes ?? []}>
+                                {(route) => (
+                                    <button
+                                        type="button"
+                                        class="homegate-home"
+                                        disabled={homeBusy() || !route.endpoint}
+                                        onClick={() => {
+                                            setHomeEndpoint(route.endpoint);
+                                            void connectHome();
+                                        }}
+                                    >
+                                        <span>{route.project}</span>
+                                        <small>{route.endpoint || `via relay — ${route.homeId}`}</small>
+                                    </button>
+                                )}
+                            </For>
+                        </div>
+                    </Show>
+
                     <label class="homegate-field">
                         <span class="homegate-label">Connect a computer or private Home</span>
                         <div class="homegate-connect-row">
@@ -2014,14 +2076,32 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     api={api}
                     productName="GaugeDesk"
                     codexLoginAvailable={codexLoginAvailable}
-                    account={accountLoginAvailable ? {
+                    account={accountLoginAvailable || hubSession()?.available ? {
                         label: localDevLogin ? "Enter local dev account" : "Sign in with Google",
                         // The overlay renders only after home discovery succeeded, which in
                         // hub-split mode already required an authenticated session; the
-                        // bearer covers the local-OIDC fragment flow.
-                        signedIn: () => bearer() !== null || import.meta.env.VITE_HOME_SPLIT === "true",
-                        subject: () => authority(),
-                        begin: () => beginLogin(controlPlaneBase()),
+                        // bearer covers the local-OIDC fragment flow, and the desktop's
+                        // hub session covers the native handoff (ADR 0123).
+                        signedIn: () =>
+                            bearer() !== null ||
+                            import.meta.env.VITE_HOME_SPLIT === "true" ||
+                            (hubSession()?.linked === true && !hubSession()?.expired),
+                        subject: () => authority() ?? hubSession()?.person ?? null,
+                        begin: () => {
+                            if (accountLoginAvailable) {
+                                beginLogin(controlPlaneBase());
+                                return;
+                            }
+                            // Desktop: the control plane mints and holds the verifier and
+                            // returns the Hub login URL for the system browser; the
+                            // gaugewright:// return completes the handoff.
+                            void api
+                                .hubSessionStart()
+                                .then(({ url }) => {
+                                    window.open(url, "_blank", "noopener,noreferrer");
+                                })
+                                .catch(() => {});
+                        },
                     } : undefined}
                     onConnected={() => {
                         void refetchStartupCreds();

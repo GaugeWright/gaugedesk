@@ -35,6 +35,7 @@ import {
     type AttentionSignal,
 } from "./attention";
 import { waitForCodexLink } from "./codex-link-poll";
+import type { HubSessionStatus } from "@gaugewright/control-plane-client";
 import {
     defaultVisibleKeys,
     ENABLED_MODELS_SETTING,
@@ -93,6 +94,12 @@ export interface AccountPanelApi {
     accountDetachFacility(id: string): Promise<void>;
     accountPublishLibrarySync(): Promise<void>;
     accountPullLibrarySync(): Promise<{ found: boolean; merged: number }>;
+    /** Desktop → Hub account sign-in (ADR 0123, LOGIN-4). Optional: only the
+     * co-resident desktop control plane custodies a Hub session; compositions
+     * without these methods simply do not render the account-session section. */
+    hubSessionStatus?(): Promise<HubSessionStatus>;
+    hubSessionStart?(): Promise<{ url: string }>;
+    hubSessionSignOut?(): Promise<void>;
 }
 
 export function AccountPanel(props: {
@@ -129,6 +136,38 @@ export function AccountPanel(props: {
     const [invitations] = createResource(tick, soft(() => props.api.accountInvitations()));
     const [managed] = createResource(tick, soft(() => props.api.accountManagedInference()));
     const [facilities] = createResource(tick, soft(() => props.api.accountFacilities()));
+    // Desktop → Hub account session (ADR 0123, LOGIN-4): server truth from the
+    // local control plane; reading status also lets the control plane refresh a
+    // session nearing expiry. Compositions without the seam render no section.
+    const [hubSession] = createResource(
+        tick,
+        soft(() => props.api.hubSessionStatus?.() ?? Promise.resolve(null)),
+    );
+    let hubPanelDisposed = false;
+    onCleanup(() => {
+        hubPanelDisposed = true;
+    });
+    const startHubSignIn = async () => {
+        const started = await props.api.hubSessionStart?.();
+        if (!started) return;
+        window.open(started.url, "_blank", "noopener,noreferrer");
+        setStatus("finish signing in in your browser — this panel updates by itself");
+        // The deep-linked return lands in the control plane; poll status until
+        // the session appears (bounded — the person may abandon the tab).
+        for (let attempt = 0; attempt < 60 && !hubPanelDisposed; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            const current = await props.api.hubSessionStatus?.().catch(() => null);
+            if (current?.linked) {
+                setStatus("signed in");
+                setTick((t) => t + 1);
+                return;
+            }
+        }
+    };
+    const hubSignOut = async () => {
+        await props.api.hubSessionSignOut?.();
+        setTick((t) => t + 1);
+    };
     // Codex OAuth (LLM-1, ADR 0062): presence + expiry in GaugeDesk's sealed
     // account store. `authUrl` holds the link as a manual
     // fallback if the popup is blocked.
@@ -447,6 +486,50 @@ export function AccountPanel(props: {
                         </For>
                     </ul>
                 </section>
+
+                <Show when={hubSession()?.available}>
+                    <section class="admin-section" data-hub-session>
+                        <h4>GaugeWright account</h4>
+                        <Show
+                            when={hubSession()?.linked}
+                            fallback={<>
+                                <p class="muted">
+                                    Sign in with Google to reach your projects, Homes, and
+                                    invitations. This is separate from model access below.
+                                </p>
+                                <button
+                                    type="button"
+                                    class="tree-action"
+                                    data-hub-session-signin
+                                    onClick={() => void startHubSignIn()}
+                                >
+                                    Sign in with Google
+                                </button>
+                            </>}
+                        >
+                            <div
+                                class="member-row"
+                                data-hub-session-state={hubSession()?.expired ? "expired" : "linked"}
+                            >
+                                <span>
+                                    {hubSession()?.person ?? "signed in"}
+                                    {hubSession()?.expired ? " — session expired" : ""}
+                                </span>
+                                <Show when={!hubSession()?.expired}>
+                                    <span class="badge">signed in</span>
+                                </Show>
+                                <button
+                                    type="button"
+                                    class="tree-action"
+                                    data-hub-session-signout
+                                    onClick={() => void hubSignOut()}
+                                >
+                                    Sign out
+                                </button>
+                            </div>
+                        </Show>
+                    </section>
+                </Show>
 
                 <Show
                     when={props.codexLoginAvailable ?? true}

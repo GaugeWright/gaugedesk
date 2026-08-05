@@ -47,6 +47,7 @@ describe("hub session wrappers", () => {
             person: "alice",
             expires: 5,
             expired: false,
+            device: null,
         });
         expect(calls[0].path).toBe("/account/hub-session");
 
@@ -57,6 +58,7 @@ describe("hub session wrappers", () => {
             person: null,
             expires: null,
             expired: false,
+            device: null,
         });
     });
 

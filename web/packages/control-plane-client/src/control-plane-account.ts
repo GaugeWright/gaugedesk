@@ -492,6 +492,8 @@ export interface HubSessionStatus {
     person: string | null;
     expires: number | null;
     expired: boolean;
+    /** The Hub-minted trusted-device id this session is bound to (LOGIN-3). */
+    device: string | null;
 }
 
 function hubSessionStatusFrom(value: unknown): HubSessionStatus {
@@ -502,6 +504,7 @@ function hubSessionStatusFrom(value: unknown): HubSessionStatus {
         person: typeof o?.person === "string" && o.person ? o.person : null,
         expires: typeof o?.expires === "number" ? o.expires : null,
         expired: Boolean(o?.expired),
+        device: typeof o?.device === "string" && o.device ? o.device : null,
     };
 }
 
@@ -528,6 +531,47 @@ export async function hubSessionCallback(
     code: string,
 ): Promise<HubSessionStatus> {
     return hubSessionStatusFrom(await json("POST", "/account/hub-session/callback", { code }));
+}
+
+/** What the signed-in account can reach (the ADR 0114 composition), read
+ *  through the local control plane's Hub proxy: the person, their registered
+ *  Homes, and the opaque project-to-Home routes. The bearer stays sealed in
+ *  the control plane — this route carries only non-secret projections. */
+export interface HubSessionReach {
+    person: string;
+    device: string;
+    homes: AccountHome[];
+    routes: OpaqueHomeRoute[];
+}
+
+export async function hubSessionReach(json: RouteJson): Promise<HubSessionReach> {
+    const o = (await json("GET", "/account/hub-session/reach")) as Record<string, unknown> | null;
+    const homesEnvelope = (o?.homes ?? null) as { homes?: unknown } | null;
+    const rawHomes = Array.isArray(homesEnvelope?.homes) ? homesEnvelope.homes : [];
+    const homes = rawHomes.flatMap((home) => {
+        const h = home as Record<string, unknown> | null;
+        if (!h || typeof h.id !== "string" || typeof h.endpoint !== "string") return [];
+        return [{
+            id: h.id as HomeId,
+            kind: (typeof h.kind === "string" ? h.kind : "registered") as AccountHomeKind,
+            endpoint: h.endpoint,
+            // The reach view connects by endpoint; the relay locator is not
+            // carried through this display projection.
+            relay: null,
+        } satisfies AccountHome];
+    });
+    let routes: OpaqueHomeRoute[] = [];
+    try {
+        routes = parseOpaqueHomeRoutes(o?.routes ?? { routes: [] });
+    } catch {
+        // A partial Hub answer (or none) yields an empty reach, not an error.
+    }
+    return {
+        person: typeof o?.person === "string" ? o.person : "",
+        device: typeof o?.device === "string" ? o.device : "",
+        homes,
+        routes,
+    };
 }
 
 /** Sign out of the GaugeWright account on this desktop. Idempotent. */

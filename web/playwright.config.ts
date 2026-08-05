@@ -57,6 +57,15 @@ export default defineConfig({
             timeout: 30_000,
             env: { BROKER_PORT: String(ports.broker) },
         },
+        // The stand-in Hub the desktop account handoff redeems against
+        // (LOGIN-5, ADR 0123): exchange, device-bound refresh, revocation.
+        {
+            command: "bash e2e/account-hub.sh",
+            url: `http://127.0.0.1:${ports.hub}/health`,
+            reuseExistingServer: false,
+            timeout: 30_000,
+            env: { HUB_PORT: String(ports.hub) },
+        },
         // The primary control plane (alice / `local-user`) — the one the existing
         // single-instance suite drives. Port-scoped launcher so the peer instance
         // survives (no blanket pkill). Its CORS allowlist blesses THIS run's preview
@@ -71,6 +80,9 @@ export default defineConfig({
                 GAUGEWRIGHT_RELAY_ENDPOINT: brokerAddr,
                 GAUGEWRIGHT_E2E_STATE: aliceState,
                 GAUGEWRIGHT_ALLOWED_ORIGINS: previewURL,
+                // The desktop account handoff redeems at THIS run's stand-in
+                // Hub (LOGIN-5), never the production default.
+                GAUGEWRIGHT_ACCOUNT_HUB_URL: `http://127.0.0.1:${ports.hub}`,
             },
         },
         // The federation peer (authority `bob`) — only the cross-machine scenarios use
