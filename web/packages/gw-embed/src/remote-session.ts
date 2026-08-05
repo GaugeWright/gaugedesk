@@ -40,11 +40,42 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
     const [selectedFile, setSelectedFile] = createSignal<string | null>(null);
     const [worktreeRev, setWorktreeRev] = createSignal(0);
     const [busy, setBusy] = createSignal(false);
+    const [turnQueue, setTurnQueue] = createSignal(
+        (api.getTurnQueue?.() ?? []).map((item) => ({
+            id: item.command_id,
+            text: item.text,
+        })),
+    );
+    const unsubscribeQueue = api.subscribeTurnQueue?.((queue) => {
+        setTurnQueue(queue.map((item) => ({ id: item.command_id, text: item.text })));
+    });
     const composerCapabilities = {
         ...UNIVERSAL_COMPOSER_CAPABILITIES,
-        steer: Boolean(api.stopTurn),
+        queue: Boolean(api.followUpTurn),
+        steer: Boolean(api.steerTurn),
         stop: Boolean(api.stopTurn),
     };
+    const composerRuntime =
+        api.followUpTurn &&
+        api.steerTurn &&
+        api.editQueuedTurn &&
+        api.removeQueuedTurn &&
+        api.reorderQueuedTurns &&
+        api.promoteQueuedTurn
+            ? {
+                queue: turnQueue,
+                followUp: (text: string, images: readonly ImageRef[]) =>
+                    api.followUpTurn!(text, [...images]),
+                steer: (text: string, images: readonly ImageRef[]) =>
+                    api.steerTurn!(text, [...images]),
+                edit: (commandId: string, text: string) =>
+                    api.editQueuedTurn!(commandId, text),
+                remove: (commandId: string) => api.removeQueuedTurn!(commandId),
+                reorder: (commandIds: readonly string[]) =>
+                    api.reorderQueuedTurns!(commandIds),
+                promote: (commandId: string) => api.promoteQueuedTurn!(commandId),
+            }
+            : undefined;
     const bumpWorktree = () => setWorktreeRev((n) => n + 1);
 
     // Transcript: durable snapshot of admitted records + live WebSocket events
@@ -128,6 +159,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         transcript,
         busy,
         composerCapabilities: () => composerCapabilities,
+        composerRuntime,
         merge: (action: MergeAction) => void api.mergeCommand(id, action).then(() => settle()),
         onContentSaved: () => void Promise.allSettled([refetchDiff(), refetchMerge()]),
         send,
@@ -137,6 +169,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         session,
         dispose: () => {
             unsubscribe();
+            unsubscribeQueue?.();
         },
     };
 }

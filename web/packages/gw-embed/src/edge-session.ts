@@ -9,6 +9,7 @@ import {
 
 import type {
     EdgeUsage,
+    EmbedQueuedTurn,
     EmbedSessionApi,
 } from "./session-api";
 import {
@@ -23,6 +24,7 @@ interface EdgeState {
     readonly cursor: number;
     readonly transcript: StreamEvent[];
     readonly files: { path: string }[];
+    readonly queue?: EmbedQueuedTurn[];
 }
 
 type PendingTurn = {
@@ -35,6 +37,10 @@ type PendingTurn = {
 type PendingAck = {
     resolve: () => void;
     reject: (reason: unknown) => void;
+};
+
+type PendingQueueOperation = PendingAck & {
+    payload: Record<string, unknown>;
 };
 
 export interface EmbedChatControls {
@@ -50,7 +56,8 @@ export class EdgeSessionApi implements EmbedSessionApi {
     private readonly listeners = new Set<(event: StreamEvent) => void>();
     private readonly pendingTurns = new Map<string, PendingTurn>();
     private readonly pendingStops = new Map<string, PendingAck>();
-    private readonly stoppedRequests = new Set<string>();
+    private readonly pendingQueueOperations = new Map<string, PendingQueueOperation>();
+    private readonly queueListeners = new Set<(queue: readonly EmbedQueuedTurn[]) => void>();
     private readonly assistantText = new Map<string, string>();
     private readonly acceptedMessages = new Set<string>();
     private readonly receivedRequests = new Set<string>();
@@ -60,6 +67,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
     private readonly sentRequests = new Set<string>();
     private snapshot: EdgeState | null = null;
     private lastUsage: EdgeUsage | null = null;
+    private turnQueue: EmbedQueuedTurn[] = [];
     private cursor = 0;
     private disposed = false;
     private refreshPromise: Promise<void> | null = null;
@@ -131,6 +139,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
         if (cursor >= this.cursor) {
             this.snapshot = snapshot as EdgeState;
             this.cursor = cursor;
+            this.setTurnQueue(this.snapshot.queue ?? []);
         }
     }
 
@@ -179,9 +188,19 @@ export class EdgeSessionApi implements EmbedSessionApi {
                     );
                 }
                 this.pendingStops.clear();
+                for (const pending of this.pendingQueueOperations.values()) {
+                    pending.reject(
+                        new Error("Session DO WebSocket closed before queue command was admitted"),
+                    );
+                }
+                this.pendingQueueOperations.clear();
                 if (
                     !this.disposed &&
-                    (this.chatControls || this.listeners.size > 0 || this.pendingTurns.size > 0)
+                    (this.chatControls ||
+                        this.listeners.size > 0 ||
+                        this.queueListeners.size > 0 ||
+                        this.pendingTurns.size > 0 ||
+                        this.pendingQueueOperations.size > 0)
                 ) {
                     this.scheduleReconnect();
                 }
@@ -302,6 +321,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
             if (snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)) {
                 this.snapshot = snapshot as unknown as EdgeState;
                 this.cursor = Math.max(this.cursor, Number(this.snapshot.cursor) || 0);
+                this.setTurnQueue(this.snapshot.queue ?? []);
             }
             return "session_ready";
         }
@@ -341,6 +361,11 @@ export class EdgeSessionApi implements EmbedSessionApi {
                     ],
                 };
             }
+            if (typeof message.parent_request_id === "string") {
+                for (const listener of this.listeners) {
+                    listener({ type: "user", text: message.text });
+                }
+            }
             return "message_accepted";
         }
         if (message.type === "text_delta" && typeof message.delta === "string") {
@@ -350,7 +375,6 @@ export class EdgeSessionApi implements EmbedSessionApi {
                     : typeof message.command_id === "string"
                       ? message.command_id
                       : "active-turn";
-            if (this.stoppedRequests.has(textRequestId)) return "text_delta";
             if (!this.receivedFirstText.has(textRequestId)) {
                 this.receivedFirstText.add(textRequestId);
                 this.awaitingFirstTextRender.push(textRequestId);
@@ -369,23 +393,22 @@ export class EdgeSessionApi implements EmbedSessionApi {
             return "text_delta";
         }
         if (
-            message.type === "turn_stopped" &&
+            (message.type === "turn_stop_requested" || message.type === "turn_stopped") &&
             typeof message.request_id === "string"
         ) {
-            this.stoppedRequests.add(message.request_id);
-            this.observeLatency("terminal_received", {
-                request_id: message.request_id,
-                ...(Number.isSafeInteger(sequence) ? { sequence } : {}),
-            });
-            this.assistantText.delete(message.request_id);
-            const turn = this.pendingTurns.get(message.request_id);
-            if (turn) {
-                this.pendingTurns.delete(message.request_id);
-                turn.resolve({ outcome: "interrupted" });
-            }
             this.pendingStops.get(message.request_id)?.resolve();
             this.pendingStops.delete(message.request_id);
-            return "turn_stopped";
+            return String(message.type);
+        }
+        if (message.type === "turn_queue_changed" && Array.isArray(message.queue)) {
+            this.setTurnQueue(message.queue);
+            const operationId =
+                typeof message.operation_id === "string" ? message.operation_id : undefined;
+            if (operationId) {
+                this.pendingQueueOperations.get(operationId)?.resolve();
+                this.pendingQueueOperations.delete(operationId);
+            }
+            return "turn_queue_changed";
         }
         if (
             message.type === "tool_call" &&
@@ -462,6 +485,14 @@ export class EdgeSessionApi implements EmbedSessionApi {
             }
             return "usage";
         }
+        if (message.type === "error" && typeof message.operation_id === "string") {
+            const pending = this.pendingQueueOperations.get(message.operation_id);
+            if (pending) {
+                this.pendingQueueOperations.delete(message.operation_id);
+                pending.reject(new Error(String(message.error ?? "queue command failed")));
+            }
+            return "error";
+        }
         if (
             (message.type === "turn_terminal" || message.type === "error") &&
             typeof message.request_id === "string"
@@ -517,6 +548,42 @@ export class EdgeSessionApi implements EmbedSessionApi {
         for (const [requestId, turn] of this.pendingTurns) {
             this.sendTurn(socket, requestId, turn);
         }
+        for (const pending of this.pendingQueueOperations.values()) {
+            socket.send(JSON.stringify(pending.payload));
+        }
+    }
+
+    private setTurnQueue(value: unknown[]): void {
+        this.turnQueue = value.flatMap((candidate) => {
+            if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+                return [];
+            }
+            const item = candidate as Partial<EmbedQueuedTurn>;
+            if (
+                typeof item.command_id !== "string" ||
+                typeof item.text !== "string" ||
+                !Number.isFinite(item.position)
+            ) {
+                return [];
+            }
+            return [{
+                command_id: item.command_id,
+                text: item.text,
+                position: Number(item.position),
+            }];
+        });
+        for (const listener of this.queueListeners) listener(this.turnQueue);
+    }
+
+    private async queueOperation(payload: Record<string, unknown>): Promise<void> {
+        const operationId = newIdempotencyKey().replaceAll("-", "_");
+        const socket = await this.connect();
+        const command = { ...payload, operation_id: operationId, after: this.cursor };
+        const admitted = new Promise<void>((resolve, reject) => {
+            this.pendingQueueOperations.set(operationId, { payload: command, resolve, reject });
+        });
+        socket.send(JSON.stringify(command));
+        return admitted;
     }
 
     async ready(): Promise<void> {
@@ -548,6 +615,62 @@ export class EdgeSessionApi implements EmbedSessionApi {
             }),
         );
         return admitted;
+    }
+
+    getTurnQueue(): readonly EmbedQueuedTurn[] {
+        return this.turnQueue;
+    }
+
+    subscribeTurnQueue(listener: (queue: readonly EmbedQueuedTurn[]) => void): () => void {
+        this.queueListeners.add(listener);
+        listener(this.turnQueue);
+        return () => this.queueListeners.delete(listener);
+    }
+
+    followUpTurn(
+        text: string,
+        images: { data: string; mimeType: string }[] = [],
+    ): Promise<void> {
+        return this.queueOperation({
+            type: "follow_up",
+            request_id: newIdempotencyKey().replaceAll("-", "_"),
+            text,
+            images: images.map((image) => ({
+                media_type: image.mimeType,
+                data_base64: image.data,
+            })),
+        });
+    }
+
+    steerTurn(
+        text: string,
+        images: { data: string; mimeType: string }[] = [],
+    ): Promise<void> {
+        return this.queueOperation({
+            type: "steer",
+            request_id: newIdempotencyKey().replaceAll("-", "_"),
+            text,
+            images: images.map((image) => ({
+                media_type: image.mimeType,
+                data_base64: image.data,
+            })),
+        });
+    }
+
+    editQueuedTurn(commandId: string, text: string): Promise<void> {
+        return this.queueOperation({ type: "queue_edit", command_id: commandId, text });
+    }
+
+    removeQueuedTurn(commandId: string): Promise<void> {
+        return this.queueOperation({ type: "queue_remove", command_id: commandId });
+    }
+
+    reorderQueuedTurns(commandIds: readonly string[]): Promise<void> {
+        return this.queueOperation({ type: "queue_reorder", command_ids: [...commandIds] });
+    }
+
+    promoteQueuedTurn(commandId: string): Promise<void> {
+        return this.queueOperation({ type: "queue_promote", command_id: commandId });
     }
 
     subscribe(

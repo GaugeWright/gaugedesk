@@ -11,7 +11,7 @@ import { IMAGE_MIMES, type Attachment } from "./attachments";
 import { Icon } from "./icons";
 
 export interface ComposerQueueItem {
-    readonly id: number;
+    readonly id: number | string;
     readonly text: string;
     readonly review?: boolean;
 }
@@ -43,9 +43,9 @@ export interface ChatComposerProps {
     readonly onPasteFiles?: (files: readonly File[]) => void | Promise<void>;
     readonly onRemoveAttachment?: (index: number) => void;
     readonly onReorderQueue?: (from: number, to: number) => void;
-    readonly onEditQueue?: (id: number, text: string) => void;
-    readonly onRemoveQueue?: (id: number) => void;
-    readonly onSendNow?: (id: number) => void;
+    readonly onEditQueue?: (id: number | string, text: string) => void;
+    readonly onRemoveQueue?: (id: number | string) => void;
+    readonly onSendNow?: (id: number | string) => void;
     readonly inputRef?: (element: HTMLTextAreaElement) => void;
 }
 
@@ -250,7 +250,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                             class="composer-primary steer-btn"
                             type="button"
                             data-testid="steer-turn"
-                            title="Send now — interrupts the running turn and redirects the agent"
+                            title="Steer the running agent before its next model response"
                             disabled={!props.canSubmit}
                             onClick={props.onSteer}
                         >
@@ -300,13 +300,13 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
 function ComposerQueue(props: {
     readonly items: readonly ComposerQueueItem[];
     readonly onReorder: (from: number, to: number) => void;
-    readonly onEdit: (id: number, text: string) => void;
-    readonly onRemove: (id: number) => void;
-    readonly onSendNow: (id: number) => void;
+    readonly onEdit: (id: number | string, text: string) => void;
+    readonly onRemove: (id: number | string) => void;
+    readonly onSendNow: (id: number | string) => void;
 }): JSX.Element {
     const [dragIndex, setDragIndex] = createSignal<number | null>(null);
     const [overIndex, setOverIndex] = createSignal<number | null>(null);
-    const [editId, setEditId] = createSignal<number | null>(null);
+    const [editId, setEditId] = createSignal<number | string | null>(null);
 
     const commitDrop = () => {
         const from = dragIndex();

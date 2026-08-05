@@ -257,8 +257,8 @@ When("I steer the embedded chat with {string}", async ({ page }, message: string
     await page.getByTestId("steer-turn").click();
 });
 
-Then("the embedded turn is interrupted", async ({ page }) => {
-    await expect(page.locator("body")).toHaveAttribute("data-fixture-stopped", "true");
+Then("the embedded turn is not interrupted", async ({ page }) => {
+    await expect(page.locator("body")).not.toHaveAttribute("data-fixture-stopped", "true");
 });
 
 async function fixtureTurnPrompts(page: import("@playwright/test").Page): Promise<string[]> {
@@ -267,15 +267,21 @@ async function fixtureTurnPrompts(page: import("@playwright/test").Page): Promis
     return (JSON.parse(raw) as { prompt: string }[]).map((turn) => turn.prompt);
 }
 
-Then("the embedded turns begin in the order {string}", async ({ page }, order: string) => {
+Then("the embedded runtime admits commands in the order {string}", async ({ page }, order: string) => {
     const expected = order.split(",");
-    await expect.poll(async () => (await fixtureTurnPrompts(page)).slice(0, expected.length))
-        .toEqual(expected);
+    await expect.poll(async () => {
+        const raw = await page.locator("body").getAttribute("data-fixture-commands");
+        if (!raw) return [];
+        return (JSON.parse(raw) as { kind: string; text: string }[])
+            .map(({ kind, text }) => `${kind}:${text}`);
+    }).toEqual(expected);
 });
 
-Then("the embedded queue eventually drains in the order {string}", async ({ page }, order: string) => {
-    const expected = order.split(",");
-    await expect.poll(() => fixtureTurnPrompts(page), { timeout: 15_000 }).toEqual(expected);
+Then("the commands join the current turn rather than starting another", async ({ page }) => {
+    await expect.poll(() => fixtureTurnPrompts(page)).toEqual(["first request"]);
+});
+
+Then("the embedded durable queue eventually drains", async ({ page }) => {
     await expect(page.getByTestId("queue-stack")).toHaveCount(0, { timeout: 15_000 });
 });
 

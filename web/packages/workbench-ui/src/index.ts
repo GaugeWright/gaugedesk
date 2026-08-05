@@ -27,6 +27,8 @@ export {
 export type {
     ComposerAttachmentCapability,
     ComposerCapabilities,
+    ComposerRuntimeCommands,
+    ComposerRuntimeQueueItem,
     ComposerTurnOptions,
     SessionComposerController,
     SessionComposerControllerOptions,

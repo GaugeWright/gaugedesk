@@ -59,6 +59,7 @@ export function SessionComposer(props: {
         capabilities: session!.composerCapabilities,
         send: (text, images, options) => session!.send(text, images, options),
         stop: session!.stop,
+        runtime: session!.composerRuntime,
     });
     const hasAttachments = () => controller.capabilities().attachments.length > 0;
     const hasQueue = () => controller.capabilities().queue;

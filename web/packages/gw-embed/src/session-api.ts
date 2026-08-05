@@ -14,6 +14,12 @@ export interface EdgeUsage {
     readonly output_tokens: number;
 }
 
+export interface EmbedQueuedTurn {
+    readonly command_id: string;
+    readonly text: string;
+    readonly position: number;
+}
+
 /** Narrow transport consumed by the shared panel Session projection. */
 export interface EmbedSessionApi {
     getTranscript(id: EngagementId): Promise<StreamEvent[]>;
@@ -51,5 +57,13 @@ export interface EmbedSessionApi {
     embedGetConfig(): Promise<{ white_label: boolean }>;
     getUsage?(): EdgeUsage | null;
     stopTurn?(): Promise<void>;
+    getTurnQueue?(): readonly EmbedQueuedTurn[];
+    subscribeTurnQueue?(listener: (queue: readonly EmbedQueuedTurn[]) => void): () => void;
+    followUpTurn?(text: string, images?: { data: string; mimeType: string }[]): Promise<void>;
+    steerTurn?(text: string, images?: { data: string; mimeType: string }[]): Promise<void>;
+    editQueuedTurn?(commandId: string, text: string): Promise<void>;
+    removeQueuedTurn?(commandId: string): Promise<void>;
+    reorderQueuedTurns?(commandIds: readonly string[]): Promise<void>;
+    promoteQueuedTurn?(commandId: string): Promise<void>;
     recordFirstTextRendered?(): void;
 }

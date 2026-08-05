@@ -66,6 +66,49 @@ describe("createSessionComposerController", () => {
         h.dispose();
     });
 
+    it("uses runtime-owned follow-up and steering commands when the Session supplies them", async () => {
+        const [busy] = createSignal(true);
+        const [queue, setQueue] = createSignal<{ id: string; text: string }[]>([]);
+        const followUp = vi.fn(async (text: string) => {
+            setQueue([{ id: "follow-1", text }]);
+        });
+        const steer = vi.fn(async () => undefined);
+        const stop = vi.fn(async () => undefined);
+        let dispose!: () => void;
+        const controller = createRoot((rootDispose) => {
+            dispose = rootDispose;
+            return createSessionComposerController({
+                scope: () => "chat-1",
+                busy,
+                capabilities: () => UNIVERSAL_COMPOSER_CAPABILITIES,
+                send: async () => undefined,
+                stop,
+                runtime: {
+                    queue,
+                    followUp,
+                    steer,
+                    edit: async () => undefined,
+                    remove: async () => undefined,
+                    reorder: async () => undefined,
+                    promote: async () => undefined,
+                },
+            });
+        });
+
+        controller.setDraft("remember this");
+        controller.submit();
+        await flush();
+        expect(followUp).toHaveBeenCalledWith("remember this", []);
+        expect(controller.queue()).toEqual([{ id: "follow-1", text: "remember this" }]);
+
+        controller.setDraft("change direction");
+        controller.steer();
+        await flush();
+        expect(steer).toHaveBeenCalledWith("change direction", []);
+        expect(stop).not.toHaveBeenCalled();
+        dispose();
+    });
+
     it("stages, edits, reorders, removes, and releases queued messages", async () => {
         const h = harness();
         h.controller.toggleGate();

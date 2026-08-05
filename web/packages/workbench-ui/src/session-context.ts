@@ -30,6 +30,7 @@ import { type Transcript } from "./transcript";
 import { type ImageRef } from "./attachments";
 import {
     type ComposerCapabilities,
+    type ComposerRuntimeCommands,
     type ComposerTurnOptions,
 } from "./session-composer-controller";
 
@@ -148,6 +149,9 @@ export interface Session {
     /** Explicit conversation commands admitted by this Environment. Audience is
      *  presentation identity, not a capability shortcut. */
     readonly composerCapabilities: Accessor<ComposerCapabilities>;
+    /** Runtime-owned interactive command queue when this Environment can join
+     * messages to a live turn. Absent environments retain local staging. */
+    readonly composerRuntime?: ComposerRuntimeCommands;
     // Scoped commands + refetch (the panel issues; the session admits/refetches).
     /** Drive the merge lifecycle for this engagement (keep / discard / …). */
     readonly merge: (action: MergeAction) => void;

@@ -1,4 +1,4 @@
-import { createComputed, createEffect, createSignal, on, type Accessor, type JSX } from "solid-js";
+import { createComputed, createEffect, createMemo, createSignal, on, type Accessor, type JSX } from "solid-js";
 import {
     buildOutgoing,
     classifyAttachment,
@@ -45,6 +45,23 @@ interface QueuedTurn extends ComposerQueueItem {
     readonly images: readonly ImageRef[];
 }
 
+export interface ComposerRuntimeQueueItem extends ComposerQueueItem {
+    readonly id: string;
+}
+
+/** Optional runtime-owned queue. Environments that supply it get durable
+ * Pi-style steer/follow-up semantics; environments without it keep the same
+ * controller with its local staged queue. */
+export interface ComposerRuntimeCommands {
+    readonly queue: Accessor<readonly ComposerRuntimeQueueItem[]>;
+    readonly followUp: (text: string, images: readonly ImageRef[]) => Promise<void>;
+    readonly steer: (text: string, images: readonly ImageRef[]) => Promise<void>;
+    readonly edit: (id: string, text: string) => Promise<void>;
+    readonly remove: (id: string) => Promise<void>;
+    readonly reorder: (ids: readonly string[]) => Promise<void>;
+    readonly promote: (id: string) => Promise<void>;
+}
+
 interface ControlledValue<T> {
     readonly value: Accessor<T>;
     readonly set: (value: T) => void;
@@ -61,6 +78,7 @@ export interface SessionComposerControllerOptions {
         options: ComposerTurnOptions,
     ) => Promise<void>;
     readonly stop?: () => Promise<void>;
+    readonly runtime?: ComposerRuntimeCommands;
     readonly draft?: ControlledValue<string>;
     /** Preserve a host-owned draft across Session selection changes. Useful when
      * navigation and immediate typing can overlap; queued/attached state still retires. */
@@ -93,9 +111,9 @@ export interface SessionComposerController {
     readonly attachFiles: (files: readonly File[]) => Promise<void>;
     readonly removeAttachment: (index: number) => void;
     readonly reorderQueue: (from: number, to: number) => void;
-    readonly editQueued: (id: number, text: string) => void;
-    readonly removeQueued: (id: number) => void;
-    readonly sendNowQueued: (id: number) => void;
+    readonly editQueued: (id: number | string, text: string) => void;
+    readonly removeQueued: (id: number | string) => void;
+    readonly sendNowQueued: (id: number | string) => void;
 }
 
 function failureMessage(error: unknown): string {
@@ -116,7 +134,11 @@ export function createSessionComposerController(
     const [internalReview, setInternalReview] = createSignal(false);
     const reviewNext = options.review?.value ?? internalReview;
     const setReviewNext = options.review?.set ?? setInternalReview;
-    const [queue, setQueue] = createSignal<QueuedTurn[]>([]);
+    const [stagedQueue, setStagedQueue] = createSignal<QueuedTurn[]>([]);
+    const queue = createMemo<readonly ComposerQueueItem[]>(() => [
+        ...(options.runtime?.queue() ?? []),
+        ...stagedQueue(),
+    ]);
     const [attachments, setAttachments] = createSignal<Attachment[]>([]);
     const [gated, setGated] = createSignal(false);
     const [dispatchingScopes, setDispatchingScopes] = createSignal<ReadonlySet<string>>(new Set());
@@ -141,7 +163,7 @@ export function createSessionComposerController(
 
     const resetScopedState = () => {
         if (!options.retainDraftOnScopeChange) setDraft("");
-        setQueue([]);
+        setStagedQueue([]);
         setGated(false);
         setReviewNext(false);
         setAttachments([]);
@@ -154,9 +176,9 @@ export function createSessionComposerController(
 
     const pump = () => {
         if (busy() || gated()) return;
-        const next = queue()[0];
+        const next = stagedQueue()[0];
         if (!next) return;
-        setQueue((current) => current.slice(1));
+        setStagedQueue((current) => current.slice(1));
         const dispatchScope = options.scope();
         markDispatching(dispatchScope, true);
         void options.send(next.text, next.images, { review: next.review })
@@ -193,21 +215,32 @@ export function createSessionComposerController(
         const outgoing = takeOutgoing();
         if (!outgoing) return;
         setError("");
-        setQueue((current) => [...current, outgoing]);
+        if (busy() && !gated() && options.runtime) {
+            void options.runtime.followUp(outgoing.text, outgoing.images)
+                .catch((cause) => report(`Could not queue: ${failureMessage(cause)}`));
+            return;
+        }
+        setStagedQueue((current) => [...current, outgoing]);
         pump();
     };
 
     const steer = () => {
-        if (!options.capabilities().steer || !options.stop) return;
+        if (!options.capabilities().steer || (!options.runtime && !options.stop)) return;
         const outgoing = takeOutgoing();
         if (!outgoing) return;
         setError("");
-        setQueue((current) => [outgoing, ...current]);
         if (!busy()) {
+            setStagedQueue((current) => [outgoing, ...current]);
             pump();
             return;
         }
-        void options.stop().catch((cause) => report(`Could not steer: ${failureMessage(cause)}`));
+        if (options.runtime) {
+            void options.runtime.steer(outgoing.text, outgoing.images)
+                .catch((cause) => report(`Could not steer: ${failureMessage(cause)}`));
+            return;
+        }
+        setStagedQueue((current) => [outgoing, ...current]);
+        void options.stop!().catch((cause) => report(`Could not steer: ${failureMessage(cause)}`));
     };
 
     const stop = () => {
@@ -264,36 +297,66 @@ export function createSessionComposerController(
     };
 
     const reorderQueue = (from: number, to: number) => {
-        setQueue((current) => {
-            if (from < 0 || to < 0 || from >= current.length || to >= current.length) return current;
+        const runtimeItems = options.runtime?.queue() ?? [];
+        if (from < runtimeItems.length && to < runtimeItems.length && options.runtime) {
+            const ids = runtimeItems.map((item) => item.id);
+            const [moved] = ids.splice(from, 1);
+            ids.splice(to, 0, moved);
+            void options.runtime.reorder(ids).catch((cause) => report(failureMessage(cause)));
+            return;
+        }
+        const localFrom = from - runtimeItems.length;
+        const localTo = to - runtimeItems.length;
+        setStagedQueue((current) => {
+            if (localFrom < 0 || localTo < 0 || localFrom >= current.length || localTo >= current.length) return current;
             const next = current.slice();
-            const [moved] = next.splice(from, 1);
-            next.splice(to, 0, moved);
+            const [moved] = next.splice(localFrom, 1);
+            next.splice(localTo, 0, moved);
             return next;
         });
     };
-    const editQueued = (id: number, text: string) => {
+    const editQueued = (id: number | string, text: string) => {
         const trimmed = text.trim();
-        setQueue((current) => current.flatMap((item) =>
+        if (typeof id === "string" && options.runtime) {
+            const operation = trimmed
+                ? options.runtime.edit(id, trimmed)
+                : options.runtime.remove(id);
+            void operation.catch((cause) => report(failureMessage(cause)));
+            return;
+        }
+        setStagedQueue((current) => current.flatMap((item) =>
             item.id !== id ? [item] : trimmed ? [{ ...item, text: trimmed }] : [],
         ));
     };
-    const removeQueued = (id: number) => setQueue((current) => current.filter((item) => item.id !== id));
-    const sendNowQueued = (id: number) => {
+    const removeQueued = (id: number | string) => {
+        if (typeof id === "string" && options.runtime) {
+            void options.runtime.remove(id).catch((cause) => report(failureMessage(cause)));
+            return;
+        }
+        setStagedQueue((current) => current.filter((item) => item.id !== id));
+    };
+    const sendNowQueued = (id: number | string) => {
         const item = queue().find((candidate) => candidate.id === id);
         if (!item) return;
+        if (typeof id === "string" && options.runtime) {
+            void options.runtime.promote(id).catch((cause) => report(failureMessage(cause)));
+            return;
+        }
         if (busy()) {
-            setQueue((current) => [item, ...current.filter((candidate) => candidate.id !== id)]);
+            setStagedQueue((current) => [
+                item as QueuedTurn,
+                ...current.filter((candidate) => candidate.id !== id),
+            ]);
             if (options.capabilities().steer && options.stop) {
                 void options.stop().catch((cause) => report(`Could not steer: ${failureMessage(cause)}`));
             }
             return;
         }
-        setQueue((current) => current.filter((candidate) => candidate.id !== id));
+        setStagedQueue((current) => current.filter((candidate) => candidate.id !== id));
         const dispatchScope = options.scope();
         markDispatching(dispatchScope, true);
         setError("");
-        void options.send(item.text, item.images, { review: item.review })
+        void options.send(item.text, (item as QueuedTurn).images, { review: item.review })
             .catch((cause) => report(failureMessage(cause)))
             .finally(() => {
                 markDispatching(dispatchScope, false);

@@ -9,7 +9,7 @@ import type {
 
 import { registerEmbedElements, type GwSessionElement } from "./elements";
 import { createRemoteSession } from "./remote-session";
-import type { EmbedSessionApi } from "./session-api";
+import type { EmbedQueuedTurn, EmbedSessionApi } from "./session-api";
 
 registerEmbedElements();
 
@@ -43,6 +43,26 @@ function fixtureApi(): EmbedSessionApi {
     const emptyMerge = { phase: "Clean" } as MergeState;
     let onEvent: ((event: StreamEvent) => void) | undefined;
     let active: { resolve: () => void; timer?: ReturnType<typeof setTimeout> } | undefined;
+    let queue: EmbedQueuedTurn[] = [];
+    const queueListeners = new Set<(items: readonly EmbedQueuedTurn[]) => void>();
+    let nextCommand = 1;
+    const publishQueue = () => {
+        for (const listener of queueListeners) listener(queue);
+    };
+    const recordCommand = (kind: "steer" | "follow_up", text: string) => {
+        const commands = JSON.parse(document.body.dataset.fixtureCommands ?? "[]") as unknown[];
+        commands.push({ kind, text });
+        document.body.dataset.fixtureCommands = JSON.stringify(commands);
+    };
+    const enqueue = (kind: "steer" | "follow_up", text: string) => {
+        const command_id = `fixture-command-${nextCommand++}`;
+        recordCommand(kind, text);
+        queue = [
+            ...queue,
+            { command_id, text, position: nextCommand * 1024 },
+        ];
+        publishQueue();
+    };
     const delayParam = params.get("delay");
     const delay = delayParam === null ? null : Number(delayParam);
     return {
@@ -63,6 +83,8 @@ function fixtureApi(): EmbedSessionApi {
                 if (delay !== null && Number.isFinite(delay) && delay >= 0) {
                     active.timer = setTimeout(() => {
                         onEvent?.({ type: "text", delta: `Completed: ${prompt}` });
+                        queue = [];
+                        publishQueue();
                         active = undefined;
                         resolve();
                     }, delay);
@@ -92,6 +114,36 @@ function fixtureApi(): EmbedSessionApi {
             active = undefined;
             document.body.dataset.fixtureStopped = "true";
             resolve();
+        },
+        getTurnQueue: () => queue,
+        subscribeTurnQueue: (listener) => {
+            queueListeners.add(listener);
+            listener(queue);
+            return () => queueListeners.delete(listener);
+        },
+        followUpTurn: async (text) => enqueue("follow_up", text),
+        steerTurn: async (text) => enqueue("steer", text),
+        editQueuedTurn: async (commandId, text) => {
+            queue = queue.map((item) => item.command_id === commandId ? { ...item, text } : item);
+            publishQueue();
+        },
+        removeQueuedTurn: async (commandId) => {
+            queue = queue.filter((item) => item.command_id !== commandId);
+            publishQueue();
+        },
+        reorderQueuedTurns: async (commandIds) => {
+            const byId = new Map(queue.map((item) => [item.command_id, item]));
+            queue = commandIds.flatMap((id, index) => {
+                const item = byId.get(id);
+                return item ? [{ ...item, position: (index + 1) * 1024 }] : [];
+            });
+            publishQueue();
+        },
+        promoteQueuedTurn: async (commandId) => {
+            const index = queue.findIndex((item) => item.command_id === commandId);
+            if (index < 0) return;
+            queue = [queue[index], ...queue.slice(0, index), ...queue.slice(index + 1)];
+            publishQueue();
         },
     };
 }

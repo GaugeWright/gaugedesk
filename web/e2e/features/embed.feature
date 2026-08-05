@@ -50,9 +50,10 @@ Feature: Embedded panels (EMBED-2)
     When I queue "second request" in the embedded chat
     Then the embedded queue shows "second request"
     When I steer the embedded chat with "urgent correction"
-    Then the embedded turn is interrupted
-    And the embedded turns begin in the order "first request,urgent correction"
-    And the embedded queue eventually drains in the order "first request,urgent correction,second request"
+    Then the embedded turn is not interrupted
+    And the embedded runtime admits commands in the order "follow_up:second request,steer:urgent correction"
+    And the commands join the current turn rather than starting another
+    And the embedded durable queue eventually drains
 
   Scenario: the embedded panels carry the workbench theme and accept --gw-* overrides
     Given the embed example page is open

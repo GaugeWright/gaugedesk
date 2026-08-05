@@ -202,6 +202,30 @@ describe("EdgeSessionApi", () => {
                 text: "hello",
             }),
         });
+        const observedQueues: string[][] = [];
+        api.subscribeTurnQueue((queue) => {
+            observedQueues.push(queue.map((item) => item.text));
+        });
+        const followUp = api.followUpTurn("and then summarize");
+        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(2));
+        const queued = JSON.parse(sockets[0]!.sent[1]!) as {
+            operation_id: string;
+            request_id: string;
+        };
+        expect(queued).toMatchObject({ type: "follow_up", text: "and then summarize" });
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "turn_queue_changed",
+                operation_id: queued.operation_id,
+                queue: [{
+                    command_id: queued.request_id,
+                    text: "and then summarize",
+                    position: 1024,
+                }],
+            }),
+        });
+        await expect(followUp).resolves.toBeUndefined();
+        expect(api.getTurnQueue()).toMatchObject([{ text: "and then summarize" }]);
         sockets[0]!.emit("message", {
             data: JSON.stringify({
                 type: "text_delta",
@@ -263,28 +287,31 @@ describe("EdgeSessionApi", () => {
             }),
         });
         const stop = api.stopTurn();
-        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(2));
-        expect(JSON.parse(sockets[0]!.sent[1]!)).toEqual({
+        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(3));
+        expect(JSON.parse(sockets[0]!.sent[2]!)).toEqual({
             type: "stop",
             request_id: sent.request_id,
             after: 6,
         });
         sockets[0]!.emit("message", {
             data: JSON.stringify({
-                type: "turn_stopped",
+                type: "turn_stop_requested",
                 sequence: 7,
                 request_id: sent.request_id,
                 command_id: `public:sess_0123456789abcdef0123456789abcdef:${sent.request_id}`,
             }),
         });
         await expect(stop).resolves.toBeUndefined();
-        await expect(turn).resolves.toEqual({ outcome: "interrupted" });
+        let turnSettled = false;
+        void turn.finally(() => { turnSettled = true; });
+        await Promise.resolve();
+        expect(turnSettled).toBe(false);
         sockets[0]!.emit("message", {
             data: JSON.stringify({
                 type: "text_delta",
                 sequence: 8,
                 request_id: sent.request_id,
-                delta: "must be ignored",
+                delta: " after stop request",
             }),
         });
         sockets[0]!.emit("message", {
@@ -293,9 +320,11 @@ describe("EdgeSessionApi", () => {
                 sequence: 9,
                 request_id: sent.request_id,
                 status: 200,
-                body: { outcome: "completed" },
+                body: { outcome: "interrupted" },
             }),
         });
+        await expect(turn).resolves.toEqual({ outcome: "interrupted" });
+        expect(observedQueues).toEqual([[], ["and then summarize"]]);
         expect(deltas).toEqual([
             { type: "text", delta: "hi" },
             {
@@ -312,10 +341,12 @@ describe("EdgeSessionApi", () => {
                 ok: true,
                 result: "contents",
             },
+            { type: "text", delta: " after stop request" },
         ]);
         expect(await api.getTranscript("ignored" as EngagementId)).toEqual([
             { type: "assistant", text: "ready" },
             { type: "user", text: "hello" },
+            { type: "assistant", text: "hi after stop request" },
         ]);
         expect(await api.getTree("ignored" as EngagementId)).toEqual([
             { path: "answer.md", isDir: false },
