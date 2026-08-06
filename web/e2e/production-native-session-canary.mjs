@@ -47,7 +47,7 @@ export async function runNativeAccountSession(
     const browser = await chromium.launch({ headless: true });
 
     const issueHandoff = async (challenge) => {
-        const context = await browser.newContext({ storageState });
+        const context = await browser.newContext({ storageState, locale: "en-US" });
         try {
             const page = await context.newPage();
             const login = new URL(`${apiOrigin}/auth/login`);

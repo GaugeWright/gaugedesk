@@ -186,6 +186,28 @@ async function awaitRecognisableScreen(page) {
     return { accounts: await accountTiles(page), consent };
 }
 
+// A provider screen with exactly two plain buttons and nothing to type is a
+// binary confirmation ("was this you?" and kin); Google places the affirmative
+// as the trailing control. Language-independent, so a localized interstitial
+// cannot stall the walk. Any other shape still fails closed with the
+// sanitized inventory.
+async function binaryConfirmationControl(page) {
+    let shape = null;
+    try {
+        shape = await page.evaluate(() => {
+            const buttons = [...document.querySelectorAll("button")];
+            const inputs = document.querySelectorAll(
+                "input[type=password], input[type=email], input[type=text], input[type=tel]",
+            );
+            return { buttons: buttons.length, inputs: inputs.length };
+        });
+    } catch {
+        return null;
+    }
+    if (!shape || shape.buttons !== 2 || shape.inputs !== 0) return null;
+    return page.locator("button").nth(1);
+}
+
 export async function advanceProviderStates(page, admitted, isSettled) {
     for (let step = 0; step < MAX_PROVIDER_STEPS; step += 1) {
         if (isSettled()) return;
@@ -220,6 +242,13 @@ export async function advanceProviderStates(page, admitted, isSettled) {
             const control = consent.first();
             await control.click();
             await settleAfter(page, control);
+            continue;
+        }
+
+        const confirmation = await binaryConfirmationControl(page);
+        if (confirmation) {
+            await confirmation.click();
+            await settleAfter(page, confirmation);
             continue;
         }
 
@@ -281,7 +310,7 @@ export async function runHostedAccountSession(
     const browser = await chromium.launch({ headless: true });
     let context;
     try {
-        context = await browser.newContext({ storageState });
+        context = await browser.newContext({ storageState, locale: "en-US" });
         const page = await context.newPage();
         const observed = new Map();
         page.on("response", (response) => {

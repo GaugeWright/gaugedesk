@@ -179,12 +179,23 @@ function providerHarness({
                 if (!current) return selector === "[data-home-sign-in]" ? 1 : 0;
                 if (selector === "[data-identifier]") return current.identifiers ?? 0;
                 if (selector.includes("submit_approve_access")) return current.consent ? 1 : 0;
+                if (selector === "button") return current.plainButtons ?? 0;
                 return 0;
             };
             const control = {
                 async waitFor() {},
                 async count() { return count(); },
                 first() { return control; },
+                nth(index) {
+                    const positioned = {
+                        ...control,
+                        async click() {
+                            clicked.push(`${selector}:nth(${index})`);
+                            advance();
+                        },
+                    };
+                    return positioned;
+                },
                 or(other) { return combineControls(control, other); },
                 async click() {
                     if (selector === "[data-home-sign-in]") {
@@ -214,15 +225,21 @@ function providerHarness({
             };
             return control;
         },
-        async evaluate(_callback, { target }) {
-            const path = new URL(target).pathname;
-            if (path === "/auth/refresh") return { status: authenticated ? 200 : 401, body: null };
-            if (path === "/auth/session") {
-                return authenticated
-                    ? { status: 200, body: { method: sessionMethod } }
-                    : { status: 401, body: null };
+        async evaluate(_callback, argument) {
+            if (argument && typeof argument === "object" && "target" in argument) {
+                const path = new URL(argument.target).pathname;
+                if (path === "/auth/refresh") return { status: authenticated ? 200 : 401, body: null };
+                if (path === "/auth/session") {
+                    return authenticated
+                        ? { status: 200, body: { method: sessionMethod } }
+                        : { status: 401, body: null };
+                }
+                throw new Error(`unexpected browser request ${path}`);
             }
-            throw new Error(`unexpected browser request ${path}`);
+            if (Array.isArray(argument)) return []; // sanitized inventory
+            // The binary-confirmation shape probe.
+            const current = screen();
+            return { buttons: current?.plainButtons ?? 0, inputs: current?.textInputs ?? 0 };
         },
     };
     // Sign-out is not the subject here; short-circuit it so each case isolates
@@ -316,6 +333,27 @@ test("a risk interstitial whose confirm is a role-button is advanced to the call
         harness.clicked,
         ["[data-identifier]", "role:button:" + String(CONSENT_ROLE_NAME)],
         "the walk must advance the chooser and then the role-button interstitial",
+    );
+});
+
+test("a localized two-button confirmation advances via the trailing control", async () => {
+    // A datacenter-lane interstitial in another language matches no selector
+    // and no accessible name; its shape — two plain buttons, nothing to type —
+    // still identifies it, and the affirmative is the trailing control.
+    const harness = providerHarness({
+        apiOrigin: API,
+        frontendOrigin: FRONTEND,
+        screens: [
+            { url: `${PROVIDER}/v3/signin/accountchooser`, identifiers: 1 },
+            { url: `${PROVIDER}/v3/signin/challenge/ipp/consent`, plainButtons: 2 },
+        ],
+    });
+    const result = await runHostedAccountSession(environmentFor(), harness.browserType);
+    assert.equal(result.callbackStatus, 302);
+    assert.equal(
+        harness.clicked[harness.clicked.length - 1],
+        "button:nth(1)",
+        "the affirmative is the trailing plain button",
     );
 });
 
