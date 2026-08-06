@@ -68,7 +68,7 @@ const CONSENT_CONTROLS = [
 // datacenter egress) render their confirm control as a `role="button"` element
 // rather than a `<button>`; the role engine matches both, by accessible name.
 export const CONSENT_ROLE_NAME =
-    /^(continue|allow|confirm|next|i agree|i understand|yes|yes,? it'?s me|it'?s me|that was me)$/i;
+    /^(continue|allow|confirm|next|i agree|i understand|yes|yes,? it[\u2019']?s me|it[\u2019']?s me|that was me)$/i;
 
 function consentControls(page) {
     return page
@@ -95,8 +95,13 @@ async function sanitizedControlInventory(page) {
             ];
             const publicLabels = publicLabelsArg;
             return controls.slice(0, 20).map((control) => {
-                const text = (control.textContent ?? "").trim().toLowerCase();
-                const label = publicLabels.includes(text) ? text : text ? "other" : "";
+                const text = (control.textContent ?? "")
+                    .replace(/[\u2018\u2019]/g, "'")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .toLowerCase();
+                const label = (publicLabels.includes(text) ? text : text ? "other" : "")
+                    + ":" + String(text.length);
                 return [
                     control.tagName.toLowerCase(),
                     control.getAttribute("role") ?? "",
