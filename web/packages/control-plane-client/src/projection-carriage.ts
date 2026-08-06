@@ -3,7 +3,7 @@
  * to the mobile (and desktop) client (ADR 0037, spec 015; MOB-007).
  *
  * The core decision: projection uncertainty must be **explicit** (mirrors
- * `gaugewright_core::freshness`). A projection never travels bare — it carries a
+ * `gaugedesk_core::freshness`). A projection never travels bare — it carries a
  * `Freshness` marker and the basis (`generatedAt`) the marker was decided
  * against, so the client can never silently render stale state as current. It
  * also carries the optimistic-reconcile correlation id (`clientRequestId`,
@@ -30,7 +30,7 @@ export function clientRequestId(raw: string): ClientRequestId {
     return raw as ClientRequestId;
 }
 
-// ----- Freshness (mirrors `gaugewright_core::freshness`, snake_case wire tags) -------
+// ----- Freshness (mirrors `gaugedesk_core::freshness`, snake_case wire tags) -------
 
 /** How current a projection is, relative to the requested scope's admitted
  *  basis. A consumer must never render anything but `live` as current — every

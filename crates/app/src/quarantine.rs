@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_store::{AdmitError, Store};
 use serde::{Deserialize, Serialize};
 
 /// The record kind under which quarantine dispositions are stored.

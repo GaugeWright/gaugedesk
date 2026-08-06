@@ -8,9 +8,9 @@
 //! self-hosted Keycloak (no external dependency, no creds) — closing the "needs a live OP"
 //! half of `ID-3` locally.
 
-use gaugewright_app::identity::IdentityProvider;
-use gaugewright_app::net_http::HttpClient;
-use gaugewright_ee::identity_oidc::{discover_jwks, ClaimMapping, OidcIdentityProvider};
+use gaugedesk_app::identity::IdentityProvider;
+use gaugedesk_app::net_http::HttpClient;
+use gaugedesk_ee::identity_oidc::{discover_jwks, ClaimMapping, OidcIdentityProvider};
 
 fn env_or_skip(key: &str) -> Option<String> {
     match std::env::var(key) {

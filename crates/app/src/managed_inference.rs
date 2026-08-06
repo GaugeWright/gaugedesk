@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use gaugewright_harness::ModelUsage;
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_harness::ModelUsage;
+use gaugedesk_store::{AdmitError, Store};
 use serde::{Deserialize, Serialize};
 
 use crate::library::RecordOp;

@@ -29,7 +29,7 @@
 //! egress. Declaring hosts via [`SandboxPolicy::allow_hosts`] alone still records
 //! *intent* only. Unfiltered egress remains a conscious operator opt-in via
 //! [`SandboxPolicy::allow_unfiltered_egress`] (env
-//! `GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1`), mirroring `GAUGEWRIGHT_SANDBOX=0`.
+//! `GAUGEDESK_ALLOW_UNFILTERED_EGRESS=1`), mirroring `GAUGEDESK_SANDBOX=0`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -128,8 +128,8 @@ impl SandboxPolicy {
     /// proxy yet, the kernel cannot filter to [`Self::allowed_hosts`], so allowing
     /// egress means the process can reach *any* host — a real exfiltration surface
     /// for a compromised or prompt-injected agent. This is therefore the conscious
-    /// operator opt-in (env `GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1`), mirroring the
-    /// `GAUGEWRIGHT_SANDBOX=0` seam: only when `acknowledged` does the posture flip to
+    /// operator opt-in (env `GAUGEDESK_ALLOW_UNFILTERED_EGRESS=1`), mirroring the
+    /// `GAUGEDESK_SANDBOX=0` seam: only when `acknowledged` does the posture flip to
     /// `Allow` (kernel network not isolated). Without it the process stays
     /// network-isolated, so a declared-but-unacknowledged egress need fails closed.
     pub fn allow_unfiltered_egress(mut self, acknowledged: bool) -> Self {
@@ -524,7 +524,7 @@ impl Sandbox for WindowsSandbox {
 }
 
 /// No sandbox — runs the process unwrapped. The honest fallback when no backend
-/// is available or `GAUGEWRIGHT_SANDBOX=0`; the caller logs that the run is unsandboxed.
+/// is available or `GAUGEDESK_SANDBOX=0`; the caller logs that the run is unsandboxed.
 pub struct NoSandbox;
 
 impl Sandbox for NoSandbox {
@@ -542,9 +542,9 @@ impl Sandbox for NoSandbox {
     }
 }
 
-/// Pick the backend for this host. `GAUGEWRIGHT_SANDBOX=0` forces [`NoSandbox`].
+/// Pick the backend for this host. `GAUGEDESK_SANDBOX=0` forces [`NoSandbox`].
 pub fn detect() -> Box<dyn Sandbox> {
-    if std::env::var("GAUGEWRIGHT_SANDBOX").as_deref() == Ok("0") {
+    if gaugedesk_env::var("SANDBOX").as_deref() == Some("0") {
         return Box::new(NoSandbox);
     }
     #[cfg(target_os = "linux")]
@@ -600,7 +600,7 @@ pub fn wrap_or_refuse(
                 eprintln!(
                     "gaugewright: filtered egress requested but not enforceable here \
                      (needs bubblewrap + slirp4netns/pasta{}); failing CLOSED to \
-                     network-isolated. Set GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1 to \
+                     network-isolated. Set GAUGEDESK_ALLOW_UNFILTERED_EGRESS=1 to \
                      consciously allow UNFILTERED egress instead.",
                     if FILTERED_ROUTING_VERIFIED {
                         ""
@@ -614,7 +614,7 @@ pub fn wrap_or_refuse(
             Ok(c)
         }
         None => {
-            let explicit_optout = std::env::var("GAUGEWRIGHT_SANDBOX").as_deref() == Ok("0");
+            let explicit_optout = gaugedesk_env::var("SANDBOX").as_deref() == Some("0");
             if !allow_unsandboxed(policy, explicit_optout) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -622,7 +622,7 @@ pub fn wrap_or_refuse(
                         "sandbox backend '{}' cannot wrap here, and the policy \
                          protects a method-definition surface (INV-24): refusing \
                          to run unsandboxed. Install a backend (bwrap on Linux) \
-                         or set GAUGEWRIGHT_SANDBOX=0 to explicitly accept an \
+                         or set GAUGEDESK_SANDBOX=0 to explicitly accept an \
                          unenforced run.",
                         backend.name()
                     ),
@@ -633,7 +633,7 @@ pub fn wrap_or_refuse(
                  ({}; install a backend to enforce)",
                 backend.name(),
                 if explicit_optout {
-                    "GAUGEWRIGHT_SANDBOX=0"
+                    "GAUGEDESK_SANDBOX=0"
                 } else {
                     "no protected definition surface in this policy"
                 }
@@ -647,7 +647,7 @@ pub fn wrap_or_refuse(
 
 /// Wrap a short-lived governed command in the host OS sandbox, refusing every
 /// unwrapped fallback. Unlike [`wrap_or_refuse`], an empty protected surface or
-/// `GAUGEWRIGHT_SANDBOX=0` is not authority to execute outside containment:
+/// `GAUGEDESK_SANDBOX=0` is not authority to execute outside containment:
 /// WhippleScript has admitted the command language, while GaugeDesk remains
 /// responsible for realizing its product workspace and network boundary.
 pub fn wrap_strict(
@@ -698,7 +698,7 @@ fn wrap_strict_with(
 /// the policy re-imposes a read-only definition surface — that is the use-mode
 /// case where the OS sandbox is the load-bearing INV-24 enforcement, so running
 /// without it would let the agent rewrite its own method. An explicit
-/// `GAUGEWRIGHT_SANDBOX=0` opt-out is the one override: the operator has consciously
+/// `GAUGEDESK_SANDBOX=0` opt-out is the one override: the operator has consciously
 /// accepted an unenforced run (dev/test), which is a decision, not a downgrade.
 fn allow_unsandboxed(policy: &SandboxPolicy, explicit_optout: bool) -> bool {
     policy.read_only_roots.is_empty() || explicit_optout
@@ -971,7 +971,7 @@ mod tests {
 
     /// RF-B1: when no backend can wrap, a policy that re-imposes a read-only
     /// definition surface (use mode — INV-24 load-bearing) must refuse to run
-    /// unsandboxed; only an explicit `GAUGEWRIGHT_SANDBOX=0` opt-out or a policy with
+    /// unsandboxed; only an explicit `GAUGEDESK_SANDBOX=0` opt-out or a policy with
     /// no protected surface (edit mode) may warn-and-run.
     #[test]
     fn unsandboxed_run_fails_closed_when_definition_surface_is_protected() {
@@ -983,7 +983,7 @@ mod tests {
         );
         assert!(
             allow_unsandboxed(&protected, true),
-            "GAUGEWRIGHT_SANDBOX=0 is a conscious operator decision"
+            "GAUGEDESK_SANDBOX=0 is a conscious operator decision"
         );
         assert!(
             allow_unsandboxed(&unprotected, false),
@@ -1024,12 +1024,12 @@ mod tests {
     #[test]
     fn detect_respects_the_disable_override() {
         // Save/restore the env so the test is hermetic.
-        let prev = std::env::var("GAUGEWRIGHT_SANDBOX").ok();
-        std::env::set_var("GAUGEWRIGHT_SANDBOX", "0");
+        let prev = gaugedesk_env::var("SANDBOX");
+        std::env::set_var("GAUGEDESK_SANDBOX", "0");
         assert_eq!(detect().name(), "none");
         match prev {
-            Some(v) => std::env::set_var("GAUGEWRIGHT_SANDBOX", v),
-            None => std::env::remove_var("GAUGEWRIGHT_SANDBOX"),
+            Some(v) => std::env::set_var("GAUGEDESK_SANDBOX", v),
+            None => std::env::remove_var("GAUGEDESK_SANDBOX"),
         }
     }
 }

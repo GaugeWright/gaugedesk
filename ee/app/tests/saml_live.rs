@@ -15,13 +15,13 @@
 //!   export SAML_IDP_CERT="$(…the IdP signing cert, PEM…)"
 //!   export SAML_AUDIENCE=<the SP entity id the assertion is scoped to>
 //!   export SAML_ROLES_ATTR=roles        # optional: the attribute carrying roles
-//!   cargo test -p gaugewright-app --test saml_live -- --ignored --nocapture
+//!   cargo test -p gaugedesk-app --test saml_live -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;
 
-use gaugewright_app::identity::IdentityProvider;
-use gaugewright_ee::identity_saml::{SamlClaimMapping, SamlSidecarIdentityProvider};
+use gaugedesk_app::identity::IdentityProvider;
+use gaugedesk_ee::identity_saml::{SamlClaimMapping, SamlSidecarIdentityProvider};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")

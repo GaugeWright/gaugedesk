@@ -16,15 +16,15 @@
 //!   export OIDC_JWKS="$(curl -s "$OIDC_ISSUER/v1/keys")"
 //!   export OIDC_TOKEN=<a real id-token from that tenant>
 //!   export OIDC_ROLES_CLAIM=roles        # optional: the custom claim carrying roles
-//!   cargo test -p gaugewright-app --test oidc_live -- --ignored --nocapture
+//!   cargo test -p gaugedesk-app --test oidc_live -- --ignored --nocapture
 //! ```
 //! Entra ID: issuer `https://login.microsoftonline.com/<tenant-id>/v2.0`, JWKS from
 //! its `/.well-known/openid-configuration` → `jwks_uri`, roles claim `roles` or
 //! `groups`. Google Workspace: issuer `https://accounts.google.com`, JWKS
 //! `https://www.googleapis.com/oauth2/v3/certs`.
 
-use gaugewright_app::identity::IdentityProvider;
-use gaugewright_ee::identity_oidc::{ClaimMapping, OidcIdentityProvider};
+use gaugedesk_app::identity::IdentityProvider;
+use gaugedesk_ee::identity_oidc::{ClaimMapping, OidcIdentityProvider};
 
 /// Read an env var, or skip the test (return `None`) with a one-line reason when the
 /// harness is run without a live tenant configured.

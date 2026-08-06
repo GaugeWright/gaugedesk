@@ -8,7 +8,7 @@
  *
  * The vocabulary is the one the rest of the mobile client already speaks — the
  * payload-access {@link AccessPhase} (`mobile-files.ts`, mirroring
- * `gaugewright_core::resource_access::AccessPhase`). A request walks the same arc the
+ * `gaugedesk_core::resource_access::AccessPhase`). A request walks the same arc the
  * core reducer walks server-side: `init` (no ask) → the user submits → `requested`
  * (awaiting the owner's approval) → the owner answers → `granted` (the body is now
  * admitted), `denied` (terminal refusal), or — if a prior grant was withdrawn —

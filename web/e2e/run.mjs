@@ -66,11 +66,11 @@ const env = {
 };
 if (process.env.GW_E2E_LIVE) {
     // The live lane exercises the selected WhippleScript runtime and a real model.
-    delete env.GAUGEWRIGHT_FAKE_AGENT;
+    delete env.GAUGEDESK_FAKE_AGENT;
 } else {
-    env.GAUGEWRIGHT_FAKE_AGENT = process.env.GAUGEWRIGHT_FAKE_AGENT ?? "1";
-    env.GAUGEWRIGHT_FAKE_MANAGEMENT_AGENT =
-        process.env.GAUGEWRIGHT_FAKE_MANAGEMENT_AGENT ?? "1";
+    env.GAUGEDESK_FAKE_AGENT = process.env.GAUGEDESK_FAKE_AGENT ?? "1";
+    env.GAUGEDESK_FAKE_MANAGEMENT_AGENT =
+        process.env.GAUGEDESK_FAKE_MANAGEMENT_AGENT ?? "1";
 }
 
 // The enterprise lane (`GW_E2E_COMPOSITION=enterprise`, `npm run e2e:enterprise`)
@@ -110,19 +110,19 @@ const installs = [eeWeb]
 
 const steps = [
     ...installs,
-    // The open harness scripts exec target/debug/gaugewright-app directly.
+    // The open harness scripts exec target/debug/gaugedesk-app directly.
     // Build that exact binary first: building the enterprise server can refresh
     // the app library dependency without refreshing the standalone executable,
     // which otherwise lets browser acceptance exercise a stale route surface.
     [
         "cargo",
-        ["build", "-p", "gaugewright-app", "--bin", "gaugewright-app"],
+        ["build", "-p", "gaugedesk-app", "--bin", "gaugedesk-app"],
         { cwd: repoRoot },
     ],
     // The enterprise webServer likewise launches this exact debug binary.
     [
         "cargo",
-        ["build", "-p", "gaugewright-ee", "--bin", "gaugewright-enterprise-server"],
+        ["build", "-p", "gaugedesk-ee", "--bin", "gaugedesk-enterprise-server"],
         { cwd: repoRoot },
     ],
     [
@@ -130,7 +130,7 @@ const steps = [
         [
             "build",
             "-p",
-            "gaugewright-relay-transport",
+            "gaugedesk-relay-transport",
             "--features",
             "test-relay",
             "--example",
@@ -141,7 +141,7 @@ const steps = [
     // The stand-in Hub for the desktop account handoff (LOGIN-5).
     [
         "cargo",
-        ["build", "-p", "gaugewright-app", "--example", "test-account-hub"],
+        ["build", "-p", "gaugedesk-app", "--example", "test-account-hub"],
         { cwd: repoRoot },
     ],
     ["npx", ["vite", "build"]],

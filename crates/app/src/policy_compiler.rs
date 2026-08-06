@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use gaugewright_core::abac::{
+use gaugedesk_core::abac::{
     permitted_with_policy, Action, AuthorityAttributes, Classification, Context, Decision, Policy,
 };
-use gaugewright_core::resource::ResourceRecord;
-use gaugewright_whip_runtime::{
+use gaugedesk_core::resource::ResourceRecord;
+use gaugedesk_whip_runtime::{
     sign_policy_envelope, HostGovernancePolicy, ProviderBindingPolicy, ResourcePolicy,
     WhipplePlacementPolicy,
 };
@@ -84,7 +84,7 @@ impl Workbench {
                     return Err("WhippleScript policy epoch overflowed".to_owned());
                 }
                 let signing_key =
-                    gaugewright_core::signature::SigningKey::from_seed(&self.governance_seed())
+                    gaugedesk_core::signature::SigningKey::from_seed(&self.governance_seed())
                         .map_err(|error| error.reason)?;
                 let signed_envelope =
                     sign_policy_envelope(&unsigned_policy, self.authority(), &signing_key)?;
@@ -416,9 +416,9 @@ fn require_nonempty(what: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gaugewright_core::boundary::Authority;
-    use gaugewright_core::resource::{ContentLocator, Resource, ResourceId, ResourceKind};
-    use gaugewright_store::Store;
+    use gaugedesk_core::boundary::Authority;
+    use gaugedesk_core::resource::{ContentLocator, Resource, ResourceId, ResourceKind};
+    use gaugedesk_store::Store;
 
     fn input() -> PolicyCompilationInput {
         PolicyCompilationInput {
@@ -426,7 +426,7 @@ mod tests {
             project_id: Some("project-1".to_owned()),
             actor: "operator-1".to_owned(),
             actor_attributes: AuthorityAttributes {
-                clearance: gaugewright_core::abac::Clearance(3),
+                clearance: gaugedesk_core::abac::Clearance(3),
                 ..AuthorityAttributes::default()
             },
             org_policy: Policy::default(),
@@ -540,8 +540,8 @@ mod tests {
             },
             |_| Authority::from("client"),
         )
-        .with_attributes(gaugewright_core::abac::ResourceAttributes {
-            purpose: BTreeSet::from([gaugewright_core::abac::Purpose::new("support")]),
+        .with_attributes(gaugedesk_core::abac::ResourceAttributes {
+            purpose: BTreeSet::from([gaugedesk_core::abac::Purpose::new("support")]),
             ..Default::default()
         });
         let mut input = input();

@@ -16,11 +16,11 @@ import {
 const repositoryRoot = resolve(import.meta.dirname, "../..");
 const serverBinary = resolve(
     repositoryRoot,
-    "target/debug/gaugewright-enterprise-server",
+    "target/debug/gaugedesk-enterprise-server",
 );
 const apiOrigin = "http://localhost:1421";
 const issuer = process.env.OIDC_ISSUER;
-const clientId = process.env.OIDC_CLIENT_ID ?? "gaugewright-app";
+const clientId = process.env.OIDC_CLIENT_ID ?? "gaugedesk-app";
 const username = process.env.OIDC_USERNAME ?? "testuser";
 const password = process.env.OIDC_PASSWORD ?? "Passw0rd!";
 if (!issuer) throw new Error("OIDC_ISSUER is required");
@@ -273,16 +273,16 @@ const enterprise = spawn(serverBinary, [], {
     cwd: stateRoot,
     env: {
         ...process.env,
-        GAUGEWRIGHT_ADDR: "127.0.0.1:1421",
-        GAUGEWRIGHT_ROOT: stateRoot,
-        GAUGEWRIGHT_TEST_RESET: "1",
-        GAUGEWRIGHT_WEB_ACCOUNT: "1",
-        GAUGEWRIGHT_GOOGLE_CLIENT_ID: clientId,
-        GAUGEWRIGHT_OIDC_ISSUER: issuer,
-        GAUGEWRIGHT_OIDC_REDIRECT_URI: `${apiOrigin}/auth/callback`,
-        GAUGEWRIGHT_OIDC_POST_LOGIN_URL: `${staticOrigin}/`,
-        GAUGEWRIGHT_SESSION_COOKIE_INSECURE: "1",
-        GAUGEWRIGHT_ALLOWED_ORIGINS: staticOrigin,
+        GAUGEDESK_ADDR: "127.0.0.1:1421",
+        GAUGEDESK_ROOT: stateRoot,
+        GAUGEDESK_TEST_RESET: "1",
+        GAUGEDESK_WEB_ACCOUNT: "1",
+        GAUGEDESK_GOOGLE_CLIENT_ID: clientId,
+        GAUGEDESK_OIDC_ISSUER: issuer,
+        GAUGEDESK_OIDC_REDIRECT_URI: `${apiOrigin}/auth/callback`,
+        GAUGEDESK_OIDC_POST_LOGIN_URL: `${staticOrigin}/`,
+        GAUGEDESK_SESSION_COOKIE_INSECURE: "1",
+        GAUGEDESK_ALLOWED_ORIGINS: staticOrigin,
     },
     stdio: ["ignore", "pipe", "pipe"],
 });

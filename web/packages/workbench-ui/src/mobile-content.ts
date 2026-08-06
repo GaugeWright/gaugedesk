@@ -4,7 +4,7 @@
  * to paint the *payload* of the handle picked in the Files pane (MOB-015). The
  * cardinal rule the Files pane already encodes carries straight through here:
  * **holding a handle is not holding the payload** (`INV-10`, mirrors
- * `gaugewright_core::resource_access`). The Files pane lists every file by name; this
+ * `gaugedesk_core::resource_access`). The Files pane lists every file by name; this
  * pane renders the *body* — and so it must make every reason a body is *not*
  * shown an **explicit, surfaced state**, never a silent blank.
  *

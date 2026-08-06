@@ -10,7 +10,7 @@ import { aliceCP, ports } from "./e2e/ports.mjs";
 // loopback (default :7878) — the dev/preview server proxies stream calls to it.
 // Under the fabric the control plane's port is chosen by the orchestrator, so
 // the proxy target follows it rather than the harness's fixed default.
-const controlPlane = process.env.GAUGEWRIGHT_DEV_CONTROL_PLANE_TARGET ?? aliceCP;
+const controlPlane = process.env.GAUGEDESK_DEV_CONTROL_PLANE_TARGET ?? aliceCP;
 const proxy = {
     "/scopes": controlPlane,
     "/engagements": controlPlane,
@@ -20,8 +20,8 @@ const proxy = {
 // one router and serves this client at the `desk` origin. Under it this server
 // binds loopback HTTP and answers to that name; run directly, it keeps the
 // canonical loopback origins the control plane's CORS allowlist blesses.
-const underFabric = process.env.GAUGEWRIGHT_DEV_FABRIC === "1";
-const fabricPort = Number(process.env.GAUGEWRIGHT_DEV_PORT ?? "7443");
+const underFabric = process.env.GAUGEDESK_DEV_FABRIC === "1";
+const fabricPort = Number(process.env.GAUGEDESK_DEV_PORT ?? "7443");
 const fabricServer = underFabric
     ? {
         host: "127.0.0.1",

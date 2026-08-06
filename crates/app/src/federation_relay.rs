@@ -1,6 +1,6 @@
 //! Loopback federation relay (FED-2): carries a federated message between two
 //! in-process admission shells (the M2 two-authority collapse), driving the
-//! verified [`gaugewright_core::federated_delivery`] reducer (FD-1).
+//! verified [`gaugedesk_core::federated_delivery`] reducer (FD-1).
 //!
 //! The relay is **transport only**: it queues and delivers, but the fact appears in
 //! the **target** scope only when the *target authority* admits it — the relay writes
@@ -8,11 +8,11 @@
 //! the handle + correlation cross; never the payload (`INV-10`). Real cross-machine
 //! transport (sockets, auth) is the `D-REMOTE` follow-on; the mechanism is here.
 
-use gaugewright_core::federated_delivery::{
+use gaugedesk_core::federated_delivery::{
     DeliveryCommand, DeliveryEnvelope, DeliveryPhase, DeliveryState,
 };
-use gaugewright_core::ids::{AuthorityId, BridgeGrantId, Nonce, PublicKey};
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::ids::{AuthorityId, BridgeGrantId, Nonce, PublicKey};
+use gaugedesk_store::{AdmitError, Store};
 
 use crate::key_store::{KeyStore, LoopbackKeyStore};
 
@@ -145,7 +145,7 @@ pub fn admitted(store: &Store, target_scope: &str) -> Result<Vec<serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gaugewright_core::federated_delivery::Authority;
+    use gaugedesk_core::federated_delivery::Authority;
 
     #[test]
     fn a_message_crosses_to_the_target_scope_via_admission_only() {
@@ -227,12 +227,12 @@ mod tests {
     // relay rides — a forged signature, a mismatched bridge grant, and a
     // replayed nonce each deny target admission (`INV-21`), and an admitted
     // crossing leaves the relay with no payload basis (`INV-13`/`INV-14`).
-    use gaugewright_core::federated_delivery::{
+    use gaugedesk_core::federated_delivery::{
         DeliveryCommand, DeliveryEnvelope, DeliveryPhase, DeliveryState,
     };
-    use gaugewright_core::ids::PublicKey;
-    use gaugewright_core::signature::Signature;
-    use gaugewright_store::AdmitError;
+    use gaugedesk_core::ids::PublicKey;
+    use gaugedesk_core::signature::Signature;
+    use gaugedesk_store::AdmitError;
 
     /// Drive one crossing through the same source → relay → target sequence
     /// [`deliver`] uses, but with a caller-chosen `envelope` so the integration

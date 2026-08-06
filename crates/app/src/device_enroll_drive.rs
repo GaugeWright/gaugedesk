@@ -37,9 +37,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
-use gaugewright_core::ids::PublicKey;
-use gaugewright_core::signature::SigningKey;
-use gaugewright_relay_transport::{connect_one_shot, OneShotLeg};
+use gaugedesk_core::ids::PublicKey;
+use gaugedesk_core::signature::SigningKey;
+use gaugedesk_relay_transport::{connect_one_shot, OneShotLeg};
 
 use crate::account::{self, DeviceRecord, DeviceStatus, RecordOp};
 use crate::at_rest::Encryptor;
@@ -61,8 +61,8 @@ const DELEGATION_TTL_SECS: u64 = 400 * 24 * 60 * 60;
 /// The default broker the holder dials / advertises in its ticket when none is
 /// configured — the same env seam federation reads ([`crate::federation`]).
 fn default_broker_addr() -> String {
-    std::env::var("GAUGEWRIGHT_RELAY_ENDPOINT")
-        .unwrap_or_else(|_| "wss://relay.gaugewright.com".to_string())
+    gaugedesk_env::var("RELAY_ENDPOINT")
+        .unwrap_or_else(|| "wss://relay.gaugewright.com".to_string())
 }
 
 fn now_secs() -> u64 {
@@ -84,7 +84,7 @@ pub struct EnrollmentTicket {
 }
 
 /// The runtime phase of one enrollment leg (distinct from the pure reducer's
-/// [`gaugewright_core::device_enrollment::EnrollmentPhase`], which is the proven
+/// [`gaugedesk_core::device_enrollment::EnrollmentPhase`], which is the proven
 /// state machine; this is the drive-layer projection the status routes poll).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -578,9 +578,9 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use gaugewright_core::ids::AuthorityId;
-    use gaugewright_store::Store;
-    use gaugewright_workspace::Instance;
+    use gaugedesk_core::ids::AuthorityId;
+    use gaugedesk_store::Store;
+    use gaugedesk_workspace::Instance;
 
     use super::{EnrollmentTicket, *};
     use crate::{account, open_control_plane, LockUnpoisoned, SharedWorkbench, Workbench};
@@ -661,11 +661,11 @@ mod tests {
     /// `net_relay::the_enrollment_handshake_runs_over_the_real_broker`, one layer up.
     #[tokio::test]
     async fn enrollment_over_http_transfers_the_account_key_and_records_the_device() {
-        let live_endpoint = std::env::var("GAUGEWRIGHT_LIVE_RELAY_ENDPOINT").ok();
+        let live_endpoint = gaugedesk_env::var("LIVE_RELAY_ENDPOINT");
         let (broker_addr, relay) = if let Some(endpoint) = live_endpoint {
             (endpoint, None)
         } else {
-            let relay = gaugewright_relay_transport::test_relay::TestRelay::bind()
+            let relay = gaugedesk_relay_transport::test_relay::TestRelay::bind()
                 .await
                 .unwrap();
             (relay.endpoint().to_owned(), Some(relay))
@@ -775,14 +775,14 @@ mod tests {
     async fn a_substituted_subkey_is_caught_by_the_sas_and_refused() {
         use crate::device_enroll::EnrollRequest;
         use crate::net_relay::{read_frame, token_bytes, write_frame};
-        use gaugewright_relay_transport::{connect_one_shot, OneShotLeg};
+        use gaugedesk_relay_transport::{connect_one_shot, OneShotLeg};
 
         // Two brokers: the victim device dials A (a malicious ticket), the honest holder
         // dials B; the attacker bridges A→B, substituting the subkey in flight.
-        let broker_a = gaugewright_relay_transport::test_relay::TestRelay::bind()
+        let broker_a = gaugedesk_relay_transport::test_relay::TestRelay::bind()
             .await
             .unwrap();
-        let broker_b = gaugewright_relay_transport::test_relay::TestRelay::bind()
+        let broker_b = gaugedesk_relay_transport::test_relay::TestRelay::bind()
             .await
             .unwrap();
         let addr_a = broker_a.endpoint().to_owned();

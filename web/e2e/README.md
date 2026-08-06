@@ -15,7 +15,7 @@ broker.sh            launches the rendezvous broker (federation scenarios)
 ## Two tiers
 
 - **Default suite** (`npm run e2e`) — fast, deterministic, no network. Runs every
-  story against the **mock-LLM** control plane (`GAUGEWRIGHT_FAKE_AGENT=1`): a scripted
+  story against the **mock-LLM** control plane (`GAUGEDESK_FAKE_AGENT=1`): a scripted
   transport writes a deterministic file + emits canned stream events, so the
   task → diff → keep flow is instant while the membrane/reducer path stays real.
   Excludes `@live`.

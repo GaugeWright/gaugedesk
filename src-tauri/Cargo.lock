@@ -1674,7 +1674,7 @@ dependencies = [
 name = "gaugedesk-desktop"
 version = "0.4.5"
 dependencies = [
- "gaugewright-app",
+ "gaugedesk-app",
  "serde_json",
  "tauri",
  "tauri-build",
@@ -1686,22 +1686,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "gaugewright-app"
+name = "gaugedesk-app"
 version = "0.4.5"
 dependencies = [
  "axum",
  "base64 0.22.1",
  "directories",
  "futures",
- "gaugewright-boundary",
- "gaugewright-core",
- "gaugewright-directory-protocol",
- "gaugewright-harness",
- "gaugewright-relay-transport",
- "gaugewright-store",
- "gaugewright-tracker",
- "gaugewright-whip-runtime",
- "gaugewright-workspace",
+ "gaugedesk-boundary",
+ "gaugedesk-core",
+ "gaugedesk-directory-protocol",
+ "gaugedesk-harness",
+ "gaugedesk-relay-transport",
+ "gaugedesk-store",
+ "gaugedesk-tracker",
+ "gaugedesk-whip-runtime",
+ "gaugedesk-workspace",
  "getrandom 0.2.17",
  "hex",
  "listenfd",
@@ -1723,16 +1723,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "gaugewright-boundary"
+name = "gaugedesk-boundary"
 version = "0.4.5"
 dependencies = [
- "gaugewright-core",
+ "gaugedesk-core",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "gaugewright-core"
+name = "gaugedesk-core"
 version = "0.4.5"
 dependencies = [
  "ciborium",
@@ -1744,16 +1744,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "gaugewright-directory-protocol"
+name = "gaugedesk-directory-protocol"
 version = "0.4.5"
 dependencies = [
- "gaugewright-core",
+ "gaugedesk-core",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "gaugewright-harness"
+name = "gaugedesk-harness"
 version = "0.4.5"
 dependencies = [
  "serde",
@@ -1763,7 +1763,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gaugewright-relay-transport"
+name = "gaugedesk-relay-transport"
 version = "0.4.5"
 dependencies = [
  "base64 0.22.1",
@@ -1780,17 +1780,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "gaugewright-store"
+name = "gaugedesk-store"
 version = "0.4.5"
 dependencies = [
- "gaugewright-core",
+ "gaugedesk-core",
  "rusqlite",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "gaugewright-tracker"
+name = "gaugedesk-tracker"
 version = "0.4.5"
 dependencies = [
  "serde_json",
@@ -1799,12 +1799,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "gaugewright-whip-runtime"
+name = "gaugedesk-whip-runtime"
 version = "0.4.5"
 dependencies = [
  "base64 0.22.1",
- "gaugewright-core",
- "gaugewright-harness",
+ "gaugedesk-core",
+ "gaugedesk-harness",
  "hex",
  "libc",
  "serde",
@@ -1818,7 +1818,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gaugewright-workspace"
+name = "gaugedesk-workspace"
 version = "0.4.5"
 dependencies = [
  "hex",

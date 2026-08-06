@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::account::{account_scope, credentials_in_scope, ModelExecutionClass};
 use crate::environment_contract::{EnvironmentKind, EnvironmentScope, EnvironmentSession};
 use crate::{LockUnpoisoned, SharedWorkbench};
-use gaugewright_store::{AdmitError, CommandRecordFact, Store};
+use gaugedesk_store::{AdmitError, CommandRecordFact, Store};
 
 pub const FILES_LIST_TOOL: &str = "environment.files.list";
 pub const FILES_READ_TOOL: &str = "environment.files.read";
@@ -419,9 +419,8 @@ fn resolve_agent_credential(
         .get("openai")
         .filter(|record| record.admits(ModelExecutionClass::PrivateHome))
     else {
-        if environment_flag("GAUGEWRIGHT_MANAGEMENT_AGENT_MANAGED") {
-            let token = std::env::var("GAUGEWRIGHT_MANAGEMENT_AGENT_OPENAI_KEY")
-                .ok()
+        if environment_flag("GAUGEDESK_MANAGEMENT_AGENT_MANAGED") {
+            let token = gaugedesk_env::var("MANAGEMENT_AGENT_OPENAI_KEY")
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
                     EnvironmentAgentError::Credential(
@@ -700,7 +699,7 @@ pub fn run_environment_agent_turn(
     // and exact-scope session without distributing a production provider key.
     // Release builds cannot activate this path, even if the variable leaks
     // into their environment.
-    if cfg!(debug_assertions) && environment_flag("GAUGEWRIGHT_FAKE_MANAGEMENT_AGENT") {
+    if cfg!(debug_assertions) && environment_flag("GAUGEDESK_FAKE_MANAGEMENT_AGENT") {
         return Ok(development_environment_agent_turn(&context, message));
     }
     let credential = resolve_agent_credential(workbench, &context.session.actor)?;
@@ -716,7 +715,7 @@ pub fn run_environment_agent_turn(
     let mut proposals = Vec::new();
     for _ in 0..MAX_TOOL_ROUNDS {
         let body = json!({
-            "model": std::env::var("GAUGEWRIGHT_MANAGEMENT_AGENT_MODEL").unwrap_or_else(|_| "gpt-5.6-terra".into()),
+            "model": gaugedesk_env::var("MANAGEMENT_AGENT_MODEL").unwrap_or_else(|| "gpt-5.6-terra".into()),
             "instructions": system,
             "input": input,
             "tools": provider_tools(),

@@ -4,7 +4,7 @@
 //! the [`Harness`]/[`RemoteHarness`] turn seam (ADR 0031), the [`EgressGate`]
 //! mediation chokepoint, the [`Observation`]/[`TurnOutcome`] turn evidence, the
 //! [`ImageContent`] content block, and the OS [`sandbox`] (ADR 0030). Adapters
-//! (`gaugewright-pi-bridge` is the Pi one) depend on this crate for the seam;
+//! (`gaugedesk-pi-bridge` is the Pi one) depend on this crate for the seam;
 //! nothing here is adapter-specific.
 
 use std::io;
@@ -19,7 +19,7 @@ pub mod sni_proxy;
 pub mod testing;
 
 /// The host's egress decision for one tool effect, as the membrane would rule.
-/// Decoupled from [`gaugewright_boundary`] so the bridge depends only on `core`; the
+/// Decoupled from [`gaugedesk_boundary`] so the bridge depends only on `core`; the
 /// orchestrator supplies the concrete membrane-backed gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GateDecision {

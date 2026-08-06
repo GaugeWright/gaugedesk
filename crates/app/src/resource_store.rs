@@ -22,26 +22,26 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use gaugewright_core::abac::{
+use gaugedesk_core::abac::{
     permitted_with_policy, Action, AuthorityAttributes, Context, Decision, Policy,
     ResourceAttributes,
 };
-use gaugewright_core::attestation::{AttestationEvidence, CodeMeasurement};
-use gaugewright_core::boundary::Authority;
-use gaugewright_core::content_erasure::{
+use gaugedesk_core::attestation::{AttestationEvidence, CodeMeasurement};
+use gaugedesk_core::boundary::Authority;
+use gaugedesk_core::content_erasure::{
     ErasureCommand, ErasurePhase, ErasureState, OWNER as ERASURE_OWNER,
 };
-use gaugewright_core::key_release::{
+use gaugedesk_core::key_release::{
     EntitlementProof, EntitlementVerdict, KeyReleaseDecision, KeyReleaseRequest,
 };
-use gaugewright_core::resource::{
+use gaugedesk_core::resource::{
     ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
 };
-use gaugewright_core::resource_access::{AccessCommand, AccessPhase, AccessState};
-use gaugewright_core::resource_export::{ExportCommand, ExportPhase, ExportState};
-use gaugewright_core::review::{ReviewCommand, ReviewPhase, ReviewState};
-use gaugewright_core::taint::EngagementReads;
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::resource_access::{AccessCommand, AccessPhase, AccessState};
+use gaugedesk_core::resource_export::{ExportCommand, ExportPhase, ExportState};
+use gaugedesk_core::review::{ReviewCommand, ReviewPhase, ReviewState};
+use gaugedesk_core::taint::EngagementReads;
+use gaugedesk_store::{AdmitError, Store};
 use serde::Deserialize;
 
 use crate::boundary_keeper::SealedKeyReleaseService;
@@ -301,7 +301,7 @@ pub fn granted_context(store: &Store, engagement: &str) -> Result<Vec<ResourceId
 pub fn certified_output_reads(
     store: &Store,
     engagement: &str,
-    signature: &[gaugewright_harness::OutputFieldFlow],
+    signature: &[gaugedesk_harness::OutputFieldFlow],
 ) -> Result<Vec<ResourceId>, AdmitError> {
     let mut reads = BTreeSet::new();
     let granted = granted_context(store, engagement)?;
@@ -460,7 +460,7 @@ impl Workbench {
     /// only after target-Home admission, then discards that admission.
     pub(crate) fn review_notification_count(
         &self,
-        actor: &gaugewright_core::ids::AuthorityId,
+        actor: &gaugedesk_core::ids::AuthorityId,
     ) -> Result<usize, AdmitError> {
         let actor = Authority::from(actor.as_str());
         let library = Library::rebuild(self.store_ref())?;
@@ -647,7 +647,7 @@ pub(crate) fn context_attributes(
     classification: Option<&str>,
     region: Option<&str>,
 ) -> ResourceAttributes {
-    use gaugewright_core::abac::{Classification, Region};
+    use gaugedesk_core::abac::{Classification, Region};
     let classification = match classification
         .map(|s| s.trim().to_ascii_lowercase())
         .as_deref()
@@ -1574,7 +1574,7 @@ pub fn attested_run_usage(store: &Store, engagement: &str) -> Result<AttestedRun
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gaugewright_core::resource::{
+    use gaugedesk_core::resource::{
         ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
     };
 
@@ -1710,7 +1710,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let eng = "engagement-1";
         let context = mint_context(&mut store, eng, "client", "client-data", "c1").unwrap();
-        let signature = vec![gaugewright_harness::OutputFieldFlow {
+        let signature = vec![gaugedesk_harness::OutputFieldFlow {
             field: "assistant_text".to_owned(),
             read_handles: vec![
                 "project".to_owned(),
@@ -1748,7 +1748,7 @@ mod tests {
 
     mod abac_gate {
         use super::*;
-        use gaugewright_core::abac::{Classification, Region, Role};
+        use gaugedesk_core::abac::{Classification, Region, Role};
 
         fn pii_record(id: &str, owner: &str, region: &str) -> ResourceRecord {
             let res = Resource::input(ResourceId::new(id), ResourceKind::context(), owner.into());
@@ -1920,10 +1920,10 @@ mod tests {
     mod sealed_keys {
         use super::*;
         use crate::boundary_keeper::LoopbackKeyReleaseService;
-        use gaugewright_core::attestation::{
+        use gaugedesk_core::attestation::{
             AttestationQuote, QuoteRejection, QuoteVerificationResult,
         };
-        use gaugewright_core::key_release::{
+        use gaugedesk_core::key_release::{
             EntitlementIneligibility, KeyReleaseDenial, SealedKeyRecord,
         };
 

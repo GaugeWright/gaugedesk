@@ -17,9 +17,9 @@
 //! the `D-REMOTE` follow-on, and TEE-attested placement is `D-ATTEST` — the return
 //! mechanism is the same regardless.
 
-use gaugewright_core::run::{RunCommand, RunState};
-use gaugewright_harness::{EgressGate, Observation, RemoteHarness};
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::run::{RunCommand, RunState};
+use gaugedesk_harness::{EgressGate, Observation, RemoteHarness};
+use gaugedesk_store::{AdmitError, Store};
 
 use crate::federation_relay::{FederationRelay, Message};
 
@@ -131,9 +131,9 @@ pub fn return_observation_via<R: FederationRelay + ?Sized>(
 mod tests {
     use super::*;
     use crate::federation_relay::{self, LoopbackRelay};
-    use gaugewright_core::run::{RunPhase, RunState};
-    use gaugewright_harness::{AllowAllGate, Harness};
-    use gaugewright_pi_bridge::RemoteLoopbackHarness;
+    use gaugedesk_core::run::{RunPhase, RunState};
+    use gaugedesk_harness::{AllowAllGate, Harness};
+    use gaugedesk_pi_bridge::RemoteLoopbackHarness;
 
     fn running_run(store: &mut Store, scope: &str) {
         store

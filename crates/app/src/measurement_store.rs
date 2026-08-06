@@ -23,8 +23,8 @@
 
 use std::collections::BTreeMap;
 
-use gaugewright_core::attestation::CodeMeasurement;
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::attestation::CodeMeasurement;
+use gaugedesk_store::{AdmitError, Store};
 
 use crate::boundary_keeper::LoopbackKeyReleaseService;
 use crate::Workbench;
@@ -243,7 +243,7 @@ impl Workbench {
 mod tests {
     use super::*;
     use crate::attestation_verifier::{LoopbackVerifier, QuoteVerifier};
-    use gaugewright_core::attestation::{AttestationQuote, QuoteVerificationResult};
+    use gaugedesk_core::attestation::{AttestationQuote, QuoteVerificationResult};
 
     fn measurement_a() -> CodeMeasurement {
         CodeMeasurement::new("a".repeat(64))

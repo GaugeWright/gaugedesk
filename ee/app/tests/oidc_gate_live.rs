@@ -16,14 +16,14 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use tower::ServiceExt;
 
-use gaugewright_app::org::{
+use gaugedesk_app::org::{
     MembershipRecord, MembershipStatus, RecordOp, SsoConnectionRecord, SsoProtocol, ORG_ID,
     ORG_SCOPE,
 };
-use gaugewright_app::Workbench;
-use gaugewright_ee::auth_oidc::build_oidc_idp;
-use gaugewright_ee::org_routes::enterprise_control_plane;
-use gaugewright_store::Store;
+use gaugedesk_app::Workbench;
+use gaugedesk_ee::auth_oidc::build_oidc_idp;
+use gaugedesk_ee::org_routes::enterprise_control_plane;
+use gaugedesk_store::Store;
 
 fn env_or_skip(key: &str) -> Option<String> {
     match std::env::var(key) {

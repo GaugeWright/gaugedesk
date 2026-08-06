@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use gaugewright_core::ids::AuthorityId;
+use gaugedesk_core::ids::AuthorityId;
 use serde_json::json;
 
 use crate::{identity::AuthenticatedActor, net_http, LockUnpoisoned, SharedWorkbench};

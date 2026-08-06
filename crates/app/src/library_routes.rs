@@ -23,8 +23,8 @@ use crate::library_state::{
     PublishArchetypeError, PullArchetypeError, UpgradePlacementError,
 };
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench, DEFAULT_AGENT};
-use gaugewright_store::AdmitError;
-use gaugewright_workspace::MergeOutcome;
+use gaugedesk_store::AdmitError;
+use gaugedesk_workspace::MergeOutcome;
 
 // ---- helpers -------------------------------------------------------------
 
@@ -531,7 +531,7 @@ pub async fn update_agent(
     Json(body): Json<UpdateAgent>,
 ) -> impl IntoResponse {
     if let Some(cfg) = &body.config {
-        if let Err(e) = gaugewright_boundary::AgentConfig::runtime_settings_from_json(cfg) {
+        if let Err(e) = gaugedesk_boundary::AgentConfig::runtime_settings_from_json(cfg) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": format!("invalid agent config: {e}") })),
@@ -590,7 +590,7 @@ pub struct CreateProject {
     /// this command; asserting another Home fails closed rather than creating a
     /// locally stored project with a remote ownership label.
     #[serde(default)]
-    pub home_id: Option<gaugewright_core::ids::HomeId>,
+    pub home_id: Option<gaugedesk_core::ids::HomeId>,
 }
 
 /// `GET /projects/:id/home` — the **project-home rollup** (`UX-2`, `mvp-workbench.md` "Project
@@ -701,7 +701,7 @@ pub struct UpdateProject {
     /// The project's **deployment mode** (`DEPLOY-1`): the `(operator, attested)` placement
     /// the consultant declares as the engagement boundary ceiling. Omitted ⇒ unchanged.
     #[serde(default)]
-    pub deployment_mode: Option<gaugewright_core::boundary_lifecycle::Placement>,
+    pub deployment_mode: Option<gaugedesk_core::boundary_lifecycle::Placement>,
     /// Business purpose admitted for runs in this project. Omitted means
     /// unchanged; `null` revokes it; purpose-tagged resources fail closed when
     /// none is set.
@@ -1416,8 +1416,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::Router;
-    use gaugewright_core::attestation::CodeMeasurement;
-    use gaugewright_core::boundary_lifecycle::{Operator, Placement};
+    use gaugedesk_core::attestation::CodeMeasurement;
+    use gaugedesk_core::boundary_lifecycle::{Operator, Placement};
     use http_body_util::BodyExt;
     use std::collections::BTreeSet;
     use std::sync::{
@@ -1454,7 +1454,7 @@ mod tests {
     }
 
     fn router_with_boundary_mode(attested: bool, mode: crate::AttestationMode) -> Router {
-        let store = gaugewright_store::Store::open_in_memory().unwrap();
+        let store = gaugedesk_store::Store::open_in_memory().unwrap();
         // ADR 0065: these tests drive the attested operator surface (`/engagements/:eid/attested-*`),
         // which is now gated off by default — opt it in for the suite.
         let mut wb = Workbench::new(store)
@@ -1485,9 +1485,9 @@ mod tests {
     /// accept consults it (the policy-gated pairing path). No attestation wiring is needed
     /// because these exercise the unattested accept.
     fn router_with_boundary_and_policy(
-        policy: gaugewright_core::boundary_lifecycle::PlacementPolicy,
+        policy: gaugedesk_core::boundary_lifecycle::PlacementPolicy,
     ) -> Router {
-        let store = gaugewright_store::Store::open_in_memory().unwrap();
+        let store = gaugedesk_store::Store::open_in_memory().unwrap();
         let mut wb = Workbench::new(store);
         let parts = BTreeSet::from([PARTICIPANT_A.to_string(), PARTICIPANT_B.to_string()]);
         wb.seed_boundary_for_test(
@@ -1547,7 +1547,7 @@ mod tests {
     /// fail-closed (`INV-20`). Proves the policy-gated pairing gate is wired to the live route.
     #[tokio::test]
     async fn accept_boundary_refused_when_org_placement_policy_excludes_operator() {
-        use gaugewright_core::boundary_lifecycle::PlacementPolicy;
+        use gaugedesk_core::boundary_lifecycle::PlacementPolicy;
         let policy = PlacementPolicy {
             require_attested: false,
             allowed_operators: BTreeSet::from([Operator::Local]),
@@ -1567,7 +1567,7 @@ mod tests {
     /// the gate narrows, it does not block a compliant deployment mode.
     #[tokio::test]
     async fn accept_boundary_admitted_when_org_placement_policy_allows_operator() {
-        use gaugewright_core::boundary_lifecycle::PlacementPolicy;
+        use gaugedesk_core::boundary_lifecycle::PlacementPolicy;
         let policy = PlacementPolicy {
             require_attested: false,
             allowed_operators: BTreeSet::from([Operator::Counterparty]),
@@ -1590,15 +1590,15 @@ mod tests {
     async fn accept_boundary_requires_member_auth_in_enterprise_mode() {
         use crate::identity::LoopbackIdentityProvider;
         use crate::org::{MembershipRecord, MembershipStatus, RecordOp, ORG_SCOPE};
-        use gaugewright_core::abac::AuthorityAttributes;
-        use gaugewright_core::ids::AuthorityId;
+        use gaugedesk_core::abac::AuthorityAttributes;
+        use gaugedesk_core::ids::AuthorityId;
 
         let idp = LoopbackIdentityProvider::new().enroll(
             "member-token",
             AuthorityId::new("member-auth"),
             AuthorityAttributes::default(),
         );
-        let mut wb = Workbench::new(gaugewright_store::Store::open_in_memory().unwrap())
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
             .with_identity_provider(Arc::new(idp));
         let parts = BTreeSet::from([PARTICIPANT_A.to_string(), PARTICIPANT_B.to_string()]);
         wb.seed_boundary_for_test(
@@ -1838,7 +1838,7 @@ mod tests {
     /// A bare control plane over an empty in-memory workbench — the pairing routes
     /// mint their own boundary scope, so they need no pre-seeded boundary.
     fn bare_router() -> Router {
-        let wb = Workbench::new(gaugewright_store::Store::open_in_memory().unwrap());
+        let wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
         open_control_plane(Arc::new(Mutex::new(wb)))
     }
 
@@ -1973,8 +1973,8 @@ mod search_tests {
     use crate::{open_control_plane, Workbench};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use gaugewright_store::Store;
-    use gaugewright_workspace::Instance;
+    use gaugedesk_store::Store;
+    use gaugedesk_workspace::Instance;
     use http_body_util::BodyExt;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
@@ -2009,7 +2009,7 @@ mod search_tests {
     /// Two chats: chat-1's *log* mentions "bridge"/"deadline"; chat-2 only has
     /// "deadline" in its *title* (its log is unrelated).
     fn seed() -> axum::Router {
-        let store = gaugewright_store::Store::open_in_memory().unwrap();
+        let store = gaugedesk_store::Store::open_in_memory().unwrap();
         let mut wb = Workbench::new(store);
         wb.write_chat_record(chat("chat-1", "weekly sync", 0));
         wb.write_chat_transcript_event(

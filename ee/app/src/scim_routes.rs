@@ -2,7 +2,7 @@
 //! through a standard SCIM Users endpoint, authenticated by a **SCIM bearer token**
 //! (issued/rotated by an admin, stored by hash only — `SEC-5`). Creating a user
 //! provisions an active member; deactivating/deleting **deprovisions** them, which —
-//! because [`Org::role_of`](gaugewright_app::org::Org::role_of) only returns an *active*
+//! because [`Org::role_of`](gaugedesk_app::org::Org::role_of) only returns an *active*
 //! member's role — immediately revokes their standing (the offboarding → access-
 //! revoked chain, `SCIM-2`/`INV-18`).
 //!
@@ -21,12 +21,12 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use gaugewright_core::rbac::Capability;
+use gaugedesk_core::rbac::Capability;
 
-use gaugewright_app::org::{
+use gaugedesk_app::org::{
     sha256_hex, MembershipRecord, MembershipStatus, Org, RecordOp, ScimTokenRecord, ORG_ID,
 };
-use gaugewright_app::{LockUnpoisoned, SharedWorkbench, Workbench};
+use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 
 use crate::org_routes::{bearer, deny, write_membership};
 
@@ -169,7 +169,7 @@ pub async fn post_scim_user(
         }
     }
     write_membership(&mut wb, &store_scope, &rec);
-    gaugewright_app::audit::record_in(&mut wb, &store_scope, "scim", "scim.provision", &rec.id);
+    gaugedesk_app::audit::record_in(&mut wb, &store_scope, "scim", "scim.provision", &rec.id);
     (StatusCode::CREATED, Json(scim_user(&rec))).into_response()
 }
 
@@ -298,7 +298,7 @@ fn set_active(wb: &mut Workbench, scope: &str, id: &str, active: bool) -> axum::
     } else {
         "scim.deprovision"
     };
-    gaugewright_app::audit::record_in(wb, scope, "scim", action, &rec.id);
+    gaugedesk_app::audit::record_in(wb, scope, "scim", action, &rec.id);
     (StatusCode::OK, Json(scim_user(&rec))).into_response()
 }
 

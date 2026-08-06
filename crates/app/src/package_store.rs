@@ -6,13 +6,13 @@
 //! (the [`crate::resource_store`]/[`crate::library`] idiom). They carry **handles
 //! and metadata, never payload** (`INV-10`); and they do **not** duplicate lifecycle
 //! phase (`data.md`): distribution/entitlement *status* is folded from the
-//! [`gaugewright_core::package_distribution`] / [`gaugewright_core::deployment_entitlement`]
+//! [`gaugedesk_core::package_distribution`] / [`gaugedesk_core::deployment_entitlement`]
 //! reducers, not stored here. A record may be tombstoned (future-only).
 
 use std::collections::BTreeMap;
 
-use gaugewright_core::resource::ResourceId;
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::resource::ResourceId;
+use gaugedesk_store::{AdmitError, Store};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// A durable record kind, folded latest-wins by `id`.
@@ -59,7 +59,7 @@ pub struct VersionRecord {
 }
 
 /// A governed deployment entitlement's durable record (status is folded from the
-/// [`gaugewright_core::deployment_entitlement`] reducer, not stored here).
+/// [`gaugedesk_core::deployment_entitlement`] reducer, not stored here).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct EntitlementRecord {
     pub id: String,

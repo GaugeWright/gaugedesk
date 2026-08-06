@@ -200,7 +200,7 @@ fn codex_status(wb: &SharedWorkbench, headers: &HeaderMap, hosted: bool) -> Json
 }
 
 fn node_bin() -> String {
-    std::env::var("GAUGEWRIGHT_NODE_BIN").unwrap_or_else(|_| "node".to_owned())
+    gaugedesk_env::var("NODE_BIN").unwrap_or_else(|| "node".to_owned())
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -370,7 +370,7 @@ fn read_codex_auth(path: &std::path::Path) -> Result<CodexOAuthCredential, Strin
 }
 
 fn codex_bin() -> String {
-    std::env::var("GAUGEWRIGHT_CODEX_BIN").unwrap_or_else(|_| "codex".to_owned())
+    gaugedesk_env::var("CODEX_BIN").unwrap_or_else(|| "codex".to_owned())
 }
 
 fn start_device_login_blocking(wb: SharedWorkbench, scope: String) -> Result<Value, String> {
@@ -619,7 +619,7 @@ pub async fn post_home_codex_login_cancel(
 
 /// The helper script rides inside the binary: spawning it must not depend on the
 /// process cwd or a bundled payload (the packaged app ships no `sidecar/` tree).
-/// `GAUGEWRIGHT_CODEX_LOGIN` still points at an on-disk script when set — the
+/// `GAUGEDESK_CODEX_LOGIN` still points at an on-disk script when set — the
 /// dev/test seam for substituting a fake helper.
 const HELPER_SOURCE: &str = include_str!("../../../sidecar/codex-oauth-login.mjs");
 
@@ -627,7 +627,7 @@ const HELPER_SOURCE: &str = include_str!("../../../sidecar/codex-oauth-login.mjs
 /// in a background thread until the credential bundle can be sealed.
 fn start_login_blocking(wb: SharedWorkbench) -> Result<String, String> {
     let mut command = Command::new(node_bin());
-    let override_path = std::env::var("GAUGEWRIGHT_CODEX_LOGIN").ok();
+    let override_path = gaugedesk_env::var("CODEX_LOGIN");
     match &override_path {
         Some(path) => {
             command.arg(path).stdin(Stdio::null());
@@ -1086,9 +1086,9 @@ IFS= read -r done
         )
         .unwrap();
         executable(&helper);
-        std::env::set_var("GAUGEWRIGHT_CODEX_BIN", &helper);
+        std::env::set_var("GAUGEDESK_CODEX_BIN", &helper);
         let projection = start_device_login_blocking(workbench.clone(), scope.clone()).unwrap();
-        std::env::remove_var("GAUGEWRIGHT_CODEX_BIN");
+        std::env::remove_var("GAUGEDESK_CODEX_BIN");
         assert_eq!(projection["user_code"], "ABCD-1234");
 
         for _ in 0..100 {

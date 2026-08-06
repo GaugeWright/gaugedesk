@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use gaugewright_core::ids::{AuthorityId, HomeId};
+use gaugedesk_core::ids::{AuthorityId, HomeId};
 
 /// Header carrying the target Home's admission credential.
 pub const HOME_ADMISSION_HEADER: &str = "x-gaugewright-home-admission";

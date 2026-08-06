@@ -4,7 +4,7 @@
 //! "Egress Mediation"). It is **not** a bypass: even trust-by-default mediates
 //! every effect — the posture only sets the *default decision* to
 //! allow-and-record vs. block. The pure soundness of release (conjunctive
-//! consent, `INV-22`) lives in [`gaugewright_core::boundary`]; this crate is the
+//! consent, `INV-22`) lives in [`gaugedesk_core::boundary`]; this crate is the
 //! imperative policy gate that classifies an effect against the agent's declared
 //! policy before it executes.
 //!

@@ -17,13 +17,13 @@
 
 use std::collections::BTreeMap;
 
-use gaugewright_core::ids::{AuthorityId, EngagementId};
+use gaugedesk_core::ids::{AuthorityId, EngagementId};
 
 /// `N` bytes of cryptographically-secure randomness (OS CSPRNG via `getrandom`) —
 /// the unguessable core of a session token or auth challenge (D-REMOTE). Falls back
 /// to the empty fill only if the OS RNG is unavailable, which `getrandom` treats as
 /// a hard error on every supported platform, so in practice this always fills.
-/// `pub` so the extracted enterprise band (`gaugewright-ee`) mints its OIDC CSRF
+/// `pub` so the extracted enterprise band (`gaugedesk-ee`) mints its OIDC CSRF
 /// `state` from the same CSPRNG seam.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];

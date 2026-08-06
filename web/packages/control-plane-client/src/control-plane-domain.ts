@@ -636,7 +636,7 @@ export function parseWorkspace(raw: unknown): Workspace {
     };
 }
 
-// ----- Run lifecycle projection (mirrors gaugewright_core::run) -----
+// ----- Run lifecycle projection (mirrors gaugedesk_core::run) -----
 
 export type RunPhase =
     | "Init"
@@ -688,7 +688,7 @@ export function describeFailure(action: string, e: unknown): string {
         : `${action} failed — something went wrong`;
 }
 
-// ----- Review / export projections (mirror gaugewright_core::review / resource_export) -----
+// ----- Review / export projections (mirror gaugedesk_core::review / resource_export) -----
 
 export type ReviewPhase = "Init" | "Proposed" | "Cleared" | "Released" | "Withheld";
 export interface ReviewState {
@@ -718,7 +718,7 @@ export interface AuditEvent {
     readonly payload: string;
 }
 
-// ----- Durable resources projection (mirrors gaugewright_core::resource / resource_access) -----
+// ----- Durable resources projection (mirrors gaugedesk_core::resource / resource_access) -----
 
 /** A resource's **kind** — `method | context | output`, an *open* set (the core
  *  treats it as a string, `INV-12`). The UI keys its panels on the three known

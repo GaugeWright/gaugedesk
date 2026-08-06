@@ -11,11 +11,11 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use gaugewright_app::account::{DeviceRecord, DeviceStatus, RecordOp};
-use gaugewright_app::open_control_plane;
-use gaugewright_app::Workbench;
-use gaugewright_store::Store;
-use gaugewright_workspace::Instance;
+use gaugedesk_app::account::{DeviceRecord, DeviceStatus, RecordOp};
+use gaugedesk_app::open_control_plane;
+use gaugedesk_app::Workbench;
+use gaugedesk_store::Store;
+use gaugedesk_workspace::Instance;
 
 fn workbench() -> (tempfile::TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();

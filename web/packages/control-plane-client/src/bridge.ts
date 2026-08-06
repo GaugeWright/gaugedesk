@@ -9,12 +9,12 @@
  * reinterpretation:
  *
  *   - `DeviceIdentity` is this physical endpoint — a `DeviceId` and the
- *     `PublicKey` device key a bridge call must present (`gaugewright_core::ids`,
+ *     `PublicKey` device key a bridge call must present (`gaugedesk_core::ids`,
  *     `BridgeGrant.device_key`). The client never holds the *private* key in
  *     this layer; secure storage of the secret is a native concern (MOB-025,
  *     needs-infra), so this type carries only the public handle.
  *   - `BridgeGrant` is the durable governed-route record, a structural mirror of
- *     `gaugewright_core::bridge_grant::BridgeGrant`. Validity is the *same pure
+ *     `gaugedesk_core::bridge_grant::BridgeGrant`. Validity is the *same pure
  *     predicate* (`active && now < expiry`) so the client decides usability the
  *     way the core does — the shell supplies `now`, the type decides
  *     (`is_valid`).
@@ -35,10 +35,10 @@ import { scopeId, type ScopeId } from "./control-plane-domain";
 declare const brand: unique symbol;
 type Brand<T, B> = T & { readonly [brand]: B };
 
-// ----- Branded identities (mirror `gaugewright_core::ids`) -------------------------
+// ----- Branded identities (mirror `gaugedesk_core::ids`) -------------------------
 
 /** A paired device — one physical endpoint that presents a device key. Mirrors
- *  `gaugewright_core::ids::DeviceId`; the stable handle the boundary's `DeviceBinding`
+ *  `gaugedesk_core::ids::DeviceId`; the stable handle the boundary's `DeviceBinding`
  *  phase records so a revoked device cannot keep delivering. */
 export type DeviceId = Brand<string, "DeviceId">;
 
@@ -48,7 +48,7 @@ export function deviceId(raw: string): DeviceId {
 }
 
 /** Stable identifier for a `BridgeGrant`. Mirrors
- *  `gaugewright_core::ids::BridgeGrantId` — the typed handle a federated delivery
+ *  `gaugedesk_core::ids::BridgeGrantId` — the typed handle a federated delivery
  *  carries so the target binds the crossing to exactly the issued grant. */
 export type BridgeGrantId = Brand<string, "BridgeGrantId">;
 
@@ -58,7 +58,7 @@ export function bridgeGrantId(raw: string): BridgeGrantId {
 }
 
 /** A public key in hex form — a root identity key or a device key. Mirrors
- *  `gaugewright_core::ids::PublicKey`. The client carries only public handles in this
+ *  `gaugedesk_core::ids::PublicKey`. The client carries only public handles in this
  *  layer; the device *secret* is a native secure-storage concern (MOB-025). */
 export type PublicKey = Brand<string, "PublicKey">;
 
@@ -77,7 +77,7 @@ export interface DeviceIdentity {
     readonly deviceKey: PublicKey;
 }
 
-// ----- Bridge grant (mirror `gaugewright_core::bridge_grant::BridgeGrant`) ----------
+// ----- Bridge grant (mirror `gaugedesk_core::bridge_grant::BridgeGrant`) ----------
 
 /** A governed bridge grant: source authority → target environment/route, bound
  *  to a device key and a governance scope, with an expiry and an active flag. A

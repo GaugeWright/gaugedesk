@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gaugewright_harness::{
+use gaugedesk_harness::{
     EgressGate, Harness, HarnessContinuitySpec, HarnessSpec, ImageContent, InterruptHandle,
     ModelUsage, Observation, OutputFieldFlow, RuntimePosition, ToolInfo, TurnOutcome,
 };

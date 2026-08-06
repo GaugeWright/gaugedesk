@@ -3,7 +3,7 @@
 //! token's signature against the issuer's configured signing key(s), checks the
 //! registered claims (`iss` / `aud` / `exp` / `nbf`), then maps the verified subject
 //! and claims onto an [`AuthorityId`] + its
-//! [`AuthorityAttributes`](gaugewright_core::abac::AuthorityAttributes). Okta,
+//! [`AuthorityAttributes`](gaugedesk_core::abac::AuthorityAttributes). Okta,
 //! Microsoft Entra ID, and Google Workspace all issue OIDC id-tokens, so the same
 //! adapter serves all three behind the seam (the IdP-specific claim names are the
 //! only difference, captured by [`ClaimMapping`]).
@@ -30,8 +30,8 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use gaugewright_core::abac::{AuthorityAttributes, Region, Role, Tenant};
-use gaugewright_core::ids::AuthorityId;
+use gaugedesk_core::abac::{AuthorityAttributes, Region, Role, Tenant};
+use gaugedesk_core::ids::AuthorityId;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
 use crate::identity::IdentityProvider;

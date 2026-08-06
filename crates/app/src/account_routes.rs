@@ -23,7 +23,7 @@ use crate::account::{seal_token, HomeRouteRecord, RecordOp, RegisteredHomeRecord
 use crate::account::{DeviceRecord, DeviceStatus};
 use crate::codex_oauth;
 use crate::{err_response, net_http, LockUnpoisoned, SharedWorkbench};
-use gaugewright_core::ids::HomeId;
+use gaugedesk_core::ids::HomeId;
 
 /// Split account route surface. Local device/settings/credential ownership stays
 /// open; hosted token brokerage and account-ledger operation are split later.
@@ -574,10 +574,10 @@ pub async fn post_library_sync_pull(State(wb): State<SharedWorkbench>) -> impl I
 /// Whether a first-run user must connect an LLM credential before the runtime
 /// can run a turn (ADR 0075 Phase 0). Mirrors the runtime selection in
 /// `harness_select::factory_for_turn`: the scripted fake agent (selected by
-/// `GAUGEWRIGHT_FAKE_AGENT`, used in dev/e2e) needs no credential, so the gate is
+/// `GAUGEDESK_FAKE_AGENT`, used in dev/e2e) needs no credential, so the gate is
 /// off there; the real WhippleScript runtime needs one, so it's on.
 pub async fn get_onboarding_status() -> impl IntoResponse {
-    let credential_required = std::env::var("GAUGEWRIGHT_FAKE_AGENT").is_err();
+    let credential_required = gaugedesk_env::var("FAKE_AGENT").is_none();
     (
         StatusCode::OK,
         Json(json!({ "credential_required": credential_required })),
@@ -592,13 +592,10 @@ pub async fn get_onboarding_status() -> impl IntoResponse {
 /// (it requires an explicit pin). Exposed so the picker can *name* the default
 /// instead of showing a blind "Default" (LLM-1, ADR 0062).
 pub async fn get_default_model() -> impl IntoResponse {
-    let provider = crate::engine::resolve_turn_provider(
-        std::env::var("GAUGEWRIGHT_MODEL_PROVIDER").ok(),
-        None,
-    );
-    let model = crate::engine::resolve_turn_model(std::env::var("GAUGEWRIGHT_MODEL").ok(), None)
-        .or_else(|| {
-            gaugewright_whip_runtime::native_provider_descriptor(&provider, None, None)
+    let provider = crate::engine::resolve_turn_provider(gaugedesk_env::var("MODEL_PROVIDER"), None);
+    let model =
+        crate::engine::resolve_turn_model(gaugedesk_env::var("MODEL"), None).or_else(|| {
+            gaugedesk_whip_runtime::native_provider_descriptor(&provider, None, None)
                 .ok()
                 .map(|d| d.model)
         });
@@ -797,7 +794,7 @@ pub async fn post_test_device_fixture(
     headers: HeaderMap,
     Json(body): Json<TestDeviceFixtureBody>,
 ) -> impl IntoResponse {
-    if std::env::var_os("GAUGEWRIGHT_TEST_RESET").is_none() {
+    if gaugedesk_env::var_os("TEST_RESET").is_none() {
         return (StatusCode::FORBIDDEN, "device fixture is disabled").into_response();
     }
     if body.id.trim().is_empty() {

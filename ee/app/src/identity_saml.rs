@@ -1,4 +1,4 @@
-//! SAML SSO adapter (M3 `ID-2`) — a real [`IdentityProvider`](gaugewright_app::identity::IdentityProvider)
+//! SAML SSO adapter (M3 `ID-2`) — a real [`IdentityProvider`](gaugedesk_app::identity::IdentityProvider)
 //! that authenticates a **SAML Response** by delegating the signature/XML-dsig
 //! verification to a co-resident **sidecar** process, then maps the verified subject
 //! + attributes onto an [`AuthorityId`] + [`AuthorityAttributes`].
@@ -33,14 +33,14 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use gaugewright_core::abac::{AuthorityAttributes, Region, Role, Tenant};
-use gaugewright_core::ids::AuthorityId;
+use gaugedesk_core::abac::{AuthorityAttributes, Region, Role, Tenant};
+use gaugedesk_core::ids::AuthorityId;
 
-use gaugewright_app::identity::IdentityProvider;
+use gaugedesk_app::identity::IdentityProvider;
 
 /// Resolve the verify-sidecar command (an explicit env-override seam,
 /// SELFHOST). A packaged bundle vendors the sidecar (e.g. a bun-compiled binary) and
-/// points here via `GAUGEWRIGHT_SAML_SIDECAR`; the dev build falls back to running the
+/// points here via `GAUGEDESK_SAML_SIDECAR`; the dev build falls back to running the
 /// script on `node` under the repo's `ee/sidecar/saml-verify/verify.mjs`. `None` when
 /// neither is resolvable (the SAML provider is then simply not configured).
 pub fn saml_command_from(env: Option<String>, cwd: Option<&Path>) -> Option<Vec<String>> {
@@ -115,7 +115,7 @@ fn now_epoch_ms() -> i64 {
 /// A SAML `IdentityProvider` backed by the verify sidecar.
 pub struct SamlSidecarIdentityProvider {
     /// The verifier command: program + args (request on stdin, verdict on stdout).
-    /// Production: the vendored bun sidecar (resolved via `GAUGEWRIGHT_SAML_SIDECAR`);
+    /// Production: the vendored bun sidecar (resolved via `GAUGEDESK_SAML_SIDECAR`);
     /// dev: `["node", "ee/sidecar/saml-verify/verify.mjs"]`.
     command: Vec<String>,
     idp_cert_pem: String,

@@ -32,7 +32,7 @@ export const ports = {
     bob: num("GW_E2E_BOB", 7879),
     broker: num("GW_E2E_BROKER", 7900),
     preview: num("GW_E2E_PREVIEW", 4173),
-    // The self-hosted enterprise composition (`gaugewright-enterprise-server`, ee/):
+    // The self-hosted enterprise composition (`gaugedesk-enterprise-server`, ee/):
     // the /admin/* + SSO surface WITHOUT the managed planes — what the combined
     // enterprise workbench drives (enterprise coverage must not require private code).
     enterprise: num("GW_E2E_ENTERPRISE", 7882),

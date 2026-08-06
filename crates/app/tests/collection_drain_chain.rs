@@ -31,9 +31,9 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use gaugewright_app::agent_release::CollectIntoProjectRequest;
-use gaugewright_app::quarantine::{self, ItemStatus};
-use gaugewright_app::{open_control_plane, open_workbench, LockUnpoisoned, SharedWorkbench};
+use gaugedesk_app::agent_release::CollectIntoProjectRequest;
+use gaugedesk_app::quarantine::{self, ItemStatus};
+use gaugedesk_app::{open_control_plane, open_workbench, LockUnpoisoned, SharedWorkbench};
 
 const PROJECT: &str = "proj-default";
 const PLACEMENT: &str = "inst-placement-default";
@@ -208,7 +208,7 @@ async fn a_chat(app: &Router) -> String {
 }
 
 fn drain(workbench: &SharedWorkbench, edge: &str, project: &str) -> Value {
-    let outcome = gaugewright_app::agent_release::collect_into_project(
+    let outcome = gaugedesk_app::agent_release::collect_into_project(
         workbench,
         CollectIntoProjectRequest {
             deployment_id: DEPLOYMENT.to_owned(),
@@ -232,13 +232,13 @@ fn drain(workbench: &SharedWorkbench, edge: &str, project: &str) -> Value {
 /// correlate to something.
 fn park_for_review(workbench: &SharedWorkbench, chat: &str) {
     struct NoModel;
-    impl gaugewright_whip_runtime::gate_runner::GateTransport for NoModel {
+    impl gaugedesk_whip_runtime::gate_runner::GateTransport for NoModel {
         fn fetch(
             &self,
-            _: &gaugewright_whip_runtime::sansio_types::HttpRequest,
+            _: &gaugedesk_whip_runtime::sansio_types::HttpRequest,
         ) -> Result<
-            gaugewright_whip_runtime::sansio_types::HttpResponse,
-            gaugewright_whip_runtime::sansio_types::TransportError,
+            gaugedesk_whip_runtime::sansio_types::HttpResponse,
+            gaugedesk_whip_runtime::sansio_types::TransportError,
         > {
             panic!("review-by-hand must not call a model");
         }
@@ -249,7 +249,7 @@ fn park_for_review(workbench: &SharedWorkbench, chat: &str) {
             PROJECT,
             ARTIFACT,
             chat,
-            &gaugewright_app::gate_service::unusable_coercion_config(),
+            &gaugedesk_app::gate_service::unusable_coercion_config(),
             &NoModel,
         )
         .expect("the gate runs");
@@ -342,7 +342,7 @@ async fn nothing_is_acknowledged_when_the_artifact_cannot_be_opened() {
 
     // The wrong admission scope: the wrap is bound to it, so this is the shape a
     // misrouted or replayed artifact takes.
-    let outcome = gaugewright_app::agent_release::collect_into_project(
+    let outcome = gaugedesk_app::agent_release::collect_into_project(
         &workbench,
         CollectIntoProjectRequest {
             deployment_id: DEPLOYMENT.to_owned(),
@@ -507,7 +507,7 @@ async fn a_reviewer_can_approve_an_item_into_the_workspace() {
     // reduced ceiling, no special resource class. The chat that reviewed it is
     // an ordinary chat.
     assert!(
-        gaugewright_app::resource_store::list(guard.store_ref(), &chat)
+        gaugedesk_app::resource_store::list(guard.store_ref(), &chat)
             .unwrap()
             .is_empty(),
         "an approved item is a workspace file, not a marked resource",
@@ -539,7 +539,7 @@ async fn a_flagged_item_never_becomes_workspace_content() {
     for worktree in guard.engagement_worktrees() {
         assert!(
             !worktree
-                .join(gaugewright_app::gate::approved_path(ARTIFACT))
+                .join(gaugedesk_app::gate::approved_path(ARTIFACT))
                 .exists(),
             "a flagged item must be readable by no agent",
         );
@@ -560,7 +560,7 @@ async fn a_chat_outside_the_project_cannot_review_its_quarantine() {
             "some-other-project",
             ARTIFACT,
             &chat,
-            gaugewright_app::gate::Verdict::Keep,
+            gaugedesk_app::gate::Verdict::Keep,
         )
         .is_err());
 }
@@ -662,7 +662,7 @@ fn a_drain_in_flight_does_not_hold_the_workbench() {
     let drainer = {
         let workbench = Arc::clone(&workbench);
         std::thread::spawn(move || {
-            gaugewright_app::agent_release::collect_into_project(
+            gaugedesk_app::agent_release::collect_into_project(
                 &workbench,
                 CollectIntoProjectRequest {
                     deployment_id: DEPLOYMENT.to_owned(),
@@ -714,16 +714,16 @@ fn a_drain_in_flight_does_not_hold_the_workbench() {
 /// A scripted coercion provider, so the gate's model leg is deterministic.
 struct Screener(&'static str);
 
-impl gaugewright_whip_runtime::gate_runner::GateTransport for Screener {
+impl gaugedesk_whip_runtime::gate_runner::GateTransport for Screener {
     fn fetch(
         &self,
-        _request: &gaugewright_whip_runtime::sansio_types::HttpRequest,
+        _request: &gaugedesk_whip_runtime::sansio_types::HttpRequest,
     ) -> Result<
-        gaugewright_whip_runtime::sansio_types::HttpResponse,
-        gaugewright_whip_runtime::sansio_types::TransportError,
+        gaugedesk_whip_runtime::sansio_types::HttpResponse,
+        gaugedesk_whip_runtime::sansio_types::TransportError,
     > {
         let disposition = self.0;
-        Ok(gaugewright_whip_runtime::sansio_types::HttpResponse {
+        Ok(gaugedesk_whip_runtime::sansio_types::HttpResponse {
             status: 200,
             body: json!({
                 "output": [{
@@ -755,14 +755,14 @@ async fn a_projects_own_gate_screens_a_drained_item_into_the_workspace() {
     let repo = dir
         .path()
         .join("targets")
-        .join(gaugewright_app::library_state::managed_project_target_id(
+        .join(gaugedesk_app::library_state::managed_project_target_id(
             PROJECT,
         ))
         .join("repo");
-    gaugewright_app::gate::install(&repo, gaugewright_app::gate::GateKind::CoerceScreen).unwrap();
+    gaugedesk_app::gate::install(&repo, gaugedesk_app::gate::GateKind::CoerceScreen).unwrap();
 
-    let coerce = gaugewright_whip_runtime::gate_runner::GateCoercionConfig {
-        backend: gaugewright_whip_runtime::gate_runner::CoerceBackend::OpenAi,
+    let coerce = gaugedesk_whip_runtime::gate_runner::GateCoercionConfig {
+        backend: gaugedesk_whip_runtime::gate_runner::CoerceBackend::OpenAi,
         provider_id: "test".into(),
         base_url: "https://example.invalid/v1/responses".into(),
         api_key: "test".into(),
@@ -813,8 +813,8 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
     drain(&workbench, &edge, PROJECT);
     let chat = a_chat(&app).await;
 
-    let coerce = gaugewright_whip_runtime::gate_runner::GateCoercionConfig {
-        backend: gaugewright_whip_runtime::gate_runner::CoerceBackend::OpenAi,
+    let coerce = gaugedesk_whip_runtime::gate_runner::GateCoercionConfig {
+        backend: gaugedesk_whip_runtime::gate_runner::CoerceBackend::OpenAi,
         provider_id: "unused".into(),
         base_url: "https://example.invalid/v1/responses".into(),
         api_key: "unused".into(),
@@ -824,13 +824,13 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
     // A transport that must never be reached: review-by-hand asks a person and
     // calls no model, so a request here would mean the wrong gate ran.
     struct NoModel;
-    impl gaugewright_whip_runtime::gate_runner::GateTransport for NoModel {
+    impl gaugedesk_whip_runtime::gate_runner::GateTransport for NoModel {
         fn fetch(
             &self,
-            _: &gaugewright_whip_runtime::sansio_types::HttpRequest,
+            _: &gaugedesk_whip_runtime::sansio_types::HttpRequest,
         ) -> Result<
-            gaugewright_whip_runtime::sansio_types::HttpResponse,
-            gaugewright_whip_runtime::sansio_types::TransportError,
+            gaugedesk_whip_runtime::sansio_types::HttpResponse,
+            gaugedesk_whip_runtime::sansio_types::TransportError,
         > {
             panic!("review-by-hand must not call a model");
         }
@@ -846,9 +846,9 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
     // ADR 0117 §5: the review surface counts what awaits a *person*. A parked
     // item is exactly that, and it is one — not the whole quarantine.
     let state_root = workbench.lock_unpoisoned().root_path();
-    let gate_state = gaugewright_app::gate_service::gate_state_dir(&state_root, PROJECT);
+    let gate_state = gaugedesk_app::gate_service::gate_state_dir(&state_root, PROJECT);
     assert_eq!(
-        gaugewright_whip_runtime::gate_runner::reviews_awaiting_a_person(&gate_state)
+        gaugedesk_whip_runtime::gate_runner::reviews_awaiting_a_person(&gate_state)
             .expect("the gate's parked reviews are readable"),
         1,
         "a parked review is one item awaiting a person",
@@ -890,7 +890,7 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
             PROJECT,
             ARTIFACT,
             &chat,
-            gaugewright_app::gate::Verdict::Keep,
+            gaugedesk_app::gate::Verdict::Keep,
             &coerce,
             &NoModel,
         )
@@ -911,7 +911,7 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
     // issue that asked the question open, so an open-issue count would still
     // report a question that has just been answered.
     assert_eq!(
-        gaugewright_whip_runtime::gate_runner::reviews_awaiting_a_person(&gate_state)
+        gaugedesk_whip_runtime::gate_runner::reviews_awaiting_a_person(&gate_state)
             .expect("readable"),
         0,
         "an answered review no longer awaits a person",

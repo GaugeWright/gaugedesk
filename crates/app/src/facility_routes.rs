@@ -238,7 +238,7 @@ mod tests {
     }
 
     fn router() -> Router {
-        let store = gaugewright_store::Store::open_in_memory().unwrap();
+        let store = gaugedesk_store::Store::open_in_memory().unwrap();
         let wb: SharedWorkbench = Arc::new(Mutex::new(Workbench::new(store)));
         router_with(wb)
     }
@@ -356,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn invitation_routes_expose_metadata_then_accept_exact_person() {
-        let mut store = gaugewright_store::Store::open_in_memory().unwrap();
+        let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
         let actor = crate::LOCAL_AUTHORITY;
         let owner = "person:owner";
         let tenant = crate::tenancy::provision_organization(

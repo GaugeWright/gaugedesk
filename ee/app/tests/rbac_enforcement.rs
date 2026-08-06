@@ -14,24 +14,24 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use gaugewright_app::identity::LoopbackIdentityProvider;
-use gaugewright_app::library::{
+use gaugedesk_app::identity::LoopbackIdentityProvider;
+use gaugedesk_app::library::{
     Admission, ChatRecord, ChatTargetBindingRecord, InstanceKind, InstanceRecord,
     PlacementTargetsRecord, ProjectRecord, RecordOp, TargetCapabilities, LIBRARY_SCOPE,
 };
-use gaugewright_app::org::{
+use gaugedesk_app::org::{
     MembershipRecord, MembershipStatus, RecordOp as OrgRecordOp, ORG_ID, ORG_SCOPE,
 };
-use gaugewright_app::{resource_store, Workbench};
-use gaugewright_core::abac::AuthorityAttributes;
-use gaugewright_core::boundary::Authority;
-use gaugewright_core::ids::AuthorityId;
-use gaugewright_core::resource::{
+use gaugedesk_app::{resource_store, Workbench};
+use gaugedesk_core::abac::AuthorityAttributes;
+use gaugedesk_core::boundary::Authority;
+use gaugedesk_core::ids::AuthorityId;
+use gaugedesk_core::resource::{
     ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
 };
-use gaugewright_ee::org_routes::enterprise_control_plane;
-use gaugewright_store::Store;
-use gaugewright_workspace::Instance;
+use gaugedesk_ee::org_routes::enterprise_control_plane;
+use gaugedesk_store::Store;
+use gaugedesk_workspace::Instance;
 
 mod support;
 use support::{administration_command, administration_document};
@@ -146,19 +146,19 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
     );
     // Seed the library: a project, a using-instance bound into it, and a chat on that instance.
     let project = ProjectRecord {
-        schema: gaugewright_app::library::LIBRARY_RECORD_SCHEMA,
+        schema: gaugedesk_app::library::LIBRARY_RECORD_SCHEMA,
         extra: Default::default(),
         id: "proj-acme".into(),
         op: RecordOp::Upsert,
         name: "Acme".into(),
         is_default: false,
-        home_id: gaugewright_core::ids::HomeId::new("home:local-user"),
+        home_id: gaugedesk_core::ids::HomeId::new("home:local-user"),
         network_isolated: false,
         run_purpose: None,
         deployment_mode: None,
     };
     let placement = InstanceRecord {
-        schema: gaugewright_app::library::LIBRARY_RECORD_SCHEMA,
+        schema: gaugedesk_app::library::LIBRARY_RECORD_SCHEMA,
         extra: Default::default(),
         id: "i-acme".into(),
         op: RecordOp::Upsert,
@@ -169,7 +169,7 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
         admission: Admission::Active,
     };
     let chat = ChatRecord {
-        schema: gaugewright_app::library::LIBRARY_RECORD_SCHEMA,
+        schema: gaugedesk_app::library::LIBRARY_RECORD_SCHEMA,
         extra: Default::default(),
         id: "chat-acme".into(),
         op: RecordOp::Upsert,
@@ -205,7 +205,7 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
             LIBRARY_SCOPE,
             "placement_targets",
             &serde_json::to_string(&PlacementTargetsRecord {
-                schema: gaugewright_app::library::LIBRARY_RECORD_SCHEMA,
+                schema: gaugedesk_app::library::LIBRARY_RECORD_SCHEMA,
                 extra: Default::default(),
                 placement_id: "i-acme".into(),
                 op: RecordOp::Upsert,
@@ -219,7 +219,7 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
             LIBRARY_SCOPE,
             "chat_target",
             &serde_json::to_string(&ChatTargetBindingRecord {
-                schema: gaugewright_app::library::LIBRARY_RECORD_SCHEMA,
+                schema: gaugedesk_app::library::LIBRARY_RECORD_SCHEMA,
                 extra: Default::default(),
                 chat_id: "chat-acme".into(),
                 op: RecordOp::Upsert,

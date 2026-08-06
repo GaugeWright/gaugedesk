@@ -1,6 +1,6 @@
 //! Workbench-local authorization and actor resolution helpers — the shared
 //! admission substrate the route compositions use: the Administration
-//! surface (`gaugewright-ee`) and the private settlement plane
+//! surface (`gaugedesk-ee`) and the private settlement plane
 //! (`gaugewright-cloud-settlement`) both gate their routes through these seams.
 
 use std::collections::BTreeSet;
@@ -12,11 +12,11 @@ use axum::response::IntoResponse;
 use crate::{identity, net_http, org, resource_store, throttle, Workbench};
 
 /// Whether this deployment is the hosted **web account** (`ADR 0077`) — the control-plane hub at
-/// `auth.gaugewright.com`. Set by `GAUGEWRIGHT_WEB_ACCOUNT=1`. In this mode the account/data routes
+/// `auth.gaugewright.com`. Set by `GAUGEDESK_WEB_ACCOUNT=1`. In this mode the account/data routes
 /// require a valid session (no bootstrap-passthrough); the desktop/enterprise paths are unchanged.
-/// (The `gaugewright-ee` login shell reads the same env for its own provisioning hook.)
+/// (The `gaugedesk-ee` login shell reads the same env for its own provisioning hook.)
 pub fn web_account_mode() -> bool {
-    std::env::var("GAUGEWRIGHT_WEB_ACCOUNT")
+    gaugedesk_env::var("WEB_ACCOUNT")
         .map(|v| v == "1")
         .unwrap_or(false)
 }
@@ -48,12 +48,12 @@ impl ProjectVisibility {
 /// Gate an admin request by capability (`RBAC-5`); returns the error response to
 /// short-circuit with, or `None` to proceed. `cap = None` is a read (any console
 /// access). Ungated in single-user mode (no IdP) — see [`Workbench::authorize`].
-/// `pub` so the extracted enterprise band (`gaugewright-ee`) and settlement plane
+/// `pub` so the extracted enterprise band (`gaugedesk-ee`) and settlement plane
 /// (`gaugewright-cloud-settlement`) reuse the RBAC gate across the crate boundary.
 pub fn deny(
     wb: &Workbench,
     headers: &HeaderMap,
-    cap: Option<gaugewright_core::rbac::Capability>,
+    cap: Option<gaugedesk_core::rbac::Capability>,
 ) -> Option<axum::response::Response> {
     wb.authorize(net_http::bearer(headers), cap)
         .err()
@@ -109,7 +109,7 @@ impl Workbench {
     /// [`with_identity_provider`](Self::with_identity_provider). `POST /admin/sso`
     /// uses this to (de)activate OIDC verification from the stored connection without
     /// a restart (`ID-3` enterprise-mode activation — the ee band's
-    /// `auth_oidc::build_oidc_idp`, `gaugewright-ee`).
+    /// `auth_oidc::build_oidc_idp`, `gaugedesk-ee`).
     pub fn set_identity_provider(
         &mut self,
         idp: Option<Arc<dyn identity::IdentityProvider + Send + Sync>>,
@@ -136,7 +136,7 @@ impl Workbench {
         &self,
         bearer: Option<&str>,
         org_scope: &str,
-    ) -> Result<Vec<gaugewright_core::rbac::Capability>, (StatusCode, &'static str)> {
+    ) -> Result<Vec<gaugedesk_core::rbac::Capability>, (StatusCode, &'static str)> {
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let provisioned = org
@@ -166,9 +166,9 @@ impl Workbench {
         let Some(role) = org.role_of(&authority) else {
             return Ok(Vec::new());
         };
-        Ok(gaugewright_core::rbac::Capability::ALL
+        Ok(gaugedesk_core::rbac::Capability::ALL
             .into_iter()
-            .filter(|&capability| gaugewright_core::rbac::role_can(&role, capability))
+            .filter(|&capability| gaugedesk_core::rbac::role_can(&role, capability))
             .collect())
     }
 
@@ -186,7 +186,7 @@ impl Workbench {
     pub fn authorize(
         &self,
         bearer: Option<&str>,
-        cap: Option<gaugewright_core::rbac::Capability>,
+        cap: Option<gaugedesk_core::rbac::Capability>,
     ) -> Result<(), (StatusCode, &'static str)> {
         let Some(idp) = &self.idp else {
             if self.hosted_home_mode() {
@@ -213,9 +213,9 @@ impl Workbench {
             return Err((StatusCode::FORBIDDEN, "not an active member"));
         };
         match cap {
-            None if gaugewright_core::rbac::can_access_console(&role) => Ok(()),
+            None if gaugedesk_core::rbac::can_access_console(&role) => Ok(()),
             None => Err((StatusCode::FORBIDDEN, "role has no console access")),
-            Some(c) if gaugewright_core::rbac::role_can(&role, c) => Ok(()),
+            Some(c) if gaugedesk_core::rbac::role_can(&role, c) => Ok(()),
             Some(_) => Err((StatusCode::FORBIDDEN, "role lacks capability")),
         }
     }
@@ -268,7 +268,7 @@ impl Workbench {
     /// bootstrap (not provisioned) ⇒ the best-effort actor; otherwise an active member, with
     /// `owner`/`admin` seeing every project and any other member needing an explicit grant
     /// (`INV-20`, fail-closed). `pub` so the extracted enterprise band's ENTSEC-1
-    /// data-route middleware (`gaugewright-ee`) admits through the same fold-once seam.
+    /// data-route middleware (`gaugedesk-ee`) admits through the same fold-once seam.
     pub fn admit_data_request(
         &self,
         bearer: Option<&str>,
@@ -395,7 +395,7 @@ impl Workbench {
     pub fn authenticate_identity(
         &self,
         bearer: Option<&str>,
-    ) -> Result<gaugewright_core::ids::AuthorityId, (StatusCode, &'static str)> {
+    ) -> Result<gaugedesk_core::ids::AuthorityId, (StatusCode, &'static str)> {
         let Some(idp) = &self.idp else {
             if self.hosted_home_mode() {
                 return Err((
@@ -444,8 +444,8 @@ impl Workbench {
         };
         match org.role_of(authority.as_str()) {
             Some(role)
-                if role == gaugewright_core::abac::Role::owner()
-                    || role == gaugewright_core::abac::Role::admin() =>
+                if role == gaugedesk_core::abac::Role::owner()
+                    || role == gaugedesk_core::abac::Role::admin() =>
             {
                 ProjectVisibility::All // the client org's own people see every project
             }
@@ -475,7 +475,7 @@ impl Workbench {
     /// resolve through the library (`chat → instance → project`); a `/projects/{id}` or
     /// `/placements/{id}` path carries / resolves the id directly. An unknown id resolving to
     /// `None` is safe: the handler itself 404s, leaking nothing. `pub` so the extracted
-    /// enterprise band's ENTSEC-1 middleware (`gaugewright-ee`) resolves the same scope.
+    /// enterprise band's ENTSEC-1 middleware (`gaugedesk-ee`) resolves the same scope.
     pub fn scope_project_of_path(&self, path: &str) -> Option<String> {
         let mut segs = path.trim_start_matches('/').split('/');
         match segs.next()? {
@@ -518,8 +518,8 @@ impl Workbench {
             return false;
         };
         match org.role_of(authority.as_str()) {
-            Some(r) if r == gaugewright_core::abac::Role::owner() => true,
-            Some(r) if r == gaugewright_core::abac::Role::admin() => {
+            Some(r) if r == gaugedesk_core::abac::Role::owner() => true,
+            Some(r) if r == gaugedesk_core::abac::Role::admin() => {
                 match org.team_of(authority.as_str()) {
                     None => true, // org-wide admin
                     Some(actor_team) => target_team == Some(actor_team.as_str()),
@@ -572,7 +572,7 @@ impl Workbench {
 
     /// Gate an export by the org's resource-floor policy (`RBAC-6`; the export half
     /// of `RBAC-5`). Single-user (no IdP) ⇒ open. Enterprise + provisioned ⇒ the
-    /// actor authenticates and the org [`Policy`](gaugewright_core::abac::Policy) must
+    /// actor authenticates and the org [`Policy`](gaugedesk_core::abac::Policy) must
     /// permit `Export` for its role — restrict-only, so e.g. a `viewer` is denied
     /// (`viewer ⇒ no export`), fail-closed (`INV-20`). Resource-attribute-specific
     /// rules (pii/region) are enforced by the resource-export protection path; this
@@ -596,19 +596,19 @@ impl Workbench {
         let Some(role) = org.role_of(authority.as_str()) else {
             return Err((StatusCode::FORBIDDEN, "not an active member"));
         };
-        let actor = gaugewright_core::abac::AuthorityAttributes {
+        let actor = gaugedesk_core::abac::AuthorityAttributes {
             roles: std::iter::once(role).collect(),
             ..Default::default()
         };
-        let decision = gaugewright_core::abac::Decision {
+        let decision = gaugedesk_core::abac::Decision {
             actor,
-            resource: gaugewright_core::abac::ResourceAttributes::default(),
-            action: gaugewright_core::abac::Action::Export,
-            context: gaugewright_core::abac::Context {
+            resource: gaugedesk_core::abac::ResourceAttributes::default(),
+            action: gaugedesk_core::abac::Action::Export,
+            context: gaugedesk_core::abac::Context {
                 ceiling_attested: false,
             },
         };
-        if gaugewright_core::abac::permitted_with_policy(true, &org.policy(), &decision) {
+        if gaugedesk_core::abac::permitted_with_policy(true, &org.policy(), &decision) {
             Ok(())
         } else {
             Err((StatusCode::FORBIDDEN, "role is not permitted to export"))
@@ -618,7 +618,7 @@ impl Workbench {
     /// **SECAUD-5 / CORE-6**: enforce the **resource-attribute** ABAC floor on a specific
     /// resource's export — the live-route half of [ADR 0032] step 4. Composes the actor's
     /// IdP claims with the resource's persisted classification/region (captured at ingest)
-    /// and the org [`Policy`](gaugewright_core::abac::Policy): restrict-only, so e.g. a `Pii`
+    /// and the org [`Policy`](gaugedesk_core::abac::Policy): restrict-only, so e.g. a `Pii`
     /// resource at an **unattested** ceiling is denied egress even when the role-level gate
     /// and the consent floor would allow it. Solo (no IdP) / not-provisioned ⇒ open
     /// (unchanged); unlabeled (`Regulated`/default) resources are unconstrained by the
@@ -627,7 +627,7 @@ impl Workbench {
         &self,
         bearer: Option<&str>,
         engagement: &str,
-        res_id: &gaugewright_core::resource::ResourceId,
+        res_id: &gaugedesk_core::resource::ResourceId,
     ) -> Result<(), (StatusCode, &'static str)> {
         let Some(idp) = &self.idp else {
             return Ok(()); // single-user local / loopback: ungated
@@ -647,7 +647,7 @@ impl Workbench {
         let actor = idp.claims(&authority);
         // A local/unattested egress edge: a `Pii` resource requires an attested ceiling,
         // so it is denied here (an attested boundary integration would pass `true`).
-        let context = gaugewright_core::abac::Context {
+        let context = gaugedesk_core::abac::Context {
             ceiling_attested: false,
         };
         match resource_store::abac_permits(
@@ -655,7 +655,7 @@ impl Workbench {
             engagement,
             res_id,
             &actor,
-            gaugewright_core::abac::Action::Export,
+            gaugedesk_core::abac::Action::Export,
             context,
             &org.policy(),
             true,
@@ -676,7 +676,7 @@ impl Workbench {
     /// resource's access is *granted* — the access counterpart of
     /// [`authorize_resource_export`](Self::authorize_resource_export). Composes the approving
     /// actor's IdP claims with the resource's persisted classification/region and the org
-    /// [`Policy`](gaugewright_core::abac::Policy): restrict-only, so e.g. a `Pii` resource at an
+    /// [`Policy`](gaugedesk_core::abac::Policy): restrict-only, so e.g. a `Pii` resource at an
     /// **unattested** ceiling is denied a grant even when the consent reducer would allow it.
     /// Solo (no IdP) / not-provisioned ⇒ open (unchanged); unlabeled resources are
     /// unconstrained. Fail-closed (`INV-20`).
@@ -684,7 +684,7 @@ impl Workbench {
         &self,
         bearer: Option<&str>,
         engagement: &str,
-        res_id: &gaugewright_core::resource::ResourceId,
+        res_id: &gaugedesk_core::resource::ResourceId,
     ) -> Result<(), (StatusCode, &'static str)> {
         let Some(idp) = &self.idp else {
             return Ok(()); // single-user local / loopback: ungated
@@ -702,7 +702,7 @@ impl Workbench {
             return Err((StatusCode::UNAUTHORIZED, "authenticate to grant access"));
         };
         let actor = idp.claims(&authority);
-        let context = gaugewright_core::abac::Context {
+        let context = gaugedesk_core::abac::Context {
             ceiling_attested: false,
         };
         match resource_store::abac_permits(
@@ -710,7 +710,7 @@ impl Workbench {
             engagement,
             res_id,
             &actor,
-            gaugewright_core::abac::Action::Access,
+            gaugedesk_core::abac::Action::Access,
             context,
             &org.policy(),
             true,

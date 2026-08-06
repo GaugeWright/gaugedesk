@@ -13,7 +13,7 @@
 //! Regenerate with `npm run capture:collection-vector` in
 //! `whipplescript/crates/whipplescript-host-do/worker`, then copy the file here.
 
-use gaugewright_app::collection_recipient::{
+use gaugedesk_app::collection_recipient::{
     ingest_sealed_collection, open_sealed_collection, CollectionIngestError, CollectionOpenError,
     SealedCollection,
 };

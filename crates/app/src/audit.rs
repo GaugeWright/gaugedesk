@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use gaugewright_core::ids::{AuthorityId, PublicKey};
-use gaugewright_core::signature::{verify_signature, Signature};
-use gaugewright_store::{AdmitError, ChainedRecordFact, Store};
+use gaugedesk_core::ids::{AuthorityId, PublicKey};
+use gaugedesk_core::signature::{verify_signature, Signature};
+use gaugedesk_store::{AdmitError, ChainedRecordFact, Store};
 
 use crate::content_vault;
 use crate::key_store::{FileKeyStore, KeyStore};
@@ -312,7 +312,7 @@ pub(crate) fn configured_audit_signer(root: &Path) -> Arc<dyn KeyStore + Send + 
 
 /// Whether sensitive-read auditing is enabled from deployment env.
 pub(crate) fn configured_audit_reads() -> bool {
-    std::env::var("GAUGEWRIGHT_AUDIT_READS").as_deref() == Ok("1")
+    gaugedesk_env::var("AUDIT_READS").as_deref() == Some("1")
 }
 
 impl Workbench {
@@ -392,7 +392,7 @@ impl Workbench {
 
 /// A blocking HTTP POST — the network seam the real client attaches behind (a thin
 /// `reqwest`/`ureq` wrapper in production; a fake in tests), mirroring the
-/// enterprise band's `identity_oidc::HttpGet` seam (`gaugewright-ee`). Returns the response status
+/// enterprise band's `identity_oidc::HttpGet` seam (`gaugedesk-ee`). Returns the response status
 /// code, or a transport error message. The literal network adapter is the one piece
 /// that needs the outside world — every customer SIEM speaks plain HTTPS, so there is
 /// no SIEM dependency here, only this wrapper.

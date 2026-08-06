@@ -21,7 +21,7 @@
 //! with no rearchitecture: they replace the report-bytes check with real signature
 //! chaining to an Intel/AMD root and real report parsing (ATTEST-15, needs-infra).
 
-use gaugewright_core::attestation::{
+use gaugedesk_core::attestation::{
     AttestationQuote, CodeMeasurement, QuoteRejection, QuoteVerificationResult,
 };
 

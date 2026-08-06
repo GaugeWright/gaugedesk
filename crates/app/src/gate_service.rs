@@ -19,11 +19,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use gaugewright_whip_runtime::gate_runner::{
+use gaugedesk_whip_runtime::gate_runner::{
     deliver_verdict, run_gate, CoerceBackend, Disposition, GateCoercionConfig, GateProgram,
     GateTransport,
 };
-use gaugewright_whip_runtime::sansio_types::{HttpRequest, HttpResponse, TransportError};
+use gaugedesk_whip_runtime::sansio_types::{HttpRequest, HttpResponse, TransportError};
 
 use crate::app_support::LockUnpoisoned;
 use crate::workbench_state::SharedWorkbench;
@@ -196,7 +196,7 @@ pub fn project_gate(
     crate::gate::admit_installed(&repo)?;
     let source = std::fs::read_to_string(repo.join(crate::gate::GATE_PROGRAM_PATH))
         .map_err(|error| crate::gate::GateRefusal::Malformed(vec![error.to_string()]))?;
-    gaugewright_whip_runtime::compile_whip_program(&source)
+    gaugedesk_whip_runtime::compile_whip_program(&source)
         .ir
         .ok_or_else(|| {
             crate::gate::GateRefusal::Malformed(vec!["the gate does not compile".into()])

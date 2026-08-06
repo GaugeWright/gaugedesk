@@ -19,7 +19,7 @@
 //! the complete challenge/quote/accept ceremony; the former handler-only route was
 //! removed under DR-0051 rather than retained as compatibility surface.
 
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_store::{AdmitError, Store};
 
 /// The record kind under which a per-participant attestation challenge is stored in a
 /// boundary scope.

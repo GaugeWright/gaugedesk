@@ -10,7 +10,7 @@
 //!    the log, and commits — bob becomes the project's home;
 //! 4. alice commits its side and becomes the operator.
 //!
-//! The relocation's one-home safety is the verified reducer (`gaugewright_core::handoff`);
+//! The relocation's one-home safety is the verified reducer (`gaugedesk_core::handoff`);
 //! only the transport — the signed offer + log over TLS through the blind broker — is
 //! the integration under test. A relocation to an unpaired peer is refused before any
 //! transport.
@@ -26,13 +26,13 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use gaugewright_app::account::{credentials_in_scope, project_scope};
-use gaugewright_app::federation::Federation;
-use gaugewright_app::open_control_plane;
-use gaugewright_app::Workbench;
-use gaugewright_core::ids::AuthorityId;
-use gaugewright_store::Store;
-use gaugewright_workspace::Instance;
+use gaugedesk_app::account::{credentials_in_scope, project_scope};
+use gaugedesk_app::federation::Federation;
+use gaugedesk_app::open_control_plane;
+use gaugedesk_app::Workbench;
+use gaugedesk_core::ids::AuthorityId;
+use gaugedesk_store::Store;
+use gaugedesk_workspace::Instance;
 
 /// Build a mounted control plane for `authority`; return it plus a handle to its
 /// workbench so the test can seed/read the store directly.
@@ -132,8 +132,8 @@ async fn get_text(app: &Router, uri: &str) -> (StatusCode, String) {
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
-async fn start_broker() -> (String, gaugewright_relay_transport::test_relay::TestRelay) {
-    let relay = gaugewright_relay_transport::test_relay::TestRelay::bind()
+async fn start_broker() -> (String, gaugedesk_relay_transport::test_relay::TestRelay) {
+    let relay = gaugedesk_relay_transport::test_relay::TestRelay::bind()
         .await
         .unwrap();
     (relay.endpoint().to_owned(), relay)
@@ -567,7 +567,7 @@ async fn relocation_carries_the_project_content_bytes_to_the_peer() {
 
         // Lay the target store down on alice's disk and register it in the workbench.
         let dir = _ra.path().join("targets").join("target-acme");
-        let target = gaugewright_workspace::Instance::init_at(&dir).unwrap();
+        let target = gaugedesk_workspace::Instance::init_at(&dir).unwrap();
         target
             .seed_main(&[("dossier.md", "acme financials")])
             .unwrap();
@@ -969,7 +969,7 @@ async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
 async fn an_operator_run_is_gated_by_host_admission() {
     // FED-7 co-drive: the operator (alice) places a project-scoped run on the host (bob);
     // it lands in bob's admission queue until bob allows it, then executes (run-admission.qnt).
-    std::env::set_var("GAUGEWRIGHT_FAKE_AGENT", "1"); // stub turn, no real model/runtime
+    std::env::set_var("GAUGEDESK_FAKE_AGENT", "1"); // stub turn, no real model/runtime
     let (broker, _relay) = start_broker().await;
     let (alice, _wa, _ra) = instance("alice", &broker);
     let (bob, _wb, _rb) = instance("bob", &broker);
@@ -1032,7 +1032,7 @@ async fn an_operator_run_is_gated_by_host_admission() {
 
 #[tokio::test]
 async fn a_federated_run_drives_a_named_hub_workstream_chat_with_crossing_attribution() {
-    std::env::set_var("GAUGEWRIGHT_FAKE_AGENT", "1");
+    std::env::set_var("GAUGEDESK_FAKE_AGENT", "1");
     let (broker, _relay) = start_broker().await;
     let (alice, _wa, _ra) = instance("alice", &broker);
     let (bob, bob_wb, _rb) = workspace_instance("bob", &broker);
@@ -1123,14 +1123,14 @@ async fn a_federated_run_drives_a_named_hub_workstream_chat_with_crossing_attrib
         "workstream contribution is attributed to alice: {events:?}",
     );
 
-    std::env::remove_var("GAUGEWRIGHT_FAKE_AGENT");
+    std::env::remove_var("GAUGEDESK_FAKE_AGENT");
 }
 
 #[tokio::test]
 async fn allow_once_executes_one_queued_run_and_delivers_the_result() {
     // FED-7 co-drive "Allow once": the host admits *this one* queued run, executes it,
     // and delivers the result to the operator — without setting a standing allow.
-    std::env::set_var("GAUGEWRIGHT_FAKE_AGENT", "1");
+    std::env::set_var("GAUGEDESK_FAKE_AGENT", "1");
     let (broker, _relay) = start_broker().await;
     let (alice, _wa, _ra) = instance("alice", &broker);
     let (bob, _wb, _rb) = instance("bob", &broker);

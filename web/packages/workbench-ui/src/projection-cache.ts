@@ -3,7 +3,7 @@
  * it has already received, so the carousel can render *something* while offline
  * or between refreshes (`mobile-client.md`, "Offline & freshness"; MOB-017).
  *
- * The doctrine carried from the core (`gaugewright_core::freshness`, ADR 0037): a
+ * The doctrine carried from the core (`gaugedesk_core::freshness`, ADR 0037): a
  * cached projection must never silently read as current. A value served from the
  * cache is, by construction, no longer connected to the live admitted basis the
  * moment it is stored — so on **read** the cache *decays* its freshness against

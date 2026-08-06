@@ -14,7 +14,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use gaugewright_core::ids::AuthorityId;
+use gaugedesk_core::ids::AuthorityId;
 use serde_json::json;
 
 use crate::home_admission::{HomeAdmissionToken, HOME_ADMISSION_HEADER};
@@ -224,8 +224,8 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use gaugewright_core::abac::AuthorityAttributes;
-    use gaugewright_core::ids::AuthorityId;
+    use gaugedesk_core::abac::AuthorityAttributes;
+    use gaugedesk_core::ids::AuthorityId;
 
     use crate::identity::LoopbackIdentityProvider;
     use crate::library::{
@@ -342,7 +342,7 @@ mod tests {
                 op: RecordOp::Upsert,
                 name: "Foreign".into(),
                 is_default: false,
-                home_id: gaugewright_core::ids::HomeId::new("home:somewhere-else"),
+                home_id: gaugedesk_core::ids::HomeId::new("home:somewhere-else"),
                 network_isolated: false,
                 run_purpose: None,
                 deployment_mode: None,

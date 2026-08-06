@@ -23,7 +23,7 @@
 use std::io;
 use std::path::Path;
 
-use gaugewright_store::Store;
+use gaugedesk_store::Store;
 
 use crate::quarantine::{self, ItemStatus, QuarantineStore};
 
@@ -398,13 +398,13 @@ impl std::error::Error for GateRefusal {}
 /// shipped constants: what runs is what the author has, which after ADR 0110 §5
 /// may differ from what shipped.
 pub fn admit(program: &str, envelope: &str) -> Result<(), GateRefusal> {
-    let verified = gaugewright_whip_runtime::ifc::VerifiedEnvelope::verify_text(envelope)
+    let verified = gaugedesk_whip_runtime::ifc::VerifiedEnvelope::verify_text(envelope)
         .map_err(GateRefusal::Envelope)?;
-    let compiled = gaugewright_whip_runtime::compile_whip_program(program);
+    let compiled = gaugedesk_whip_runtime::compile_whip_program(program);
     let Some(ir) = compiled.ir else {
         return Err(GateRefusal::Malformed(compiled.diagnostics));
     };
-    let diagnostics = gaugewright_whip_runtime::ifc::check_with_envelope(&ir, &verified);
+    let diagnostics = gaugedesk_whip_runtime::ifc::check_with_envelope(&ir, &verified);
     if diagnostics.is_empty() {
         return Ok(());
     }

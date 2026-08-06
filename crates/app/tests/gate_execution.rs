@@ -17,11 +17,11 @@
 
 use std::cell::RefCell;
 
-use gaugewright_app::gate::{COERCE_SCREEN_ENVELOPE, COERCE_SCREEN_GATE};
-use gaugewright_whip_runtime::gate_runner::{
+use gaugedesk_app::gate::{COERCE_SCREEN_ENVELOPE, COERCE_SCREEN_GATE};
+use gaugedesk_whip_runtime::gate_runner::{
     run_gate, Disposition, GateCoercionConfig, GateTransport,
 };
-use gaugewright_whip_runtime::sansio_types::{HttpRequest, HttpResponse, TransportError};
+use gaugedesk_whip_runtime::sansio_types::{HttpRequest, HttpResponse, TransportError};
 use whipplescript_kernel::coerce_native::CoerceProvider;
 
 /// A provider that answers with one scripted disposition and records what it
@@ -205,7 +205,7 @@ fn the_gate_that_runs_is_the_gate_that_was_admitted() {
     // Execution and admission must agree on the same pair. Running a program
     // the checker never saw is the hole this ordering closes.
     assert_eq!(
-        gaugewright_app::gate::admit(COERCE_SCREEN_GATE, COERCE_SCREEN_ENVELOPE),
+        gaugedesk_app::gate::admit(COERCE_SCREEN_GATE, COERCE_SCREEN_ENVELOPE),
         Ok(())
     );
     let quarantine = staged(r#"{"q1":"x"}"#);

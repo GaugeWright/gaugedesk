@@ -9,19 +9,19 @@
 //! id (`data.md`, `INV-5`/`INV-6`) — an `Upsert` sets, a `Tombstone` removes — held
 //! in a reserved `org` scope. This module is the pure data model + projection (no
 //! `Workbench`/route deps); the CRUD routes and their workspace-change notifications
-//! live in the ee band's `org_routes` (`gaugewright-ee`, `ee/app` — SPLIT-1).
+//! live in the ee band's `org_routes` (`gaugedesk-ee`, `ee/app` — SPLIT-1).
 //! Adds no protection invariant (ADR 0020): the org
 //! lives inside one authority's domain.
 //!
-//! [[authority]]: gaugewright_core::ids::AuthorityId
+//! [[authority]]: gaugedesk_core::ids::AuthorityId
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use gaugewright_core::abac::{Policy, Role};
-use gaugewright_core::boundary_lifecycle::PlacementPolicy;
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::abac::{Policy, Role};
+use gaugedesk_core::boundary_lifecycle::PlacementPolicy;
+use gaugedesk_store::{AdmitError, Store};
 
 // Reuse the library's latest-wins / tombstone record op — same record discipline.
 pub use crate::library::RecordOp;
@@ -90,7 +90,7 @@ pub struct OrgRecord {
 /// One person in the directory (B11): the [[authority]] they authenticate to, their
 /// email, their role, status, and whether the IdP (SCIM) owns their lifecycle.
 ///
-/// [[authority]]: gaugewright_core::ids::AuthorityId
+/// [[authority]]: gaugedesk_core::ids::AuthorityId
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MembershipRecord {
     /// Stable member id (the authority string for a directly-known member, or a
@@ -128,7 +128,7 @@ pub enum SsoProtocol {
 }
 
 /// Which id-token claims carry the ABAC attributes the verifier maps (B12 / `ID-3`):
-/// the admin-configurable home for what was previously only a `GAUGEWRIGHT_OIDC_*_CLAIM`
+/// the admin-configurable home for what was previously only a `GAUGEDESK_OIDC_*_CLAIM`
 /// env knob. Every field is optional — unset means "fall back to the env knob, else do
 /// not map that attribute" (fail-closed: no attribute is safer than a wrong one). The
 /// subject defaults to `sub` (the OIDC stable identifier) when unset.
@@ -864,11 +864,11 @@ mod tests {
         let empty = Org::default();
         assert_eq!(
             empty.policy(),
-            gaugewright_core::abac::Policy::enterprise_example()
+            gaugedesk_core::abac::Policy::enterprise_example()
         );
 
         // A stored policy round-trips and overrides the default.
-        let custom = gaugewright_core::abac::Policy::default(); // no rules
+        let custom = gaugedesk_core::abac::Policy::default(); // no rules
         let rec = PolicyRecord {
             id: ORG_ID.into(),
             op: RecordOp::Upsert,

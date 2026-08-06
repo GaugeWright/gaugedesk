@@ -2,7 +2,7 @@
  * The mobile **Files pane** (`mobile-client.md`, MOB-015): the worktree tree
  * shown at the `files` carousel stop. It lists every handle **by name** — a
  * handle always names something — while keeping the payload behind its access
- * basis (`INV-10`, `gaugewright_core::resource_access`: `name_visible()` is always
+ * basis (`INV-10`, `gaugedesk_core::resource_access`: `name_visible()` is always
  * true, `payload_accessible()` only once `Granted`). Picking a *granted* file
  * advances the carousel to the `content` pane (MOB-016); a *locked* file offers
  * to request access rather than silently doing nothing.

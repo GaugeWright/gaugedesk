@@ -2,7 +2,7 @@
  * The mobile **inline merge/review approval card** (`mobile-client.md`, MOB-031):
  * the card threaded into the chat transcript when a turn surfaces a result that
  * needs approval. It is the carousel's answer to the desktop output catalog:
- * the same conjunctive-consent review lifecycle (`gaugewright_core::review`, `INV-7`),
+ * the same conjunctive-consent review lifecycle (`gaugedesk_core::review`, `INV-7`),
  * but inline in the chat stop rather than a second shelf the phone has no room for.
  *
  * Like {@link AccessRequestPanel} / {@link MobileChat} / {@link Carousel} this is a

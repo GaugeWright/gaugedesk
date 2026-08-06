@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use gaugewright_core::{
+use gaugedesk_core::{
     ids::{DeviceId, HomeId, PublicKey},
     mobile_machine_session::{
         enrollment_challenge_bytes, session_challenge_bytes, ControllerCommand, ControllerPhase,
@@ -647,7 +647,7 @@ async fn post_revoke(
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn folded_grants(store: &gaugewright_store::Store) -> Vec<ControllerGrantRecord> {
+fn folded_grants(store: &gaugedesk_store::Store) -> Vec<ControllerGrantRecord> {
     let mut grants = BTreeMap::<String, ControllerGrantRecord>::new();
     for payload in store.records(SCOPE, KIND).unwrap_or_default() {
         if let Ok(record) = serde_json::from_str::<ControllerGrantRecord>(&payload) {
@@ -664,7 +664,7 @@ fn folded_grants(store: &gaugewright_store::Store) -> Vec<ControllerGrantRecord>
     grants.into_values().collect()
 }
 
-fn active_grant(store: &gaugewright_store::Store, grant_id: &str) -> Option<ControllerGrantRecord> {
+fn active_grant(store: &gaugedesk_store::Store, grant_id: &str) -> Option<ControllerGrantRecord> {
     folded_grants(store)
         .into_iter()
         .find(|grant| grant.id == grant_id && grant.status == ControllerGrantStatus::Active)

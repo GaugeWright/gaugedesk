@@ -77,12 +77,12 @@ export default defineConfig({
             timeout: 30_000,
             env: {
                 FED_PORT: String(ports.alice),
-                GAUGEWRIGHT_RELAY_ENDPOINT: brokerAddr,
-                GAUGEWRIGHT_E2E_STATE: aliceState,
-                GAUGEWRIGHT_ALLOWED_ORIGINS: previewURL,
+                GAUGEDESK_RELAY_ENDPOINT: brokerAddr,
+                GAUGEDESK_E2E_STATE: aliceState,
+                GAUGEDESK_ALLOWED_ORIGINS: previewURL,
                 // The desktop account handoff redeems at THIS run's stand-in
                 // Hub (LOGIN-5), never the production default.
-                GAUGEWRIGHT_ACCOUNT_HUB_URL: `http://127.0.0.1:${ports.hub}`,
+                GAUGEDESK_ACCOUNT_HUB_URL: `http://127.0.0.1:${ports.hub}`,
             },
         },
         // The federation peer (authority `bob`) — only the cross-machine scenarios use
@@ -94,10 +94,10 @@ export default defineConfig({
             timeout: 30_000,
             env: {
                 FED_PORT: String(ports.bob),
-                GAUGEWRIGHT_AUTHORITY: "bob",
-                GAUGEWRIGHT_RELAY_ENDPOINT: brokerAddr,
-                GAUGEWRIGHT_E2E_STATE: bobState,
-                GAUGEWRIGHT_ALLOWED_ORIGINS: previewURL,
+                GAUGEDESK_AUTHORITY: "bob",
+                GAUGEDESK_RELAY_ENDPOINT: brokerAddr,
+                GAUGEDESK_E2E_STATE: bobState,
+                GAUGEDESK_ALLOWED_ORIGINS: previewURL,
             },
         },
         // The composition under test at the preview origin. Both bundles bake
@@ -118,7 +118,7 @@ export default defineConfig({
                 reuseExistingServer: false,
                 timeout: 30_000,
             },
-        // The SELF-HOSTED enterprise composition (`gaugewright-enterprise-server`,
+        // The SELF-HOSTED enterprise composition (`gaugedesk-enterprise-server`,
         // ee/): the /admin/* + SSO surface without the managed planes. The
         // combined enterprise-workbench scenarios point at it via `?cp=` — enterprise
         // coverage runs against ee code only, never the private cloud repo.
@@ -129,8 +129,8 @@ export default defineConfig({
             timeout: 30_000,
             env: {
                 ENTERPRISE_PORT: String(ports.enterprise),
-                GAUGEWRIGHT_E2E_STATE: enterpriseState,
-                GAUGEWRIGHT_ALLOWED_ORIGINS: [
+                GAUGEDESK_E2E_STATE: enterpriseState,
+                GAUGEDESK_ALLOWED_ORIGINS: [
                     previewURL,
                     new URL(enterpriseAppURL).origin,
                 ].join(","),

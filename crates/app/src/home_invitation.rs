@@ -11,7 +11,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use gaugewright_core::rbac::Capability;
+use gaugedesk_core::rbac::Capability;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -102,14 +102,13 @@ fn decode_envelope(encoded: &str) -> Option<InvitationEnvelope> {
 }
 
 fn invitation_url(encoded: &str) -> String {
-    let console = std::env::var("GAUGEWRIGHT_CONSOLE_URL")
-        .ok()
+    let console = gaugedesk_env::var("CONSOLE_URL")
         .filter(|url| !url.trim().is_empty())
         .unwrap_or_else(|| "https://desk.gaugewright.com".to_owned());
     format!("{}/invite?d={encoded}", console.trim_end_matches('/'))
 }
 
-fn latest_invitation(store: &gaugewright_store::Store, id: &str) -> Option<HomeInvitationRecord> {
+fn latest_invitation(store: &gaugedesk_store::Store, id: &str) -> Option<HomeInvitationRecord> {
     store
         .records(ORG_SCOPE, INVITATION_KIND)
         .ok()?
@@ -328,8 +327,8 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use gaugewright_core::abac::AuthorityAttributes;
-    use gaugewright_core::ids::AuthorityId;
+    use gaugedesk_core::abac::AuthorityAttributes;
+    use gaugedesk_core::ids::AuthorityId;
 
     use crate::home_admission::HOME_ADMISSION_HEADER;
     use crate::identity::LoopbackIdentityProvider;

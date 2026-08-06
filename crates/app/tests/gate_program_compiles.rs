@@ -9,7 +9,7 @@
 //! This compiles the program. It does not run it — executing the gate needs a
 //! provider binding for the `coerce`, which is the remaining half of GATE-3.
 
-use gaugewright_app::gate::{
+use gaugedesk_app::gate::{
     COERCE_SCREEN_ENVELOPE, COERCE_SCREEN_GATE, REVIEW_BY_HAND_ENVELOPE, REVIEW_BY_HAND_GATE,
 };
 
@@ -32,7 +32,7 @@ fn the_shipped_envelope_parses_and_authorizes_the_crossing() {
     // `from_dsl` is the real check: it accepts only a well-formed envelope, so a
     // malformed `grant endorse` clause fails here rather than at the first run.
     // That the clause is *present* is asserted beside the program text itself.
-    gaugewright_whip_runtime::ifc::Envelope::from_dsl(COERCE_SCREEN_ENVELOPE)
+    gaugedesk_whip_runtime::ifc::Envelope::from_dsl(COERCE_SCREEN_ENVELOPE)
         .expect("the shipped envelope parses");
 }
 
@@ -45,7 +45,7 @@ fn the_shipped_envelope_parses_and_authorizes_the_crossing() {
 /// working gate right up until a real run.
 #[test]
 fn the_endorsed_crossing_is_refused_without_its_grant() {
-    use gaugewright_whip_runtime::ifc::{check_with_envelope, VerifiedEnvelope};
+    use gaugedesk_whip_runtime::ifc::{check_with_envelope, VerifiedEnvelope};
 
     let ir = whipplescript_parser::compile_program(COERCE_SCREEN_GATE)
         .ir
@@ -97,7 +97,7 @@ fn the_shipped_review_gate_compiles() {
 
 #[test]
 fn the_review_gate_envelope_parses() {
-    gaugewright_whip_runtime::ifc::VerifiedEnvelope::verify_text(REVIEW_BY_HAND_ENVELOPE)
+    gaugedesk_whip_runtime::ifc::VerifiedEnvelope::verify_text(REVIEW_BY_HAND_ENVELOPE)
         .expect("the shipped review envelope parses");
 }
 
@@ -118,9 +118,9 @@ fn the_review_gate_envelope_parses() {
 /// gate now carries it.
 #[test]
 fn the_shipped_gates_admit() {
-    gaugewright_app::gate::admit(COERCE_SCREEN_GATE, COERCE_SCREEN_ENVELOPE)
+    gaugedesk_app::gate::admit(COERCE_SCREEN_GATE, COERCE_SCREEN_ENVELOPE)
         .expect("the screening gate admits: its endorsed coerce is the sanctioned crossing");
-    gaugewright_app::gate::admit(REVIEW_BY_HAND_GATE, REVIEW_BY_HAND_ENVELOPE)
+    gaugedesk_app::gate::admit(REVIEW_BY_HAND_GATE, REVIEW_BY_HAND_ENVELOPE)
         .expect("the human gate admits: a reviewer's claim on a vouched queue is the crossing");
 }
 
@@ -137,7 +137,7 @@ fn the_human_crossing_is_refused_without_a_vouched_queue() {
         .filter(|line| !line.starts_with("grant tracker verdicts"))
         .map(|line| format!("{line}\n"))
         .collect();
-    let refusal = gaugewright_app::gate::admit(REVIEW_BY_HAND_GATE, &stripped)
+    let refusal = gaugedesk_app::gate::admit(REVIEW_BY_HAND_GATE, &stripped)
         .expect_err("an unvouched queue may not endorse");
     let message = refusal.to_string();
     assert!(
@@ -201,13 +201,13 @@ fn both_gates_print_their_crossings_in_the_guarantee_report() {
         ),
         ("coerce-screen", COERCE_SCREEN_GATE, COERCE_SCREEN_ENVELOPE),
     ] {
-        let verified = gaugewright_whip_runtime::ifc::VerifiedEnvelope::verify_text(envelope)
+        let verified = gaugedesk_whip_runtime::ifc::VerifiedEnvelope::verify_text(envelope)
             .expect("the shipped envelope verifies");
-        let ir = gaugewright_whip_runtime::compile_whip_program(program)
+        let ir = gaugedesk_whip_runtime::compile_whip_program(program)
             .ir
             .expect("the shipped gate compiles");
         let surface =
-            gaugewright_whip_runtime::ifc::governance_report(&ir, &verified).trusted_surface;
+            gaugedesk_whip_runtime::ifc::governance_report(&ir, &verified).trusted_surface;
 
         // The governance half: the envelope names who may endorse.
         assert!(
@@ -231,12 +231,12 @@ fn both_gates_print_their_crossings_in_the_guarantee_report() {
 
     // And the screener's own crossing, which only the screening gate has.
     let verified =
-        gaugewright_whip_runtime::ifc::VerifiedEnvelope::verify_text(COERCE_SCREEN_ENVELOPE)
+        gaugedesk_whip_runtime::ifc::VerifiedEnvelope::verify_text(COERCE_SCREEN_ENVELOPE)
             .expect("verifies");
-    let ir = gaugewright_whip_runtime::compile_whip_program(COERCE_SCREEN_GATE)
+    let ir = gaugedesk_whip_runtime::compile_whip_program(COERCE_SCREEN_GATE)
         .ir
         .expect("compiles");
-    let surface = gaugewright_whip_runtime::ifc::governance_report(&ir, &verified).trusted_surface;
+    let surface = gaugedesk_whip_runtime::ifc::governance_report(&ir, &verified).trusted_surface;
     assert!(
         surface.iter().any(|crossing| {
             crossing.contains("endorsed (source)") && crossing.contains("screen_item")

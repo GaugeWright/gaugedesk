@@ -17,8 +17,8 @@
 //! person via OIDC and holds no sovereign keypair, so it does not publish). The facility flag in
 //! the person's account scope says whether sync is on.
 
-use gaugewright_core::signature::SigningKey;
-pub use gaugewright_directory_protocol::{
+use gaugedesk_core::signature::SigningKey;
+pub use gaugedesk_directory_protocol::{
     put_verifies, signing_bytes, DirectoryEntry, SignedDirectoryPut,
 };
 
@@ -47,7 +47,7 @@ pub fn signed_put(
         directory: directory_record(&root_pubkey, acct, placement_pointers, home_routes),
         sealed_blob: seal_account_blob(key, acct)?,
     };
-    gaugewright_directory_protocol::sign_entry(entry, signing_key).ok()
+    gaugedesk_directory_protocol::sign_entry(entry, signing_key).ok()
 }
 
 /// Publish a signed record to the blind directory (`PUT {base}/directory/:root`). `base` is the
@@ -181,13 +181,12 @@ impl crate::Workbench {
 }
 
 /// Canonical public blind-directory origin. Development and hermetic tests may
-/// override it with `GAUGEWRIGHT_DIRECTORY_URL`; a release never silently
+/// override it with `GAUGEDESK_DIRECTORY_URL`; a release never silently
 /// disables account sync because an environment variable was omitted.
 pub const DIRECTORY_URL: &str = "https://directory.gaugewright.com";
 
 pub fn directory_url_from_env() -> String {
-    std::env::var("GAUGEWRIGHT_DIRECTORY_URL")
-        .ok()
+    gaugedesk_env::var("DIRECTORY_URL")
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DIRECTORY_URL.to_string())
 }

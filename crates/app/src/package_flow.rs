@@ -5,13 +5,13 @@
 //! authority** — a governed run is ready only when the install is `Installed` *and*
 //! a deployment entitlement is `Active` (ADR 0011/0016/0021).
 
-use gaugewright_core::agent_version::{VersionCommand, VersionState};
-use gaugewright_core::deployment_entitlement::{
+use gaugedesk_core::agent_version::{VersionCommand, VersionState};
+use gaugedesk_core::deployment_entitlement::{
     EntitlementCommand, EntitlementPhase, EntitlementState,
 };
-use gaugewright_core::key_release::{EntitlementIneligibility, EntitlementVerdict};
-use gaugewright_core::package_distribution::{DistCommand, DistPhase, DistState};
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::key_release::{EntitlementIneligibility, EntitlementVerdict};
+use gaugedesk_core::package_distribution::{DistCommand, DistPhase, DistState};
+use gaugedesk_store::{AdmitError, Store};
 
 use crate::library::LIBRARY_SCOPE;
 use crate::package_store::{self, PackageRecord, VersionRecord};
@@ -312,7 +312,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gaugewright_core::resource::ResourceId;
+    use gaugedesk_core::resource::ResourceId;
 
     fn version_rec(id: &str) -> VersionRecord {
         VersionRecord {

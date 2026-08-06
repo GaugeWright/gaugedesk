@@ -2,7 +2,7 @@
  * The mobile **Files pane's** view-derived vocabulary (`mobile-client.md`,
  * MOB-015): the small, pure projections the {@link MobileFiles} island needs to
  * paint a worktree tree where **a handle's name is always visible but its
- * payload is not** (`INV-10`, mirrors `gaugewright_core::resource_access`:
+ * payload is not** (`INV-10`, mirrors `gaugedesk_core::resource_access`:
  * `name_visible()` is always true, `payload_accessible()` only once `Granted`).
  *
  * The island is a thin renderer; all the "what may I show?" decisions live here

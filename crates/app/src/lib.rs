@@ -101,7 +101,7 @@ pub use app_support::{
     AttestationMode, RuntimePackageDescriptor, DEFAULT_AGENT, DEFAULT_INSTANCE, DEFAULT_PLACEMENT,
     DEFAULT_PROJECT, LOCAL_AUTHORITY,
 };
-pub use gaugewright_whip_runtime::{
+pub use gaugedesk_whip_runtime::{
     AdmittedPolicyEpoch, DoHostConfig, DoHostRequest, DoHostResponse, DoHostTransport,
     PolicyAdmissionError, PolicyEpoch, WhipHarnessFactory,
 };

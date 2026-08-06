@@ -5,9 +5,9 @@
 //! self-hosted Keycloak (the browser login is automated through it). `#[ignore]`d; the
 //! code is single-use and short-lived, so it runs immediately after capture.
 
-use gaugewright_app::identity::IdentityProvider;
-use gaugewright_app::net_http::HttpClient;
-use gaugewright_ee::identity_oidc::{
+use gaugedesk_app::identity::IdentityProvider;
+use gaugedesk_app::net_http::HttpClient;
+use gaugedesk_ee::identity_oidc::{
     discover_jwks, exchange_code, ClaimMapping, OidcIdentityProvider,
 };
 

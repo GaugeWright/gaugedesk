@@ -5,13 +5,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gaugewright_app::agent_release::{
+use gaugedesk_app::agent_release::{
     AcknowledgeCollectionsRequest, ControlDeploymentRequest, DrainCollectionsRequest,
     ErasePublicSessionRequest, ListPublicCredentialsRequest, ProvisionPublicCredentialRequest,
     PublishDeploymentRequest, ReleasePublishSpec, RevokePublicCredentialRequest,
 };
-use gaugewright_app::{open_workbench, LockUnpoisoned, Workbench};
-use gaugewright_core::agent_release::{
+use gaugedesk_app::{open_workbench, LockUnpoisoned, Workbench};
+use gaugedesk_core::agent_release::{
     AttributionPolicy, PanelManifest, ProviderPolicy, RetentionPolicy, SignedAgentRelease,
     AGENT_RELEASE_MEDIA_TYPE,
 };

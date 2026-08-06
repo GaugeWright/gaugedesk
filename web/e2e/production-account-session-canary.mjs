@@ -300,7 +300,7 @@ export async function runHostedAccountSession(
     );
     const providerOrigin = providerOriginFor(environment);
     // The deployment, not the client, chooses where a completed sign-in lands
-    // (GAUGEWRIGHT_OIDC_POST_LOGIN_URL). Declaring it keeps the journey exact:
+    // (GAUGEDESK_OIDC_POST_LOGIN_URL). Declaring it keeps the journey exact:
     // a changed landing page must fail here rather than pass unnoticed.
     const postLoginOrigin = environment.GW_SYNTHETIC_POST_LOGIN_ORIGIN?.trim()
         ? exactOrigin(environment, "GW_SYNTHETIC_POST_LOGIN_ORIGIN")

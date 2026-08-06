@@ -2,18 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use gaugewright_core::attestation::{AttestationQuote, CodeMeasurement};
-use gaugewright_core::boundary_lifecycle::{
+use gaugedesk_core::attestation::{AttestationQuote, CodeMeasurement};
+use gaugedesk_core::boundary_lifecycle::{
     BoundaryCommand, BoundaryPhase, BoundaryState, Operator, Placement, PlacementPolicy,
 };
-use gaugewright_core::ids::{BridgeGrantId, DeviceId};
-use gaugewright_core::instance::{InstanceCommand, InstanceState};
-use gaugewright_core::merge::MergeState;
-use gaugewright_core::run::RunState;
-use gaugewright_core::workstream::{WorkstreamPhase, WorkstreamState};
-use gaugewright_harness::HarnessFactory;
-use gaugewright_store::{AdmitError, Store};
-use gaugewright_workspace::{ChatWorkspace, Instance, MergeOutcome, Workspace, WorkspaceError};
+use gaugedesk_core::ids::{BridgeGrantId, DeviceId};
+use gaugedesk_core::instance::{InstanceCommand, InstanceState};
+use gaugedesk_core::merge::MergeState;
+use gaugedesk_core::run::RunState;
+use gaugedesk_core::workstream::{WorkstreamPhase, WorkstreamState};
+use gaugedesk_harness::HarnessFactory;
+use gaugedesk_store::{AdmitError, Store};
+use gaugedesk_workspace::{ChatWorkspace, Instance, MergeOutcome, Workspace, WorkspaceError};
 
 use crate::attestation_verifier::{LoopbackVerifier, QuoteVerifier, RealQuoteVerifierError};
 use crate::boundary_keeper::{accept_boundary_attested, AcceptError};
@@ -37,7 +37,7 @@ pub(crate) fn published_package_root(
     targets_dir
         .join(target_id)
         .join("repo")
-        .join(gaugewright_boundary::definition::version_root(version))
+        .join(gaugedesk_boundary::definition::version_root(version))
 }
 
 pub(crate) fn published_discipline_root(
@@ -56,7 +56,7 @@ fn published_archetype_version(
     target_id: &str,
     version: u64,
 ) -> std::io::Result<ArchetypeVersionRecord> {
-    let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(published_package_root(
+    let package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(published_package_root(
         targets_dir,
         target_id,
         version,
@@ -74,12 +74,12 @@ fn published_archetype_version(
 }
 
 fn archetype_files(
-    definition: &gaugewright_boundary::definition::AgentDefinition,
+    definition: &gaugedesk_boundary::definition::AgentDefinition,
     skills: BTreeSet<String>,
 ) -> Result<Vec<(String, String)>, String> {
     let mut files = definition.seed_files();
     let manifest = crate::discipline::manifest(
-        gaugewright_boundary::definition::PackageCapabilities::default()
+        gaugedesk_boundary::definition::PackageCapabilities::default()
             .names()
             .into_iter()
             .map(str::to_owned),
@@ -178,7 +178,7 @@ pub(crate) enum ForkChatError {
 struct ResolvedForkPoint {
     entry_id: i64,
     workspace_cut: String,
-    runtime_position: gaugewright_harness::RuntimePosition,
+    runtime_position: gaugedesk_harness::RuntimePosition,
     reads: Vec<String>,
 }
 
@@ -223,7 +223,7 @@ pub(crate) fn load_startup_library_state(
     store: &mut Store,
     targets_dir: &std::path::Path,
     providers: &WorkspaceProviders,
-    home_id: &gaugewright_core::ids::HomeId,
+    home_id: &gaugedesk_core::ids::HomeId,
 ) -> std::io::Result<StartupLibraryState> {
     let mut library = crate::library::Library::rebuild(store).map_err(io)?;
     if migrate_exact_pre_target_defaults(store, &library, home_id)? {
@@ -281,7 +281,7 @@ fn managed_target_record(
     id: String,
     name: String,
     owner: WorkTargetOwner,
-    home_id: &gaugewright_core::ids::HomeId,
+    home_id: &gaugedesk_core::ids::HomeId,
     current_basis: String,
 ) -> WorkTargetRecord {
     WorkTargetRecord {
@@ -348,7 +348,7 @@ fn init_managed_target(
 fn migrate_exact_pre_target_defaults(
     store: &mut Store,
     library: &crate::library::Library,
-    home_id: &gaugewright_core::ids::HomeId,
+    home_id: &gaugedesk_core::ids::HomeId,
 ) -> std::io::Result<bool> {
     let Some(agent) = library.agents.get(DEFAULT_AGENT) else {
         return Ok(false);
@@ -451,18 +451,18 @@ fn migrate_agent_ability_manifests(
         let result = (|| {
             let mut changed = false;
             let mut roots = vec![
-                gaugewright_boundary::definition::DRAFT_ROOT.to_owned(),
+                gaugedesk_boundary::definition::DRAFT_ROOT.to_owned(),
                 crate::discipline::DISCIPLINE_DRAFT_ROOT.to_owned(),
             ];
             for version in archetype.versions.keys() {
-                roots.push(gaugewright_boundary::definition::version_root(*version));
+                roots.push(gaugedesk_boundary::definition::version_root(*version));
                 roots.push(crate::discipline::discipline_version_root(*version));
             }
 
             for package_root in roots.iter().step_by(2) {
                 let manifest_path = format!(
                     "{package_root}/{}",
-                    gaugewright_boundary::definition::MANIFEST_FILE
+                    gaugedesk_boundary::definition::MANIFEST_FILE
                 );
                 let text = engagement.read_file(&manifest_path).map_err(io)?;
                 let mut manifest: serde_json::Value =
@@ -486,7 +486,7 @@ fn migrate_agent_ability_manifests(
 
                 let source_path = format!(
                     "{package_root}/{}",
-                    gaugewright_boundary::definition::SOURCE_FILE
+                    gaugedesk_boundary::definition::SOURCE_FILE
                 );
                 let source = engagement.read_file(&source_path).map_err(io)?;
                 let source = remove_legacy_human_authority(&source);
@@ -883,7 +883,7 @@ fn seed_builtin_archetype(
     library: &mut crate::library::Library,
     targets_dir: &std::path::Path,
     providers: &WorkspaceProviders,
-    home_id: &gaugewright_core::ids::HomeId,
+    home_id: &gaugedesk_core::ids::HomeId,
     archetype: &crate::app_support::BuiltinArchetype,
 ) -> std::io::Result<()> {
     if library.agents.contains_key(archetype.id) {
@@ -996,7 +996,7 @@ fn ensure_builtin_archetypes(
     library: &mut crate::library::Library,
     targets_dir: &std::path::Path,
     providers: &WorkspaceProviders,
-    home_id: &gaugewright_core::ids::HomeId,
+    home_id: &gaugedesk_core::ids::HomeId,
 ) -> std::io::Result<()> {
     for archetype in crate::app_support::builtin_archetypes() {
         seed_builtin_archetype(store, library, targets_dir, providers, home_id, archetype)?;
@@ -1016,7 +1016,7 @@ pub(crate) fn seed_default_agent(
     library: &mut crate::library::Library,
     targets_dir: &std::path::Path,
     providers: &WorkspaceProviders,
-    home_id: &gaugewright_core::ids::HomeId,
+    home_id: &gaugedesk_core::ids::HomeId,
 ) -> std::io::Result<()> {
     let general = crate::app_support::builtin_archetypes()
         .iter()
@@ -1166,7 +1166,7 @@ impl Workbench {
             .unwrap_or_else(|| project_id.to_string())
     }
 
-    pub fn project_home_id(&self, project_id: &str) -> Option<&gaugewright_core::ids::HomeId> {
+    pub fn project_home_id(&self, project_id: &str) -> Option<&gaugedesk_core::ids::HomeId> {
         self.library.project_home_id(project_id)
     }
 
@@ -1175,7 +1175,7 @@ impl Workbench {
     pub fn project_deployment_mode(
         &self,
         project_id: &str,
-    ) -> gaugewright_core::boundary_lifecycle::Placement {
+    ) -> gaugedesk_core::boundary_lifecycle::Placement {
         self.library.deployment_mode_of(project_id)
     }
 
@@ -1186,7 +1186,7 @@ impl Workbench {
     pub(crate) fn project_record_for_home_rebind(
         &self,
         project_id: &str,
-        home_id: gaugewright_core::ids::HomeId,
+        home_id: gaugedesk_core::ids::HomeId,
     ) -> Option<ProjectRecord> {
         let mut project = self.library.projects.get(project_id)?.clone();
         project.home_id = home_id;
@@ -1265,7 +1265,7 @@ impl Workbench {
             .library
             .authoring_target_for(&archetype.id)
             .ok_or_else(|| "archetype authoring target is unavailable".to_owned())?;
-        let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(published_package_root(
+        let package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(published_package_root(
             &self.targets_dir(),
             &authoring_target.id,
             instance.version,
@@ -1714,7 +1714,7 @@ impl Workbench {
                 measurement.clone(),
             ));
         self.sealed_keys
-            .seal(gaugewright_core::key_release::SealedKeyRecord::new(
+            .seal(gaugedesk_core::key_release::SealedKeyRecord::new(
                 sealed_key_id,
                 measurement,
                 sealed_key,
@@ -1919,7 +1919,7 @@ impl Workbench {
             .ok_or_else(|| "archetype authoring target is unavailable".to_owned())?;
         let package_root =
             published_package_root(&self.targets_dir(), &authoring_target.id, instance.version);
-        let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(&package_root)
+        let package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(&package_root)
             .map_err(|error| error.to_string())?;
         let bundle = crate::discipline::load(
             &published_discipline_root(&self.targets_dir(), &authoring_target.id, instance.version),
@@ -1931,7 +1931,7 @@ impl Workbench {
             .ok_or_else(|| "chat target candidate is unavailable".to_owned())?;
         let mount = engagement
             .path()
-            .join(gaugewright_boundary::definition::RUNTIME_MOUNT_ROOT);
+            .join(gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT);
         if mount.exists() {
             std::fs::remove_dir_all(&mount).map_err(|error| error.to_string())?;
         }
@@ -2082,8 +2082,8 @@ impl Workbench {
             let text = engagement
                 .read_file(&format!(
                     "{}/{}",
-                    gaugewright_boundary::definition::DRAFT_ROOT,
-                    gaugewright_boundary::definition::MANIFEST_FILE
+                    gaugedesk_boundary::definition::DRAFT_ROOT,
+                    gaugedesk_boundary::definition::MANIFEST_FILE
                 ))
                 .map_err(|error| error.to_string())?;
             let manifest: serde_json::Value =
@@ -2141,8 +2141,8 @@ impl Workbench {
         let result = (|| {
             let path = format!(
                 "{}/{}",
-                gaugewright_boundary::definition::DRAFT_ROOT,
-                gaugewright_boundary::definition::MANIFEST_FILE
+                gaugedesk_boundary::definition::DRAFT_ROOT,
+                gaugedesk_boundary::definition::MANIFEST_FILE
             );
             let text = engagement
                 .read_file(&path)
@@ -2343,8 +2343,7 @@ impl Workbench {
                 .unwrap_or_default();
             if !matches!(
                 merge.phase,
-                gaugewright_core::merge::MergePhase::Idle
-                    | gaugewright_core::merge::MergePhase::Clean
+                gaugedesk_core::merge::MergePhase::Idle | gaugedesk_core::merge::MergePhase::Clean
             ) {
                 outputs.push(serde_json::json!({
                     "chat": chat.id,
@@ -2731,8 +2730,8 @@ impl Workbench {
         let engagement = instance
             .create_engagement(&snapshot_chat)
             .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
-        let draft = gaugewright_boundary::definition::DRAFT_ROOT;
-        let target = gaugewright_boundary::definition::version_root(version);
+        let draft = gaugedesk_boundary::definition::DRAFT_ROOT;
+        let target = gaugedesk_boundary::definition::version_root(version);
         let result = (|| {
             if engagement
                 .tree()
@@ -2745,9 +2744,9 @@ impl Workbench {
                 )));
             }
             for file in [
-                gaugewright_boundary::definition::MANIFEST_FILE,
-                gaugewright_boundary::definition::SOURCE_FILE,
-                gaugewright_boundary::definition::PERSONA_FILE,
+                gaugedesk_boundary::definition::MANIFEST_FILE,
+                gaugedesk_boundary::definition::SOURCE_FILE,
+                gaugedesk_boundary::definition::PERSONA_FILE,
             ] {
                 let body = engagement
                     .read_file(&format!("{draft}/{file}"))
@@ -2756,10 +2755,9 @@ impl Workbench {
                     .write_file(&format!("{target}/{file}"), &body)
                     .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
             }
-            let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(
-                engagement.path().join(&target),
-            )
-            .map_err(PublishArchetypeError::InvalidPackage)?;
+            let package =
+                gaugedesk_whip_runtime::AuthoredAgentPackage::load(engagement.path().join(&target))
+                    .map_err(PublishArchetypeError::InvalidPackage)?;
             let discipline = crate::discipline::load(
                 &engagement
                     .path()
@@ -2874,13 +2872,12 @@ impl Workbench {
             .library
             .authoring_target_for(&agent.id)
             .ok_or(UpgradePlacementError::ArchetypeNotFound)?;
-        let resolved =
-            gaugewright_whip_runtime::AuthoredAgentPackage::load(published_package_root(
-                &self.targets_dir(),
-                &authoring_target.id,
-                agent.current_version,
-            ))
-            .map_err(UpgradePlacementError::PackageUnavailable)?;
+        let resolved = gaugedesk_whip_runtime::AuthoredAgentPackage::load(published_package_root(
+            &self.targets_dir(),
+            &authoring_target.id,
+            agent.current_version,
+        ))
+        .map_err(UpgradePlacementError::PackageUnavailable)?;
         if resolved.version_ref() != expected_version.package_ref {
             return Err(UpgradePlacementError::PackageUnavailable(
                 "placement package bytes do not match the published reference".to_owned(),
@@ -2907,7 +2904,7 @@ impl Workbench {
             published_discipline_root(&self.targets_dir(), &authoring_target.id, placement.version);
         let old_files = crate::discipline::load(
             &old_assets,
-            gaugewright_whip_runtime::AuthoredAgentPackage::load(published_package_root(
+            gaugedesk_whip_runtime::AuthoredAgentPackage::load(published_package_root(
                 &self.targets_dir(),
                 &authoring_target.id,
                 placement.version,
@@ -3151,7 +3148,7 @@ impl Workbench {
         let source_policy = self
             .latest_whipple_policy(id)
             .map_err(ForkChatError::Continuity)?;
-        let source_continuity = gaugewright_harness::HarnessContinuitySpec {
+        let source_continuity = gaugedesk_harness::HarnessContinuitySpec {
             chat_id: id.to_owned(),
             runtime_placement_id: runtime_placement_id.clone(),
             worktree: src_path,
@@ -3163,7 +3160,7 @@ impl Workbench {
             signed_policy_envelope: source_policy.as_ref().map(|(_, envelope)| envelope.clone()),
             source_position: point.as_ref().map(|point| point.runtime_position.clone()),
         };
-        let target_continuity = gaugewright_harness::HarnessContinuitySpec {
+        let target_continuity = gaugedesk_harness::HarnessContinuitySpec {
             chat_id: new_id.clone(),
             runtime_placement_id,
             worktree: new_path,
@@ -3299,12 +3296,12 @@ impl Workbench {
             .fold::<MergeState>(chat_id)
             .unwrap_or_default();
         (
-            merge.phase == gaugewright_core::merge::MergePhase::Clean
+            merge.phase == gaugedesk_core::merge::MergePhase::Clean
                 && merge.review_requested
                 && rules.attention(Signal::Changes) != Attention::Mute,
-            ((merge.phase == gaugewright_core::merge::MergePhase::Rejected
-                && merge.workspace_outcome == gaugewright_core::merge::WorkspaceOutcome::Conflict)
-                || merge.phase == gaugewright_core::merge::MergePhase::Repairing)
+            ((merge.phase == gaugedesk_core::merge::MergePhase::Rejected
+                && merge.workspace_outcome == gaugedesk_core::merge::WorkspaceOutcome::Conflict)
+                || merge.phase == gaugedesk_core::merge::MergePhase::Repairing)
                 && rules.attention(Signal::Conflict) != Attention::Mute,
         )
     }
@@ -3786,19 +3783,18 @@ impl Workbench {
                 continue;
             }
             let state_dir = crate::gate_service::gate_state_dir(&self.root_path(), &project.id);
-            let waiting = match gaugewright_whip_runtime::gate_runner::reviews_awaiting_a_person(
-                &state_dir,
-            ) {
-                Ok(waiting) => waiting,
-                Err(error) => {
-                    tracing::warn!(
-                        project = %project.id,
-                        error = %error,
-                        "task queue: could not read the project's parked reviews",
-                    );
-                    continue;
-                }
-            };
+            let waiting =
+                match gaugedesk_whip_runtime::gate_runner::reviews_awaiting_a_person(&state_dir) {
+                    Ok(waiting) => waiting,
+                    Err(error) => {
+                        tracing::warn!(
+                            project = %project.id,
+                            error = %error,
+                            "task queue: could not read the project's parked reviews",
+                        );
+                        continue;
+                    }
+                };
             if waiting == 0 {
                 continue;
             }
@@ -3866,11 +3862,11 @@ impl Workbench {
                             .is_empty()
                     }
                     Signal::Conflict => matches!(&merge, Some(m)
-                        if m.phase == gaugewright_core::merge::MergePhase::Rejected
+                        if m.phase == gaugedesk_core::merge::MergePhase::Rejected
                             && m.workspace_outcome
-                                == gaugewright_core::merge::WorkspaceOutcome::Conflict),
+                                == gaugedesk_core::merge::WorkspaceOutcome::Conflict),
                     Signal::Changes => matches!(&merge, Some(m)
-                        if m.phase == gaugewright_core::merge::MergePhase::Clean
+                        if m.phase == gaugedesk_core::merge::MergePhase::Clean
                             && m.review_requested),
                     // A newer attempt appends a newer summary, so reply clears
                     // by construction when the human speaks/runs again.
@@ -3882,7 +3878,7 @@ impl Workbench {
                                     | crate::turn_summary::ReceiptStatus::Failed
                             )
                         }) || (turn_summary.is_none()
-                            && run_phase == Some(gaugewright_core::run::RunPhase::Completed))
+                            && run_phase == Some(gaugedesk_core::run::RunPhase::Completed))
                     }
                 }
             };
@@ -4137,7 +4133,7 @@ mod startup_reconcile_tests {
             WorkTargetOwner::Project {
                 project_id: "proj-fixture".to_owned(),
             },
-            &gaugewright_core::ids::HomeId::new("home:fixture"),
+            &gaugedesk_core::ids::HomeId::new("home:fixture"),
             String::new(),
         ));
         library

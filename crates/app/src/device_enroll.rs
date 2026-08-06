@@ -1,6 +1,6 @@
 //! The device-enrollment **wire** (`ACCT-1`, [ADR 0055]) — the app-layer shell that carries
 //! the enrollment handshake over the dumb rendezvous relay and drives the pure, proptested
-//! reducer [`gaugewright_core::device_enrollment`]. A new device joins an existing account
+//! reducer [`gaugedesk_core::device_enrollment`]. A new device joins an existing account
 //! **root** (the "this is also me" act, distinct from federation's `INV-13` crossing).
 //!
 //! The three-message handshake ([ADR 0055]) over the shared binary-WSS relay:
@@ -29,12 +29,12 @@ use p256::{ecdh::diffie_hellman, PublicKey as P256PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use gaugewright_core::delegation::DeviceDelegation;
-use gaugewright_core::device_enrollment::{
+use gaugedesk_core::delegation::DeviceDelegation;
+use gaugedesk_core::device_enrollment::{
     decide, evolve, Delegation, EnrollmentCommand, EnrollmentPhase, EnrollmentState, Seal,
 };
-use gaugewright_core::ids::PublicKey;
-use gaugewright_core::signature::SigningKey;
+use gaugedesk_core::ids::PublicKey;
+use gaugedesk_core::signature::SigningKey;
 
 use crate::at_rest::{Encryptor, LocalAeadEncryptor};
 

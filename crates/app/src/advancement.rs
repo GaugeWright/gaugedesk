@@ -268,7 +268,7 @@ impl AdvancementRules {
 /// The wire type for a certified dynamic guarantee outcome lives with the
 /// harness seam (the runtime adapters produce it); re-exported here so the
 /// policy vocabulary is importable from one place.
-pub use gaugewright_harness::GuaranteeOutcome;
+pub use gaugedesk_harness::GuaranteeOutcome;
 
 /// What the runtime-certified guarantees say about advancing (ADR 0082 §5).
 #[derive(Clone, Debug, PartialEq, Eq)]

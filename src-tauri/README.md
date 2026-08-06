@@ -9,7 +9,7 @@ remote client; Tauri is packaging + a window, not a second transport.
 
 **Built and testable here.** The Rust shell, generated icons, configuration, and
 capabilities are present, and the shell compiles against the backend
-(`gaugewright_app::open_api::open_serve`). A full interactive launch still needs
+(`gaugedesk_app::open_api::open_serve`). A full interactive launch still needs
 a windowed desktop session.
 
 ## Build / run (where the toolchain exists)

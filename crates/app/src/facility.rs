@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_store::{AdmitError, Store};
 
 // Reuse the library's latest-wins / tombstone record op — same record discipline.
 pub use crate::library::RecordOp;

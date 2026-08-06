@@ -1,5 +1,5 @@
 [package]
-name = "gaugewright-core"
+name = "gaugedesk-core"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

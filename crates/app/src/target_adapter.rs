@@ -14,7 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use gaugewright_workspace::{ExternalTargetKind, ExternalWorkspace, Workspace};
+use gaugedesk_workspace::{ExternalTargetKind, ExternalWorkspace, Workspace};
 
 use crate::library::{
     gen_id, PlacementTargetsRecord, RecordOp, TargetCapabilities, TargetVcsPosture, WorkTargetKind,
@@ -531,7 +531,7 @@ mod tests {
             std::fs::write(source.path().join("work.txt"), "concurrent\n").unwrap();
             assert_eq!(
                 candidate.merge_into_main().unwrap(),
-                gaugewright_workspace::MergeOutcome::Conflict
+                gaugedesk_workspace::MergeOutcome::Conflict
             );
             (target.id, chat_id, target.locator_handle)
         };

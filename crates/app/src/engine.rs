@@ -22,7 +22,7 @@ use crate::workbench_state::SharedHarness;
 /// forced to `Conflict`, driving the engagement into the isolated/repair-context path
 /// (`INV-24`) so a browser BDD can exercise conflict-repair without staging a real adversarial
 /// workspace conflict. Toggled by the `POST /test/force-conflict` route (gated by
-/// `GAUGEWRIGHT_TEST_RESET`); cleared by `POST /test/reset`. Inert in a normal run.
+/// `GAUGEDESK_TEST_RESET`); cleared by `POST /test/reset`. Inert in a normal run.
 static FORCE_MERGE_CONFLICT: AtomicBool = AtomicBool::new(false);
 
 /// Registry of in-flight turns to their [`InterruptHandle`], kept outside the
@@ -71,7 +71,7 @@ pub fn force_merge_conflict() -> bool {
     FORCE_MERGE_CONFLICT.load(Ordering::Relaxed)
 }
 
-use gaugewright_boundary::{definition, AgentConfig, AuthoringMode, Decision, Effect, Membrane};
+use gaugedesk_boundary::{definition, AgentConfig, AuthoringMode, Decision, Effect, Membrane};
 use tokio::sync::broadcast;
 
 use crate::harness_select::ScriptedFakeFactory;
@@ -116,7 +116,7 @@ impl Workbench {
     pub fn register_remote_session(
         &mut self,
         chat_id: impl Into<String>,
-        harness: Box<dyn gaugewright_harness::RemoteHarness>,
+        harness: Box<dyn gaugedesk_harness::RemoteHarness>,
     ) {
         let chat_id = chat_id.into();
         if let Some(local) = self.sessions.remove(&chat_id) {
@@ -135,7 +135,7 @@ impl Workbench {
     pub(crate) fn seed_local_session_for_test(
         &mut self,
         chat_id: impl Into<String>,
-        harness: Box<dyn gaugewright_harness::Harness>,
+        harness: Box<dyn gaugedesk_harness::Harness>,
     ) {
         self.sessions
             .insert(chat_id.into(), Arc::new(Mutex::new(harness)));
@@ -191,15 +191,15 @@ fn append_transcript(
     store: &mut Store,
     scope: &str,
     event: &ServerEvent,
-) -> Result<i64, gaugewright_store::AdmitError> {
+) -> Result<i64, gaugedesk_store::AdmitError> {
     store.append_record(scope, "transcript", &event.to_json())
 }
 
 fn turn_reads(
     store: &Store,
     scope: &str,
-    signature: &[gaugewright_harness::OutputFieldFlow],
-) -> Result<Vec<gaugewright_core::resource::ResourceId>, AdmitError> {
+    signature: &[gaugedesk_harness::OutputFieldFlow],
+) -> Result<Vec<gaugedesk_core::resource::ResourceId>, AdmitError> {
     if signature.is_empty() {
         // Legacy/test adapters publish no signature. Preserve the existing
         // conservative rule: every granted context may have flowed.
@@ -217,7 +217,7 @@ fn admit_turn_summary(
     receipt_status: crate::turn_summary::ReceiptStatus,
     error: Option<String>,
     diff: &str,
-    reads: &[gaugewright_core::resource::ResourceId],
+    reads: &[gaugedesk_core::resource::ResourceId],
 ) -> Result<(), AdmitError> {
     let changed_paths = crate::advancement::TurnFacts::changed_paths_of(diff);
     let summary = crate::turn_summary::TurnSummary {
@@ -242,8 +242,8 @@ pub(crate) struct TurnBoundaryRecord {
     pub(crate) assistant_entry_id: i64,
     pub(crate) before_workspace_cut: String,
     pub(crate) after_workspace_cut: String,
-    pub(crate) runtime_before: gaugewright_harness::RuntimePosition,
-    pub(crate) runtime_after: gaugewright_harness::RuntimePosition,
+    pub(crate) runtime_before: gaugedesk_harness::RuntimePosition,
+    pub(crate) runtime_after: gaugedesk_harness::RuntimePosition,
     pub(crate) reads_before: Vec<String>,
     pub(crate) reads_after: Vec<String>,
 }
@@ -297,14 +297,14 @@ fn admit_runtime_evidence_pointers(
     }
     Ok(positions)
 }
-use gaugewright_core::merge::{MergeCommand, MergePhase, MergeState};
-use gaugewright_core::run::{RunCommand, RunPhase, RunState};
-use gaugewright_harness::{
+use gaugedesk_core::merge::{MergeCommand, MergePhase, MergeState};
+use gaugedesk_core::run::{RunCommand, RunPhase, RunState};
+use gaugedesk_harness::{
     CredentialProbe, EgressGate, GateDecision, Harness, HarnessFactory, HarnessSpec, ImageContent,
     InterruptHandle, Observation, TurnOutcome,
 };
-use gaugewright_store::{AdmitError, Store};
-use gaugewright_workspace::{ChatWorkspace, MergeOutcome};
+use gaugedesk_store::{AdmitError, Store};
+use gaugedesk_workspace::{ChatWorkspace, MergeOutcome};
 
 /// A membrane-backed egress gate: maps a harness tool name to an [`Effect`] and asks
 /// the [`Membrane`] to rule. Tools known to leave the workspace (network) are
@@ -383,7 +383,7 @@ pub(crate) fn resolve_turn_provider(
         .unwrap_or_else(|| "openai-codex".to_string())
 }
 
-/// Resolve a turn's model: a non-empty host override (`GAUGEWRIGHT_MODEL`) wins over the chat's
+/// Resolve a turn's model: a non-empty host override (`GAUGEDESK_MODEL`) wins over the chat's
 /// configured model; `None` leaves the selected provider's default. Paired with
 /// [`resolve_turn_provider`] so a host that forces the provider can pin a compatible model.
 pub(crate) fn resolve_turn_model(
@@ -415,7 +415,7 @@ fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
 /// The network egress posture a turn runs under (RF-B3, CORE-5). Pure so the
 /// precedence is unit-testable:
 ///
-/// - operator forced unfiltered egress (`GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1`) ⇒
+/// - operator forced unfiltered egress (`GAUGEDESK_ALLOW_UNFILTERED_EGRESS=1`) ⇒
 ///   [`Network::Allow`] — the conscious unfiltered opt-in wins over everything;
 /// - the project isolates its network ⇒ [`Network::Deny`];
 /// - a non-isolated project ⇒ [`Network::Filtered`], admitting only the resolved
@@ -429,8 +429,8 @@ fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
 fn egress_posture(
     project_isolated: bool,
     forced_unfiltered: bool,
-) -> gaugewright_harness::sandbox::Network {
-    use gaugewright_harness::sandbox::Network;
+) -> gaugedesk_harness::sandbox::Network {
+    use gaugedesk_harness::sandbox::Network;
     if forced_unfiltered {
         Network::Allow
     } else if project_isolated {
@@ -487,7 +487,7 @@ pub struct TaskResult {
     /// workbench-holding caller, which is the layer that can resolve a recipient
     /// against the roster (ADR 0113 §4).
     #[serde(skip)]
-    pub asked_questions: Vec<gaugewright_harness::AskedQuestion>,
+    pub asked_questions: Vec<gaugedesk_harness::AskedQuestion>,
     /// The runtime/model error that failed this turn, if any — lets the client show
     /// an honest status immediately (the same text is also a durable transcript line).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -496,18 +496,18 @@ pub struct TaskResult {
     /// name at settle by the advancement policy (ADR 0082 §5). Empty when the
     /// runtime published no report — the local-truth path decides.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub guarantee_outcomes: Vec<gaugewright_harness::GuaranteeOutcome>,
+    pub guarantee_outcomes: Vec<gaugedesk_harness::GuaranteeOutcome>,
     /// Runtime-owned usage evidence projected for an in-process funding ledger.
     /// It is admitted durably below and deliberately omitted from the public
     /// task response; callers receive only their normal turn projection.
     #[serde(skip)]
-    pub usage_observation: Option<gaugewright_harness::ModelUsage>,
+    pub usage_observation: Option<gaugedesk_harness::ModelUsage>,
 }
 
 #[derive(Debug)]
 pub enum EngineError {
     Admit(AdmitError),
-    Workspace(gaugewright_workspace::WorkspaceError),
+    Workspace(gaugedesk_workspace::WorkspaceError),
     Harness(std::io::Error),
 }
 impl From<AdmitError> for EngineError {
@@ -515,8 +515,8 @@ impl From<AdmitError> for EngineError {
         EngineError::Admit(e)
     }
 }
-impl From<gaugewright_workspace::WorkspaceError> for EngineError {
-    fn from(e: gaugewright_workspace::WorkspaceError) -> Self {
+impl From<gaugedesk_workspace::WorkspaceError> for EngineError {
+    fn from(e: gaugedesk_workspace::WorkspaceError) -> Self {
         EngineError::Workspace(e)
     }
 }
@@ -794,7 +794,7 @@ fn run_task_streaming_billed<G: EgressGate>(
     // scope resolves to itself; under federation a `scope:<authority>:<rest>`
     // scope resolves to the authority the server authenticated for the call, so
     // a minted output is owned by — and governed by — the right keyset (D-REMOTE).
-    let owner = gaugewright_core::determine_scope_authority(scope);
+    let owner = gaugedesk_core::determine_scope_authority(scope);
     let _ = crate::resource_store::mint_output(
         store,
         scope,
@@ -851,7 +851,7 @@ fn run_task_streaming_billed<G: EgressGate>(
             reads_after,
         };
         let payload =
-            serde_json::to_string(&boundary).map_err(gaugewright_store::AdmitError::Json)?;
+            serde_json::to_string(&boundary).map_err(gaugedesk_store::AdmitError::Json)?;
         store.append_record(scope, TURN_BOUNDARY_KIND, &payload)?;
     }
     // A failed turn records *why* as durable evidence, so the user sees the reason
@@ -941,7 +941,7 @@ pub struct RemoteTaskResult {
 /// federation** ([`remote_runtime::federate_remote_turn`], `OBSERVATION-FEDERATION-1`)
 /// so a relayed outcome becomes run truth only via the owner's admission (`INV-4`).
 /// The derived output is minted under the scope's owning authority
-/// ([`determine_scope_authority`](gaugewright_core::determine_scope_authority), MINT-1),
+/// ([`determine_scope_authority`](gaugedesk_core::determine_scope_authority), MINT-1),
 /// not the hardcoded local constant.
 ///
 /// The test-only single-process loopback harness and a real cross-machine relay
@@ -950,7 +950,7 @@ pub struct RemoteTaskResult {
 pub fn run_task_remote(
     store: &mut Store,
     scope: &str,
-    harness: &mut dyn gaugewright_harness::RemoteHarness,
+    harness: &mut dyn gaugedesk_harness::RemoteHarness,
     gate: &dyn EgressGate,
     task: &str,
 ) -> Result<RemoteTaskResult, EngineError> {
@@ -1017,7 +1017,7 @@ pub fn run_task_remote(
     //    local commit, so the output's locator carries no commit hash.
     let reads = crate::resource_store::granted_context(store, scope)?;
     crate::resource_store::record_reads(store, scope, &reads)?;
-    let owner = gaugewright_core::determine_scope_authority(scope);
+    let owner = gaugedesk_core::determine_scope_authority(scope);
     let _ = crate::resource_store::mint_output(store, scope, owner.as_str(), "");
 
     let run_phase = RunPhase::Completed;
@@ -1057,7 +1057,7 @@ pub fn run_task_remote(
 /// run refuses up front instead of letting the runtime fail opaquely on a missing key.
 fn llm_credential_status(
     provider: &str,
-    credential_capability: Option<&dyn gaugewright_harness::CredentialCapability>,
+    credential_capability: Option<&dyn gaugedesk_harness::CredentialCapability>,
     factory: &dyn HarnessFactory,
 ) -> Result<(), String> {
     // BYOK providers require an exact-reference GaugeDesk capability. Secret
@@ -1100,7 +1100,7 @@ fn host_managed_model_status(
     provider: &str,
     get: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(), String> {
-    let ready = get("GAUGEWRIGHT_HOST_MODEL_READY")
+    let ready = get("GAUGEDESK_HOST_MODEL_READY")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     if ready {
         Ok(())
@@ -1108,7 +1108,7 @@ fn host_managed_model_status(
         Err(format!(
             "The {provider} model can't run: the managed host has not reported model \
              readiness. Configure the private managed runtime, then set \
-             GAUGEWRIGHT_HOST_MODEL_READY=1."
+             GAUGEDESK_HOST_MODEL_READY=1."
         ))
     }
 }
@@ -1198,7 +1198,7 @@ fn record_precheck_failure(
 /// credentials, provider/model, fail-closed precheck, base sandbox) into a
 /// [`HarnessSpec`]; the runtime itself is constructed by the factory the
 /// per-turn selector picks ([`crate::harness_select::factory_for_turn`] — the
-/// real WhippleScript adapter, or the scripted fake under `GAUGEWRIGHT_FAKE_AGENT`).
+/// real WhippleScript adapter, or the scripted fake under `GAUGEDESK_FAKE_AGENT`).
 /// Returns the turn result, or a human-readable error (the model endpoint may
 /// be unauthenticated/offline).
 ///
@@ -1208,7 +1208,7 @@ pub struct EngagementTurnInput<'a> {
     pub task: &'a str,
     pub images: &'a [ImageContent],
     pub mode: ChatMode,
-    pub authenticated_actor: Option<&'a gaugewright_core::ids::AuthorityId>,
+    pub authenticated_actor: Option<&'a gaugedesk_core::ids::AuthorityId>,
     /// Authority that drove this turn for workstream contribution attribution.
     /// This is distinct from the runtime actor: a verified federated crossing may
     /// drive a hub-resident chat while the hub still owns runtime execution.
@@ -1250,18 +1250,15 @@ pub fn isolated_turn_descriptor(
     let guard = wb.lock_unpoisoned();
     let config = AgentConfig::from_json(&guard.effective_agent_config_for_chat(chat_id)?)
         .unwrap_or_default();
-    let provider = resolve_turn_provider(
-        std::env::var("GAUGEWRIGHT_MODEL_PROVIDER").ok(),
-        config.provider,
-    );
-    let model = resolve_turn_model(std::env::var("GAUGEWRIGHT_MODEL").ok(), config.model);
+    let provider = resolve_turn_provider(gaugedesk_env::var("MODEL_PROVIDER"), config.provider);
+    let model = resolve_turn_model(gaugedesk_env::var("MODEL"), config.model);
     let class = guard.model_execution_class();
     let base_url_override = if provider == "openai-generic" {
         guard.credential_base_url_for_chat_in_class(chat_id, &provider, actor, class)
     } else {
         None
     };
-    let provider_descriptor = gaugewright_whip_runtime::native_provider_descriptor(
+    let provider_descriptor = gaugedesk_whip_runtime::native_provider_descriptor(
         &provider,
         model.as_deref(),
         base_url_override.as_deref(),
@@ -1370,7 +1367,7 @@ pub fn run_engagement_turn(
     };
 
     // The one harness decision point (SUB-0): which adapter drives this turn.
-    // Consulted per turn — tests flip `GAUGEWRIGHT_FAKE_AGENT` against a live
+    // Consulted per turn — tests flip `GAUGEDESK_FAKE_AGENT` against a live
     // workbench, so the selection must never be cached at startup.
     let factory =
         harness_factory.unwrap_or_else(|| crate::harness_select::factory_for_turn(whip_factory));
@@ -1404,7 +1401,7 @@ pub fn run_engagement_turn(
             system_prompt,
             credential_capability: None,
             credentials: Vec::new(),
-            sandbox: gaugewright_harness::sandbox::SandboxPolicy::new(vec![worktree.to_path_buf()]),
+            sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![worktree.to_path_buf()]),
             // The fake seam offers no people: this path never reaches a model, so
             // there is no tool schema for a roster to appear on.
             roster: Vec::new(),
@@ -1427,7 +1424,7 @@ pub fn run_engagement_turn(
         // The private composition may override the authored provider/model. Public
         // releases do not execute through this GaugeDesk engine.
         let provider = resolve_turn_provider(
-            std::env::var("GAUGEWRIGHT_MODEL_PROVIDER").ok(),
+            gaugedesk_env::var("MODEL_PROVIDER"),
             config.provider.clone(),
         );
         let effective_execution_class = wb.lock_unpoisoned().model_execution_class();
@@ -1494,10 +1491,7 @@ pub fn run_engagement_turn(
                 effective_execution_class,
             )
         };
-        let model = resolve_turn_model(
-            std::env::var("GAUGEWRIGHT_MODEL").ok(),
-            config.model.clone(),
-        );
+        let model = resolve_turn_model(gaugedesk_env::var("MODEL"), config.model.clone());
         // openai-generic (ADR 0083) carries its endpoint with the linked credential;
         // resolve it nearest-scope-wins so the descriptor derives the admitted host
         // from the same base_url the request will use. Other providers ignore it.
@@ -1512,7 +1506,7 @@ pub fn run_engagement_turn(
         } else {
             None
         };
-        let provider_descriptor = gaugewright_whip_runtime::native_provider_descriptor(
+        let provider_descriptor = gaugedesk_whip_runtime::native_provider_descriptor(
             &provider,
             model.as_deref(),
             base_url_override.as_deref(),
@@ -1597,7 +1591,7 @@ pub fn run_engagement_turn(
         // workspace capabilities, so writes outside the grant or into protected
         // subtrees fail before filesystem execution (INV-24).
         let sandbox_policy = {
-            use gaugewright_harness::sandbox::Network;
+            use gaugedesk_harness::sandbox::Network;
             let path_scope = wb
                 .lock_unpoisoned()
                 .library_chat_target_binding(id)
@@ -1611,8 +1605,8 @@ pub fn run_engagement_turn(
             // with a disclosed lower ceiling — the 2026-06-17 product decision) rather
             // than breaking model access. The model endpoint is named explicitly
             // (recorded + auditable; load-bearing under Filtered).
-            // `GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1` force-opens to UNFILTERED egress
-            // regardless (the conscious opt-in, mirroring `GAUGEWRIGHT_SANDBOX=0`); an
+            // `GAUGEDESK_ALLOW_UNFILTERED_EGRESS=1` force-opens to UNFILTERED egress
+            // regardless (the conscious opt-in, mirroring `GAUGEDESK_SANDBOX=0`); an
             // isolated project denies network entirely. A `Filtered` request the host
             // can't enforce is failed closed to `Deny` by the harness — never silently
             // to `Allow` — which is exactly why the engine only requests it when enforceable.
@@ -1626,7 +1620,7 @@ pub fn run_engagement_turn(
             };
             let project_isolated = wb.lock_unpoisoned().chat_network_isolated(id);
             let forced_unfiltered =
-                std::env::var("GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS").as_deref() == Ok("1");
+                gaugedesk_env::var("ALLOW_UNFILTERED_EGRESS").as_deref() == Some("1");
             let posture = egress_posture(project_isolated, forced_unfiltered);
             match posture {
                 Network::Deny => eprintln!(
@@ -1642,12 +1636,12 @@ pub fn run_engagement_turn(
                 ),
                 Network::Allow => eprintln!(
                     "[gaugewright] NOTE: project policy allows unfiltered egress \
-                     (GAUGEWRIGHT_ALLOW_UNFILTERED_EGRESS=1); the current WhippleScript \
+                     (GAUGEDESK_ALLOW_UNFILTERED_EGRESS=1); the current WhippleScript \
                      package still exposes only its governed provider endpoint ({}).",
                     egress_hosts.join(", ")
                 ),
             }
-            let base = gaugewright_harness::sandbox::SandboxPolicy::new(writable)
+            let base = gaugedesk_harness::sandbox::SandboxPolicy::new(writable)
                 .read_only(method_surface_readonly_roots(worktree, mode));
             match posture {
                 // Filtered: the allowlist is load-bearing (enforced by the proxy).
@@ -1663,14 +1657,14 @@ pub fn run_engagement_turn(
                 let root = package_root.as_deref().ok_or_else(|| {
                     "a work chat has no selected WhippleScript package root".to_owned()
                 })?;
-                gaugewright_whip_runtime::AuthoredAgentPackage::load(root)
+                gaugedesk_whip_runtime::AuthoredAgentPackage::load(root)
                     .map_err(|error| error.to_string())?
                     .capabilities()
                     .iter()
                     .cloned()
                     .collect()
             }
-            ChatMode::Edit => gaugewright_whip_runtime::editor_package_capabilities()
+            ChatMode::Edit => gaugedesk_whip_runtime::editor_package_capabilities()
                 .map_err(|error| error.to_string())?,
         };
         let runtime_placement_id;
@@ -1703,9 +1697,9 @@ pub fn run_engagement_turn(
             )
             .declared_scopes();
             let actor_attributes = g.idp.as_ref().map_or_else(
-                || gaugewright_core::abac::AuthorityAttributes {
-                    clearance: gaugewright_core::abac::Clearance(3),
-                    roles: BTreeSet::from([gaugewright_core::abac::Role::owner()]),
+                || gaugedesk_core::abac::AuthorityAttributes {
+                    clearance: gaugedesk_core::abac::Clearance(3),
+                    roles: BTreeSet::from([gaugedesk_core::abac::Role::owner()]),
                     region: org
                         .security
                         .as_ref()
@@ -1715,8 +1709,8 @@ pub fn run_engagement_turn(
                                 .as_ref()
                                 .and_then(|record| record.default_region.as_deref())
                         })
-                        .map(gaugewright_core::abac::Region::new),
-                    ..gaugewright_core::abac::AuthorityAttributes::default()
+                        .map(gaugedesk_core::abac::Region::new),
+                    ..gaugedesk_core::abac::AuthorityAttributes::default()
                 },
                 |idp| idp.claims(&actor),
             );
@@ -1738,7 +1732,7 @@ pub fn run_engagement_turn(
                     "local".to_owned()
                 },
                 command_network: sandbox_policy.network
-                    != gaugewright_harness::sandbox::Network::Deny,
+                    != gaugedesk_harness::sandbox::Network::Deny,
                 resources,
                 advancement_scopes,
             })?
@@ -1893,7 +1887,7 @@ fn auto_advance_turn(
     wb: &SharedWorkbench,
     id: &str,
     sender: &broadcast::Sender<ServerEvent>,
-    guarantee_outcomes: &[gaugewright_harness::GuaranteeOutcome],
+    guarantee_outcomes: &[gaugedesk_harness::GuaranteeOutcome],
 ) {
     let mut g = wb.lock_unpoisoned();
     g.auto_advance_turn(id, sender, guarantee_outcomes);
@@ -1914,7 +1908,7 @@ impl Workbench {
         sender: &broadcast::Sender<ServerEvent>,
         contribution_by: Option<&str>,
     ) {
-        use gaugewright_core::workstream::{WorkstreamCommand, WorkstreamState};
+        use gaugedesk_core::workstream::{WorkstreamCommand, WorkstreamState};
         if !self
             .library_chat_target_binding(id)
             .and_then(|binding| self.library.work_targets.get(&binding.target_id))
@@ -1951,7 +1945,7 @@ impl Workbench {
                 .filter(|authority| !authority.trim().is_empty())
                 .map(str::to_owned)
                 .unwrap_or_else(|| {
-                    gaugewright_core::determine_scope_authority(id)
+                    gaugedesk_core::determine_scope_authority(id)
                         .as_str()
                         .to_string()
                 });
@@ -2034,7 +2028,7 @@ impl Workbench {
         &mut self,
         id: &str,
         sender: &broadcast::Sender<ServerEvent>,
-        guarantee_outcomes: &[gaugewright_harness::GuaranteeOutcome],
+        guarantee_outcomes: &[gaugedesk_harness::GuaranteeOutcome],
     ) {
         if !self
             .library_chat_target_binding(id)
@@ -2095,7 +2089,7 @@ impl Workbench {
             if rules.is_empty() {
                 return;
             }
-            let owner = gaugewright_core::determine_scope_authority(id);
+            let owner = gaugedesk_core::determine_scope_authority(id);
             let external =
                 crate::resource_store::external_read_stakeholders(&self.store, id, owner.as_str())
                     .unwrap_or_else(|_| vec!["<unresolved>".to_string()]);
@@ -2325,7 +2319,7 @@ fn drive_persistent_turn(
 /// different trust authority and held in the workbench's `remote_sessions` map
 /// alongside the local ones (`WORKBENCH-REMOTE-1`). This is the workbench-level
 /// sibling of [`drive_persistent_turn`]: it pulls the registered
-/// [`RemoteHarness`](gaugewright_harness::RemoteHarness) for `id` and routes the turn
+/// [`RemoteHarness`](gaugedesk_harness::RemoteHarness) for `id` and routes the turn
 /// through [`run_task_remote`] (`ENGINE-REMOTE-1`), so the remote outcome becomes
 /// run truth only via the owner's federated admission (`INV-4`). The remote path
 /// has no local worktree, so there is no commit/diff/merge to surface.
@@ -2359,8 +2353,8 @@ impl Workbench {
 mod tests {
     use super::*;
     use crate::test_support::fake_agent_env;
-    use gaugewright_pi_bridge::{run_rpc_turn, RpcTransport, ScriptedTransport};
-    use gaugewright_workspace::Instance;
+    use gaugedesk_pi_bridge::{run_rpc_turn, RpcTransport, ScriptedTransport};
+    use gaugedesk_workspace::Instance;
     use std::collections::VecDeque;
     use std::io;
 
@@ -2376,22 +2370,22 @@ mod tests {
         resource_handle: String,
     }
 
-    impl gaugewright_harness::Harness for PositionedHarness {
+    impl gaugedesk_harness::Harness for PositionedHarness {
         fn run_turn(
             &mut self,
-            _gate: &dyn gaugewright_harness::EgressGate,
+            _gate: &dyn gaugedesk_harness::EgressGate,
             _prompt: &str,
-            _images: &[gaugewright_harness::ImageContent],
-            _sink: &mut dyn FnMut(&gaugewright_harness::Observation),
+            _images: &[gaugedesk_harness::ImageContent],
+            _sink: &mut dyn FnMut(&gaugedesk_harness::Observation),
         ) -> io::Result<TurnOutcome> {
             std::fs::write(self.worktree.join("point.txt"), "after").unwrap();
             Ok(TurnOutcome {
                 assistant_text: "done".into(),
-                runtime_start_position: Some(gaugewright_harness::RuntimePosition {
+                runtime_start_position: Some(gaugedesk_harness::RuntimePosition {
                     instance_ref: "whip:source".into(),
                     sequence: 4,
                 }),
-                runtime_terminal_position: Some(gaugewright_harness::RuntimePosition {
+                runtime_terminal_position: Some(gaugedesk_harness::RuntimePosition {
                     instance_ref: "whip:source".into(),
                     sequence: 9,
                 }),
@@ -2400,13 +2394,13 @@ mod tests {
         }
     }
 
-    impl gaugewright_harness::Harness for SummaryHarness {
+    impl gaugedesk_harness::Harness for SummaryHarness {
         fn run_turn(
             &mut self,
-            _gate: &dyn gaugewright_harness::EgressGate,
+            _gate: &dyn gaugedesk_harness::EgressGate,
             _prompt: &str,
-            _images: &[gaugewright_harness::ImageContent],
-            _sink: &mut dyn FnMut(&gaugewright_harness::Observation),
+            _images: &[gaugedesk_harness::ImageContent],
+            _sink: &mut dyn FnMut(&gaugedesk_harness::Observation),
         ) -> io::Result<TurnOutcome> {
             std::fs::write(
                 self.worktree.join(".agent-config.json"),
@@ -2415,7 +2409,7 @@ mod tests {
             .unwrap();
             Ok(TurnOutcome {
                 assistant_text: "configured".into(),
-                output_flow_signature: vec![gaugewright_harness::OutputFieldFlow {
+                output_flow_signature: vec![gaugedesk_harness::OutputFieldFlow {
                     field: "assistant_text".into(),
                     read_handles: vec![format!("resource:{}", self.resource_handle)],
                 }],
@@ -2448,7 +2442,7 @@ mod tests {
             "summary-chat",
             &eng,
             &mut harness,
-            &gaugewright_harness::AllowAllGate,
+            &gaugedesk_harness::AllowAllGate,
             "configure it",
             &[],
         )
@@ -2491,7 +2485,7 @@ mod tests {
             "chat-1",
             &eng,
             &mut harness,
-            &gaugewright_harness::AllowAllGate,
+            &gaugedesk_harness::AllowAllGate,
             "change it",
             &[],
         )
@@ -2513,7 +2507,7 @@ mod tests {
         assert!(transcript_positions.contains(&boundary.assistant_entry_id));
     }
 
-    impl gaugewright_harness::CredentialCapability for PresentCredential {
+    impl gaugedesk_harness::CredentialCapability for PresentCredential {
         fn credential_ref(&self) -> &str {
             "credential:test"
         }
@@ -2521,11 +2515,11 @@ mod tests {
         fn resolve(
             &self,
             credential_ref: &str,
-        ) -> io::Result<gaugewright_harness::CredentialMaterial> {
+        ) -> io::Result<gaugedesk_harness::CredentialMaterial> {
             if credential_ref != self.credential_ref() {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, "wrong ref"));
             }
-            Ok(gaugewright_harness::CredentialMaterial::new("secret", None))
+            Ok(gaugedesk_harness::CredentialMaterial::new("secret", None))
         }
     }
 
@@ -2562,7 +2556,7 @@ mod tests {
     // The BYOK leg is shell policy — the factory is never consulted for it.
     #[test]
     fn byok_provider_requires_its_linked_key() {
-        let pi = gaugewright_pi_bridge::PiHarnessFactory;
+        let pi = gaugedesk_pi_bridge::PiHarnessFactory;
         let capability = PresentCredential;
         assert!(llm_credential_status("openai", Some(&capability), &pi).is_ok());
         // nothing linked ⇒ refused with an actionable message
@@ -2588,17 +2582,17 @@ mod tests {
             move |k: &str| m.get(k).cloned()
         };
 
-        let ready = env(&[("GAUGEWRIGHT_HOST_MODEL_READY", "1")]);
+        let ready = env(&[("GAUGEDESK_HOST_MODEL_READY", "1")]);
         assert!(host_managed_model_status("cloudflare-ai-gateway", &ready).is_ok());
 
         let not_ready = env(&[]);
         let err = host_managed_model_status("cloudflare-ai-gateway", &not_ready).unwrap_err();
         assert!(
-            err.contains("GAUGEWRIGHT_HOST_MODEL_READY"),
+            err.contains("GAUGEDESK_HOST_MODEL_READY"),
             "names the readiness flag: {err}"
         );
 
-        let false_value = env(&[("GAUGEWRIGHT_HOST_MODEL_READY", "0")]);
+        let false_value = env(&[("GAUGEDESK_HOST_MODEL_READY", "0")]);
         assert!(host_managed_model_status("cloudflare-workers-ai", &false_value).is_err());
     }
 
@@ -2660,7 +2654,7 @@ mod tests {
     // the admitted provider endpoint without relying on Pi's netns capability.
     #[test]
     fn egress_posture_filters_provider_calls_unless_policy_overrides() {
-        use gaugewright_harness::sandbox::Network;
+        use gaugedesk_harness::sandbox::Network;
         assert_eq!(egress_posture(false, false), Network::Filtered);
         assert_eq!(egress_posture(true, false), Network::Deny);
         // The explicit operator escape hatch preserves its existing precedence.
@@ -2708,7 +2702,7 @@ mod tests {
     /// fake and retired adapters. WhippleScript is the production authority.
     #[test]
     fn membrane_gate_enforces_the_edit_use_write_gate() {
-        use gaugewright_harness::GateDecision;
+        use gaugedesk_harness::GateDecision;
         let cfg = AgentConfig::default();
         let use_gate = MembraneGate::new(&cfg, default_external_tools()).with_mode(ChatMode::Use);
         // use mode: writing the definition surface is blocked…
@@ -3047,7 +3041,7 @@ mod tests {
 
     #[test]
     fn managed_usage_is_admitted_to_run_and_billing_scopes() {
-        use gaugewright_harness::testing::ScriptedHarness;
+        use gaugedesk_harness::testing::ScriptedHarness;
 
         let dir = tempfile::tempdir().unwrap();
         let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
@@ -3055,7 +3049,7 @@ mod tests {
         let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
         let mut harness = ScriptedHarness::new(vec![TurnOutcome {
             assistant_text: "done".into(),
-            managed_usage: Some(gaugewright_harness::ModelUsage {
+            managed_usage: Some(gaugedesk_harness::ModelUsage {
                 usage_ref: "whip:evidence:usage:1".into(),
                 provider: "cloudflare-workers-ai".into(),
                 model: "@cf/model".into(),
@@ -3331,7 +3325,7 @@ mod tests {
     /// minted under the scope's owning authority (MINT-1) — no local worktree.
     #[test]
     fn engine_drives_a_remote_placed_turn_and_federates_its_observations() {
-        use gaugewright_pi_bridge::RemoteLoopbackHarness;
+        use gaugedesk_pi_bridge::RemoteLoopbackHarness;
 
         let mut store = Store::open_in_memory().unwrap();
         // A federated scope owned by `acme` (the second `:`-segment), so the minted
@@ -3411,8 +3405,8 @@ mod tests {
     /// (INV-4), with no local worktree.
     #[test]
     fn workbench_holds_a_remote_session_and_drives_a_turn_against_it() {
-        use gaugewright_pi_bridge::RemoteLoopbackHarness;
-        use gaugewright_workspace::Instance;
+        use gaugedesk_pi_bridge::RemoteLoopbackHarness;
+        use gaugedesk_workspace::Instance;
         use std::sync::{Arc, Mutex};
 
         let dir = tempfile::tempdir().unwrap();
@@ -3488,13 +3482,13 @@ mod tests {
     #[test]
     #[ignore = "E2E-TEST-1: end-to-end two-authority loopback; run with --ignored"]
     fn e2e_two_authority_loopback_federation_with_signatures() {
-        use gaugewright_core::federated_delivery::{
+        use gaugedesk_core::federated_delivery::{
             Authority, DeliveryCommand, DeliveryEnvelope, DeliveryPhase, DeliveryState,
         };
-        use gaugewright_core::ids::{BridgeGrantId, Nonce, PublicKey};
-        use gaugewright_core::signature::Signature;
-        use gaugewright_pi_bridge::RemoteLoopbackHarness;
-        use gaugewright_store::AdmitError;
+        use gaugedesk_core::ids::{BridgeGrantId, Nonce, PublicKey};
+        use gaugedesk_core::signature::Signature;
+        use gaugedesk_pi_bridge::RemoteLoopbackHarness;
+        use gaugedesk_store::AdmitError;
 
         let mut store = Store::open_in_memory().unwrap();
         // The owner federates work to a runtime placed in the `acme` authority.
@@ -3672,7 +3666,7 @@ mod tests {
     #[test]
     fn a_turn_holds_its_own_harness_not_the_workbench() {
         use crate::app_support::LockUnpoisoned;
-        use gaugewright_workspace::Instance;
+        use gaugedesk_workspace::Instance;
         use std::sync::{Arc, Mutex};
 
         let dir = tempfile::tempdir().unwrap();
@@ -3709,8 +3703,8 @@ mod tests {
     /// session retires any local one under the same id, so the two maps stay disjoint.
     #[test]
     fn registering_a_remote_session_retires_a_local_one() {
-        use gaugewright_pi_bridge::RemoteLoopbackHarness;
-        use gaugewright_workspace::Instance;
+        use gaugedesk_pi_bridge::RemoteLoopbackHarness;
+        use gaugedesk_workspace::Instance;
         use std::sync::{Arc, Mutex};
 
         let dir = tempfile::tempdir().unwrap();

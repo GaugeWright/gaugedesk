@@ -1,12 +1,13 @@
 [package]
-name = "gaugewright-store"
+name = "gaugedesk-store"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "gaugewright local store: SQLite event log + records + the admission transaction (imperative shell)."
 
 [dependencies]
-gaugewright-core = { path = "../core" }
+gaugedesk-env = { path = "../env" }
+gaugedesk-core = { path = "../core" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = "1"
 serde_json = "1"

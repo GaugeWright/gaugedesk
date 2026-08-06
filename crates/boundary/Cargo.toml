@@ -1,11 +1,11 @@
 [package]
-name = "gaugewright-boundary"
+name = "gaugedesk-boundary"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
-gaugewright-core = { path = "../core" }
+gaugedesk-core = { path = "../core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

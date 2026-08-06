@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use gaugewright_relay_transport::{bind_client_loopback, RelayRoute, RouteProof};
+use gaugedesk_relay_transport::{bind_client_loopback, RelayRoute, RouteProof};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 

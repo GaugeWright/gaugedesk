@@ -33,7 +33,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, Server
 use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme};
 use tokio_rustls::{client, server, TlsAcceptor, TlsConnector};
 
-use gaugewright_core::ids::AuthorityId;
+use gaugedesk_core::ids::AuthorityId;
 
 use crate::net_server::{CertFingerprint, PinRejection, PinnedTlsClientConfig};
 

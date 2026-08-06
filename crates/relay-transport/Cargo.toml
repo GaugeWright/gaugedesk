@@ -1,5 +1,5 @@
 [package]
-name = "gaugewright-relay-transport"
+name = "gaugedesk-relay-transport"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ description = "Blind role-aware rendezvous and cert-pinned Home/client tunnel."
 test-relay = []
 
 [dependencies]
+gaugedesk-env = { path = "../env" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

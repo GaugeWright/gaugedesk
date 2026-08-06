@@ -34,7 +34,7 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 hex = "0.4"
-gaugewright-relay-transport = { path = "../crates/relay-transport" }
+gaugedesk-relay-transport = { path = "../crates/relay-transport" }
 tokio = { version = "1", features = ["rt", "net"] }
 
 [features]

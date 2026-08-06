@@ -9,17 +9,17 @@
 use std::io;
 use std::sync::Arc;
 
-use gaugewright_app::engine::run_task_streaming;
-use gaugewright_core::merge::MergePhase;
-use gaugewright_core::run::RunPhase;
-use gaugewright_harness::sandbox::SandboxPolicy;
-use gaugewright_harness::testing::ScriptedHarness;
-use gaugewright_harness::{
+use gaugedesk_app::engine::run_task_streaming;
+use gaugedesk_core::merge::MergePhase;
+use gaugedesk_core::run::RunPhase;
+use gaugedesk_harness::sandbox::SandboxPolicy;
+use gaugedesk_harness::testing::ScriptedHarness;
+use gaugedesk_harness::{
     AllowAllGate, ChatMode, CredentialProbe, Harness, HarnessFactory, HarnessSpec, Observation,
     TurnOutcome,
 };
-use gaugewright_store::Store;
-use gaugewright_workspace::{WhippleWorkspaceProvider, WorkspaceProvider};
+use gaugedesk_store::Store;
+use gaugedesk_workspace::{WhippleWorkspaceProvider, WorkspaceProvider};
 
 /// The registered test factory: builds the neutral scripted harness from a
 /// [`HarnessSpec`] — the same construction seam the engine's selector serves.
@@ -58,7 +58,7 @@ impl HarnessFactory for NeutralScriptedFactory {
     fn credential_status(
         &self,
         _provider: &str,
-        _capability: Option<&dyn gaugewright_harness::CredentialCapability>,
+        _capability: Option<&dyn gaugedesk_harness::CredentialCapability>,
     ) -> CredentialProbe {
         CredentialProbe::Ready
     }

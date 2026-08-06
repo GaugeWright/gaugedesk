@@ -98,7 +98,7 @@ try {
             resolve(value);
         });
         server.once("error", reject);
-        server.listen(1455, process.env.GAUGEWRIGHT_OAUTH_CALLBACK_HOST || "127.0.0.1", () => {
+        server.listen(1455, process.env.GAUGEDESK_OAUTH_CALLBACK_HOST || "127.0.0.1", () => {
             emit({ event: "auth_url", url: authorize.toString() });
         });
     });

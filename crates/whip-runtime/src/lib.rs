@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use gaugewright_core::ids::{AuthorityId, PublicKey};
-use gaugewright_core::signature::{verify_signature, Signature, SigningKey};
-use gaugewright_harness::sandbox::Network;
-use gaugewright_harness::{
+use gaugedesk_core::ids::{AuthorityId, PublicKey};
+use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
+use gaugedesk_harness::sandbox::Network;
+use gaugedesk_harness::{
     CredentialCapability, CredentialProbe, EgressGate, Harness, HarnessContinuitySpec,
     HarnessFactory, HarnessSpec, ImageContent, Observation, OutputFieldFlow, RuntimePosition,
     ToolInfo, TurnOutcome,
@@ -341,13 +341,13 @@ impl WhipHarnessFactory {
     }
 
     pub(crate) fn package_for(
-        mode: gaugewright_harness::ChatMode,
+        mode: gaugedesk_harness::ChatMode,
         package_root: Option<&Path>,
         package_version_ref: Option<&str>,
         prompt_override: Option<&str>,
     ) -> io::Result<AuthoredAgentPackage> {
         match mode {
-            gaugewright_harness::ChatMode::Use => {
+            gaugedesk_harness::ChatMode::Use => {
                 if prompt_override.is_some() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -375,7 +375,7 @@ impl WhipHarnessFactory {
                 }
                 Ok(package)
             }
-            gaugewright_harness::ChatMode::Edit => AuthoredAgentPackage::from_documents(
+            gaugedesk_harness::ChatMode::Edit => AuthoredAgentPackage::from_documents(
                 GAUGEDESK_EDITOR_MANIFEST,
                 GAUGEDESK_EDITOR_SOURCE,
                 prompt_override.ok_or_else(|| {
@@ -391,7 +391,7 @@ impl WhipHarnessFactory {
 
     fn previous_package_for(
         worktree: &Path,
-        mode: gaugewright_harness::ChatMode,
+        mode: gaugedesk_harness::ChatMode,
         prompt_override: Option<&str>,
         roster: &[(String, String)],
     ) -> io::Result<StaticPackage> {
@@ -765,13 +765,12 @@ impl Harness for WhipHarness {
         // Unconditional since ADR 0111: every turn now reaches a terminal, so
         // there is no suspended case without a receipt.
         if let Ok(Some(report)) = self.runtime.turn_guarantee_report(&command) {
-            outcome.guarantee_outcomes =
-                gaugewright_harness::GuaranteeOutcome::from_report(&report);
+            outcome.guarantee_outcomes = gaugedesk_harness::GuaranteeOutcome::from_report(&report);
         }
         Ok(outcome)
     }
 
-    fn interrupt_handle(&self) -> Option<gaugewright_harness::InterruptHandle> {
+    fn interrupt_handle(&self) -> Option<gaugedesk_harness::InterruptHandle> {
         let cancellation = Arc::clone(&self.cancellation);
         Some(Arc::new(move || {
             if let Some(handle) = cancellation
@@ -978,7 +977,7 @@ mod retired_os_command_executor {
     /// authority: WhippleScript owns the simple-command grammar, allow policy,
     /// timeout ceiling, and output projection.
     struct GaugeDeskCommandExecutor {
-        sandbox: gaugewright_harness::sandbox::SandboxPolicy,
+        sandbox: gaugedesk_harness::sandbox::SandboxPolicy,
     }
 
     impl CommandExecutor for GaugeDeskCommandExecutor {
@@ -986,7 +985,7 @@ mod retired_os_command_executor {
             let policy = command_sandbox_policy(&self.sandbox, admitted);
 
             let args = vec!["-c".to_owned(), admitted.command.clone()];
-            let mut command = gaugewright_harness::sandbox::wrap_strict(
+            let mut command = gaugedesk_harness::sandbox::wrap_strict(
                 &policy,
                 "/bin/sh",
                 &args,
@@ -1092,9 +1091,9 @@ mod retired_os_command_executor {
     }
 
     fn command_sandbox_policy(
-        base: &gaugewright_harness::sandbox::SandboxPolicy,
+        base: &gaugedesk_harness::sandbox::SandboxPolicy,
         admitted: &AdmittedCommand,
-    ) -> gaugewright_harness::sandbox::SandboxPolicy {
+    ) -> gaugedesk_harness::sandbox::SandboxPolicy {
         let mut policy = base.clone();
         policy.writable_roots = vec![admitted.workspace_root.clone()];
         policy.read_only_roots = admitted.read_only_paths.clone();
@@ -1442,7 +1441,7 @@ struct TurnResources<'a> {
     /// Questions asked during this turn. Interior mutability because
     /// `execute_tool` takes `&self`; the engine drains these once the turn
     /// settles, since it holds the store across the run (ADR 0113).
-    asked: std::cell::RefCell<Vec<gaugewright_harness::AskedQuestion>>,
+    asked: std::cell::RefCell<Vec<gaugedesk_harness::AskedQuestion>>,
 }
 
 impl ResourceResolver for TurnResources<'_> {
@@ -1513,7 +1512,7 @@ impl ResourceResolver for TurnResources<'_> {
                 .unwrap_or(false);
             self.asked
                 .borrow_mut()
-                .push(gaugewright_harness::AskedQuestion {
+                .push(gaugedesk_harness::AskedQuestion {
                     question,
                     choices,
                     to,
@@ -1619,7 +1618,7 @@ fn legacy_method_prompt(worktree: &Path, prompt_override: Option<&str>) -> io::R
 }
 
 fn package_version_ref(
-    mode: gaugewright_harness::ChatMode,
+    mode: gaugedesk_harness::ChatMode,
     system_prompt: &str,
     revision: &str,
 ) -> String {
@@ -1837,13 +1836,11 @@ mod tests {
         fn resolve(
             &self,
             credential_ref: &str,
-        ) -> io::Result<gaugewright_harness::CredentialMaterial> {
+        ) -> io::Result<gaugedesk_harness::CredentialMaterial> {
             if credential_ref != self.credential_ref {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, "wrong ref"));
             }
-            Ok(gaugewright_harness::CredentialMaterial::new(
-                "test-key", None,
-            ))
+            Ok(gaugedesk_harness::CredentialMaterial::new("test-key", None))
         }
     }
 
@@ -2148,7 +2145,7 @@ workflow Method {
         let spec = HarnessSpec {
             chat_id: "chat-1".to_owned(),
             worktree: worktree.path().to_path_buf(),
-            mode: gaugewright_harness::ChatMode::Use,
+            mode: gaugedesk_harness::ChatMode::Use,
             package_root: Some(package_root.clone()),
             package_version_ref: Some(package_ref.clone()),
             policy_epoch: Some(1),
@@ -2164,7 +2161,7 @@ workflow Method {
             system_prompt: None,
             credential_capability: Some(test_credential_capability()),
             credentials: vec![("OPENAI_API_KEY".to_owned(), "test-key".to_owned())],
-            sandbox: gaugewright_harness::sandbox::SandboxPolicy::new(vec![worktree
+            sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![worktree
                 .path()
                 .to_path_buf()])
             .read_only(vec![worktree.path().join(".whipple")])
@@ -2258,7 +2255,7 @@ workflow Method {
         let target_spec = HarnessSpec {
             chat_id: target_continuity.chat_id.clone(),
             worktree: target_continuity.worktree.clone(),
-            sandbox: gaugewright_harness::sandbox::SandboxPolicy::new(vec![target_continuity
+            sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![target_continuity
                 .worktree
                 .clone()])
             .read_only(vec![target_continuity.worktree.join(".whipple")])

@@ -14,11 +14,11 @@ use axum::{
     Json,
 };
 use futures::Stream;
-use gaugewright_core::instance::{InstanceCommand, InstanceState};
-use gaugewright_core::merge::{MergeCommand, MergeState};
+use gaugedesk_core::instance::{InstanceCommand, InstanceState};
+use gaugedesk_core::merge::{MergeCommand, MergeState};
 #[cfg(debug_assertions)]
-use gaugewright_store::Store;
-use gaugewright_workspace::{
+use gaugedesk_store::Store;
+use gaugedesk_workspace::{
     ChatWorkspace, FileEntry, MergeOutcome, MergePreview, RegionResolution, SaveBase,
     SaveFileOutcome, WorkspaceError,
 };
@@ -199,7 +199,7 @@ impl Workbench {
     pub(crate) fn engagement_transcript_json(
         &self,
         id: &str,
-    ) -> Result<String, gaugewright_store::AdmitError> {
+    ) -> Result<String, gaugedesk_store::AdmitError> {
         let events = self.store_ref().events(id)?;
         let forkable: std::collections::BTreeSet<i64> = events
             .iter()
@@ -231,7 +231,7 @@ impl Workbench {
     pub(crate) fn engagement_audit_json(
         &self,
         id: &str,
-    ) -> Result<String, gaugewright_store::AdmitError> {
+    ) -> Result<String, gaugedesk_store::AdmitError> {
         self.store_ref()
             .records(id, "audit")
             .map(|rows| format!("[{}]", rows.join(",")))
@@ -406,7 +406,7 @@ impl Workbench {
 
     fn authorize_file_edit(&self, chat_id: &str, path: &str) -> Result<(), &'static str> {
         let normalized = path.trim_start_matches("./");
-        if gaugewright_boundary::is_control_surface_path(normalized) {
+        if gaugedesk_boundary::is_control_surface_path(normalized) {
             return Err("GaugeDesk runtime settings must be changed through Settings");
         }
         if normalized.starts_with(".whipple/versions/")
@@ -416,7 +416,7 @@ impl Workbench {
         {
             return Err("published archetype versions are immutable");
         }
-        if gaugewright_boundary::is_method_surface_path(normalized) {
+        if gaugedesk_boundary::is_method_surface_path(normalized) {
             let chat = self
                 .library
                 .chats
@@ -468,7 +468,7 @@ impl Workbench {
     pub(crate) fn engagement_merge_state(
         &self,
         id: &str,
-    ) -> Result<MergeState, gaugewright_store::AdmitError> {
+    ) -> Result<MergeState, gaugedesk_store::AdmitError> {
         self.store_ref().fold::<MergeState>(id)
     }
 
@@ -782,7 +782,7 @@ pub(crate) async fn put_config(
     body: String,
 ) -> impl IntoResponse {
     // Validate the host-owned subset before writing.
-    if let Err(e) = gaugewright_boundary::AgentConfig::runtime_settings_from_json(&body) {
+    if let Err(e) = gaugedesk_boundary::AgentConfig::runtime_settings_from_json(&body) {
         return (
             StatusCode::BAD_REQUEST,
             format!("invalid agent config: {e}"),
@@ -1140,7 +1140,7 @@ pub(crate) struct TaskBody {
     /// WhippleScript as message-scoped model input; never recorded in the durable
     /// transcript. Absent ⇒ a text turn.
     #[serde(default)]
-    images: Vec<gaugewright_harness::ImageContent>,
+    images: Vec<gaugedesk_harness::ImageContent>,
 }
 
 /// Task an engagement: drive one governed WhippleScript turn in its worktree,
@@ -1258,7 +1258,7 @@ pub(crate) async fn post_stop(
 }
 
 /// **Test-only** — reset the control plane to a freshly-seeded state. Gated behind
-/// `GAUGEWRIGHT_TEST_RESET` (set by the e2e launcher), so it is inert in a normal run.
+/// `GAUGEDESK_TEST_RESET` (set by the e2e launcher), so it is inert in a normal run.
 ///
 /// The e2e suite shares one control plane across all scenarios, serially; with no
 /// reset the append-only store accumulates every scenario's projects, archetypes
@@ -1290,14 +1290,14 @@ pub(crate) struct TestResetQuery {
 
 /// Debug builds only (DR-0054 Phase A): a route that deletes the entire state
 /// root must not exist in a release artifact, so the handler and its mounting
-/// are both compiled out. The `GAUGEWRIGHT_TEST_RESET` process guard below
+/// are both compiled out. The `GAUGEDESK_TEST_RESET` process guard below
 /// remains as defense in depth where the route does exist.
 #[cfg(debug_assertions)]
 pub(crate) async fn post_test_reset(
     State(wb): State<SharedWorkbench>,
     Query(query): Query<TestResetQuery>,
 ) -> impl IntoResponse {
-    if std::env::var("GAUGEWRIGHT_TEST_RESET").is_err() {
+    if gaugedesk_env::var("TEST_RESET").is_none() {
         return (StatusCode::FORBIDDEN, "reset is disabled").into_response();
     }
     let mut guard = wb.lock_unpoisoned();
@@ -1347,14 +1347,14 @@ pub(crate) async fn post_test_reset(
                 "membership",
                 &serde_json::to_string(&owner).expect("test owner serializes"),
             );
-            if let Ok(owner_token) = std::env::var("GAUGEWRIGHT_TEST_IDENTITY_TOKEN") {
+            if let Some(owner_token) = gaugedesk_env::var("TEST_IDENTITY_TOKEN") {
                 use std::sync::Arc;
 
-                use gaugewright_core::abac::AuthorityAttributes;
-                use gaugewright_core::ids::AuthorityId;
+                use gaugedesk_core::abac::AuthorityAttributes;
+                use gaugedesk_core::ids::AuthorityId;
 
-                let member_token = std::env::var("GAUGEWRIGHT_TEST_MEMBER_TOKEN")
-                    .unwrap_or_else(|_| "gw-e2e-member-token".to_owned());
+                let member_token = gaugedesk_env::var("TEST_MEMBER_TOKEN")
+                    .unwrap_or_else(|| "gw-e2e-member-token".to_owned());
                 let member = crate::org::MembershipRecord {
                     id: "e2e-member".to_owned(),
                     op: crate::org::RecordOp::Upsert,
@@ -1388,7 +1388,7 @@ pub(crate) async fn post_test_reset(
                 let record = crate::org::PlacementPolicyRecord {
                     id: crate::org::ORG_ID.to_owned(),
                     op: crate::org::RecordOp::Upsert,
-                    policy: gaugewright_core::boundary_lifecycle::PlacementPolicy {
+                    policy: gaugedesk_core::boundary_lifecycle::PlacementPolicy {
                         require_attested: true,
                         allowed_operators: Default::default(),
                     },
@@ -1426,8 +1426,8 @@ pub(crate) async fn post_test_reset(
                 }
             }
             if query.withheld_resource {
-                use gaugewright_core::boundary::Authority;
-                use gaugewright_core::resource::{
+                use gaugedesk_core::boundary::Authority;
+                use gaugedesk_core::resource::{
                     ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
                 };
 
@@ -1542,14 +1542,14 @@ pub(crate) struct ForceConflictBody {
 }
 
 /// Test-only (`UX-7`): arm/disarm merge-conflict injection so a browser BDD can drive the
-/// `INV-24` conflict-repair path. Inert unless `GAUGEWRIGHT_TEST_RESET` is set, like
+/// `INV-24` conflict-repair path. Inert unless `GAUGEDESK_TEST_RESET` is set, like
 /// [`post_test_reset`]; `POST /test/reset` also clears it. Debug builds only
 /// (DR-0054 Phase A), like the reset route it accompanies.
 #[cfg(debug_assertions)]
 pub(crate) async fn post_test_force_conflict(
     Json(body): Json<ForceConflictBody>,
 ) -> impl IntoResponse {
-    if std::env::var("GAUGEWRIGHT_TEST_RESET").is_err() {
+    if gaugedesk_env::var("TEST_RESET").is_none() {
         return (StatusCode::FORBIDDEN, "conflict injection is disabled").into_response();
     }
     engine::set_force_merge_conflict(body.on);

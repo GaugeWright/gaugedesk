@@ -14,7 +14,7 @@
 //! live desktop keeps itself signed in without a background daemon).
 //!
 //! The Hub endpoint is deployment configuration, not edition:
-//! `GAUGEWRIGHT_ACCOUNT_HUB_URL` overrides the production default, and an
+//! `GAUGEDESK_ACCOUNT_HUB_URL` overrides the production default, and an
 //! explicitly empty value disables the surface (status then reports
 //! `available: false`, and the welcome/account UIs show their local-only
 //! wording instead of a dead button).
@@ -47,11 +47,11 @@ const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 const NATIVE_RETURN: &str = "gaugewright://auth/callback";
 
 /// The Hub account-API base, or `None` when the surface is disabled.
-/// `GAUGEWRIGHT_ACCOUNT_HUB_URL` overrides; explicitly empty disables.
+/// `GAUGEDESK_ACCOUNT_HUB_URL` overrides; explicitly empty disables.
 fn hub_base() -> Option<String> {
-    let configured = std::env::var("GAUGEWRIGHT_ACCOUNT_HUB_URL")
+    let configured = gaugedesk_env::var("ACCOUNT_HUB_URL")
         .map(|value| value.trim().to_string())
-        .unwrap_or_else(|_| "https://auth.gaugewright.com".to_string());
+        .unwrap_or_else(|| "https://auth.gaugewright.com".to_string());
     if configured.is_empty() {
         return None;
     }

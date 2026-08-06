@@ -4,7 +4,7 @@ use crate::{federation, open_control_plane, open_workbench, LockUnpoisoned};
 
 /// Resolve the directory the open control plane roots its decision and workspace stores in.
 pub fn open_control_plane_root() -> std::path::PathBuf {
-    if let Some(root) = gaugewright_store::process_env::var_os("ROOT") {
+    if let Some(root) = gaugedesk_env::var_os("ROOT") {
         return std::path::PathBuf::from(root);
     }
     if let Some(dirs) = directories::ProjectDirs::from("dev", "gaugewright", "gaugewright") {
@@ -29,19 +29,19 @@ pub async fn open_serve(addr: &str, root: &std::path::Path) -> std::io::Result<(
     if let Some(endpoint) = configured_relay_endpoint() {
         let local = listener.local_addr()?;
         let directory = root.join("relay");
-        let identity = gaugewright_relay_transport::TlsIdentity::load_or_generate(&directory)?;
+        let identity = gaugedesk_relay_transport::TlsIdentity::load_or_generate(&directory)?;
         let config =
-            gaugewright_relay_transport::HomeRelayConfig::load_or_mint(&directory, &endpoint)?;
+            gaugedesk_relay_transport::HomeRelayConfig::load_or_mint(&directory, &endpoint)?;
         let route = config.relay_route(&identity)?;
         eprintln!(
             "[home-relay] supervised endpoint={} epoch={} tls_pin={}",
             config.endpoint,
             config.route_epoch,
-            gaugewright_relay_transport::HomeRelayConfig::fingerprint_hex(&identity),
+            gaugedesk_relay_transport::HomeRelayConfig::fingerprint_hex(&identity),
         );
         tokio::spawn(async move {
             if let Err(error) =
-                gaugewright_relay_transport::serve_home_forever(route, local, identity).await
+                gaugedesk_relay_transport::serve_home_forever(route, local, identity).await
             {
                 eprintln!("[home-relay] availability loop stopped: {error}");
             }
@@ -51,8 +51,7 @@ pub async fn open_serve(addr: &str, root: &std::path::Path) -> std::io::Result<(
 }
 
 pub(crate) fn configured_relay_endpoint() -> Option<String> {
-    std::env::var("GAUGEWRIGHT_HOME_RELAY_ENDPOINT")
-        .ok()
+    gaugedesk_env::var("HOME_RELAY_ENDPOINT")
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
@@ -76,8 +75,8 @@ pub async fn open_listener(addr: &str) -> std::io::Result<tokio::net::TcpListene
             Ok(listener)
         }
         None => {
-            let opted_in = gaugewright_store::process_env::enabled("ALLOW_NETWORK_HTTP");
-            let tls_acked = gaugewright_store::process_env::enabled("TLS_TERMINATED");
+            let opted_in = gaugedesk_env::enabled("ALLOW_NETWORK_HTTP");
+            let tls_acked = gaugedesk_env::enabled("TLS_TERMINATED");
             open_check_loopback_bind(addr, opted_in, tls_acked)?;
             let listener = tokio::net::TcpListener::bind(addr).await?;
             println!("gaugewright open control plane listening on http://{addr}");
@@ -103,7 +102,7 @@ pub(crate) fn open_check_loopback_bind(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "refusing to bind the open control-plane HTTP API to non-loopback {addr}: set \
-                 GAUGEWRIGHT_ALLOW_NETWORK_HTTP=1 to override behind a trusted network boundary."
+                 GAUGEDESK_ALLOW_NETWORK_HTTP=1 to override behind a trusted network boundary."
             ),
         ));
     }
@@ -112,13 +111,13 @@ pub(crate) fn open_check_loopback_bind(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "refusing to bind the open control-plane HTTP API to non-loopback {addr}: front \
-                 it with a TLS-terminating reverse proxy and set GAUGEWRIGHT_TLS_TERMINATED=1."
+                 it with a TLS-terminating reverse proxy and set GAUGEDESK_TLS_TERMINATED=1."
             ),
         ));
     }
     eprintln!(
         "[gaugewright] WARNING: open control-plane HTTP API bound to non-loopback {addr} via \
-         GAUGEWRIGHT_ALLOW_NETWORK_HTTP=1. A TLS-terminating proxy MUST front it."
+         GAUGEDESK_ALLOW_NETWORK_HTTP=1. A TLS-terminating proxy MUST front it."
     );
     Ok(())
 }

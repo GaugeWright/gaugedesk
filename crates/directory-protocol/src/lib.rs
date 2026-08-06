@@ -4,8 +4,8 @@
 //! routing deliberately remain outside it: this boundary owns only the exact
 //! JSON shape, canonical signing bytes, and fail-closed P-256 verification.
 
-use gaugewright_core::ids::{HomeId, PublicKey};
-use gaugewright_core::signature::{verify_signature, Signature, SigningKey};
+use gaugedesk_core::ids::{HomeId, PublicKey};
+use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
 use serde::{Deserialize, Serialize};
 
 /// Blind durable reachability metadata. Possession permits a tunnel attempt

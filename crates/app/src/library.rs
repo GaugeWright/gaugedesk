@@ -17,9 +17,9 @@
 
 use std::collections::BTreeMap;
 
-use gaugewright_core::boundary_lifecycle::{BoundaryPhase, BoundaryState, Operator, Placement};
-use gaugewright_core::ids::HomeId;
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::boundary_lifecycle::{BoundaryPhase, BoundaryState, Operator, Placement};
+use gaugedesk_core::ids::HomeId;
+use gaugedesk_store::{AdmitError, Store};
 use serde::{Deserialize, Serialize};
 
 /// The reserved store scope holding every library record.
@@ -95,7 +95,7 @@ pub enum Admission {
 /// The chat kind lives in the harness seam crate (SUB-0) — the runtime adapter
 /// needs it to key the membrane/persona — re-exported here at its old path so
 /// existing callers keep compiling unchanged.
-pub use gaugewright_harness::ChatMode;
+pub use gaugedesk_harness::ChatMode;
 
 impl InstanceKind {
     /// The chat kind a chat rooted on an instance of this kind takes (ADR 0035):
@@ -197,7 +197,7 @@ pub struct ProjectRecord {
     /// chats in this project may reach the model (and, with no per-host proxy yet,
     /// any host) — and the operator *opts into* isolation per project. `true`
     /// re-imposes the fail-closed kernel network isolation (`--unshare-net`) the
-    /// core [`SandboxPolicy`](gaugewright_harness::sandbox::SandboxPolicy) defaults to.
+    /// core [`SandboxPolicy`](gaugedesk_harness::sandbox::SandboxPolicy) defaults to.
     /// Defaults to `false` (open) for older records.
     #[serde(default)]
     pub network_isolated: bool,
@@ -465,10 +465,10 @@ pub struct ForkNode {
 /// one placement (its `instance_id`). This record carries only the stream's *existence*
 /// for nav — its name and where it lives. The authoritative status (`active`/`archived`)
 /// and **membership** live in the per-workstream [`WorkstreamState`] reducer
-/// (`gaugewright_core::workstream`, scope = the workstream id), folded on demand; a chat's
-/// homing is the in-memory [`gaugewright_workspace::Engagement::target`] cache rebuilt from it.
+/// (`gaugedesk_core::workstream`, scope = the workstream id), folded on demand; a chat's
+/// homing is the in-memory [`gaugedesk_workspace::Engagement::target`] cache rebuilt from it.
 ///
-/// [`WorkstreamState`]: gaugewright_core::workstream::WorkstreamState
+/// [`WorkstreamState`]: gaugedesk_core::workstream::WorkstreamState
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WorkstreamRecord {
     pub id: String,
@@ -822,8 +822,8 @@ impl Library {
 /// missing or failed verification is honestly reported as *not* host-blind: the
 /// ceiling claim degrades to the unattested case rather than over-promising.
 ///
-/// [`Placement`]: gaugewright_core::boundary_lifecycle::Placement
-/// [`AttestationEvidence`]: gaugewright_core::attestation::AttestationEvidence
+/// [`Placement`]: gaugedesk_core::boundary_lifecycle::Placement
+/// [`AttestationEvidence`]: gaugedesk_core::attestation::AttestationEvidence
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct BoundaryProjection {
     pub phase: BoundaryPhase,
@@ -1361,11 +1361,11 @@ mod tests {
 
     mod ceiling_description {
         use super::super::*;
-        use gaugewright_core::attestation::{
+        use gaugedesk_core::attestation::{
             AttestationEvidence, AttestationQuote, CodeMeasurement, QuoteRejection,
             QuoteVerificationResult,
         };
-        use gaugewright_core::boundary_lifecycle::{
+        use gaugedesk_core::boundary_lifecycle::{
             decide, evolve, BoundaryCommand, BoundaryState, Operator, Placement,
         };
 

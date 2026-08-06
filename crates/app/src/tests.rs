@@ -4,21 +4,21 @@ use std::sync::{
 };
 
 use axum::Router;
-use gaugewright_core::instance::InstanceState;
-use gaugewright_store::Store;
-use gaugewright_workspace::Instance;
+use gaugedesk_core::instance::InstanceState;
+use gaugedesk_store::Store;
+use gaugedesk_workspace::Instance;
 
 use super::*;
 use crate::test_support::fake_agent_env;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use gaugewright_core::instance::InstanceCommand;
+use gaugedesk_core::instance::InstanceCommand;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 #[test]
 fn context_attributes_map_labels_and_fail_closed_on_unknown() {
-    use gaugewright_core::abac::{Classification, Region};
+    use gaugedesk_core::abac::{Classification, Region};
     // SECAUD-5: known labels map; region is carried.
     let a = resource_store::context_attributes(Some("pii"), Some("eu"));
     assert_eq!(a.classification, Classification::Pii);
@@ -55,8 +55,8 @@ fn authorize_resource_export_enforces_pii_classification_on_egress() {
     use crate::identity::LoopbackIdentityProvider;
     use crate::library::RecordOp;
     use crate::org::{MembershipRecord, MembershipStatus, ORG_SCOPE};
-    use gaugewright_core::abac::{AuthorityAttributes, Classification, Region, ResourceAttributes};
-    use gaugewright_core::ids::AuthorityId;
+    use gaugedesk_core::abac::{AuthorityAttributes, Classification, Region, ResourceAttributes};
+    use gaugedesk_core::ids::AuthorityId;
 
     let idp = LoopbackIdentityProvider::new().enroll(
         "member-token",
@@ -289,8 +289,8 @@ fn workbench() -> (tempfile::TempDir, SharedWorkbench) {
 async fn console_review_count_is_actor_scoped_and_contains_no_review_metadata() {
     use std::collections::BTreeSet;
 
-    use gaugewright_core::boundary::Authority;
-    use gaugewright_core::resource::{ContentLocator, Resource, ResourceId, ResourceRecord};
+    use gaugedesk_core::boundary::Authority;
+    use gaugedesk_core::resource::{ContentLocator, Resource, ResourceId, ResourceRecord};
 
     let _fake_agent = fake_agent_env();
     let (_dir, wb) = workbench();
@@ -465,8 +465,8 @@ async fn explicit_resource_access_request_approve_revoke_routes() {
     let app = open_control_plane(Arc::clone(&wb));
     send(&app, "POST", "/chats", Some(r#"{"id":"c1"}"#)).await;
     {
-        use gaugewright_core::boundary::Authority;
-        use gaugewright_core::resource::{
+        use gaugedesk_core::boundary::Authority;
+        use gaugedesk_core::resource::{
             ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
         };
 
@@ -544,10 +544,10 @@ async fn explicit_resource_access_request_approve_revoke_routes() {
 async fn resource_access_approval_is_bound_to_the_authenticated_stakeholder() {
     use crate::identity::LoopbackIdentityProvider;
     use crate::org::{MembershipRecord, MembershipStatus, ORG_SCOPE};
-    use gaugewright_core::abac::AuthorityAttributes;
-    use gaugewright_core::boundary::Authority;
-    use gaugewright_core::ids::AuthorityId;
-    use gaugewright_core::resource::{
+    use gaugedesk_core::abac::AuthorityAttributes;
+    use gaugedesk_core::boundary::Authority;
+    use gaugedesk_core::ids::AuthorityId;
+    use gaugedesk_core::resource::{
         ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
     };
 
@@ -644,10 +644,10 @@ async fn resource_access_approval_is_bound_to_the_authenticated_stakeholder() {
 async fn resource_review_and_export_decisions_derive_scope_and_authenticated_actor() {
     use crate::identity::LoopbackIdentityProvider;
     use crate::org::{MembershipRecord, MembershipStatus, ORG_SCOPE};
-    use gaugewright_core::abac::AuthorityAttributes;
-    use gaugewright_core::boundary::Authority;
-    use gaugewright_core::ids::AuthorityId;
-    use gaugewright_core::resource::{
+    use gaugedesk_core::abac::AuthorityAttributes;
+    use gaugedesk_core::boundary::Authority;
+    use gaugedesk_core::ids::AuthorityId;
+    use gaugedesk_core::resource::{
         ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
     };
 
@@ -1281,7 +1281,7 @@ async fn health_probe_is_a_fixed_ok() {
     assert_eq!(v["migrations"], "current");
     assert_eq!(
         v["schema_version"],
-        gaugewright_store::SUPPORTED_SCHEMA_VERSION
+        gaugedesk_store::SUPPORTED_SCHEMA_VERSION
     );
 }
 
@@ -1300,7 +1300,7 @@ async fn project_home_rolls_up_runs_outputs_and_audit() {
             op: RecordOp::Upsert,
             name: "Acme".into(),
             is_default: false,
-            home_id: gaugewright_core::ids::HomeId::new("home:local-user"),
+            home_id: gaugedesk_core::ids::HomeId::new("home:local-user"),
             network_isolated: false,
             run_purpose: None,
             deployment_mode: None,
@@ -1674,7 +1674,7 @@ fn startup_persists_the_agent_ability_hard_cutover_and_reconciles_frozen_refs() 
         edit.commit_turn("restore pre-ABIL package shape").unwrap();
         assert_eq!(
             edit.merge_into_main().unwrap(),
-            gaugewright_workspace::MergeOutcome::Clean
+            gaugedesk_workspace::MergeOutcome::Clean
         );
         workspace.remove_engagement(&engagement_id).unwrap();
         original_ref
@@ -1733,7 +1733,7 @@ fn placement_project_lookup_returns_only_the_exact_using_binding() {
 fn published_agent_release_contains_the_runtime_closure_and_verifies_offline() {
     use std::collections::BTreeSet;
 
-    use gaugewright_core::agent_release::{
+    use gaugedesk_core::agent_release::{
         AttributionPolicy, PanelManifest, ProviderPolicy, PublicDoRuntimeSupport, ReleaseFile,
         RetentionPolicy,
     };
@@ -1808,14 +1808,14 @@ fn published_agent_release_contains_the_runtime_closure_and_verifies_offline() {
         signed.payload.initial_workspace[0].bytes,
         b"Published session brief"
     );
-    let admitted = gaugewright_whip_runtime::AdmittedPolicyEpoch::verify_with(
-        gaugewright_whip_runtime::PolicyEpoch::new(signed.payload.host_policy.epoch).unwrap(),
+    let admitted = gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+        gaugedesk_whip_runtime::PolicyEpoch::new(signed.payload.host_policy.epoch).unwrap(),
         &signed.payload.host_policy.signed_envelope,
-        &gaugewright_whip_runtime::GovernanceRootVerifier::new(
-            gaugewright_core::ids::AuthorityId::new(
+        &gaugedesk_whip_runtime::GovernanceRootVerifier::new(
+            gaugedesk_core::ids::AuthorityId::new(
                 signed.payload.host_policy.expected_signer.clone(),
             ),
-            gaugewright_core::ids::PublicKey::new(
+            gaugedesk_core::ids::PublicKey::new(
                 signed.payload.host_policy.signer_public_key_hex.clone(),
             ),
         ),
@@ -2159,7 +2159,7 @@ async fn workspace_seeds_built_in_archetypes_and_official_office_skills() {
     assert!(!d.path().join("targets").join(DEFAULT_PLACEMENT).exists());
     assert!(!d.path().join("instances").exists());
 
-    let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(
+    let package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(
         d.path()
             .join("targets")
             .join(library_state::authoring_target_id(DEFAULT_AGENT))
@@ -2429,7 +2429,7 @@ async fn publish_atomically_freezes_package_and_discipline_without_copying_them_
             .expect("commit draft");
         assert_eq!(
             edit.merge_into_main().expect("merge draft"),
-            gaugewright_workspace::MergeOutcome::Clean
+            gaugedesk_workspace::MergeOutcome::Clean
         );
         workspace.remove_engagement(&id).expect("remove edit");
     };
@@ -2460,7 +2460,7 @@ async fn publish_atomically_freezes_package_and_discipline_without_copying_them_
         edit.commit_turn("edit discipline draft").unwrap();
         assert_eq!(
             edit.merge_into_main().unwrap(),
-            gaugewright_workspace::MergeOutcome::Clean
+            gaugedesk_workspace::MergeOutcome::Clean
         );
         workspace.remove_engagement(&id).unwrap();
     }
@@ -2482,7 +2482,7 @@ async fn publish_atomically_freezes_package_and_discipline_without_copying_them_
         .join(library_state::authoring_target_id(DEFAULT_AGENT))
         .join("repo/.whipple/versions/2");
     let frozen =
-        gaugewright_whip_runtime::AuthoredAgentPackage::load(&frozen_root).expect("frozen package");
+        gaugedesk_whip_runtime::AuthoredAgentPackage::load(&frozen_root).expect("frozen package");
     let frozen_ref = frozen.version_ref().to_owned();
     let frozen_discipline = dir
         .path()
@@ -2511,7 +2511,7 @@ async fn publish_atomically_freezes_package_and_discipline_without_copying_them_
     // Further draft work cannot mutate version 2 or its content address.
     edit_draft(&wb, "unpublished persona");
     assert_eq!(
-        gaugewright_whip_runtime::AuthoredAgentPackage::load(&frozen_root)
+        gaugedesk_whip_runtime::AuthoredAgentPackage::load(&frozen_root)
             .unwrap()
             .version_ref(),
         frozen_ref
@@ -2592,7 +2592,7 @@ async fn publish_rejects_discipline_capability_drift_without_advancing_version()
         edit.commit_turn("introduce capability drift").unwrap();
         assert_eq!(
             edit.merge_into_main().unwrap(),
-            gaugewright_workspace::MergeOutcome::Clean
+            gaugedesk_workspace::MergeOutcome::Clean
         );
         workspace.remove_engagement(&id).unwrap();
     }
@@ -2983,7 +2983,7 @@ async fn exact_pre_target_defaults_migrate_additively() {
             op: RecordOp::Upsert,
             name: "Personal".into(),
             is_default: false,
-            home_id: gaugewright_core::ids::HomeId::new(""),
+            home_id: gaugedesk_core::ids::HomeId::new(""),
             network_isolated: false,
             run_purpose: None,
             deployment_mode: None,
@@ -3172,10 +3172,7 @@ async fn reopening_a_suspended_default_instance_is_not_auto_resumed() {
         !st.runnable,
         "a deliberately suspended instance is not auto-resumed on reopen"
     );
-    assert_eq!(
-        st.phase,
-        gaugewright_core::instance::InstancePhase::Suspended
-    );
+    assert_eq!(st.phase, gaugedesk_core::instance::InstancePhase::Suspended);
 }
 
 /// Archetype fork (ADR 0035/0038): copies the source's config + method into a

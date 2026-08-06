@@ -35,13 +35,13 @@ pub(crate) const ONBOARDING_LABEL: &str = "onboarding";
 const ONBOARDING_FILER: &str = "onboarding-system";
 
 /// Whether the onboarding feature is active. Off under the scripted fake agent
-/// (`GAUGEWRIGHT_FAKE_AGENT`, used in dev/e2e): that harness needs no credential
+/// (`GAUGEDESK_FAKE_AGENT`, used in dev/e2e): that harness needs no credential
 /// and isn't a real first-run, so seeding the checklist there would put phantom
 /// `issue` pills in the task bar the e2e suite doesn't expect. Mirrors the
 /// server's `/account/onboarding-status` gate and `harness_select`'s runtime
 /// choice, so the whole feature (overlay + tracker) is coherently on or off.
 fn onboarding_enabled() -> bool {
-    std::env::var("GAUGEWRIGHT_FAKE_AGENT").is_err()
+    gaugedesk_env::var("FAKE_AGENT").is_none()
 }
 
 /// One step of the first-run learn-to-build checklist. `step` is the stable key

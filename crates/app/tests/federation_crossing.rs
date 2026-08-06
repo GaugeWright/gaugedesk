@@ -15,11 +15,11 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use gaugewright_app::federation::Federation;
-use gaugewright_app::open_control_plane;
-use gaugewright_app::{SharedWorkbench, Workbench};
-use gaugewright_core::ids::AuthorityId;
-use gaugewright_store::Store;
+use gaugedesk_app::federation::Federation;
+use gaugedesk_app::open_control_plane;
+use gaugedesk_app::{SharedWorkbench, Workbench};
+use gaugedesk_core::ids::AuthorityId;
+use gaugedesk_store::Store;
 
 fn instance(authority: &str, broker: &str) -> (Router, tempfile::TempDir, SharedWorkbench) {
     let root = tempfile::tempdir().unwrap();
@@ -97,12 +97,12 @@ async fn delete(app: &Router, uri: &str) -> (StatusCode, Value) {
 
 async fn start_broker() -> (
     String,
-    Option<gaugewright_relay_transport::test_relay::TestRelay>,
+    Option<gaugedesk_relay_transport::test_relay::TestRelay>,
 ) {
-    if let Ok(endpoint) = std::env::var("GAUGEWRIGHT_LIVE_RELAY_ENDPOINT") {
+    if let Some(endpoint) = gaugedesk_env::var("LIVE_RELAY_ENDPOINT") {
         return (endpoint, None);
     }
-    let relay = gaugewright_relay_transport::test_relay::TestRelay::bind()
+    let relay = gaugedesk_relay_transport::test_relay::TestRelay::bind()
         .await
         .unwrap();
     (relay.endpoint().to_owned(), Some(relay))

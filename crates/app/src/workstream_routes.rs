@@ -20,11 +20,11 @@ use serde_json::json;
 
 use crate::library::{gen_id, RecordOp, WorkstreamRecord, WorkstreamRootRecord};
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
-use gaugewright_core::merge::{MergeCommand, MergePhase, MergeState};
-use gaugewright_core::run::{RunPhase, RunState};
-use gaugewright_core::workstream::{WorkstreamCommand, WorkstreamPhase, WorkstreamState};
-use gaugewright_store::AdmitError;
-use gaugewright_workspace::MergeOutcome;
+use gaugedesk_core::merge::{MergeCommand, MergePhase, MergeState};
+use gaugedesk_core::run::{RunPhase, RunState};
+use gaugedesk_core::workstream::{WorkstreamCommand, WorkstreamPhase, WorkstreamState};
+use gaugedesk_store::AdmitError;
+use gaugedesk_workspace::MergeOutcome;
 
 /// Whether a rendered provider diff contains collaborative workspace changes.
 /// `.agent-config.json` is a host-owned per-chat overlay, preserved across re-home;
@@ -33,7 +33,7 @@ fn diff_has_shared_line_changes(diff: &str) -> bool {
     diff.lines()
         .filter_map(|line| line.strip_prefix("diff --git a/"))
         .filter_map(|line| line.split_once(" b/").map(|(path, _)| path))
-        .any(|path| path != gaugewright_boundary::definition::CONFIG_PATH)
+        .any(|path| path != gaugedesk_boundary::definition::CONFIG_PATH)
 }
 
 #[derive(Deserialize)]

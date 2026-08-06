@@ -11,5 +11,5 @@ PORT="${HUB_PORT:-7910}"
 (fuser -k "${PORT}/tcp" 2>/dev/null || lsof -ti "tcp:${PORT}" 2>/dev/null | xargs -r kill 2>/dev/null) || true
 sleep 0.3
 
-export GAUGEWRIGHT_TEST_HUB_ADDR="127.0.0.1:${PORT}"
+export GAUGEDESK_TEST_HUB_ADDR="127.0.0.1:${PORT}"
 exec "$BIN"

@@ -19,15 +19,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub use gaugewright_directory_protocol::DirectoryRecord;
+pub use gaugedesk_directory_protocol::DirectoryRecord;
 
-use gaugewright_harness::{CredentialCapability, CredentialMaterial};
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_harness::{CredentialCapability, CredentialMaterial};
+use gaugedesk_store::{AdmitError, Store};
 
 use crate::at_rest::{Encryptor, LocalAeadEncryptor};
 pub use crate::library::RecordOp;
 use crate::Workbench;
-use gaugewright_core::ids::HomeId;
+use gaugedesk_core::ids::HomeId;
 
 /// The reserved store scope holding the person's account state.
 pub const ACCOUNT_SCOPE: &str = "account";
@@ -275,7 +275,7 @@ impl Account {
 /// Derive the account encryption key from the governance root **seed** (ADR 0053 §4).
 /// The seed is the *private* key material behind the recovery code — unlike the public
 /// authority id it is secret, so this key is secret too. Restoring the seed
-/// ([`gaugewright_core::recovery`]) re-derives the **same** account key, so seed recovery
+/// ([`gaugedesk_core::recovery`]) re-derives the **same** account key, so seed recovery
 /// restores access to all sealed account state. The `v2` domain tag marks the deliberate
 /// break from the old public-id "loopback double" (`v1`), which **anyone** who knew your
 /// public root id could derive — the vulnerability this closes. Callers never derive this
@@ -336,7 +336,7 @@ pub fn link_base_url_for(provider: &str, base_url: Option<&str>) -> Result<Strin
         .filter(|url| !url.is_empty())
         .ok_or_else(|| "openai-generic requires an endpoint URL".to_owned())?;
     // Validate parseability + TLS policy; the derived host is not needed here.
-    gaugewright_whip_runtime::openai_generic_endpoint_host(base_url)
+    gaugedesk_whip_runtime::openai_generic_endpoint_host(base_url)
         .map_err(|error| error.to_string())?;
     Ok(base_url.to_owned())
 }

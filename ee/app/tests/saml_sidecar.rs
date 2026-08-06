@@ -10,10 +10,10 @@
 
 use std::path::PathBuf;
 
-use gaugewright_app::identity::IdentityProvider;
-use gaugewright_core::abac::Role;
-use gaugewright_core::ids::AuthorityId;
-use gaugewright_ee::identity_saml::{SamlClaimMapping, SamlSidecarIdentityProvider};
+use gaugedesk_app::identity::IdentityProvider;
+use gaugedesk_core::abac::Role;
+use gaugedesk_core::ids::AuthorityId;
+use gaugedesk_ee::identity_saml::{SamlClaimMapping, SamlSidecarIdentityProvider};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")

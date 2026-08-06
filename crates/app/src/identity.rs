@@ -2,16 +2,16 @@
 //! its attribute claims (ADR 0032 step 3). Mirrors the `Harness` seam of ADR 0031
 //! and the [`crate::key_store::KeyStore`] seam: the pure core stays
 //! **identity-agnostic** — it speaks only [`AuthorityId`] +
-//! [`AuthorityAttributes`](gaugewright_core::abac::AuthorityAttributes) — and Okta/Entra
+//! [`AuthorityAttributes`](gaugedesk_core::abac::AuthorityAttributes) — and Okta/Entra
 //! (OIDC+SCIM), AD/LDAP, or a custom directory are interchangeable adapters behind
 //! this trait. The first adapter is a loopback/dev in-memory directory; a real IdP
 //! implements the same trait with **no change** to the ABAC evaluation path
-//! ([`gaugewright_core::abac`]). No IdP is pinned (per the ADR) — the seam is.
+//! ([`gaugedesk_core::abac`]). No IdP is pinned (per the ADR) — the seam is.
 
 use std::collections::BTreeMap;
 
-use gaugewright_core::abac::AuthorityAttributes;
-use gaugewright_core::ids::{AuthorityId, HomeId};
+use gaugedesk_core::abac::AuthorityAttributes;
+use gaugedesk_core::ids::{AuthorityId, HomeId};
 
 use crate::Workbench;
 
@@ -27,13 +27,13 @@ impl Workbench {
     /// federation/dev deployments. Empty values are ignored so a mis-set env var
     /// does not erase the local single-user default.
     pub(crate) fn activate_configured_authority(&mut self) {
-        if let Some(authority) = gaugewright_store::process_env::var("AUTHORITY") {
+        if let Some(authority) = gaugedesk_env::var("AUTHORITY") {
             if !authority.is_empty() {
                 self.authority = AuthorityId::new(authority);
                 self.home_id = HomeId::new(format!("home:{}", self.authority.as_str()));
             }
         }
-        if let Some(home) = gaugewright_store::process_env::var("HOME_ID") {
+        if let Some(home) = gaugedesk_env::var("HOME_ID") {
             if !home.is_empty() {
                 self.home_id = HomeId::new(home);
             }
@@ -71,12 +71,12 @@ impl Workbench {
     }
 
     pub(crate) fn configured_home_id() -> HomeId {
-        if let Some(home) = gaugewright_store::process_env::var("HOME_ID") {
+        if let Some(home) = gaugedesk_env::var("HOME_ID") {
             if !home.is_empty() {
                 return HomeId::new(home);
             }
         }
-        let authority = gaugewright_store::process_env::var("AUTHORITY")
+        let authority = gaugedesk_env::var("AUTHORITY")
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| crate::LOCAL_AUTHORITY.to_string());
         HomeId::new(format!("home:{authority}"))
@@ -146,7 +146,7 @@ impl IdentityProvider for LoopbackIdentityProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gaugewright_core::abac::{
+    use gaugedesk_core::abac::{
         permitted_with_policy, Action, AuthorityAttributes, Classification, Context, Decision,
         Policy, Region, ResourceAttributes, Role,
     };

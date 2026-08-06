@@ -114,7 +114,7 @@ export function consumeCallbackToken(): boolean {
  * Begin OIDC login: navigate the browser to the control plane's `/auth/login`, which
  * redirects to the configured IdP. After the IdP, `/auth/callback` returns to this
  * origin with the token in the fragment (the deployment points
- * `GAUGEWRIGHT_OIDC_POST_LOGIN_URL` at this client).
+ * `GAUGEDESK_OIDC_POST_LOGIN_URL` at this client).
  */
 export function beginLogin(controlPlaneBase: string): void {
     if (typeof window === "undefined") return;

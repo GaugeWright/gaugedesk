@@ -9,7 +9,7 @@
 //! A projection then crosses to the device as a federated message — but only the
 //! resource **handle name** crosses, never the payload (`INV-10`): the device can
 //! render a file tree of handle names with no granted basis, and the payload stays
-//! behind the [`resource_access`](gaugewright_core::resource_access) grant.
+//! behind the [`resource_access`](gaugedesk_core::resource_access) grant.
 //!
 //! The crossing is **device-bound** (MOB-004): the delivery shell runs
 //! `ValidateDeviceBinding` before it routes, so only the bound, still-active device
@@ -20,11 +20,11 @@
 //! cross-machine mobile client attaches behind the same [`FederationRelay`] seam
 //! with no rearchitecture (`MOBILE-PROJECTION-1`, ADR 0020).
 
-use gaugewright_core::boundary_lifecycle::{BoundaryCommand, BoundaryState};
-use gaugewright_core::federated_delivery::{DeliveryCommand, DeliveryEnvelope, DeliveryState};
-use gaugewright_core::ids::{BridgeGrantId, DeviceId, Nonce, PublicKey};
-use gaugewright_core::signature::Signature;
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::boundary_lifecycle::{BoundaryCommand, BoundaryState};
+use gaugedesk_core::federated_delivery::{DeliveryCommand, DeliveryEnvelope, DeliveryState};
+use gaugedesk_core::ids::{BridgeGrantId, DeviceId, Nonce, PublicKey};
+use gaugedesk_core::signature::Signature;
+use gaugedesk_store::{AdmitError, Store};
 
 use crate::federation_relay::{delivery_scope, FederationRelay, Message};
 
@@ -94,7 +94,7 @@ pub fn bind_device(
     store.admit::<BoundaryState>(scope, BoundaryCommand::Propose(required))?;
     store.admit::<BoundaryState>(
         scope,
-        BoundaryCommand::DeclareCeiling(gaugewright_core::boundary_lifecycle::Placement::local()),
+        BoundaryCommand::DeclareCeiling(gaugedesk_core::boundary_lifecycle::Placement::local()),
     )?;
     store.admit::<BoundaryState>(
         scope,
@@ -197,17 +197,17 @@ impl<R: FederationRelay> TwoAuthorityMobileFixture<R> {
     /// federate back into. Returns the boundary state with the device bound.
     pub fn bind(&self, store: &mut Store) -> Result<BoundaryState, AdmitError> {
         let b = bind_device(store, &self.bridge_scope, &self.device)?;
-        store.admit::<gaugewright_core::run::RunState>(
+        store.admit::<gaugedesk_core::run::RunState>(
             &self.run_scope,
-            gaugewright_core::run::RunCommand::RequestRun,
+            gaugedesk_core::run::RunCommand::RequestRun,
         )?;
-        store.admit::<gaugewright_core::run::RunState>(
+        store.admit::<gaugedesk_core::run::RunState>(
             &self.run_scope,
-            gaugewright_core::run::RunCommand::AdmitRun,
+            gaugedesk_core::run::RunCommand::AdmitRun,
         )?;
-        store.admit::<gaugewright_core::run::RunState>(
+        store.admit::<gaugedesk_core::run::RunState>(
             &self.run_scope,
-            gaugewright_core::run::RunCommand::StartRun,
+            gaugedesk_core::run::RunCommand::StartRun,
         )?;
         Ok(b)
     }
@@ -221,8 +221,8 @@ impl<R: FederationRelay> TwoAuthorityMobileFixture<R> {
     pub fn run_flows_back(
         &self,
         store: &mut Store,
-        harness: &mut dyn gaugewright_harness::RemoteHarness,
-        gate: &dyn gaugewright_harness::EgressGate,
+        harness: &mut dyn gaugedesk_harness::RemoteHarness,
+        gate: &dyn gaugedesk_harness::EgressGate,
         prompt: &str,
     ) -> Result<u32, crate::remote_runtime::RemoteRuntimeError> {
         crate::remote_runtime::federate_remote_turn(store, &self.run_scope, harness, gate, prompt)
@@ -257,7 +257,7 @@ impl<R: FederationRelay> TwoAuthorityMobileFixture<R> {
 mod tests {
     use super::*;
     use crate::federation_relay::{self, LoopbackRelay};
-    use gaugewright_core::resource_access::AccessState;
+    use gaugedesk_core::resource_access::AccessState;
 
     /// MOB-006 end-to-end: the owner binds a paired device to a ceiling-declared
     /// boundary (MOB-001), then a projection crosses to the device over the relay
@@ -416,9 +416,9 @@ mod tests {
         );
     }
 
-    use gaugewright_core::run::{RunPhase, RunState};
-    use gaugewright_harness::AllowAllGate;
-    use gaugewright_pi_bridge::RemoteLoopbackHarness;
+    use gaugedesk_core::run::{RunPhase, RunState};
+    use gaugedesk_harness::AllowAllGate;
+    use gaugedesk_pi_bridge::RemoteLoopbackHarness;
 
     /// MOB-013 end-to-end: the [`TwoAuthorityMobileFixture`] ties the whole mobile
     /// flow together over the two-authority loopback collapse. The owner binds the

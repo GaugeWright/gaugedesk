@@ -3,12 +3,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use gaugewright_core::ids::{AuthorityId, HomeId};
-use gaugewright_store::Store;
-use gaugewright_tracker::WhipTrackerHandle;
-use gaugewright_workspace::{
-    ChatWorkspace, WhippleWorkspaceProvider, Workspace, WorkspaceProvider,
-};
+use gaugedesk_core::ids::{AuthorityId, HomeId};
+use gaugedesk_store::Store;
+use gaugedesk_tracker::WhipTrackerHandle;
+use gaugedesk_workspace::{ChatWorkspace, WhippleWorkspaceProvider, Workspace, WorkspaceProvider};
 use tokio::sync::broadcast;
 
 use crate::app_support::{attestation_enabled, attestation_mode_from_env, prepare_workbench_root};
@@ -83,7 +81,7 @@ pub struct Workbench {
     /// fact as "this chat is busy" — one representation, not two.
     pub(crate) sessions: BTreeMap<String, SharedHarness>,
     /// One remote harness per remotely placed engagement (ADR 0020/0031).
-    pub(crate) remote_sessions: BTreeMap<String, Box<dyn gaugewright_harness::RemoteHarness>>,
+    pub(crate) remote_sessions: BTreeMap<String, Box<dyn gaugedesk_harness::RemoteHarness>>,
     /// One embedded WhippleScript tracker runtime per trust boundary (ADR 0075),
     /// keyed by boundary id (`account::global` in v1). Spawned on demand and held
     /// for the workbench's lifetime, mirroring `sessions`. Structural isolation:
@@ -141,7 +139,7 @@ pub struct Workbench {
     /// run the broker legs (which await) without holding the workbench mutex.
     pub(crate) enroll_drive: Arc<crate::device_enroll_drive::EnrollDrive>,
     /// The rendezvous broker this workbench dials / advertises for enrollment
-    /// (`ACCT-1`); `None` falls back to `GAUGEWRIGHT_RELAY_ENDPOINT` / the default.
+    /// (`ACCT-1`); `None` falls back to `GAUGEDESK_RELAY_ENDPOINT` / the default.
     pub(crate) enroll_broker: Option<String>,
     /// The account key a newly-enrolled device recovered over the handshake
     /// (`ACCT-1`), held in memory — never returned over HTTP (`INV-10`).
@@ -155,7 +153,7 @@ pub type SharedWorkbench = Arc<Mutex<Workbench>>;
 
 /// One chat's agent harness, independently lockable so a turn can hold it without
 /// holding the workbench (ADR 0031 + the per-chat serialization unit).
-pub(crate) type SharedHarness = Arc<Mutex<Box<dyn gaugewright_harness::Harness>>>;
+pub(crate) type SharedHarness = Arc<Mutex<Box<dyn gaugedesk_harness::Harness>>>;
 
 /// Shut a harness down, but only if this is the last reference to it. A harness a
 /// turn still holds is left to that turn, which drops the final reference when it
@@ -264,7 +262,7 @@ fn build_workbench_with_content_keywrap_for_home(
     // best-effort, so a tracker failure never aborts workbench startup.
     wb.ensure_onboarding_seeded();
     federation::activate_configured_federation(&mut wb)?;
-    // Enterprise SSO activation (`ID-3`) moved with the ee band (`gaugewright-ee`,
+    // Enterprise SSO activation (`ID-3`) moved with the ee band (`gaugedesk-ee`,
     // SPLIT-1): the ee/hosted compositions call `activate_configured_idp` right
     // after workbench open, through the open `set_identity_provider` seam.
     Ok(wb)
@@ -335,7 +333,7 @@ impl Workbench {
     pub(crate) fn tracker_for_boundary(
         &mut self,
         boundary_id: &str,
-    ) -> gaugewright_tracker::TrackerResult<&mut WhipTrackerHandle> {
+    ) -> gaugedesk_tracker::TrackerResult<&mut WhipTrackerHandle> {
         if !self.tracker_runtimes.contains_key(boundary_id) {
             let handle = WhipTrackerHandle::open(&self.root, boundary_id)?;
             self.tracker_runtimes.insert(boundary_id.to_owned(), handle);
@@ -349,7 +347,7 @@ impl Workbench {
     /// The v1 account-global onboarding tracker (ADR 0075 §2).
     pub(crate) fn account_tracker(
         &mut self,
-    ) -> gaugewright_tracker::TrackerResult<&mut WhipTrackerHandle> {
+    ) -> gaugedesk_tracker::TrackerResult<&mut WhipTrackerHandle> {
         self.tracker_for_boundary(ACCOUNT_GLOBAL_BOUNDARY)
     }
 }

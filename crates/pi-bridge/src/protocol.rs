@@ -5,9 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The image content block lives in `gaugewright-harness` (SUB-0); re-exported at
+/// The image content block lives in `gaugedesk-harness` (SUB-0); re-exported at
 /// its pre-extraction path so existing callers keep compiling unchanged.
-pub use gaugewright_harness::{ImageContent, ImageKind};
+pub use gaugedesk_harness::{ImageContent, ImageKind};
 
 /// A command we send to Pi as one JSON line on stdin.
 #[derive(Debug, Serialize)]

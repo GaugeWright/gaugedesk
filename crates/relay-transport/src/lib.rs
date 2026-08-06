@@ -1092,13 +1092,12 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_http_crosses_the_blind_pinned_home_tunnel() {
-        let (endpoint, relay) =
-            if let Ok(endpoint) = std::env::var("GAUGEWRIGHT_LIVE_RELAY_ENDPOINT") {
-                (endpoint, None)
-            } else {
-                let (endpoint, relay) = test_relay().await;
-                (endpoint, Some(relay))
-            };
+        let (endpoint, relay) = if let Some(endpoint) = gaugedesk_env::var("LIVE_RELAY_ENDPOINT") {
+            (endpoint, None)
+        } else {
+            let (endpoint, relay) = test_relay().await;
+            (endpoint, Some(relay))
+        };
 
         let control_plane = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let control_plane_address = control_plane.local_addr().unwrap();
@@ -1167,10 +1166,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires GAUGEWRIGHT_LIVE_RELAY_ENDPOINT"]
+    #[ignore = "requires GAUGEDESK_LIVE_RELAY_ENDPOINT"]
     async fn live_route_rotation_retires_the_stale_locator() {
-        let endpoint =
-            std::env::var("GAUGEWRIGHT_LIVE_RELAY_ENDPOINT").expect("live relay endpoint");
+        let endpoint = gaugedesk_env::var("LIVE_RELAY_ENDPOINT").expect("live relay endpoint");
         let mut handle = [0u8; 32];
         getrandom::getrandom(&mut handle).unwrap();
         let first = RelayRoute {

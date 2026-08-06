@@ -41,7 +41,7 @@ use http_body_util::BodyExt;
 use serde_json::json;
 use tower::ServiceExt;
 
-use gaugewright_app::{open_control_plane, open_workbench};
+use gaugedesk_app::{open_control_plane, open_workbench};
 
 const PROJECT: &str = "proj-default";
 /// An id that matches nothing. A route that reaches its handler answers "no such
@@ -201,13 +201,13 @@ async fn every_declared_route_reaches_a_handler_that_accepts_its_callers_shape()
 
 /// Test-only paths compile only into debug builds (DR-0054 Phase A) — release
 /// artifacts carry no such routes at all. Where the routes do exist (this test
-/// binary is a debug build), the `GAUGEWRIGHT_TEST_RESET` process guard stays
+/// binary is a debug build), the `GAUGEDESK_TEST_RESET` process guard stays
 /// as defense in depth: without it the router must refuse them before reset,
 /// conflict-injection, or raw account-device fixture state can change.
 #[tokio::test]
 async fn test_only_harness_routes_refuse_without_activation_guard() {
     assert!(
-        std::env::var_os("GAUGEWRIGHT_TEST_RESET").is_none(),
+        gaugedesk_env::var_os("TEST_RESET").is_none(),
         "this disposition check must run without the BDD-only activation guard",
     );
     let (_dir, app) = control_plane();

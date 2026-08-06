@@ -19,15 +19,15 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use gaugewright_core::abac::Policy;
-use gaugewright_core::rbac::Capability;
+use gaugedesk_core::abac::Policy;
+use gaugedesk_core::rbac::Capability;
 
-use gaugewright_app::org::{
+use gaugedesk_app::org::{
     is_valid_role, ArchetypeApprovalPolicyRecord, BillingRecord, GroupMappingRecord,
     MemberGrantRecord, MembershipRecord, MembershipStatus, Org, OrgRecord, PolicyRecord, RecordOp,
     SecurityPolicyRecord, SoftwarePolicyRecord, SsoConnectionRecord, ORG_ID,
 };
-use gaugewright_app::{LockUnpoisoned, SharedWorkbench, Workbench};
+use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 
 /// The ee enterprise composition (SPLIT-1): the open route surface plus this
 /// module's governance routes, wrapped in the same ENTSEC-1 auth route-layer /
@@ -50,32 +50,32 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
         g.is_federation_enabled()
     };
     Router::new()
-        .merge(gaugewright_app::local_routes::routes(federation_on))
-        .merge(gaugewright_app::home_routes::routes())
+        .merge(gaugedesk_app::local_routes::routes(federation_on))
+        .merge(gaugedesk_app::home_routes::routes())
         .merge(routes())
         // A shared authenticated process may expose person-scoped account
         // records and runtime credentials, but not sovereign library sync: that
         // operation signs/opens with the co-resident desktop's root key.
-        .merge(gaugewright_app::account_routes::hub_routes())
-        .merge(gaugewright_app::account_routes::runtime_credential_routes())
-        .merge(gaugewright_app::facility_routes::routes())
-        .merge(gaugewright_app::mobile_machine_session::routes())
+        .merge(gaugedesk_app::account_routes::hub_routes())
+        .merge(gaugedesk_app::account_routes::runtime_credential_routes())
+        .merge(gaugedesk_app::facility_routes::routes())
+        .merge(gaugedesk_app::mobile_machine_session::routes())
         // Materialize non-environment mutation idempotency inside the
         // enterprise identity boundary. An anonymous mutation must fail as
         // unauthenticated before request-shape or idempotency diagnostics reveal
         // anything about an admitted route.
         .layer(axum::middleware::from_fn_with_state(
             wb.clone(),
-            gaugewright_app::command_idempotency::guard,
+            gaugedesk_app::command_idempotency::guard,
         ))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_wb,
             enterprise_auth,
         ))
-        .layer(gaugewright_app::net_http::cors_layer())
+        .layer(gaugedesk_app::net_http::cors_layer())
         .with_state(wb.clone())
         .layer(axum::middleware::from_fn(
-            gaugewright_app::net_http::security_headers,
+            gaugedesk_app::net_http::security_headers,
         ))
 }
 
@@ -181,13 +181,13 @@ async fn get_capabilities(
 
 /// The bearer credential from the `Authorization: Bearer <token>` header — the
 /// open neutral parser, re-exported for this module's handlers and tests.
-pub use gaugewright_app::net_http::bearer;
+pub use gaugedesk_app::net_http::bearer;
 
-/// The open admin-gate and tenant-scope substrate ([`gaugewright_app::workbench_auth`]),
+/// The open admin-gate and tenant-scope substrate ([`gaugedesk_app::workbench_auth`]),
 /// re-exported so the ee route surface and its sibling modules keep one import home.
 /// The settlement plane (`gaugewright-cloud-settlement`) consumes the same seams
 /// directly from the open crate.
-pub use gaugewright_app::workbench_auth::{deny, req_scope};
+pub use gaugedesk_app::workbench_auth::{deny, req_scope};
 
 /// ENTSEC-1: paths that bypass the enterprise data-route auth gate — the pre-auth and
 /// own-auth flows. `/health` (readiness), `/auth/*` (the OIDC login/callback that *mints* the
@@ -243,16 +243,15 @@ pub async fn enterprise_auth(
         && !request_path.starts_with("/auth/")
         && !request_path.starts_with("/mobile/")
     {
-        if let Some(session) = gaugewright_app::mobile_machine_session::session_token(req.headers())
-        {
+        if let Some(session) = gaugedesk_app::mobile_machine_session::session_token(req.headers()) {
             let grant = {
                 let mut guard = wb.lock_unpoisoned();
-                gaugewright_app::mobile_machine_session::authorize_session(&mut guard, session)
+                gaugedesk_app::mobile_machine_session::authorize_session(&mut guard, session)
             };
             if let Some(grant) = grant {
                 req.extensions_mut()
-                    .insert(gaugewright_app::identity::AuthenticatedActor(
-                        gaugewright_core::ids::AuthorityId::new(grant.device.as_str()),
+                    .insert(gaugedesk_app::identity::AuthenticatedActor(
+                        gaugedesk_core::ids::AuthorityId::new(grant.device.as_str()),
                     ));
                 return next.run(req).await;
             }
@@ -266,7 +265,7 @@ pub async fn enterprise_auth(
     let bearer = bearer(req.headers());
     let path = req.uri().path().to_string();
     let method = req.method().clone();
-    let client = gaugewright_app::client_admission::ClientBuild::from_headers(req.headers());
+    let client = gaugedesk_app::client_admission::ClientBuild::from_headers(req.headers());
     let org_scope = req_scope(req.headers());
     // Every active member must retain this authenticated recovery path so the
     // desktop updater can discover the policy that blocked its current build.
@@ -301,7 +300,7 @@ pub async fn enterprise_auth(
         let mutating = method != axum::http::Method::GET;
         let sensitive_read = !mutating && project.is_some() && guard.audits_reads();
         if guard.has_idp() && !is_admin && (mutating || sensitive_read) {
-            gaugewright_app::audit::record_in(
+            gaugedesk_app::audit::record_in(
                 &mut guard,
                 &org_scope,
                 &actor,
@@ -310,7 +309,7 @@ pub async fn enterprise_auth(
             );
         }
         req.extensions_mut()
-            .insert(gaugewright_app::identity::AuthenticatedActor(actor.into()));
+            .insert(gaugedesk_app::identity::AuthenticatedActor(actor.into()));
     }
     next.run(req).await
 }
@@ -365,7 +364,7 @@ pub struct OrgSettingsBody {
     #[serde(default)]
     default_region: Option<String>,
     #[serde(default)]
-    kind: gaugewright_app::org::OrgKind,
+    kind: gaugedesk_app::org::OrgKind,
 }
 
 pub async fn post_org(
@@ -473,7 +472,7 @@ pub async fn post_member(
     };
     write_membership(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(&mut wb, &actor, "member.invite", &record.id);
+    gaugedesk_app::audit::record(&mut wb, &actor, "member.invite", &record.id);
     (StatusCode::OK, Json(json!({ "member": record }))).into_response()
 }
 
@@ -519,7 +518,7 @@ pub async fn post_member_role(
     record.role = body.role;
     write_membership(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(&mut wb, &actor, "member.role", &record.id);
+    gaugedesk_app::audit::record(&mut wb, &actor, "member.role", &record.id);
     (StatusCode::OK, Json(json!({ "member": record }))).into_response()
 }
 
@@ -555,7 +554,7 @@ pub async fn post_member_deactivate(
     record.status = MembershipStatus::Deprovisioned;
     write_membership(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(&mut wb, &actor, "member.deactivate", &record.id);
+    gaugedesk_app::audit::record(&mut wb, &actor, "member.deactivate", &record.id);
     (StatusCode::OK, Json(json!({ "member": record }))).into_response()
 }
 
@@ -616,7 +615,7 @@ pub async fn post_grant(
     };
     write_grant(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(&mut wb, &actor, "grant.add", &record.id);
+    gaugedesk_app::audit::record(&mut wb, &actor, "grant.add", &record.id);
     (StatusCode::OK, Json(json!({ "grant": record }))).into_response()
 }
 
@@ -640,7 +639,7 @@ pub async fn delete_grant(
     };
     write_grant(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(&mut wb, &actor, "grant.revoke", &record.id);
+    gaugedesk_app::audit::record(&mut wb, &actor, "grant.revoke", &record.id);
     (StatusCode::OK, Json(json!({ "grant": record }))).into_response()
 }
 
@@ -711,8 +710,8 @@ pub async fn get_audit_log(
         return resp;
     }
     let store_scope = req_scope(&headers);
-    let entries: Vec<gaugewright_app::audit::AuditEntry> =
-        gaugewright_app::audit::list_in(wb.store_ref(), &store_scope)
+    let entries: Vec<gaugedesk_app::audit::AuditEntry> =
+        gaugedesk_app::audit::list_in(wb.store_ref(), &store_scope)
             .into_iter()
             .filter(|e| q.actor.as_ref().is_none_or(|a| &e.actor == a))
             .filter(|e| q.action.as_ref().is_none_or(|a| &e.action == a))
@@ -721,7 +720,7 @@ pub async fn get_audit_log(
         (
             StatusCode::OK,
             [("content-type", "text/csv")],
-            gaugewright_app::audit::to_csv(&entries),
+            gaugedesk_app::audit::to_csv(&entries),
         )
             .into_response()
     } else {
@@ -729,7 +728,7 @@ pub async fn get_audit_log(
         // append-only/forever (`INV-6`); this is the contractual floor surfaced to the buyer.
         let retention_min_days = Org::rebuild_in(wb.store_ref(), &store_scope)
             .map(|o| o.audit_retention_min_days())
-            .unwrap_or(gaugewright_app::org::DEFAULT_AUDIT_RETENTION_MIN_DAYS);
+            .unwrap_or(gaugedesk_app::org::DEFAULT_AUDIT_RETENTION_MIN_DAYS);
         (
             StatusCode::OK,
             Json(json!({ "entries": entries, "retention_min_days": retention_min_days })),
@@ -756,7 +755,7 @@ pub async fn get_audit_verify(
     let pubkey = wb.governance_public_key();
     (
         StatusCode::OK,
-        Json(gaugewright_app::audit::verify_in(
+        Json(gaugedesk_app::audit::verify_in(
             wb.store_ref(),
             &req_scope(&headers),
             Some(&pubkey),
@@ -845,7 +844,7 @@ pub async fn post_policy(
     };
     write_policy(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(&mut wb, &actor, "policy.update", "policy");
+    gaugedesk_app::audit::record(&mut wb, &actor, "policy.update", "policy");
     (StatusCode::OK, Json(json!({ "policy": record.policy }))).into_response()
 }
 
@@ -854,7 +853,7 @@ pub async fn post_policy(
 fn write_placement_policy(
     wb: &mut Workbench,
     scope: &str,
-    r: &gaugewright_app::org::PlacementPolicyRecord,
+    r: &gaugedesk_app::org::PlacementPolicyRecord,
 ) {
     let op = op_str(r.op);
     let _ = wb.store_mut().append_record(
@@ -886,20 +885,20 @@ pub async fn get_placement_policy(
 pub async fn post_placement_policy(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
-    Json(policy): Json<gaugewright_core::boundary_lifecycle::PlacementPolicy>,
+    Json(policy): Json<gaugedesk_core::boundary_lifecycle::PlacementPolicy>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
     if let Some(resp) = deny(&wb, &headers, Some(Capability::ConfigureSecurity)) {
         return resp;
     }
-    let record = gaugewright_app::org::PlacementPolicyRecord {
+    let record = gaugedesk_app::org::PlacementPolicyRecord {
         id: ORG_ID.to_string(),
         op: RecordOp::Upsert,
         policy,
     };
     write_placement_policy(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(
+    gaugedesk_app::audit::record(
         &mut wb,
         &actor,
         "placement_policy.update",
@@ -944,7 +943,7 @@ pub async fn get_software_policy(
 pub async fn post_software_policy(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
-    Json(mut policy): Json<gaugewright_app::client_admission::SoftwarePolicy>,
+    Json(mut policy): Json<gaugedesk_app::client_admission::SoftwarePolicy>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
     if let Some(resp) = deny(&wb, &headers, Some(Capability::ConfigureSecurity)) {
@@ -972,7 +971,7 @@ pub async fn post_software_policy(
     };
     write_software_policy(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(&mut wb, &actor, "software_policy.update", "software_policy");
+    gaugedesk_app::audit::record(&mut wb, &actor, "software_policy.update", "software_policy");
     (
         StatusCode::OK,
         Json(json!({ "software_policy": record.policy })),
@@ -1006,7 +1005,7 @@ pub async fn get_billing(
                 .as_ref()
                 .and_then(|billing| billing.managed_inference.as_ref())
                 .map_or(0, |plan| plan.included_tokens);
-            match gaugewright_app::managed_inference::fold_usage(wb.store_ref(), &scope, included) {
+            match gaugedesk_app::managed_inference::fold_usage(wb.store_ref(), &scope, included) {
                 Ok(usage) => (
                     StatusCode::OK,
                     Json(json!({
@@ -1036,7 +1035,7 @@ pub async fn post_billing(
     record.op = RecordOp::Upsert;
     write_billing(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(&mut wb, &actor, "billing.update", "billing");
+    gaugedesk_app::audit::record(&mut wb, &actor, "billing.update", "billing");
     (StatusCode::OK, Json(json!({ "billing": record }))).into_response()
 }
 
@@ -1077,7 +1076,7 @@ pub async fn post_security(
     record.op = RecordOp::Upsert;
     write_security(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(&mut wb, &actor, "security.update", "security");
+    gaugedesk_app::audit::record(&mut wb, &actor, "security.update", "security");
     (StatusCode::OK, Json(json!({ "security": record }))).into_response()
 }
 
@@ -1126,7 +1125,7 @@ pub async fn post_archetype_approval(
     record.op = RecordOp::Upsert;
     write_archetype_approval(&mut wb, &req_scope(&headers), &record);
     let actor = wb.actor(bearer(&headers));
-    gaugewright_app::audit::record(
+    gaugedesk_app::audit::record(
         &mut wb,
         &actor,
         "archetype_approval.update",
@@ -1174,7 +1173,7 @@ pub async fn post_sso(
         record.op = RecordOp::Upsert;
         write_sso(&mut wbg, &req_scope(&headers), &record);
         let actor = wbg.actor(bearer(&headers));
-        gaugewright_app::audit::record(&mut wbg, &actor, "sso.configure", "sso");
+        gaugedesk_app::audit::record(&mut wbg, &actor, "sso.configure", "sso");
     }
     // Activate OIDC verification from the just-saved connection (`ID-3`) without a
     // restart, so the bearer `/auth/callback` returns is honored on `/admin/*`. The
@@ -1198,11 +1197,11 @@ pub async fn post_sso(
 // ---- SP integration details (ONB-1) --------------------------------------
 
 /// The control plane's public base URL — what the admin's IdP must reach. An explicit
-/// `GAUGEWRIGHT_PUBLIC_URL` wins (the deployment's canonical externally-visible URL);
+/// `GAUGEDESK_PUBLIC_URL` wins (the deployment's canonical externally-visible URL);
 /// otherwise it is derived from the request (`X-Forwarded-Proto` + `Host`), so a
 /// default loopback run works unconfigured.
 fn public_base(headers: &HeaderMap) -> String {
-    if let Ok(u) = std::env::var("GAUGEWRIGHT_PUBLIC_URL") {
+    if let Some(u) = gaugedesk_env::var("PUBLIC_URL") {
         if !u.trim().is_empty() {
             return u.trim_end_matches('/').to_string();
         }
@@ -1219,8 +1218,7 @@ fn public_base(headers: &HeaderMap) -> String {
 }
 
 fn sp_entity_id(base: &str) -> String {
-    std::env::var("GAUGEWRIGHT_SP_ENTITY_ID")
-        .ok()
+    gaugedesk_env::var("SP_ENTITY_ID")
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("{base}/saml/metadata"))
 }
@@ -1306,7 +1304,7 @@ pub async fn post_sso_test(
             return resp;
         }
     }
-    if record.protocol != gaugewright_app::org::SsoProtocol::Oidc {
+    if record.protocol != gaugedesk_app::org::SsoProtocol::Oidc {
         return (
             StatusCode::OK,
             Json(json!({
@@ -1374,7 +1372,7 @@ fn txt_matches(values: &[String], domain: &str) -> bool {
 /// client — no resolver dependency). Returns the record strings (empty on any error).
 fn doh_txt(name: &str) -> Vec<String> {
     use crate::identity_oidc::HttpGet;
-    let http = gaugewright_app::net_http::HttpClient::new();
+    let http = gaugedesk_app::net_http::HttpClient::new();
     let url = format!("https://dns.google/resolve?name={name}&type=TXT");
     let Ok(body) = http.get(&url) else {
         return vec![];
@@ -1490,7 +1488,7 @@ pub async fn post_domain_verify(
     }
     write_org(&mut wbg, &req_scope(&headers), &record);
     let actor = wbg.actor(bearer(&headers));
-    gaugewright_app::audit::record(&mut wbg, &actor, "domain.verified", &domain);
+    gaugedesk_app::audit::record(&mut wbg, &actor, "domain.verified", &domain);
     (
         StatusCode::OK,
         Json(json!({ "verified": true, "domain": domain })),
@@ -1531,13 +1529,13 @@ mod authenticated_actor_tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use gaugewright_app::identity::{AuthenticatedActor, LoopbackIdentityProvider};
-    use gaugewright_app::org::{MembershipRecord, MembershipStatus, ORG_SCOPE};
-    use gaugewright_app::Workbench;
-    use gaugewright_core::abac::AuthorityAttributes;
-    use gaugewright_core::ids::AuthorityId;
-    use gaugewright_store::Store;
-    use gaugewright_workspace::Instance;
+    use gaugedesk_app::identity::{AuthenticatedActor, LoopbackIdentityProvider};
+    use gaugedesk_app::org::{MembershipRecord, MembershipStatus, ORG_SCOPE};
+    use gaugedesk_app::Workbench;
+    use gaugedesk_core::abac::AuthorityAttributes;
+    use gaugedesk_core::ids::AuthorityId;
+    use gaugedesk_store::Store;
+    use gaugedesk_workspace::Instance;
 
     use super::{enterprise_auth, entsec_exempt, write_membership, RecordOp};
 

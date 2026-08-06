@@ -35,7 +35,7 @@ tauri-plugin-updater = "2"
 # Linux/Windows (must be registered first); macOS delivers to the running app natively.
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
-gaugewright-app = { path = "../crates/app", default-features = false }
+gaugedesk-app = { path = "../crates/app", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # `tauri::generate_context!()` expands to code that parses the bundled config via
 # serde_json, so it must be a direct dependency (else E0433: serde_json not in crate root).

@@ -18,7 +18,7 @@
 //!    authority via [`determine_scope_authority`] (the `SCOPE-AUTH-1` seam) and
 //!    verifies the signature against that authority's **registered** governance key
 //!    with the pure [`verify_signature`] predicate — **real P-256 ECDSA**,
-//!    fail-closed (`gaugewright_core::signature`; the old `SIGN-1` length-only stub was
+//!    fail-closed (`gaugedesk_core::signature`; the old `SIGN-1` length-only stub was
 //!    replaced by P256-STUB-1). An unregistered authority or a bad signature is
 //!    rejected; a forged signature cannot authenticate (CONF-4, verified stale).
 //!
@@ -32,9 +32,9 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use gaugewright_core::determine_scope_authority;
-use gaugewright_core::ids::{AuthorityId, EngagementId, PublicKey};
-use gaugewright_core::signature::{verify_signature, Signature, SigningKey};
+use gaugedesk_core::determine_scope_authority;
+use gaugedesk_core::ids::{AuthorityId, EngagementId, PublicKey};
+use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
 
 use crate::session::SessionStore;
 
@@ -542,7 +542,7 @@ mod tests {
     }
 
     /// The real governance signing key for an authority (loopback store).
-    fn key_for(authority: &str) -> gaugewright_core::signature::SigningKey {
+    fn key_for(authority: &str) -> gaugedesk_core::signature::SigningKey {
         LoopbackKeyStore.signing_key(&AuthorityId::new(authority))
     }
 
@@ -763,7 +763,7 @@ mod tests {
     // key, and the server verifies + issues a session token — or refuses.
 
     use crate::session::{SessionStore, SessionToken};
-    use gaugewright_core::ids::EngagementId;
+    use gaugedesk_core::ids::EngagementId;
 
     /// Run one served handshake end to end over a fresh ephemeral TCP port:
     /// build a `GovernanceAuth` + `SessionStore`, accept the client's connection,

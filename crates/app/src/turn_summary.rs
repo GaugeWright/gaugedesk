@@ -4,8 +4,8 @@
 //! workspace. Read-side projections only fold the latest record; they never walk
 //! git, inspect labels, or reinterpret a runtime flow signature.
 
-use gaugewright_core::resource::ResourceId;
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::resource::ResourceId;
+use gaugedesk_store::{AdmitError, Store};
 
 pub const TURN_SUMMARY_KIND: &str = "turn_summary";
 

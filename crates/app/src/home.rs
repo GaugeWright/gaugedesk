@@ -6,10 +6,10 @@
 //! evidence bodies. This module makes that ownership map executable so route and
 //! storage composition can test it instead of relying on deployment convention.
 
-use gaugewright_core::ids::{AuthorityId, HomeId};
+use gaugedesk_core::ids::{AuthorityId, HomeId};
 use serde::{Deserialize, Serialize};
 
-pub use gaugewright_directory_protocol::{OpaqueHomeRoute, OpaqueRelayLocator};
+pub use gaugedesk_directory_protocol::{OpaqueHomeRoute, OpaqueRelayLocator};
 
 /// Where a Home is operated. This is operational placement behind one product
 /// identity; changing a process/VM does not change the [`HomeId`].

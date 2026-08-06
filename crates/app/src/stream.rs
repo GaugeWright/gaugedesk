@@ -7,7 +7,7 @@
 //! control plane; a `tokio::broadcast` per engagement fans events to subscribers
 //! (and drops silently when no one listens — events are also durable in the log).
 
-use gaugewright_harness::Observation;
+use gaugedesk_harness::Observation;
 use serde::Serialize;
 use tokio::sync::broadcast;
 

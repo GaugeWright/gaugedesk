@@ -17,11 +17,11 @@
 
 use std::collections::BTreeSet;
 
-use gaugewright_app::resource_store;
-use gaugewright_core::resource::{ContentLocator, Resource, ResourceKind, ResourceRecord};
-use gaugewright_core::resource_export::{ExportCommand, ExportPhase, ExportState};
-use gaugewright_core::review::{ReviewCommand, ReviewPhase, ReviewState};
-use gaugewright_store::Store;
+use gaugedesk_app::resource_store;
+use gaugedesk_core::resource::{ContentLocator, Resource, ResourceKind, ResourceRecord};
+use gaugedesk_core::resource_export::{ExportCommand, ExportPhase, ExportState};
+use gaugedesk_core::review::{ReviewCommand, ReviewPhase, ReviewState};
+use gaugedesk_store::Store;
 
 const ENG: &str = "shared-project-chat";
 const EXPERT: &str = "expert";
@@ -41,7 +41,7 @@ fn contribute_context(store: &mut Store, owner: &str, path: &str) {
 /// so the output's stakeholders are {expert, client}. Returns that stakeholder set.
 fn mint_two_authority_output(store: &mut Store) -> BTreeSet<String> {
     // expert's method resource (owned by expert), read this turn.
-    let method_id = gaugewright_core::resource::ResourceId::new("method::expert-skill".to_string());
+    let method_id = gaugedesk_core::resource::ResourceId::new("method::expert-skill".to_string());
     let method = ResourceRecord::new(
         Resource::input(method_id.clone(), ResourceKind::method(), EXPERT.into()),
         ContentLocator::Workspace {

@@ -1,4 +1,10 @@
-//! Process-configuration variable names for the GaugeDesk control plane.
+//! Process-configuration variable names for GaugeDesk.
+//!
+//! This crate exists because the compatibility window below must have exactly
+//! one home, and the crates that read configuration do not share an ancestor:
+//! `harness` and `relay-transport` deliberately depend on nothing, so neither
+//! `core` nor `store` is reachable from them. A leaf crate with no
+//! dependencies of its own is the only shape every layer may use.
 //!
 //! GaugeWright is the company; GaugeDesk is the product this control plane
 //! implements. The variables were originally named for the company, which put

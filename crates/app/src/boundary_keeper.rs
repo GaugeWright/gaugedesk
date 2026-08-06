@@ -10,9 +10,9 @@
 //!
 //! - The [`QuoteVerifier`](crate::attestation_verifier) (ATTEST-3) turns the raw
 //!   [`AttestationQuote`] a host presents into a
-//!   [`QuoteVerificationResult`](gaugewright_core::attestation::QuoteVerificationResult).
+//!   [`QuoteVerificationResult`](gaugedesk_core::attestation::QuoteVerificationResult).
 //!   The keeper pairs quote + verdict into the
-//!   [`AttestationEvidence`](gaugewright_core::attestation::AttestationEvidence) that
+//!   [`AttestationEvidence`](gaugedesk_core::attestation::AttestationEvidence) that
 //!   rides in `BoundaryEvent::Accepted` (ATTEST-2) — so an attested acceptance is
 //!   admitted *only* with evidence the verifier vouched for.
 //! - The [`SealedKeyReleaseService`] (the KMS seam) releases the keys that unseal
@@ -32,15 +32,15 @@
 
 use std::collections::BTreeMap;
 
-use gaugewright_core::attestation::{AttestationEvidence, AttestationQuote, CodeMeasurement};
-use gaugewright_core::boundary_lifecycle::{
+use gaugedesk_core::attestation::{AttestationEvidence, AttestationQuote, CodeMeasurement};
+use gaugedesk_core::boundary_lifecycle::{
     self, pairing_admitted, BoundaryCommand, BoundaryEvent, BoundaryState, PlacementPolicy,
 };
-use gaugewright_core::key_release::{
+use gaugedesk_core::key_release::{
     EntitlementProof, EntitlementVerdict, KeyReleaseDecision, KeyReleaseRequest, SealedKeyRecord,
 };
-use gaugewright_core::Lifecycle;
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_core::Lifecycle;
+use gaugedesk_store::{AdmitError, Store};
 
 use crate::attestation_verifier::QuoteVerifier;
 
@@ -52,7 +52,7 @@ use crate::attestation_verifier::QuoteVerifier;
 pub trait SealedKeyReleaseService {
     /// Decide whether to release the key named by `request.sealed_key_id` to the
     /// evidence the request carries. An unknown id is denied
-    /// ([`KeyReleaseDenial::UnknownSealedKey`](gaugewright_core::key_release::KeyReleaseDenial)),
+    /// ([`KeyReleaseDenial::UnknownSealedKey`](gaugedesk_core::key_release::KeyReleaseDenial)),
     /// never released.
     fn release(&self, request: &KeyReleaseRequest) -> KeyReleaseDecision;
 
@@ -108,7 +108,7 @@ impl SealedKeyReleaseService for LoopbackKeyReleaseService {
         match self.sealed.get(&request.sealed_key_id) {
             Some(record) => request.decide(record),
             None => KeyReleaseDecision::Denied {
-                reason: gaugewright_core::key_release::KeyReleaseDenial::UnknownSealedKey,
+                reason: gaugedesk_core::key_release::KeyReleaseDenial::UnknownSealedKey,
             },
         }
     }
@@ -189,7 +189,7 @@ impl<C: SecureKeyRelease> KmsKeyReleaseService<C> {
 
 impl<C: SecureKeyRelease> SealedKeyReleaseService for KmsKeyReleaseService<C> {
     fn release(&self, request: &KeyReleaseRequest) -> KeyReleaseDecision {
-        use gaugewright_core::key_release::KeyReleaseDenial;
+        use gaugedesk_core::key_release::KeyReleaseDenial;
         let Some(binding) = self.bindings.get(&request.sealed_key_id) else {
             return KeyReleaseDecision::Denied {
                 reason: KeyReleaseDenial::UnknownSealedKey,
@@ -250,10 +250,10 @@ pub enum AcceptError {
     /// The presented quote did not verify (the verifier rejected it). The
     /// acceptance is never admitted — an attested boundary admits only verified
     /// evidence (ATTEST-2), so the ceiling never over-promises.
-    QuoteRejected(gaugewright_core::attestation::QuoteRejection),
+    QuoteRejected(gaugedesk_core::attestation::QuoteRejection),
     /// The boundary reducer rejected the acceptance command (not a declared
     /// boundary, not a participant, or the placement is not attested).
-    Boundary(gaugewright_core::Rejection),
+    Boundary(gaugedesk_core::Rejection),
     /// The store failed to admit the event.
     Store(AdmitError),
 }
@@ -267,7 +267,7 @@ pub enum AcceptError {
 /// 1. **Verify** the presented `quote` against `expected_nonce` via `verifier`. A
 ///    rejection returns [`AcceptError::QuoteRejected`] — nothing is admitted.
 /// 2. **Pair** quote + verdict into
-///    [`AttestationEvidence`](gaugewright_core::attestation::AttestationEvidence) and drive
+///    [`AttestationEvidence`](gaugedesk_core::attestation::AttestationEvidence) and drive
 ///    `BoundaryCommand::Accept` against the boundary `scope`. The reducer enforces
 ///    `ATTESTED_ACCEPT_REQUIRES_EVIDENCE` (ATTEST-2); a non-participant or
 ///    unattested placement is rejected here.
@@ -286,7 +286,7 @@ pub enum AcceptError {
 /// The **policy axis** of policy-gated pairing (`DEPLOY-3`, [ADR 0059]/[ADR 0061]): read the
 /// boundary's declared placement from `scope` and decide whether the org placement `policy`
 /// admits it, composed with the measurement verdict via
-/// [`pairing_admitted`](gaugewright_core::boundary_lifecycle::pairing_admitted). The client's
+/// [`pairing_admitted`](gaugedesk_core::boundary_lifecycle::pairing_admitted). The client's
 /// `accept` route calls this **before** admitting an engagement — refusing a non-compliant
 /// deployment mode regardless of whether the quote verifies. Fail-closed (`INV-20`): an
 /// unreadable, malformed, or not-yet-declared boundary is **not** admitted.
@@ -327,7 +327,7 @@ pub fn accept_boundary_attested(
     entitlement: EntitlementVerdict,
     sealed_key_id: Option<&str>,
 ) -> Result<AttestedAcceptance, AcceptError> {
-    use gaugewright_core::attestation::{AttestationEvidence, QuoteVerificationResult};
+    use gaugedesk_core::attestation::{AttestationEvidence, QuoteVerificationResult};
 
     // 1. Verify the presented quote. A rejected quote never reaches the boundary.
     let result = verifier.verify(&quote, expected_nonce);
@@ -371,9 +371,9 @@ pub fn accept_boundary_attested(
 mod tests {
     use super::*;
     use crate::attestation_verifier::LoopbackVerifier;
-    use gaugewright_core::attestation::{CodeMeasurement, QuoteRejection};
-    use gaugewright_core::boundary_lifecycle::{Operator, Placement};
-    use gaugewright_core::key_release::{EntitlementIneligibility, KeyReleaseDenial};
+    use gaugedesk_core::attestation::{CodeMeasurement, QuoteRejection};
+    use gaugedesk_core::boundary_lifecycle::{Operator, Placement};
+    use gaugedesk_core::key_release::{EntitlementIneligibility, KeyReleaseDenial};
     use std::collections::BTreeSet;
 
     const NONCE: &str = "challenge-1";
@@ -714,9 +714,9 @@ mod tests {
         assert!(service.get("sealed-1").is_some());
         assert!(service.get("missing").is_none());
 
-        let evidence = gaugewright_core::attestation::AttestationEvidence::new(
+        let evidence = gaugedesk_core::attestation::AttestationEvidence::new(
             quote_for(measurement(), NONCE),
-            gaugewright_core::attestation::QuoteVerificationResult::Verified {
+            gaugedesk_core::attestation::QuoteVerificationResult::Verified {
                 measurement: measurement(),
             },
         );
@@ -733,7 +733,7 @@ mod tests {
     /// authorizes — a denial never touches the network.
     mod kms {
         use super::*;
-        use gaugewright_core::attestation::{AttestationEvidence, QuoteVerificationResult};
+        use gaugedesk_core::attestation::{AttestationEvidence, QuoteVerificationResult};
         use std::cell::Cell;
         use std::rc::Rc;
 

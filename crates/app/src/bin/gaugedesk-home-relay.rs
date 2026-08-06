@@ -7,26 +7,25 @@
 
 use std::path::PathBuf;
 
-use gaugewright_relay_transport::{serve_home_forever, RelayRoute, RouteProof, TlsIdentity};
+use gaugedesk_relay_transport::{serve_home_forever, RelayRoute, RouteProof, TlsIdentity};
 
 #[tokio::main]
 async fn main() {
-    let endpoint = required("GAUGEWRIGHT_HOME_RELAY_ENDPOINT");
-    let local_control_plane = required("GAUGEWRIGHT_HOME_RELAY_LOCAL")
+    let endpoint = required("GAUGEDESK_HOME_RELAY_ENDPOINT");
+    let local_control_plane = required("GAUGEDESK_HOME_RELAY_LOCAL")
         .parse()
-        .expect("GAUGEWRIGHT_HOME_RELAY_LOCAL must be host:port");
-    let handle = required("GAUGEWRIGHT_HOME_RELAY_HANDLE");
-    let epoch = required("GAUGEWRIGHT_HOME_RELAY_EPOCH")
+        .expect("GAUGEDESK_HOME_RELAY_LOCAL must be host:port");
+    let handle = required("GAUGEDESK_HOME_RELAY_HANDLE");
+    let epoch = required("GAUGEDESK_HOME_RELAY_EPOCH")
         .parse()
-        .expect("GAUGEWRIGHT_HOME_RELAY_EPOCH must be a positive integer");
-    let proof = RouteProof::from_base64url(&required("GAUGEWRIGHT_HOME_RELAY_PROOF"))
-        .expect("GAUGEWRIGHT_HOME_RELAY_PROOF must contain 32 base64url bytes");
-    let previous_proof = std::env::var("GAUGEWRIGHT_HOME_RELAY_PREVIOUS_PROOF")
-        .ok()
+        .expect("GAUGEDESK_HOME_RELAY_EPOCH must be a positive integer");
+    let proof = RouteProof::from_base64url(&required("GAUGEDESK_HOME_RELAY_PROOF"))
+        .expect("GAUGEDESK_HOME_RELAY_PROOF must contain 32 base64url bytes");
+    let previous_proof = gaugedesk_env::var("HOME_RELAY_PREVIOUS_PROOF")
         .map(|value| RouteProof::from_base64url(&value))
         .transpose()
-        .expect("GAUGEWRIGHT_HOME_RELAY_PREVIOUS_PROOF must contain 32 base64url bytes");
-    let identity_directory = PathBuf::from(required("GAUGEWRIGHT_HOME_RELAY_IDENTITY_DIR"));
+        .expect("GAUGEDESK_HOME_RELAY_PREVIOUS_PROOF must contain 32 base64url bytes");
+    let identity_directory = PathBuf::from(required("GAUGEDESK_HOME_RELAY_IDENTITY_DIR"));
     let identity =
         TlsIdentity::load_or_generate(&identity_directory).expect("load Home relay TLS identity");
     let fingerprint = identity.fingerprint();

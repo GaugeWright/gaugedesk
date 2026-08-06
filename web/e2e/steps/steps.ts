@@ -26,7 +26,7 @@ const { Given, When, Then, Before } = createBdd();
 // so without this the append-only store accumulates every prior scenario's projects,
 // archetypes and chats — and later scenarios collide with the pile (a global
 // `.first()` grabs a stale chat; a context menu opens off-screen on a tall tree).
-// The test-only POST /test/reset route (gated by GAUGEWRIGHT_TEST_RESET, set in
+// The test-only POST /test/reset route (gated by GAUGEDESK_TEST_RESET, set in
 // fed-control-plane.sh) stops live agents, wipes the state, and re-seeds — so every
 // scenario starts from the same fresh workbench, pollution-proof by construction.
 Before(async ({ request }) => {

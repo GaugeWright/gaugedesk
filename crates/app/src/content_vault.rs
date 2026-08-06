@@ -25,7 +25,7 @@ use std::sync::Mutex;
 
 use ring::rand::{SecureRandom, SystemRandom};
 
-use gaugewright_store::{ContentCodec, Store};
+use gaugedesk_store::{ContentCodec, Store};
 
 use crate::at_rest::{Encryptor, KeyWrap, LocalAeadEncryptor};
 use crate::workbench_state::Workbench;
@@ -41,10 +41,10 @@ pub(crate) fn configured_content_vault(
     root: &Path,
     content_keywrap: impl Fn(&Path) -> std::io::Result<Box<dyn KeyWrap>>,
 ) -> std::io::Result<Option<Arc<ContentVault>>> {
-    if std::env::var("GAUGEWRIGHT_ENCRYPT_CONTENT").as_deref() != Ok("1") {
+    if gaugedesk_env::var("ENCRYPT_CONTENT").as_deref() != Some("1") {
         return Ok(None);
     }
-    // KEK selection is creds-only: a hosted deployment sets GAUGEWRIGHT_CONTENT_KEK_ID
+    // KEK selection is creds-only: a hosted deployment sets GAUGEDESK_CONTENT_KEK_ID
     // + the AZURE_* Crypto User SP creds to use the KMS; dev uses the local KEK.
     Ok(Some(Arc::new(ContentVault::new(
         root.join("content-keys"),
@@ -71,7 +71,7 @@ impl Workbench {
     }
 }
 
-/// Per-scope content encryption + crypto-erasure. Held by the [`Store`](gaugewright_store::Store)
+/// Per-scope content encryption + crypto-erasure. Held by the [`Store`](gaugedesk_store::Store)
 /// as its [`ContentCodec`]; `Send + Sync` so it can ride the shared workbench.
 pub struct ContentVault {
     /// Directory holding the per-scope wrapped-DEK files.

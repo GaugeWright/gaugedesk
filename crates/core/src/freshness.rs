@@ -107,7 +107,7 @@ mod tests {
         // The wire tag is the snake_case variant name, so the TS
         // projection-carriage types (MOB-007) and the projection API agree on
         // the string form. Probe the tag via ciborium's value model (no
-        // serde_json dep in gaugewright-core).
+        // serde_json dep in gaugedesk-core).
         let mut bytes = Vec::new();
         ciborium::into_writer(&FreshnessMarker::Indeterminate, &mut bytes).unwrap();
         let value: ciborium::value::Value = ciborium::from_reader(bytes.as_slice()).unwrap();

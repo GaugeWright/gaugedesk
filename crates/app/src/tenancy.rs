@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_store::{AdmitError, Store};
 
 use crate::account::ACCOUNT_SCOPE;
 use crate::org::{
@@ -371,10 +371,7 @@ mod tests {
         // the personal tenant's own directory: an org record + a single owner/active membership.
         let org = Org::rebuild_in(&s, &tenant_scope(&tid)).unwrap();
         assert_eq!(org.org.as_ref().unwrap().display_name, "Personal");
-        assert_eq!(
-            org.role_of(ROOT),
-            Some(gaugewright_core::abac::Role::owner())
-        );
+        assert_eq!(org.role_of(ROOT), Some(gaugedesk_core::abac::Role::owner()));
         assert!(org.can_access_project(ROOT, "any-project")); // owner bypass
 
         // the switcher: one personal tenant.
@@ -418,10 +415,7 @@ mod tests {
 
         let org = Org::rebuild_in(&s, &tenant_scope(&created.id)).unwrap();
         assert_eq!(org.org.as_ref().unwrap().display_name, "Acme Studio");
-        assert_eq!(
-            org.role_of(ROOT),
-            Some(gaugewright_core::abac::Role::owner())
-        );
+        assert_eq!(org.role_of(ROOT), Some(gaugedesk_core::abac::Role::owner()));
 
         let tenancy = Tenancy::rebuild_in(&s, &crate::account::account_scope(ROOT)).unwrap();
         assert_eq!(tenancy.list().count(), 1);
@@ -474,7 +468,7 @@ mod tests {
             Org::rebuild_in(&s, &tenant_scope(&a))
                 .unwrap()
                 .role_of("root-a"),
-            Some(gaugewright_core::abac::Role::owner())
+            Some(gaugedesk_core::abac::Role::owner())
         );
         assert_eq!(
             Org::rebuild_in(&s, &tenant_scope(&a))
@@ -535,7 +529,7 @@ mod tests {
             Org::rebuild_in(&s, &tenant_scope)
                 .unwrap()
                 .role_of("person:invitee"),
-            Some(gaugewright_core::abac::Role::member())
+            Some(gaugedesk_core::abac::Role::member())
         );
         assert!(pending_tenant_invitations_in(&s, "person:invitee")
             .unwrap()

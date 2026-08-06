@@ -7,7 +7,7 @@
  * the carousel is local view state. So the composer is where the **optimistic
  * reconcile** discipline lives on the client edge.
  *
- * The model mirrors `gaugewright_core::run::pending_commands` (MOB-003) exactly:
+ * The model mirrors `gaugedesk_core::run::pending_commands` (MOB-003) exactly:
  *
  *   - A **send** while a turn is running does not manufacture truth. It clears the
  *     draft and records an *optimistic* pending entry keyed by a fresh

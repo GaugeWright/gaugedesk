@@ -1,12 +1,12 @@
 [package]
-name = "gaugewright-whip-runtime"
+name = "gaugedesk-whip-runtime"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
-gaugewright-core = { path = "../core" }
-gaugewright-harness = { path = "../harness" }
+gaugedesk-core = { path = "../core" }
+gaugedesk-harness = { path = "../harness" }
 base64 = "0.22"
 hex = "0.4"
 libc = "0.2"

@@ -52,7 +52,7 @@ export interface Member {
     readonly managed_by_scim: boolean;
 }
 /** Which id-token claims carry the ABAC attributes the verifier maps (B12 / `ID-3`).
- *  All optional — unset falls back to the `GAUGEWRIGHT_OIDC_*_CLAIM` env knob, else
+ *  All optional — unset falls back to the `GAUGEDESK_OIDC_*_CLAIM` env knob, else
  *  unmapped (subject defaults to `sub`). */
 export interface SsoClaimMapping {
     readonly subject_claim?: string | null;

@@ -3,20 +3,20 @@
 //! Turns the proven seams — [`net_tls`](crate::net_tls) (cert-pinned TLS),
 //! [`net_server`](crate::net_server) (the TOFU pin registry), the rendezvous broker
 //! (the WSS crossing integration tests), and the verified
-//! [`gaugewright_core::federation`] crossing reducer — into a runnable surface a person
+//! [`gaugedesk_core::federation`] crossing reducer — into a runnable surface a person
 //! and Playwright can drive between two machines:
 //!
 //! 1. **Pairing ticket** — the owner mints a [`PairingTicket`] describing itself
 //!    (authority id, governance public key, TLS-cert fingerprint, broker address,
 //!    scope, expiry). It travels out-of-band (`INV-7`: no global directory).
 //! 2. **Pair (TOFU)** — the peer accepts the ticket: it pins the ticket's
-//!    governance key into a [`BridgeGrant`](gaugewright_core::bridge_grant::BridgeGrant)
+//!    governance key into a [`BridgeGrant`](gaugedesk_core::bridge_grant::BridgeGrant)
 //!    and the cert fingerprint into the [`PinnedTlsClientConfig`], so every later
 //!    crossing is verified against *these pinned values* (`INV-21`, C-1).
 //! 3. **Receiver loop** — for each paired peer, a task dials the broker on a derived
 //!    inbox token, completes the cert-pinned TLS handshake (this side is the TLS
 //!    server), receives a signed crossing, and admits it through the
-//!    [`CrossingState`](gaugewright_core::federation::CrossingState) reducer **against the
+//!    [`CrossingState`](gaugedesk_core::federation::CrossingState) reducer **against the
 //!    pinned grant** — only the target's admission writes the fact (`INV-13`).
 //! 4. **Cross** — the source signs a handle with its governance key and sends it
 //!    over the TLS leg; the verified, grant-pinned admission happens on the peer.
@@ -41,21 +41,19 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 
-use gaugewright_core::bridge_grant::BridgeGrant;
-use gaugewright_core::delegation::{DeviceDelegation, SubkeyRevocation};
-use gaugewright_core::federated_delivery::{
+use gaugedesk_core::bridge_grant::BridgeGrant;
+use gaugedesk_core::delegation::{DeviceDelegation, SubkeyRevocation};
+use gaugedesk_core::federated_delivery::{
     DeliveryCommand, DeliveryEnvelope, DeliveryPhase, DeliveryState,
 };
-use gaugewright_core::federation::{CrossingCommand, CrossingEnvelope, CrossingState};
-use gaugewright_core::handoff::{self, HandoffCommand, HandoffEvent, HandoffPhase, HandoffState};
-use gaugewright_core::ids::{
-    AuthorityId, BridgeGrantId, DeviceId, HomeId, KeyId, Nonce, PublicKey,
-};
-use gaugewright_core::review::{ReviewCommand, ReviewState};
-use gaugewright_core::run::{RunCommand, RunState};
-use gaugewright_core::signature::{verify_signature, SigningKey};
-use gaugewright_relay_transport::{connect_one_shot, BoxedRelayByteStream, OneShotLeg};
-use gaugewright_store::Store;
+use gaugedesk_core::federation::{CrossingCommand, CrossingEnvelope, CrossingState};
+use gaugedesk_core::handoff::{self, HandoffCommand, HandoffEvent, HandoffPhase, HandoffState};
+use gaugedesk_core::ids::{AuthorityId, BridgeGrantId, DeviceId, HomeId, KeyId, Nonce, PublicKey};
+use gaugedesk_core::review::{ReviewCommand, ReviewState};
+use gaugedesk_core::run::{RunCommand, RunState};
+use gaugedesk_core::signature::{verify_signature, SigningKey};
+use gaugedesk_relay_transport::{connect_one_shot, BoxedRelayByteStream, OneShotLeg};
+use gaugedesk_store::Store;
 
 use crate::device_enroll::{open_sealed, seal_to_subkey, SealedKey};
 use crate::key_store::{FileKeyStore, KeyStore};
@@ -136,7 +134,7 @@ impl Workbench {
     pub fn register_target(
         &mut self,
         target_id: impl Into<String>,
-        target: Box<dyn gaugewright_workspace::Workspace>,
+        target: Box<dyn gaugedesk_workspace::Workspace>,
     ) {
         self.targets.insert(target_id.into(), target);
     }
@@ -190,8 +188,8 @@ pub(crate) fn activate_configured_federation(wb: &mut Workbench) -> std::io::Res
     if !crate::app_support::federation_enabled() {
         return Ok(());
     }
-    let broker_addr = std::env::var("GAUGEWRIGHT_RELAY_ENDPOINT")
-        .unwrap_or_else(|_| "wss://relay.gaugewright.com".to_string());
+    let broker_addr = gaugedesk_env::var("RELAY_ENDPOINT")
+        .unwrap_or_else(|| "wss://relay.gaugewright.com".to_string());
     let mut fed = Federation::open(wb.authority().clone(), &wb.root_path(), broker_addr)?;
     fed.restore_bridges(&folded_bridges(wb.store_ref()));
     wb.apply_startup_federation(fed);
@@ -205,7 +203,7 @@ const DEFAULT_TTL_SECS: u64 = 3600;
 /// The self-operated federation route surface (D-REMOTE / SERVE-1).
 ///
 /// Mounted only when the workbench has federation configured
-/// (`GAUGEWRIGHT_FEDERATION=1`). These routes stay outside the enterprise auth
+/// (`GAUGEDESK_FEDERATION=1`). These routes stay outside the enterprise auth
 /// layer because cross-authority auth rides signed envelopes plus broker pins.
 pub(crate) fn featured_routes(on: bool) -> axum::Router<SharedWorkbench> {
     #[cfg(feature = "federation-protocol")]
@@ -549,7 +547,7 @@ struct CrossWire {
     target: String,
     payload_handle: String,
     signed_bytes: Vec<u8>,
-    signature: gaugewright_core::signature::Signature,
+    signature: gaugedesk_core::signature::Signature,
     source_pubkey: String,
     /// The signer's **device-subkey delegation** (Model A, FED-5a). Present when the
     /// crossing is signed by a device subkey rather than the root governance key
@@ -587,7 +585,7 @@ fn device_identity(
 /// Resolve the effective key a federated message from `source` must verify under,
 /// given the `grant` it crosses and an optional device delegation (Model A). The
 /// shared C-1 gate for the consent + observation paths (the crossing path runs the
-/// equivalent inside the `gaugewright_core::federation` reducer):
+/// equivalent inside the `gaugedesk_core::federation` reducer):
 /// - **no delegation:** the claimed key must equal the grant's pinned root.
 /// - **delegation:** it must be issued by the pinned root, unexpired, the claimed
 ///   key must be the delegated subkey, and that subkey must not be revoked.
@@ -815,7 +813,7 @@ async fn send_crossing(
 //
 // The owner *places a run on the peer*: it sends a RunReq over the cert-pinned TLS
 // leg; the peer executes a turn through the configured GaugeDesk engine and
-// returns its [`Observation`](gaugewright_harness::Observation)s; the owner then
+// returns its [`Observation`](gaugedesk_harness::Observation)s; the owner then
 // federates each one back through the relay seam and admits it as run evidence —
 // standing run truth only via the **owner's** RecordObservation admission (INV-4).
 
@@ -835,7 +833,7 @@ struct ObsWire {
     detail: String,
     /// The canonical bytes the peer signed (the observation's correlation).
     signed_bytes: Vec<u8>,
-    signature: gaugewright_core::signature::Signature,
+    signature: gaugedesk_core::signature::Signature,
     /// The peer's governance pubkey — must equal the grant's pinned source key.
     source_pubkey: String,
     /// Single-use per-observation nonce (anti-replay within the run delivery).
@@ -927,7 +925,7 @@ fn execute_peer_turn(
 /// Run the peer turn in a real, **persistent peer-side engagement** through the
 /// engine (FED-5b-3): create + register an engagement (a worktree off the peer's
 /// default instance), drive the turn with the full membrane / sandbox / run
-/// lifecycle (`run_engagement_turn` — fake under `GAUGEWRIGHT_FAKE_AGENT`,
+/// lifecycle (`run_engagement_turn` — fake under `GAUGEDESK_FAKE_AGENT`,
 /// WhippleScript otherwise), and return the run's admitted-observation count + assistant text.
 /// `None` when the peer has no instance (a minimal/test workbench) — the caller
 /// then falls back to the in-process turn.
@@ -937,7 +935,7 @@ fn engine_peer_turn(
     target_chat: Option<&str>,
     contribution_by: Option<&str>,
 ) -> Option<(u32, String)> {
-    use gaugewright_core::run::RunState;
+    use gaugedesk_core::run::RunState;
     let (eng_id, worktree) = {
         let mut g = wb.lock_unpoisoned();
         if let Some(target_chat) = target_chat {
@@ -986,11 +984,11 @@ fn engine_peer_turn(
 /// Run the no-instance fallback for a peer (FED-4). Explicit fake-agent mode uses
 /// the neutral scripted harness so CI can exercise the federation transport. A
 /// real peer must have a registered instance and therefore fails closed here.
-fn run_peer_outcome(prompt: &str, run_scope: &str) -> gaugewright_harness::TurnOutcome {
-    use gaugewright_harness::testing::{ScriptedHarness, ScriptedTurn};
-    use gaugewright_harness::{AllowAllGate, Harness, Observation, TurnOutcome};
+fn run_peer_outcome(prompt: &str, run_scope: &str) -> gaugedesk_harness::TurnOutcome {
+    use gaugedesk_harness::testing::{ScriptedHarness, ScriptedTurn};
+    use gaugedesk_harness::{AllowAllGate, Harness, Observation, TurnOutcome};
 
-    if std::env::var("GAUGEWRIGHT_FAKE_AGENT").is_ok() {
+    if gaugedesk_env::var("FAKE_AGENT").is_some() {
         let text = format!("remote ran: {prompt}");
         return ScriptedHarness::from_neutral_turns(vec![ScriptedTurn {
             assistant_text: text.clone(),
@@ -1114,8 +1112,8 @@ async fn remote_run_rpc(
 
 /// Drive a run scope to `Running` from wherever it is (idempotent across the
 /// happy-path prefix), so the owner can admit observations into it (INV-4).
-fn ensure_running(store: &mut gaugewright_store::Store, run_scope: &str) {
-    use gaugewright_core::run::{RunCommand, RunPhase, RunState};
+fn ensure_running(store: &mut gaugedesk_store::Store, run_scope: &str) {
+    use gaugedesk_core::run::{RunCommand, RunPhase, RunState};
     let phase = store
         .fold::<RunState>(run_scope)
         .map(|s| s.phase)
@@ -1254,7 +1252,7 @@ struct ConsentReq {
     review_scope: String,
     consenting_authority: String,
     signed_bytes: Vec<u8>,
-    signature: gaugewright_core::signature::Signature,
+    signature: gaugedesk_core::signature::Signature,
     source_pubkey: String,
     /// The consenter's device-subkey delegation (Model A); `None` for a root-signed
     /// consent. The owner verifies it chains to the consenter's pinned root.
@@ -1861,7 +1859,7 @@ fn run_allowed(store: &Store, project: &str, operator: &str) -> bool {
 ///
 /// [ADR 0074]: ../../../specs/decisions/0074-continuous-abac-floor-on-federated-runs.md
 fn run_place_floor_admits(store: &Store, library: &crate::library::Library, project: &str) -> bool {
-    use gaugewright_core::boundary_lifecycle::{pairing_admitted, PlacementPolicy};
+    use gaugedesk_core::boundary_lifecycle::{pairing_admitted, PlacementPolicy};
     let policy = crate::org::Org::rebuild(store)
         .map(|o| o.effective_placement_policy())
         .unwrap_or_else(|_| PlacementPolicy::open());
@@ -1943,7 +1941,7 @@ struct RunPlaceWire {
     source: String,
     target: String,
     signed_bytes: Vec<u8>,
-    signature: gaugewright_core::signature::Signature,
+    signature: gaugedesk_core::signature::Signature,
     source_pubkey: String,
     #[serde(default)]
     delegation: Option<DeviceDelegation>,
@@ -2021,16 +2019,16 @@ pub async fn post_consent(
 }
 
 /// KEY-EGRESS guard (CONF-6): refuse a key-material operation while network HTTP is
-/// enabled (`GAUGEWRIGHT_ALLOW_NETWORK_HTTP=1`). The control-plane API is unauthenticated
+/// enabled (`GAUGEDESK_ALLOW_NETWORK_HTTP=1`). The control-plane API is unauthenticated
 /// and peers federate over the broker, never this API — so root-key export/restore
 /// is a loopback-only, local-operator operation. Fail-closed: any network-HTTP
 /// posture refuses regardless of the actual bind.
 fn network_http_refusal(op: &str) -> Option<axum::response::Response> {
-    if gaugewright_store::process_env::enabled("ALLOW_NETWORK_HTTP") {
+    if gaugedesk_env::enabled("ALLOW_NETWORK_HTTP") {
         return Some(
             (
                 StatusCode::FORBIDDEN,
-                format!("{op} is loopback-only; refused while GAUGEWRIGHT_ALLOW_NETWORK_HTTP=1"),
+                format!("{op} is loopback-only; refused while GAUGEDESK_ALLOW_NETWORK_HTTP=1"),
             )
                 .into_response(),
         );
@@ -2051,7 +2049,7 @@ pub async fn post_recovery_code(State(wb): State<SharedWorkbench>) -> impl IntoR
     let guard = wb.lock_unpoisoned();
     let me = guard.authority().clone();
     let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
-    let code = gaugewright_core::recovery::export_recovery(&root);
+    let code = gaugedesk_core::recovery::export_recovery(&root);
     Json(serde_json::json!({ "authority": me.as_str(), "recovery_code": code })).into_response()
 }
 
@@ -2076,7 +2074,7 @@ pub async fn post_restore(
     if let Some(resp) = network_http_refusal("recovery restore") {
         return resp;
     }
-    let key = match gaugewright_core::recovery::import_recovery(&req.code) {
+    let key = match gaugedesk_core::recovery::import_recovery(&req.code) {
         Ok(k) => k,
         Err(e) => {
             return (
@@ -2125,7 +2123,7 @@ fn guard_root(guard: &crate::Workbench) -> std::path::PathBuf {
 
 // ---------------------------------------------------------------------------
 // Project handoff / authority relocation (FED-6) — the control-plane surface over
-// the `gaugewright_core::handoff` reducer. A project's handoff history is an append-only
+// the `gaugedesk_core::handoff` reducer. A project's handoff history is an append-only
 // per-project event scope; current state is the deterministic fold of those events
 // through `handoff::evolve` (`INV-6`/`INV-7`/`INV-8`). Each endpoint `decide`s one
 // command against the folded state and appends the resulting event(s).
@@ -2440,7 +2438,7 @@ struct HandoffWire {
     #[serde(default)]
     credential_key: Option<SealedKey>,
     signed_bytes: Vec<u8>,
-    signature: gaugewright_core::signature::Signature,
+    signature: gaugedesk_core::signature::Signature,
     source_pubkey: String,
     #[serde(default)]
     delegation: Option<DeviceDelegation>,
@@ -3063,7 +3061,7 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
         // closed until a measurement-bearing transport exists.
         let placement_policy = crate::org::Org::rebuild(guard.store_ref())
             .map(|org| org.effective_placement_policy())
-            .unwrap_or_else(|_| gaugewright_core::boundary_lifecycle::PlacementPolicy::open());
+            .unwrap_or_else(|_| gaugedesk_core::boundary_lifecycle::PlacementPolicy::open());
         if !handoff_placement_admitted(&placement_policy, &wire.log, &wire.project) {
             return serde_json::json!({
                 "ok": false,
@@ -3414,8 +3412,8 @@ struct EngagementInvite {
     ticket: PairingTicket,
     project: String,
     project_name: String,
-    #[serde(default = "gaugewright_core::boundary_lifecycle::Placement::local")]
-    deployment_mode: gaugewright_core::boundary_lifecycle::Placement,
+    #[serde(default = "gaugedesk_core::boundary_lifecycle::Placement::local")]
+    deployment_mode: gaugedesk_core::boundary_lifecycle::Placement,
     #[serde(default)]
     manifest: Vec<String>,
     confirm_code: String,
@@ -3463,7 +3461,7 @@ struct InviteAcceptWire {
     invite_id: String,
     ticket: PairingTicket,
     signed_bytes: Vec<u8>,
-    signature: gaugewright_core::signature::Signature,
+    signature: gaugedesk_core::signature::Signature,
 }
 
 /// Record / look up a pending outgoing invite (origin side), folded latest-wins per
@@ -3731,8 +3729,8 @@ pub async fn post_invite_accept(
         let guard = wb.lock_unpoisoned();
         let policy = crate::org::Org::rebuild(guard.store_ref())
             .map(|org| org.effective_placement_policy())
-            .unwrap_or_else(|_| gaugewright_core::boundary_lifecycle::PlacementPolicy::open());
-        if !gaugewright_core::boundary_lifecycle::pairing_admitted(
+            .unwrap_or_else(|_| gaugedesk_core::boundary_lifecycle::PlacementPolicy::open());
+        if !gaugedesk_core::boundary_lifecycle::pairing_admitted(
             &policy,
             &invite.deployment_mode,
             false,
@@ -3942,7 +3940,7 @@ fn admit_run_place(
             return refused("verification failed");
         }
         if let Some(target_chat) = wire.target_chat.as_deref() {
-            use gaugewright_core::workstream::{WorkstreamPhase, WorkstreamState};
+            use gaugedesk_core::workstream::{WorkstreamPhase, WorkstreamState};
 
             let target_is_member = guard.library.project_of_chat(target_chat)
                 == Some(wire.project.as_str())
@@ -4204,7 +4202,7 @@ struct EraseWire {
     source: String,
     target: String,
     signed_bytes: Vec<u8>,
-    signature: gaugewright_core::signature::Signature,
+    signature: gaugedesk_core::signature::Signature,
     source_pubkey: String,
     #[serde(default)]
     delegation: Option<DeviceDelegation>,
@@ -4231,7 +4229,7 @@ fn decide_erasure(
     basis: &str,
 ) -> EraseVerdict {
     if erase_term_granted(store, source) {
-        let id = gaugewright_core::resource::ResourceId::new(resource);
+        let id = gaugedesk_core::resource::ResourceId::new(resource);
         match crate::resource_store::tombstone(store, engagement, &id) {
             Ok(true) => EraseVerdict {
                 status: "erased".into(),
@@ -4633,7 +4631,7 @@ pub async fn get_handoff_incoming(State(wb): State<SharedWorkbench>) -> impl Int
             let log: Vec<HandoffLogRecord> =
                 serde_json::from_value(o["log"].clone()).unwrap_or_default();
             let deployment_mode = incoming_deployment_mode(&log, project)
-                .unwrap_or_else(gaugewright_core::boundary_lifecycle::Placement::local);
+                .unwrap_or_else(gaugedesk_core::boundary_lifecycle::Placement::local);
             serde_json::json!({
                 "project": o["project"],
                 "source": o["source"],
@@ -4659,7 +4657,7 @@ pub struct HandoffConsentRequest {
 fn incoming_deployment_mode(
     log: &[HandoffLogRecord],
     project: &str,
-) -> Option<gaugewright_core::boundary_lifecycle::Placement> {
+) -> Option<gaugedesk_core::boundary_lifecycle::Placement> {
     log.iter()
         .filter(|r| r.kind == "project")
         .filter_map(|r| serde_json::from_str::<crate::library::ProjectRecord>(&r.payload).ok())
@@ -4674,13 +4672,13 @@ fn incoming_deployment_mode(
 /// itself declares attested placement still needs measurement proof. Shared by explicit,
 /// batch, preauthorized, and one-shot admission so every path enforces the same gate.
 fn handoff_placement_admitted(
-    policy: &gaugewright_core::boundary_lifecycle::PlacementPolicy,
+    policy: &gaugedesk_core::boundary_lifecycle::PlacementPolicy,
     log: &[HandoffLogRecord],
     project: &str,
 ) -> bool {
     let declared = incoming_deployment_mode(log, project)
-        .unwrap_or_else(gaugewright_core::boundary_lifecycle::Placement::local);
-    gaugewright_core::boundary_lifecycle::pairing_admitted(policy, &declared, false)
+        .unwrap_or_else(gaugedesk_core::boundary_lifecycle::Placement::local);
+    gaugedesk_core::boundary_lifecycle::pairing_admitted(policy, &declared, false)
 }
 
 pub async fn post_handoff_accept(
@@ -4724,7 +4722,7 @@ pub async fn post_handoff_accept(
         // for an engagement that declares attested placement.
         let placement_policy = crate::org::Org::rebuild(guard.store_ref())
             .map(|o| o.effective_placement_policy())
-            .unwrap_or_else(|_| gaugewright_core::boundary_lifecycle::PlacementPolicy::open());
+            .unwrap_or_else(|_| gaugedesk_core::boundary_lifecycle::PlacementPolicy::open());
         if !handoff_placement_admitted(&placement_policy, &log, req.project.as_str()) {
             return (
                 StatusCode::FORBIDDEN,
@@ -4817,7 +4815,7 @@ pub async fn post_handoff_accept_all(
         // committed), the bulk analog of the single-accept 403. Rebuilt once (org-wide).
         let placement_policy = crate::org::Org::rebuild(guard.store_ref())
             .map(|o| o.effective_placement_policy())
-            .unwrap_or_else(|_| gaugewright_core::boundary_lifecycle::PlacementPolicy::open());
+            .unwrap_or_else(|_| gaugedesk_core::boundary_lifecycle::PlacementPolicy::open());
         let mut accepted: Vec<String> = Vec::new();
         let mut notifies: Vec<(HandoffNotify, String)> = Vec::new();
         for offer in pending_incoming(guard.store_ref()) {
@@ -5137,8 +5135,8 @@ async fn notify_origin(n: HandoffNotify, kind: HandoffMsgKind, project: &str) {
 mod erasure_tests {
     use super::*;
     use crate::resource_store::{get, put};
-    use gaugewright_core::boundary::Authority;
-    use gaugewright_core::resource::{
+    use gaugedesk_core::boundary::Authority;
+    use gaugedesk_core::resource::{
         ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
     };
 
@@ -5297,7 +5295,7 @@ mod handoff_routes_tests {
 
     #[test]
     fn incoming_deployment_mode_reads_the_relocated_project_ceiling() {
-        use gaugewright_core::boundary_lifecycle::{Operator, Placement};
+        use gaugedesk_core::boundary_lifecycle::{Operator, Placement};
         let project = crate::library::ProjectRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
@@ -5305,7 +5303,7 @@ mod handoff_routes_tests {
             op: crate::library::RecordOp::Upsert,
             name: "Acme".into(),
             is_default: false,
-            home_id: gaugewright_core::ids::HomeId::new("home:local-user"),
+            home_id: gaugedesk_core::ids::HomeId::new("home:local-user"),
             network_isolated: false,
             run_purpose: None,
             deployment_mode: Some(Placement {
@@ -5412,7 +5410,7 @@ mod handoff_routes_tests {
             },
             project: "policy-project".into(),
             project_name: "Policy project".into(),
-            deployment_mode: gaugewright_core::boundary_lifecycle::Placement::local(),
+            deployment_mode: gaugedesk_core::boundary_lifecycle::Placement::local(),
             manifest: Vec::new(),
             confirm_code: "1-2-3".into(),
         };
@@ -5504,8 +5502,8 @@ mod handoff_routes_tests {
         use crate::org::{MembershipRecord, MembershipStatus, ORG_SCOPE};
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
-        use gaugewright_core::abac::AuthorityAttributes;
-        use gaugewright_core::ids::AuthorityId;
+        use gaugedesk_core::abac::AuthorityAttributes;
+        use gaugedesk_core::ids::AuthorityId;
         use std::sync::{Arc, Mutex};
         use tower::ServiceExt;
 
@@ -5571,7 +5569,7 @@ mod run_place_floor_tests {
     //! `run_allowed` grant no longer exempts a run from the org's placement policy.
     use super::*;
     use crate::library::{Library, ProjectRecord, RecordOp};
-    use gaugewright_core::boundary_lifecycle::{Operator, Placement, PlacementPolicy};
+    use gaugedesk_core::boundary_lifecycle::{Operator, Placement, PlacementPolicy};
     use std::collections::BTreeSet;
 
     fn store_with_policy(policy: Option<PlacementPolicy>) -> Store {
@@ -5597,7 +5595,7 @@ mod run_place_floor_tests {
             op: RecordOp::Upsert,
             name: project.into(),
             is_default: false,
-            home_id: gaugewright_core::ids::HomeId::new("home:local-user"),
+            home_id: gaugedesk_core::ids::HomeId::new("home:local-user"),
             network_isolated: false,
             run_purpose: None,
             deployment_mode: mode,

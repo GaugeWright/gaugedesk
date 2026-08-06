@@ -11,9 +11,9 @@ use axum::Router;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use gaugewright_app::org::{MembershipRecord, MembershipStatus, RecordOp, ORG_ID, ORG_SCOPE};
-use gaugewright_app::{open_workbench, LockUnpoisoned, SharedWorkbench};
-use gaugewright_ee::enterprise_control_plane;
+use gaugedesk_app::org::{MembershipRecord, MembershipStatus, RecordOp, ORG_ID, ORG_SCOPE};
+use gaugedesk_app::{open_workbench, LockUnpoisoned, SharedWorkbench};
+use gaugedesk_ee::enterprise_control_plane;
 
 /// A workbench seeded like the live server (builder agent + authoring instance)
 /// so the library routes have an instance to work against.

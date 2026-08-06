@@ -3,7 +3,7 @@
 //!
 //! The event log is **append-only and immutable** (`INV-6`), and the content-erasure
 //! lifecycle deliberately *preserves history* (`HISTORY_PRESERVED`,
-//! [`content_erasure`](gaugewright_core::content_erasure)) — so a tombstone makes a
+//! [`content_erasure`](gaugedesk_core::content_erasure)) — so a tombstone makes a
 //! payload *unresolvable for future use* but does **not** shred the bytes. For a true
 //! right-to-erasure ("the data is gone, unrecoverable"), shredding bytes in the
 //! immutable log is not an option.

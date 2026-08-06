@@ -4,10 +4,10 @@
  * This is the plugin surface Pi sees (`pi-rpc.md`, "Roles"). It enforces the
  * agent's `.agent-config.json` `policy` on Pi's `tool_call` hook — the
  * **no-prompt static path** of the boundary membrane — so an out-of-policy
- * effect is blocked *before* it executes. The Rust host (`gaugewright-boundary`)
+ * effect is blocked *before* it executes. The Rust host (`gaugedesk-boundary`)
  * holds the same policy model; this plugin is its enforcement point inside Pi.
  *
- * Posture (mirrors `gaugewright_boundary::Posture`):
+ * Posture (mirrors `gaugedesk_boundary::Posture`):
  *   - trust-by-default : in-workspace effects proceed; external ones blocked.
  *   - prompt-on-risk   : risky effects ask via `ctx.ui` (→ extension_ui_request).
  *   - policy-only-block: only allow-listed tools proceed.
@@ -47,7 +47,7 @@ function isWriteTool(tool: string): boolean {
 /**
  * The agent's **method-definition surface** (ADR 0029): the Pi-native files that
  * define the agent. A write here is edit-authored (INV-24). Mirrors
- * `gaugewright_boundary::is_method_surface_path`.
+ * `gaugedesk_boundary::is_method_surface_path`.
  *
  * Source of truth for the layout: the `definition` module in `crates/boundary`
  * (SYSTEM_PATH / INSTRUCTIONS_PATH / CONFIG_PATH / READONLY_ROOTS). This is a
@@ -68,11 +68,11 @@ function isMethodSurfacePath(path: string): boolean {
 }
 
 /**
- * The engagement's authoring mode, from the host (`GAUGEWRIGHT_CHAT_MODE`). Edit may
+ * The engagement's authoring mode, from the host (`GAUGEDESK_CHAT_MODE`). Edit may
  * edit the agent's own definition; anything else is read-only to it (fail-closed).
  */
 function isEditMode(): boolean {
-    return process.env.GAUGEWRIGHT_CHAT_MODE === "edit";
+    return process.env.GAUGEDESK_CHAT_MODE === "edit";
 }
 
 function loadPolicy(cwd: string): Policy {

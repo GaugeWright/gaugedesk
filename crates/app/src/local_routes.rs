@@ -232,7 +232,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
     // compiles only into debug builds, so no released artifact carries a route
     // that can delete persisted user data (DR-0054 Phase A). The debug/test
     // harness binaries that need it are always debug builds (`web/e2e/*.sh`,
-    // `scripts/dev.sh`), and the `GAUGEWRIGHT_TEST_RESET` process guard stays
+    // `scripts/dev.sh`), and the `GAUGEDESK_TEST_RESET` process guard stays
     // in force as defense in depth where the routes do exist.
     #[cfg(debug_assertions)]
     let routes = routes

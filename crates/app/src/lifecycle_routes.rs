@@ -4,14 +4,14 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use gaugewright_core::boundary_lifecycle::BoundaryState;
-use gaugewright_core::freshness::{Freshness, FreshnessMarker};
-use gaugewright_core::instance::{InstanceCommand, InstanceState};
-use gaugewright_core::merge::MergeState;
-use gaugewright_core::resource_export::{ExportCommand, ExportState};
-use gaugewright_core::review::{ReviewCommand, ReviewState};
-use gaugewright_core::run::{RunCommand, RunState};
-use gaugewright_store::{AdmitError, MaterializedAdmission};
+use gaugedesk_core::boundary_lifecycle::BoundaryState;
+use gaugedesk_core::freshness::{Freshness, FreshnessMarker};
+use gaugedesk_core::instance::{InstanceCommand, InstanceState};
+use gaugedesk_core::merge::MergeState;
+use gaugedesk_core::resource_export::{ExportCommand, ExportState};
+use gaugedesk_core::review::{ReviewCommand, ReviewState};
+use gaugedesk_core::run::{RunCommand, RunState};
+use gaugedesk_store::{AdmitError, MaterializedAdmission};
 use serde::Deserialize;
 
 use crate::stream::ServerEvent;
@@ -197,8 +197,7 @@ pub(crate) async fn post_instance_command(
 ) -> impl IntoResponse {
     if let InstanceCommand::SetLocalConfig { config, .. } = &command {
         if !config.trim().is_empty() {
-            if let Err(error) =
-                gaugewright_boundary::AgentConfig::runtime_settings_from_json(config)
+            if let Err(error) = gaugedesk_boundary::AgentConfig::runtime_settings_from_json(config)
             {
                 return (
                     StatusCode::BAD_REQUEST,

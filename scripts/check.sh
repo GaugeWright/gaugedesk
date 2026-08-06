@@ -61,7 +61,7 @@ run_rust() {
 
     # The open build must stay buildable without the enterprise features.
     echo "== no-default-features =="
-    cargo check -p gaugewright-app --no-default-features --all-targets
+    cargo check -p gaugedesk-app --no-default-features --all-targets
 }
 
 run_web() {

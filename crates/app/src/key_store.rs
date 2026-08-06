@@ -1,14 +1,14 @@
 //! `KeyStore` — where an authority's / device's P-256 **governance signing key**
 //! lives (D-CRYPTO / ADR 0042). The pure core does the crypto
-//! ([`gaugewright_core::signature`]); *storage* is impure and lives here behind a trait,
+//! ([`gaugedesk_core::signature`]); *storage* is impure and lives here behind a trait,
 //! so the loopback double, a file-backed dev impl, and a future secure-enclave /
 //! TPM impl are interchangeable with no change to the signing path.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use gaugewright_core::ids::{AuthorityId, PublicKey};
-use gaugewright_core::signature::{Signature, SigningKey};
+use gaugedesk_core::ids::{AuthorityId, PublicKey};
+use gaugedesk_core::signature::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
 
 use crate::workbench_state::Workbench;
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn signed_then_verified_through_the_store() {
-        use gaugewright_core::signature::verify_signature;
+        use gaugedesk_core::signature::verify_signature;
         let ks = LoopbackKeyStore;
         let key = ks.signing_key(&AuthorityId::new("acme"));
         let sig = key.sign(b"challenge");

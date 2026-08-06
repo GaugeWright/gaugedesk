@@ -3,7 +3,7 @@
 //! Spawns and drives `pi --mode rpc` as **one subprocess per engagement**,
 //! hosting the engagement's persistent Pi thread across turns (`pi-rpc.md`). Each
 //! turn is a `prompt`; the bridge folds Pi's event stream into the pure
-//! [`gaugewright_core::runtime_session`] reducer so the model's invariants govern the
+//! [`gaugedesk_core::runtime_session`] reducer so the model's invariants govern the
 //! adapter:
 //! - every streamed event is **operational runtime-session evidence** only — the
 //!   bridge never admits it into run truth (`OBSERVATION_REQUIRES_OWNER_ADMISSION`
@@ -19,16 +19,16 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcCommand, Stdio};
 
-use gaugewright_core::runtime_session::{decide, evolve, SessionCommand, SessionState};
+use gaugedesk_core::runtime_session::{decide, evolve, SessionCommand, SessionState};
 
 pub mod protocol;
-/// The seam types live in `gaugewright-harness` (SUB-0); re-exported here at
+/// The seam types live in `gaugedesk-harness` (SUB-0); re-exported here at
 /// their pre-extraction paths so existing callers keep compiling unchanged.
-pub use gaugewright_harness::{
+pub use gaugedesk_harness::{
     sandbox, AllowAllGate, EgressGate, GateDecision, Harness, ModelUsage, Observation,
     RemoteHarness, ToolInfo, TurnOutcome,
 };
-use gaugewright_harness::{
+use gaugedesk_harness::{
     ChatMode, CredentialProbe, HarnessContinuitySpec, HarnessFactory, HarnessSpec,
 };
 /// Native Pi image content block, re-exported for the engine + control plane that
@@ -396,7 +396,7 @@ pub fn run_rpc_turn<T: RpcTransport>(
 /// over the (in-process) loopback wire to a [`peer`](LoopbackPeer) that owns the
 /// agent runtime, and the agent's [`TurnOutcome`] comes back as one
 /// [`RpcResponse::TurnComplete`] line. The orchestrator side then sequences the
-/// exchange through the verified [`remote_session`](gaugewright_core::remote_session)
+/// exchange through the verified [`remote_session`](gaugedesk_core::remote_session)
 /// reducer, so the returned outcome becomes the caller's truth **only via source
 /// admission** (`OUTCOME_REQUIRES_SOURCE_ADMISSION`, `INV-4`) — the relay's
 /// say-so never suffices.
@@ -469,7 +469,7 @@ impl Harness for RemoteLoopbackHarness {
         _images: &[ImageContent],
         sink: &mut dyn FnMut(&Observation),
     ) -> io::Result<TurnOutcome> {
-        use gaugewright_core::remote_session::{
+        use gaugedesk_core::remote_session::{
             decide as rdecide, evolve as revolve, RemoteCommand, RemoteState,
         };
 
@@ -513,7 +513,7 @@ impl Harness for RemoteLoopbackHarness {
         step(&mut session, RemoteCommand::CompleteSession)?;
         debug_assert_eq!(
             session.phase,
-            gaugewright_core::remote_session::RemotePhase::Completed
+            gaugedesk_core::remote_session::RemotePhase::Completed
         );
 
         Ok(outcome)
@@ -543,7 +543,7 @@ pub struct PiConfig {
     /// `.pi/SYSTEM.md`; use mode leaves it `None` so Pi discovers the agent's own
     /// definition from the worktree (ADR 0029).
     pub system_prompt: Option<String>,
-    /// Environment variables to set on the child (e.g. `GAUGEWRIGHT_CHAT_MODE` so the
+    /// Environment variables to set on the child (e.g. `GAUGEDESK_CHAT_MODE` so the
     /// in-process plugin can enforce the edit/use write-gate, ADR 0029).
     pub env: Vec<(String, String)>,
     /// OS sandbox to run Pi (and its children, incl. `bash`) under (ADR 0030).
@@ -560,9 +560,9 @@ pub struct PiConfig {
 }
 
 /// Resolve the Pi executable for the retained conformance adapter. A manual
-/// test may override `GAUGEWRIGHT_PI_BIN`; otherwise it finds `pi` on PATH.
+/// test may override `GAUGEDESK_PI_BIN`; otherwise it finds `pi` on PATH.
 fn resolve_pi_bin() -> String {
-    pi_bin_from(std::env::var("GAUGEWRIGHT_PI_BIN").ok())
+    pi_bin_from(gaugedesk_env::var("PI_BIN"))
 }
 
 /// The pure resolution (pulled out of [`resolve_pi_bin`] so it is testable without
@@ -632,7 +632,7 @@ pub struct PiProcess {
     /// composition. Held here so the egress checkpoint lives exactly as long as the
     /// sandboxed process: dropping/`shutdown`ing `PiProcess` drops this guard, which
     /// tears the proxy down. `None` for every other posture.
-    _egress_proxy: Option<gaugewright_harness::sni_proxy::SniProxyGuard>,
+    _egress_proxy: Option<gaugedesk_harness::sni_proxy::SniProxyGuard>,
 }
 
 impl PiProcess {
@@ -653,7 +653,7 @@ impl PiProcess {
         let mut egress_proxy = None;
         let mut cmd = match &config.sandbox {
             Some(policy) if sandbox::wants_transparent_egress(policy) => {
-                let guard = gaugewright_harness::sni_proxy::SniProxyGuard::spawn(
+                let guard = gaugedesk_harness::sni_proxy::SniProxyGuard::spawn(
                     policy.allowed_hosts.clone(),
                 )?;
                 let argv =
@@ -800,7 +800,7 @@ impl RpcTransport for PiProcess {
 }
 
 /// A transport that replays canned stdout lines and discards sent commands — the
-/// **mock-LLM** transport used by the control plane's `GAUGEWRIGHT_FAKE_AGENT` mode and
+/// **mock-LLM** transport used by the control plane's `GAUGEDESK_FAKE_AGENT` mode and
 /// by tests. It drives the exact same turn loop as a real Pi process, so the
 /// membrane/reducer path is exercised identically; only the bytes are scripted.
 pub struct ScriptedTransport {
@@ -886,7 +886,7 @@ impl HarnessFactory for PiHarnessFactory {
     fn credential_status(
         &self,
         provider: &str,
-        _capability: Option<&dyn gaugewright_harness::CredentialCapability>,
+        _capability: Option<&dyn gaugedesk_harness::CredentialCapability>,
     ) -> CredentialProbe {
         if pi_oauth_present() {
             CredentialProbe::Ready
@@ -928,19 +928,19 @@ impl HarnessFactory for PiHarnessFactory {
 
 /// The [`PiConfig`] a [`HarnessSpec`] assembles to — everything Pi-specific the
 /// engine used to build inline: the session dir + `--continue` detection, the
-/// sandbox extension, the membrane plugin `-e` arg, and `GAUGEWRIGHT_CHAT_MODE`.
+/// sandbox extension, the membrane plugin `-e` arg, and `GAUGEDESK_CHAT_MODE`.
 /// The spec carries the shell's resolved policy; this adds the adapter-private
 /// pieces.
 pub fn pi_config_for(spec: &HarnessSpec) -> PiConfig {
     pi_config_from(
         spec,
-        std::env::var("GAUGEWRIGHT_PLUGIN_PATH").ok(),
+        gaugedesk_env::var("PLUGIN_PATH"),
         std::env::current_dir().ok(),
         std::env::var_os("HOME"),
     )
 }
 
-/// The assembly itself, with the process-env reads (`GAUGEWRIGHT_PLUGIN_PATH`,
+/// The assembly itself, with the process-env reads (`GAUGEDESK_PLUGIN_PATH`,
 /// cwd, `HOME`) parameterized — mirroring [`pi_bin_from`]'s pure-resolution
 /// shape — so the golden parity test is deterministic.
 pub fn pi_config_from(
@@ -989,7 +989,7 @@ pub fn pi_config_from(
         // (INV-24) before an effect executes — defense-in-depth + clean errors.
         env: {
             let mut env = vec![(
-                "GAUGEWRIGHT_CHAT_MODE".to_string(),
+                "GAUGEDESK_CHAT_MODE".to_string(),
                 match spec.mode {
                     ChatMode::Edit => "edit".to_string(),
                     ChatMode::Use => "use".to_string(),
@@ -1013,7 +1013,7 @@ pub fn pi_config_from(
 }
 
 /// Resolve the retained membrane plugin for a conformance run. An explicit
-/// `GAUGEWRIGHT_PLUGIN_PATH` wins; source-tree tests fall back to
+/// `GAUGEDESK_PLUGIN_PATH` wins; source-tree tests fall back to
 /// `plugin/gaugewright-plugin.ts` under the cwd. Pure candidate-selector (no
 /// filesystem) so it is unit-testable; the caller `.exists()`-guards before
 /// handing the path to Pi.
@@ -1332,7 +1332,7 @@ mod tests {
     /// inputs — regenerate them only from that block, never from the factory.
     mod pi_factory_golden {
         use super::*;
-        use gaugewright_harness::sandbox::Network;
+        use gaugedesk_harness::sandbox::Network;
 
         #[test]
         fn use_mode_full_spec_reproduces_the_inline_assembly() {
@@ -1407,7 +1407,7 @@ mod tests {
             assert_eq!(
                 pc.env,
                 vec![
-                    ("GAUGEWRIGHT_CHAT_MODE".to_string(), "use".to_string()),
+                    ("GAUGEDESK_CHAT_MODE".to_string(), "use".to_string()),
                     ("OPENAI_API_KEY".to_string(), "sk-test-123".to_string()),
                 ]
             );
@@ -1492,7 +1492,7 @@ mod tests {
             assert_eq!(pi_args(&pc), expected_args);
             assert_eq!(
                 pc.env,
-                vec![("GAUGEWRIGHT_CHAT_MODE".to_string(), "edit".to_string())]
+                vec![("GAUGEDESK_CHAT_MODE".to_string(), "edit".to_string())]
             );
             assert_eq!(pc.working_dir.as_deref(), Some(wt.to_str().unwrap()));
             assert!(pc.continue_session, "existing history must resume");
@@ -1570,7 +1570,7 @@ mod tests {
 
         // the session went through execution → terminal, evidence preserved,
         // and product truth was NOT auto-admitted (owner admission still required).
-        use gaugewright_core::runtime_session::SessionPhase;
+        use gaugedesk_core::runtime_session::SessionPhase;
         assert_eq!(session.phase, SessionPhase::Terminal);
         assert!(session.evidence_present);
         assert!(
@@ -1775,7 +1775,7 @@ mod tests {
         // response → source-admit → complete). We prove the reducer sequence the
         // harness runs reaches that terminal state for a well-formed exchange — the
         // outcome is product truth only past source admission, not on relay say-so.
-        use gaugewright_core::remote_session::{
+        use gaugedesk_core::remote_session::{
             decide, evolve, RemoteCommand, RemotePhase, RemoteState,
         };
         let mut s = RemoteState::default();
@@ -1814,7 +1814,7 @@ mod tests {
 
     /// Smoke-test the real `PiProcess` transport against an installed `pi`,
     /// using `get_state` (no model call). Ignored by default — requires `pi` on
-    /// PATH. Run with `cargo test -p gaugewright-pi-bridge -- --ignored`.
+    /// PATH. Run with `cargo test -p gaugedesk-pi-bridge -- --ignored`.
     #[test]
     #[ignore = "requires pi binary on PATH"]
     fn real_pi_process_round_trips_get_state() {

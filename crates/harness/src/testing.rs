@@ -2,7 +2,7 @@
 //!
 //! Nothing here is adapter-shaped: the doubles fabricate the seam's own types
 //! directly, proving the [`Harness`] contract needs no runtime wire behind it.
-//! GaugeDesk's `GAUGEWRIGHT_FAKE_AGENT` path uses this double directly, so its
+//! GaugeDesk's `GAUGEDESK_FAKE_AGENT` path uses this double directly, so its
 //! deterministic acceptance suite does not depend on Pi's wire protocol.
 
 use std::collections::VecDeque;

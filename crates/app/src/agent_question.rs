@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_store::{AdmitError, Store};
 use serde::{Deserialize, Serialize};
 
 use crate::workbench_state::Workbench;
@@ -34,10 +34,10 @@ use crate::workbench_state::Workbench;
 /// whip-runtime, not the reverse), so the manifest, the ceiling check, and this
 /// record cannot drift onto three different strings — the drift `ASK-1` flagged
 /// as ungated. `tests/gaugewright_package.rs` ties the manifest's JSON to these.
-pub use gaugewright_whip_runtime::{QUESTION_ASK_CAPABILITY, QUESTION_RESOURCE};
+pub use gaugedesk_whip_runtime::{QUESTION_ASK_CAPABILITY, QUESTION_RESOURCE};
 
 /// The GaugeWright package manifest, registered beside the std set.
-pub const GAUGEWRIGHT_PACKAGE_MANIFEST: &str = include_str!("../packages/gaugewright.json");
+pub const GAUGEDESK_PACKAGE_MANIFEST: &str = include_str!("../packages/gaugewright.json");
 
 const QUESTION_KIND: &str = "agent-question";
 
@@ -586,7 +586,7 @@ mod tests {
         // The manifest is what makes asking a governed ability rather than a
         // tool the host hands out unconditionally (ADR 0113 §1).
         let manifest: serde_json::Value =
-            serde_json::from_str(GAUGEWRIGHT_PACKAGE_MANIFEST).expect("the manifest parses");
+            serde_json::from_str(GAUGEDESK_PACKAGE_MANIFEST).expect("the manifest parses");
         assert_eq!(manifest["package_id"], "gaugewright");
         let declares = manifest["capabilities"]
             .as_array()
@@ -664,14 +664,11 @@ mod tests {
         // leave a capability that silently never admits anything.
         assert_eq!(
             QUESTION_ASK_CAPABILITY,
-            gaugewright_whip_runtime::QUESTION_ASK_CAPABILITY
+            gaugedesk_whip_runtime::QUESTION_ASK_CAPABILITY
         );
-        assert_eq!(
-            QUESTION_RESOURCE,
-            gaugewright_whip_runtime::QUESTION_RESOURCE
-        );
+        assert_eq!(QUESTION_RESOURCE, gaugedesk_whip_runtime::QUESTION_RESOURCE);
         let manifest: serde_json::Value =
-            serde_json::from_str(GAUGEWRIGHT_PACKAGE_MANIFEST).expect("the manifest parses");
+            serde_json::from_str(GAUGEDESK_PACKAGE_MANIFEST).expect("the manifest parses");
         let provider_backs_it = manifest["providers"]
             .as_array()
             .expect("providers")

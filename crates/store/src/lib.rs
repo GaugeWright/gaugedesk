@@ -1,6 +1,6 @@
 //! gaugewright local store — the SQLite event log + the admission transaction.
 //!
-//! The imperative shell around the pure `gaugewright-core` reducers (ADR 0004): it
+//! The imperative shell around the pure `gaugedesk-core` reducers (ADR 0004): it
 //! folds a scope's events to current state (`INV-8`), runs `decide`, and appends
 //! the resulting events **atomically** at the next position (single-writer per
 //! scope, `INV-7`). A rejected command appends nothing (`INV-2`). The
@@ -19,10 +19,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gaugewright_core::{Lifecycle, Rejection};
+use gaugedesk_core::{Lifecycle, Rejection};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-
-pub mod process_env;
 
 /// A transparent at-rest transform applied to record payloads of designated
 /// **content** kinds (`SECAUD-9`/`SECAUD-6`). The store crate stays crypto-free: this
@@ -177,7 +175,7 @@ impl From<serde_json::Error> for AdmitError {
     }
 }
 
-/// Map the `GAUGEWRIGHT_SQLITE_SYNCHRONOUS` setting to a SQLite `synchronous` mode
+/// Map the `GAUGEDESK_SQLITE_SYNCHRONOUS` setting to a SQLite `synchronous` mode
 /// (`SCALE-5`): `FULL` (case-insensitive) for a hosted data plane's fsync-per-commit
 /// durability, else the desktop default `NORMAL`. Pure, so the policy is unit-testable.
 fn synchronous_mode(setting: Option<&str>) -> &'static str {
@@ -411,7 +409,7 @@ impl Store {
         // under a live projection reader SQLite can reject that setup with BUSY
         // before the turn reaches its properly serialized IMMEDIATE transactions.
         // `synchronous` is connection-local, so carry that one setting explicitly.
-        let sync = synchronous_mode(process_env::var("SQLITE_SYNCHRONOUS").as_deref());
+        let sync = synchronous_mode(gaugedesk_env::var("SQLITE_SYNCHRONOUS").as_deref());
         conn.execute_batch(&format!("PRAGMA synchronous={sync};"))?;
         Ok(Self {
             conn,
@@ -439,14 +437,10 @@ impl Store {
         // default. `NORMAL` + WAL is crash-safe against an *application* crash and only
         // risks losing the most-recent commit(s) on an *OS/power* crash mid-checkpoint —
         // the right desktop default (no fsync per commit). A hosted/multi-user data plane
-        // sets `GAUGEWRIGHT_SQLITE_SYNCHRONOUS=FULL` for fsync-per-commit durability.
+        // sets `GAUGEDESK_SQLITE_SYNCHRONOUS=FULL` for fsync-per-commit durability.
         // WAL auto-recovers (replays the log) on the next open, so no separate sweep.
-        let sync = synchronous_mode(process_env::var("SQLITE_SYNCHRONOUS").as_deref());
-        let journal = journal_mode(
-            std::env::var("GAUGEWRIGHT_SQLITE_JOURNAL_MODE")
-                .ok()
-                .as_deref(),
-        );
+        let sync = synchronous_mode(gaugedesk_env::var("SQLITE_SYNCHRONOUS").as_deref());
+        let journal = journal_mode(gaugedesk_env::var("SQLITE_JOURNAL_MODE").as_deref());
         conn.busy_timeout(Duration::from_secs(30))?;
         conn.execute_batch(&format!(
             "PRAGMA journal_mode={journal}; PRAGMA synchronous={sync};"
@@ -455,7 +449,7 @@ impl Store {
     }
 
     /// The `synchronous` durability level (`SCALE-5`): the desktop default is **NORMAL**;
-    /// `GAUGEWRIGHT_SQLITE_SYNCHRONOUS=FULL` (case-insensitive) opts into fsync-per-commit
+    /// `GAUGEDESK_SQLITE_SYNCHRONOUS=FULL` (case-insensitive) opts into fsync-per-commit
     /// for a hosted data plane. Any other/absent value → `NORMAL`. The current level is
     /// readable via [`synchronous`](Self::synchronous).
     pub fn synchronous(&self) -> Result<i64, rusqlite::Error> {
@@ -1632,14 +1626,14 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gaugewright_core::managed_machine_execution::{
+    use gaugedesk_core::managed_machine_execution::{
         ExecutionCapability, ExecutionPhase, ExecutionProfile, ExecutionRequest,
         ExecutionResourceBounds, ManagedExecutionCommand, ManagedExecutionState,
         WorkspaceAuthorization,
     };
-    use gaugewright_core::resource_export::{ExportCommand, ExportPhase, ExportState};
-    use gaugewright_core::review::{ReviewCommand, ReviewPhase, ReviewState};
-    use gaugewright_core::run::{RunCommand::*, RunPhase, RunState};
+    use gaugedesk_core::resource_export::{ExportCommand, ExportPhase, ExportState};
+    use gaugedesk_core::review::{ReviewCommand, ReviewPhase, ReviewState};
+    use gaugedesk_core::run::{RunCommand::*, RunPhase, RunState};
     use std::collections::BTreeSet;
 
     #[test]

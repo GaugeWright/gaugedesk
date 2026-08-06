@@ -1147,7 +1147,7 @@ name = "gaugedesk-mobile"
 version = "0.4.3"
 dependencies = [
  "base64 0.22.1",
- "gaugewright-relay-transport",
+ "gaugedesk-relay-transport",
  "hex",
  "serde",
  "serde_json",
@@ -1161,7 +1161,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gaugewright-relay-transport"
+name = "gaugedesk-relay-transport"
 version = "0.4.3"
 dependencies = [
  "base64 0.22.1",

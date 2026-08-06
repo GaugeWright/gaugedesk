@@ -9,8 +9,8 @@
 //! composition without a fold (the solo desktop, a private Home) gets a login
 //! with no membership consequences — exactly the consumer contract.
 
-use gaugewright_app::org::{MembershipRecord, MembershipStatus, Org, RecordOp, ORG_ID};
-use gaugewright_app::Workbench;
+use gaugedesk_app::org::{MembershipRecord, MembershipStatus, Org, RecordOp, ORG_ID};
+use gaugedesk_app::Workbench;
 
 use crate::auth_oidc::LoginFold;
 
@@ -71,7 +71,7 @@ pub fn jit_provision(wb: &mut Workbench, scope: &str, authority: &str, id_token:
         team: None,
     };
     crate::org_routes::write_membership(wb, scope, &record);
-    gaugewright_app::audit::record_in(wb, scope, authority, "member.jit-provision", authority);
+    gaugedesk_app::audit::record_in(wb, scope, authority, "member.jit-provision", authority);
     true
 }
 
@@ -90,8 +90,8 @@ mod tests {
 
     #[test]
     fn jit_provisions_a_verified_domain_subject_and_skips_others() {
-        use gaugewright_app::org::{Org, OrgRecord, ORG_ID, ORG_SCOPE};
-        let store = gaugewright_store::Store::open_in_memory().unwrap();
+        use gaugedesk_app::org::{Org, OrgRecord, ORG_ID, ORG_SCOPE};
+        let store = gaugedesk_store::Store::open_in_memory().unwrap();
         let mut wb = Workbench::new(store);
         // Seed an org with a verified domain (the JIT basis).
         let org_rec = OrgRecord {

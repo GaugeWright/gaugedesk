@@ -46,17 +46,17 @@ fn main() {
         .setup(|app| {
             // Spawn-vs-connect (DEPLOY-5): the **solo** shell spawns a co-resident control
             // plane; an **enterprise** deployment that names an org control plane
-            // (`GAUGEWRIGHT_ORG_CP`) skips the spawn — the webview connects to that org CP
+            // (`GAUGEDESK_ORG_CP`) skips the spawn — the webview connects to that org CP
             // through its own DEPLOY-5 seam (the persisted endpoint / `?cp=`). One shell,
             // two runtime configs.
             // ENTSEC-8 (ADR 0065) fail-loud guard: an enterprise/thin install pins
-            // `GAUGEWRIGHT_REQUIRE_ORG_CP=1`. If it is set but no org CP is configured, refuse to
+            // `GAUGEDESK_REQUIRE_ORG_CP=1`. If it is set but no org CP is configured, refuse to
             // silently fall back to spawning a co-resident on-disk store (which would write the
             // client's data — db, workspaces, transcripts — onto the consultant's unmanaged
             // endpoint, the exact leak thin mode exists to prevent). Hard-exit with a clear
             // operator message instead of degrading open.
-            let org_cp = std::env::var("GAUGEWRIGHT_ORG_CP").ok();
-            let require_org_cp = std::env::var("GAUGEWRIGHT_REQUIRE_ORG_CP").as_deref() == Ok("1");
+            let org_cp = gaugedesk_env::var("ORG_CP");
+            let require_org_cp = gaugedesk_env::var("REQUIRE_ORG_CP").as_deref() == Some("1");
             let decision =
                 cp_launch_decision(org_cp.as_deref(), require_org_cp).unwrap_or_else(|msg| {
                     eprintln!("[gaugewright] FATAL: {msg}");
@@ -74,7 +74,7 @@ fn main() {
                             .build()
                             .expect("tokio runtime");
                         rt.block_on(async move {
-                            if let Err(e) = gaugewright_app::open_api::open_serve(bind, &root).await
+                            if let Err(e) = gaugedesk_app::open_api::open_serve(bind, &root).await
                             {
                                 eprintln!("control plane exited: {e}");
                             }
@@ -128,15 +128,15 @@ fn main() {
 }
 
 fn open_control_plane_root() -> std::path::PathBuf {
-    // Delegate to the workspace resolver (GAUGEWRIGHT_ROOT → OS app-data dir →
+    // Delegate to the workspace resolver (GAUGEDESK_ROOT → OS app-data dir →
     // `./.gaugewright`), which is the unit-tested source of truth. src-tauri sits
     // outside the cargo workspace, so this thin wrapper is not cargo-tested.
-    gaugewright_app::open_api::open_control_plane_root()
+    gaugedesk_app::open_api::open_control_plane_root()
 }
 
 /// The co-resident control-plane bind address, or `None` when the shell should **not** spawn
 /// one (DEPLOY-5). Solo → `Some(127.0.0.1:7878)`; an enterprise deployment that names an org
-/// control plane (a non-empty `GAUGEWRIGHT_ORG_CP`) → `None`, so the webview connects to that
+/// control plane (a non-empty `GAUGEDESK_ORG_CP`) → `None`, so the webview connects to that
 /// org CP instead. Pure in its input, so the spawn-vs-connect decision is unit-testable.
 fn local_cp_bind(org_cp: Option<&str>) -> Option<&'static str> {
     match org_cp {
@@ -146,9 +146,9 @@ fn local_cp_bind(org_cp: Option<&str>) -> Option<&'static str> {
 }
 
 /// The spawn-vs-connect decision with the `ENTSEC-8` fail-loud guard. Normally this is just
-/// [`local_cp_bind`]: solo spawns a local CP, an enterprise install (a named `GAUGEWRIGHT_ORG_CP`)
+/// [`local_cp_bind`]: solo spawns a local CP, an enterprise install (a named `GAUGEDESK_ORG_CP`)
 /// connects to it. But when the install is **pinned to thin/enterprise** mode
-/// (`require_org_cp`, from `GAUGEWRIGHT_REQUIRE_ORG_CP=1`) and no org CP is configured, this
+/// (`require_org_cp`, from `GAUGEDESK_REQUIRE_ORG_CP=1`) and no org CP is configured, this
 /// returns `Err` rather than silently spawning a co-resident on-disk store — so a misconfigured
 /// launch fails loudly instead of leaking the client's data onto the consultant's endpoint. Pure
 /// in its inputs, so the guard is unit-testable without env/Tauri.
@@ -159,9 +159,9 @@ fn cp_launch_decision(
     let thin = matches!(org_cp, Some(s) if !s.trim().is_empty());
     if require_org_cp && !thin {
         return Err(
-            "GAUGEWRIGHT_REQUIRE_ORG_CP=1 but GAUGEWRIGHT_ORG_CP is unset/empty — refusing to spawn \
-             a local on-disk store (thin-client mode was required). Set GAUGEWRIGHT_ORG_CP to the \
-             org control plane, or unset GAUGEWRIGHT_REQUIRE_ORG_CP to run solo."
+            "GAUGEDESK_REQUIRE_ORG_CP=1 but GAUGEDESK_ORG_CP is unset/empty — refusing to spawn \
+             a local on-disk store (thin-client mode was required). Set GAUGEDESK_ORG_CP to the \
+             org control plane, or unset GAUGEDESK_REQUIRE_ORG_CP to run solo."
                 .to_string(),
         );
     }
@@ -171,7 +171,7 @@ fn cp_launch_decision(
 /// The webview **init script** that seeds the enrolled org control-plane endpoint (DEPLOY-5):
 /// it persists `org_cp` under the `gw.cp` localStorage key the web client's
 /// `resolveControlPlaneBase` reads, so the enterprise webview connects to the org CP. `None`
-/// for solo (no/empty `GAUGEWRIGHT_ORG_CP`), so the solo path injects nothing. The URL is
+/// for solo (no/empty `GAUGEDESK_ORG_CP`), so the solo path injects nothing. The URL is
 /// JSON-escaped, so an operator-configured endpoint cannot break out of the string. Pure in its
 /// input → the produced script (and the key it writes) is unit-testable without a window.
 fn webview_org_cp_script(org_cp: Option<&str>) -> Option<String> {
@@ -241,7 +241,7 @@ mod tests {
         // ENTSEC-8: pinned-thin install + no org CP → refuse, do NOT fall back to a local store.
         let err = cp_launch_decision(None, true).unwrap_err();
         assert!(
-            err.contains("GAUGEWRIGHT_ORG_CP"),
+            err.contains("GAUGEDESK_ORG_CP"),
             "names the missing var: {err}"
         );
         assert!(cp_launch_decision(Some(""), true).is_err());

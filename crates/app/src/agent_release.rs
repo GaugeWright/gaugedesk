@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gaugewright_core::agent_release::{
+use gaugedesk_core::agent_release::{
     AgentRelease, CapabilityManifest, CollectionPolicy, HostPolicyClosure, PackageClosure,
     PanelManifest, PersonaClosure, ProviderPolicy, ReleaseFile, RetentionPolicy,
     RuntimeCompatibility, SignedAgentRelease, AGENT_RELEASE_MEDIA_TYPE, AGENT_RELEASE_SCHEMA,
@@ -438,7 +438,7 @@ struct PackageManifestPaths {
 /// covered both.
 pub struct PublisherCredential {
     authority: String,
-    signing_key: gaugewright_core::signature::SigningKey,
+    signing_key: gaugedesk_core::signature::SigningKey,
 }
 
 impl PublisherCredential {
@@ -483,8 +483,8 @@ impl Workbench {
         })
     }
 
-    fn public_publisher_signing_key(&self) -> io::Result<gaugewright_core::signature::SigningKey> {
-        let authority = gaugewright_core::ids::AuthorityId::new(format!(
+    fn public_publisher_signing_key(&self) -> io::Result<gaugedesk_core::signature::SigningKey> {
+        let authority = gaugedesk_core::ids::AuthorityId::new(format!(
             "{}{PUBLIC_PUBLISHER_KEY_SUFFIX}",
             self.authority().as_str(),
         ));
@@ -538,7 +538,7 @@ impl Workbench {
         let package_root =
             published_package_root(&self.targets_dir(), &target.id, instance.version);
         let package =
-            gaugewright_whip_runtime::AuthoredAgentPackage::load(&package_root).map_err(invalid)?;
+            gaugedesk_whip_runtime::AuthoredAgentPackage::load(&package_root).map_err(invalid)?;
         if package.version_ref() != version.package_ref {
             return Err(invalid(
                 "published package bytes do not match the selected version",
@@ -606,24 +606,24 @@ impl Workbench {
         ];
         let required = package_abilities;
         let signing_key = self.public_publisher_signing_key()?;
-        let policy_principal = gaugewright_whip_runtime::ResourcePolicy {
+        let policy_principal = gaugedesk_whip_runtime::ResourcePolicy {
             reader: BTreeSet::from(["audience".to_owned()]),
             writer: BTreeSet::from(["audience".to_owned()]),
             principal: true,
             internal: false,
         };
-        let host_policy = gaugewright_whip_runtime::HostGovernancePolicy {
+        let host_policy = gaugedesk_whip_runtime::HostGovernancePolicy {
             resources: BTreeMap::from([
                 (
                     "file:public-session:workspace".to_owned(),
-                    gaugewright_whip_runtime::ResourcePolicy {
+                    gaugedesk_whip_runtime::ResourcePolicy {
                         principal: false,
                         ..policy_principal.clone()
                     },
                 ),
                 (
                     "memory:public-session:turn-images".to_owned(),
-                    gaugewright_whip_runtime::ResourcePolicy {
+                    gaugedesk_whip_runtime::ResourcePolicy {
                         principal: false,
                         ..policy_principal.clone()
                     },
@@ -659,7 +659,7 @@ impl Workbench {
             capabilities: required.clone(),
             provider_bindings: BTreeMap::from([(
                 "model".to_owned(),
-                gaugewright_whip_runtime::ProviderBindingPolicy {
+                gaugedesk_whip_runtime::ProviderBindingPolicy {
                     provider: spec.provider.provider.clone(),
                     model: spec.provider.model.clone(),
                     base_url: spec.provider.base_url.clone(),
@@ -668,15 +668,15 @@ impl Workbench {
             )]),
             placements: BTreeMap::from([(
                 "public-do".to_owned(),
-                gaugewright_whip_runtime::WhipplePlacementPolicy {
+                gaugedesk_whip_runtime::WhipplePlacementPolicy {
                     kind: "do".to_owned(),
                     provider_bindings: BTreeSet::from(["model".to_owned()]),
                     command_network: false,
                 },
             )]),
-            ..gaugewright_whip_runtime::HostGovernancePolicy::default()
+            ..gaugedesk_whip_runtime::HostGovernancePolicy::default()
         };
-        let signed_host_policy = gaugewright_whip_runtime::sign_policy_envelope(
+        let signed_host_policy = gaugedesk_whip_runtime::sign_policy_envelope(
             &host_policy.to_json().map_err(invalid)?,
             self.authority(),
             &signing_key,
@@ -857,7 +857,7 @@ impl Workbench {
                 panels: PanelManifest {
                     components: request.panel_ceiling.clone(),
                     default_component: default_panel,
-                    attribution: gaugewright_core::agent_release::AttributionPolicy::GaugeWright,
+                    attribution: gaugedesk_core::agent_release::AttributionPolicy::GaugeWright,
                 },
                 // A managed-funded release is built for the metered gateway, and
                 // that is what makes it eligible to be paid from GaugeWright's
@@ -1691,7 +1691,7 @@ pub fn validate_deployment_id(value: &str) -> io::Result<()> {
 
 fn sign_publisher_command(
     authority: &str,
-    signing_key: &gaugewright_core::signature::SigningKey,
+    signing_key: &gaugedesk_core::signature::SigningKey,
     method: &str,
     path_and_query: &str,
     body: &[u8],
@@ -1728,7 +1728,7 @@ fn not_found(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod publisher_tests {
     use super::*;
-    use gaugewright_core::signature::{verify_signature, Signature, SigningKey};
+    use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
 
     #[test]
     fn reservation_is_an_internal_estimate_not_a_turn_limit() {

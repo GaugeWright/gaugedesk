@@ -1,29 +1,29 @@
 //! The one harness decision point (SUB-0, ADR 0071 §3): which
 //! [`HarnessFactory`] drives a turn. Everything else in the engine is
 //! adapter-blind — it resolves the turn's *policy* into a
-//! [`HarnessSpec`](gaugewright_harness::HarnessSpec) and lets the selected
+//! [`HarnessSpec`](gaugedesk_harness::HarnessSpec) and lets the selected
 //! factory construct the runtime.
 
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use gaugewright_harness::testing::{ScriptedHarness, ScriptedToolCall, ScriptedTurn};
-use gaugewright_harness::{CredentialProbe, Harness, HarnessFactory, HarnessSpec, Observation};
-use gaugewright_whip_runtime::WhipHarnessFactory;
+use gaugedesk_harness::testing::{ScriptedHarness, ScriptedToolCall, ScriptedTurn};
+use gaugedesk_harness::{CredentialProbe, Harness, HarnessFactory, HarnessSpec, Observation};
+use gaugedesk_whip_runtime::WhipHarnessFactory;
 
 /// Select the factory for ONE turn. Consulted per turn, never cached at
-/// startup: tests flip `GAUGEWRIGHT_FAKE_AGENT` against a live workbench. The
+/// startup: tests flip `GAUGEDESK_FAKE_AGENT` against a live workbench. The
 /// fake stays deterministic; every real local turn targets WhippleScript.
 pub fn factory_for_turn(whip: WhipHarnessFactory) -> Arc<dyn HarnessFactory> {
-    if std::env::var("GAUGEWRIGHT_FAKE_AGENT").is_ok() {
+    if gaugedesk_env::var("FAKE_AGENT").is_some() {
         Arc::new(ScriptedFakeFactory)
     } else {
         Arc::new(whip)
     }
 }
 
-/// The mock-LLM adapter (`GAUGEWRIGHT_FAKE_AGENT`): no runtime, no model call.
+/// The mock-LLM adapter (`GAUGEDESK_FAKE_AGENT`): no runtime, no model call.
 /// A fresh neutral [`ScriptedHarness`] projects deterministic observations and
 /// tool calls through the real membrane every turn. No WhippleScript runtime or
 /// provider credential participates in the fake path (SUB-1).
@@ -94,7 +94,7 @@ impl HarnessFactory for ScriptedFakeFactory {
     fn credential_status(
         &self,
         _provider: &str,
-        _capability: Option<&dyn gaugewright_harness::CredentialCapability>,
+        _capability: Option<&dyn gaugedesk_harness::CredentialCapability>,
     ) -> CredentialProbe {
         CredentialProbe::Ready
     }
@@ -128,11 +128,11 @@ fn fake_turn() -> ScriptedTurn {
                 ok: true,
             },
         ],
-        runtime_start_position: Some(gaugewright_harness::RuntimePosition {
+        runtime_start_position: Some(gaugedesk_harness::RuntimePosition {
             instance_ref: "scripted-fake".into(),
             sequence: 0,
         }),
-        runtime_terminal_position: Some(gaugewright_harness::RuntimePosition {
+        runtime_terminal_position: Some(gaugedesk_harness::RuntimePosition {
             instance_ref: "scripted-fake".into(),
             sequence: 1,
         }),

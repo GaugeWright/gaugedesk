@@ -10,7 +10,7 @@
 # See specs/implementation/backend-stack.md and mvp-plan.md.
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/tracker", "crates/whip-runtime", "crates/relay-transport", "crates/directory-protocol", "crates/app", "ee/app"]
+members = ["crates/env", "crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/tracker", "crates/whip-runtime", "crates/relay-transport", "crates/directory-protocol", "crates/app", "ee/app"]
 # The Tauri desktop shell is its own workspace (needs system webkit/CLI to build);
 # excluded so `cargo test` over the backend stays self-contained.
 exclude = ["src-tauri"]

@@ -7,7 +7,7 @@
  * threaded between the turns that produced it — the carousel has no second shelf.
  *
  * The vocabulary is the one the rest of the client already speaks — the review
- * {@link ReviewPhase} (`control-plane.ts`, mirroring `gaugewright_core::review`). A card
+ * {@link ReviewPhase} (`control-plane.ts`, mirroring `gaugedesk_core::review`). A card
  * walks the same arc the core reducer walks server-side: `Init` (nothing to
  * approve) → an agent proposes → `Proposed` (the required parties must each
  * consent) → every required party consents → `Cleared` → the user releases →

@@ -1,5 +1,5 @@
 [package]
-name = "gaugewright-app"
+name = "gaugedesk-app"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -10,25 +10,26 @@ default = [
   "federation-protocol",
 ]
 # Transitional repo-split feature band. The enterprise band extracted to the
-# `ee/app` crate (`gaugewright-ee`, SPLIT-1); federation is the only route
+# `ee/app` crate (`gaugedesk-ee`, SPLIT-1); federation is the only route
 # surface still gated by a feature in the open app crate.
 federation-protocol = []
 
 [dependencies]
-gaugewright-core = { path = "../core" }
-gaugewright-store = { path = "../store" }
-gaugewright-workspace = { path = "../workspace" }
-gaugewright-boundary = { path = "../boundary" }
-gaugewright-harness = { path = "../harness" }
+gaugedesk-env = { path = "../env" }
+gaugedesk-core = { path = "../core" }
+gaugedesk-store = { path = "../store" }
+gaugedesk-workspace = { path = "../workspace" }
+gaugedesk-boundary = { path = "../boundary" }
+gaugedesk-harness = { path = "../harness" }
 # The per-boundary WhippleScript tracker runtime (ADR 0075): embeds whip's
 # RuntimeKernel + WorkItemStore for the onboarding/issue surface projected into
 # the task bar.
-gaugewright-tracker = { path = "../tracker" }
+gaugedesk-tracker = { path = "../tracker" }
 # Permanent GaugeDesk↔WhippleScript policy/runtime boundary (ADR 0080). This is
 # distinct from the transitional Harness/EgressGate adapter.
-gaugewright-whip-runtime = { path = "../whip-runtime" }
-gaugewright-relay-transport = { path = "../relay-transport" }
-gaugewright-directory-protocol = { path = "../directory-protocol" }
+gaugedesk-whip-runtime = { path = "../whip-runtime" }
+gaugedesk-relay-transport = { path = "../relay-transport" }
+gaugedesk-directory-protocol = { path = "../directory-protocol" }
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }
@@ -76,8 +77,8 @@ tempfile = "3"
 whipplescript-store = { version = "0.4.1" }
 
 [dev-dependencies]
-gaugewright-pi-bridge = { path = "../pi-bridge" }
-gaugewright-relay-transport = { path = "../relay-transport", features = ["test-relay"] }
+gaugedesk-pi-bridge = { path = "../pi-bridge" }
+gaugedesk-relay-transport = { path = "../relay-transport", features = ["test-relay"] }
 # Compiles the shipped gate program in tests. A gate we ship but never parse is
 # the same class of bug as a sealing construction nobody cross-checked: it looks
 # fine until it runs. Dev-only — nothing at runtime depends on the parser.

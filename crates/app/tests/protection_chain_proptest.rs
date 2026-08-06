@@ -2,7 +2,7 @@
 //! (context grant → run/observe → engagement-scoped taint → review/export
 //! consent) holds over **random interleavings**, end-to-end through the Store.
 //!
-//! The per-reducer proptests in `gaugewright-core` prove each lifecycle in isolation;
+//! The per-reducer proptests in `gaugedesk-core` prove each lifecycle in isolation;
 //! this drives the *integration glue* the app layer adds and that no single
 //! reducer can see:
 //! - reads recorded durably per turn and the output's stakeholders derived from
@@ -19,12 +19,12 @@ use std::collections::BTreeSet;
 
 use proptest::prelude::*;
 
-use gaugewright_app::resource_store;
-use gaugewright_core::resource_export::{ExportCommand, ExportPhase, ExportState};
-use gaugewright_core::review::{ReviewCommand, ReviewPhase, ReviewState};
-use gaugewright_core::run::{RunCommand, RunState};
-use gaugewright_core::Lifecycle;
-use gaugewright_store::{AdmitError, Store};
+use gaugedesk_app::resource_store;
+use gaugedesk_core::resource_export::{ExportCommand, ExportPhase, ExportState};
+use gaugedesk_core::review::{ReviewCommand, ReviewPhase, ReviewState};
+use gaugedesk_core::run::{RunCommand, RunState};
+use gaugedesk_core::Lifecycle;
+use gaugedesk_store::{AdmitError, Store};
 
 const ENG: &str = "eng-chain";
 const OWNER: &str = "local-user";

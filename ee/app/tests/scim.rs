@@ -13,11 +13,11 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use gaugewright_app::org::{tenant_scope, MembershipRecord, MembershipStatus, RecordOp, ORG_ID};
-use gaugewright_app::Workbench;
-use gaugewright_ee::org_routes::enterprise_control_plane;
-use gaugewright_store::Store;
-use gaugewright_workspace::Instance;
+use gaugedesk_app::org::{tenant_scope, MembershipRecord, MembershipStatus, RecordOp, ORG_ID};
+use gaugedesk_app::Workbench;
+use gaugedesk_ee::org_routes::enterprise_control_plane;
+use gaugedesk_store::Store;
+use gaugedesk_workspace::Instance;
 
 mod support;
 use support::{administration_command, administration_document};

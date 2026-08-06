@@ -1,5 +1,5 @@
 [package]
-name = "gaugewright-tracker"
+name = "gaugedesk-tracker"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

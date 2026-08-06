@@ -36,8 +36,8 @@ use jsonwebtoken::decode_header;
 use serde::Deserialize;
 use serde_json::json;
 
-use gaugewright_core::abac::AuthorityAttributes;
-use gaugewright_core::ids::AuthorityId;
+use gaugedesk_core::abac::AuthorityAttributes;
+use gaugedesk_core::ids::AuthorityId;
 
 use crate::identity::IdentityProvider;
 use crate::identity_oidc::{
@@ -288,7 +288,7 @@ pub fn start_login(
     // consent screen so a refresh token is re-issued even for an already-granted account — the hub
     // sets it; enterprise SSO leaves it off (seamless SSO). Standard OAuth ignores unknown params.
     let mut extra = String::from("&access_type=offline");
-    if std::env::var("GAUGEWRIGHT_OIDC_PROMPT_CONSENT").as_deref() == Ok("1") {
+    if gaugedesk_env::var("OIDC_PROMPT_CONSENT").as_deref() == Some("1") {
         extra.push_str("&prompt=consent");
     }
     let url = authorize_url(
@@ -373,7 +373,7 @@ pub fn finish_callback(
 
 /// How id-token claims map onto ABAC attributes for a connection (`ID-3`). The home
 /// is the SSO connection record (`/admin/sso`); each field falls back to its
-/// `GAUGEWRIGHT_OIDC_*_CLAIM` env knob (the legacy operator path) and then to unmapped
+/// `GAUGEDESK_OIDC_*_CLAIM` env knob (the legacy operator path) and then to unmapped
 /// (fail-closed: no attribute is safer than a wrong one). The subject defaults to `sub`.
 /// RBAC console gating reads the member's role from the org directory, not the token —
 /// so this only feeds the *attribute* path (roles/region/tenant the ABAC evaluator reads).
@@ -384,20 +384,20 @@ pub fn claim_mapping_for(sso: &SsoConnectionRecord) -> ClaimMapping {
         subject_claim: m
             .subject_claim
             .clone()
-            .or_else(|| env_opt("GAUGEWRIGHT_OIDC_SUBJECT_CLAIM"))
+            .or_else(|| env_opt("GAUGEDESK_OIDC_SUBJECT_CLAIM"))
             .unwrap_or_else(|| "sub".to_string()),
         roles_claim: m
             .roles_claim
             .clone()
-            .or_else(|| env_opt("GAUGEWRIGHT_OIDC_ROLES_CLAIM")),
+            .or_else(|| env_opt("GAUGEDESK_OIDC_ROLES_CLAIM")),
         region_claim: m
             .region_claim
             .clone()
-            .or_else(|| env_opt("GAUGEWRIGHT_OIDC_REGION_CLAIM")),
+            .or_else(|| env_opt("GAUGEDESK_OIDC_REGION_CLAIM")),
         tenant_claim: m
             .tenant_claim
             .clone()
-            .or_else(|| env_opt("GAUGEWRIGHT_OIDC_TENANT_CLAIM")),
+            .or_else(|| env_opt("GAUGEDESK_OIDC_TENANT_CLAIM")),
     }
 }
 
@@ -694,9 +694,9 @@ pub async fn activate_updated_idp(
 /// Whether this deployment is the **hosted web account** (`ADR 0077`): a successful login
 /// provisions the person their own account (a personal tenant-of-one), rather than only
 /// reconciling them into an enterprise org directory. Off by default — the enterprise SSO and
-/// desktop paths are unchanged; the hosted control-plane hub sets `GAUGEWRIGHT_WEB_ACCOUNT=1`.
+/// desktop paths are unchanged; the hosted control-plane hub sets `GAUGEDESK_WEB_ACCOUNT=1`.
 pub fn web_account_mode() -> bool {
-    std::env::var("GAUGEWRIGHT_WEB_ACCOUNT")
+    gaugedesk_env::var("WEB_ACCOUNT")
         .map(|v| v == "1")
         .unwrap_or(false)
 }
@@ -744,18 +744,15 @@ fn resolve_refresh_token(wb: &Workbench, person: &str) -> Option<String> {
 }
 
 /// A Google (or any OIDC) SSO connection for the hosted web account, from env — so the hub
-/// offers "Continue with Google" without a manual `/admin/sso` POST. `GAUGEWRIGHT_GOOGLE_CLIENT_ID`
+/// offers "Continue with Google" without a manual `/admin/sso` POST. `GAUGEDESK_GOOGLE_CLIENT_ID`
 /// is the OAuth client id (the id-token `aud`); the issuer defaults to Google's, overridable via
-/// `GAUGEWRIGHT_OIDC_ISSUER`. `None` unless web-account mode with a client id configured.
+/// `GAUGEDESK_OIDC_ISSUER`. `None` unless web-account mode with a client id configured.
 pub fn web_account_sso_from_env() -> Option<SsoConnectionRecord> {
     if !web_account_mode() {
         return None;
     }
-    let client_id = std::env::var("GAUGEWRIGHT_GOOGLE_CLIENT_ID")
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
-    let issuer = std::env::var("GAUGEWRIGHT_OIDC_ISSUER")
-        .ok()
+    let client_id = gaugedesk_env::var("GOOGLE_CLIENT_ID").filter(|s| !s.trim().is_empty())?;
+    let issuer = gaugedesk_env::var("OIDC_ISSUER")
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "https://accounts.google.com".to_string());
     Some(google_sso(&issuer, &client_id))
@@ -859,29 +856,28 @@ pub fn expired_session_cookie_value(domain: Option<&str>, secure: bool) -> Strin
     c
 }
 
-/// The OAuth **client secret** for a confidential OP (Google), from `GAUGEWRIGHT_GOOGLE_CLIENT_SECRET`.
+/// The OAuth **client secret** for a confidential OP (Google), from `GAUGEDESK_GOOGLE_CLIENT_SECRET`.
 /// `None` when unset — a public PKCE client (Okta/Entra) needs no secret at exchange.
 fn google_client_secret_from_env() -> Option<crate::secret::Secret> {
-    std::env::var("GAUGEWRIGHT_GOOGLE_CLIENT_SECRET")
-        .ok()
+    gaugedesk_env::var("GOOGLE_CLIENT_SECRET")
         .filter(|s| !s.trim().is_empty())
         .map(Into::into)
 }
 
-/// The `Set-Cookie` value for the login session, from env: `GAUGEWRIGHT_SESSION_COOKIE_DOMAIN`
-/// (e.g. `.gaugewright.com`; unset ⇒ host-only, for loopback) and `GAUGEWRIGHT_SESSION_COOKIE_INSECURE=1`
+/// The `Set-Cookie` value for the login session, from env: `GAUGEDESK_SESSION_COOKIE_DOMAIN`
+/// (e.g. `.gaugewright.com`; unset ⇒ host-only, for loopback) and `GAUGEDESK_SESSION_COOKIE_INSECURE=1`
 /// (dev-only, drops `Secure` so the cookie works over http loopback).
 fn session_cookie_header(id_token: &str) -> String {
-    let domain = std::env::var("GAUGEWRIGHT_SESSION_COOKIE_DOMAIN").ok();
-    let insecure = std::env::var("GAUGEWRIGHT_SESSION_COOKIE_INSECURE")
+    let domain = gaugedesk_env::var("SESSION_COOKIE_DOMAIN");
+    let insecure = gaugedesk_env::var("SESSION_COOKIE_INSECURE")
         .map(|v| v == "1")
         .unwrap_or(false);
     session_cookie_value(id_token, domain.as_deref(), !insecure)
 }
 
 fn expired_session_cookie_header() -> String {
-    let domain = std::env::var("GAUGEWRIGHT_SESSION_COOKIE_DOMAIN").ok();
-    let insecure = std::env::var("GAUGEWRIGHT_SESSION_COOKIE_INSECURE")
+    let domain = gaugedesk_env::var("SESSION_COOKIE_DOMAIN");
+    let insecure = gaugedesk_env::var("SESSION_COOKIE_INSECURE")
         .map(|v| v == "1")
         .unwrap_or(false);
     expired_session_cookie_value(domain.as_deref(), !insecure)
@@ -890,10 +886,10 @@ fn expired_session_cookie_header() -> String {
 // ---- axum handlers -------------------------------------------------------
 
 /// The `redirect_uri` this control plane registers with the OP. An explicit
-/// `GAUGEWRIGHT_OIDC_REDIRECT_URI` wins (the value registered at the IdP); otherwise it
+/// `GAUGEDESK_OIDC_REDIRECT_URI` wins (the value registered at the IdP); otherwise it
 /// is derived from the request `Host` so a default loopback dev run works unconfigured.
 fn callback_redirect_uri(headers: &HeaderMap) -> String {
-    if let Ok(uri) = std::env::var("GAUGEWRIGHT_OIDC_REDIRECT_URI") {
+    if let Some(uri) = gaugedesk_env::var("OIDC_REDIRECT_URI") {
         if !uri.trim().is_empty() {
             return uri;
         }
@@ -959,8 +955,8 @@ pub async fn get_login(
     };
 
     let redirect_uri = callback_redirect_uri(&headers);
-    let scope = std::env::var("GAUGEWRIGHT_OIDC_SCOPE")
-        .unwrap_or_else(|_| "openid profile email".to_string());
+    let scope =
+        gaugedesk_env::var("OIDC_SCOPE").unwrap_or_else(|| "openid profile email".to_string());
     // The claim mapping comes from the connection record (env-fallback) — the same
     // resolution the durable verifier uses, so the shell and `wb.idp` agree (`ID-3`).
     let mapping = claim_mapping_for(&sso);
@@ -1167,8 +1163,7 @@ pub async fn get_callback(
     // (unlike a header) rides SSE + top-level navigations. Redirect to the Console; the token never
     // touches the URL.
     if web_account_mode() {
-        let post_login = std::env::var("GAUGEWRIGHT_OIDC_POST_LOGIN_URL")
-            .ok()
+        let post_login = gaugedesk_env::var("OIDC_POST_LOGIN_URL")
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| "/".to_string());
         let mut resp = Redirect::to(&post_login).into_response();
@@ -1182,7 +1177,7 @@ pub async fn get_callback(
     // Enterprise / programmatic clients: deliver the bearer. With a configured client URL, 302
     // there with the token in the URL *fragment* (not a query param — fragments are never sent to
     // servers, so the token stays out of access logs / `Referer`); otherwise return JSON.
-    if let Ok(url) = std::env::var("GAUGEWRIGHT_OIDC_POST_LOGIN_URL") {
+    if let Some(url) = gaugedesk_env::var("OIDC_POST_LOGIN_URL") {
         if !url.trim().is_empty() {
             // A JWT is base64url + `.` — all URL-fragment-safe, no escaping needed.
             let target = format!("{url}#id_token={id_token}&token_type=Bearer");
@@ -1690,7 +1685,7 @@ iqlTEKVISscuchxZtKQJ4k8=
     #[test]
     fn claim_mapping_prefers_the_record_and_defaults_the_subject() {
         // The record is the home (ID-3): its claim names win, and the subject defaults
-        // to `sub` when unset — independent of any GAUGEWRIGHT_OIDC_*_CLAIM env fallback.
+        // to `sub` when unset — independent of any GAUGEDESK_OIDC_*_CLAIM env fallback.
         let mut sso = oidc_sso();
         sso.claim_mapping = crate::org::SsoClaimMapping {
             roles_claim: Some("groups".into()),
@@ -1706,7 +1701,7 @@ iqlTEKVISscuchxZtKQJ4k8=
     #[test]
     fn web_account_login_provisions_the_persons_personal_tenant() {
         use crate::tenancy::{personal_tenant_id, Tenancy};
-        let store = gaugewright_store::Store::open_in_memory().unwrap();
+        let store = gaugedesk_store::Store::open_in_memory().unwrap();
         let mut wb = Workbench::new(store);
         let person = "google-sub-123";
 

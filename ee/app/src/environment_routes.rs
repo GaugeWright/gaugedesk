@@ -11,27 +11,27 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use gaugewright_app::environment_agent::{
+use gaugedesk_app::environment_agent::{
     append_environment_agent_exchange, environment_agent_transcript, run_environment_agent_turn,
     EnvironmentAgentContext, EnvironmentAgentDocument, EnvironmentAgentError,
 };
-use gaugewright_app::environment_contract::{
+use gaugedesk_app::environment_contract::{
     decide_environment_command, decide_reviewed_environment_command, environment_change_id,
     environment_receipt, environment_session_id, fold_environment_changes, AdmissionDisposition,
     EnvironmentChangeRecord, EnvironmentChangeStatus, EnvironmentClient,
     EnvironmentCommandEnvelope, EnvironmentCommandGrant, EnvironmentDocumentGrant, EnvironmentKind,
     EnvironmentScope, EnvironmentSession, ReviewPolicy, ENVIRONMENT_CHANGE_KIND,
 };
-use gaugewright_app::org::{
+use gaugedesk_app::org::{
     sha256_hex, ArchetypeApprovalPolicyRecord, BillingRecord, GroupMappingRecord,
     MemberGrantRecord, MembershipRecord, MembershipStatus, Org, OrgKind, OrgRecord,
     PlacementPolicyRecord, PolicyRecord, RecordOp, ScimTokenRecord, SecurityPolicyRecord,
     SoftwarePolicyRecord, SsoConnectionRecord, ORG_ID,
 };
-use gaugewright_app::{LockUnpoisoned, SharedWorkbench, Workbench};
-use gaugewright_core::abac::Policy;
-use gaugewright_core::rbac::Capability;
-use gaugewright_store::{AdmitError, CommandRecordFact};
+use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
+use gaugedesk_core::abac::Policy;
+use gaugedesk_core::rbac::Capability;
+use gaugedesk_store::{AdmitError, CommandRecordFact};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -497,7 +497,7 @@ fn project_document(
         "administration.software-policy" => json!(org.software_policy.unwrap_or_default()),
         "administration.clients" => json!({ "sessions": wb.session_roster() }),
         "administration.machines" => {
-            let workspace = gaugewright_app::library_routes::workspace_value(wb);
+            let workspace = gaugedesk_app::library_routes::workspace_value(wb);
             json!({ "homes": [{
                 "id": wb.home_id().as_str(), "kind": "local", "endpoint": "",
                 "state": "live", "repair_hint": Value::Null,
@@ -505,8 +505,8 @@ fn project_document(
             }] })
         }
         "administration.audit" => json!({
-            "integrity": gaugewright_app::audit::verify_in(wb.store_ref(), store_scope, Some(&wb.governance_public_key())),
-            "entries": gaugewright_app::audit::list_in(wb.store_ref(), store_scope),
+            "integrity": gaugedesk_app::audit::verify_in(wb.store_ref(), store_scope, Some(&wb.governance_public_key())),
+            "entries": gaugedesk_app::audit::list_in(wb.store_ref(), store_scope),
         }),
         "administration.billing" => {
             let included = org
@@ -514,7 +514,7 @@ fn project_document(
                 .as_ref()
                 .and_then(|billing| billing.managed_inference.as_ref())
                 .map_or(0, |plan| plan.included_tokens);
-            let usage = gaugewright_app::managed_inference::fold_usage(
+            let usage = gaugedesk_app::managed_inference::fold_usage(
                 wb.store_ref(),
                 store_scope,
                 included,
@@ -532,7 +532,7 @@ fn project_document(
             "sso": public_sso(org.sso.as_ref()),
             "security": org.security,
             "placement": org.effective_placement_policy(),
-            "audit_integrity": gaugewright_app::audit::verify_in(wb.store_ref(), store_scope, Some(&wb.governance_public_key())),
+            "audit_integrity": gaugedesk_app::audit::verify_in(wb.store_ref(), store_scope, Some(&wb.governance_public_key())),
         }),
         _ => Value::Null,
     };
@@ -937,11 +937,11 @@ fn command_policy(id: &str) -> Option<CommandPolicy> {
 }
 
 fn reject_environment(
-    error: gaugewright_app::environment_contract::EnvironmentRejection,
+    error: gaugedesk_app::environment_contract::EnvironmentRejection,
 ) -> Response {
     let status = if matches!(
         error,
-        gaugewright_app::environment_contract::EnvironmentRejection::StaleBase
+        gaugedesk_app::environment_contract::EnvironmentRejection::StaleBase
     ) {
         StatusCode::CONFLICT
     } else {
@@ -1032,7 +1032,7 @@ struct GrantPayload {
 struct PolicyPayload {
     resource: Policy,
     security: SecurityPolicyRecord,
-    placement: gaugewright_core::boundary_lifecycle::PlacementPolicy,
+    placement: gaugedesk_core::boundary_lifecycle::PlacementPolicy,
     archetype_approval: ArchetypeApprovalPolicyRecord,
 }
 
@@ -1146,8 +1146,7 @@ fn plan_command(
         }
         "member.invite" => {
             let value: InvitePayload = parse(&command.payload)?;
-            if !gaugewright_app::org::is_valid_role(&value.role)
-                || value.authority.trim().is_empty()
+            if !gaugedesk_app::org::is_valid_role(&value.role) || value.authority.trim().is_empty()
             {
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -1176,7 +1175,7 @@ fn plan_command(
         }
         "member.role.set" => {
             let value: MemberRolePayload = parse(&command.payload)?;
-            if !gaugewright_app::org::is_valid_role(&value.role) {
+            if !gaugedesk_app::org::is_valid_role(&value.role) {
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(json!({ "error": "unknown role" })),
@@ -1323,7 +1322,7 @@ fn plan_command(
         }
         "group-mapping.set" => {
             let value: crate::org_routes::GroupMappingBody = parse(&command.payload)?;
-            if !gaugewright_app::org::is_valid_role(&value.role) || value.group.trim().is_empty() {
+            if !gaugedesk_app::org::is_valid_role(&value.role) || value.group.trim().is_empty() {
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(json!({ "error": "group and a fixed role are required" })),
@@ -1382,7 +1381,7 @@ fn plan_command(
             }
         }
         "software-policy.update" => {
-            let mut policy: gaugewright_app::client_admission::SoftwarePolicy =
+            let mut policy: gaugedesk_app::client_admission::SoftwarePolicy =
                 parse(&command.payload)?;
             policy.minimum_version = policy.minimum_version.trim().to_owned();
             policy.allowed_channels = policy
@@ -1466,7 +1465,7 @@ fn snapshot(envelope: &EnvironmentCommandEnvelope) -> String {
 }
 
 fn idempotency(headers: &HeaderMap) -> Result<String, Response> {
-    gaugewright_app::command_idempotency::caller_idempotency_key(headers)
+    gaugedesk_app::command_idempotency::caller_idempotency_key(headers)
 }
 
 /// Return a previously committed exact command result before re-evaluating its
@@ -1489,7 +1488,7 @@ fn replayed_command_response(
     };
     if record.snapshot_json != snapshot(envelope) {
         return Err(store_error(AdmitError::Rejected(
-            gaugewright_core::Rejection {
+            gaugedesk_core::Rejection {
                 reason: "idempotency key reused with different command",
             },
         )));
@@ -1568,30 +1567,27 @@ async fn submit_command(
                 Ok(fact) => fact,
                 Err(response) => return response,
             };
-            let audit_link = gaugewright_app::audit::link(
+            let audit_link = gaugedesk_app::audit::link(
                 &session.actor,
                 "environment.change.proposed",
                 &change.id,
             );
             let store_scope = req_scope(&headers);
-            let audit_scope = gaugewright_app::audit::scope_for(&store_scope);
+            let audit_scope = gaugedesk_app::audit::scope_for(&store_scope);
             let result = match guard.store_mut().admit_record_facts_chained(
                 &command_scope(&headers),
                 &key,
                 &snapshot(&envelope),
                 &[change_fact],
-                Some(gaugewright_app::audit::chained_in(
-                    &audit_scope,
-                    &audit_link,
-                )),
+                Some(gaugedesk_app::audit::chained_in(&audit_scope, &audit_link)),
             ) {
                 Ok(result) => result,
                 Err(error) => return store_error(error),
             };
             if let Some(entry) =
-                gaugewright_app::audit::committed_entry(result.chained_payload.as_deref())
+                gaugedesk_app::audit::committed_entry(result.chained_payload.as_deref())
             {
-                gaugewright_app::audit::finish_committed_in(&mut guard, &store_scope, &entry);
+                gaugedesk_app::audit::finish_committed_in(&mut guard, &store_scope, &entry);
             }
             (StatusCode::OK, Json(json!({ "receipt": environment_receipt(&session, &envelope, &key, "proposed"), "change": change }))).into_response()
         }
@@ -1657,18 +1653,15 @@ fn apply_command(
     };
     facts.push(change_fact);
     let audit_link =
-        gaugewright_app::audit::link(&session.actor, plan.audit_action, &plan.audit_target);
+        gaugedesk_app::audit::link(&session.actor, plan.audit_action, &plan.audit_target);
     let store_scope = req_scope(headers);
-    let audit_scope = gaugewright_app::audit::scope_for(&store_scope);
+    let audit_scope = gaugedesk_app::audit::scope_for(&store_scope);
     let result = match wb.store_mut().admit_record_facts_chained(
         &command_scope(headers),
         key,
         &snapshot(envelope),
         &facts,
-        Some(gaugewright_app::audit::chained_in(
-            &audit_scope,
-            &audit_link,
-        )),
+        Some(gaugedesk_app::audit::chained_in(&audit_scope, &audit_link)),
     ) {
         Ok(result) => result,
         Err(error) => return (store_error(error), false),
@@ -1678,9 +1671,9 @@ fn apply_command(
             wb.notify_library_changed(kind, id, op);
         }
         if let Some(entry) =
-            gaugewright_app::audit::committed_entry(result.chained_payload.as_deref())
+            gaugedesk_app::audit::committed_entry(result.chained_payload.as_deref())
         {
-            gaugewright_app::audit::finish_committed_in(wb, &store_scope, &entry);
+            gaugedesk_app::audit::finish_committed_in(wb, &store_scope, &entry);
         }
     }
     let freshly_applied = !result.replayed;
@@ -1963,26 +1956,23 @@ async fn review_change(
             Err(response) => return response,
         };
         let audit_link =
-            gaugewright_app::audit::link(&session.actor, "environment.change.rejected", &id);
+            gaugedesk_app::audit::link(&session.actor, "environment.change.rejected", &id);
         let store_scope = req_scope(&headers);
-        let audit_scope = gaugewright_app::audit::scope_for(&store_scope);
+        let audit_scope = gaugedesk_app::audit::scope_for(&store_scope);
         let result = match guard.store_mut().admit_record_facts_chained(
             &command_scope(&headers),
             &key,
             &serde_json::to_string(&json!({ "change": id, "decision": "reject" })).unwrap(),
             &[change_fact],
-            Some(gaugewright_app::audit::chained_in(
-                &audit_scope,
-                &audit_link,
-            )),
+            Some(gaugedesk_app::audit::chained_in(&audit_scope, &audit_link)),
         ) {
             Ok(result) => result,
             Err(error) => return store_error(error),
         };
         if let Some(entry) =
-            gaugewright_app::audit::committed_entry(result.chained_payload.as_deref())
+            gaugedesk_app::audit::committed_entry(result.chained_payload.as_deref())
         {
-            gaugewright_app::audit::finish_committed_in(&mut guard, &store_scope, &entry);
+            gaugedesk_app::audit::finish_committed_in(&mut guard, &store_scope, &entry);
         }
         return (StatusCode::OK, Json(json!({ "receipt": environment_receipt(&session, &envelope, &key, "rejected"), "change": change }))).into_response();
     }
@@ -1996,7 +1986,7 @@ async fn review_change(
     if let Err(error) = decide_reviewed_environment_command(&session, &envelope) {
         if matches!(
             error,
-            gaugewright_app::environment_contract::EnvironmentRejection::StaleBase
+            gaugedesk_app::environment_contract::EnvironmentRejection::StaleBase
         ) {
             change.status = EnvironmentChangeStatus::Conflict;
             change.reviewed_by = Some(session.actor.clone());
@@ -2005,26 +1995,23 @@ async fn review_change(
                 Err(response) => return response,
             };
             let audit_link =
-                gaugewright_app::audit::link(&session.actor, "environment.change.conflict", &id);
+                gaugedesk_app::audit::link(&session.actor, "environment.change.conflict", &id);
             let store_scope = req_scope(&headers);
-            let audit_scope = gaugewright_app::audit::scope_for(&store_scope);
+            let audit_scope = gaugedesk_app::audit::scope_for(&store_scope);
             let result = match guard.store_mut().admit_record_facts_chained(
                 &command_scope(&headers),
                 &key,
                 &snapshot(&envelope),
                 &[conflict_fact],
-                Some(gaugewright_app::audit::chained_in(
-                    &audit_scope,
-                    &audit_link,
-                )),
+                Some(gaugedesk_app::audit::chained_in(&audit_scope, &audit_link)),
             ) {
                 Ok(result) => result,
                 Err(error) => return store_error(error),
             };
             if let Some(entry) =
-                gaugewright_app::audit::committed_entry(result.chained_payload.as_deref())
+                gaugedesk_app::audit::committed_entry(result.chained_payload.as_deref())
             {
-                gaugewright_app::audit::finish_committed_in(&mut guard, &store_scope, &entry);
+                gaugedesk_app::audit::finish_committed_in(&mut guard, &store_scope, &entry);
             }
             return (
                 StatusCode::CONFLICT,
@@ -2078,11 +2065,11 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use gaugewright_app::identity::LoopbackIdentityProvider;
-    use gaugewright_core::abac::AuthorityAttributes;
-    use gaugewright_core::ids::AuthorityId;
-    use gaugewright_store::Store;
-    use gaugewright_workspace::Instance;
+    use gaugedesk_app::identity::LoopbackIdentityProvider;
+    use gaugedesk_core::abac::AuthorityAttributes;
+    use gaugedesk_core::ids::AuthorityId;
+    use gaugedesk_store::Store;
+    use gaugedesk_workspace::Instance;
 
     fn test_app_as(role: &str) -> (tempfile::TempDir, SharedWorkbench, Router) {
         let dir = tempfile::tempdir().unwrap();
@@ -2644,7 +2631,7 @@ mod tests {
             1
         );
         assert_eq!(
-            gaugewright_app::audit::list(shared.lock().unwrap().store_ref()).len(),
+            gaugedesk_app::audit::list(shared.lock().unwrap().store_ref()).len(),
             2,
             "proposal and admitted effect each have one atomic audit row"
         );

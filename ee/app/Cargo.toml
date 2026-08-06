@@ -1,4 +1,4 @@
-# gaugewright-ee — GaugeDesk Administration capabilities.
+# gaugedesk-ee — GaugeDesk Administration capabilities.
 # Owns the enterprise admin/SSO/SCIM control-plane surface extracted from
 # `crates/app`: the org admin routes + ENTSEC-1 data-route auth middleware
 # (`org_routes`), the OIDC auth-code + PKCE login shell and startup SSO
@@ -9,16 +9,17 @@
 # substrate it composes over (org/audit/workbench_auth/identity records,
 # traits, and Workbench accessors) stays in `crates/app`.
 [package]
-name = "gaugewright-ee"
+name = "gaugedesk-ee"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "GaugeDesk Administration capabilities: org admin, SSO (OIDC/SAML), SCIM, and enterprise data-route auth over the AGPL platform."
 
 [dependencies]
-gaugewright-core = { path = "../../crates/core" }
-gaugewright-store = { path = "../../crates/store" }
-gaugewright-app = { path = "../../crates/app", default-features = false }
+gaugedesk-env = { path = "../../crates/env" }
+gaugedesk-core = { path = "../../crates/core" }
+gaugedesk-store = { path = "../../crates/store" }
+gaugedesk-app = { path = "../../crates/app", default-features = false }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -36,7 +37,7 @@ jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"]
 base64 = "0.22"
 
 [dev-dependencies]
-gaugewright-workspace = { path = "../../crates/workspace" }
+gaugedesk-workspace = { path = "../../crates/workspace" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"

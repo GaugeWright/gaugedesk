@@ -127,8 +127,7 @@ async fn revoke(State(hub): State<Arc<Hub>>) -> impl IntoResponse {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let addr =
-        std::env::var("GAUGEWRIGHT_TEST_HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:7910".to_string());
+    let addr = gaugedesk_env::var("TEST_HUB_ADDR").unwrap_or_else(|| "127.0.0.1:7910".to_string());
     let hub = Arc::new(Hub::default());
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))

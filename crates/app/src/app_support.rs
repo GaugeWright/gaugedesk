@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use gaugewright_store::Store;
+use gaugedesk_store::Store;
 
 use crate::boundary_keeper::LoopbackKeyReleaseService;
 use crate::workbench_state::Workbench;
@@ -105,8 +105,8 @@ pub(crate) fn builtin_archetypes() -> &'static [BuiltinArchetype] {
 
 pub(crate) fn builtin_agent_definition(
     archetype: &BuiltinArchetype,
-) -> gaugewright_boundary::definition::AgentDefinition {
-    gaugewright_boundary::definition::AgentDefinition {
+) -> gaugedesk_boundary::definition::AgentDefinition {
+    gaugedesk_boundary::definition::AgentDefinition {
         system: archetype.system.into(),
         instructions: archetype.instructions.into(),
         config: None,
@@ -115,8 +115,8 @@ pub(crate) fn builtin_agent_definition(
 
 /// The seeded default agent as the neutral definition (ADR 0029/0035): the one
 /// constructor both seeding paths materialize via
-/// [`AgentDefinition::seed_files`](gaugewright_boundary::definition::AgentDefinition::seed_files).
-pub(crate) fn default_agent_definition() -> gaugewright_boundary::definition::AgentDefinition {
+/// [`AgentDefinition::seed_files`](gaugedesk_boundary::definition::AgentDefinition::seed_files).
+pub(crate) fn default_agent_definition() -> gaugedesk_boundary::definition::AgentDefinition {
     builtin_agent_definition(&BUILTIN_ARCHETYPES[0])
 }
 
@@ -124,30 +124,30 @@ pub(crate) fn default_agent_definition() -> gaugewright_boundary::definition::Ag
 /// single-user collapse. Multi-user identity is the G1/M2 deferral.
 pub const LOCAL_AUTHORITY: &str = "local-user";
 
-/// Whether the cross-authority **federation** surface is enabled (`GAUGEWRIGHT_FEDERATION=1`).
+/// Whether the cross-authority **federation** surface is enabled (`GAUGEDESK_FEDERATION=1`).
 /// **PARKED off by default (ADR 0065):** the single-authority initial product needs no relay, so
 /// the federation subsystem is not opened and its routes are not mounted unless an operator
 /// explicitly opts in. The cross-authority machinery reactivates with D-ATTEST / a real
 /// multi-party push; until then it is dormant and unreachable in the product.
 pub(crate) fn federation_enabled() -> bool {
-    std::env::var("GAUGEWRIGHT_FEDERATION").as_deref() == Ok("1")
+    gaugedesk_env::var("FEDERATION").as_deref() == Some("1")
 }
 
-/// Whether the **attested-specific operator surface** is enabled (`GAUGEWRIGHT_ATTESTATION=1`).
+/// Whether the **attested-specific operator surface** is enabled (`GAUGEDESK_ATTESTATION=1`).
 /// **PARKED off by default (ADR 0065):** the measurement registry + attested-run entitlement
 /// routes are mounted only on opt-in. The attested accept path stays fail-closed
 /// (`RealRequired`) regardless; this gate removes the operator surface from the initial product.
 pub(crate) fn attestation_enabled() -> bool {
-    std::env::var("GAUGEWRIGHT_ATTESTATION").as_deref() == Ok("1")
+    gaugedesk_env::var("ATTESTATION").as_deref() == Some("1")
 }
 
 /// The attestation verifier mode for a real served deployment. It fails closed
 /// by default; the loopback stand-in is used only when explicitly requested.
 pub(crate) fn attestation_mode_from_env() -> AttestationMode {
-    if gaugewright_store::process_env::var("ATTESTATION_VERIFIER").as_deref() == Some("loopback") {
+    if gaugedesk_env::var("ATTESTATION_VERIFIER").as_deref() == Some("loopback") {
         eprintln!(
             "[gaugewright] WARNING: attested-boundary acceptance is using the LOOPBACK quote \
-             verifier (GAUGEWRIGHT_ATTESTATION_VERIFIER=loopback). Its signature check is only \
+             verifier (GAUGEDESK_ATTESTATION_VERIFIER=loopback). Its signature check is only \
              \"report bytes non-empty\" — a forged quote for a registered measurement would \
              verify and unseal keys. Use only for the loopback/dev shape, never with real \
              measurements/sealed keys."
@@ -190,7 +190,7 @@ impl Workbench {
                     "selected WhippleScript package is unavailable",
                 )
             })?;
-        let package = gaugewright_whip_runtime::AuthoredAgentPackage::load(&root)
+        let package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(&root)
             .map_err(std::io::Error::other)?;
         if package.version_ref() != expected_ref {
             return Err(std::io::Error::new(
@@ -206,31 +206,30 @@ impl Workbench {
 
     pub fn whip_harness_factory(
         &self,
-    ) -> std::io::Result<gaugewright_whip_runtime::WhipHarnessFactory> {
-        let signing_key =
-            gaugewright_core::signature::SigningKey::from_seed(&self.governance_seed())
-                .map_err(|error| std::io::Error::other(error.reason))?;
-        let factory = gaugewright_whip_runtime::WhipHarnessFactory::new(
+    ) -> std::io::Result<gaugedesk_whip_runtime::WhipHarnessFactory> {
+        let signing_key = gaugedesk_core::signature::SigningKey::from_seed(&self.governance_seed())
+            .map_err(|error| std::io::Error::other(error.reason))?;
+        let factory = gaugedesk_whip_runtime::WhipHarnessFactory::new(
             self.authority().clone(),
             signing_key,
             self.root_path().join("whip-runtimes"),
         );
-        match std::env::var("GAUGEWRIGHT_DO_HOST_URL") {
-            Ok(url) if !url.trim().is_empty() => {
-                let token = std::env::var("GAUGEWRIGHT_DO_HOST_TOKEN").map_err(|_| {
+        match gaugedesk_env::var("DO_HOST_URL") {
+            Some(url) if !url.trim().is_empty() => {
+                let token = gaugedesk_env::var("DO_HOST_TOKEN").ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "GAUGEWRIGHT_DO_HOST_TOKEN is required with GAUGEWRIGHT_DO_HOST_URL",
+                        "GAUGEDESK_DO_HOST_TOKEN is required with GAUGEDESK_DO_HOST_URL",
                     )
                 })?;
-                let tenant = std::env::var("GAUGEWRIGHT_DO_TENANT").map_err(|_| {
+                let tenant = gaugedesk_env::var("DO_TENANT").ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "GAUGEWRIGHT_DO_TENANT is required with GAUGEWRIGHT_DO_HOST_URL",
+                        "GAUGEDESK_DO_TENANT is required with GAUGEDESK_DO_HOST_URL",
                     )
                 })?;
                 Ok(
-                    factory.with_do_host(gaugewright_whip_runtime::DoHostConfig::new(
+                    factory.with_do_host(gaugedesk_whip_runtime::DoHostConfig::new(
                         url, token, tenant,
                     )?),
                 )
@@ -240,7 +239,7 @@ impl Workbench {
     }
 
     /// Set how attested acceptance verifies quotes (C-3). Production reads
-    /// `GAUGEWRIGHT_ATTESTATION_VERIFIER` (see `open_workbench`); the loopback/e2e shape
+    /// `GAUGEDESK_ATTESTATION_VERIFIER` (see `open_workbench`); the loopback/e2e shape
     /// sets [`AttestationMode::Loopback`] explicitly. Builder-style.
     pub fn with_attestation_mode(mut self, mode: AttestationMode) -> Self {
         self.attestation_mode = mode;
@@ -254,7 +253,7 @@ impl Workbench {
 
     /// Enable the **attested-specific operator surface** (the measurement registry + attested-run
     /// entitlement/metering routes). PARKED off by default (ADR 0065); startup sets this from
-    /// `GAUGEWRIGHT_ATTESTATION=1`, the attested e2e suites set it explicitly. Builder-style.
+    /// `GAUGEDESK_ATTESTATION=1`, the attested e2e suites set it explicitly. Builder-style.
     /// Does **not** affect the shared `/boundaries/*` lifecycle.
     pub fn with_attestation_enabled(mut self, on: bool) -> Self {
         self.attestation_enabled = on;

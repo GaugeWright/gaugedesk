@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use axum::{http::StatusCode, response::IntoResponse, Json};
-use gaugewright_store::AdmitError;
+use gaugedesk_store::AdmitError;
 
 /// The name of the shared web-account session cookie (ADR 0077): the hosted hub sets it
 /// `Domain=.gaugewright.com` on login, so one sign-in authenticates the whole site.
@@ -19,7 +19,7 @@ pub const SESSION_COOKIE: &str = "gw_session";
 
 /// The credential a request presents, from **either** the `Authorization: Bearer <token>`
 /// header **or** the [`SESSION_COOKIE`] cookie. `pub` so the extracted enterprise band
-/// (`gaugewright-ee`) and the private route lanes parse it exactly like the open routes.
+/// (`gaugedesk-ee`) and the private route lanes parse it exactly like the open routes.
 ///
 /// The cookie fallback is what makes the hosted Console work: a browser cannot set an
 /// `Authorization` header on an `EventSource` (SSE) or a top-level navigation, but it *does*
@@ -58,7 +58,7 @@ pub fn session_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
 /// (`local-api-contract.md`), and it needs no store read to be honest: the
 /// router only serves after `Store::open` succeeded, and open **applies every
 /// pending migration and fails closed on a schema newer than
-/// [`gaugewright_store::SUPPORTED_SCHEMA_VERSION`]** (DR-0054 Phase B/C) — so a
+/// [`gaugedesk_store::SUPPORTED_SCHEMA_VERSION`]** (DR-0054 Phase B/C) — so a
 /// serving process *implies* the store stands at exactly `schema_version`.
 pub(crate) async fn health() -> impl IntoResponse {
     (
@@ -66,7 +66,7 @@ pub(crate) async fn health() -> impl IntoResponse {
         Json(serde_json::json!({
             "ok": true,
             "migrations": "current",
-            "schema_version": gaugewright_store::SUPPORTED_SCHEMA_VERSION,
+            "schema_version": gaugedesk_store::SUPPORTED_SCHEMA_VERSION,
         })),
     )
 }
@@ -89,7 +89,7 @@ pub async fn security_headers(
 }
 
 /// The default CORS origin allowlist (FED-2): the Vite dev server, the built preview, and the
-/// Tauri webview — instead of permissive `*`. Extended by `GAUGEWRIGHT_ALLOWED_ORIGINS`
+/// Tauri webview — instead of permissive `*`. Extended by `GAUGEDESK_ALLOWED_ORIGINS`
 /// (comma-separated). Public Embeddable Panels enforce their deployment origin
 /// policy at the edge and do not use this private control-plane CORS layer.
 pub fn default_allowed_origins() -> Vec<String> {
@@ -103,7 +103,7 @@ pub fn default_allowed_origins() -> Vec<String> {
         "http://tauri.localhost",
     ];
     let mut v: Vec<String> = DEFAULT_ORIGINS.iter().map(|s| s.to_string()).collect();
-    if let Ok(extra) = std::env::var("GAUGEWRIGHT_ALLOWED_ORIGINS") {
+    if let Some(extra) = gaugedesk_env::var("ALLOWED_ORIGINS") {
         for o in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             v.push(o.to_string());
         }

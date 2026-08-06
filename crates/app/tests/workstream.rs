@@ -17,14 +17,14 @@ use axum::Router;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use gaugewright_app::open_control_plane;
-use gaugewright_app::Workbench;
-use gaugewright_store::Store;
-use gaugewright_workspace::Instance;
+use gaugedesk_app::open_control_plane;
+use gaugedesk_app::Workbench;
+use gaugedesk_store::Store;
+use gaugedesk_workspace::Instance;
 
 fn workbench() -> (tempfile::TempDir, Router) {
     static FAKE_RUNTIME: Once = Once::new();
-    FAKE_RUNTIME.call_once(|| std::env::set_var("GAUGEWRIGHT_FAKE_AGENT", "1"));
+    FAKE_RUNTIME.call_once(|| std::env::set_var("GAUGEDESK_FAKE_AGENT", "1"));
     let dir = tempfile::tempdir().unwrap();
     let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
     let store = Store::open_in_memory().unwrap();

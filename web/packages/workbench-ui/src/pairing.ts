@@ -17,7 +17,7 @@
  * the network beyond folding the wire status it is handed.
  *
  * The step vocabulary mirrors the boundary phases the server reports verbatim
- * (`gaugewright_core::boundary_lifecycle::BoundaryPhase`): a freshly bound pairing sits
+ * (`gaugedesk_core::boundary_lifecycle::BoundaryPhase`): a freshly bound pairing sits
  * at `DeviceBinding` (awaiting the owner's acceptance); the owner accepting moves
  * the boundary to `Active`, which the client reads as `paired` and the flow as
  * done. The flow never manufactures the paired fact — it is `paired` only once the
