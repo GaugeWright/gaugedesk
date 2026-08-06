@@ -9,9 +9,7 @@
 //! composition without a fold (the solo desktop, a private Home) gets a login
 //! with no membership consequences — exactly the consumer contract.
 
-use gaugewright_app::org::{
-    MembershipRecord, MembershipStatus, Org, RecordOp, ORG_ID,
-};
+use gaugewright_app::org::{MembershipRecord, MembershipStatus, Org, RecordOp, ORG_ID};
 use gaugewright_app::Workbench;
 
 use crate::auth_oidc::LoginFold;

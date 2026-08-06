@@ -27,7 +27,8 @@ async fn main() {
         .try_init();
 
     let root = open_control_plane_root();
-    let addr = std::env::var("GAUGEWRIGHT_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
+    let addr =
+        gaugewright_store::process_env::var("ADDR").unwrap_or_else(|| "127.0.0.1:7878".to_string());
 
     let wb = open_workbench(&root).expect("open workbench");
     gaugewright_app::federation::respawn_restored_receivers(&wb);

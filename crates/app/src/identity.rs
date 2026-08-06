@@ -27,13 +27,13 @@ impl Workbench {
     /// federation/dev deployments. Empty values are ignored so a mis-set env var
     /// does not erase the local single-user default.
     pub(crate) fn activate_configured_authority(&mut self) {
-        if let Ok(authority) = std::env::var("GAUGEWRIGHT_AUTHORITY") {
+        if let Some(authority) = gaugewright_store::process_env::var("AUTHORITY") {
             if !authority.is_empty() {
                 self.authority = AuthorityId::new(authority);
                 self.home_id = HomeId::new(format!("home:{}", self.authority.as_str()));
             }
         }
-        if let Ok(home) = std::env::var("GAUGEWRIGHT_HOME_ID") {
+        if let Some(home) = gaugewright_store::process_env::var("HOME_ID") {
             if !home.is_empty() {
                 self.home_id = HomeId::new(home);
             }
@@ -71,13 +71,12 @@ impl Workbench {
     }
 
     pub(crate) fn configured_home_id() -> HomeId {
-        if let Ok(home) = std::env::var("GAUGEWRIGHT_HOME_ID") {
+        if let Some(home) = gaugewright_store::process_env::var("HOME_ID") {
             if !home.is_empty() {
                 return HomeId::new(home);
             }
         }
-        let authority = std::env::var("GAUGEWRIGHT_AUTHORITY")
-            .ok()
+        let authority = gaugewright_store::process_env::var("AUTHORITY")
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| crate::LOCAL_AUTHORITY.to_string());
         HomeId::new(format!("home:{authority}"))

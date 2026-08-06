@@ -115,7 +115,8 @@ jobs:
             --output tsv)"
           test "$state" = "Succeeded"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:

@@ -19,7 +19,8 @@ async fn main() {
     // The bind address is `GAUGEWRIGHT_ADDR` (default loopback `127.0.0.1:7878`). A
     // multi-machine deployment runs two instances on distinct ports/roots, each
     // with its own `GAUGEWRIGHT_AUTHORITY` identity (D-REMOTE / `SERVE-1`).
-    let addr = std::env::var("GAUGEWRIGHT_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
+    let addr =
+        gaugewright_store::process_env::var("ADDR").unwrap_or_else(|| "127.0.0.1:7878".to_string());
     gaugewright_app::open_api::open_serve(&addr, &root)
         .await
         .expect("serve open control plane");

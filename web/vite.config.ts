@@ -8,10 +8,27 @@ import { aliceCP, ports } from "./e2e/ports.mjs";
 // The workbench is a client-owned Solid island served by Vite; Tauri wraps this
 // same build for desktop (`app-stack.md`). The control plane runs separately on
 // loopback (default :7878) — the dev/preview server proxies stream calls to it.
+// Under the fabric the control plane's port is chosen by the orchestrator, so
+// the proxy target follows it rather than the harness's fixed default.
+const controlPlane = process.env.GAUGEWRIGHT_DEV_CONTROL_PLANE_TARGET ?? aliceCP;
 const proxy = {
-    "/scopes": aliceCP,
-    "/engagements": aliceCP,
+    "/scopes": controlPlane,
+    "/engagements": controlPlane,
 };
+
+// The cross-surface development fabric terminates TLS for every surface behind
+// one router and serves this client at the `desk` origin. Under it this server
+// binds loopback HTTP and answers to that name; run directly, it keeps the
+// canonical loopback origins the control plane's CORS allowlist blesses.
+const underFabric = process.env.GAUGEWRIGHT_DEV_FABRIC === "1";
+const fabricPort = Number(process.env.GAUGEWRIGHT_DEV_PORT ?? "7443");
+const fabricServer = underFabric
+    ? {
+        host: "127.0.0.1",
+        allowedHosts: ["desk.gw.localhost", "127.0.0.1"],
+        hmr: { protocol: "wss", host: "desk.gw.localhost", clientPort: fabricPort },
+    }
+    : {};
 
 export default defineConfig({
     plugins: [solid()],
@@ -36,6 +53,7 @@ export default defineConfig({
         port: 5173,
         strictPort: true,
         proxy,
+        ...fabricServer,
     },
     // The e2e harness drives `vite preview`; its port (passed via --port) and proxy track
     // this run's resolved ports so concurrent runs don't collide.

@@ -18,8 +18,8 @@
 pub use gaugewright_app::auth_oidc;
 pub mod environment_routes;
 pub use gaugewright_app::identity_oidc;
-pub mod login_fold;
 pub mod identity_saml;
+pub mod login_fold;
 pub mod org_routes;
 pub mod scim_routes;
 

@@ -20,18 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # rustup materializes the toolchain named in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: fmt
-        run: cargo fmt --all --check
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: test
-        run: cargo test --workspace
-      - name: app no-default feature gate
-        run: cargo check -p gaugewright-app --no-default-features --all-targets
+      - run: scripts/check.sh rust
 
   architecture:
     if: ${{ github.event.repository.private == false }}
@@ -63,28 +56,5 @@ jobs:
           cache-dependency-path: |
             web/package-lock.json
             ee/web/package-lock.json
-      - run: npm ci
-      - name: typecheck
-        run: npm run typecheck
-      - name: split target typecheck
-        run: npm run typecheck:split
-      - name: vitest
-        run: npm run test
-      - name: open-source workbench build
-        run: npm run build:open
-      - name: public embed bundle build
-        run: npm run build:embed
-      - name: staged open app entries build
-        run: npm run build:apps:open
-      - name: enterprise web install (ee/web)
-        working-directory: ee/web
-        run: npm ci
-      - name: enterprise web typecheck (ee/web)
-        working-directory: ee/web
-        run: npm run typecheck
-      - name: enterprise web build (ee/web)
-        working-directory: ee/web
-        run: npm run build
-      - name: saml verify sidecar (install + crypto tests)
-        working-directory: ee/sidecar/saml-verify
-        run: npm ci && npm test
+      - run: scripts/check.sh web
+        working-directory: .

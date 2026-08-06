@@ -2026,7 +2026,7 @@ pub async fn post_consent(
 /// is a loopback-only, local-operator operation. Fail-closed: any network-HTTP
 /// posture refuses regardless of the actual bind.
 fn network_http_refusal(op: &str) -> Option<axum::response::Response> {
-    if std::env::var("GAUGEWRIGHT_ALLOW_NETWORK_HTTP").as_deref() == Ok("1") {
+    if gaugewright_store::process_env::enabled("ALLOW_NETWORK_HTTP") {
         return Some(
             (
                 StatusCode::FORBIDDEN,

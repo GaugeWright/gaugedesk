@@ -39,17 +39,15 @@ use serde_json::json;
 use gaugewright_core::abac::AuthorityAttributes;
 use gaugewright_core::ids::AuthorityId;
 
+use crate::identity::IdentityProvider;
 use crate::identity_oidc::{
     authorize_url, discover_endpoints, discover_jwks, exchange_code, refresh_id_token,
     ClaimMapping, HttpForm, HttpGet, OidcIdentityProvider, Pkce,
 };
-use base64::Engine as _;
-use crate::identity::IdentityProvider;
 use crate::net_http::HttpClient;
-use crate::org::{
-    Org, RecordOp, SsoConnectionRecord, SsoProtocol, ORG_ID,
-};
+use crate::org::{Org, RecordOp, SsoConnectionRecord, SsoProtocol, ORG_ID};
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
+use base64::Engine as _;
 
 /// Server-side state carried from `/auth/login` to `/auth/callback` for one
 /// auth-code + PKCE exchange, keyed by the CSRF `state` (`ID-3`). Holds the PKCE
@@ -1384,7 +1382,10 @@ fn subject_claim(id_token: &str) -> Option<String> {
 /// (ADR 0123 §4 / ADR 0053): the handoff session is device-bound, so the
 /// account surface can see and revoke it. Returns the minted device id.
 pub fn record_native_device(wb: &SharedWorkbench, person: &str, label: &str) -> Option<String> {
-    let id = format!("native-{}", hex::encode(crate::session::random_bytes::<8>()));
+    let id = format!(
+        "native-{}",
+        hex::encode(crate::session::random_bytes::<8>())
+    );
     let record = crate::account::DeviceRecord {
         id: id.clone(),
         op: RecordOp::Upsert,
@@ -1711,23 +1712,19 @@ iqlTEKVISscuchxZtKQJ4k8=
 
         // Off (enterprise/desktop): a login provisions no personal tenant.
         assert!(provision_web_account(&mut wb, person, false).is_none());
-        assert!(Tenancy::rebuild_in(
-            wb.store_ref(),
-            &crate::account::account_scope(person)
-        )
-        .unwrap()
-        .tenants
-        .is_empty());
+        assert!(
+            Tenancy::rebuild_in(wb.store_ref(), &crate::account::account_scope(person))
+                .unwrap()
+                .tenants
+                .is_empty()
+        );
 
         // On (hosted web account): the login mints the person's personal tenant-of-one.
         let tid =
             provision_web_account(&mut wb, person, true).expect("provisions in web-account mode");
         assert_eq!(tid, personal_tenant_id(person));
-        let tenancy = Tenancy::rebuild_in(
-            wb.store_ref(),
-            &crate::account::account_scope(person),
-        )
-        .unwrap();
+        let tenancy =
+            Tenancy::rebuild_in(wb.store_ref(), &crate::account::account_scope(person)).unwrap();
         let personal = tenancy.personal().expect("a personal tenant is indexed");
         assert_eq!(personal.id, tid);
         assert_eq!(personal.role, "owner");
@@ -1739,13 +1736,10 @@ iqlTEKVISscuchxZtKQJ4k8=
             Some(tid.as_str())
         );
         assert_eq!(
-            Tenancy::rebuild_in(
-                wb.store_ref(),
-                &crate::account::account_scope(person)
-            )
-            .unwrap()
-            .tenants
-            .len(),
+            Tenancy::rebuild_in(wb.store_ref(), &crate::account::account_scope(person))
+                .unwrap()
+                .tenants
+                .len(),
             1
         );
     }

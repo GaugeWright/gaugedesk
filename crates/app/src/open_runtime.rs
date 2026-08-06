@@ -4,7 +4,7 @@ use crate::{federation, open_control_plane, open_workbench, LockUnpoisoned};
 
 /// Resolve the directory the open control plane roots its decision and workspace stores in.
 pub fn open_control_plane_root() -> std::path::PathBuf {
-    if let Some(root) = std::env::var_os("GAUGEWRIGHT_ROOT") {
+    if let Some(root) = gaugewright_store::process_env::var_os("ROOT") {
         return std::path::PathBuf::from(root);
     }
     if let Some(dirs) = directories::ProjectDirs::from("dev", "gaugewright", "gaugewright") {
@@ -76,8 +76,8 @@ pub async fn open_listener(addr: &str) -> std::io::Result<tokio::net::TcpListene
             Ok(listener)
         }
         None => {
-            let opted_in = std::env::var("GAUGEWRIGHT_ALLOW_NETWORK_HTTP").as_deref() == Ok("1");
-            let tls_acked = std::env::var("GAUGEWRIGHT_TLS_TERMINATED").as_deref() == Ok("1");
+            let opted_in = gaugewright_store::process_env::enabled("ALLOW_NETWORK_HTTP");
+            let tls_acked = gaugewright_store::process_env::enabled("TLS_TERMINATED");
             open_check_loopback_bind(addr, opted_in, tls_acked)?;
             let listener = tokio::net::TcpListener::bind(addr).await?;
             println!("gaugewright open control plane listening on http://{addr}");

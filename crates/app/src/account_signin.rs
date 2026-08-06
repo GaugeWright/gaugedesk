@@ -145,7 +145,10 @@ fn write_session(wb: &SharedWorkbench, record: &SessionRecord) -> Result<(), Str
 
 fn latest_session(wb: &SharedWorkbench) -> Option<SessionRecord> {
     let workbench = wb.lock_unpoisoned();
-    let rows = workbench.store_ref().records(ACCOUNT_SCOPE, RECORD_KIND).ok()?;
+    let rows = workbench
+        .store_ref()
+        .records(ACCOUNT_SCOPE, RECORD_KIND)
+        .ok()?;
     let last = rows.last()?;
     let record: SessionRecord = serde_json::from_str(last).ok()?;
     if record.sealed.is_empty() {
@@ -162,7 +165,11 @@ pub fn hub_session_token(wb: &SharedWorkbench) -> Option<String> {
     workbench.unseal_account_secret(&record.sealed)
 }
 
-fn seal_session(wb: &SharedWorkbench, id_token: &str, device: &str) -> Result<SessionRecord, String> {
+fn seal_session(
+    wb: &SharedWorkbench,
+    id_token: &str,
+    device: &str,
+) -> Result<SessionRecord, String> {
     let person = jwt_subject(id_token).unwrap_or_default();
     let expires = jwt_expiry_ms(id_token).unwrap_or(0);
     let sealed = {
@@ -216,7 +223,10 @@ fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<(String, Strin
 
 /// How this desktop names itself in the person's trusted-devices registry.
 fn device_label() -> String {
-    match std::env::var("HOSTNAME").ok().filter(|h| !h.trim().is_empty()) {
+    match std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+    {
         Some(host) => format!("GaugeDesk on {host}"),
         None => "GaugeDesk desktop".to_string(),
     }
@@ -232,11 +242,7 @@ fn refresh_at_hub(hub: &str, bearer: &str, device: &str) -> Result<String, Strin
         headers.push(("x-gw-device".to_string(), device.to_string()));
     }
     let (status, response) = http
-        .post_json_headers(
-            &format!("{hub}/auth/mobile/refresh"),
-            &headers,
-            "{}",
-        )
+        .post_json_headers(&format!("{hub}/auth/mobile/refresh"), &headers, "{}")
         .map_err(|error| format!("the Hub was unreachable: {error}"))?;
     if status != 200 {
         return Err(format!("the Hub refused the refresh ({status})"));

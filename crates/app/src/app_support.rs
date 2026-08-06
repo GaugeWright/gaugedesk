@@ -144,7 +144,7 @@ pub(crate) fn attestation_enabled() -> bool {
 /// The attestation verifier mode for a real served deployment. It fails closed
 /// by default; the loopback stand-in is used only when explicitly requested.
 pub(crate) fn attestation_mode_from_env() -> AttestationMode {
-    if std::env::var("GAUGEWRIGHT_ATTESTATION_VERIFIER").as_deref() == Ok("loopback") {
+    if gaugewright_store::process_env::var("ATTESTATION_VERIFIER").as_deref() == Some("loopback") {
         eprintln!(
             "[gaugewright] WARNING: attested-boundary acceptance is using the LOOPBACK quote \
              verifier (GAUGEWRIGHT_ATTESTATION_VERIFIER=loopback). Its signature check is only \

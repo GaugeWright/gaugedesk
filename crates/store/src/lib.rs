@@ -22,6 +22,8 @@ use std::time::Duration;
 use gaugewright_core::{Lifecycle, Rejection};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
+pub mod process_env;
+
 /// A transparent at-rest transform applied to record payloads of designated
 /// **content** kinds (`SECAUD-9`/`SECAUD-6`). The store crate stays crypto-free: this
 /// is the seam an app-side content vault implements to encrypt sensitive content
@@ -409,11 +411,7 @@ impl Store {
         // under a live projection reader SQLite can reject that setup with BUSY
         // before the turn reaches its properly serialized IMMEDIATE transactions.
         // `synchronous` is connection-local, so carry that one setting explicitly.
-        let sync = synchronous_mode(
-            std::env::var("GAUGEWRIGHT_SQLITE_SYNCHRONOUS")
-                .ok()
-                .as_deref(),
-        );
+        let sync = synchronous_mode(process_env::var("SQLITE_SYNCHRONOUS").as_deref());
         conn.execute_batch(&format!("PRAGMA synchronous={sync};"))?;
         Ok(Self {
             conn,
@@ -443,11 +441,7 @@ impl Store {
         // the right desktop default (no fsync per commit). A hosted/multi-user data plane
         // sets `GAUGEWRIGHT_SQLITE_SYNCHRONOUS=FULL` for fsync-per-commit durability.
         // WAL auto-recovers (replays the log) on the next open, so no separate sweep.
-        let sync = synchronous_mode(
-            std::env::var("GAUGEWRIGHT_SQLITE_SYNCHRONOUS")
-                .ok()
-                .as_deref(),
-        );
+        let sync = synchronous_mode(process_env::var("SQLITE_SYNCHRONOUS").as_deref());
         let journal = journal_mode(
             std::env::var("GAUGEWRIGHT_SQLITE_JOURNAL_MODE")
                 .ok()
