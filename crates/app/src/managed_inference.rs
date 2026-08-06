@@ -619,14 +619,41 @@ pub const METERED_GATEWAY_ACCOUNT: &str = "1689dd452ba2d2d8eb1f3c364c92b3f4";
 /// hard-stop the private runtime — see `specs/systems.md`.
 pub const METERED_GATEWAY_PANELS: &str = "gaugewright-panels";
 
+#[cfg(debug_assertions)]
+const DEVELOPMENT_GATEWAY_ID_ENV: &str = "GAUGEWRIGHT_DEV_AI_GATEWAY_ID";
+
+fn valid_gateway_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[cfg(debug_assertions)]
+fn metered_gateway_id() -> String {
+    match std::env::var(DEVELOPMENT_GATEWAY_ID_ENV) {
+        Ok(value) if valid_gateway_id(&value) => value,
+        Ok(_) => panic!("{DEVELOPMENT_GATEWAY_ID_ENV} is not a valid exact gateway id"),
+        Err(std::env::VarError::NotPresent) => METERED_GATEWAY_PANELS.to_owned(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("{DEVELOPMENT_GATEWAY_ID_ENV} is not Unicode")
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn metered_gateway_id() -> String {
+    METERED_GATEWAY_PANELS.to_owned()
+}
+
 /// The OpenAI-compatible base URL a managed release is admitted against.
 ///
 /// The runtime proves a request never leaves this origin and path, so this
 /// string is the egress grant for every metered turn.
 pub fn metered_gateway_base_url() -> String {
-    format!(
-        "https://gateway.ai.cloudflare.com/v1/{METERED_GATEWAY_ACCOUNT}/{METERED_GATEWAY_PANELS}/compat"
-    )
+    let gateway = metered_gateway_id();
+    format!("https://gateway.ai.cloudflare.com/v1/{METERED_GATEWAY_ACCOUNT}/{gateway}/compat")
 }
 
 /// The model name in the gateway's unified `provider/model` form.
@@ -658,6 +685,15 @@ mod metered_rail {
         // Never the private runtime's gateway: sharing one gateway shares its
         // spend limit, and a busy panel would hard-stop the private runtime.
         assert!(!url.contains("gaugewright-hosted"));
+    }
+
+    #[test]
+    fn development_gateway_ids_are_single_safe_path_segments() {
+        assert!(super::valid_gateway_id("gaugewright-development"));
+        assert!(super::valid_gateway_id("dev_2"));
+        assert!(!super::valid_gateway_id(""));
+        assert!(!super::valid_gateway_id("../gaugewright-panels"));
+        assert!(!super::valid_gateway_id("gateway/compat"));
     }
 
     #[test]
