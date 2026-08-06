@@ -39,6 +39,7 @@ import {
     ContentViewer,
     createWorkbenchShellState,
     emptyTranscript,
+    localTurnActivity,
     SessionProvider,
     TaskBar,
     WorkbenchShell,
@@ -420,6 +421,7 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
         methodName: () => "Administration",
         transcript,
         busy: agentBusy,
+        turnActivity: localTurnActivity(agentBusy, transcript),
         composerCapabilities: () => ({
             queue: true,
             steer: false,

@@ -24,6 +24,7 @@ import {
 import { type Session } from "@gaugewright/workbench-ui/session-context";
 import { type ImageRef } from "@gaugewright/workbench-ui/attachments";
 import { type EmbedSessionApi } from "./session-api";
+import { type TurnObservation } from "./session-api";
 import { UNIVERSAL_COMPOSER_CAPABILITIES } from "@gaugewright/workbench-ui/session-composer-controller";
 
 export interface RemoteSessionOptions {
@@ -39,7 +40,14 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
     const [engagementId] = createSignal<EngagementId | null>(id);
     const [selectedFile, setSelectedFile] = createSignal<string | null>(null);
     const [worktreeRev, setWorktreeRev] = createSignal(0);
-    const [busy, setBusy] = createSignal(false);
+    const [dispatching, setDispatching] = createSignal(false);
+    const [turnActivity, setTurnActivity] = createSignal<TurnObservation>(
+        api.getTurnActivity?.() ?? { state: "idle" },
+    );
+    const unsubscribeActivity = api.subscribeTurnActivity?.((observation) =>
+        setTurnActivity(observation),
+    );
+    const busy = () => dispatching() || turnActivity().state !== "idle";
     const [turnQueue, setTurnQueue] = createSignal(
         (api.getTurnQueue?.() ?? []).map((item) => ({
             id: item.command_id,
@@ -126,7 +134,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         const t = text.trim();
         if (!t) throw new Error("A message is required.");
         if (busy()) throw new Error("A turn is already running.");
-        setBusy(true);
+        setDispatching(true);
         // Optimistic echo: show the user's line the instant the turn starts; the
         // snapshot re-read in settle() retires it (a failed turn drops it).
         setLive((tr) => reduce(tr, { type: "user", text: t }));
@@ -139,7 +147,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
             await loadSnapshot();
             throw error;
         } finally {
-            setBusy(false);
+            setDispatching(false);
         }
     }
 
@@ -158,6 +166,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         methodName: () => "",
         transcript,
         busy,
+        turnActivity,
         composerCapabilities: () => composerCapabilities,
         composerRuntime,
         merge: (action: MergeAction) => void api.mergeCommand(id, action).then(() => settle()),
@@ -170,6 +179,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         dispose: () => {
             unsubscribe();
             unsubscribeQueue?.();
+            unsubscribeActivity?.();
         },
     };
 }

@@ -137,6 +137,7 @@ function providerHarness({
     const responseListeners = [];
     const waiters = [];
     const clicked = [];
+    const filled = [];
     const emit = (item) => {
         for (const listener of responseListeners) listener(item);
         for (const waiter of waiters.splice(0)) {
@@ -180,6 +181,7 @@ function providerHarness({
                 if (selector === "[data-identifier]") return current.identifiers ?? 0;
                 if (selector.includes("submit_approve_access")) return current.consent ? 1 : 0;
                 if (selector === "button") return current.plainButtons ?? 0;
+                if (selector.includes("totpPin")) return current.totpInput ? 1 : 0;
                 return 0;
             };
             const control = {
@@ -197,6 +199,8 @@ function providerHarness({
                     return positioned;
                 },
                 or(other) { return combineControls(control, other); },
+                async fill(value) { filled.push(value); },
+                async press() { advance(); },
                 async click() {
                     if (selector === "[data-home-sign-in]") {
                         emit(response(`${apiOrigin}/auth/login`, 302));
@@ -210,16 +214,27 @@ function providerHarness({
             return control;
         },
         getByRole(role, options = {}) {
+            // Match with the caller's real RegExp against the label Google
+            // actually renders, so a mock can never disagree with production
+            // matching about which control a screen offers.
+            const matches = (label) =>
+                options.name instanceof RegExp ? options.name.test(label) : false;
+            const name = String(options.name ?? "");
             const control = {
                 async waitFor() {},
                 async count() {
                     const current = screen();
-                    return role === "button" && current?.roleConsent ? 1 : 0;
+                    if (role === "button" && current?.roleConsent && matches("Continue")) return 1;
+                    // The challenge menu offers its authenticator entry as a link.
+                    if (current?.totpOption && matches("Google Authenticator")) return 1;
+                    // The challenge screen's submit control.
+                    if (current?.totpInput && matches("Next")) return 1;
+                    return 0;
                 },
                 first() { return control; },
                 or(other) { return combineControls(control, other); },
                 async click() {
-                    clicked.push(`role:${role}:${String(options.name ?? "")}`);
+                    clicked.push(`role:${role}:${name}`);
                     advance();
                 },
             };
@@ -274,6 +289,7 @@ function providerHarness({
     };
     return {
         clicked,
+        filled,
         browserType: {
             async launch() {
                 return { async newContext() { return context; }, async close() {} };
@@ -334,6 +350,46 @@ test("a risk interstitial whose confirm is a role-button is advanced to the call
         ["[data-identifier]", "role:button:" + String(CONSENT_ROLE_NAME)],
         "the walk must advance the chooser and then the role-button interstitial",
     );
+});
+
+test("an authenticator challenge is answered from the deposited key", async () => {
+    // The datacenter step-up: Google offers a challenge menu, then asks for a
+    // 6-digit code. Both states must advance without operator involvement.
+    const harness = providerHarness({
+        apiOrigin: API,
+        frontendOrigin: FRONTEND,
+        screens: [
+            { url: `${PROVIDER}/v3/signin/accountchooser`, identifiers: 1 },
+            { url: `${PROVIDER}/v3/signin/challenge/selection`, totpOption: true },
+            { url: `${PROVIDER}/v3/signin/challenge/totp`, totpInput: true },
+        ],
+    });
+    const environment = {
+        ...environmentFor(),
+        // RFC 6238 reference secret — the code is computed, never hard-coded.
+        GW_SYNTHETIC_OIDC_TOTP_SECRET: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+    };
+    const result = await runHostedAccountSession(environment, harness.browserType);
+    assert.equal(result.callbackStatus, 302);
+    assert.equal(harness.filled.length, 1, "exactly one code is entered");
+    assert.match(harness.filled[0], /^\d{6}$/, "a six-digit authenticator code");
+});
+
+test("an authenticator challenge without a deposited key fails closed", async () => {
+    const harness = providerHarness({
+        apiOrigin: API,
+        frontendOrigin: FRONTEND,
+        screens: [
+            { url: `${PROVIDER}/v3/signin/accountchooser`, identifiers: 1 },
+            { url: `${PROVIDER}/v3/signin/challenge/totp`, totpInput: true },
+        ],
+    });
+    await assert.rejects(
+        () => runHostedAccountSession(environmentFor(), harness.browserType),
+        /GW_SYNTHETIC_OIDC_TOTP_SECRET is not in this environment/,
+        "a challenge with no key in custody must not stall or silently skip",
+    );
+    assert.equal(harness.filled.length, 0, "nothing is entered without a key");
 });
 
 test("a localized two-button confirmation advances via the trailing control", async () => {

@@ -174,8 +174,8 @@ export type {
     DeploymentPanelApi,
     DeploymentSelection,
 } from "./DeploymentPanel";
-export { SessionProvider, useSession } from "./session-context";
-export type { Session, SessionApi } from "./session-context";
+export { SessionProvider, useSession, localTurnActivity, TURN_ACTIVITIES } from "./session-context";
+export type { Session, SessionApi, TurnActivity } from "./session-context";
 export { Shelf } from "./Shelf";
 export type { ShelfApi } from "./Shelf";
 export { StatusGem, gemState } from "./StatusGem";

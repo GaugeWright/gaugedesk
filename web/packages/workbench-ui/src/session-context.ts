@@ -91,6 +91,62 @@ export interface SessionApi {
     embedGetConfig?(): Promise<{ white_label: boolean }>;
 }
 
+/** The provider-neutral live-turn vocabulary (ADR 0123; WhippleScript
+ *  `spec/agent-harness.md` "Live Turn Observation"). One list, declared once:
+ *  the panel's labels, the transport's frame validation, and every producer all
+ *  derive from it, so a runtime state cannot be added in one place and silently
+ *  go unrendered in another. */
+export const TURN_ACTIVITIES = [
+    "idle",
+    "awaiting_model",
+    "streaming_output",
+    "running_tool",
+    "compacting",
+    "retrying",
+    "settling",
+    "stopping",
+] as const;
+
+export type TurnActivity = (typeof TURN_ACTIVITIES)[number];
+
+/** One live-turn reading. `tool` is the tool's name while `state` is
+ *  `running_tool` — the state alone would only say "something is happening",
+ *  and the whole point of showing a long pause is saying what it is. */
+export interface TurnObservation {
+    readonly state: TurnActivity;
+    readonly tool?: string;
+}
+
+/** The live-turn reading for an Environment whose runtime publishes no activity
+ *  frames of its own — the desktop and Administration placements, which observe
+ *  a turn through the busy flag and the transcript instead.
+ *
+ *  Every state here is read off something the transcript reduction already
+ *  records, so this reports what those Environments genuinely see rather than
+ *  standing in for the runtime's own observation. `openText` is non-null exactly
+ *  while deltas append to an open line. A tool line whose `ok` is still unset is
+ *  a tool that started and has not reported back — which is precisely a tool
+ *  running, and it carries the name.
+ *
+ *  `compacting` is absent by necessity, not by choice: a local runtime does not
+ *  tell the panel when it compacts, and there is nothing in the transcript to
+ *  infer it from. Guessing would be worse than the honest `awaiting_model`. */
+export function localTurnActivity(
+    busy: Accessor<boolean>,
+    transcript: Accessor<Transcript>,
+): Accessor<TurnObservation> {
+    return () => {
+        if (!busy()) return { state: "idle" };
+        const current = transcript();
+        if (current.openText !== null) return { state: "streaming_output" };
+        const lastTool = [...current.lines].reverse().find((line) => line.kind === "tool");
+        if (lastTool?.tool && lastTool.tool.ok === undefined) {
+            return { state: "running_tool", tool: lastTool.tool.name };
+        }
+        return { state: "awaiting_model" };
+    };
+}
+
 export interface Session {
     /** The control-plane transport, already scoped to this session's backend. */
     readonly api: SessionApi;
@@ -146,6 +202,15 @@ export interface Session {
     /** Whether this session is waiting on an admitted turn. Environments that
      *  can observe it expose the same shared working/composer presentation. */
     readonly busy: Accessor<boolean>;
+    /** Ephemeral provider-neutral observation of the active turn. Durable
+     * transcript and terminal output remain authoritative.
+     *
+     * Required, not optional: ADR 0123 makes this a shared-panel presentation
+     * for every Environment, and an optional member is exactly how a producer
+     * silently opts out while still typechecking. An Environment whose runtime
+     * reports nothing finer than busy/idle says so by returning those two —
+     * that is an honest answer, and omitting the member is not. */
+    readonly turnActivity: Accessor<TurnObservation>;
     /** Explicit conversation commands admitted by this Environment. Audience is
      *  presentation identity, not a capability shortcut. */
     readonly composerCapabilities: Accessor<ComposerCapabilities>;

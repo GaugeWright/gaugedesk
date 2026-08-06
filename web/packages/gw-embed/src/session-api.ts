@@ -20,6 +20,13 @@ export interface EmbedQueuedTurn {
     readonly position: number;
 }
 
+// The live-turn vocabulary is declared once, by the shared panel contract this
+// transport feeds. Re-exported rather than restated so the edge frame validator
+// and the panel's labels cannot drift apart.
+import type { TurnObservation } from "@gaugewright/workbench-ui/session-context";
+export { TURN_ACTIVITIES } from "@gaugewright/workbench-ui/session-context";
+export type { TurnActivity, TurnObservation } from "@gaugewright/workbench-ui/session-context";
+
 /** Narrow transport consumed by the shared panel Session projection. */
 export interface EmbedSessionApi {
     getTranscript(id: EngagementId): Promise<StreamEvent[]>;
@@ -59,6 +66,8 @@ export interface EmbedSessionApi {
     stopTurn?(): Promise<void>;
     getTurnQueue?(): readonly EmbedQueuedTurn[];
     subscribeTurnQueue?(listener: (queue: readonly EmbedQueuedTurn[]) => void): () => void;
+    getTurnActivity?(): TurnObservation;
+    subscribeTurnActivity?(listener: (activity: TurnObservation) => void): () => void;
     followUpTurn?(text: string, images?: { data: string; mimeType: string }[]): Promise<void>;
     steerTurn?(text: string, images?: { data: string; mimeType: string }[]): Promise<void>;
     editQueuedTurn?(commandId: string, text: string): Promise<void>;

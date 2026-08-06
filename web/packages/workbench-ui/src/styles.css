@@ -509,6 +509,17 @@ code, pre, textarea {
 .embed-chat { display: flex; flex-direction: column; height: 100%; min-height: 0;
     min-width: 0; overflow: hidden; }
 .embed-chat > .transcript { flex: 1 1 auto; overflow: auto; min-height: 0; }
+.turn-activity { display: flex; align-items: center; gap: 7px; padding: 7px 10px;
+    color: var(--muted); font-size: var(--fs-ui); }
+.turn-activity-dots { display: inline-flex; align-items: center; gap: 3px; }
+.turn-activity-dots i { width: 4px; height: 4px; border-radius: 50%; background: currentColor;
+    animation: turn-activity-dot 1.2s ease-in-out infinite; }
+.turn-activity-dots i:nth-child(2) { animation-delay: 0.15s; }
+.turn-activity-dots i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes turn-activity-dot {
+    0%, 60%, 100% { opacity: 0.35; transform: translateY(0); }
+    30% { opacity: 1; transform: translateY(-2px); }
+}
 .embed-chat-toolbar { display: flex; align-items: center; justify-content: flex-end;
     gap: 6px; flex: 0 0 auto; padding: 0 2px 8px; border-bottom: 1px solid var(--edge); }
 .embed-chat-toolbar .audience-chats { min-width: 0; margin-right: auto; border-bottom: 0; }
@@ -981,7 +992,8 @@ input {
 @media (prefers-reduced-motion: reduce) {
     .status-badge .status-dot,
     .tree-leaf .status-gem[data-state="working"],
-    .working .pulse { animation: none; opacity: 0.85; }
+    .working .pulse,
+    .turn-activity-dots i { animation: none; opacity: 0.85; }
 }
 
 /* The facet tabs share one row as a segmented strip — they stretch to fill and

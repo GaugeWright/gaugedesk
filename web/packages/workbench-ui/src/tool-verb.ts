@@ -61,6 +61,32 @@ export function friendlyToolVerb(name: string): string {
 }
 
 /**
+ * The same vocabulary as `friendlyToolVerb`, in the present progressive, for a
+ * tool that is running *right now* rather than one already in the transcript.
+ * Kept beside its past-tense twin so a tool cannot be phrased one way live and
+ * another way in the history.
+ */
+export function liveToolVerb(name: string): string {
+    switch (toolId(name)) {
+        case "write":
+            return "writing a file";
+        case "edit":
+            return "editing a file";
+        case "read":
+            return "reading a file";
+        case "bash":
+            return "running a command";
+        case "grep":
+        case "find":
+            return "searching";
+        case "ls":
+            return "listing files";
+        case "other":
+            return `using ${name}`;
+    }
+}
+
+/**
  * Whether a tool's `target` is a **file that opens in the content viewer** (so it
  * renders as a clickable link) versus a **command string or query** (which is
  * shown inline as monospace code and is never a link). A shell command is not a

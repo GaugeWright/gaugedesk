@@ -7,6 +7,7 @@ import {
     exactOrigin,
     providerOriginFor,
     providerStorageState,
+    totpSecretFor,
 } from "./production-account-session-canary.mjs";
 
 function handoffChallenge(verifier) {
@@ -71,6 +72,7 @@ export async function runNativeAccountSession(
                 page,
                 { provider: providerOrigin, api: apiOrigin },
                 () => callbackSettled,
+                { totpSecret: totpSecretFor(environment) },
             );
             const callback = await callbackPromise;
             const location = callback.headers().location;

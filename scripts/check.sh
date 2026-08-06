@@ -40,6 +40,7 @@ run_contracts() {
         scripts/production-wiring-canary.test.mjs \
         scripts/run-production-wiring-canaries.test.mjs \
         scripts/wiring-canary/runners.test.mjs \
+        scripts/wiring-canary/totp.test.mjs \
         web/e2e/production-account-session-canary.test.mjs
 
     echo "== client calls =="

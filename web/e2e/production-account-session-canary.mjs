@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 
+import { totp } from "../../scripts/wiring-canary/totp.mjs";
+
 function required(environment, name) {
     const value = environment[name]?.trim();
     assert(value, `${name} is required`);
@@ -127,6 +129,14 @@ function expectedSessionMethod(providerOrigin) {
         : "oidc";
 }
 
+/** The deposited authenticator key, or `null`. Optional by design: a lane
+ *  whose provider never challenges still runs, and a lane that is challenged
+ *  without a key fails closed with an explicit message. */
+export function totpSecretFor(environment) {
+    const raw = environment.GW_SYNTHETIC_OIDC_TOTP_SECRET?.trim();
+    return raw ? raw : null;
+}
+
 export function providerOriginFor(environment) {
     const raw = environment.GW_SYNTHETIC_OIDC_PROVIDER_ORIGIN?.trim()
         || "https://accounts.google.com";
@@ -208,7 +218,66 @@ async function binaryConfirmationControl(page) {
     return page.locator("button").nth(1);
 }
 
-export async function advanceProviderStates(page, admitted, isSettled) {
+// Google steps a datacenter sign-in up to an identity challenge. The synthetic
+// principal is enrolled in TOTP precisely so this state is deterministic: the
+// challenge-selection list offers an authenticator option, and the challenge
+// itself is one short numeric input. Both are matched structurally as well as
+// by name, because the runner's locale is pinned but Google still localizes
+// some interstitials.
+const TOTP_OPTION_NAME =
+    /(authenticator|google authenticator|verification code|6[- ]digit code|totp)/i;
+const TOTP_INPUT = [
+    "input#totpPin",
+    "input[name=totpPin]",
+    "input[autocomplete='one-time-code']",
+    "input[type=tel]",
+].join(", ");
+
+function totpInput(page) {
+    return page.locator(TOTP_INPUT);
+}
+
+/** The challenge-selection entry that leads to the authenticator prompt, or
+ *  `null` when this screen is not offering one. */
+async function totpChallengeOption(page) {
+    const byName = page
+        .getByRole("link", { name: TOTP_OPTION_NAME })
+        .or(page.getByRole("button", { name: TOTP_OPTION_NAME }));
+    if (await byName.count()) return byName.first();
+    return null;
+}
+
+/** Answer the authenticator challenge from the deposited key. Returns whether
+ *  a challenge was present and answered. Fails closed when the challenge is
+ *  shown but no key is in custody — a silent skip would strand the walk in a
+ *  state the inventory cannot explain. */
+async function answerTotpChallenge(page, secret) {
+    const input = totpInput(page);
+    if (!(await input.count())) return false;
+    assert(
+        secret,
+        "the provider asked for an authenticator code but GW_SYNTHETIC_OIDC_TOTP_SECRET "
+            + "is not in this environment",
+    );
+    const field = input.first();
+    await field.fill(totp(secret));
+    const submit = page
+        .getByRole("button", { name: /^(next|verify|continue|submit|done)$/i })
+        .or(page.locator("#totpNext, button[type=submit]"));
+    if (await submit.count()) {
+        const control = submit.first();
+        await control.click();
+        await settleAfter(page, control);
+    } else {
+        await field.press("Enter");
+        await page.waitForLoadState("domcontentloaded", { timeout: PROVIDER_STEP_TIMEOUT_MS })
+            .catch(() => {});
+    }
+    return true;
+}
+
+export async function advanceProviderStates(page, admitted, isSettled, options = {}) {
+    const totpSecret = options.totpSecret ?? null;
     for (let step = 0; step < MAX_PROVIDER_STEPS; step += 1) {
         if (isSettled()) return;
         const here = providerLocation(page);
@@ -235,6 +304,18 @@ export async function advanceProviderStates(page, admitted, isSettled) {
             const account = accounts.first();
             await account.click();
             await settleAfter(page, account);
+            continue;
+        }
+
+        // Challenges are matched BEFORE consent: the authenticator screen also
+        // carries a "Next" button, which the consent name set would otherwise
+        // click with the code field still empty.
+        if (await answerTotpChallenge(page, totpSecret)) continue;
+
+        const totpOption = await totpChallengeOption(page);
+        if (totpOption) {
+            await totpOption.click();
+            await settleAfter(page, totpOption);
             continue;
         }
 
@@ -352,6 +433,7 @@ export async function runHostedAccountSession(
                 postLogin: postLoginOrigin,
             },
             () => callbackSettled,
+            { totpSecret: totpSecretFor(environment) },
         );
         const callbackResponse = await callback;
         assert(

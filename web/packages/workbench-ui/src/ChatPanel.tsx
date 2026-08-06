@@ -16,7 +16,53 @@ import {
 import { type FilterPrefs } from "./transcript-filter";
 import { type TranscriptLine } from "./transcript";
 import { TranscriptView } from "./TranscriptView";
-import { type Session, useSession } from "./session-context";
+import {
+    type Session,
+    type TurnActivity as Activity,
+    type TurnObservation,
+    useSession,
+} from "./session-context";
+import { liveToolVerb } from "./tool-verb";
+
+/** One label per live-turn state, keyed by the shared vocabulary so a state
+ *  added to `TURN_ACTIVITIES` cannot compile without a phrase to show for it.
+ *
+ *  `streaming_output` is intentionally blank: the answer text arriving in the
+ *  transcript is itself the indicator, and a status line under it would only
+ *  narrate what the reader is already watching. */
+const ACTIVITY_LABEL: Record<Activity, (name: string, observation: TurnObservation) => string> = {
+    idle: () => "",
+    awaiting_model: (name) => `${name} is thinking`,
+    streaming_output: () => "",
+    // The tool's name is the reason this state earns a line at all: a ten-second
+    // pause reads completely differently as "running a command".
+    running_tool: (name, observation) =>
+        observation.tool ? `${name} is ${liveToolVerb(observation.tool)}` : `${name} is using a tool`,
+    compacting: (name) => `${name} is making room for more context`,
+    retrying: (name) => `${name} is retrying`,
+    settling: (name) => `${name} is finishing up`,
+    stopping: (name) => `Stopping ${name}`,
+};
+
+function TurnActivity(props: { session: Session; agentName?: string }): JSX.Element {
+    const observation = () => props.session.turnActivity();
+    const label = () =>
+        ACTIVITY_LABEL[observation().state](props.agentName?.trim() || "Agent", observation());
+    return (
+        <Show when={label() !== ""}>
+            <div
+                class="turn-activity"
+                data-turn-activity={observation().state}
+                data-turn-tool={observation().tool}
+                role="status"
+                aria-live="polite"
+            >
+                <span>{label()}</span>
+                <span class="turn-activity-dots" aria-hidden="true"><i /><i /><i /></span>
+            </div>
+        </Show>
+    );
+}
 
 export interface ChatPanelProps {
     /** Explicit leaf for hosts that mount without an ambient provider. */
@@ -177,6 +223,7 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                     onResolveCredential={props.onResolveCredential}
                     onFork={session().forkAt}
                 />
+                <TurnActivity session={session()} agentName={props.agentName} />
                 {props.transcriptTail}
             </div>
             <SessionComposer

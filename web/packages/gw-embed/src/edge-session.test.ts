@@ -178,6 +178,8 @@ describe("EdgeSessionApi", () => {
 
         const deltas: StreamEvent[] = [];
         api.subscribe("ignored" as EngagementId, (event) => deltas.push(event));
+        const activities: { state: string; tool?: string }[] = [];
+        api.subscribeTurnActivity((activity) => activities.push(activity));
         const turn = api.runEmbedTurn("ignored" as EngagementId, "hello", [
             { mimeType: "image/png", data: "aGVsbG8=" },
         ]);
@@ -226,6 +228,44 @@ describe("EdgeSessionApi", () => {
         });
         await expect(followUp).resolves.toBeUndefined();
         expect(api.getTurnQueue()).toMatchObject([{ text: "and then summarize" }]);
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "turn_activity",
+                request_id: sent.request_id,
+                activity: "awaiting_model",
+                ephemeral: true,
+            }),
+        });
+        expect(api.getTurnActivity()).toEqual({ state: "awaiting_model" });
+        expect(activities).toEqual([{ state: "awaiting_model" }]);
+
+        // The tool's name rides the frame — it is the whole reason this state
+        // earns a line rather than reading as an unexplained pause.
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "turn_activity",
+                request_id: sent.request_id,
+                activity: "running_tool",
+                tool: "bash",
+                ephemeral: true,
+            }),
+        });
+        expect(api.getTurnActivity()).toEqual({ state: "running_tool", tool: "bash" });
+
+        // A runtime ahead of this client may publish a state it has never heard
+        // of. Hold the last known state rather than adopting an unrenderable
+        // one: `busy` is derived from activity, so a word with no label would
+        // disable the composer with nothing on screen explaining why.
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "turn_activity",
+                request_id: sent.request_id,
+                activity: "reticulating_splines",
+                ephemeral: true,
+            }),
+        });
+        expect(api.getTurnActivity()).toEqual({ state: "running_tool", tool: "bash" });
+
         sockets[0]!.emit("message", {
             data: JSON.stringify({
                 type: "text_delta",

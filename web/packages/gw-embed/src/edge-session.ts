@@ -11,7 +11,9 @@ import type {
     EdgeUsage,
     EmbedQueuedTurn,
     EmbedSessionApi,
+    TurnObservation,
 } from "./session-api";
+import { TURN_ACTIVITIES } from "./session-api";
 import {
     observeBrowserLatency,
     relayServerLatency,
@@ -25,6 +27,7 @@ interface EdgeState {
     readonly transcript: StreamEvent[];
     readonly files: { path: string }[];
     readonly queue?: EmbedQueuedTurn[];
+    readonly active_turn?: { readonly activity?: string };
 }
 
 type PendingTurn = {
@@ -58,6 +61,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
     private readonly pendingStops = new Map<string, PendingAck>();
     private readonly pendingQueueOperations = new Map<string, PendingQueueOperation>();
     private readonly queueListeners = new Set<(queue: readonly EmbedQueuedTurn[]) => void>();
+    private readonly activityListeners = new Set<(activity: TurnObservation) => void>();
     private readonly assistantText = new Map<string, string>();
     private readonly acceptedMessages = new Set<string>();
     private readonly receivedRequests = new Set<string>();
@@ -68,6 +72,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
     private snapshot: EdgeState | null = null;
     private lastUsage: EdgeUsage | null = null;
     private turnQueue: EmbedQueuedTurn[] = [];
+    private turnActivity: TurnObservation = { state: "idle" };
     private cursor = 0;
     private disposed = false;
     private refreshPromise: Promise<void> | null = null;
@@ -140,6 +145,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
             this.snapshot = snapshot as EdgeState;
             this.cursor = cursor;
             this.setTurnQueue(this.snapshot.queue ?? []);
+            this.setTurnActivity(this.snapshot.active_turn?.activity);
         }
     }
 
@@ -322,8 +328,20 @@ export class EdgeSessionApi implements EmbedSessionApi {
                 this.snapshot = snapshot as unknown as EdgeState;
                 this.cursor = Math.max(this.cursor, Number(this.snapshot.cursor) || 0);
                 this.setTurnQueue(this.snapshot.queue ?? []);
+                this.setTurnActivity(this.snapshot.active_turn?.activity);
             }
             return "session_ready";
+        }
+        // An unrecognized activity is dropped rather than rendered: the runtime
+        // may publish a state this client predates, and holding the last known
+        // state is the safe reading — it never invents a label and never pins
+        // the composer busy on a word we cannot show.
+        if (message.type === "turn_activity" && typeof message.activity === "string") {
+            this.setTurnActivity(
+                message.activity,
+                typeof message.tool === "string" ? message.tool : undefined,
+            );
+            return "turn_activity";
         }
         const sequence = Number(message.sequence);
         if (Number.isSafeInteger(sequence)) {
@@ -497,6 +515,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
             (message.type === "turn_terminal" || message.type === "error") &&
             typeof message.request_id === "string"
         ) {
+            this.setTurnActivity("idle");
             const pending = this.pendingTurns.get(message.request_id);
             if (!pending) return String(message.type);
             this.observeLatency("terminal_received", {
@@ -575,6 +594,16 @@ export class EdgeSessionApi implements EmbedSessionApi {
         for (const listener of this.queueListeners) listener(this.turnQueue);
     }
 
+    private setTurnActivity(activity: string | undefined, tool?: string): void {
+        const state = (TURN_ACTIVITIES as readonly string[]).includes(activity ?? "idle")
+            ? ((activity ?? "idle") as TurnObservation["state"])
+            : undefined;
+        if (state === undefined) return;
+        if (state === this.turnActivity.state && tool === this.turnActivity.tool) return;
+        this.turnActivity = tool ? { state, tool } : { state };
+        for (const listener of this.activityListeners) listener(this.turnActivity);
+    }
+
     private async queueOperation(payload: Record<string, unknown>): Promise<void> {
         const operationId = newIdempotencyKey().replaceAll("-", "_");
         const socket = await this.connect();
@@ -619,6 +648,15 @@ export class EdgeSessionApi implements EmbedSessionApi {
 
     getTurnQueue(): readonly EmbedQueuedTurn[] {
         return this.turnQueue;
+    }
+
+    getTurnActivity(): TurnObservation {
+        return this.turnActivity;
+    }
+
+    subscribeTurnActivity(listener: (activity: TurnObservation) => void): () => void {
+        this.activityListeners.add(listener);
+        return () => this.activityListeners.delete(listener);
     }
 
     subscribeTurnQueue(listener: (queue: readonly EmbedQueuedTurn[]) => void): () => void {

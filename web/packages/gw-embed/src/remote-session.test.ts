@@ -13,6 +13,8 @@ const idleMerge: MergeState = {
 
 /** Minimal fake edge API that captures live events and records commands. */
 function fakeApi() {
+    let activity: import("./session-api").TurnObservation = { state: "idle" };
+    let onActivity: ((value: import("./session-api").TurnObservation) => void) | undefined;
     const calls = {
         onEvent: undefined as ((ev: StreamEvent) => void) | undefined,
         closed: false,
@@ -20,6 +22,10 @@ function fakeApi() {
         runEmbedTurn: vi.fn<EmbedSessionApi["runEmbedTurn"]>(async () => undefined),
         mergeCommand: vi.fn(async () => idleMerge),
         recordFirstTextRendered: vi.fn(),
+        emitActivity: (value: import("./session-api").TurnObservation) => {
+            activity = value;
+            onActivity?.(value);
+        },
     };
     const api: EmbedSessionApi = {
         getTranscript: async () => [] as StreamEvent[],
@@ -40,6 +46,11 @@ function fakeApi() {
         embedMyChats: async () => [],
         embedGetConfig: async () => ({ white_label: false }),
         recordFirstTextRendered: calls.recordFirstTextRendered,
+        getTurnActivity: () => activity,
+        subscribeTurnActivity: (listener) => {
+            onActivity = listener;
+            return () => { onActivity = undefined; };
+        },
     };
     return { api, calls };
 }
@@ -153,6 +164,20 @@ describe("createRemoteSession", () => {
         await first;
         await vi.waitFor(() => expect(session.busy()).toBe(false));
         disposeRoot();
+    });
+
+    it("keeps the shared composer busy from runtime activity across reconnect", () => {
+        createRoot((dispose) => {
+            const f = fakeApi();
+            const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
+            expect(session.busy()).toBe(false);
+            f.calls.emitActivity({ state: "awaiting_model" });
+            expect(session.turnActivity().state).toBe("awaiting_model");
+            expect(session.busy()).toBe(true);
+            f.calls.emitActivity({ state: "idle" });
+            expect(session.busy()).toBe(false);
+            dispose();
+        });
     });
 
     it("tracks cross-panel file selection", () => {
