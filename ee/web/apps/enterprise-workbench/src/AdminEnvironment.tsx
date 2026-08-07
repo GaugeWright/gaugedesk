@@ -429,6 +429,10 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
             stage: true,
             attachments: [],
         }),
+        // Same-origin HTTP to the Administration Environment: no separately
+        // observable transport state, so a command is always issuable and its
+        // failure is reported as the turn's.
+        canCommand: () => true,
         merge: () => undefined,
         onContentSaved: refresh,
         send: answer,

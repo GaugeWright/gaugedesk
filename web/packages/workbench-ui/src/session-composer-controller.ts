@@ -72,6 +72,9 @@ export interface SessionComposerControllerOptions {
     readonly scope: Accessor<string>;
     readonly busy: Accessor<boolean>;
     readonly capabilities: Accessor<ComposerCapabilities>;
+    /** The Session's momentary command admission. Omitted means always able —
+     * the honest default for a host whose transport is local. */
+    readonly canCommand?: Accessor<boolean>;
     readonly send: (
         text: string,
         images: readonly ImageRef[],
@@ -96,6 +99,11 @@ export interface SessionComposerController {
     readonly queue: Accessor<readonly ComposerQueueItem[]>;
     readonly attachments: Accessor<readonly Attachment[]>;
     readonly busy: Accessor<boolean>;
+    /** The transport cannot presently carry a standing command. Distinct from
+     * `canSubmit` (is there anything to send?) and from `busy` (is a turn
+     * already running?), because the repair is different for each and the
+     * composer says so differently. */
+    readonly blocked: Accessor<boolean>;
     readonly gated: Accessor<boolean>;
     readonly reviewNext: Accessor<boolean>;
     readonly canSubmit: Accessor<boolean>;
@@ -147,6 +155,7 @@ export function createSessionComposerController(
     let nextQueueId = 1;
 
     const busy = () => options.busy() || dispatchingScopes().has(options.scope());
+    const blocked = () => options.canCommand?.() === false;
     const markDispatching = (scope: string, active: boolean) => {
         setDispatchingScopes((current) => {
             const next = new Set(current);
@@ -175,7 +184,7 @@ export function createSessionComposerController(
     createComputed(on(options.scope, resetScopedState, { defer: true }));
 
     const pump = () => {
-        if (busy() || gated()) return;
+        if (busy() || gated() || blocked()) return;
         const next = stagedQueue()[0];
         if (!next) return;
         setStagedQueue((current) => current.slice(1));
@@ -195,6 +204,13 @@ export function createSessionComposerController(
         if (previous && !now) queueMicrotask(pump);
     }));
 
+    // A transport that recovers drains what was staged while it was down. Without
+    // this, anything queued during an outage waits for the next unrelated pump
+    // and reads as silently swallowed — the outcome `blocked` exists to prevent.
+    createEffect(on(blocked, (now, previous) => {
+        if (previous && !now) queueMicrotask(pump);
+    }));
+
     const takeOutgoing = (): QueuedTurn | null => {
         const outgoing = buildOutgoing(draft(), [...attachments()]);
         if (!outgoing.message.trim()) return null;
@@ -211,6 +227,9 @@ export function createSessionComposerController(
     };
 
     const submit = () => {
+        // Refuse before `takeOutgoing`, which clears the draft: a send that cannot
+        // be carried must leave the text where the writer can still see it.
+        if (blocked()) return;
         if (!options.capabilities().queue && busy()) return;
         const outgoing = takeOutgoing();
         if (!outgoing) return;
@@ -225,6 +244,7 @@ export function createSessionComposerController(
     };
 
     const steer = () => {
+        if (blocked()) return;
         if (!options.capabilities().steer || (!options.runtime && !options.stop)) return;
         const outgoing = takeOutgoing();
         if (!outgoing) return;
@@ -244,7 +264,8 @@ export function createSessionComposerController(
     };
 
     const stop = () => {
-        if (!options.stop || !busy()) return;
+        // Stop is a standing command too, so a dead transport cannot deliver it.
+        if (blocked() || !options.stop || !busy()) return;
         setError("");
         void options.stop().catch((cause) => report(`Could not stop: ${failureMessage(cause)}`));
     };
@@ -336,6 +357,7 @@ export function createSessionComposerController(
         setStagedQueue((current) => current.filter((item) => item.id !== id));
     };
     const sendNowQueued = (id: number | string) => {
+        if (blocked()) return;
         const item = queue().find((candidate) => candidate.id === id);
         if (!item) return;
         if (typeof id === "string" && options.runtime) {
@@ -370,6 +392,7 @@ export function createSessionComposerController(
         queue,
         attachments,
         busy,
+        blocked,
         gated,
         reviewNext,
         canSubmit,

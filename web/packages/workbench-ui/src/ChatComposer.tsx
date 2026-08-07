@@ -25,6 +25,12 @@ export interface ChatComposerProps {
     readonly gated?: boolean;
     readonly reviewNext?: boolean;
     readonly canSubmit: boolean;
+    /** The Session cannot presently carry a standing command. Disables the
+     *  command controls and *only* those — the draft stays editable, because
+     *  composing while unable to deliver is the point of an offline client. The
+     *  Environment shows why elsewhere (mobile's connection banner), so this is
+     *  a refusal with a stated reason rather than a dead control. */
+    readonly blocked?: boolean;
     readonly error?: string;
     readonly attaching?: boolean;
     /** Marks the public custom-element contract without changing presentation. */
@@ -237,7 +243,8 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                             class="composer-primary send-btn"
                             type="button"
                             data-embed-send={props.audience ? "" : undefined}
-                            disabled={!props.canSubmit}
+                            data-blocked={props.blocked ? "" : undefined}
+                            disabled={!props.canSubmit || props.blocked}
                             onClick={props.onSubmit}
                         >
                             <Icon name={props.gated ? "queue" : "send"} />
@@ -251,7 +258,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                             type="button"
                             data-testid="steer-turn"
                             title="Steer the running agent before its next model response"
-                            disabled={!props.canSubmit}
+                            disabled={!props.canSubmit || props.blocked}
                             onClick={props.onSteer}
                         >
                             Steer
@@ -263,7 +270,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                             type="button"
                             data-testid="queue-msg"
                             title="Queue this message — runs after the current turn finishes"
-                            disabled={!props.canSubmit}
+                            disabled={!props.canSubmit || props.blocked}
                             onClick={props.onSubmit}
                         >
                             <Icon name="queue" />
@@ -276,6 +283,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                             type="button"
                             data-testid="stop-turn"
                             title="Stop the running turn"
+                            disabled={props.blocked}
                             onClick={() => props.onStop?.()}
                         >
                             Stop

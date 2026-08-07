@@ -168,6 +168,12 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         busy,
         turnActivity,
         composerCapabilities: () => composerCapabilities,
+        // The EDGE-5 client owns one socket and re-establishes it on demand
+        // rather than exposing an up/down state the panel reads, so from here a
+        // command is always issuable — a send during a reconnect waits on the
+        // socket instead of being refused. If that client later projects its
+        // transport state, this is where the panel starts believing it.
+        canCommand: () => true,
         composerRuntime,
         merge: (action: MergeAction) => void api.mergeCommand(id, action).then(() => settle()),
         onContentSaved: () => void Promise.allSettled([refetchDiff(), refetchMerge()]),

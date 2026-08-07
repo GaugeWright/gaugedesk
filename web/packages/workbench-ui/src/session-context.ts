@@ -214,6 +214,27 @@ export interface Session {
     /** Explicit conversation commands admitted by this Environment. Audience is
      *  presentation identity, not a capability shortcut. */
     readonly composerCapabilities: Accessor<ComposerCapabilities>;
+    /** Whether this Session can carry a standing command *right now*.
+     *
+     * The momentary companion to `composerCapabilities`, which is static: that
+     * says which commands this Environment admits at all, this says whether the
+     * transport can presently deliver one. A phone whose relay dropped still
+     * admits `send` as a capability; it simply cannot issue one until the
+     * connection returns.
+     *
+     * `false` refuses the send, and only the send. Drafting stays permitted —
+     * composing while unable to deliver is exactly what an offline client is for
+     * (`mobile-client.md`, "Connection, freshness, offline"), and the client
+     * cannot manufacture truth by queueing a command it cannot carry (`INV-5`).
+     * The Environment is responsible for saying *why* somewhere the reader can
+     * see it (mobile's connection banner), so this never becomes a silently dead
+     * control.
+     *
+     * Required, not optional, for the reason `turnActivity` is: an optional
+     * member is how a producer whose transport genuinely can drop silently opts
+     * out while still typechecking. An Environment whose transport is local and
+     * always available answers `() => true`, and that is an honest answer. */
+    readonly canCommand: Accessor<boolean>;
     /** Runtime-owned interactive command queue when this Environment can join
      * messages to a live turn. Absent environments retain local staging. */
     readonly composerRuntime?: ComposerRuntimeCommands;

@@ -13,6 +13,7 @@ const flush = async () => {
 function harness(send = vi.fn(async () => undefined)) {
     const [scope, setScope] = createSignal("chat-1");
     const [busy, setBusy] = createSignal(false);
+    const [canCommand, setCanCommand] = createSignal(true);
     const stop = vi.fn(async () => undefined);
     let dispose!: () => void;
     const controller = createRoot((rootDispose) => {
@@ -21,11 +22,12 @@ function harness(send = vi.fn(async () => undefined)) {
             scope,
             busy,
             capabilities: () => UNIVERSAL_COMPOSER_CAPABILITIES,
+            canCommand,
             send,
             stop,
         });
     });
-    return { controller, send, stop, setBusy, setScope, dispose };
+    return { controller, send, stop, setBusy, setScope, setCanCommand, dispose };
 }
 
 describe("createSessionComposerController", () => {
@@ -212,5 +214,80 @@ describe("createSessionComposerController", () => {
         setScope("chat-2");
         expect(controller.draft()).toBe("typed during navigation");
         dispose();
+    });
+
+    describe("a transport that cannot carry a standing command", () => {
+        it("refuses the send and keeps the draft where the writer can see it", () => {
+            const h = harness();
+            h.setCanCommand(false);
+            h.controller.setDraft("written while offline");
+            h.controller.submit();
+            expect(h.controller.blocked()).toBe(true);
+            expect(h.send).not.toHaveBeenCalled();
+            // The refusal must not consume the text. Clearing it would lose work
+            // to a condition the writer did not cause and cannot see here.
+            expect(h.controller.draft()).toBe("written while offline");
+            h.dispose();
+        });
+
+        it("still permits drafting, which is the point of composing offline", () => {
+            const h = harness();
+            h.setCanCommand(false);
+            h.controller.setDraft("a long message composed on the train");
+            expect(h.controller.draft()).toBe("a long message composed on the train");
+            expect(h.controller.canSubmit()).toBe(true);
+            h.dispose();
+        });
+
+        it("refuses stop, which is a standing command a dead transport cannot deliver", () => {
+            const h = harness();
+            h.setBusy(true);
+            h.setCanCommand(false);
+            h.controller.stop();
+            expect(h.stop).not.toHaveBeenCalled();
+            h.dispose();
+        });
+
+        it("drains what was staged during the outage once the transport returns", async () => {
+            const h = harness();
+            // Staged while able, held by a turn already running.
+            h.setBusy(true);
+            h.controller.setDraft("queued before the drop");
+            h.controller.submit();
+            expect(h.controller.queue()).toHaveLength(1);
+
+            // The transport drops, then the turn settles: the queue must not
+            // dispatch into a connection that cannot carry it.
+            h.setCanCommand(false);
+            h.setBusy(false);
+            await flush();
+            expect(h.send).not.toHaveBeenCalled();
+            expect(h.controller.queue()).toHaveLength(1);
+
+            // Recovery drains it without further input. Anything less reads as
+            // silently swallowed.
+            h.setCanCommand(true);
+            await flush();
+            expect(h.send).toHaveBeenCalledWith("queued before the drop", [], { review: false });
+            expect(h.controller.queue()).toHaveLength(0);
+            h.dispose();
+        });
+
+        it("is always able when the host declares no momentary admission", () => {
+            const [scope] = createSignal("chat-1");
+            const [busy] = createSignal(false);
+            let dispose!: () => void;
+            const controller = createRoot((rootDispose) => {
+                dispose = rootDispose;
+                return createSessionComposerController({
+                    scope,
+                    busy,
+                    capabilities: () => UNIVERSAL_COMPOSER_CAPABILITIES,
+                    send: async () => undefined,
+                });
+            });
+            expect(controller.blocked()).toBe(false);
+            dispose();
+        });
     });
 });

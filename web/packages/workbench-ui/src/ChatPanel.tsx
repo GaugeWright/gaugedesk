@@ -106,6 +106,7 @@ export function SessionComposer(props: {
         send: (text, images, options) => session!.send(text, images, options),
         stop: session!.stop,
         runtime: session!.composerRuntime,
+        canCommand: session!.canCommand,
     });
     const hasAttachments = () => controller.capabilities().attachments.length > 0;
     const hasQueue = () => controller.capabilities().queue;
@@ -117,6 +118,7 @@ export function SessionComposer(props: {
             queue={hasQueue() ? controller.queue() : []}
             attachments={controller.attachments()}
             busy={controller.busy()}
+            blocked={controller.blocked()}
             gated={controller.gated()}
             reviewNext={controller.reviewNext()}
             canSubmit={controller.canSubmit()}

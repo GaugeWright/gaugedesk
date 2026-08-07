@@ -1,8 +1,9 @@
 /**
  * Step bindings for the mobile projection-client flow (MOB-029). They drive the
  * real mobile harness (`?mobile=1`, {@link MobileApp}) in the browser — clicking
- * the committed D-MOBILE islands (PairingFlow, Carousel, MobileChat,
- * ConnectionBanner) and asserting on the rendered projections — over the live
+ * the committed D-MOBILE islands (PairingFlow, Carousel, ConnectionBanner) and
+ * the shared ChatPanel at the chat stop, asserting on the rendered projections —
+ * over the live
  * control plane. Like `steps.ts` these never reach into client state; they assert
  * only on what the device actually renders (`principles.md`: thin renderer).
  *
@@ -61,6 +62,13 @@ async function tapPane(page: Page, label: string): Promise<void> {
     await page.locator(".carousel-seg", { hasText: label }).click();
 }
 
+// The chat stop renders the one shared ChatPanel (ADR 0076), so these steps drive
+// the same composer the desktop and embed steps drive — scoped to the mobile pane
+// so they cannot accidentally match another surface on the page.
+const draftBox = (page: Page) =>
+    page.locator('.mobile-chat [data-chat-composer] textarea[aria-label="Message"]');
+const sendButton = (page: Page) => page.locator(".mobile-chat [data-chat-composer] .send-btn");
+
 When("I open the chat pane", async ({ page }) => {
     await tapPane(page, "Chat");
     await expect(page.locator(".carousel[data-pane='chat']")).toBeVisible();
@@ -73,7 +81,7 @@ When("I open the browse pane", async ({ page }) => {
 });
 
 Then("the chat composer is shown", async ({ page }) => {
-    await expect(page.locator("[data-composer-draft]")).toBeVisible();
+    await expect(draftBox(page)).toBeVisible();
 });
 
 Then("the paired environment is shown", async ({ page }) => {
@@ -86,7 +94,7 @@ When("I start a new chat on the device", async ({ page }) => {
     // The Chat tab's "new chat" affordance starts a chat (the same "just chat"
     // work-chat quick-start the desktop uses) and opens its composer.
     await tapPane(page, "Chat");
-    await expect(page.locator("[data-composer-draft]")).toBeVisible();
+    await expect(draftBox(page)).toBeVisible();
 });
 
 Then("it shows up as a work chat in the desktop's Personal project", async ({ page }) => {
@@ -126,17 +134,24 @@ Then("the offline banner is gone", async ({ page }) => {
 
 Then("the composer refuses to send", async ({ page }) => {
     // The banner and the disabled send are one fold (MOB-028): offline disables send.
-    await page.locator("[data-composer-draft]").fill("blocked while offline");
-    await expect(page.locator("[data-composer-send]")).toBeDisabled();
+    await draftBox(page).fill("blocked while offline");
+    await expect(sendButton(page)).toBeDisabled();
+    // Disabled *for the stated reason*, not incidentally: with text in the box
+    // the only thing that can be refusing the send is the connection.
+    await expect(sendButton(page)).toHaveAttribute("data-blocked", "");
+    // And the draft survives the refusal — a send that cannot be carried must
+    // not consume the text (the shared controller refuses before taking it).
+    await expect(draftBox(page)).toHaveValue("blocked while offline");
+    await draftBox(page).fill("");
 });
 
 Then("I can send {string}", async ({ page }, text: string) => {
-    const send = page.locator("[data-composer-send]");
-    await page.locator("[data-composer-draft]").fill(text);
+    const send = sendButton(page);
+    await draftBox(page).fill(text);
     await expect(send).toBeEnabled();
     await send.click();
-    // The optimistic send clears the draft (the committed composer reducer).
-    await expect(page.locator("[data-composer-draft]")).toHaveValue("");
+    // Taking the message clears the draft (the shared composer controller).
+    await expect(draftBox(page)).toHaveValue("");
 });
 
 // ---- the human task queue (the top bar's Next ③ affordance) ------------------

@@ -1806,6 +1806,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         busy: () => selected() === id && busy(),
         turnActivity: localTurnActivity(() => selected() === id && busy(), transcript),
         composerCapabilities: () => UNIVERSAL_COMPOSER_CAPABILITIES,
+        // The desktop's control plane is co-resident, so there is no transport
+        // between this panel and the runtime that can be down on its own. A
+        // failing command fails as a turn, which the composer already reports.
+        canCommand: () => true,
         merge: (action) => void onMerge(action),
         onContentSaved: () => void Promise.all([refetchDiff(), refetchMerge()]),
         send: async (text, images = [], options = {}) => {

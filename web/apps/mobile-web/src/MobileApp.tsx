@@ -59,21 +59,19 @@ import {
 } from "@gaugewright/control-plane-client";
 import {
     applySelection,
-    applySend,
     Carousel,
     ChatApprovalCard,
     type ChatApprovalState,
+    ChatPanel,
     ConnectionBanner,
     type ConnectionState,
-    type ComposerState,
-    emptyComposer,
+    createSessionComposerController,
     emptyTranscript,
     FacetBrowser,
     fromSnapshot,
     initialCarousel,
     initialConnection,
     initialPairing,
-    MobileChat,
     PairingFlow,
     parsePairingStatus,
     parseTicket,
@@ -89,9 +87,8 @@ import {
     type Transcript,
     type CarouselState,
     type PaneKind,
-    type TurnPhase,
-    TranscriptView,
 } from "@gaugewright/workbench-ui";
+import { createMobileSession } from "./mobile-session";
 import { MobileControlPlane } from "./mobile-control-plane";
 import {
     accountTokenExpiresWithin,
@@ -995,8 +992,11 @@ function MobileSession(props: {
         initialConnection({ identity: DEVICE, grants: [] }, Date.now()),
     );
     const [carousel, setCarousel] = createSignal<CarouselState>(initialCarousel);
-    const [composer, setComposer] = createSignal<ComposerState>(emptyComposer);
-    const [turn, setTurn] = createSignal<TurnPhase>("idle");
+    // The composer draft is held here rather than inside the shared controller so
+    // it can ride the account draft cache on every keystroke (MOB-004: a draft
+    // survives leaving the chat, restarting, and going offline). The controller
+    // reads and writes it through its controlled-draft seam.
+    const [draft, setDraftText] = createSignal("");
     // An inline merge/review approval card threaded in the chat transcript (MOB-031),
     // or `null` when the turn surfaced nothing to approve. It folds the same review
     // lifecycle the desktop output catalog drives, inline at the chat stop.
@@ -1269,7 +1269,10 @@ function MobileSession(props: {
             props.account.project.id,
             `chat:${id}`,
         )?.value;
-        setComposer(savedDraft ? { ...emptyComposer, draft: savedDraft } : emptyComposer);
+        // Restored without re-caching: `setDraftText`, not `setDraft`. The value
+        // came from the cache, and writing it back would restamp its freshness as
+        // though it had just been typed on this connection.
+        setDraftText(savedDraft ?? "");
         setSelectedFile(null);
         setTranscript(emptyTranscript);
         setApproval(null);
@@ -1526,58 +1529,28 @@ function MobileSession(props: {
     // ---- send (the one standing command the client may issue) ---------------
     const [reviewNext, setReviewNext] = createSignal(false);
 
-    async function send(text: string) {
+    // Every draft change is cached for the open chat, so a draft survives leaving
+    // the chat, restarting, and going offline. The shared composer clears the
+    // draft when it takes a message, which lands here as an empty value and
+    // retires the saved one — the same two writes the retired composer made, now
+    // driven by one seam instead of two call sites.
+    const cacheDraft = (value: string) => {
+        const account = props.account;
         const id = engagement();
-        if (id === null) return;
-        const rid = clientRequestId(`req-${Date.now()}`);
-        if (props.account) {
-            props.account.draftCache.put({
-                homeId: props.account.connection.homeId,
-                project: props.account.project.id,
-                key: `chat:${id}`,
-                value: text,
-                freshness: props.account.connectionState() === "live" ? "live" : "offline",
-                updatedAt: Date.now(),
-            });
-        }
-        setComposer((s) => applySend(s, rid, turn()));
-        setTurn("running");
-        append(`send: ${text}`);
-        try {
-            const review = reviewNext();
-            setReviewNext(false);
-            await api.runTask(id, text, [], review);
-            props.account?.draftCache.put({
-                homeId: props.account.connection.homeId,
-                project: props.account.project.id,
-                key: `chat:${id}`,
-                value: "",
-                freshness: props.account.connectionState() === "live" ? "live" : "offline",
-                updatedAt: Date.now(),
-            });
-            append("turn complete");
-            setWsKey((k) => k + 1); // settle changes the sibling task-queue projection
-            setFilesKey((k) => k + 1); // the turn may have changed the worktree
-        } catch (e) {
-            append(`turn error: ${String(e)}`);
-            if (props.account) setComposer((state) => ({ ...state, draft: text }));
-        } finally {
-            setTurn("idle");
-            // Reconcile the optimistic entry now the environment answered.
-            setComposer((s) => ({ draft: s.draft, pending: s.pending.filter((p) => p !== rid) }));
-        }
-    }
-
-    async function stop() {
-        const id = engagement();
-        if (id === null) return;
-        try {
-            await api.stopTurn(id);
-        } catch {
-            /* best-effort abort */
-        }
-        setTurn("idle");
-    }
+        if (!account || id === null) return;
+        account.draftCache.put({
+            homeId: account.connection.homeId,
+            project: account.project.id,
+            key: `chat:${id}`,
+            value,
+            freshness: account.connectionState() === "live" ? "live" : "offline",
+            updatedAt: Date.now(),
+        });
+    };
+    const setDraft = (value: string) => {
+        setDraftText(value);
+        cacheDraft(value);
+    };
 
     // ---- inline approval (consent / release on the chat-stop card) ----------
     // Consent and release are standing review commands (INV-5/INV-7): we record the
@@ -1622,6 +1595,46 @@ function MobileSession(props: {
                 return "offline" as const;
         }
     };
+
+    // The chat stop renders the one shared ChatPanel (ADR 0076) over this
+    // Session, so the phone shows the same transcript, live-turn activity line,
+    // and composer every other surface shows. A phone's narrower means are
+    // declared as capabilities on the Session, not as a lesser composer.
+    const session = createMobileSession({
+        api,
+        engagementId: engagement,
+        transcript,
+        connection: status,
+        selectedFile,
+        selectFile: (path) => (path === null ? setSelectedFile(null) : openFile(path)),
+        worktreeRev: filesKey,
+        onSettled: () => {
+            setWsKey((k) => k + 1); // settle changes the sibling task-queue projection
+            setFilesKey((k) => k + 1); // the turn may have changed the worktree
+        },
+        onSendFailed: setDraft,
+        onStatus: append,
+    });
+
+    // Bound here rather than left to ChatPanel's default so the draft routes
+    // through the account cache and the review toggle drives the phone's own
+    // signal. Everything else is the shared controller's.
+    const composerController = createSessionComposerController({
+        scope: () => String(engagement() ?? "none"),
+        busy: session.busy,
+        capabilities: session.composerCapabilities,
+        canCommand: session.canCommand,
+        send: (text, images, turnOptions) => session.send(text, images, turnOptions),
+        stop: session.stop,
+        draft: { value: draft, set: setDraft },
+        review: { value: reviewNext, set: setReviewNext },
+        // The host owns the draft across selection changes: `selectEngagement`
+        // restores the newly opened chat's cached draft itself. Letting the
+        // controller clear on scope change would write that empty value straight
+        // back through the cache seam and destroy the draft it had just restored.
+        retainDraftOnScopeChange: true,
+        onStatus: append,
+    });
 
     // The four carousel panes. Chat is the committed MobileChat composer wired to a
     // real engagement; the others are light, real projections of the paired state —
@@ -1676,6 +1689,7 @@ function MobileSession(props: {
                         if (engagement() === id) {
                             unsubscribe?.();
                             setEngagement(null);
+                            setDraftText("");
                             setTranscript(emptyTranscript);
                             setCarousel((c) =>
                                 applySelection(c, { chatSelected: false, fileSelected: false }),
@@ -1690,53 +1704,29 @@ function MobileSession(props: {
         ),
         chat: (
             <div class="mobile-chat" data-pane="chat">
-                {/* The live transcript (MOB-F2): the same fold the desktop chat pane
-                    renders, so the device sees what the agent did — not just the
-                    consent surface below it. */}
-                <div class="mobile-transcript" data-mobile-transcript>
-                    <TranscriptView
-                        lines={transcript().lines}
-                        onOpen={() => undefined}
-                        fallback={<div class="status">no activity yet</div>}
-                    />
-                </div>
-                {/* An inline merge/review approval card threads into the transcript
-                    when a turn surfaces a result needing approval (MOB-031). */}
-                <Show when={approval()}>
-                    {(a) => (
-                        <ChatApprovalCard
-                            state={a()}
-                            connection={status()}
-                            onConsent={consent}
-                            onRelease={release}
-                        />
-                    )}
-                </Show>
-                <MobileChat
-                    state={composer()}
-                    phase={turn()}
-                    connection={status()}
-                    reviewNext={reviewNext()}
-                    onState={(state) => {
-                        setComposer(state);
-                        const id = engagement();
-                        if (props.account && id) {
-                            props.account.draftCache.put({
-                                homeId: props.account.connection.homeId,
-                                project: props.account.project.id,
-                                key: `chat:${id}`,
-                                value: state.draft,
-                                freshness:
-                                    props.account.connectionState() === "live"
-                                        ? "live"
-                                        : "offline",
-                                updatedAt: Date.now(),
-                            });
-                        }
-                    }}
-                    onSend={send}
-                    onToggleReview={() => setReviewNext((value) => !value)}
-                    onStop={stop}
+                {/* The one shared chat panel (ADR 0076): transcript, live-turn
+                    activity, and composer — the same components the desktop and
+                    every audience surface render. `bare` because this pane owns
+                    its own flex container. The inline merge/review approval card
+                    (MOB-031) threads into the transcript through the panel's
+                    tail slot, which is where it belongs. */}
+                <ChatPanel
+                    bare
+                    session={session}
+                    composerController={composerController}
+                    composerPlaceholder="Message…"
+                    transcriptTail={
+                        <Show when={approval()}>
+                            {(a) => (
+                                <ChatApprovalCard
+                                    state={a()}
+                                    connection={status()}
+                                    onConsent={consent}
+                                    onRelease={release}
+                                />
+                            )}
+                        </Show>
+                    }
                 />
             </div>
         ),
