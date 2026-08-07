@@ -37,6 +37,12 @@
     "qrcode-generator": "^2.0.4",
     "solid-js": "^1.9.0"
   },
+  "_overrides": "officeparser pins pdfjs-dist at exactly 6.1.200, which GHSA-hq66-cqwq-w95j reports as high severity: a malicious PDF can execute arbitrary JavaScript. Every published officeparser through 7.5.1 pins that same version, so no upgrade resolves it, and `npm audit fix --force` would downgrade officeparser to 6.0.7 and an older pdfjs still. 6.2.108 is the first fixed release and is the same major, which is why forcing it here is safe. Remove this once officeparser ships a pin at or above 6.2.108.",
+  "overrides": {
+    "officeparser": {
+      "pdfjs-dist": "6.2.108"
+    }
+  },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
     "@types/node": "^26.1.2",
