@@ -32,7 +32,12 @@ hex = "0.4"
 # `IdentityProvider` seam. `ring` is the crypto backend (already in the tree via
 # tokio-rustls), keeping the build OpenSSL- and cmake-free to match the app's
 # `crypto_nossl` choice. `use_pem` gives RS256/ES256 key loading from PEM.
-jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+# jsonwebtoken 11 makes the crypto backend pluggable and installs none by
+# default: verifying a token panics unless exactly one provider feature is
+# on. `rust_crypto` is pure Rust and pulls crates this workspace already
+# builds (p256, sha2); `aws_lc_rs` would add a C toolchain requirement to
+# every desktop and mobile cross-build.
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
 # base64 for the enterprise OIDC auth-code state/claims decoding (ID-3).
 base64 = "0.23"
 

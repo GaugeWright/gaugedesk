@@ -8,14 +8,21 @@ description = "gaugewright pure core: domain types and lifecycle reducers (no I/
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 hex = "0.4"
 sha2 = "0.11"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Keep the shared authority/lifecycle core usable from browser projections.
 # Native Machine and Android adapters still use their platform RNGs.
-getrandom = { version = "0.2", features = ["js"] }
+#
+# p256 0.14 moved the RNG under elliptic-curve 0.14 -> crypto-common 0.2 to
+# getrandom 0.4, and features never cross a crate major: the 0.2 `js` backend
+# this line used to enable no longer reaches the instance the graph resolves to.
+# `wasm_js` is 0.4's Crypto.getRandomValues backend for wasm32-unknown-unknown,
+# which otherwise refuses to compile for want of one. getrandom 0.2 is no longer
+# in this crate's tree, so the old entry would enable a backend for nothing.
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 proptest = "1"

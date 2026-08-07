@@ -75,7 +75,8 @@ impl SigningKey {
             })
     }
 
-    /// The matching [`PublicKey`] — SEC1-compressed, hex-encoded. This is the
+    /// The matching [`PublicKey`] — SEC1 uncompressed (`04 || x || y`),
+    /// hex-encoded. This is the
     /// value pinned in a `BridgeGrant` at pairing and carried as an envelope's
     /// `source_pubkey`.
     pub fn public_key(&self) -> PublicKey {
@@ -87,7 +88,11 @@ impl SigningKey {
     /// Protocol adapters that must publish JWK coordinates can use this without
     /// gaining access to private key material.
     pub fn public_key_uncompressed_bytes(&self) -> [u8; 65] {
-        let encoded = self.0.verifying_key().to_encoded_point(false);
+        // p256 0.14 renames `to_encoded_point` to `to_sec1_point`; both emit
+        // the uncompressed SEC1 encoding for `false`, so the 65 bytes are
+        // unchanged. `uncompressed_point_agrees_with_the_compressed_key` holds
+        // that against the compressed API, which this release did not touch.
+        let encoded = self.0.verifying_key().to_sec1_point(false);
         encoded
             .as_bytes()
             .try_into()
@@ -166,6 +171,38 @@ mod tests {
         let uncompressed = sk.public_key_uncompressed_bytes();
         assert_eq!(uncompressed.len(), 65);
         assert_eq!(uncompressed[0], 4);
+    }
+
+    /// `public_key()` and `public_key_uncompressed_bytes()` describe the same
+    /// point, byte for byte.
+    ///
+    /// Both are wire formats: `public_key()` is pinned in a `BridgeGrant` at
+    /// pairing and carried as an envelope's `source_pubkey`, and the byte form
+    /// is what protocol adapters publish as JWK coordinates. A changed encoding
+    /// re-identifies existing peers rather than failing.
+    ///
+    /// p256 0.14 renamed the call behind the byte form (`to_encoded_point` to
+    /// `to_sec1_point`) and left `to_sec1_bytes` alone, so holding the two
+    /// against each other checks the renamed call against an independent
+    /// witness rather than against a recorded constant.
+    ///
+    /// Both are the *uncompressed* SEC1 encoding: `NistP256::COMPRESS_POINTS`
+    /// is `false` in 0.13 and 0.14 alike, so `to_sec1_bytes` emits `04 || x || y`
+    /// and always has. The doc on `public_key` calling it compressed is wrong
+    /// and predates this; the encoding itself is unchanged by the upgrade.
+    #[test]
+    fn the_two_public_key_encodings_agree() {
+        let sk = signer();
+        let from_hex = hex::decode(sk.public_key().as_str()).expect("public key is hex");
+        let from_bytes = sk.public_key_uncompressed_bytes();
+
+        assert_eq!(from_hex.len(), 65, "SEC1 uncompressed is 65 bytes");
+        assert_eq!(from_hex[0], 0x04, "SEC1 uncompressed is tagged 0x04");
+        assert_eq!(
+            from_hex.as_slice(),
+            from_bytes.as_slice(),
+            "the renamed call must produce what the untouched one produces",
+        );
     }
 
     /// The same signature over a *different* message does not verify (INV-21).

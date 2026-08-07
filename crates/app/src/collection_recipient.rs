@@ -13,7 +13,7 @@
 //! TypeScript sealer and this opener agree; without it, artifacts seal
 //! successfully and never decrypt, and nothing surfaces until ingest.
 
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{ecdh::diffie_hellman, PublicKey as P256PublicKey, SecretKey};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -97,7 +97,7 @@ pub fn open_sealed_collection(
 ) -> Result<Vec<u8>, CollectionOpenError> {
     let secret = SecretKey::from_slice(recipient_private_seed)
         .map_err(|_| CollectionOpenError::InvalidRecipient)?;
-    let recipient_public = hex::encode(secret.public_key().to_encoded_point(false).as_bytes());
+    let recipient_public = hex::encode(secret.public_key().to_sec1_point(false).as_bytes());
     let wrap = sealed
         .wraps
         .iter()
@@ -238,7 +238,7 @@ impl CollectionRecipientStore {
             .map_err(|_| io::Error::other("stored recipient key is invalid"))?;
         Ok(CollectionRecipient {
             recipient_ref: format!("recipient:collection:{recipient_id}"),
-            public_key_hex: hex::encode(secret.public_key().to_encoded_point(false).as_bytes()),
+            public_key_hex: hex::encode(secret.public_key().to_sec1_point(false).as_bytes()),
         })
     }
 
@@ -296,7 +296,8 @@ impl CollectionRecipientStore {
         }
         let seed = loop {
             let mut candidate = [0_u8; 32];
-            getrandom::getrandom(&mut candidate).map_err(io::Error::other)?;
+            getrandom::getrandom(&mut candidate)
+                .map_err(|error| io::Error::other(error.to_string()))?;
             if SecretKey::from_slice(&candidate).is_ok() {
                 break candidate;
             }
@@ -349,7 +350,7 @@ mod tests {
         let seed = store.open_seed("theory-a").expect("seed is readable");
         let secret = SecretKey::from_slice(&seed).expect("seed is a valid scalar");
         assert_eq!(
-            hex::encode(secret.public_key().to_encoded_point(false).as_bytes()),
+            hex::encode(secret.public_key().to_sec1_point(false).as_bytes()),
             recipient.public_key_hex,
         );
         let _ = std::fs::remove_dir_all(&dir);

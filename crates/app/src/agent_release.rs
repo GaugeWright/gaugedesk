@@ -459,7 +459,13 @@ impl PublisherCredential {
             .as_millis()
             .to_string();
         let mut nonce_bytes = [0_u8; 24];
-        getrandom::getrandom(&mut nonce_bytes).map_err(io::Error::other)?;
+        // p256 0.14 brings a second `getrandom` major into the graph, and the
+        // `std::error::Error` impl no longer applies to the one this resolves
+        // to, so `io::Error::other` cannot take it directly. `Display` is
+        // implemented by every version, so converting through it is stable
+        // whichever major wins resolution.
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|error| io::Error::other(error.to_string()))?;
         let nonce = hex::encode(nonce_bytes);
         Ok(sign_publisher_command(
             &self.authority,

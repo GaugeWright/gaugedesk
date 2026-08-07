@@ -95,7 +95,7 @@ impl FileKeyStore {
         }
         let key = loop {
             let mut seed = [0_u8; 32];
-            getrandom::getrandom(&mut seed).map_err(io::Error::other)?;
+            getrandom::getrandom(&mut seed).map_err(|error| io::Error::other(error.to_string()))?;
             if let Ok(key) = SigningKey::from_seed(&seed) {
                 break key;
             }

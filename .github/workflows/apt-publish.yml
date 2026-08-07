@@ -21,7 +21,7 @@ permissions:
 jobs:
   publish:
     name: promote Debian release
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ubuntu-22.04
     environment: production
     env:
       AWS_REGION: auto

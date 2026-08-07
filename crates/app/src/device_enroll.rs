@@ -24,7 +24,7 @@
 //!
 //! [ADR 0055]: ../../specs/decisions/0055-enrollment-handshake-protocol.md
 
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{ecdh::diffie_hellman, PublicKey as P256PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -85,7 +85,7 @@ pub fn seal_to_subkey(subkey_pub: &PublicKey, plaintext: &[u8]) -> Option<Sealed
     let key = derive_key(shared.raw_secret_bytes().as_ref());
     let ct = LocalAeadEncryptor::new(key).encrypt(plaintext).ok()?;
     Some(SealedKey {
-        ephemeral_pubkey: hex::encode(eph.public_key().to_encoded_point(false).as_bytes()),
+        ephemeral_pubkey: hex::encode(eph.public_key().to_sec1_point(false).as_bytes()),
         ciphertext: hex::encode(ct),
     })
 }

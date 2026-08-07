@@ -11,7 +11,7 @@
 //! [`BackupRecipientPublicKey`], [`BackupKeyWrap`], and point ciphertext. The
 //! private type is intentionally neither serializable nor cloneable.
 
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{ecdh::diffie_hellman, PublicKey as P256PublicKey, SecretKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -84,7 +84,7 @@ impl BackupRecipientPrivateKey {
 
     pub fn public_key(&self) -> BackupRecipientPublicKey {
         BackupRecipientPublicKey(hex::encode(
-            self.0.public_key().to_encoded_point(false).as_bytes(),
+            self.0.public_key().to_sec1_point(false).as_bytes(),
         ))
     }
 
@@ -224,7 +224,7 @@ pub fn wrap_data_key(
         .map_err(|_| BackupKeyringError::Encrypt)?;
     Ok(BackupKeyWrap {
         recipient_id: recipient.id.clone(),
-        ephemeral_pubkey: hex::encode(ephemeral.public_key().to_encoded_point(false).as_bytes()),
+        ephemeral_pubkey: hex::encode(ephemeral.public_key().to_sec1_point(false).as_bytes()),
         ciphertext: hex::encode(ciphertext),
     })
 }
