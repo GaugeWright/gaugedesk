@@ -101,6 +101,15 @@ async function sanitizedControlInventory(page) {
                 ),
             ];
             const publicLabels = publicLabelsArg;
+            const anchorPath = (control) => {
+                if (control.tagName.toLowerCase() !== "a") return "";
+                try {
+                    // The pathname only: a query can carry identifiers.
+                    return new URL(control.href, location.origin).pathname;
+                } catch {
+                    return "";
+                }
+            };
             return controls.slice(0, 20).map((control) => {
                 const text = (control.textContent ?? "")
                     .replace(/[\u2018\u2019]/g, "'")
@@ -115,6 +124,7 @@ async function sanitizedControlInventory(page) {
                     control.id ?? "",
                     control.getAttribute("type") ?? "",
                     label,
+                    anchorPath(control),
                 ].join(":");
             });
         }, PUBLIC_CONTROL_LABELS);
@@ -334,7 +344,10 @@ async function answerTotpChallenge(page, secret, path) {
 // cannot answer (a device prompt, which renders no controls at all) reaches
 // the authenticator instead.
 function anotherWayLink(page) {
-    return page.locator("a[href*='challenge/selection'], a[href*='/selectchallenge']");
+    return page
+        .locator("a[href*='challenge/selection'], a[href*='/selectchallenge']")
+        .or(page.getByRole("link", { name: /try another way|another way|more ways/i }))
+        .or(page.getByRole("button", { name: /try another way|another way|more ways/i }));
 }
 
 export async function advanceProviderStates(page, admitted, isSettled, options = {}) {
@@ -384,6 +397,20 @@ export async function advanceProviderStates(page, admitted, isSettled, options =
             continue;
         }
 
+        // A verification we cannot answer (a phone code, a device tap) ends the
+        // walk here: take the hatch to the method menu, where the
+        // authenticator is selectable by its stable type.
+        if (/challenge\//.test(here.path) && !TOTP_PATH.test(here.path)
+            && !/consent/.test(here.path) && !/challenge\/selection/.test(here.path)) {
+            const another = anotherWayLink(page);
+            if (await another.count()) {
+                const link = another.first();
+                await link.click();
+                await settleAfter(page, link);
+                continue;
+            }
+        }
+
         // Challenges are matched BEFORE consent: the authenticator screen also
         // carries a "Next" button, which the consent name set would otherwise
         // click with the code field still empty.
@@ -419,7 +446,12 @@ export async function advanceProviderStates(page, admitted, isSettled, options =
             }
         }
 
-        if (await consent.count() > 0) {
+        // Consent names ("Next", "Continue") also label challenge submit
+        // buttons — the phone-code screen's Next is one — so consent matching
+        // is confined to screens that are not asking to verify. A consent
+        // interstitial is a challenge path too, and its confirm is genuine.
+        const verificationScreen = /challenge\//.test(here.path) && !/consent/.test(here.path);
+        if (!verificationScreen && await consent.count() > 0) {
             const control = consent.first();
             await control.click();
             await settleAfter(page, control);
