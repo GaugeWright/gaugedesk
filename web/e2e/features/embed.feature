@@ -18,6 +18,29 @@ Feature: Embedded panels (EMBED-2)
     Then the embedded chat still shows its configured opening message
     Then the embedded transcript shows "hello from the embed"
 
+  Scenario: a running turn says what the agent is doing, then gets out of the way
+    Given a delayed embedded chat is open
+    When I send "what is taking so long" in the embedded chat
+    Then the embedded chat says the agent is thinking
+    And the embedded activity row is announced politely
+    When the delayed turn completes
+    Then the embedded chat shows no activity row
+
+  Scenario: a running tool is named rather than left unexplained
+    Given a delayed embedded chat running the "bash" tool is open
+    When I send "build it" in the embedded chat
+    Then the embedded chat says the agent is thinking
+    Then the embedded chat says the agent is running a command
+    When the delayed turn completes
+    Then the embedded chat shows no activity row
+
+  Scenario: stopping a turn returns the indicator to rest
+    Given a delayed embedded chat is open
+    When I send "never mind" in the embedded chat
+    Then the embedded chat says the agent is thinking
+    When I stop the embedded turn
+    Then the embedded chat shows no activity row
+
   Scenario: an anonymous embedded chat can start a fresh session
     Given an anonymous embedded chat is open
     Then the embedded chat shows a new session action

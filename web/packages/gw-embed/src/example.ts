@@ -9,7 +9,7 @@ import type {
 
 import { registerEmbedElements, type GwSessionElement } from "./elements";
 import { createRemoteSession } from "./remote-session";
-import type { EmbedQueuedTurn, EmbedSessionApi } from "./session-api";
+import type { EmbedQueuedTurn, EmbedSessionApi, TurnObservation } from "./session-api";
 
 registerEmbedElements();
 
@@ -65,7 +65,26 @@ function fixtureApi(): EmbedSessionApi {
     };
     const delayParam = params.get("delay");
     const delay = delayParam === null ? null : Number(delayParam);
+    // The live-turn projection, driven exactly as the runtime drives it: the
+    // states and the `tool` field mirror WhippleScript's `turn_activity` frame
+    // (spec/agent-harness.md), so a fixture turn rehearses the real sequence
+    // rather than a shape only this file believes in.
+    let observation: TurnObservation = { state: "idle" };
+    const activityListeners = new Set<(value: TurnObservation) => void>();
+    const setObservation = (next: TurnObservation) => {
+        observation = next;
+        for (const listener of activityListeners) listener(next);
+    };
+    // `?tool=` rehearses a turn that runs a named tool before answering; without
+    // it the turn goes straight from thinking to streaming, which is what a
+    // tool-less deployment actually does.
+    const fixtureTool = params.get("tool");
     return {
+        getTurnActivity: () => observation,
+        subscribeTurnActivity: (listener: (value: TurnObservation) => void) => {
+            activityListeners.add(listener);
+            return () => activityListeners.delete(listener);
+        },
         getTranscript: async () => [] as StreamEvent[],
         subscribe: (_id, listener) => {
             onEvent = listener;
@@ -78,14 +97,25 @@ function fixtureApi(): EmbedSessionApi {
             const turns = JSON.parse(document.body.dataset.fixtureTurns ?? "[]") as unknown[];
             turns.push({ prompt, images });
             document.body.dataset.fixtureTurns = JSON.stringify(turns);
+            setObservation({ state: "awaiting_model" });
             return new Promise<void>((resolve) => {
                 active = { resolve };
                 if (delay !== null && Number.isFinite(delay) && delay >= 0) {
+                    if (fixtureTool) {
+                        setTimeout(
+                            () => setObservation({ state: "running_tool", tool: fixtureTool }),
+                            Math.max(1, Math.floor(delay / 3)),
+                        );
+                    }
                     active.timer = setTimeout(() => {
+                        // Answer text is its own indicator, so the runtime moves
+                        // to streaming as the first delta lands.
+                        setObservation({ state: "streaming_output" });
                         onEvent?.({ type: "text", delta: `Completed: ${prompt}` });
                         queue = [];
                         publishQueue();
                         active = undefined;
+                        setObservation({ state: "idle" });
                         resolve();
                     }, delay);
                 }
@@ -113,6 +143,7 @@ function fixtureApi(): EmbedSessionApi {
             const { resolve } = active;
             active = undefined;
             document.body.dataset.fixtureStopped = "true";
+            setObservation({ state: "idle" });
             resolve();
         },
         getTurnQueue: () => queue,

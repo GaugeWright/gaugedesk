@@ -30,6 +30,11 @@ Given("a delayed embedded chat is open", async ({ page }) => {
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
 });
 
+Given("a delayed embedded chat running the {string} tool is open", async ({ page }, tool: string) => {
+    await page.goto(`/embed-example.html?fixture=1&panels=chat&delay=1200&tool=${encodeURIComponent(tool)}`);
+    await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
+});
+
 Given("an anonymous embedded chat is open", async ({ page }) => {
     await page.goto("/embed-example.html?fixture=1&panels=chat&audience=anonymous");
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
@@ -398,4 +403,46 @@ Then("every embedded panel fits without horizontal overflow", async ({ page }) =
         expect(metrics.hostScrollWidth).toBeLessThanOrEqual(metrics.hostClientWidth);
         expect(metrics.panelScrollWidth).toBeLessThanOrEqual(metrics.panelClientWidth);
     }
+});
+
+// -- live turn observation (ADR 0123) ---------------------------------------
+// The panel is the only place a visitor learns a turn is running before its
+// durable answer lands, so these assert the rendered words, not the state name.
+
+Then("the embedded chat says the agent is thinking", async ({ page }) => {
+    await expect(page.locator("[data-turn-activity='awaiting_model']"))
+        .toContainText(/is thinking/i, { timeout: 10_000 });
+});
+
+Then("the embedded chat says the agent is running a command", async ({ page }) => {
+    const running = page.locator("[data-turn-activity='running_tool']");
+    // The tool's name is the whole point of the state — a generic "using a tool"
+    // would leave the pause as unexplained as no indicator at all.
+    await expect(running).toContainText(/is running a command/i, { timeout: 10_000 });
+    await expect(running).toHaveAttribute("data-turn-tool", "bash");
+});
+
+Then("the embedded activity row is announced politely", async ({ page }) => {
+    // A status that only exists visually is not an indicator for everyone.
+    const row = page.locator(".turn-activity").first();
+    await expect(row).toHaveAttribute("role", "status");
+    await expect(row).toHaveAttribute("aria-live", "polite");
+    // The dots are decoration; a screen reader must not spell them out.
+    await expect(page.locator(".turn-activity-dots").first())
+        .toHaveAttribute("aria-hidden", "true");
+});
+
+When("the delayed turn completes", async ({ page }) => {
+    await expect(page.locator(".turn-activity")).toHaveCount(0, { timeout: 15_000 });
+});
+
+When("I stop the embedded turn", async ({ page }) => {
+    await page.locator("[data-testid='stop-turn']").click();
+});
+
+Then("the embedded chat shows no activity row", async ({ page }) => {
+    // Streaming text is its own indicator, and a settled turn shows nothing —
+    // an indicator that never clears is worse than none, because it also keeps
+    // the composer disabled.
+    await expect(page.locator(".turn-activity")).toHaveCount(0, { timeout: 15_000 });
 });
