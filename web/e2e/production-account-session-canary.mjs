@@ -238,13 +238,36 @@ function totpInput(page) {
 }
 
 /** The challenge-selection entry that leads to the authenticator prompt, or
- *  `null` when this screen is not offering one. */
+ *  `null` when this screen is not offering one by a name we recognize. */
 async function totpChallengeOption(page) {
     const byName = page
         .getByRole("link", { name: TOTP_OPTION_NAME })
         .or(page.getByRole("button", { name: TOTP_OPTION_NAME }));
     if (await byName.count()) return byName.first();
     return null;
+}
+
+/** A challenge menu that offers exactly one way to verify. Its label is
+ *  localized — Google picks the language from the account and the egress, not
+ *  from the browser's locale — so the sole option is taken by shape rather
+ *  than by name. A menu offering several options still requires the
+ *  authenticator entry to be recognized by name, so the walk can never pick an
+ *  unautomatable method (a phone tap, an SMS) by accident. */
+async function soleChallengeOption(page) {
+    let shape = null;
+    try {
+        shape = await page.evaluate(() => {
+            const buttons = [...document.querySelectorAll("button, [role=button], a[role=link]")];
+            const inputs = document.querySelectorAll(
+                "input[type=password], input[type=email], input[type=text], input[type=tel]",
+            );
+            return { options: buttons.length, inputs: inputs.length };
+        });
+    } catch {
+        return null;
+    }
+    if (!shape || shape.options !== 1 || shape.inputs !== 0) return null;
+    return page.locator("button, [role=button], a[role=link]").first();
 }
 
 /** Answer the authenticator challenge from the deposited key. Returns whether
@@ -317,6 +340,15 @@ export async function advanceProviderStates(page, admitted, isSettled, options =
             await totpOption.click();
             await settleAfter(page, totpOption);
             continue;
+        }
+
+        if (/challenge\/selection/.test(here.path)) {
+            const sole = await soleChallengeOption(page);
+            if (sole) {
+                await sole.click();
+                await settleAfter(page, sole);
+                continue;
+            }
         }
 
         if (await consent.count() > 0) {

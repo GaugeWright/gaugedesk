@@ -182,6 +182,7 @@ function providerHarness({
                 if (selector.includes("submit_approve_access")) return current.consent ? 1 : 0;
                 if (selector === "button") return current.plainButtons ?? 0;
                 if (selector.includes("totpPin")) return current.totpInput ? 1 : 0;
+                if (selector.startsWith("button, [role=button]")) return current.soleOption ? 1 : 0;
                 return 0;
             };
             const control = {
@@ -252,9 +253,13 @@ function providerHarness({
                 throw new Error(`unexpected browser request ${path}`);
             }
             if (Array.isArray(argument)) return []; // sanitized inventory
-            // The binary-confirmation shape probe.
+            // The two shape probes: binary confirmation and sole challenge option.
             const current = screen();
-            return { buttons: current?.plainButtons ?? 0, inputs: current?.textInputs ?? 0 };
+            return {
+                buttons: current?.plainButtons ?? 0,
+                options: current?.soleOption ? 1 : (current?.plainButtons ?? 0),
+                inputs: current?.textInputs ?? 0,
+            };
         },
     };
     // Sign-out is not the subject here; short-circuit it so each case isolates
@@ -349,6 +354,44 @@ test("a risk interstitial whose confirm is a role-button is advanced to the call
         harness.clicked,
         ["[data-identifier]", "role:button:" + String(CONSENT_ROLE_NAME)],
         "the walk must advance the chooser and then the role-button interstitial",
+    );
+});
+
+test("a localized sole challenge option is taken by shape", async () => {
+    // Google localizes the challenge menu by account and egress, so its single
+    // entry matches no English name; taking the only option is unambiguous.
+    const harness = providerHarness({
+        apiOrigin: API,
+        frontendOrigin: FRONTEND,
+        screens: [
+            { url: `${PROVIDER}/v3/signin/accountchooser`, identifiers: 1 },
+            { url: `${PROVIDER}/v3/signin/challenge/selection`, soleOption: true },
+            { url: `${PROVIDER}/v3/signin/challenge/totp`, totpInput: true },
+        ],
+    });
+    const environment = {
+        ...environmentFor(),
+        GW_SYNTHETIC_OIDC_TOTP_SECRET: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+    };
+    const result = await runHostedAccountSession(environment, harness.browserType);
+    assert.equal(result.callbackStatus, 302);
+    assert.match(harness.filled[0] ?? "", /^\d{6}$/, "the walk reached and answered the code");
+});
+
+test("a challenge menu offering several options fails closed", async () => {
+    // Several methods and no recognizable authenticator name: picking blind
+    // could select a phone tap or an SMS, which nothing can automate.
+    const harness = providerHarness({
+        apiOrigin: API,
+        frontendOrigin: FRONTEND,
+        screens: [
+            { url: `${PROVIDER}/v3/signin/accountchooser`, identifiers: 1 },
+            { url: `${PROVIDER}/v3/signin/challenge/selection`, plainButtons: 3 },
+        ],
+    });
+    await assert.rejects(
+        () => runHostedAccountSession(environmentFor(), harness.browserType),
+        /unrecognised screen at \/v3\/signin\/challenge\/selection/,
     );
 });
 
