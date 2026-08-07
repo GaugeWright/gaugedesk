@@ -246,9 +246,16 @@ function totpInput(page) {
     return page.locator(TOTP_INPUT);
 }
 
+// Google tags each verification method on the challenge menu with a stable
+// numeric type; 6 is the authenticator. Preferring the attribute over the
+// label keeps the choice exact when the menu is localized, which it is.
+const TOTP_CHALLENGE_TYPE = '[data-challengetype="6"]';
+
 /** The challenge-selection entry that leads to the authenticator prompt, or
- *  `null` when this screen is not offering one by a name we recognize. */
+ *  `null` when this screen is not offering one. */
 async function totpChallengeOption(page) {
+    const byType = page.locator(TOTP_CHALLENGE_TYPE);
+    if (await byType.count()) return byType.first();
     const byName = page
         .getByRole("link", { name: TOTP_OPTION_NAME })
         .or(page.getByRole("button", { name: TOTP_OPTION_NAME }));
