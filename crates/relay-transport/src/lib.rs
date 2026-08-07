@@ -419,7 +419,10 @@ impl TlsIdentity {
         let certified = rcgen::generate_simple_self_signed(vec![PIN_SNI.to_owned()])
             .map_err(|error| other(format!("generate relay TLS identity: {error}")))?;
         let cert = certified.cert.der().clone();
-        let key = certified.key_pair.serialize_der();
+        // rcgen 0.14 renamed `CertifiedKey::key_pair` to `signing_key`. Same
+        // key, same PKCS#8 DER serialization — the pinned certificate this
+        // produces is unchanged.
+        let key = certified.signing_key.serialize_der();
         let fingerprint = fingerprint(&cert);
         Ok(Self {
             cert,

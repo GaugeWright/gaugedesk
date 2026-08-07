@@ -61,7 +61,8 @@ impl TlsIdentity {
         let certified = rcgen::generate_simple_self_signed(vec![PIN_SNI.to_string()])
             .map_err(|e| std::io::Error::other(format!("rcgen self-signed: {e}")))?;
         let cert_der = certified.cert.der().clone();
-        let key_der = certified.key_pair.serialize_der();
+        // rcgen 0.14 renamed `CertifiedKey::key_pair` to `signing_key`.
+        let key_der = certified.signing_key.serialize_der();
         let fingerprint = fingerprint_of(&cert_der);
         Ok(Self {
             cert_der,
