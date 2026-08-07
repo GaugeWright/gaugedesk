@@ -96,7 +96,9 @@ async function sanitizedControlInventory(page) {
     try {
         return await page.evaluate((publicLabelsArg) => {
             const controls = [
-                ...document.querySelectorAll("button, [role=button], input[type=submit], input[type=password], input[type=email]"),
+                ...document.querySelectorAll(
+                    "button, [role=button], a[href], input[type=submit], input[type=password], input[type=email]",
+                ),
             ];
             const publicLabels = publicLabelsArg;
             return controls.slice(0, 20).map((control) => {
@@ -326,6 +328,15 @@ async function answerTotpChallenge(page, secret, path) {
     return true;
 }
 
+// Every challenge screen carries an escape hatch to the method menu — the
+// "Try another way" link, whose label is localized but whose href always
+// points at the selection path. Taking it is how a walk stuck on a method it
+// cannot answer (a device prompt, which renders no controls at all) reaches
+// the authenticator instead.
+function anotherWayLink(page) {
+    return page.locator("a[href*='challenge/selection'], a[href*='/selectchallenge']");
+}
+
 export async function advanceProviderStates(page, admitted, isSettled, options = {}) {
     const totpSecret = options.totpSecret ?? null;
     let codesEntered = 0;
@@ -344,6 +355,21 @@ export async function advanceProviderStates(page, admitted, isSettled, options =
 
         const { accounts, consent } = await awaitRecognisableScreen(page);
         if (isSettled()) return;
+        // A screen with no controls at all is the device-prompt challenge: it
+        // waits for a tap that will never come here. Take the escape hatch
+        // immediately rather than idling through the step budget.
+        if (!/challenge\/selection/.test(here.path) && !(await accounts?.count())) {
+            const stuck = await sanitizedControlInventory(page);
+            if (stuck.length === 0) {
+                const another = anotherWayLink(page);
+                if (await another.count()) {
+                    const link = another.first();
+                    await link.click();
+                    await settleAfter(page, link);
+                    continue;
+                }
+            }
+        }
         const offered = accounts ? await accounts.count() : 0;
         if (offered > 0) {
             assert.equal(
@@ -405,6 +431,19 @@ export async function advanceProviderStates(page, admitted, isSettled, options =
             await confirmation.click();
             await settleAfter(page, confirmation);
             continue;
+        }
+
+        // Nothing on this screen is answerable: fall back to the method menu
+        // before giving up, so a device-prompt challenge does not end the walk
+        // when the authenticator is available one click away.
+        if (!/challenge\/selection/.test(here.path)) {
+            const another = anotherWayLink(page);
+            if (await another.count()) {
+                const link = another.first();
+                await link.click();
+                await settleAfter(page, link);
+                continue;
+            }
         }
 
         const inventory = await sanitizedControlInventory(page);

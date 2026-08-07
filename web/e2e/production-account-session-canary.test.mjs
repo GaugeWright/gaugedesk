@@ -184,6 +184,7 @@ function providerHarness({
                 if (selector.includes("totpPin")) return current.totpInput ? 1 : 0;
                 if (selector.startsWith("button, [role=button]")) return current.soleOption ? 1 : 0;
                 if (selector.includes("data-challengetype")) return current.totpChallengeType ? 1 : 0;
+                if (selector.includes("challenge/selection")) return current.anotherWay ? 1 : 0;
                 return 0;
             };
             const control = {
@@ -356,6 +357,28 @@ test("a risk interstitial whose confirm is a role-button is advanced to the call
         ["[data-identifier]", "role:button:" + String(CONSENT_ROLE_NAME)],
         "the walk must advance the chooser and then the role-button interstitial",
     );
+});
+
+test("a device-prompt challenge escapes to the method menu", async () => {
+    // The device prompt renders no controls at all — it waits for a tap that
+    // will never come from a datacenter. Its "Try another way" link reaches
+    // the menu, where the authenticator is selectable by type.
+    const harness = providerHarness({
+        apiOrigin: API,
+        frontendOrigin: FRONTEND,
+        screens: [
+            { url: `${PROVIDER}/v3/signin/accountchooser`, identifiers: 1 },
+            { url: `${PROVIDER}/v3/signin/challenge/ipp/verify`, anotherWay: true },
+            { url: `${PROVIDER}/v3/signin/challenge/selection`, totpChallengeType: true },
+            { url: `${PROVIDER}/v3/signin/challenge/totp`, totpInput: true },
+        ],
+    });
+    const result = await runHostedAccountSession(
+        { ...environmentFor(), GW_SYNTHETIC_OIDC_TOTP_SECRET: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" },
+        harness.browserType,
+    );
+    assert.equal(result.callbackStatus, 302);
+    assert.match(harness.filled[0] ?? "", /^\d{6}$/, "the walk reached the authenticator");
 });
 
 test("the authenticator option is chosen by its stable type, not its label", async () => {
