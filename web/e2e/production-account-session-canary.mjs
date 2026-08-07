@@ -229,12 +229,18 @@ async function binaryConfirmationControl(page) {
 // some interstitials.
 const TOTP_OPTION_NAME =
     /(authenticator|google authenticator|verification code|6[- ]digit code|totp)/i;
+// Only fields that are unambiguously an authenticator code. A bare
+// `input[type=tel]` also matches Google's phone-number and SMS-code
+// challenges, and typing an authenticator code into one of those produces a
+// refusal indistinguishable from a wrong key — so it is deliberately absent.
 const TOTP_INPUT = [
     "input#totpPin",
     "input[name=totpPin]",
     "input[autocomplete='one-time-code']",
-    "input[type=tel]",
 ].join(", ");
+// The provider's own path for the authenticator challenge. A code is typed
+// only on a screen that asks for one.
+const TOTP_PATH = /challenge\/(totp|ipp\/totp)/;
 
 function totpInput(page) {
     return page.locator(TOTP_INPUT);
@@ -277,9 +283,20 @@ async function soleChallengeOption(page) {
  *  a challenge was present and answered. Fails closed when the challenge is
  *  shown but no key is in custody — a silent skip would strand the walk in a
  *  state the inventory cannot explain. */
-async function answerTotpChallenge(page, secret) {
+async function answerTotpChallenge(page, secret, path) {
     const input = totpInput(page);
-    if (!(await input.count())) return false;
+    if (!(await input.count())) {
+        // A challenge screen that asks for a code but exposes no field we
+        // recognize is a different verification method (a phone number, a
+        // mailed code) — report it rather than typing into whatever is there.
+        return false;
+    }
+    if (!TOTP_PATH.test(path)) {
+        assert.fail(
+            `the provider asked for a code at ${path}, which is not its authenticator `
+                + "challenge; this account's step-up is a method the canary cannot answer",
+        );
+    }
     assert(
         secret,
         "the provider asked for an authenticator code but GW_SYNTHETIC_OIDC_TOTP_SECRET "
@@ -337,7 +354,7 @@ export async function advanceProviderStates(page, admitted, isSettled, options =
         // Challenges are matched BEFORE consent: the authenticator screen also
         // carries a "Next" button, which the consent name set would otherwise
         // click with the code field still empty.
-        if (await answerTotpChallenge(page, totpSecret)) {
+        if (await answerTotpChallenge(page, totpSecret, here.path)) {
             codesEntered += 1;
             // A second prompt means the provider refused the first code. Say so
             // rather than spending the step budget re-entering codes it will
@@ -345,9 +362,10 @@ export async function advanceProviderStates(page, admitted, isSettled, options =
             // machine's clock is outside the provider's tolerance.
             assert(
                 codesEntered < 2,
-                "the provider refused the authenticator code; the deposited "
-                    + "GW_SYNTHETIC_OIDC_TOTP_SECRET does not match the account's "
-                    + "current enrollment (or the runner's clock is out of tolerance)",
+                `the provider refused the authenticator code at ${here.path}; the `
+                    + "deposited GW_SYNTHETIC_OIDC_TOTP_SECRET does not match the "
+                    + "account's current enrollment (or the runner's clock is out of "
+                    + "tolerance)",
             );
             continue;
         }

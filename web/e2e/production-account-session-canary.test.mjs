@@ -418,6 +418,28 @@ test("an authenticator challenge is answered from the deposited key", async () =
     assert.match(harness.filled[0], /^\d{6}$/, "a six-digit authenticator code");
 });
 
+test("a code prompt outside the authenticator challenge is refused, not typed into", async () => {
+    // A phone or mailed-code challenge exposes a code field too; typing an
+    // authenticator code into it yields a refusal indistinguishable from a
+    // wrong key, so the walk names the method instead.
+    const harness = providerHarness({
+        apiOrigin: API,
+        frontendOrigin: FRONTEND,
+        screens: [
+            { url: `${PROVIDER}/v3/signin/accountchooser`, identifiers: 1 },
+            { url: `${PROVIDER}/v3/signin/challenge/ipp`, totpInput: true },
+        ],
+    });
+    await assert.rejects(
+        () => runHostedAccountSession(
+            { ...environmentFor(), GW_SYNTHETIC_OIDC_TOTP_SECRET: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" },
+            harness.browserType,
+        ),
+        /not its authenticator challenge/,
+    );
+    assert.equal(harness.filled.length, 0, "no code is typed into another method's field");
+});
+
 test("an authenticator challenge without a deposited key fails closed", async () => {
     const harness = providerHarness({
         apiOrigin: API,
