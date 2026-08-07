@@ -414,7 +414,7 @@ jobs:
       - name: upload bundles (workflow artifact)
         # Keep each platform's bundles inspectable after the run. `error` makes a
         # missing output fail loudly instead of silently publishing an empty artifact.
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gaugedesk-bundles-${{ matrix.os-label }}
           path: |
