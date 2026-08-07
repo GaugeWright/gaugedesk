@@ -527,14 +527,36 @@ test("a provider that never returns to the callback fails with a provider diagno
         apiOrigin: API,
         frontendOrigin: FRONTEND,
         emitCallbackAtEnd: false,
-        screens: Array.from({ length: 8 }, () => ({
+        screens: Array.from({ length: 12 }, () => ({
             url: `${PROVIDER}/v3/signin/accountchooser`,
             identifiers: 1,
         })),
     });
     await assert.rejects(
         runHostedAccountSession(environmentFor(), harness.browserType),
-        /did not return through the callback within 6 provider steps/,
+        /did not return through the callback within 10 provider steps; last screen \/v3\/signin\/accountchooser/,
+    );
+});
+
+test("a refused authenticator code is named rather than retried", async () => {
+    // The provider re-prompting for a code means it refused the first one:
+    // a wrong or rotated key, or a clock outside its tolerance. Spending the
+    // step budget re-entering codes would hide that.
+    const harness = providerHarness({
+        apiOrigin: API,
+        frontendOrigin: FRONTEND,
+        emitCallbackAtEnd: false,
+        screens: Array.from({ length: 4 }, () => ({
+            url: `${PROVIDER}/v3/signin/challenge/totp`,
+            totpInput: true,
+        })),
+    });
+    await assert.rejects(
+        runHostedAccountSession(
+            { ...environmentFor(), GW_SYNTHETIC_OIDC_TOTP_SECRET: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" },
+            harness.browserType,
+        ),
+        /refused the authenticator code/,
     );
 });
 

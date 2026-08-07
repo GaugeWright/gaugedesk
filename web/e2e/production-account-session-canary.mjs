@@ -53,7 +53,10 @@ export function providerStorageState(environment) {
 // a healthy production sign-in.
 const PROVIDER_STEP_TIMEOUT_MS = 30_000;
 const PROVIDER_SCREEN_TIMEOUT_MS = 15_000;
-const MAX_PROVIDER_STEPS = 6;
+// An unchallenged sign-in crosses two or three provider screens; a challenged
+// one adds the menu, the code prompt, and whatever follows it. The budget
+// bounds a stuck walk without truncating an honest path.
+const MAX_PROVIDER_STEPS = 10;
 // The provider marks an account tile differently across its chooser variants.
 // These are tried in order and only the first that matches is counted: taking
 // their union would count one account twice when a variant carries both, and a
@@ -301,6 +304,7 @@ async function answerTotpChallenge(page, secret) {
 
 export async function advanceProviderStates(page, admitted, isSettled, options = {}) {
     const totpSecret = options.totpSecret ?? null;
+    let codesEntered = 0;
     for (let step = 0; step < MAX_PROVIDER_STEPS; step += 1) {
         if (isSettled()) return;
         const here = providerLocation(page);
@@ -333,7 +337,20 @@ export async function advanceProviderStates(page, admitted, isSettled, options =
         // Challenges are matched BEFORE consent: the authenticator screen also
         // carries a "Next" button, which the consent name set would otherwise
         // click with the code field still empty.
-        if (await answerTotpChallenge(page, totpSecret)) continue;
+        if (await answerTotpChallenge(page, totpSecret)) {
+            codesEntered += 1;
+            // A second prompt means the provider refused the first code. Say so
+            // rather than spending the step budget re-entering codes it will
+            // keep refusing: the deposited key is wrong, rotated, or this
+            // machine's clock is outside the provider's tolerance.
+            assert(
+                codesEntered < 2,
+                "the provider refused the authenticator code; the deposited "
+                    + "GW_SYNTHETIC_OIDC_TOTP_SECRET does not match the account's "
+                    + "current enrollment (or the runner's clock is out of tolerance)",
+            );
+            continue;
+        }
 
         const totpOption = await totpChallengeOption(page);
         if (totpOption) {
@@ -371,10 +388,17 @@ export async function advanceProviderStates(page, admitted, isSettled, options =
                 + `(controls: ${inventory.join(", ") || "none"})`,
         );
     }
-    assert(
-        isSettled(),
-        `sign-in did not return through the callback within ${MAX_PROVIDER_STEPS} provider steps`,
-    );
+    if (!isSettled()) {
+        // Name where the walk ran out of budget, structurally — the same
+        // sanitized vocabulary an unrecognised screen reports.
+        const here = providerLocation(page);
+        const inventory = await sanitizedControlInventory(page);
+        assert.fail(
+            `sign-in did not return through the callback within ${MAX_PROVIDER_STEPS} `
+                + `provider steps; last screen ${here.path} `
+                + `(controls: ${inventory.join(", ") || "none"})`,
+        );
+    }
 }
 
 export async function defaultBrowserType() {

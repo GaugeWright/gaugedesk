@@ -37,6 +37,7 @@ run_contracts() {
     node scripts/check-production-canaries.mjs
     node --test \
         scripts/canary-preflight.test.mjs \
+        scripts/provision-canary.test.mjs \
         scripts/check-production-canaries.test.mjs \
         scripts/production-wiring-canary.test.mjs \
         scripts/run-production-wiring-canaries.test.mjs \
