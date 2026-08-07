@@ -34,7 +34,7 @@ hex = "0.4"
 # `crypto_nossl` choice. `use_pem` gives RS256/ES256 key loading from PEM.
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 # base64 for the enterprise OIDC auth-code state/claims decoding (ID-3).
-base64 = "0.22"
+base64 = "0.23"
 
 [dev-dependencies]
 gaugedesk-workspace = { path = "../../crates/workspace" }
