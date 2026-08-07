@@ -94,7 +94,22 @@ const PUBLIC_CONTROL_LABELS = [
 // account address or page content into a job log.
 async function sanitizedControlInventory(page) {
     try {
-        return await page.evaluate((publicLabelsArg) => {
+        const menu = await page.evaluate(() => {
+            const typed = [...document.querySelectorAll("[data-challengetype]")]
+                .map((element) => element.getAttribute("data-challengetype"))
+                .filter((value) => /^\d+$/.test(value ?? ""));
+            const items = document.querySelectorAll("li").length;
+            const clickable = document.querySelectorAll("[jsaction], [jsname]").length;
+            return { typed, items, clickable };
+        }).catch(() => null);
+        const menuNote = menu
+            ? [
+                menu.typed.length ? `challengetypes=${menu.typed.join("|")}` : "",
+                menu.items ? `li=${menu.items}` : "",
+                menu.clickable ? `jsactions=${menu.clickable}` : "",
+            ].filter(Boolean)
+            : [];
+        const controls = await page.evaluate((publicLabelsArg) => {
             const controls = [
                 ...document.querySelectorAll(
                     "button, [role=button], a[href], input[type=submit], input[type=password], input[type=email]",
@@ -128,6 +143,7 @@ async function sanitizedControlInventory(page) {
                 ].join(":");
             });
         }, PUBLIC_CONTROL_LABELS);
+        return [...controls, ...menuNote];
     } catch {
         return ["<inventory unavailable>"];
     }
@@ -353,6 +369,7 @@ function anotherWayLink(page) {
 export async function advanceProviderStates(page, admitted, isSettled, options = {}) {
     const totpSecret = options.totpSecret ?? null;
     let codesEntered = 0;
+    let directPathTried = false;
     for (let step = 0; step < MAX_PROVIDER_STEPS; step += 1) {
         if (isSettled()) return;
         const here = providerLocation(page);
@@ -438,10 +455,31 @@ export async function advanceProviderStates(page, admitted, isSettled, options =
         }
 
         if (/challenge\/selection/.test(here.path)) {
+            // The menu renders its options as list items rather than buttons or
+            // links, so shape and name are tried on those too.
+            const listed = page
+                .locator("li")
+                .filter({ hasText: TOTP_OPTION_NAME })
+                .or(page.locator("li [data-challengetype='6']"));
+            if (await listed.count()) {
+                const option = listed.first();
+                await option.click();
+                await settleAfter(page, option);
+                continue;
+            }
             const sole = await soleChallengeOption(page);
             if (sole) {
                 await sole.click();
                 await settleAfter(page, sole);
+                continue;
+            }
+            // Last resort: the provider addresses each method by path, so ask
+            // for the authenticator directly, carrying this flow's parameters.
+            const current = new URL(page.url());
+            if (!directPathTried && !/challenge\/totp/.test(current.pathname)) {
+                directPathTried = true;
+                current.pathname = current.pathname.replace(/challenge\/selection.*/, "challenge/totp");
+                await page.goto(current.toString(), { waitUntil: "domcontentloaded" }).catch(() => {});
                 continue;
             }
         }

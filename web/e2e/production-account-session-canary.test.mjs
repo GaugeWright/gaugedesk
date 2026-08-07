@@ -185,6 +185,7 @@ function providerHarness({
                 if (selector.startsWith("button, [role=button]")) return current.soleOption ? 1 : 0;
                 if (selector.includes("data-challengetype")) return current.totpChallengeType ? 1 : 0;
                 if (selector.includes("challenge/selection")) return current.anotherWay ? 1 : 0;
+                if (selector === "li" || selector.includes("li ")) return current.listedTotp ? 1 : 0;
                 return 0;
             };
             const control = {
@@ -202,6 +203,7 @@ function providerHarness({
                     return positioned;
                 },
                 or(other) { return combineControls(control, other); },
+                filter() { return control; },
                 async fill(value) { filled.push(value); },
                 async press() { advance(); },
                 async click() {
