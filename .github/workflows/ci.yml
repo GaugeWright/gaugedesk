@@ -22,7 +22,7 @@ jobs:
   rust:
     if: ${{ github.event.repository.private == false }}
     name: rust (fmt · clippy · test)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       # rustup materializes the toolchain named in rust-toolchain.toml.
@@ -34,7 +34,7 @@ jobs:
   architecture:
     if: ${{ github.event.repository.private == false }}
     name: architecture boundaries
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v7
@@ -48,7 +48,7 @@ jobs:
   web:
     if: ${{ github.event.repository.private == false }}
     name: web (typecheck · vitest)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     defaults:
       run:
         working-directory: web
