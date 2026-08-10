@@ -255,7 +255,7 @@ jobs:
         # `--config tauri.bundle.conf.json` merges the release-only overlay that
         # enables createUpdaterArtifacts. Runtime assets need no Pi/plugin bundle:
         # WhippleScript is linked into the control plane.
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           # tauri-action creates the draft GitHub Release + uploads assets with this
           # (the permissions block alone doesn't inject it into the step env).
