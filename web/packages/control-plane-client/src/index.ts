@@ -14,6 +14,7 @@ export * from "./control-plane-workbench";
 export * from "./project-home";
 export * from "./registered-host";
 export * from "./fork-tree";
+export * from "./home-pool";
 export * from "./home-routing";
 export * from "./home-invitation";
 export * from "./management-environment";

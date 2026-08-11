@@ -2,292 +2,43 @@ import {
     accountHomeRoutes,
     accountTenants,
     browserRouteJson,
-    opaqueHomeRouteKey,
     parseOpaqueHomeRoutes,
-    type HomeId,
+    HomePool,
     type AccountTenant,
+    type HomeConnection,
+    type HomeConnectionState,
+    type HomePoolOptions,
     type OpaqueHomeRoute,
-    type ProjectId,
-    type RouteJson,
 } from "@gaugewright/control-plane-client";
 import { MobileControlPlane } from "./mobile-control-plane";
 
-export type MobileHomeConnectionState =
-    | "needs-sign-in"
-    | "needs-admission"
-    | "connecting"
-    | "live"
-    | "stale"
-    | "offline"
-    | "grant-expired"
-    | "grant-revoked"
-    | "device-untrusted"
-    | "policy-denied";
-
-export interface MobileHomeConnection {
-    readonly homeId: HomeId;
-    readonly endpoint: string;
-    readonly api: MobileControlPlane;
-    readonly state: MobileHomeConnectionState;
-    readonly lastUsedAt: number;
-}
-
-interface MutableHomeConnection {
-    readonly homeId: HomeId;
-    readonly endpoint: string;
-    readonly routeKey: string;
-    readonly admission: string;
-    readonly api: MobileControlPlane;
-    state: MobileHomeConnectionState;
-    lastUsedAt: number;
-}
-
-export interface MobileHomePoolOptions {
-    readonly maxConnections?: number;
-    readonly idleMs?: number;
-    readonly now?: () => number;
-    readonly onStateChange?: (
-        homeId: HomeId,
-        state: MobileHomeConnectionState,
-    ) => void;
-    readonly routeJson?: (
-        endpoint: string,
-        auth: {
-            readonly bearer: () => string | null;
-            readonly homeAdmission: () => string | null;
-        },
-    ) => RouteJson;
-    readonly resolveEndpoint?: (route: OpaqueHomeRoute) => Promise<string>;
-    readonly closeRoute?: (homeId: HomeId) => Promise<void>;
-}
-
 /**
- * Bounded exact-Home connection registry for the signed-in mobile client.
- * Hub pointers can select an endpoint but never become authority: every new
- * entry performs target admission and pins the announced Home identity.
+ * Mobile's binding of the shared multi-Home pool (DESK-3). The pool itself —
+ * routing, admission, identity verification, bounded eviction, per-Home state —
+ * lives in `control-plane-client` and is used unchanged by every project-first
+ * client. All that is mobile-specific is which client wraps each Home.
  */
-export class MobileHomePool {
-    private routes = new Map<ProjectId, OpaqueHomeRoute>();
-    private readonly connections = new Map<HomeId, MutableHomeConnection>();
-    private readonly pending = new Map<HomeId, Promise<MutableHomeConnection>>();
-    private readonly maxConnections: number;
-    private readonly idleMs: number;
-    private readonly now: () => number;
-    private readonly makeRouteJson: NonNullable<MobileHomePoolOptions["routeJson"]>;
-    private readonly resolveEndpoint: NonNullable<MobileHomePoolOptions["resolveEndpoint"]>;
-    private readonly closeRoute: NonNullable<MobileHomePoolOptions["closeRoute"]>;
-    private readonly onStateChange: NonNullable<MobileHomePoolOptions["onStateChange"]>;
+export type MobileHomeConnectionState = HomeConnectionState;
+export type MobileHomeConnection = HomeConnection<MobileControlPlane>;
+export type MobileHomePoolOptions = Omit<HomePoolOptions<MobileControlPlane>, "client">;
 
+export class MobileHomePool extends HomePool<MobileControlPlane> {
     constructor(
         routes: readonly OpaqueHomeRoute[],
-        private readonly bearer: () => string | null,
+        bearer: () => string | null,
         options: MobileHomePoolOptions = {},
     ) {
-        this.maxConnections = Math.max(1, options.maxConnections ?? 3);
-        this.idleMs = Math.max(1, options.idleMs ?? 5 * 60_000);
-        this.now = options.now ?? Date.now;
-        this.onStateChange = options.onStateChange ?? (() => undefined);
-        this.makeRouteJson =
-            options.routeJson
-            ?? ((endpoint, auth) => browserRouteJson(endpoint, auth));
-        this.resolveEndpoint = options.resolveEndpoint ?? (async (route) => route.endpoint);
-        this.closeRoute = options.closeRoute ?? (async () => undefined);
-        this.replaceRoutes(routes);
-    }
-
-    replaceRoutes(routes: readonly OpaqueHomeRoute[]): void {
-        const next = new Map<ProjectId, OpaqueHomeRoute>();
-        for (const route of routes) {
-            const prior = next.get(route.project);
-            if (
-                prior
-                && opaqueHomeRouteKey(prior) !== opaqueHomeRouteKey(route)
-            ) {
-                throw new Error(`conflicting Home routes for project ${route.project}`);
-            }
-            next.set(route.project, route);
-        }
-        this.routes = next;
-
-        for (const [homeId, connection] of this.connections) {
-            const stillRouted = routes.some(
-                (route) =>
-                    route.homeId === homeId
-                    && opaqueHomeRouteKey(route) === connection.routeKey,
-            );
-            if (!stillRouted) void this.disconnect(homeId);
-        }
-    }
-
-    routeFor(project: ProjectId): OpaqueHomeRoute {
-        const route = this.routes.get(project);
-        if (!route) throw new Error(`no granted Home route for project ${project}`);
-        return route;
-    }
-
-    snapshot(): MobileHomeConnection[] {
-        return [...this.connections.values()]
-            .map(({ admission: _admission, ...connection }) => connection)
-            .sort((left, right) => left.homeId.localeCompare(right.homeId));
-    }
-
-    async connectProject(project: ProjectId): Promise<MobileHomeConnection> {
-        const route = this.routeFor(project);
-        const existing = this.connections.get(route.homeId);
-        if (existing) {
-            if (existing.routeKey !== opaqueHomeRouteKey(route)) {
-                await this.disconnect(route.homeId);
-            } else if (existing.state === "live") {
-                existing.lastUsedAt = this.now();
-                return this.publicConnection(existing);
-            } else {
-                await this.disconnect(route.homeId);
-            }
-        }
-
-        let pending = this.pending.get(route.homeId);
-        if (!pending) {
-            pending = this.admit(route);
-            this.pending.set(route.homeId, pending);
-        }
-        try {
-            return this.publicConnection(await pending);
-        } finally {
-            this.pending.delete(route.homeId);
-        }
-    }
-
-    mark(project: ProjectId, state: MobileHomeConnectionState): void {
-        const route = this.routeFor(project);
-        const connection = this.connections.get(route.homeId);
-        if (!connection) return;
-        connection.state = state;
-        connection.lastUsedAt = this.now();
-        this.onStateChange(connection.homeId, state);
-    }
-
-    async evictIdle(now = this.now()): Promise<void> {
-        const stale = [...this.connections.values()]
-            .filter((connection) => now - connection.lastUsedAt >= this.idleMs)
-            .map((connection) => connection.homeId);
-        await Promise.all(stale.map((homeId) => this.disconnect(homeId)));
-    }
-
-    async closeAll(): Promise<void> {
-        await Promise.all(
-            [...this.connections.keys()].map((homeId) => this.disconnect(homeId)),
-        );
-        this.pending.clear();
-    }
-
-    private async admit(route: OpaqueHomeRoute): Promise<MutableHomeConnection> {
-        if (!this.bearer()) throw new Error("sign in before opening a project");
-        let admission: string | null = null;
-        const auth = {
-            bearer: this.bearer,
-            homeAdmission: () => admission,
-        };
-        const routeKey = opaqueHomeRouteKey(route);
-        const endpoint = await this.resolveEndpoint(route);
-        const json = this.makeRouteJson(endpoint, auth);
-        const result = await json("POST", "/home/admissions") as {
-            home?: unknown;
-            admission?: unknown;
-        };
-        if (result.home !== route.homeId || typeof result.admission !== "string") {
-            if (typeof result.admission === "string") {
-                admission = result.admission;
-                await json("DELETE", "/home/admissions").catch(() => undefined);
-            }
-            throw new Error(`Home identity mismatch: expected ${route.homeId}`);
-        }
-        admission = result.admission;
-        const current = this.routes.get(route.project);
-        if (
-            !current
-            || current.homeId !== route.homeId
-            || opaqueHomeRouteKey(current) !== routeKey
-        ) {
-            await json("DELETE", "/home/admissions").catch(() => undefined);
-            throw new Error("project route changed during Home admission");
-        }
-        let connection: MutableHomeConnection;
-        const api = new MobileControlPlane(endpoint, {
-            routeJson: json,
-            bearer: this.bearer,
-            homeAdmission: () => admission,
-            onAuthorizationRejected: (status, detail) => {
-                connection.state =
-                    status === 421
-                        ? "stale"
-                        : status === 401
-                            ? (/target Home admission required/i.test(detail)
-                                ? "needs-admission"
-                                : "needs-sign-in")
-                            : /Home admission/i.test(detail)
-                                ? "needs-admission"
-                                : "policy-denied";
-                this.onStateChange(connection.homeId, connection.state);
-            },
-            onTransportUnavailable: () => {
-                connection.state = "offline";
-                connection.lastUsedAt = this.now();
-                this.onStateChange(connection.homeId, "offline");
-            },
+        super(routes, bearer, {
+            ...options,
+            client: (context) =>
+                new MobileControlPlane(context.endpoint, {
+                    routeJson: context.routeJson,
+                    bearer: context.bearer,
+                    homeAdmission: context.homeAdmission,
+                    onAuthorizationRejected: context.onAuthorizationRejected,
+                    onTransportUnavailable: context.onTransportUnavailable,
+                }),
         });
-        connection = {
-            homeId: route.homeId,
-            endpoint,
-            routeKey,
-            admission,
-            api,
-            state: "live",
-            lastUsedAt: this.now(),
-        };
-        this.connections.set(route.homeId, connection);
-        this.onStateChange(connection.homeId, "live");
-        await this.enforceBound();
-        return connection;
-    }
-
-    private async enforceBound(): Promise<void> {
-        while (this.connections.size > this.maxConnections) {
-            const oldest = [...this.connections.values()]
-                .sort((left, right) => left.lastUsedAt - right.lastUsedAt)[0];
-            if (!oldest) return;
-            await this.disconnect(oldest.homeId);
-        }
-    }
-
-    private async disconnect(homeId: HomeId): Promise<void> {
-        const connection = this.connections.get(homeId);
-        if (!connection) return;
-        this.connections.delete(homeId);
-        const auth = {
-            bearer: this.bearer,
-            homeAdmission: () => connection.admission,
-        };
-        await this.makeRouteJson(connection.endpoint, auth)(
-            "DELETE",
-            "/home/admissions",
-        ).catch(() => undefined);
-        await this.closeRoute(homeId).catch(() => undefined);
-    }
-
-    private publicConnection(
-        connection: MutableHomeConnection,
-    ): MobileHomeConnection {
-        return {
-            homeId: connection.homeId,
-            endpoint: connection.endpoint,
-            api: connection.api,
-            get state() {
-                return connection.state;
-            },
-            get lastUsedAt() {
-                return connection.lastUsedAt;
-            },
-        };
     }
 }
 
@@ -314,7 +65,9 @@ export async function loadMobileHomeRoutes(
                 }
                 : undefined,
         })),
-    });
+    // Same provenance the hub read already used: re-parsing at a lower trust
+    // would silently drop every relay locator and take relay-only Homes offline.
+    }, "signed");
 }
 
 export async function loadMobileMemberships(
