@@ -70,6 +70,15 @@ run_rust() {
 
 run_web() {
     [ -d web/node_modules ] || npm --prefix web ci
+    # The browser tunnel (DESK-7, ADR 0130) is generated and gitignored, so a
+    # fresh checkout has no module for the loader's dynamic import to resolve
+    # and `vite build` fails outright — it cannot bundle an unresolvable
+    # specifier, and a stub is not an option because the design refuses to
+    # silently degrade a Home to unreachable. Built on absence, exactly the way
+    # node_modules above is: a developer pays once, CI pays every run because
+    # its checkout is always fresh.
+    [ -f web/packages/control-plane-client/src/generated/tunnel.js ] \
+        || scripts/build-wasm-tunnel.sh
     echo "== web typecheck =="
     npm --prefix web run typecheck
     npm --prefix web run typecheck:split

@@ -61,5 +61,23 @@ jobs:
           cache-dependency-path: |
             web/package-lock.json
             ee/web/package-lock.json
+      # The web builds bundle the browser tunnel (DESK-7, ADR 0130), which is
+      # generated from `crates/relay-transport` rather than committed. This
+      # runner is fresh every time, so `check.sh web` builds it here — and that
+      # needs the wasm32 toolchain. `ring` compiles C for wasm32, hence clang;
+      # `build-wasm-tunnel.sh` finishes with wasm-opt, hence binaryen. The same
+      # set the private repo's browser-tunnel job installs.
+      - name: Install Rust for the wasm32 target
+        working-directory: .
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+      - name: Install clang and binaryen for the wasm32 target
+        working-directory: .
+        run: sudo apt-get update && sudo apt-get install -y clang llvm binaryen
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the matching wasm-bindgen CLI
+        working-directory: .
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
       - run: scripts/check.sh web
         working-directory: .
