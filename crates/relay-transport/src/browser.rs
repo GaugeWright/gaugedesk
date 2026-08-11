@@ -65,6 +65,9 @@ pub fn message_bytes(event: &web_sys::MessageEvent) -> Option<Vec<u8>> {
 #[wasm_bindgen]
 pub struct BrowserTunnel {
     client: crate::tunnel_client::TunnelClient,
+    /// Whether the relay has paired this leg with the Home's. Sending tunnel
+    /// bytes before that is writing into a route with no other end.
+    paired: bool,
     /// Body of the response whose status was last reported, held so the two
     /// halves cross the boundary as separate calls.
     pending: Option<Vec<u8>>,
@@ -95,6 +98,7 @@ impl BrowserTunnel {
             .map(|client| BrowserTunnel {
                 client,
                 pending: None,
+                paired: false,
             })
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -126,7 +130,10 @@ impl BrowserTunnel {
     #[wasm_bindgen(js_name = receiveFrame)]
     pub fn receive_frame(&mut self, frame: &[u8]) -> Result<(), JsValue> {
         match classify_frame(frame).map_err(|error| JsValue::from_str(&error.to_string()))? {
-            RelayFrame::Ready => Ok(()),
+            RelayFrame::Ready => {
+                self.paired = true;
+                Ok(())
+            }
             RelayFrame::Data(bytes) => {
                 self.client.session_mut().received(&bytes);
                 Ok(())
@@ -192,6 +199,14 @@ impl BrowserTunnel {
             .take()
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default()
+    }
+
+    /// Whether the relay has paired this leg. A caller must not send tunnel
+    /// bytes until it has: the relay pairs complementary legs and only then
+    /// splices, so anything written earlier has nowhere to go.
+    #[wasm_bindgen(js_name = isPaired)]
+    pub fn is_paired(&self) -> bool {
+        self.paired
     }
 
     #[wasm_bindgen(js_name = isHandshaking)]

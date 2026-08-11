@@ -84,7 +84,11 @@ async fn serve_admissions(listener: TcpListener) {
                 // silent 200 that makes a broken journey look complete.
                 r#"{"error":"the hermetic Home serves admissions only"}"#.to_owned()
             };
-            let status = if request.starts_with("POST /home/admissions") { "201 Created" } else { "404 Not Found" };
+            let status = if request.starts_with("POST /home/admissions") {
+                "201 Created"
+            } else {
+                "404 Not Found"
+            };
             let response = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
                 body.len(),
