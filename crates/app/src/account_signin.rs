@@ -257,6 +257,46 @@ fn refresh_at_hub(hub: &str, bearer: &str, device: &str) -> Result<String, Strin
         .ok_or_else(|| "malformed Hub response".to_string())
 }
 
+/// Tell the Hub which root signs this account's directory record, so a client
+/// with no root of its own can find it (DESK-5f, ADR 0133 §2).
+///
+/// This is the one hub *write* the desktop performs, and it is deliberately
+/// narrow. Only a public key crosses: the root's private half never leaves this
+/// process, and `library_sync_routes` stays out of `hub_routes()` precisely so a
+/// shared Hub never holds one. A signed-out desktop announces nothing, because
+/// there is no session to announce under.
+///
+/// Returns whether the announcement landed. Callers treat `false` as reduced
+/// discoverability rather than failure — the record it points at is already
+/// published, and the next publish tries again.
+pub async fn announce_directory_root(wb: &SharedWorkbench) -> bool {
+    let Some(hub) = hub_base() else {
+        return false;
+    };
+    let Some(bearer) = hub_session_token(wb) else {
+        return false;
+    };
+    let root = {
+        let workbench = wb.lock_unpoisoned();
+        workbench.library_sync_root()
+    };
+    if root.is_empty() {
+        return false;
+    }
+    let origin = crate::directory_sync::directory_url_from_env();
+    tokio::task::spawn_blocking(move || {
+        let http = HttpClient::new();
+        let headers = vec![("authorization".to_string(), format!("Bearer {bearer}"))];
+        let body = json!({ "root_pubkey": root, "origin": origin }).to_string();
+        matches!(
+            http.post_json_headers(&format!("{hub}/account/directory"), &headers, &body),
+            Ok((200..=299, _))
+        )
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Non-secret status projection, shared by the status route and the
 /// post-refresh re-read.
 fn status_json(record: Option<&SessionRecord>, available: bool) -> Value {

@@ -72,6 +72,10 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
             get(get_home_routes).post(post_home_route),
         )
         .route("/account/home-routes/{project}", delete(delete_home_route))
+        .route(
+            "/account/directory",
+            get(get_account_directory).post(post_account_directory),
+        )
         .merge(managed_inference_routes())
 }
 
@@ -312,6 +316,88 @@ pub async fn delete_home(
     }
 }
 
+/// `GET /account/directory` — which root signs this account's directory record,
+/// and where that record lives (DESK-5f, ADR 0133 §1).
+///
+/// A browser cannot read the root-signed record without this: the directory is
+/// addressed by the root key, so with no key there is no path to fetch. `404`
+/// when nothing has published one, which is the ordinary state for an account
+/// that has never enabled library sync — a caller must degrade to endpoint-only
+/// reachability there, not treat it as an error.
+pub async fn get_account_directory(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    match crate::account::Account::rebuild_in(wb.store_ref(), &scope) {
+        Ok(account) => match account.directory {
+            Some(record) => (
+                StatusCode::OK,
+                Json(json!({
+                    "root_pubkey": record.root_pubkey,
+                    "origin": if record.origin.is_empty() {
+                        crate::directory_sync::DIRECTORY_URL.to_owned()
+                    } else {
+                        record.origin
+                    },
+                })),
+            )
+                .into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                "this account has published no directory record",
+            )
+                .into_response(),
+        },
+        Err(error) => err_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AccountDirectoryBody {
+    root_pubkey: String,
+    #[serde(default)]
+    origin: String,
+}
+
+/// `POST /account/directory` — publish the account root's public half.
+///
+/// The publisher is a client that holds the root; this endpoint cannot check
+/// that and does not pretend to. Anyone holding the person's bearer can write
+/// here, and demanding a self-signature would prove nothing, because an attacker
+/// signs their own key with their own root just as validly. The whole defence is
+/// on the reading side: a browser pins the first key it sees and refuses a later
+/// change (ADR 0132 §2). What this route *does* guarantee is scope isolation —
+/// the record lands in the caller's own account scope and nowhere else.
+pub async fn post_account_directory(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Json(body): Json<AccountDirectoryBody>,
+) -> impl IntoResponse {
+    let root = body.root_pubkey.trim().to_owned();
+    if root.is_empty() {
+        return (StatusCode::BAD_REQUEST, "root_pubkey is required").into_response();
+    }
+    let record = crate::account::AccountDirectoryRecord {
+        id: crate::account::DIRECTORY_RECORD_ID.to_owned(),
+        op: RecordOp::Upsert,
+        root_pubkey: root,
+        origin: body.origin.trim().trim_end_matches('/').to_owned(),
+    };
+    let mut wb = wb.lock_unpoisoned();
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    match wb.write_account_record_in(
+        &scope,
+        crate::account::DIRECTORY_RECORD_KIND,
+        &record.id,
+        &record,
+    ) {
+        Ok(()) => (StatusCode::CREATED, Json(json!({ "directory": record }))).into_response(),
+        Err(error) => err_response(error),
+    }
+}
+
 pub async fn get_home_routes(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
@@ -530,7 +616,21 @@ pub async fn post_library_sync_publish(State(wb): State<SharedWorkbench>) -> imp
     })
     .await;
     match published {
-        Ok(Ok(())) => (StatusCode::OK, Json(json!({ "published": true }))).into_response(),
+        Ok(Ok(())) => {
+            // Only now, and in this order (DESK-5f, ADR 0133 §2). The projection
+            // tells a browser where to look; announcing it before the record
+            // exists would point every reader at a 404 and make a working
+            // account look broken. Best-effort: the directory publish is the
+            // operation the caller asked for and it has succeeded, so a hub that
+            // is unreachable costs discoverability until the next publish, not
+            // this one's result.
+            let announced = crate::account_signin::announce_directory_root(&wb).await;
+            (
+                StatusCode::OK,
+                Json(json!({ "published": true, "announced": announced })),
+            )
+                .into_response()
+        }
         Ok(Err(e)) => (StatusCode::BAD_GATEWAY, e).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "publish task panicked").into_response(),
     }
@@ -753,6 +853,117 @@ mod home_directory_tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&routes).unwrap()["routes"],
             serde_json::json!([])
+        );
+    }
+
+    /// An account nobody has published for must say so rather than answer with
+    /// an empty or invented key: a caller that mistook silence for a value would
+    /// pin nothing and then verify against it (DESK-5f, ADR 0133 §1).
+    #[tokio::test]
+    async fn an_unpublished_account_has_no_directory_to_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(dir.path()).unwrap();
+        let app = routes().with_state(wb);
+        let (status, _) = call(&app, "GET", "/account/directory", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The projection is what lets a browser address the blind directory at all,
+    /// so it must carry both halves: which key signs, and where to read.
+    #[tokio::test]
+    async fn a_published_root_key_is_projected_with_its_directory_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(dir.path()).unwrap();
+        let app = routes().with_state(wb);
+
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/account/directory",
+            Some(r#"{"root_pubkey":"ed25519:abc","origin":"https://directory.example/"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = call(&app, "GET", "/account/directory", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["root_pubkey"], "ed25519:abc");
+        assert_eq!(
+            value["origin"], "https://directory.example",
+            "the trailing slash must not survive into a fetch path",
+        );
+    }
+
+    /// A record written before the origin existed, or by a deployment that does
+    /// not name one, must still be readable — the reader's canonical default is
+    /// the right answer, not an empty string it would then fetch against.
+    #[tokio::test]
+    async fn a_record_naming_no_origin_reports_the_canonical_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(dir.path()).unwrap();
+        let app = routes().with_state(wb);
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/account/directory",
+            Some(r#"{"root_pubkey":"ed25519:abc"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, body) = call(&app, "GET", "/account/directory", None).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["origin"],
+            crate::directory_sync::DIRECTORY_URL,
+        );
+    }
+
+    /// An empty key is the shape a missing variable produces, and it would be
+    /// pinned as though it were real. Refuse it at the door.
+    #[tokio::test]
+    async fn an_empty_root_key_is_refused_rather_than_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(dir.path()).unwrap();
+        let app = routes().with_state(wb);
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/account/directory",
+            Some(r#"{"root_pubkey":"   "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(&app, "GET", "/account/directory", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Latest wins, because an account has one root. A rotated key must replace
+    /// rather than accumulate, or a reader would have to choose between two.
+    #[tokio::test]
+    async fn republishing_replaces_the_projected_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(dir.path()).unwrap();
+        let app = routes().with_state(wb);
+        for key in ["ed25519:first", "ed25519:second"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/account/directory")
+                        .header("content-type", "application/json")
+                        .header("idempotency-key", format!("directory:{key}"))
+                        .body(Body::from(format!(r#"{{"root_pubkey":"{key}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+        let (_, body) = call(&app, "GET", "/account/directory", None).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["root_pubkey"],
+            "ed25519:second",
         );
     }
 }

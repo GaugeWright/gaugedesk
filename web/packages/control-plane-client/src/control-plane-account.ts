@@ -107,6 +107,42 @@ export async function accountHomeRoutes(json: RouteJson): Promise<OpaqueHomeRout
     return parseOpaqueHomeRoutes(await json("GET", "/account/home-routes"), "signed");
 }
 
+/** Which root signs this account's directory record, and where it lives. */
+export interface AccountDirectory {
+    readonly rootPubkey: string;
+    readonly origin: string;
+}
+
+/**
+ * Read the account's directory projection (DESK-5f, ADR 0133 §1).
+ *
+ * A browser cannot reach the root-signed record without this, because the
+ * directory is addressed *by* the root key — with no key there is no path to
+ * fetch. `null` when the account has published none, which is ordinary rather
+ * than exceptional: nobody has run a desktop with library sync on. A caller
+ * degrades to endpoint-only reachability there.
+ *
+ * What comes back is **not** authenticated. Anyone holding the person's bearer
+ * can write this record, so the value's whole weight rests on the reader pinning
+ * it on first sight and refusing a later change (ADR 0132 §2).
+ */
+export async function accountDirectory(json: RouteJson): Promise<AccountDirectory | null> {
+    let value: unknown;
+    try {
+        value = await json("GET", "/account/directory");
+    } catch {
+        // A hub too old to serve it, or an account with none. Both mean the
+        // same thing to a caller — no signed record to read — and neither is a
+        // reason to fail an account that works without one.
+        return null;
+    }
+    const record = value as { root_pubkey?: unknown; origin?: unknown } | null;
+    const rootPubkey = typeof record?.root_pubkey === "string" ? record.root_pubkey.trim() : "";
+    if (!rootPubkey) return null;
+    const origin = typeof record?.origin === "string" ? record.origin.trim() : "";
+    return { rootPubkey, origin: origin.replace(/\/+$/, "") };
+}
+
 /**
  * Record reachability an **invitation** delivered into this person's own
  * account. It is deliberately not general route authorship: the serving Home

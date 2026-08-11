@@ -167,6 +167,39 @@ pub struct RegisteredHomeRecord {
     pub relay: Option<crate::home::OpaqueRelayLocator>,
 }
 
+/// Where this account's root-signed directory record lives, and which key signs
+/// it (DESK-5f, [ADR 0133](../../../specs/decisions/0133-the-hub-projects-the-account-root-key.md)).
+///
+/// The directory is addressed *by* the root key, so a client with no root of its
+/// own — a browser — has nothing to start from. This is that starting point, and
+/// it is only ever a **public** key: publishing it grants nothing, which is why
+/// it may live in an account projection a page can read.
+///
+/// What this record cannot do is prove itself. Anyone holding the person's
+/// bearer can write one, and a proof of possession would not help, because an
+/// attacker signs their own key with their own root just as validly. The
+/// defence is entirely on the reading side — a browser pins on first sight and
+/// treats a later change as an alarm ([ADR 0132](../../../specs/decisions/0132-a-browser-pins-the-account-root-key.md)) —
+/// and stating that here is the point, because a reader who mistook this for an
+/// authenticated value would be trusting it for more than it can carry.
+pub const DIRECTORY_RECORD_KIND: &str = "account_directory";
+/// Latest-wins: one account, one root, one directory.
+pub const DIRECTORY_RECORD_ID: &str = "directory";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AccountDirectoryRecord {
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    /// The account root's **public** half, as `library_sync_root` reports it.
+    pub root_pubkey: String,
+    /// The blind directory this record is published to. Carried so a
+    /// self-hosted deployment can name its own; a reader with no value here
+    /// falls back to its own canonical default rather than failing.
+    #[serde(default)]
+    pub origin: String,
+}
+
 /// The blind account-plane route for one granted project.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct HomeRouteRecord {
@@ -199,6 +232,9 @@ pub struct Account {
     pub credentials: BTreeMap<String, CredentialRecord>,
     pub homes: BTreeMap<String, RegisteredHomeRecord>,
     pub home_routes: BTreeMap<String, HomeRouteRecord>,
+    /// Absent until a root-holding client publishes it, which is the ordinary
+    /// state for an account that has never enabled library sync.
+    pub directory: Option<AccountDirectoryRecord>,
     pub managed_inference_plan: Option<crate::managed_inference::ManagedInferencePlan>,
 }
 
@@ -257,6 +293,12 @@ impl Account {
             let r: HomeRouteRecord = serde_json::from_str(&row)?;
             fold(&mut acct.home_routes, r.id.clone(), r.op, r);
         }
+        let mut directory = BTreeMap::new();
+        for row in store.records(scope, DIRECTORY_RECORD_KIND)? {
+            let r: AccountDirectoryRecord = serde_json::from_str(&row)?;
+            fold(&mut directory, r.id.clone(), r.op, r);
+        }
+        acct.directory = directory.remove(DIRECTORY_RECORD_ID);
         acct.managed_inference_plan = crate::managed_inference::fold_plan(store, scope)?;
         Ok(acct)
     }
