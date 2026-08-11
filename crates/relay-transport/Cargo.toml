@@ -9,19 +9,35 @@ description = "Blind role-aware rendezvous and cert-pinned Home/client tunnel."
 test-relay = []
 
 [dependencies]
-gaugedesk-env = { path = "../env" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
-rustls = { version = "0.23", default-features = false, features = ["std"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 sha2 = "0.11"
 base64 = "0.23"
-getrandom = "0.2"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# The native carrier: sockets, the filesystem, and the tungstenite client. A
+# wasm32 build links none of this.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+gaugedesk-env = { path = "../env" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+getrandom = "0.2"
 futures-util = { version = "0.3", features = ["sink"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+
+# The browser carrier. `ring` is the *same* provider the native carrier uses —
+# its `wasm32_unknown_unknown_js` feature routes entropy to
+# `crypto.getRandomValues`, so the browser introduces no new crypto trust
+# surface (ADR 0130 §4). Building it needs clang for the wasm32 target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["BinaryType", "CloseEvent", "ErrorEvent", "MessageEvent", "WebSocket"] }
 
 [dev-dependencies]
 tempfile = "3"

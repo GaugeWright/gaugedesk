@@ -8,9 +8,11 @@
 //! `WebSocket`. That is the point: one implementation of the frame and the pin,
 //! three carriers.
 //!
-//! The crypto provider is *injected* rather than selected here, because native
-//! targets use `ring` and `wasm32` cannot ([ADR 0130](../../../specs/decisions/0130-browser-thin-client-tunnels-the-relay-fabric-in-wasm.md)
-//! §4). Nothing in this module names a provider.
+//! The crypto provider is *injected* rather than selected here, so a carrier
+//! supplies it. In practice every target supplies `ring` — including `wasm32`,
+//! through ring's own `wasm32_unknown_unknown_js` feature — so the browser adds
+//! no new crypto trust surface ([ADR 0130](../../../specs/decisions/0130-browser-thin-client-tunnels-the-relay-fabric-in-wasm.md)
+//! §4). Nothing in this module names one.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -278,7 +280,16 @@ pub fn pinned_client_config(
     expected: CertFingerprint,
     provider: Arc<CryptoProvider>,
 ) -> std::io::Result<ClientConfig> {
-    let mut config = ClientConfig::builder_with_provider(provider.clone())
+    // The pin ignores time entirely, so the time source only feeds rustls' own
+    // bookkeeping. Native takes rustls' default; a browser has a clock, it just
+    // is not `SystemTime`, so it supplies one explicitly (DESK-2).
+    #[cfg(not(target_arch = "wasm32"))]
+    let builder = ClientConfig::builder_with_provider(provider.clone());
+    #[cfg(target_arch = "wasm32")]
+    let builder =
+        ClientConfig::builder_with_details(provider.clone(), Arc::new(BrowserTimeProvider));
+
+    let mut config = builder
         .with_safe_default_protocol_versions()
         .map_err(|error| other(format!("relay TLS client: {error}")))?
         .dangerous()
@@ -286,6 +297,55 @@ pub fn pinned_client_config(
         .with_no_client_auth();
     config.enable_early_data = false;
     Ok(config)
+}
+
+/// `wasm32-unknown-unknown` has no `SystemTime`, but a page has `Date.now()`.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug)]
+pub struct BrowserTimeProvider;
+
+#[cfg(target_arch = "wasm32")]
+impl rustls::time_provider::TimeProvider for BrowserTimeProvider {
+    fn current_time(&self) -> Option<UnixTime> {
+        Some(UnixTime::since_unix_epoch(
+            core::time::Duration::from_millis(js_sys::Date::now() as u64),
+        ))
+    }
+}
+
+/// Frame ciphertext as the relay's binary `DATA` record. Pure framing, so it is
+/// shared by every carrier and exercised by native tests rather than only in a
+/// browser.
+pub fn data_frame(ciphertext: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(ciphertext.len() + 1);
+    frame.push(WSS_DATA);
+    frame.extend_from_slice(ciphertext);
+    frame
+}
+
+/// What a received relay frame means to the carrier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelayFrame {
+    Ready,
+    Data(Vec<u8>),
+    Fin,
+    FinAck,
+}
+
+/// Classify one binary frame from the relay, fail-closed on anything else.
+pub fn classify_frame(bytes: &[u8]) -> std::io::Result<RelayFrame> {
+    if bytes == WSS_READY {
+        return Ok(RelayFrame::Ready);
+    }
+    if bytes.is_empty() || bytes.len() > WSS_MAX_FRAME_BYTES {
+        return Err(invalid_data("relay frame out of bounds"));
+    }
+    match bytes[0] {
+        WSS_DATA => Ok(RelayFrame::Data(bytes[1..].to_vec())),
+        WSS_FIN => Ok(RelayFrame::Fin),
+        WSS_FIN_ACK => Ok(RelayFrame::FinAck),
+        _ => Err(invalid_data("relay frame has an unknown kind")),
+    }
 }
 
 pub(crate) fn invalid_data(message: &str) -> std::io::Error {
@@ -401,5 +461,24 @@ mod tests {
         let other =
             one_shot_websocket_route("wss://relay.example", [4u8; TOKEN_LEN]).expect("route");
         assert_ne!(first.proof, other.proof);
+    }
+
+    #[test]
+    fn frames_classify_fail_closed() {
+        assert_eq!(classify_frame(&WSS_READY).unwrap(), RelayFrame::Ready);
+        assert_eq!(classify_frame(&[WSS_FIN]).unwrap(), RelayFrame::Fin);
+        assert_eq!(classify_frame(&[WSS_FIN_ACK]).unwrap(), RelayFrame::FinAck);
+        assert_eq!(
+            classify_frame(&[WSS_DATA, 1, 2, 3]).unwrap(),
+            RelayFrame::Data(vec![1, 2, 3])
+        );
+        assert!(classify_frame(&[]).is_err());
+        assert!(classify_frame(&[9, 1]).is_err());
+        assert!(classify_frame(&vec![WSS_DATA; WSS_MAX_FRAME_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn a_data_frame_carries_its_kind_byte() {
+        assert_eq!(data_frame(&[7, 8]), vec![WSS_DATA, 7, 8]);
     }
 }
