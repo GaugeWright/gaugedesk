@@ -13,6 +13,10 @@
  * the human admits (advance `main`) or rejects (isolate) the turn (D1).
  */
 
+// Side effect, and it must run before anything renders: registers this
+// build's wasm loaders for every host that renders `App`, not just the
+// standalone entry (see wasm-modules.ts).
+import "./wasm-modules";
 import { createEffect, createMemo, createResource, createSignal, For, on, onCleanup, Show, untrack, type Accessor } from "solid-js";
 import {
     authority,
