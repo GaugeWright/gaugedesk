@@ -217,6 +217,11 @@ enum DeviceLoginState {
 struct DeviceLogin {
     login_id: String,
     scope: String,
+    /// When this login was started. The map is keyed by a random `login_id`, so
+    /// without this there is no notion of "the current attempt" — only
+    /// lexicographic order, which is what made the status route answer with
+    /// whichever login happened to sort first.
+    started_at: i64,
     verification_url: String,
     user_code: String,
     state: DeviceLoginState,
@@ -248,12 +253,29 @@ fn device_logins() -> &'static Mutex<BTreeMap<String, DeviceLogin>> {
     LOGINS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// This scope's current device login: an active one if there is one, otherwise
+/// the most recently started.
+///
+/// `find` over a `BTreeMap` keyed by a random `login_id` returned whichever
+/// login sorted first, which is unrelated to which one is current. Two things
+/// went wrong with that. The status route answered with a stale login — the
+/// wrong `user_code` and `verification_url`, so a person would be told to enter
+/// a code that authorizes nothing. And `start_device_login_blocking`, which
+/// reuses an existing login through this same lookup, saw `None` whenever the
+/// first-sorting login was inactive and spawned a second app-server for a scope
+/// that already had one.
+///
+/// Active wins over recency deliberately: at most one login can be live for a
+/// scope, and it is the one a person is part-way through. Recency only orders
+/// the terminal ones, so the status keeps reporting the last outcome —
+/// `linked`, `failed` — rather than an arbitrary older one.
 fn device_login_for_scope(scope: &str) -> Option<DeviceLogin> {
     device_logins()
         .lock()
         .ok()?
         .values()
-        .find(|login| login.scope == scope)
+        .filter(|login| login.scope == scope)
+        .max_by_key(|login| (login.active(), login.started_at))
         .cloned()
 }
 
@@ -459,12 +481,22 @@ fn start_device_login_blocking(wb: SharedWorkbench, scope: String) -> Result<Val
         state: DeviceLoginState::Pending,
         error: None,
         stdin: Some(shared_stdin),
+        started_at: now_ms(),
     };
     let projection = login.projection();
-    device_logins()
-        .lock()
-        .map_err(|_| "Codex device-login state is unavailable".to_owned())?
-        .insert(login_id.clone(), login);
+    {
+        let mut logins = device_logins()
+            .lock()
+            .map_err(|_| "Codex device-login state is unavailable".to_owned())?;
+        // Nothing ever removed a login, so this map grew for the life of the
+        // process and every stale entry was another candidate for the lookup
+        // above. Settled logins for this scope are dropped as a new one starts:
+        // `set_device_login_state` clears `stdin` the moment a login stops being
+        // active, so a non-active entry holds no live process and removing it
+        // cannot orphan one.
+        logins.retain(|_, login| login.scope != scope || login.active());
+        logins.insert(login_id.clone(), login);
+    }
 
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -892,6 +924,74 @@ mod tests {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    /// Seed a login directly: these tests are about the lookup, not about
+    /// spawning a real Codex app-server.
+    fn seed_login(scope: &str, login_id: &str, state: DeviceLoginState, started_at: i64) {
+        device_logins().lock().unwrap().insert(
+            login_id.to_owned(),
+            DeviceLogin {
+                login_id: login_id.to_owned(),
+                scope: scope.to_owned(),
+                verification_url: "https://example.invalid/device".into(),
+                user_code: login_id.to_owned(),
+                state,
+                error: None,
+                stdin: None,
+                started_at,
+            },
+        );
+    }
+
+    /// The status route must answer with the login a person is part-way
+    /// through, not with whichever id sorts first.
+    ///
+    /// The map is keyed by a random `login_id`, so `find` returned an arbitrary
+    /// login — in production it answered `2d94d963…` while the caller had just
+    /// started `a8a8ebbb…`, purely because the first sorts lower.
+    #[test]
+    fn the_current_login_wins_over_one_that_merely_sorts_first() {
+        let scope = "scope:codex-lookup-active";
+        seed_login(scope, "0000-settled", DeviceLoginState::Failed, 100);
+        seed_login(scope, "ffff-pending", DeviceLoginState::Pending, 50);
+
+        let found = device_login_for_scope(scope).expect("a login for the scope");
+        assert_eq!(
+            found.login_id, "ffff-pending",
+            "an active login is the current one even when another sorts first \
+             and even when it started earlier",
+        );
+    }
+
+    /// With nothing active, the most recent outcome is the useful one.
+    #[test]
+    fn the_newest_settled_login_is_reported_when_none_is_active() {
+        let scope = "scope:codex-lookup-settled";
+        seed_login(scope, "aaaa-older", DeviceLoginState::Failed, 10);
+        seed_login(scope, "zzzz-newer", DeviceLoginState::Linked, 20);
+
+        let found = device_login_for_scope(scope).expect("a login for the scope");
+        assert_eq!(found.login_id, "zzzz-newer");
+        assert_eq!(found.state, DeviceLoginState::Linked);
+    }
+
+    /// A scope with no login at all is still `None`, and scopes do not bleed.
+    #[test]
+    fn a_login_belongs_to_exactly_one_scope() {
+        seed_login(
+            "scope:codex-owner",
+            "owner-login",
+            DeviceLoginState::Pending,
+            1,
+        );
+        assert!(device_login_for_scope("scope:codex-stranger").is_none());
+        assert_eq!(
+            device_login_for_scope("scope:codex-owner")
+                .unwrap()
+                .login_id,
+            "owner-login",
+        );
     }
 
     #[test]
