@@ -794,10 +794,13 @@ When("I create an edit chat under the archetype {string}", async ({ page }, name
     await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 
-// The chat's kind (its root) is shown read-only via the lineage header; there is
-// no toggle and no composer caption. `data-kind` carries the kind ("edit"|"work").
+// The chat's kind (its root) is shown read-only, with no toggle and no composer
+// caption. It is anchored on the header's status gem rather than the context slot:
+// the gem's glyph *is* the kind and it is present for every selected chat, while
+// the context slot names the project and is deliberately empty in the Personal
+// project, which names nothing a reader does not already know.
 Then("the chat pane kind is {string}", async ({ page }, kind: string) => {
-    await expect(page.locator("[data-chat-lineage]")).toHaveAttribute("data-kind", kind);
+    await expect(page.locator(`.chat-heading .status-gem[data-kind="${kind}"]`)).toBeVisible();
 });
 
 Then("an edit chat is marked in the nav", async ({ page }) => {
@@ -1260,7 +1263,9 @@ When("I use the archetype {string} from its menu", async ({ page }, name: string
 
 Then("a work chat opens", async ({ page }) => {
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
-    await expect(page.locator('[data-chat-lineage][data-kind="work"]')).toBeVisible();
+    // This opens into the hidden Personal project, whose context slot is empty by
+    // design, so the kind is read from the gem — the element that carries it.
+    await expect(page.locator('.chat-heading .status-gem[data-kind="work"]')).toBeVisible();
 });
 
 // ---- auto-titling a new chat (#4, round 2) ----

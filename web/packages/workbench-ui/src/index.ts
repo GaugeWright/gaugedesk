@@ -16,7 +16,7 @@ export { Carousel, applySelection } from "./CarouselIsland";
 export { ChatPanel, SessionComposer } from "./ChatPanel";
 export type { ChatPanelProps } from "./ChatPanel";
 export { ChatPaneHeader } from "./ChatPaneHeader";
-export type { ChatPaneHeaderProps, ChatPaneStatusTone } from "./ChatPaneHeader";
+export type { ChatPaneHeaderProps } from "./ChatPaneHeader";
 export { ChatComposer } from "./ChatComposer";
 export type { ChatComposerProps, ComposerQueueItem } from "./ChatComposer";
 export {

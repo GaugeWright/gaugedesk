@@ -578,9 +578,13 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
                     <>
                         <ChatPaneHeader
                             title="Admin agent"
-                            lineage={org()?.display_name || "Organization"}
+                            context={org()?.display_name || "Organization"}
+                            contextKind="work"
+                            kind="work"
+                            // The admin agent runs no turns of its own, so its gem has no
+                            // live tone: an unavailable admin is a permission outcome, not
+                            // an errored turn, and it stays in the written label.
                             statusLabel={fullAdmin() || billingAdmin() ? "Ready" : "Unavailable"}
-                            statusTone={fullAdmin() || billingAdmin() ? "ready" : "error"}
                             mobile={shell.isMobile()}
                             onCollapse={() => shell.setCollapsed("chat", true)}
                         />

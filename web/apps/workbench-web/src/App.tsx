@@ -59,6 +59,8 @@ import {
     DeploymentPanel,
     createSessionComposerController,
     deriveFreshness,
+    gemState,
+    type GemState,
     displayChatTitle,
     emptyTranscript as empty,
     EngagementPane,
@@ -645,6 +647,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     return {
                         kind: c.kind,
                         lineage: `${pl.archetypeName} · ${p.name}`,
+                        // What the header names as this chat's context. Personal is the
+                        // catch-all placement every chat falls back to, so naming it
+                        // spends header width on a constant: the slot stays empty and
+                        // disappears instead.
+                        context: ws.personalPlacement === pl.placementId ? "" : p.name,
+                        // The gem's inputs, read from the same projection fields the
+                        // navigation row reads, so the two cannot disagree.
+                        conflict: c.conflict,
+                        changes: c.changes,
+                        // The line this chat's work lands on: its workstream when it is
+                        // homed to one, else the work target — the default mainline is a
+                        // workstream of one.
+                        workstream: ws.workstreams.find((w) => w.id === c.workstream)?.name
+                            ?? target?.name ?? String(c.targetId),
                         title: c.title,
                         target: target?.name ?? String(c.targetId),
                         targetKind: c.targetKind,
@@ -667,6 +683,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 return {
                     kind: c.kind,
                     lineage: `${a.name} · Library`,
+                    // An edit chat's context is the method it edits.
+                    context: a.name,
+                    conflict: c.conflict,
+                    changes: c.changes,
+                    workstream: ws.workstreams.find((w) => w.id === c.workstream)?.name
+                        ?? target?.name ?? String(c.targetId),
                     title: c.title,
                     target: target?.name ?? String(c.targetId),
                     targetKind: c.targetKind,
@@ -682,6 +704,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         return {
             kind: r?.kind ?? "work",
             lineage: r?.archetype ?? "",
+            // The flat recent list carries the archetype only — no project to name.
+            context: "",
+            conflict: false,
+            changes: false,
+            workstream: r
+                ? (ws.workTargets.find((target) => target.id === r.targetId)?.name ?? String(r.targetId))
+                : "",
             title: r?.title ?? "",
             target: r ? (ws.workTargets.find((target) => target.id === r.targetId)?.name ?? String(r.targetId)) : "",
             targetKind: r?.targetKind,
@@ -699,20 +728,19 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // chat's title to tell them apart. Reuse the shared placeholder rule so a
     // still-unnamed chat reads "Untitled" rather than the raw "new chat" token.
     const chatTitle = () => displayChatTitle(chatInfo()?.title ?? "");
-    const shortRevision = (revision: string | undefined) => revision
-        ? revision.replace(/^sha256:/, "").slice(0, 10)
-        : "—";
-    const targetLabel = () => {
+    // What this chat belongs to, for the header's context slot. The Personal project
+    // is the catch-all, so it names nothing; `lineage` itself is left alone because
+    // `methodName` still parses the method out of it for the composer caption.
+    const headerContext = () => chatInfo()?.context ?? "";
+    // The line's sync state in words. `basis === candidate` means the line holds no
+    // work this chat has not landed — which is what "up to date" says. Deliberately
+    // not a count: the projection carries two revisions, not a distance between them,
+    // and inventing "2 ahead" from data that cannot support it would be a lie.
+    const workstreamState = () => {
         const info = chatInfo();
-        return info?.target
-            ? `${info.target} · ${shortRevision(info.basis)} → ${shortRevision(info.candidate)}`
-            : "";
-    };
-    const targetTitle = () => {
-        const info = chatInfo();
-        return info?.target
-            ? `${info.targetKind}; concurrency: ${info.targetConcurrency}; basis ${info.basis}; candidate ${info.candidate}; available acts: ${(info.acts ?? []).join(", ")}`
-            : "";
+        if (!info?.workstream) return "";
+        if (!info.basis || !info.candidate) return "";
+        return info.basis === info.candidate ? "up to date" : "changes pending";
     };
     // Fork lineage (#3): the source this chat was copied from (from the "(fork)"
     // suffix), so the empty state can explain what a fork is and what carried over.
@@ -1244,25 +1272,30 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
 
     const phase = createMemo(() => run()?.phase ?? "—");
 
-    // The chat-status badge (#4): a real, coloured badge separated from the
-    // breadcrumb — not a small-caps word camouflaged inside the title. While a turn
-    // is in flight it shows "Working" (animated); a finished turn with work to keep
-    // shows "Needs review"; otherwise plain "Ready". `tone` drives the colour.
-    type StatusTone = "working" | "review" | "ready" | "conflict";
-    const statusBadge = createMemo<{ tone: StatusTone; label: string }>(() => {
-        // The selected chat's own state: a conflict is the most urgent — it is a
-        // decision the human must make (WS-H c) — then working / needs-review / ready.
-        const t = runToneOf(selected());
-        if (
-            merge()?.phase === "Repairing"
-            || (merge()?.phase === "Rejected" && merge()?.git_outcome === "Conflict")
-        ) return { tone: "conflict", label: "Conflict" };
-        if (t === "working") return { tone: "working", label: "Working" };
-        if (t === "review" || (merge()?.phase === "Clean" && merge()?.review_requested)) {
-            return { tone: "review", label: "Needs review" };
-        }
-        return { tone: "ready", label: "Ready" };
-    });
+    // The selected chat's state, folded by the SAME pure function the navigation row
+    // uses (`gemState`). This used to be a second derivation with its own precedence
+    // and its own inputs, and the two disagreed: the row could paint `error`, which
+    // this could not express, so an errored turn showed a red row beside a calm
+    // "Ready". Feed one fold from one set of inputs and agreement is structural.
+    const chatConflict = () => chatInfo()?.conflict
+        || merge()?.phase === "Repairing"
+        || (merge()?.phase === "Rejected" && merge()?.git_outcome === "Conflict");
+    const chatChanges = () => chatInfo()?.changes
+        || (merge()?.phase === "Clean" && merge()?.review_requested);
+    const chatState = createMemo<GemState>(() => gemState({
+        tone: runToneOf(selected()),
+        conflict: chatConflict(),
+        changes: chatChanges(),
+    }));
+    // The state as words — for assistive technology and the browser lane. Colour is
+    // never the only carrier of the state.
+    const STATE_LABEL: Record<GemState, string> = {
+        idle: "Ready",
+        working: "Working",
+        review: "Needs review",
+        error: "Error",
+        conflict: "Conflict",
+    };
 
     async function attachTarget(
         projectId: import("@gaugewright/control-plane-client").ProjectId,
@@ -1569,22 +1602,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         <>
             <ChatPaneHeader
                 title={selected() ? chatTitle() : undefined}
-                lineage={selected() ? lineage() : undefined}
-                lineageKind={selected() ? chatKind() : undefined}
-                targetLabel={selected() ? targetLabel() : undefined}
-                targetTitle={selected() ? targetTitle() : undefined}
-                statusLabel={selected() ? statusBadge().label : undefined}
-                statusTone={selected() ? statusBadge().tone : undefined}
+                kind={selected() ? chatKind() : undefined}
+                tone={selected() ? runToneOf(selected()) : undefined}
+                conflict={selected() ? chatConflict() : undefined}
+                changes={selected() ? chatChanges() : undefined}
+                statusLabel={selected() ? STATE_LABEL[chatState()] : undefined}
                 statusPhase={selected() ? phase() : undefined}
-                statusTitle={selected()
-                    ? statusBadge().tone === "conflict"
-                        ? "This chat hit a sync conflict — resolve it in the Changes view"
-                        : statusBadge().tone === "working"
-                            ? "The agent is working on your request now"
-                            : statusBadge().tone === "review"
-                                ? "The agent finished — review what changed and keep or discard it"
-                                : "Ready for your next request"
-                    : undefined}
+                context={selected() ? headerContext() : undefined}
+                contextKind={selected() ? chatKind() : undefined}
+                workstream={selected() ? chatInfo()?.workstream : undefined}
+                workstreamState={selected() ? workstreamState() : undefined}
+                connection={selected() ? freshnessStatus() : undefined}
                 mobile={workbenchShell.isMobile()}
                 onCollapse={() => workbenchShell.setCollapsed("chat", true)}
                 actions={
