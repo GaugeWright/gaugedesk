@@ -871,12 +871,15 @@ impl Workbench {
                 // provider, precisely so a plan cannot be declared over a release
                 // that egresses somewhere else (ADR 0085 §6, `FUND-1`).
                 provider: if managed {
+                    // The endpoint and the model name are chosen together: the
+                    // gateway's two surfaces spell models differently, and an
+                    // Anthropic model must reach the native one or it can never
+                    // use the prompt cache.
+                    let route = crate::managed_inference::metered_route(&request.model);
                     ProviderPolicy {
                         provider: crate::managed_inference::METERED_GATEWAY_PROVIDER.to_owned(),
-                        // Unified billing routes by `provider/model`; a bare name
-                        // is not addressable through the gateway.
-                        model: crate::managed_inference::unified_model_name(&request.model),
-                        base_url: crate::managed_inference::metered_gateway_base_url(),
+                        model: route.model,
+                        base_url: route.base_url,
                         credential_class: request.credential_class.clone(),
                         max_input_tokens: None,
                         max_output_tokens: None,

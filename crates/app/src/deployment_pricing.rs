@@ -245,19 +245,25 @@ mod funding_boundary {
 /// author thought they had published.
 #[cfg(test)]
 mod metered_release {
-    use crate::managed_inference::{
-        metered_gateway_base_url, unified_model_name, METERED_GATEWAY_PROVIDER,
-    };
+    use crate::managed_inference::{metered_route, METERED_GATEWAY_PROVIDER};
 
     #[test]
     fn the_release_the_edge_demands_is_the_release_managed_publishing_builds() {
         // The edge's check is `release.provider !== "cloudflare-ai-gateway"`.
         assert_eq!(METERED_GATEWAY_PROVIDER, "cloudflare-ai-gateway");
         // And the runtime proves the request never leaves this origin+path, so
-        // the admitted base URL is the egress grant for every metered turn.
-        let base = metered_gateway_base_url();
-        assert!(base.ends_with("/compat"));
+        // the admitted base URL is the egress grant for every metered turn. The
+        // runtime admits exactly the gateway's two surfaces and nothing else.
+        for model in ["gpt-4.1-mini", "claude-opus-5"] {
+            let route = metered_route(model);
+            assert!(
+                route.base_url.ends_with("/compat") || route.base_url.ends_with("/anthropic"),
+                "{}",
+                route.base_url
+            );
+            assert!(!route.model.is_empty());
+        }
         // A bare model name is not routable through unified billing.
-        assert!(unified_model_name("gpt-4.1-mini").contains('/'));
+        assert!(metered_route("gpt-4.1-mini").model.contains('/'));
     }
 }

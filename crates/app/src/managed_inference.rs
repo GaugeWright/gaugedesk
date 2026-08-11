@@ -647,36 +647,75 @@ fn metered_gateway_id() -> String {
     METERED_GATEWAY_PANELS.to_owned()
 }
 
-/// The OpenAI-compatible base URL a managed release is admitted against.
+/// Where a managed release reaches its model: the endpoint it is admitted
+/// against and the name to ask that endpoint for.
 ///
-/// The runtime proves a request never leaves this origin and path, so this
-/// string is the egress grant for every metered turn.
-pub fn metered_gateway_base_url() -> String {
-    let gateway = metered_gateway_id();
-    format!("https://gateway.ai.cloudflare.com/v1/{METERED_GATEWAY_ACCOUNT}/{gateway}/compat")
+/// These travel together because they have to agree. The gateway fronts two
+/// surfaces that spell models differently — unified `provider/model` on the
+/// compat shim, a bare provider-native id on `/anthropic` — so handing them out
+/// separately invites a pairing that routes nowhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeteredRoute {
+    /// The egress grant: the runtime proves a metered request never leaves this
+    /// origin and path.
+    pub base_url: String,
+    pub model: String,
 }
 
-/// The model name in the gateway's unified `provider/model` form.
+/// Route a managed model through the gateway surface that fits it.
 ///
-/// Unified billing routes by that form, so a bare `gpt-4.1-mini` is not
-/// addressable. A name that already carries a provider is left alone; a bare one
-/// is qualified with `openai`, which is the only provider a public release's
-/// `managed-openai` credential class admits today. If another provider becomes
-/// publishable, this must take the provider rather than assume it.
-pub fn unified_model_name(model: &str) -> String {
+/// Anthropic models take the provider-native `/anthropic` surface rather than
+/// the OpenAI-compatible shim. Same gateway, same BYOK key, same metered log —
+/// but the shim **drops `cache_control`**, and Anthropic caching is opt-in, so a
+/// Claude model behind it can never use the prompt cache and pays full price on
+/// every re-sent prefix. Measured 2026-08-11 against `gaugewright-panels`: on an
+/// identical prefix the native route bills 1.25x on the cache write and 0.1x on
+/// the read — 9.25x cheaper on the cached span — while the gateway still logs
+/// `cost`, so measured-cost settlement is unaffected.
+///
+/// Everything else keeps the compat shim and its unified `provider/model`
+/// naming, which is what unified billing routes by.
+pub fn metered_route(model: &str) -> MeteredRoute {
+    let gateway = metered_gateway_id();
+    let base = format!("https://gateway.ai.cloudflare.com/v1/{METERED_GATEWAY_ACCOUNT}/{gateway}");
     let model = model.trim();
-    if model.contains('/') {
-        model.to_owned()
-    } else {
-        format!("openai/{model}")
+    let native = model.strip_prefix("anthropic/").unwrap_or(model);
+    if is_anthropic_model(native) {
+        return MeteredRoute {
+            base_url: format!("{base}/anthropic"),
+            // The native surface selects the provider by path, so the name it
+            // takes carries no prefix. Sending `anthropic/claude-opus-5` there
+            // asks for a model that does not exist.
+            model: native.to_owned(),
+        };
     }
+    MeteredRoute {
+        base_url: format!("{base}/compat"),
+        // A bare name is not addressable through unified billing. One that
+        // already carries a provider is left alone; a bare one is qualified with
+        // `openai`, the only other provider a public release admits today.
+        model: if model.contains('/') {
+            model.to_owned()
+        } else {
+            format!("openai/{model}")
+        },
+    }
+}
+
+/// Whether a bare model id names an Anthropic model.
+///
+/// Needed because the native surface takes unprefixed names, so a bare
+/// `claude-opus-5` has to be recognized rather than qualified — and a release
+/// may declare its model either way.
+fn is_anthropic_model(model: &str) -> bool {
+    model.starts_with("claude-")
 }
 
 #[cfg(test)]
 mod metered_rail {
     #[test]
     fn the_base_url_is_the_panels_gateway_and_ends_at_compat() {
-        let url = super::metered_gateway_base_url();
+        let url = super::metered_route("gpt-4.1-mini").base_url;
         // The runtime appends `/chat/completions`, so the admitted base must end
         // exactly at `/compat` or the egress proof fails on every turn.
         assert!(url.ends_with("/compat"), "{url}");
@@ -685,6 +724,25 @@ mod metered_rail {
         // Never the private runtime's gateway: sharing one gateway shares its
         // spend limit, and a busy panel would hard-stop the private runtime.
         assert!(!url.contains("gaugewright-hosted"));
+    }
+
+    /// An Anthropic model must reach the provider-native surface. On `/compat`
+    /// the shim drops `cache_control`, so caching is impossible and every
+    /// re-sent prefix bills at full price — silently, because a compat endpoint
+    /// ignoring a cache hint is not an error.
+    #[test]
+    fn an_anthropic_model_routes_to_the_native_surface_with_a_bare_name() {
+        let route = super::metered_route("claude-opus-5");
+        // The runtime appends `/v1/messages` here, not `/chat/completions`.
+        assert!(route.base_url.ends_with("/anthropic"), "{}", route.base_url);
+        assert!(route.base_url.contains(super::METERED_GATEWAY_PANELS));
+        assert_eq!(route.model, "claude-opus-5");
+
+        // A release may declare the model either way; both reach the same place,
+        // and the prefix is stripped because the path already selects Anthropic.
+        let qualified = super::metered_route("anthropic/claude-opus-5");
+        assert_eq!(qualified, route);
+        assert_eq!(super::metered_route("  claude-opus-5 "), route);
     }
 
     #[test]
@@ -699,21 +757,26 @@ mod metered_rail {
     #[test]
     fn a_bare_model_is_qualified_and_a_qualified_one_is_left_alone() {
         assert_eq!(
-            super::unified_model_name("gpt-4.1-mini"),
+            super::metered_route("gpt-4.1-mini").model,
             "openai/gpt-4.1-mini"
         );
         assert_eq!(
-            super::unified_model_name("openai/gpt-4.1"),
+            super::metered_route("openai/gpt-4.1").model,
             "openai/gpt-4.1"
         );
         assert_eq!(
-            super::unified_model_name("  gpt-5-mini "),
+            super::metered_route("  gpt-5-mini ").model,
             "openai/gpt-5-mini"
         );
         // Double-qualifying would produce a model the gateway cannot route.
         assert_eq!(
-            super::unified_model_name(&super::unified_model_name("gpt-4.1-mini")),
+            super::metered_route(&super::metered_route("gpt-4.1-mini").model).model,
             "openai/gpt-4.1-mini",
         );
+        // A non-Anthropic model stays on the compat shim, which is what unified
+        // billing routes by.
+        assert!(super::metered_route("gpt-4.1-mini")
+            .base_url
+            .ends_with("/compat"));
     }
 }
