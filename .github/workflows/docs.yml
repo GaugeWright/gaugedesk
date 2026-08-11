@@ -28,7 +28,7 @@ env:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'GaugeWright/gaugedesk' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v7
