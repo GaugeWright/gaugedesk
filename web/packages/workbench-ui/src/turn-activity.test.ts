@@ -10,7 +10,7 @@ function transcriptOf(...events: Parameters<typeof reduce>[1][]): Transcript {
     return events.reduce<Transcript>((current, event) => reduce(current, event), empty);
 }
 
-describe("live turn observation vocabulary (ADR 0123)", () => {
+describe("live turn observation vocabulary (ADR 0133)", () => {
     it("matches the runtime vocabulary exactly", () => {
         // This list is the contract with WhippleScript's `PublicTurnActivity`
         // (spec/agent-harness.md). A state the runtime publishes but this list

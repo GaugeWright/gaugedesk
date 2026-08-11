@@ -409,7 +409,7 @@ Then("every embedded panel fits without horizontal overflow", async ({ page }) =
     }
 });
 
-// -- live turn observation (ADR 0123) ---------------------------------------
+// -- live turn observation (ADR 0133) ---------------------------------------
 // The panel is the only place a visitor learns a turn is running before its
 // durable answer lands, so these assert the rendered words, not the state name.
 
