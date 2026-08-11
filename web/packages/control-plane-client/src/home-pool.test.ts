@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HomePool, isStaleRouteFailure } from "./home-pool";
+import { HomePool, UnroutedHomeError, isStaleRouteFailure } from "./home-pool";
 import { parseOpaqueHomeRoutes } from "./home-routing";
 import type { ProjectId } from "./control-plane-domain";
 
@@ -145,5 +145,56 @@ describe("closing a connection releases the transport that held it", () => {
         expect(calls).toEqual(["home:a#0 POST", "home:a#0 DELETE"]);
         expect(closed).toEqual(["home:a"]);
         expect(instance.snapshot()).toHaveLength(0);
+    });
+});
+
+describe("reaching a Home the caller already knows (ADR 0134 §3)", () => {
+    /** Two projects on one Home, plus a Home nothing routes to. */
+    function poolOverHomes() {
+        const admitted: string[] = [];
+        const instance = new HomePool<{ endpoint: string }>(
+            parseOpaqueHomeRoutes({
+                routes: [
+                    { project: "proj-1", home_id: "home:a", endpoint: "https://a.example" },
+                    { project: "proj-2", home_id: "home:a", endpoint: "https://a.example" },
+                ],
+            }),
+            () => "token",
+            {
+                client: (context) => ({ endpoint: context.endpoint }),
+                routeJson: ((endpoint: string) => (async (method: string) => {
+                    if (method !== "POST") return {};
+                    admitted.push(endpoint);
+                    return { home: "home:a", admission: "token" };
+                })) as never,
+            },
+        );
+        return { instance, admitted };
+    }
+
+    it("connects a Home through whichever of its routes is at hand", async () => {
+        const { instance } = poolOverHomes();
+        const connection = await instance.connectHome("home:a" as never);
+        expect(connection.homeId).toBe("home:a");
+        expect(connection.state).toBe("live");
+    });
+
+    it("shares one connection with the project work on that Home", async () => {
+        // The whole reason to route this through the pool: account-scoped work
+        // and project work on one Home are one tunnel and one admission, not two.
+        const { instance, admitted } = poolOverHomes();
+        await instance.connectHome("home:a" as never);
+        await instance.connectProject("proj-2" as ProjectId);
+        expect(admitted).toEqual(["https://a.example"]);
+        expect(instance.snapshot()).toHaveLength(1);
+    });
+
+    it("says a Home is unrouted rather than reporting a failed connection", async () => {
+        // Distinct because it resolves differently: the Home has to publish a
+        // route before anything can reach it, so retrying achieves nothing.
+        const { instance } = poolOverHomes();
+        await expect(instance.connectHome("home:silent" as never)).rejects.toThrow(
+            UnroutedHomeError,
+        );
     });
 });

@@ -103,6 +103,16 @@ export interface HomePoolOptions<Api> {
     readonly refreshRoutes?: () => Promise<readonly OpaqueHomeRoute[]>;
 }
 
+/**
+ * No route in this account names the Home a caller asked for.
+ *
+ * Not a connection failure and not a refusal — there is nothing to connect to
+ * yet. A Home publishes a route for each project it serves, so a Home serving
+ * none has published none, and the repair is on the Home rather than in a retry.
+ * Its own type so a caller can say that instead of reporting an outage.
+ */
+export class UnroutedHomeError extends Error {}
+
 /** Whether a failure looks like the relay refusing a superseded locator, rather
  * than the Home refusing the person. Only the former is worth re-reading for:
  * an admission refusal will refuse again just as fast. */
@@ -192,6 +202,25 @@ export class HomePool<Api> {
         return [...this.connections.values()]
             .map(({ admission: _admission, ...connection }) => connection)
             .sort((left, right) => left.homeId.localeCompare(right.homeId));
+    }
+
+    /**
+     * Connect a Home by id, through whichever of its granted routes is at hand
+     * (ADR 0134 §3).
+     *
+     * A caller that already knows the Home should not have to invent a project
+     * to reach it: the project only ever selected *which* Home, and the route it
+     * selected describes the Home, not the project. This is what serves
+     * account-scoped work on a Home with no endpoint — and because it lands in
+     * the same pool entry, that work and the project work on that Home share one
+     * tunnel and one admission (§4).
+     */
+    async connectHome(homeId: HomeId): Promise<HomeConnection<Api>> {
+        const route = [...this.routes.values()].find((entry) => entry.homeId === homeId);
+        // Distinct from a Home that refused, and it resolves differently: the
+        // Home has to publish before anything can reach it (§5).
+        if (!route) throw new UnroutedHomeError(`no granted route reaches Home ${homeId}`);
+        return this.connectProject(route.project);
     }
 
     async connectProject(project: ProjectId): Promise<HomeConnection<Api>> {

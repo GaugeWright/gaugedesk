@@ -50,6 +50,7 @@ import {
     openTunnel,
     tunnelAvailable,
     tunnelRouteJson,
+    UnroutedHomeError,
 } from "@gaugewright/control-plane-client";
 import {
     browserRouteEventStream,
@@ -347,6 +348,17 @@ export class WorkbenchControlPlane implements ControlPlane {
                         bearer: context.bearer,
                         homeAdmission: context.homeAdmission,
                     };
+                    // The tunnel carries JSON calls and nothing else: raw
+                    // fetches and the SSE stream are still browser-native, and a
+                    // Home with no endpoint gives them no origin to aim at.
+                    // Omitting them makes callers say so — `workTransport`
+                    // raises "Home raw transport unavailable" and the event
+                    // subscription simply does not start — rather than firing
+                    // relative requests at desk's own origin, where they would
+                    // come back as this page's HTML.
+                    if (!context.endpoint) {
+                        return { base: "", json: context.routeJson };
+                    }
                     return {
                         base: context.endpoint,
                         json: context.routeJson,
@@ -363,10 +375,24 @@ export class WorkbenchControlPlane implements ControlPlane {
         return this.pool;
     }
 
+    /** The Home that answers work not scoped to a project — the chat list, the
+     * workspace, the account's own view of itself. */
     private async connectSelectedHome(): Promise<workbenchClient.WorkbenchTransport> {
         const state = await accountClient.accountHomes(this.route);
         const selected = state.homes.find((home) => home.id === state.selectedHome);
         if (!selected) throw new NoSelectedHomeError("No reachable Home is selected");
+        // No address to dial (ADR 0134 §3). Its reachability lives in the
+        // root-signed record, which the pool already reads and verifies — and
+        // going through the pool rather than around it means the project work on
+        // this Home shares the one tunnel and the one admission (§4).
+        //
+        // Note what is *not* read here: the locator on the account Home record.
+        // Anyone holding the person's session can write that table, so its pin
+        // proves nothing (ADR 0131 §3).
+        if (!selected.endpoint) {
+            const pool = await this.homePool();
+            return (await pool.connectHome(selected.id)).api;
+        }
         let admission: string | null = null;
         const auth = {
             bearer: () => this.bearer,
@@ -399,7 +425,15 @@ export class WorkbenchControlPlane implements ControlPlane {
             if (!home) throw new NoSelectedHomeError("No reachable Home is selected");
             return { kind: "connected", home };
         } catch (error) {
-            if (!(error instanceof NoSelectedHomeError) && !isUnprovisionedHomeError(error)) {
+            // A selected Home that has published no route belongs with the other
+            // "no Home is serving you yet" states, not with connection failures
+            // (ADR 0134 §5): the surface below lists the account's Homes and
+            // routes, which is exactly what someone in that position needs.
+            if (
+                !(error instanceof NoSelectedHomeError)
+                && !(error instanceof UnroutedHomeError)
+                && !isUnprovisionedHomeError(error)
+            ) {
                 throw error;
             }
             this.homeTransport = null;

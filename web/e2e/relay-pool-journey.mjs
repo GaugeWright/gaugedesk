@@ -54,8 +54,9 @@ export async function runRelayPoolJourney() {
         assert(outcome, "the page produced no outcome");
         assert(outcome.ok, `the joined lane failed: ${outcome.ok ? "" : outcome.error}`);
         console.log(
-            `the pool admitted ${outcome.result.homeId} over the tunnel (${outcome.result.state});`
-                + ` a route naming another Home was refused: ${outcome.result.mismatch}`,
+            `the pool admitted ${outcome.result.homeId} over the tunnel (${outcome.result.state}),`
+                + ` reached it again by id alone (${outcome.result.byHome}), and refused a route`
+                + ` naming another Home: ${outcome.result.mismatch}`,
         );
         return outcome.result;
     } finally {

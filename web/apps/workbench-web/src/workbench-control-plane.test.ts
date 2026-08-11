@@ -572,3 +572,90 @@ describe("the tunnel payload is only fetched when it is needed (DESK-7)", () => 
         }
     });
 });
+
+describe("a selected Home with no address (DESK-8, ADR 0134)", () => {
+    /** The account's only Home is reachable through the relay, so its record in
+     * the Home table carries no endpoint. Its reachability comes from the route
+     * set instead, and the pool is what reads that. */
+    function relayOnlySelected(routeEndpoint: string | null) {
+        const worked: string[] = [];
+        const admitted: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            if (url === "https://hub.example/account/homes") {
+                return new Response(JSON.stringify({
+                    // No endpoint, and a locator that must be read past: this
+                    // table is writable by anyone holding the session, so its
+                    // pin proves nothing (ADR 0134 §2).
+                    homes: [{
+                        id: "home:r",
+                        kind: "registered",
+                        endpoint: "",
+                        relay: {
+                            endpoint: "wss://forged.example",
+                            handle: "C".repeat(43),
+                            proof: "D".repeat(43),
+                            route_epoch: 9,
+                            home_fingerprint: "cd".repeat(32),
+                        },
+                    }],
+                    selected_home: "home:r",
+                }));
+            }
+            if (url === "https://hub.example/account/directory") {
+                return new Response(null, { status: 404 });
+            }
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(JSON.stringify({
+                    routes: routeEndpoint
+                        ? [{ project: "proj-r", home_id: "home:r", endpoint: routeEndpoint }]
+                        : [],
+                }));
+            }
+            if (url === "https://r.example/home/admissions" && init?.method === "POST") {
+                admitted.push("r");
+                return new Response(
+                    JSON.stringify({ home: "home:r", admission: "t" }),
+                    { status: 201 },
+                );
+            }
+            if (url === "https://r.example/workspace") {
+                worked.push("r");
+                return new Response(JSON.stringify({
+                    archetypes: [], projects: [], recent: [], workstreams: [],
+                    work_targets: [], personal_placement: null,
+                }));
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        api.setBearer("person-token");
+        return { api, worked, admitted };
+    }
+
+    it("serves work with no project open, through the route set", async () => {
+        // Before this, the account-scoped call dialed `selected.endpoint` — the
+        // empty string — and every request went to desk's own origin. Nothing
+        // could reach a relay-only Home, so nothing could open a project on one.
+        const { api, worked } = relayOnlySelected("https://r.example");
+        await api.getWorkspace();
+        expect(worked).toEqual(["r"]);
+    });
+
+    it("shares its connection with the project work on the same Home", async () => {
+        const { api, admitted } = relayOnlySelected("https://r.example");
+        await api.getWorkspace();
+        api.setCurrentProject("proj-r" as never);
+        await api.getWorkspace();
+        expect(admitted).toEqual(["r"]);
+    });
+
+    it("reports a Home that has published nothing as having no Home yet", async () => {
+        // Not a failed connection: the Home has to publish a route before
+        // anything can reach it, so this belongs with the other "nobody is
+        // serving you yet" states rather than with an outage (ADR 0134 §5).
+        const { api } = relayOnlySelected(null);
+        const state = await api.bootstrapHome();
+        expect(state.kind).toBe("none");
+    });
+});

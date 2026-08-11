@@ -1,4 +1,4 @@
-import type { RouteJson } from "./control-plane-transport";
+import { isSecureControlPlaneEndpoint, type RouteJson } from "./control-plane-transport";
 import type { HomeId, ProjectId } from "./control-plane-domain";
 import {
     parseOpaqueHomeRoutes,
@@ -15,6 +15,26 @@ export interface AccountHome {
     readonly relay?: OpaqueRelayLocator | null;
 }
 
+/**
+ * The account's Homes and which one is selected.
+ *
+ * **An empty endpoint is a Home, not a malformed record (ADR 0134 §1).** A Home
+ * reachable only through the relay has no address to publish, and the account
+ * plane already accepts one (`valid_reachability`). What it means here is "this
+ * Home's reachability lives elsewhere" — in the root-signed record, which is the
+ * only place a certificate pin may come from.
+ *
+ * So the locator on this record is **read past, deliberately** (ADR 0134 §2).
+ * This table is writable by anyone holding the person's session,
+ * `home_fingerprint` included, which is exactly the forgery ADR 0131 §3 closed;
+ * honouring a pin from here would reopen it. It stays on the wire for the
+ * writers that populate it and is not a reachability input in a page.
+ *
+ * This previously ran each Home through `parseOpaqueHomeRoutes` at `unsigned`
+ * provenance, which *drops* an unsigned relay-only route — so an endpoint-less
+ * Home parsed to nothing and the result was dereferenced. Registering one made
+ * this whole route unreadable in a browser.
+ */
 export async function accountHomes(
     json: RouteJson,
 ): Promise<{ homes: AccountHome[]; selectedHome: HomeId | null }> {
@@ -23,7 +43,6 @@ export async function accountHomes(
             id?: unknown;
             kind?: unknown;
             endpoint?: unknown;
-            relay?: unknown;
         }[];
         selected_home?: unknown;
     };
@@ -36,19 +55,16 @@ export async function accountHomes(
         ) {
             throw new Error("account Home response is malformed");
         }
-        const parsed = parseOpaqueHomeRoutes({
-            routes: [{
-                project: "account-home",
-                home_id: home.id,
-                endpoint: home.endpoint,
-                relay: home.relay,
-            }],
-        })[0]!;
+        const endpoint = home.endpoint.replace(/\/+$/, "");
+        // An endpoint that is present must still be dialable; an absent one is
+        // answered by the pool, over the tunnel the signed record describes.
+        if (endpoint && !isSecureControlPlaneEndpoint(endpoint)) {
+            throw new Error(`refusing insecure Home endpoint for ${home.id}`);
+        }
         return {
             id: home.id as HomeId,
             kind: home.kind as AccountHomeKind,
-            endpoint: parsed.endpoint,
-            ...(parsed.relay ? { relay: parsed.relay } : {}),
+            endpoint,
         };
     });
     return {

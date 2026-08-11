@@ -54,6 +54,8 @@ interface HarnessDescription {
 export interface JourneyResult {
     readonly homeId: string;
     readonly state: string;
+    /** The Home reached by id alone, with no project named (DESK-8). */
+    readonly byHome: string;
     /** How the pool refused a route naming the wrong Home. */
     readonly mismatch: string;
 }
@@ -130,6 +132,18 @@ export async function runJourney(): Promise<JourneyResult> {
     // This is the `closeRoute` seam doing its job, not test hygiene.
     await pool.closeAll();
 
+    // Reaching the Home by id alone, with no project named (DESK-8, ADR 0134
+    // §3). This is the path that serves the chat list — the work a person does
+    // *before* there is a project open — and without it nothing in a browser
+    // ever arrives at a relay-only Home at all. A fresh pool, so this opens its
+    // own tunnel rather than inheriting the one above.
+    const account = poolFor(routeTo(description.home_id, description));
+    const byHome = await account.connectHome(description.home_id as HomeId);
+    if (byHome.homeId !== description.home_id) {
+        throw new Error(`connectHome reached ${byHome.homeId}`);
+    }
+    await account.closeAll();
+
     // The same Home, reached the same way, claimed to be someone else. The
     // admission succeeds and the pool throws it away, which is the check.
     const wrong = poolFor(routeTo("home:not-the-hermetic-one", description));
@@ -143,7 +157,7 @@ export async function runJourney(): Promise<JourneyResult> {
     if (!/Home identity mismatch/.test(mismatch)) {
         throw new Error(`a Home answering as another id was accepted: ${mismatch || "no error"}`);
     }
-    return { homeId: connection.homeId, state: connection.state, mismatch };
+    return { homeId: connection.homeId, state: connection.state, byHome: byHome.homeId, mismatch };
 }
 
 declare global {
