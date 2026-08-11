@@ -723,6 +723,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // bar. Only a project-rooted work chat has one — an edit chat or the hidden
     // Personal default resolves to `null`, so the bar reads-only there.
     const currentProject = () => chatInfo()?.project ?? null;
+    // Tell the control plane which project is open, so work resolves to *that*
+    // project's Home rather than one selected Home (DESK-3). Several Homes stay
+    // connected at once; this only decides which one serves the work in hand.
+    createEffect(() => {
+        api.setCurrentProject((currentProject()?.id ?? null) as ProjectId | null);
+    });
     const [networkBusy, setNetworkBusy] = createSignal(false);
     async function toggleNetworkIsolated() {
         const p = currentProject();

@@ -398,3 +398,86 @@ describe("hosted Home bootstrap", () => {
         );
     });
 });
+
+describe("project-first Home resolution (DESK-3)", () => {
+    /** Two projects on two different Homes, plus a selected Home that serves
+     * neither, so a mistake cannot pass by accidentally hitting the right one. */
+    function twoHomes() {
+        const admitted: string[] = [];
+        const worked: string[] = [];
+        const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(
+                    JSON.stringify({
+                        routes: [
+                            { project: "proj-a", home_id: "home:a", endpoint: "https://a.example" },
+                            { project: "proj-b", home_id: "home:b", endpoint: "https://b.example" },
+                        ],
+                    }),
+                );
+            }
+            if (url === "https://hub.example/account/homes") {
+                return new Response(
+                    JSON.stringify({
+                        homes: [{ id: "home:z", kind: "cloud", endpoint: "https://z.example" }],
+                        selected_home: "home:z",
+                    }),
+                );
+            }
+            const admission = url.match(/^https:\/\/([abz])\.example\/home\/admissions$/);
+            if (admission && init?.method === "POST") {
+                admitted.push(admission[1]);
+                return new Response(
+                    JSON.stringify({ home: `home:${admission[1]}`, admission: `token-${admission[1]}` }),
+                    { status: 201 },
+                );
+            }
+            if (admission) return new Response(null, { status: 204 });
+            const work = url.match(/^https:\/\/([abz])\.example\/workspace$/);
+            if (work) {
+                worked.push(work[1]);
+                return new Response(
+                    JSON.stringify({
+                        archetypes: [], projects: [], recent: [], workstreams: [],
+                        work_targets: [], personal_placement: null,
+                    }),
+                );
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        });
+        vi.stubGlobal("fetch", fetch);
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        api.setBearer("person-token");
+        return { api, admitted, worked };
+    }
+
+    it("sends a project's work to that project's Home, not to a selected one", async () => {
+        const { api, worked } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        await api.getWorkspace();
+        expect(worked).toEqual(["a"]);
+    });
+
+    it("holds several Homes at once and follows the open project between them", async () => {
+        const { api, admitted, worked } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        await api.getWorkspace();
+        api.setCurrentProject("proj-b" as never);
+        await api.getWorkspace();
+        expect(worked).toEqual(["a", "b"]);
+        // Returning to the first project reuses its live connection rather than
+        // re-admitting: that is what "several Homes at once" has to mean.
+        api.setCurrentProject("proj-a" as never);
+        await api.getWorkspace();
+        expect(worked).toEqual(["a", "b", "a"]);
+        expect(admitted).toEqual(["a", "b"]);
+    });
+
+    it("falls back to the selected Home for a project with no granted route", async () => {
+        const { api, worked } = twoHomes();
+        api.setCurrentProject("proj-unrouted" as never);
+        await api.getWorkspace();
+        expect(worked).toEqual(["z"]);
+    });
+});

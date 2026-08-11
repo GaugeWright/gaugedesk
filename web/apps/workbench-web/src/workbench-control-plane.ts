@@ -43,6 +43,7 @@ import type {
     OpaqueHomeRoute,
     CreatedHomeInvitation,
 } from "@gaugewright/control-plane-client";
+import { HomePool } from "@gaugewright/control-plane-client";
 import {
     browserRouteEventStream,
     browserRouteJson,
@@ -102,6 +103,11 @@ export class WorkbenchControlPlane implements ControlPlane {
     private readonly splitHomes: boolean;
     private readonly workTransport: workbenchClient.WorkbenchTransport;
     private homeTransport: Promise<workbenchClient.WorkbenchTransport> | null = null;
+    /** Several Homes at once, resolved per project (DESK-3). There is no
+     * selected Home here: whichever project is open decides which Home serves,
+     * and a Home that fails degrades only the projects routed to it. */
+    private pool: HomePool<workbenchClient.WorkbenchTransport> | null = null;
+    private currentProject: ProjectId | null = null;
 
     constructor(
         private readonly base = controlPlaneBase(),
@@ -155,6 +161,8 @@ export class WorkbenchControlPlane implements ControlPlane {
         if (this.bearer !== token) {
             this.homeAdmission = null;
             this.homeTransport = null;
+            void this.pool?.closeAll().catch(() => undefined);
+            this.pool = null;
         }
         this.bearer = token;
     }
@@ -187,10 +195,76 @@ export class WorkbenchControlPlane implements ControlPlane {
         return this.splitHomes ? (await this.requireHomeTransport()).json : this.route;
     }
 
+    /** Open a project, so subsequent work resolves to *its* Home. Passing null
+     * returns to whatever the account last selected. */
+    setCurrentProject(project: ProjectId | null): void {
+        if (this.currentProject === project) return;
+        this.currentProject = project;
+        // Only the per-project path is invalidated; other Homes in the pool keep
+        // their connections, which is the point of holding several.
+        this.homeTransport = null;
+    }
+
+    /** Resolve the transport for the work in hand.
+     *
+     * Every work call in this client funnels through here, so per-project
+     * resolution lands in one place rather than in each caller. A project with a
+     * granted route is served by its own Home through the pool; anything else
+     * falls back to the account's selected Home, which is what accounts whose
+     * Homes have not yet authored routes still rely on (DESK-5a). */
     private requireHomeTransport(): Promise<workbenchClient.WorkbenchTransport> {
         if (!this.splitHomes) return Promise.resolve(this.workTransport);
+        const project = this.currentProject;
+        if (project) {
+            this.homeTransport ??= this.connectRoutedProject(project).catch((error) => {
+                // A project with no granted route is not an error: it predates
+                // authorship, so the selected Home still serves it.
+                if (String(error).includes("no granted Home route")) {
+                    this.homeTransport = null;
+                    return this.connectSelectedHome();
+                }
+                throw error;
+            });
+            return this.homeTransport;
+        }
         this.homeTransport ??= this.connectSelectedHome();
         return this.homeTransport;
+    }
+
+    /** Connect the exact Home a project is routed to, reusing a live connection
+     * when the pool already holds one. */
+    private async connectRoutedProject(
+        project: ProjectId,
+    ): Promise<workbenchClient.WorkbenchTransport> {
+        const pool = await this.homePool();
+        const connection = await pool.connectProject(project);
+        return connection.api;
+    }
+
+    /** The account's project→Home routes, as a live pool. Built once and
+     * refreshed whenever the account directory is re-read. */
+    private async homePool(): Promise<HomePool<workbenchClient.WorkbenchTransport>> {
+        if (this.pool) return this.pool;
+        const routes = await accountClient.accountHomeRoutes(this.route);
+        this.pool = new HomePool<workbenchClient.WorkbenchTransport>(
+            routes,
+            () => this.bearer,
+            {
+                client: (context) => {
+                    const auth = {
+                        bearer: context.bearer,
+                        homeAdmission: context.homeAdmission,
+                    };
+                    return {
+                        base: context.endpoint,
+                        json: context.routeJson,
+                        request: browserRouteRequest(context.endpoint, auth),
+                        events: browserRouteEventStream(context.endpoint, auth),
+                    };
+                },
+            },
+        );
+        return this.pool;
     }
 
     private async connectSelectedHome(): Promise<workbenchClient.WorkbenchTransport> {
