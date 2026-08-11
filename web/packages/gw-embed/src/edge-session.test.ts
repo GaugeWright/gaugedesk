@@ -575,6 +575,96 @@ describe("EdgeSessionApi", () => {
         },
     );
 
+    it("backs a repeatedly refused socket off instead of flooding the deployment", async () => {
+        vi.useFakeTimers();
+        const sockets: FakeWebSocket[] = [];
+        // The state projection answers 200, so every failure reads as
+        // transient. That is exactly the shape that used to spin: an upgrade
+        // the deployment refuses, and a probe that never corroborates it.
+        const fetchMock = vi.fn().mockResolvedValue(
+            new Response(
+                JSON.stringify({
+                    session_id: "sess_0123456789abcdef0123456789abcdef",
+                    cursor: 0,
+                    transcript: [],
+                    files: [],
+                }),
+                { status: 200 },
+            ),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+        vi.stubGlobal(
+            "WebSocket",
+            class extends FakeWebSocket {
+                constructor(url: string) {
+                    super(url);
+                    sockets.push(this);
+                }
+            },
+        );
+        const api = new EdgeSessionApi(
+            "https://panels.gaugewright.com/d/theory-a",
+            "sess_0123456789abcdef0123456789abcdef" as EngagementId,
+            "resume-capability",
+            "connection-capability",
+            Date.now() + 15 * 60 * 1000,
+            null,
+            false,
+        );
+        const ready = api.ready();
+        sockets[0]!.emit("open");
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "session_ready",
+                snapshot: { cursor: 0, transcript: [], files: [] },
+            }),
+        });
+        await ready;
+        api.subscribe("ignored" as EngagementId, () => undefined);
+
+        // Every subsequent upgrade is refused before it reaches ready.
+        const refuse = async () => {
+            sockets.at(-1)!.close();
+            await vi.advanceTimersByTimeAsync(0);
+        };
+        await refuse();
+        for (const delay of [100, 200, 400, 800]) {
+            const before = sockets.length;
+            await vi.advanceTimersByTimeAsync(delay - 1);
+            expect(sockets).toHaveLength(before);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(sockets).toHaveLength(before + 1);
+            await refuse();
+        }
+
+        // It settles at the ceiling rather than growing without bound.
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+            await vi.advanceTimersByTimeAsync(30_000);
+            await refuse();
+        }
+        const settled = sockets.length;
+        await vi.advanceTimersByTimeAsync(29_999);
+        expect(sockets).toHaveLength(settled);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(sockets).toHaveLength(settled + 1);
+
+        // One connection that reaches ready earns a fast retry again.
+        sockets.at(-1)!.emit("open");
+        sockets.at(-1)!.emit("message", {
+            data: JSON.stringify({
+                type: "session_ready",
+                snapshot: { cursor: 0, transcript: [], files: [] },
+            }),
+        });
+        await refuse();
+        const recovered = sockets.length;
+        await vi.advanceTimersByTimeAsync(100);
+        expect(sockets).toHaveLength(recovered + 1);
+
+        api.dispose();
+        vi.useRealTimers();
+    });
+
     it("repairs a cursor gap from the last contiguous event", async () => {
         vi.useFakeTimers();
         const sockets: FakeWebSocket[] = [];

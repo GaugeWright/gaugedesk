@@ -52,6 +52,18 @@ export interface EmbedChatControls {
     erase?(chat: string): Promise<void>;
 }
 
+/** The overwhelmingly common reconnect is one dropped frame on a live session,
+ * so the first retry stays fast enough that a visitor never feels it. */
+const RECONNECT_BASE_MS = 100;
+
+/** A rejected upgrade is not always transient, and the client cannot read the
+ * status a failed WebSocket handshake returned. Without a ceiling, one session
+ * the deployment refuses becomes ten upgrade attempts a second for as long as
+ * the tab stays open — a self-inflicted flood that never resolves and buries
+ * the real error in console noise. Doubling to this ceiling keeps a genuine
+ * blip invisible while a persistent refusal settles into a slow poll. */
+const RECONNECT_CEILING_MS = 30_000;
+
 /** One canonical, cursor-resumable WebSocket to the engagement's Session DO. */
 export class EdgeSessionApi implements EmbedSessionApi {
     private socket: WebSocket | null = null;
@@ -78,6 +90,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
     private refreshPromise: Promise<void> | null = null;
     private refreshTimer: ReturnType<typeof setTimeout> | null = null;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private reconnectAttempts = 0;
     private terminalRecoveryStarted = false;
 
     constructor(
@@ -177,6 +190,11 @@ export class EdgeSessionApi implements EmbedSessionApi {
                 if (type === "session_ready" && !ready) {
                     ready = true;
                     this.openPromise = null;
+                    // A connection that reached ready is the only evidence the
+                    // backoff should start over from; an upgrade that merely
+                    // succeeded is not, since the session can still be refused
+                    // after the socket opens.
+                    this.reconnectAttempts = 0;
                     this.observeLatency("session_ready_received", {
                         sequence: this.cursor,
                     });
@@ -217,15 +235,23 @@ export class EdgeSessionApi implements EmbedSessionApi {
 
     private scheduleReconnect(): void {
         if (this.reconnectTimer || this.terminalRecoveryStarted) return;
+        const delay = Math.min(
+            RECONNECT_CEILING_MS,
+            RECONNECT_BASE_MS * 2 ** this.reconnectAttempts,
+        );
+        this.reconnectAttempts += 1;
         this.reconnectTimer = globalThis.setTimeout(() => {
             this.reconnectTimer = null;
             void this.recoverOrReconnect();
-        }, 100);
+        }, delay);
     }
 
     /** Distinguish a transient transport loss from a session the deployment has
      * terminally removed. WebSocket does not expose its failed HTTP upgrade
-     * status, so the scoped state projection is the authoritative probe. */
+     * status, so the scoped state projection is the authoritative probe — which
+     * is why every public route must agree about whether a session is still
+     * usable. When the projection disagreed with the socket, this probe read a
+     * refused session as transient and reconnected against it forever. */
     private async recoverOrReconnect(): Promise<void> {
         let unavailable = false;
         try {
