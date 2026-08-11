@@ -51,6 +51,12 @@ tempfile = "3"
 name = "test-wss-relay"
 required-features = ["test-relay"]
 
+# The hermetic end of the browser lane (DESK-7): a relay, a parked Home leg, and
+# a config endpoint the browser test reads because the relay port is ephemeral.
+[[example]]
+name = "hermetic-home"
+required-features = ["test-relay"]
+
 # The browser half is proven by running it in a browser, not by trusting
 # that a successful wasm32 compile implies a working ring at runtime (DESK-6).
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
