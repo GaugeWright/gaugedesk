@@ -28,7 +28,7 @@ pub fn routes() -> Router<SharedWorkbench> {
             "/account/facilities",
             get(get_facilities).post(post_facility),
         )
-        .route("/account/facilities/:id", delete(delete_facility))
+        .route("/account/facilities/{id}", delete(delete_facility))
         // The tenant switcher (ADR 0077 §9): the person's tenants. Empty on the solo desktop
         // path (no personal tenant is provisioned there) — that is the org-free solo shape.
         .route("/account/tenants", get(get_tenants).post(post_tenant))
@@ -36,7 +36,7 @@ pub fn routes() -> Router<SharedWorkbench> {
         // expose/accept only the current person's metadata pointer.
         .route("/account/invitations", get(get_invitations))
         .route(
-            "/account/invitations/:tenant/accept",
+            "/account/invitations/{tenant}/accept",
             post(post_accept_invitation),
         )
 }

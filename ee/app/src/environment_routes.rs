@@ -373,7 +373,7 @@ pub fn routes() -> Router<SharedWorkbench> {
     Router::new()
         .route("/environments/administration/sessions", post(open_session))
         .route(
-            "/environments/administration/documents/:id",
+            "/environments/administration/documents/{id}",
             get(read_document),
         )
         .route(
@@ -393,7 +393,7 @@ pub fn routes() -> Router<SharedWorkbench> {
             get(list_changes).post(submit_change),
         )
         .route(
-            "/environments/administration/changes/:id/review",
+            "/environments/administration/changes/{id}/review",
             post(review_change),
         )
 }

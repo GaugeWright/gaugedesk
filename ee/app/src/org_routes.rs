@@ -120,7 +120,7 @@ pub fn routes() -> Router<SharedWorkbench> {
         // its token and group mappings only through the shared Environment command path.
         .route("/scim/v2/Users", post(crate::scim_routes::post_scim_user))
         .route(
-            "/scim/v2/Users/:id",
+            "/scim/v2/Users/{id}",
             patch(crate::scim_routes::patch_scim_user).delete(crate::scim_routes::delete_scim_user),
         )
 }

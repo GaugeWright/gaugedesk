@@ -20,7 +20,7 @@ gaugedesk-env = { path = "../../crates/env" }
 gaugedesk-core = { path = "../../crates/core" }
 gaugedesk-store = { path = "../../crates/store" }
 gaugedesk-app = { path = "../../crates/app", default-features = false }
-axum = "0.7"
+axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }

@@ -230,7 +230,7 @@ pub(crate) fn routes() -> axum::Router<SharedWorkbench> {
         .route("/federation/pairing-ticket", post(post_pairing_ticket))
         .route("/federation/pair", post(post_pair))
         .route("/federation/peers", get(get_peers))
-        .route("/federation/peers/:authority", delete(delete_peer))
+        .route("/federation/peers/{authority}", delete(delete_peer))
         // Project handoff / authority relocation (FED-6): the shipped control
         // surface is relocate/consent/abort/status. The reducer's former raw
         // offer -> sync -> commit HTTP steps were retired because no product

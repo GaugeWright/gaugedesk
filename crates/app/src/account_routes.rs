@@ -43,14 +43,14 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
                 get(get_devices)
             }
         })
-        .route("/account/devices/:id/revoke", post(post_device_revoke))
+        .route("/account/devices/{id}/revoke", post(post_device_revoke))
         // Device-enrollment handshake drive (ACCT-1, ADR 0055): the holder hosts +
         // authorizes; the new device joins. Both dial the rendezvous broker; status
         // GETs surface the phase + SAS for the out-of-band human compare. The account
         // key crosses only as ECIES ciphertext over the broker, never over HTTP.
         .route("/account/devices/enroll/host", post(post_enroll_host))
         .route(
-            "/account/devices/enroll/host/:session",
+            "/account/devices/enroll/host/{session}",
             get(get_enroll_host),
         )
         .route(
@@ -59,19 +59,19 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
         )
         .route("/account/devices/enroll/join", post(post_enroll_join))
         .route(
-            "/account/devices/enroll/join/:session",
+            "/account/devices/enroll/join/{session}",
             get(get_enroll_join),
         )
         .route("/account/settings", get(get_settings))
-        .route("/account/settings/:key", put(put_setting))
+        .route("/account/settings/{key}", put(put_setting))
         .route("/account/homes", get(get_homes).post(post_home))
         .route("/account/homes/selected", put(put_selected_home))
-        .route("/account/homes/:id", delete(delete_home))
+        .route("/account/homes/{id}", delete(delete_home))
         .route(
             "/account/home-routes",
             get(get_home_routes).post(post_home_route),
         )
-        .route("/account/home-routes/:project", delete(delete_home_route))
+        .route("/account/home-routes/{project}", delete(delete_home_route))
         .merge(managed_inference_routes())
 }
 
@@ -156,7 +156,7 @@ fn shared_runtime_credential_routes() -> Router<SharedWorkbench> {
             "/account/credentials",
             get(get_credentials).post(post_credential),
         )
-        .route("/account/credentials/:provider", delete(delete_credential))
+        .route("/account/credentials/{provider}", delete(delete_credential))
         // First-run gate signal (ADR 0075 Phase 0): whether the default runtime
         // actually needs an LLM credential. False under the scripted fake agent
         // (dev/e2e), so the first-run overlay never blocks a no-credential test.

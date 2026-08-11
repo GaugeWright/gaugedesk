@@ -30,7 +30,7 @@ gaugedesk-tracker = { path = "../tracker" }
 gaugedesk-whip-runtime = { path = "../whip-runtime" }
 gaugedesk-relay-transport = { path = "../relay-transport" }
 gaugedesk-directory-protocol = { path = "../directory-protocol" }
-axum = "0.7"
+axum = "0.8"
 tower-http = { version = "0.7", features = ["cors"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

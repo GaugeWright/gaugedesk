@@ -143,14 +143,14 @@ pub fn routes() -> Router<SharedWorkbench> {
         .route("/mobile/enrollment/status", post(post_status))
         .route("/mobile/enrollment/requests", get(get_pending_requests))
         .route(
-            "/mobile/enrollment/requests/:id/approve",
+            "/mobile/enrollment/requests/{id}/approve",
             post(post_approve),
         )
-        .route("/mobile/enrollment/requests/:id/reject", post(post_reject))
+        .route("/mobile/enrollment/requests/{id}/reject", post(post_reject))
         .route("/mobile/sessions/challenge", post(post_session_challenge))
         .route("/mobile/sessions", post(post_session))
         .route("/mobile/controllers", get(get_controllers))
-        .route("/mobile/controllers/:id/revoke", post(post_revoke))
+        .route("/mobile/controllers/{id}/revoke", post(post_revoke))
 }
 
 #[derive(Deserialize)]
