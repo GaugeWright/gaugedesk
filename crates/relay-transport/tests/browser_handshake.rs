@@ -26,12 +26,21 @@ fn the_pinned_session_starts_in_a_browser() {
 #[wasm_bindgen_test]
 fn the_browser_produces_a_client_hello() {
     let mut session = PinnedSession::new([0xAB; 32]).expect("session");
-    session.pump().expect("the handshake must advance in a browser");
+    session
+        .pump()
+        .expect("the handshake must advance in a browser");
     let hello = session.take_outgoing();
-    assert!(!hello.is_empty(), "ring produced no ClientHello in the browser");
+    assert!(
+        !hello.is_empty(),
+        "ring produced no ClientHello in the browser"
+    );
     // TLS record: handshake content type, then the legacy record version.
     assert_eq!(hello[0], 0x16, "expected a TLS handshake record");
-    assert_eq!(&hello[1..3], &[0x03, 0x01], "expected the legacy record version");
+    assert_eq!(
+        &hello[1..3],
+        &[0x03, 0x01],
+        "expected the legacy record version"
+    );
     assert_eq!(hello[5], 0x01, "expected a ClientHello");
 }
 

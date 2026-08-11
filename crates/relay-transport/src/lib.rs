@@ -22,6 +22,14 @@ pub use native::*;
 /// handshake-tested — on every target.
 pub mod session;
 
+/// HTTP/1.1 and SSE over the tunnel, for a client with no socket to hand an
+/// operating system. Sans-io, so it is tested natively (DESK-7).
+pub mod http_stream;
+
+/// The pinned tunnel as a request/response client — what the multi-Home pool
+/// consumes. Target-independent, so the journey is tested natively (DESK-7).
+pub mod tunnel_client;
+
 #[cfg(target_arch = "wasm32")]
 pub mod browser;
 
