@@ -23,8 +23,8 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::wire;
 use crate::wire::{
     invalid_data, one_shot_websocket_route, other, websocket_handshake, CertFingerprint,
-    OneShotLeg, RouteProof, WebSocketRelayRole, WebSocketRelayRoute, PIN_SNI,
-    TOKEN_LEN, WSS_DATA, WSS_FIN, WSS_FIN_ACK, WSS_HANDSHAKE_LEN, WSS_MAX_FRAME_BYTES, WSS_READY,
+    OneShotLeg, RouteProof, WebSocketRelayRole, WebSocketRelayRoute, PIN_SNI, TOKEN_LEN, WSS_DATA,
+    WSS_FIN, WSS_FIN_ACK, WSS_HANDSHAKE_LEN, WSS_MAX_FRAME_BYTES, WSS_READY,
     WSS_STREAM_BUFFER_BYTES,
 };
 
@@ -298,7 +298,7 @@ impl TlsIdentity {
         self.fingerprint
     }
 
-    fn server_config(&self) -> std::io::Result<ServerConfig> {
+    pub(crate) fn server_config(&self) -> std::io::Result<ServerConfig> {
         ServerConfig::builder_with_provider(Arc::new(
             tokio_rustls::rustls::crypto::ring::default_provider(),
         ))

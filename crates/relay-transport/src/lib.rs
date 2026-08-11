@@ -18,6 +18,10 @@ mod native;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
 
+/// The pinned session is target-independent, so it is compiled — and
+/// handshake-tested — on every target.
+pub mod session;
+
 #[cfg(target_arch = "wasm32")]
 pub mod browser;
 
