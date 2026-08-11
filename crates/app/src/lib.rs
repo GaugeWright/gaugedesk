@@ -51,6 +51,7 @@ pub mod home;
 pub mod home_admission;
 pub mod home_backup;
 pub mod home_invitation;
+pub mod home_reachability;
 pub mod home_routes;
 pub mod identity;
 pub mod identity_oidc;

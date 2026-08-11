@@ -58,7 +58,10 @@ describe("opaque project Home routing", () => {
         );
     });
 
-    it("parses only bounded opaque relay locators without treating them as authority", () => {
+    it("refuses a certificate pin that arrives unsigned, keeping the endpoint", () => {
+        // The hub's route table is a convenience projection anyone holding the
+        // person's session can write into, `home_fingerprint` included. An
+        // endpoint is CA-validated so a forgery buys nothing; a pin is not.
         const [route] = parseOpaqueHomeRoutes({
             routes: [{
                 project: "project-relay",
@@ -73,6 +76,45 @@ describe("opaque project Home routing", () => {
                 },
             }],
         });
+        expect(route?.endpoint).toBe("https://fallback.example");
+        expect(route?.relay).toBeUndefined();
+    });
+
+    it("drops an unsigned relay-only route without hiding the rest of the directory", () => {
+        const routes = parseOpaqueHomeRoutes({
+            routes: [
+                {
+                    project: "project-relay-only",
+                    home_id: "home:relay-only",
+                    relay: {
+                        endpoint: "wss://relay.gaugewright.com",
+                        handle: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        proof: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+                        route_epoch: 3,
+                        home_fingerprint: "cd".repeat(32),
+                    },
+                },
+                { project: "project-direct", home_id: "home:direct", endpoint: "https://home.example" },
+            ],
+        });
+        expect(routes.map((route) => route.project)).toEqual(["project-direct"]);
+    });
+
+    it("parses only bounded opaque relay locators without treating them as authority", () => {
+        const [route] = parseOpaqueHomeRoutes({
+            routes: [{
+                project: "project-relay",
+                home_id: "home:relay",
+                endpoint: "https://fallback.example",
+                relay: {
+                    endpoint: "wss://relay.gaugewright.com",
+                    handle: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    proof: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+                    route_epoch: 2,
+                    home_fingerprint: "ab".repeat(32),
+                },
+            }],
+        }, "signed");
         expect(route?.relay).toEqual({
             endpoint: "wss://relay.gaugewright.com",
             handle: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -92,7 +134,7 @@ describe("opaque project Home routing", () => {
                     home_fingerprint: "cd".repeat(32),
                 },
             }],
-        });
+        }, "signed");
         expect(relayOnly?.endpoint).toBe("");
         expect(relayOnly?.relay?.routeEpoch).toBe(3);
         expect(
@@ -111,6 +153,6 @@ describe("opaque project Home routing", () => {
                     home_fingerprint: "not-a-pin",
                 },
             }],
-        })).toThrow(/invalid relay locator/);
+        }, "signed")).toThrow(/invalid relay locator/);
     });
 });

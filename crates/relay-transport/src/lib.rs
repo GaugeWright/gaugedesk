@@ -5,6 +5,12 @@
 //! frames. TLS is end to end between Home and client; the relay owns no key.
 //! A native client may expose the resulting stream on device loopback so the
 //! shared HTTP/SSE workbench needs no mobile-specific API (ADR 0116).
+//!
+//! This module is the **native carrier**: sockets, tasks, the filesystem, and
+//! the `ring` provider. What a leg says and what it accepts — the handshake
+//! frame, the route rules, and the certificate pin — lives sans-io in
+//! [`wire`], so a browser carrier can drive the identical bytes over a
+//! `WebSocket` without linking any of this (DESK-1, ADR 0130).
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -14,172 +20,25 @@ use std::time::Duration;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
-use tokio_rustls::rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_tungstenite::tungstenite::Message;
 
+pub mod wire;
+pub use wire::*;
+use wire::{invalid_data, other, PIN_SNI, WSS_DATA, WSS_FIN, WSS_FIN_ACK, WSS_READY};
+
 #[cfg(any(test, feature = "test-relay"))]
 pub mod test_relay;
-
-pub const TOKEN_LEN: usize = 32;
-pub const WSS_PROTOCOL_VERSION: u16 = 1;
-pub const WSS_MAX_FRAME_BYTES: usize = 64 * 1024;
-pub const WSS_STREAM_BUFFER_BYTES: usize = 256 * 1024;
-pub const WSS_HANDSHAKE_LEN: usize = 84;
-const WSS_HANDSHAKE_MAGIC: [u8; 8] = *b"GWRWSS1\n";
-const WSS_READY: [u8; 8] = *b"GWRREADY";
-const WSS_DATA: u8 = 0;
-const WSS_FIN: u8 = 1;
-const WSS_FIN_ACK: u8 = 2;
-const PIN_SNI: &str = "gaugewright-home";
-
-/// The four roles admitted by the one WSS relay fabric. A route family is
-/// fixed by its first admitted leg, so durable Home/client traffic can never
-/// pair with a one-shot enrollment or federation leg.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum WebSocketRelayRole {
-    Home = 1,
-    Client = 2,
-    Source = 3,
-    Target = 4,
-}
-
-/// Which side of a bounded one-shot rendezvous is expected to park first.
-/// This is transport ordering only; it grants no source/target authority.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OneShotLeg {
-    Initializer,
-    Joiner,
-}
 
 /// Type-erased ordered byte stream used by the enrollment/federation shells.
 pub trait RelayByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> RelayByteStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 pub type BoxedRelayByteStream = Box<dyn RelayByteStream>;
-
-impl WebSocketRelayRole {
-    pub fn is_initializer(self) -> bool {
-        matches!(self, Self::Home | Self::Source)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RouteProof([u8; 32]);
-
-impl RouteProof {
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn from_base64url(value: &str) -> std::io::Result<Self> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(value)
-            .map_err(|_| invalid_data("relay route proof is not base64url"))?;
-        Ok(Self(bytes.try_into().map_err(|_| {
-            invalid_data("relay route proof must contain 32 bytes")
-        })?))
-    }
-
-    pub fn to_base64url(self) -> String {
-        URL_SAFE_NO_PAD.encode(self.0)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-/// Canonical WSS locator. `handle` selects one hibernatable object, while the
-/// epoch and proof are checked inside that object before it will pair a leg.
-/// Possession grants reachability only; carried TLS and Home admission remain
-/// the work-authority gates.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WebSocketRelayRoute {
-    pub endpoint: String,
-    pub handle: String,
-    pub epoch: u64,
-    pub proof: RouteProof,
-    /// Only an initializer may advance exactly one epoch, proving continuity
-    /// with the prior proof while installing the new proof.
-    pub previous_proof: Option<RouteProof>,
-}
-
-impl WebSocketRelayRoute {
-    pub fn validate(&self) -> std::io::Result<()> {
-        let production = self
-            .endpoint
-            .strip_prefix("wss://")
-            .is_some_and(valid_origin_authority);
-        let loopback_test = self
-            .endpoint
-            .strip_prefix("ws://")
-            .and_then(|authority| authority.parse::<SocketAddr>().ok())
-            .is_some_and(|address| address.ip().is_loopback());
-        if (!production && !loopback_test)
-            || self.endpoint.ends_with('/')
-            || self.endpoint.contains('#')
-            || self.endpoint.contains('?')
-        {
-            return Err(invalid_data(
-                "relay endpoint must be a canonical wss:// origin (or a loopback ws:// test origin)",
-            ));
-        }
-        let handle = URL_SAFE_NO_PAD
-            .decode(&self.handle)
-            .map_err(|_| invalid_data("relay route handle is not base64url"))?;
-        if handle.len() != 32 {
-            return Err(invalid_data("relay route handle must contain 32 bytes"));
-        }
-        if self.epoch == 0 {
-            return Err(invalid_data("relay route epoch must be positive"));
-        }
-        Ok(())
-    }
-
-    fn url(&self) -> std::io::Result<String> {
-        self.validate()?;
-        Ok(format!("{}/v1/relay/{}", self.endpoint, self.handle))
-    }
-}
-
-fn valid_origin_authority(authority: &str) -> bool {
-    !authority.is_empty()
-        && !authority.contains('/')
-        && !authority.contains('@')
-        && !authority.chars().any(char::is_whitespace)
-}
-
-pub fn websocket_handshake(
-    route: &WebSocketRelayRoute,
-    role: WebSocketRelayRole,
-) -> std::io::Result<[u8; WSS_HANDSHAKE_LEN]> {
-    route.validate()?;
-    if !role.is_initializer() && route.previous_proof.is_some() {
-        return Err(invalid_data(
-            "only an initializer may present a previous route proof",
-        ));
-    }
-    let mut frame = [0u8; WSS_HANDSHAKE_LEN];
-    frame[..8].copy_from_slice(&WSS_HANDSHAKE_MAGIC);
-    frame[8..10].copy_from_slice(&WSS_PROTOCOL_VERSION.to_be_bytes());
-    frame[10] = role as u8;
-    frame[11] = u8::from(route.previous_proof.is_some());
-    frame[12..20].copy_from_slice(&route.epoch.to_be_bytes());
-    frame[20..52].copy_from_slice(route.proof.as_bytes());
-    if let Some(previous) = route.previous_proof {
-        frame[52..84].copy_from_slice(previous.as_bytes());
-    }
-    Ok(frame)
-}
 
 /// Ordered byte stream backed by bounded binary WebSocket frames. Closing or
 /// dropping it terminates the pump; no reconnect can silently join two TLS
@@ -236,29 +95,6 @@ pub async fn connect_websocket_stream(
         .await
         .map_err(|error| other(format!("connect relay WebSocket: {error}")))?;
     websocket_stream_from_socket(socket, handshake).await
-}
-
-/// Derive the edge object's opaque handle and proof from the existing 32-byte
-/// rendezvous capability. This preserves the established one-shot ticket wire
-/// while moving its outer transport to WSS; neither derived value grants work
-/// authority.
-pub fn one_shot_websocket_route(
-    endpoint: &str,
-    token: [u8; TOKEN_LEN],
-) -> std::io::Result<WebSocketRelayRoute> {
-    let mut proof_hasher = Sha256::new();
-    proof_hasher.update(b"gaugewright-relay-proof-v1\0");
-    proof_hasher.update(token);
-    let proof: [u8; 32] = proof_hasher.finalize().into();
-    let route = WebSocketRelayRoute {
-        endpoint: endpoint.to_string(),
-        handle: URL_SAFE_NO_PAD.encode(token),
-        epoch: 1,
-        proof: RouteProof::new(proof),
-        previous_proof: None,
-    };
-    route.validate()?;
-    Ok(route)
 }
 
 /// Connect a bounded enrollment/federation leg through the canonical WSS
@@ -405,8 +241,6 @@ async fn connect_websocket_joiner(
     unreachable!("bounded joiner loop always returns")
 }
 
-pub type CertFingerprint = [u8; 32];
-
 #[derive(Clone, Debug)]
 pub struct TlsIdentity {
     cert: CertificateDer<'static>,
@@ -483,69 +317,6 @@ impl TlsIdentity {
             PrivatePkcs8KeyDer::from(self.key.clone()).into(),
         )
         .map_err(|error| other(format!("relay TLS identity: {error}")))
-    }
-}
-
-fn fingerprint(cert: &CertificateDer<'_>) -> CertFingerprint {
-    Sha256::digest(cert.as_ref()).into()
-}
-
-#[derive(Debug)]
-struct PinnedVerifier {
-    expected: CertFingerprint,
-    provider: Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
-}
-
-impl ServerCertVerifier for PinnedVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, tokio_rustls::rustls::Error> {
-        if fingerprint(end_entity) == self.expected {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(tokio_rustls::rustls::Error::General(
-                "Home certificate does not match the route pin".to_owned(),
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        tokio_rustls::rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        tokio_rustls::rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
     }
 }
 
@@ -764,24 +535,53 @@ pub async fn serve_home_forever(
     }
 }
 
+/// The availability loop over a **rotatable** locator (DESK-5b).
+///
+/// Rotation is initializer-only and one step, and it takes effect at the relay
+/// the moment the new proof is installed — so the loop must pick the new route
+/// up rather than keep parking legs on a dead epoch. Each attempt reads the
+/// latest route, and a rotation while a leg is parked interrupts that leg so the
+/// next attempt uses the new proof. Republishing the rotated locator is the
+/// caller's job, because only the caller knows the account it publishes under.
+pub async fn serve_home_supervised(
+    mut routes: tokio::sync::watch::Receiver<RelayRoute>,
+    local_control_plane: SocketAddr,
+    identity: TlsIdentity,
+) -> std::io::Result<()> {
+    let mut delay = Duration::from_millis(100);
+    loop {
+        let route = routes.borrow_and_update().clone();
+        let outcome = tokio::select! {
+            served = serve_home_once(&route, local_control_plane, &identity) => Some(served),
+            // A rotation supersedes the parked leg: its proof is already stale.
+            changed = routes.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                None
+            }
+        };
+        match outcome {
+            Some(Ok(())) | None => delay = Duration::from_millis(100),
+            Some(Err(_)) => {
+                sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(10));
+            }
+        }
+    }
+}
+
 async fn connect_client(
     route: &RelayRoute,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<WebSocketByteStream>> {
     let broker =
         connect_websocket_joiner(&websocket_route(route, false), WebSocketRelayRole::Client)
             .await?;
+    // The pin and the configuration are the portable half; only the provider is
+    // this carrier's choice (ADR 0130 §4 — `ring` here, pure-Rust on wasm32).
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(PinnedVerifier {
-        expected: route.home_fingerprint,
-        provider: provider.clone(),
-    });
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|error| other(format!("relay TLS versions: {error}")))?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    let name = ServerName::try_from(PIN_SNI)
+    let config = wire::pinned_client_config(route.home_fingerprint, provider)?;
+    let name = tokio_rustls::rustls::pki_types::ServerName::try_from(PIN_SNI)
         .map_err(|error| other(format!("relay TLS server name: {error}")))?;
     TlsConnector::from(Arc::new(config))
         .connect(name, broker)
@@ -818,17 +618,12 @@ pub async fn bind_client_loopback(
     Ok((address, task))
 }
 
-fn invalid_data(message: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
-}
-
-fn other(message: String) -> std::io::Error {
-    std::io::Error::other(message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::rustls::ClientConfig;
     use tokio_tungstenite::{accept_async, connect_async};
 
     fn wss_test_route(epoch: u64) -> WebSocketRelayRoute {
@@ -1060,10 +855,7 @@ mod tests {
         let home_tls =
             TlsAcceptor::from(Arc::new(identity.server_config().unwrap())).accept(home_stream);
         let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-        let verifier = Arc::new(PinnedVerifier {
-            expected,
-            provider: provider.clone(),
-        });
+        let verifier = Arc::new(PinnedVerifier::new(expected, provider.clone()));
         let client_config = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .unwrap()

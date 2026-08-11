@@ -30,7 +30,21 @@ function requiredString(value: unknown, field: string): string {
     return value;
 }
 
-export function parseOpaqueHomeRoute(raw: unknown): OpaqueHomeRoute {
+/**
+ * Where a route came from, which decides whether its certificate pin may be
+ * honoured (ADR 0131 §3).
+ *
+ * `signed` means the caller verified the account root's signature over the
+ * directory record carrying this route. `unsigned` is anything else — notably
+ * the hub's route table, which is a convenience projection any holder of the
+ * person's session can write into, `home_fingerprint` included.
+ */
+export type RouteProvenance = "signed" | "unsigned";
+
+export function parseOpaqueHomeRoute(
+    raw: unknown,
+    provenance: RouteProvenance = "unsigned",
+): OpaqueHomeRoute {
     const route = (raw ?? {}) as Record<string, unknown>;
     const project = requiredString(route.project, "project");
     const homeId = requiredString(route.home_id, "home_id");
@@ -41,9 +55,16 @@ export function parseOpaqueHomeRoute(raw: unknown): OpaqueHomeRoute {
     if (endpoint && !isSecureControlPlaneEndpoint(endpoint)) {
         throw new Error(`refusing insecure Home endpoint for project ${project}`);
     }
-    const relay = parseRelayLocator(route.relay);
+    // A pinning instruction is only as trustworthy as its author. An unsigned
+    // route may still name an endpoint — the browser CA-validates that, so a
+    // forgery buys nothing a DNS answer would not — but its pin is dropped.
+    const relay = provenance === "signed" ? parseRelayLocator(route.relay) : null;
     if (!endpoint && relay === null) {
-        throw new Error(`opaque Home route requires endpoint or relay for project ${project}`);
+        throw new Error(
+            provenance === "signed"
+                ? `opaque Home route requires endpoint or relay for project ${project}`
+                : `refusing an unsigned relay-only route for project ${project}`,
+        );
     }
     return {
         project: project as ProjectId,
@@ -90,10 +111,26 @@ export function opaqueHomeRouteKey(route: OpaqueHomeRoute): string {
     return `${route.homeId}\n${route.endpoint}\n${relay}`;
 }
 
-export function parseOpaqueHomeRoutes(raw: unknown): OpaqueHomeRoute[] {
+export function parseOpaqueHomeRoutes(
+    raw: unknown,
+    provenance: RouteProvenance = "unsigned",
+): OpaqueHomeRoute[] {
     const body = (raw ?? {}) as { routes?: unknown };
     if (!Array.isArray(body.routes)) throw new Error("Home directory response requires routes");
-    return body.routes.map(parseOpaqueHomeRoute);
+    // An unsigned relay-only route is unusable rather than malformed: its pin
+    // cannot be honoured and it carries no endpoint to fall back to. Drop it and
+    // keep the rest of the directory, so one unreachable project does not hide
+    // every other one.
+    const routes: OpaqueHomeRoute[] = [];
+    for (const entry of body.routes) {
+        try {
+            routes.push(parseOpaqueHomeRoute(entry, provenance));
+        } catch (error) {
+            if (provenance === "signed") throw error;
+            if (!String(error).includes("refusing an unsigned relay-only route")) throw error;
+        }
+    }
+    return routes;
 }
 
 export interface HomeRouteDirectoryOptions {

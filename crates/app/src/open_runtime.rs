@@ -26,22 +26,61 @@ pub async fn open_serve(addr: &str, root: &std::path::Path) -> std::io::Result<(
         );
     }
     let listener = open_listener(addr).await?;
-    if let Some(endpoint) = configured_relay_endpoint() {
+    // Reachability follows the person's publication choice (ADR 0131 §6): a Home
+    // that publishes nothing does not park a leg either, so a local-first,
+    // signed-out install still dials nowhere.
+    let publishes = wb.lock_unpoisoned().library_sync_active();
+    if let (Some(endpoint), true) = (configured_relay_endpoint(), publishes) {
         let local = listener.local_addr()?;
         let directory = root.join("relay");
         let identity = gaugedesk_relay_transport::TlsIdentity::load_or_generate(&directory)?;
         let config =
             gaugedesk_relay_transport::HomeRelayConfig::load_or_mint(&directory, &endpoint)?;
-        let route = config.relay_route(&identity)?;
         eprintln!(
             "[home-relay] supervised endpoint={} epoch={} tls_pin={}",
             config.endpoint,
             config.route_epoch,
             gaugedesk_relay_transport::HomeRelayConfig::fingerprint_hex(&identity),
         );
+        // Reconcile at startup: the parked leg is this Home's current
+        // reachability, so the published set should say so before the first
+        // client ever resolves a project (ADR 0131 §6).
+        let parked = config.relay_route(&identity)?;
+        crate::home_reachability::republish(&wb, &parked);
+        let (routes, route_reader) = tokio::sync::watch::channel(parked);
+        let rotation_identity = identity.clone();
+        let rotation_directory = directory.clone();
+        let rotation_workbench = wb.clone();
+        tokio::spawn(async move {
+            let mut current = config;
+            loop {
+                tokio::time::sleep(HOME_RELAY_ROTATION).await;
+                let rotated = match current.rotate(&rotation_directory) {
+                    Ok(rotated) => rotated,
+                    Err(error) => {
+                        eprintln!("[home-relay] rotation failed: {error}");
+                        continue;
+                    }
+                };
+                match rotated.relay_route(&rotation_identity) {
+                    // Republish before the parked leg is superseded, so the
+                    // window where a client holds only the dead epoch is as
+                    // short as we can make it.
+                    Ok(route) => {
+                        crate::home_reachability::republish(&rotation_workbench, &route);
+                        if routes.send(route).is_err() {
+                            return;
+                        }
+                        current = rotated;
+                    }
+                    Err(error) => eprintln!("[home-relay] rotated route invalid: {error}"),
+                }
+            }
+        });
         tokio::spawn(async move {
             if let Err(error) =
-                gaugedesk_relay_transport::serve_home_forever(route, local, identity).await
+                gaugedesk_relay_transport::serve_home_supervised(route_reader, local, identity)
+                    .await
             {
                 eprintln!("[home-relay] availability loop stopped: {error}");
             }
@@ -50,10 +89,26 @@ pub async fn open_serve(addr: &str, root: &std::path::Path) -> std::io::Result<(
     axum::serve(listener, open_control_plane(wb)).await
 }
 
+/// The canonical blind rendezvous origin, matching the default federation and
+/// enrollment already use. A Home needs no configuration to become reachable —
+/// only a person's choice to publish (ADR 0131 §6).
+pub const DEFAULT_HOME_RELAY_ENDPOINT: &str = "wss://relay.gaugewright.com";
+
+/// How often a parked Home advances its route proof. Rotation is cheap and
+/// invalidates any locator that leaked; clients recover by re-reading the route
+/// once (ADR 0131 §5).
+pub(crate) const HOME_RELAY_ROTATION: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Where this Home parks its leg. An explicit endpoint wins; `off` disables
+/// reachability entirely for an operator who wants a Home that is only ever
+/// reached at a known address.
 pub(crate) fn configured_relay_endpoint() -> Option<String> {
-    gaugedesk_env::var("HOME_RELAY_ENDPOINT")
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+    match gaugedesk_env::var("HOME_RELAY_ENDPOINT") {
+        Some(value) if value.trim().eq_ignore_ascii_case("off") => None,
+        Some(value) if !value.trim().is_empty() => Some(value.trim().to_owned()),
+        _ => Some(DEFAULT_HOME_RELAY_ENDPOINT.to_owned()),
+    }
 }
 
 /// Bind the local control-plane listener with the fail-closed loopback guard

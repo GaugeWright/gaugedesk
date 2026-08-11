@@ -1862,6 +1862,13 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .homegate-invite button:disabled { opacity: .45; cursor: default; }
 .homegate-auth-note { margin: 0; }
 .homegate-error { margin: 0; color: var(--danger, #e66); font-size: var(--fs-ui); }
+/* The first-run act is a link (it leaves for the download), so it has to carry
+   the button shape `.firstrun-connect` gives a <button> (DESK-4). */
+a.firstrun-connect { display: inline-block; text-align: center; text-decoration: none; }
+/* The recovery affordance is deliberately quiet: a person who already has a Home
+   knows to look for it, and a new person should not meet a second act. */
+.homegate-link { padding: 0; border: 0; background: none; cursor: pointer; color: var(--accent);
+  font: inherit; text-decoration: underline; }
 
 /* The conflict fold (SUB-6): regions to resolve after a conflicted save. */
 .conflict-fold { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow: auto; }

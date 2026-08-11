@@ -88,27 +88,49 @@ export async function accountUnregisterHome(json: RouteJson, home: HomeId): Prom
     await json("DELETE", `/account/homes/${encodeURIComponent(home)}`);
 }
 
+/**
+ * The hub's route table.
+ *
+ * **Temporary carve-out (DESK-5c).** ADR 0131 §3 says a client that has not
+ * verified the account root's signature must refuse a route's certificate pin,
+ * and this table is exactly the unsigned source that rule is about. The refusal
+ * is implemented and tested in `home-routing.ts`; it is not applied *here* yet,
+ * because no client can currently verify the signed directory record, and
+ * flipping this before that lands would silently strip the locators native
+ * mobile depends on and take working Homes offline.
+ *
+ * Removing this argument is the last step of DESK-5c, once clients read and
+ * verify the signed record. It is deliberately spelled out rather than left as
+ * a default so it cannot be mistaken for the intended posture.
+ */
 export async function accountHomeRoutes(json: RouteJson): Promise<OpaqueHomeRoute[]> {
-    return parseOpaqueHomeRoutes(await json("GET", "/account/home-routes"));
+    return parseOpaqueHomeRoutes(await json("GET", "/account/home-routes"), "signed");
 }
 
+/**
+ * Record reachability an **invitation** delivered into this person's own
+ * account. It is deliberately not general route authorship: the serving Home
+ * authors the routes for the projects it holds (ADR 0131 §1), and it cannot
+ * write into a *different* person's account scope, so accepting an invitation
+ * is the one place a client records where a project lives.
+ *
+ * A relay locator is refused here. A locator carries a certificate pin, and a
+ * pin is only as trustworthy as its author (ADR 0131 §3) — a page has no
+ * standing to assert one. An invitation therefore delivers an endpoint, whose
+ * TLS the browser validates against the public CA set, and nothing a forger
+ * would gain from.
+ */
 export async function accountPublishHomeRoute(
     json: RouteJson,
     route: OpaqueHomeRoute,
 ): Promise<void> {
+    if (route.relay) {
+        throw new Error("a client may not publish a Home certificate pin");
+    }
     await json("POST", "/account/home-routes", {
         project: route.project,
         home_id: route.homeId,
         endpoint: route.endpoint,
-        ...(route.relay ? {
-            relay: {
-                endpoint: route.relay.endpoint,
-                handle: route.relay.handle,
-                proof: route.relay.proof,
-                route_epoch: route.relay.routeEpoch,
-                home_fingerprint: route.relay.homeFingerprint,
-            },
-        } : {}),
     });
 }
 

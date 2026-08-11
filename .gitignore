@@ -5,7 +5,12 @@
 /site/
 
 # Web island (Solid)
-web/node_modules/
+#
+# No trailing slash on any node_modules entry: a trailing slash matches
+# directories only, and a worktree that symlinks its modules at the main
+# checkout — to skip a reinstall — leaves git seeing an untracked *file*.
+# `git add -A` would then commit a symlink to an absolute path on one machine.
+web/node_modules
 web/dist/
 web/dist-embed/
 web/dist-open/
@@ -14,12 +19,12 @@ web/dist-app-workbench-web/
 web/dist-app-mobile-web/
 
 # Enterprise web workspace (ee/web, SPLIT-2)
-ee/web/node_modules/
+ee/web/node_modules
 ee/web/dist-apps-enterprise/
 ee/web/dist-app-admin-console/
 ee/web/dist-enterprise-workbench/
 
-node_modules/
+node_modules
 src-tauri/linux/changelog.gz
 dist/
 dist-types/
@@ -50,7 +55,7 @@ untie.db
 # Tauri build artifacts
 src-tauri/target/
 src-tauri-mobile/target/
-src-tauri-mobile/node_modules/
+src-tauri-mobile/node_modules
 
 # Release-staged bundle payload (for example a future portable Git tree), never
 # committed. WhippleScript is linked into the control plane; Pi is not bundled.

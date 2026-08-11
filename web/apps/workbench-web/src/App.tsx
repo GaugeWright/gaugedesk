@@ -181,6 +181,10 @@ export interface WorkbenchAppProps {
     /** Account and managed-service dashboard. Hosted GaugeDesk sends missing-
      * Home setup here instead of becoming a second management surface. */
     readonly hubUrl?: string;
+    /** Where a person with no Home yet gets one. The first-run surface offers
+     * this as its single primary act (DESK-4): installing GaugeDesk and signing
+     * in there makes that computer the person's first Home. */
+    readonly downloadUrl?: string;
 }
 
 function WorkbenchApp(props: WorkbenchAppProps = {}) {
@@ -1844,30 +1848,51 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const state = homeState();
         return state?.kind === "none" ? state : null;
     });
+    // Whether the person asked for the advanced/recovery Home affordances
+    // (endpoint entry, registered Homes, account reach). Off by default so a new
+    // person meets one act, not a control panel.
+    const [homeRecovery, setHomeRecovery] = createSignal(false);
     const HomeSetup = () => {
-        if (import.meta.env.VITE_HOME_SPLIT === "true" && !homeInvite()) {
-            const openHub = () => {
-                const base = props.hubUrl
-                    || import.meta.env.VITE_HUB_URL
-                    || "https://hub.gaugewright.com/";
-                const url = new URL(base, window.location.href);
-                const tenant = new URLSearchParams(window.location.search).get("tenant");
-                if (tenant) url.searchParams.set("setup", tenant);
-                window.location.assign(url.toString());
-            };
+        // A person with a valid account and no Home yet is an ordinary starting
+        // state, not an error (`experience/desk.md`). It gets one page whose single
+        // primary act is a way to *get* a Home; the endpoint/picker affordances
+        // below are recovery, revealed on request rather than met on arrival.
+        if (import.meta.env.VITE_HOME_SPLIT === "true" && !homeInvite() && !homeRecovery()) {
+            const downloadUrl = props.downloadUrl
+                || import.meta.env.VITE_DOWNLOAD_URL
+                || "https://gaugewright.com/gaugedesk/download";
             return (
                 <Show when={noHomeState()}>
                     <div class="homegate-scrim" data-home-setup>
                         <section class="homegate-card" aria-labelledby="homegate-title">
-                            <p class="homegate-kicker">GaugeWright Hub</p>
-                            <h1 id="homegate-title">Choose a Home before opening GaugeDesk</h1>
+                            <p class="homegate-kicker">Welcome to GaugeDesk</p>
+                            <h1 id="homegate-title">Your work needs a Home</h1>
                             <p class="homegate-lede">
-                                Your account has no selected reachable Home. Manage computers and
-                                Cloud Home in Hub, then return here to work.
+                                Projects, chats, and files live on a Home — a computer you
+                                control — rather than in this browser. Install GaugeDesk and
+                                sign in there, and that computer becomes your first Home.
+                                This page then opens it from anywhere you sign in.
                             </p>
-                            <button class="firstrun-connect" type="button" onClick={openHub}>
-                                Open GaugeWright Hub
-                            </button>
+                            <a
+                                class="firstrun-connect"
+                                data-home-download
+                                href={downloadUrl}
+                                rel="noreferrer"
+                            >
+                                Download GaugeDesk
+                            </a>
+                            <p class="homegate-auth-note">
+                                GaugeWright-hosted Homes, where we run one for you, are coming.
+                                {" "}
+                                <button
+                                    type="button"
+                                    class="homegate-link"
+                                    data-home-recovery
+                                    onClick={() => setHomeRecovery(true)}
+                                >
+                                    Already have a Home?
+                                </button>
+                            </p>
                         </section>
                     </div>
                 </Show>
