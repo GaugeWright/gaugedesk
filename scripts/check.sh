@@ -24,6 +24,9 @@ cd "$(dirname "$0")/.."
 section="${1:-all}"
 
 run_contracts() {
+    echo "== agent guide =="
+    node scripts/check-agent-guide.mjs
+
     echo "== architecture boundaries =="
     python3 scripts/architecture-check.py
 
