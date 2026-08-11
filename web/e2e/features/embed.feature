@@ -25,6 +25,7 @@ Feature: Embedded panels (EMBED-2)
     And the embedded activity row is announced politely
     When the delayed turn completes
     Then the embedded chat shows no activity row
+    And the embedded transcript keeps the answer it streamed
 
   Scenario: a running tool is named rather than left unexplained
     Given a delayed embedded chat running the "bash" tool is open
@@ -40,6 +41,13 @@ Feature: Embedded panels (EMBED-2)
     Then the embedded chat says the agent is thinking
     When I stop the embedded turn
     Then the embedded chat shows no activity row
+
+  Scenario: stopping a turn cancels the work it had already scheduled
+    Given a delayed embedded chat running the "bash" tool is open
+    When I send "never mind" in the embedded chat
+    Then the embedded chat says the agent is thinking
+    When I stop the embedded turn
+    Then the embedded chat stays at rest through the stopped turn's schedule
 
   Scenario: an anonymous embedded chat can start a fresh session
     Given an anonymous embedded chat is open

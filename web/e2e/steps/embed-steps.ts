@@ -31,7 +31,11 @@ Given("a delayed embedded chat is open", async ({ page }) => {
 });
 
 Given("a delayed embedded chat running the {string} tool is open", async ({ page }, tool: string) => {
-    await page.goto(`/embed-example.html?fixture=1&panels=chat&delay=1200&tool=${encodeURIComponent(tool)}`);
+    // The fixture splits its delay into thinking / tool / streaming thirds, so a
+    // 1200ms turn leaves the tool visible for only ~400ms — long enough to race
+    // the assertion. A longer turn is not a slower test: every step here waits on
+    // a state, none on the clock.
+    await page.goto(`/embed-example.html?fixture=1&panels=chat&delay=3000&tool=${encodeURIComponent(tool)}`);
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
 });
 
@@ -445,4 +449,31 @@ Then("the embedded chat shows no activity row", async ({ page }) => {
     // an indicator that never clears is worse than none, because it also keeps
     // the composer disabled.
     await expect(page.locator(".turn-activity")).toHaveCount(0, { timeout: 15_000 });
+});
+
+Then("the embedded chat stays at rest through the stopped turn's schedule", async ({ page }) => {
+    // A stop that cancels only the settling timer leaves the rest of the turn's
+    // schedule pending: those callbacks fire after the turn has already resolved,
+    // re-enter `streaming_output`, and — with nothing left to return the
+    // observation to `idle` — pin the composer busy for good. Rest has to survive
+    // the whole schedule, not just the moment of the click.
+    const stop = page.getByTestId("stop-turn");
+    await expect(stop).toHaveCount(0, { timeout: 15_000 });
+    await page.waitForTimeout(3_500);
+    await expect(stop).toHaveCount(0);
+    await expect(page.locator(".turn-activity")).toHaveCount(0);
+});
+
+Then("the embedded transcript keeps the answer it streamed", async ({ page }) => {
+    // `settle()` re-reads the durable snapshot *over* the streamed projection,
+    // so the answer must survive a replacement that happens after the turn ends.
+    // Asserting the text is present is not enough — it is present mid-stream
+    // either way, and an assertion that polls until it appears passes before the
+    // replacement has even run. Wait for the re-read, then require it still.
+    const transcript = page.locator("[data-embed-transcript]");
+    await expect(transcript).toContainText("transcript fills in progressively", {
+        timeout: 15_000,
+    });
+    await page.waitForTimeout(1_500);
+    await expect(transcript).toContainText("transcript fills in progressively");
 });

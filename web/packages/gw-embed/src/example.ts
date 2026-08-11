@@ -42,7 +42,10 @@ function mountHosted(host: string): void {
 function fixtureApi(): EmbedSessionApi {
     const emptyMerge = { phase: "Clean" } as MergeState;
     let onEvent: ((event: StreamEvent) => void) | undefined;
-    let active: { resolve: () => void; timer?: ReturnType<typeof setTimeout> } | undefined;
+    // Every timer a turn schedules is held here, not just the settling one: a
+    // stop has to cancel the whole turn, and a delayed turn has a tool timer and
+    // one timer per streamed word still pending before streaming even begins.
+    let active: { resolve: () => void; timers: ReturnType<typeof setTimeout>[] } | undefined;
     let queue: EmbedQueuedTurn[] = [];
     const queueListeners = new Set<(items: readonly EmbedQueuedTurn[]) => void>();
     let nextCommand = 1;
@@ -63,6 +66,11 @@ function fixtureApi(): EmbedSessionApi {
         ];
         publishQueue();
     };
+    // The fixture's durable transcript. Without one, `settle()`'s snapshot re-read
+    // replaced the streamed answer with nothing, and a turn looked like it had
+    // produced no reply at all — the durable transcript is authority, so a fixture
+    // standing in for the runtime has to actually be one.
+    const durable: StreamEvent[] = [];
     const delayParam = params.get("delay");
     const delay = delayParam === null ? null : Number(delayParam);
     // The live-turn projection, driven exactly as the runtime drives it: the
@@ -85,7 +93,7 @@ function fixtureApi(): EmbedSessionApi {
             activityListeners.add(listener);
             return () => activityListeners.delete(listener);
         },
-        getTranscript: async () => [] as StreamEvent[],
+        getTranscript: async () => [...durable],
         subscribe: (_id, listener) => {
             onEvent = listener;
             return () => { onEvent = undefined; };
@@ -97,28 +105,48 @@ function fixtureApi(): EmbedSessionApi {
             const turns = JSON.parse(document.body.dataset.fixtureTurns ?? "[]") as unknown[];
             turns.push({ prompt, images });
             document.body.dataset.fixtureTurns = JSON.stringify(turns);
+            durable.push({ type: "user", text: prompt } as StreamEvent);
             setObservation({ state: "awaiting_model" });
             return new Promise<void>((resolve) => {
-                active = { resolve };
-                if (delay !== null && Number.isFinite(delay) && delay >= 0) {
-                    if (fixtureTool) {
-                        setTimeout(
-                            () => setObservation({ state: "running_tool", tool: fixtureTool }),
-                            Math.max(1, Math.floor(delay / 3)),
-                        );
-                    }
-                    active.timer = setTimeout(() => {
-                        // Answer text is its own indicator, so the runtime moves
-                        // to streaming as the first delta lands.
-                        setObservation({ state: "streaming_output" });
-                        onEvent?.({ type: "text", delta: `Completed: ${prompt}` });
-                        queue = [];
-                        publishQueue();
-                        active = undefined;
-                        setObservation({ state: "idle" });
-                        resolve();
-                    }, delay);
+                const turn = { resolve, timers: [] as ReturnType<typeof setTimeout>[] };
+                active = turn;
+                const schedule = (fn: () => void, ms: number) => {
+                    turn.timers.push(setTimeout(fn, ms));
+                };
+                if (delay === null || !Number.isFinite(delay) || delay < 0) return;
+                const answer =
+                    `Here is what I found for "${prompt}". This reply arrives as a `
+                    + "sequence of deltas, the way a provider streams one, so the "
+                    + "transcript fills in progressively rather than appearing whole.";
+                // Roughly: think for a third, run the tool for a third, stream the
+                // answer across the last third.
+                const third = Math.max(1, Math.floor(delay / 3));
+                if (fixtureTool) {
+                    schedule(
+                        () => setObservation({ state: "running_tool", tool: fixtureTool }),
+                        third,
+                    );
                 }
+                const words = answer.split(" ");
+                const streamStart = fixtureTool ? third * 2 : third;
+                const perWord = Math.max(16, Math.floor((delay - streamStart) / words.length));
+                words.forEach((word, index) => {
+                    schedule(() => {
+                        if (index === 0) setObservation({ state: "streaming_output" });
+                        onEvent?.({ type: "text", delta: index === 0 ? word : ` ${word}` });
+                    }, streamStart + index * perWord);
+                });
+                schedule(() => {
+                    setObservation({ state: "settling" });
+                    // The durable message is what survives; the streamed copy is a
+                    // projection the snapshot re-read replaces.
+                    durable.push({ type: "assistant", text: answer } as StreamEvent);
+                    queue = [];
+                    publishQueue();
+                    active = undefined;
+                    setObservation({ state: "idle" });
+                    resolve();
+                }, streamStart + words.length * perWord + 120);
             });
         },
         runTask: () => new Promise<never>(() => undefined),
@@ -139,7 +167,7 @@ function fixtureApi(): EmbedSessionApi {
         embedGetConfig: async () => ({ white_label: false }),
         stopTurn: async () => {
             if (!active) throw new Error("fixture has no active turn");
-            if (active.timer) clearTimeout(active.timer);
+            for (const timer of active.timers) clearTimeout(timer);
             const { resolve } = active;
             active = undefined;
             document.body.dataset.fixtureStopped = "true";
