@@ -37,7 +37,7 @@ jobs:
           sudo apt-get install -y awscli dpkg-dev gnupg lintian
 
       - name: fetch production publication secrets through OIDC
-        uses: Infisical/secrets-action@v1.0.9
+        uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
         with:
           method: oidc
           identity-id: ${{ vars.INFISICAL_PRODUCTION_IDENTITY_ID }}

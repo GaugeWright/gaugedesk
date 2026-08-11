@@ -28,7 +28,7 @@ jobs:
       # rustup materializes the toolchain named in rust-toolchain.toml.
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: scripts/check.sh rust
 
   architecture:
@@ -75,7 +75,7 @@ jobs:
       - name: Install clang and binaryen for the wasm32 target
         working-directory: .
         run: sudo apt-get update && sudo apt-get install -y clang llvm binaryen
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install the matching wasm-bindgen CLI
         working-directory: .
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked

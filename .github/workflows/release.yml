@@ -92,7 +92,7 @@ jobs:
 
       - name: authenticate Windows release identity
         if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
-        uses: azure/login@v3
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
@@ -117,7 +117,7 @@ jobs:
 
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@v7
         with:
           node-version-file: .node-version
@@ -255,7 +255,7 @@ jobs:
         # `--config tauri.bundle.conf.json` merges the release-only overlay that
         # enables createUpdaterArtifacts. Runtime assets need no Pi/plugin bundle:
         # WhippleScript is linked into the control plane.
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           # tauri-action creates the draft GitHub Release + uploads assets with this
           # (the permissions block alone doesn't inject it into the step env).
