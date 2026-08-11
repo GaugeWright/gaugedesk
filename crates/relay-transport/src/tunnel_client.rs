@@ -7,7 +7,7 @@
 //! thin glue over this, and deliberately so — everything with a decision in it
 //! lives here, where a native test can drive it against a real pinned server.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::http_stream::{encode_request, HttpResponse, ResponseReader};
 use crate::session::PinnedSession;
@@ -16,6 +16,14 @@ use crate::wire::CertFingerprint;
 pub struct TunnelClient {
     session: PinnedSession,
     responses: ResponseReader,
+    /// Responses the reader has yielded and no caller has taken yet.
+    ///
+    /// A carrier pumps for two reasons — to collect ciphertext to write, and to
+    /// look for a reply — and the reader hands each response out exactly once.
+    /// Without somewhere to put it, whichever pump happens to decode the last
+    /// record destroys the response the other one was waiting for. Holding it
+    /// here is what makes the two reasons the same call.
+    completed: VecDeque<HttpResponse>,
 }
 
 impl TunnelClient {
@@ -23,6 +31,7 @@ impl TunnelClient {
         Ok(Self {
             session: PinnedSession::new(expected)?,
             responses: ResponseReader::new(),
+            completed: VecDeque::new(),
         })
     }
 
@@ -51,16 +60,28 @@ impl TunnelClient {
         self.session.send(&encoded)
     }
 
-    /// Take a complete response, or `None` while more bytes are needed.
-    /// Decrypted plaintext is moved into the reader every call, so a response
-    /// split across records is reassembled rather than lost.
-    pub fn poll(&mut self) -> std::io::Result<Option<HttpResponse>> {
+    /// Advance the session and decode whatever it yields, without taking a
+    /// response. This is what a carrier calls when it wants ciphertext: it must
+    /// still be able to find a reply afterwards, so anything decoded here is
+    /// held rather than returned.
+    pub fn pump(&mut self) -> std::io::Result<()> {
         self.session.pump()?;
         let plaintext = self.session.take_plaintext();
         if !plaintext.is_empty() {
             self.responses.feed(&plaintext);
         }
-        self.responses.take()
+        while let Some(response) = self.responses.take()? {
+            self.completed.push_back(response);
+        }
+        Ok(())
+    }
+
+    /// Take a complete response, or `None` while more bytes are needed.
+    /// Decrypted plaintext is moved into the reader every call, so a response
+    /// split across records is reassembled rather than lost.
+    pub fn poll(&mut self) -> std::io::Result<Option<HttpResponse>> {
+        self.pump()?;
+        Ok(self.completed.pop_front())
     }
 }
 
@@ -162,6 +183,56 @@ mod tests {
         let response = exchange(&mut client, &mut server, reply).expect("a reply must arrive");
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"abcdefg");
+    }
+
+    /// A carrier pumps for ciphertext between reads and polls for a reply, and
+    /// which of the two decodes the final record is a matter of timing. If
+    /// pumping took the response, the reply would vanish exactly when the whole
+    /// exchange fitted in one arrival — which is the common case, and which is
+    /// what stalled the browser lane.
+    #[test]
+    fn pumping_for_ciphertext_does_not_consume_the_response() {
+        let (identity, config) = home();
+        let mut server = ServerConnection::new(Arc::new(config)).expect("server");
+        let mut client = TunnelClient::new(identity.fingerprint()).expect("client");
+        client
+            .send("POST", "/home/admissions", &BTreeMap::new(), None)
+            .expect("queue");
+
+        let reply = b"HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\nhi";
+        // Interleave a pump before every poll, the way a carrier that flushes
+        // ciphertext after each arrival does.
+        let mut answered = false;
+        for _ in 0..64 {
+            client.pump().expect("pump");
+            if let Some(response) = client.poll().expect("poll") {
+                assert_eq!(response.status, 201);
+                assert_eq!(response.body, b"hi");
+                return;
+            }
+            let out = client.session_mut().take_outgoing();
+            if !out.is_empty() {
+                let mut cursor = std::io::Cursor::new(out);
+                while (cursor.position() as usize) < cursor.get_ref().len() {
+                    server.read_tls(&mut cursor).expect("server reads");
+                    server.process_new_packets().expect("server processes");
+                }
+            }
+            if !answered {
+                let mut request = Vec::new();
+                let _ = server.reader().read_to_end(&mut request);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    server.writer().write_all(reply).expect("server writes");
+                    answered = true;
+                }
+            }
+            let mut back = Vec::new();
+            server.write_tls(&mut back).ok();
+            if !back.is_empty() {
+                client.session_mut().received(&back);
+            }
+        }
+        panic!("a response decoded by a pump must survive until it is polled");
     }
 
     /// The pin still governs: a client aimed at a different Home gets no reply,

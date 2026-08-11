@@ -42,6 +42,40 @@ function pool(refreshRoutes?: () => Promise<ReturnType<typeof routes>>) {
     return { instance, attempts };
 }
 
+/** A pool whose Home admits, but answers as `answersAs` rather than the id the
+ * route named. */
+function impostorPool(answersAs: string) {
+    const calls: string[] = [];
+    const instance = new HomePool<{ endpoint: string }>(routes("A".repeat(43)), () => "token", {
+        client: (context) => ({ endpoint: context.endpoint }),
+        resolveEndpoint: async () => "https://home.example",
+        routeJson: (() => (async (method: string) => {
+            calls.push(method);
+            if (method !== "POST") return {};
+            return { home: answersAs, admission: "token" };
+        })) as never,
+    });
+    return { instance, calls };
+}
+
+describe("a Home that answers as another Home does not get to serve", () => {
+    it("refuses the connection and releases the admission it was handed", async () => {
+        const { instance, calls } = impostorPool("home:impostor");
+        await expect(instance.connectProject("proj" as ProjectId)).rejects.toThrow(
+            /Home identity mismatch: expected home:a/,
+        );
+        // The admission is surrendered rather than left live on the wrong Home.
+        expect(calls).toEqual(["POST", "DELETE"]);
+        expect(instance.snapshot()).toHaveLength(0);
+    });
+
+    it("connects the project to the Home its route named", async () => {
+        const { instance } = impostorPool("home:a");
+        const connection = await instance.connectProject("proj" as ProjectId);
+        expect(connection.homeId).toBe("home:a");
+    });
+});
+
 describe("a stale route epoch is re-read once (ADR 0131 §5)", () => {
     it("classifies a superseded locator, not an admission refusal", () => {
         expect(isStaleRouteFailure(new Error("relay refused pairing: stale route epoch"))).toBe(true);

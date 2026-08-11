@@ -24,6 +24,8 @@ export interface TunnelFacade {
     pollStatus(): number | undefined;
     takeBody(): string;
     isHandshaking(): boolean;
+    /** Whether the relay has spliced this leg to the Home's. */
+    isPaired(): boolean;
 }
 
 /** The socket, narrowed to what the loop uses. */
@@ -83,8 +85,14 @@ export function tunnelRouteJson(options: TunnelRouteOptions): RouteJson {
             tunnel.sendRequest(method, path, body === undefined ? undefined : JSON.stringify(body));
             const deadline = now() + timeoutMs;
             for (;;) {
-                const outgoing = tunnel.takeOutgoing();
-                if (outgoing.length > 0) socket.send(outgoing);
+                // Not before the relay has spliced this leg. Ciphertext written
+                // into an unpaired route has no other end, and relying on the
+                // relay to hold it is relying on a component whose whole design
+                // is to be dumb. It accumulates in the session either way.
+                if (tunnel.isPaired()) {
+                    const outgoing = tunnel.takeOutgoing();
+                    if (outgoing.length > 0) socket.send(outgoing);
+                }
                 const status = tunnel.pollStatus();
                 if (status !== undefined) {
                     const text = tunnel.takeBody();

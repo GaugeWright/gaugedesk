@@ -164,8 +164,10 @@ impl BrowserTunnel {
     /// record. Empty when there is nothing to send.
     #[wasm_bindgen(js_name = takeOutgoing)]
     pub fn take_outgoing(&mut self) -> Result<Vec<u8>, JsValue> {
+        // `pump`, not `poll`: taking a response here would consume the one
+        // `pollStatus` is about to be called for.
         self.client
-            .poll()
+            .pump()
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let ciphertext = self.client.session_mut().take_outgoing();
         Ok(if ciphertext.is_empty() {

@@ -22,5 +22,6 @@ declare module "@gaugewright/control-plane-client/generated/tunnel.js" {
         pollStatus(): number | undefined;
         takeBody(): string;
         isHandshaking(): boolean;
+        isPaired(): boolean;
     }
 }

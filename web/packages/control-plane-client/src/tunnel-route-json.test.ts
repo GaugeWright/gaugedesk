@@ -1,22 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { tunnelRouteJson, type TunnelFacade, type TunnelSocket } from "./tunnel-route-json";
-import type { OpaqueRelayLocator } from "./home-routing";
-
-const locator: OpaqueRelayLocator = {
-    endpoint: "wss://relay.example",
-    handle: "A".repeat(43),
-    proof: "B".repeat(42) + "A",
-    routeEpoch: 1,
-    homeFingerprint: "ab".repeat(32),
-};
 
 /** A tunnel that answers after `afterPumps` pumps, so the loop's polling is
  * exercised rather than short-circuited. */
-function fakeTunnel(replies: Array<{ status: number; body: string }>, afterPumps = 2): TunnelFacade & { sent: string[] } {
+function fakeTunnel(
+    replies: Array<{ status: number; body: string }>,
+    afterPumps = 2,
+    paired = true,
+): TunnelFacade & { sent: string[] } {
     let pumps = 0;
     const sent: string[] = [];
     return {
         sent,
+        isPaired: () => paired,
         receiveFrame: () => undefined,
         sendRequest: (method, path, body) => {
             pumps = 0;
@@ -92,11 +88,23 @@ describe("routeJson over the tunnel (DESK-7)", () => {
             pollStatus: () => undefined,
             takeBody: () => "",
             isHandshaking: () => true,
+            isPaired: () => true,
         };
         const { socket } = fakeSocket();
         let clock = 0;
         const json = build(tunnel, socket, 50, () => (clock += 30));
         await expect(json("GET", "/workspace")).rejects.toThrow(/timed out/);
+    });
+
+    it("writes nothing until the relay has paired the leg", async () => {
+        // No reply, so the call ends at the deadline and the frames it did not
+        // send are the assertion.
+        const tunnel = fakeTunnel([], 2, false);
+        const { socket, frames } = fakeSocket();
+        let clock = 0;
+        const json = build(tunnel, socket, 50, () => (clock += 30));
+        await expect(json("GET", "/workspace")).rejects.toThrow(/timed out/);
+        expect(frames).toEqual([]);
     });
 
     it("does not wedge later requests behind a failed one", async () => {

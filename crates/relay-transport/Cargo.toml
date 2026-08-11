@@ -47,6 +47,13 @@ web-sys = { version = "0.3", features = ["BinaryType", "CloseEvent", "ErrorEvent
 [dev-dependencies]
 tempfile = "3"
 
+# The integration tests drive a real relay, which lives behind `test-relay` so it
+# never ships. A self dev-dependency turns the feature on for this crate's own
+# tests without an explicit `--features` on every invocation — so the ordinary
+# workspace gate covers the relay splice rather than skipping past it.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+gaugedesk-relay-transport = { path = ".", features = ["test-relay"] }
+
 [[example]]
 name = "test-wss-relay"
 required-features = ["test-relay"]
