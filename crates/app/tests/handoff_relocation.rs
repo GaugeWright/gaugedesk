@@ -500,7 +500,19 @@ async fn placement_policy_blocks_a_pre_authorized_handoff_before_auto_commit() {
         json!({ "project": "policy-blocked", "peer": "bob" }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "policy refusal: {body}");
+    // A refusal, not a gateway failure: bob's placement policy *decided* against
+    // this relocation and will decide the same way every time, so it must not be
+    // reported as a broken upstream inviting a retry (`403`, not `502`).
+    assert_eq!(status, StatusCode::FORBIDDEN, "policy refusal: {body}");
+    // And bob's own sentence reaches the caller. Behind Cloudflare an origin 5xx
+    // has its body replaced, so a refusal explained in a 502 explains nothing.
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("placement policy"),
+        "the refusal must say why it refused: {body}",
+    );
     assert_eq!(
         alice_wb
             .lock()
@@ -518,6 +530,59 @@ async fn placement_policy_blocks_a_pre_authorized_handoff_before_auto_commit() {
             .project_home_id("policy-blocked")
             .is_none(),
         "preauthorization must not import a project that violates policy"
+    );
+}
+
+#[tokio::test]
+async fn a_relocation_that_cannot_reach_the_peer_is_still_a_gateway_failure() {
+    // The counterpart to the refusal above, and the reason `403` is not simply
+    // the new answer for "the relocation did not happen": when the leg to the
+    // peer never comes up, nothing has *decided* anything. That is a genuine
+    // transport fault, it may well succeed on the next attempt, and it keeps
+    // `502` — the status a caller should retry.
+    let (broker, _relay) = start_broker().await;
+    // alice dials a broker nothing is listening on: bind one, take its address,
+    // drop it. Pairing is local HTTP and does not need the broker, so alice ends
+    // up properly paired with a peer it cannot reach.
+    let dead_broker = {
+        let relay = gaugedesk_relay_transport::test_relay::TestRelay::bind()
+            .await
+            .unwrap();
+        relay.endpoint().to_owned()
+    };
+    let (alice, alice_wb, _ra) = instance("alice", &dead_broker);
+    let (bob, _bob_wb, _rb) = instance("bob", &broker);
+    pair(&alice, &bob).await;
+
+    {
+        let mut alice = alice_wb.lock().unwrap();
+        alice
+            .store_mut()
+            .append_record(
+                "library",
+                "project",
+                r#"{"id":"unreachable","op":"upsert","name":"Unreachable","is_default":false,"home_id":"home:alice","network_isolated":false}"#,
+            )
+            .unwrap();
+        alice.rebuild_library();
+    }
+
+    let (status, body) = post(
+        &alice,
+        "/federation/handoff/relocate",
+        json!({ "project": "unreachable", "peer": "bob" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "transport fault: {body}");
+    assert_eq!(
+        alice_wb
+            .lock()
+            .unwrap()
+            .project_home_id("unreachable")
+            .unwrap()
+            .as_str(),
+        "home:alice",
+        "the origin rolls back and remains home when the offer never lands"
     );
 }
 
@@ -963,6 +1028,56 @@ async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
         "the relocated workstream member is admitted to the host queue: {placed}"
     );
     assert_eq!(placed["status"], "pending");
+}
+
+#[tokio::test]
+async fn a_run_placement_refused_by_the_host_floor_is_forbidden_not_a_gateway_failure() {
+    // The third federation route that flattened a decision into a 5xx. Bob's
+    // placement floor declines the run (`ITGOV-3` (b) / ADR 0074): no attestation
+    // quote crosses a run-place, so an attested-required policy refuses. That is
+    // the host deciding — identically on every retry — and answers `403`.
+    let (broker, _relay) = start_broker().await;
+    let (alice, _wa, _ra) = instance("alice", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    {
+        let mut bob = bob_wb.lock().unwrap();
+        bob.store_mut()
+            .append_record(
+                "org",
+                "placement_policy",
+                r#"{"id":"","op":"upsert","policy":{"require_attested":true,"allowed_operators":[]}}"#,
+            )
+            .unwrap();
+    }
+    // The floor narrows an *admitted* run, so bob must first grant the standing
+    // allow the floor then overrides — grant admits, floor refuses (ADR 0074).
+    let (allow, _) = post(
+        &bob,
+        "/federation/run/allow",
+        json!({ "project": "floor-blocked", "operator": "alice" }),
+    )
+    .await;
+    assert_eq!(allow, StatusCode::OK);
+
+    let (status, body) = post(
+        &alice,
+        "/federation/run/place",
+        json!({ "peer": "bob", "project": "floor-blocked", "archetype": "analyst",
+                "data_handle": "folder://acme", "prompt": "go" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "floor refusal: {body}");
+    assert_eq!(body["status"], "refused");
+    // A floor refusal refuses rather than queues — it is not a consent prompt —
+    // so there is nothing pending for bob to act on.
+    let (_, queue) = get(&bob, "/federation/run/queue").await;
+    assert!(
+        queue["queue"].as_array().unwrap().is_empty(),
+        "a floor refusal does not queue for admission: {queue}",
+    );
 }
 
 #[tokio::test]

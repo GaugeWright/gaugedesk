@@ -3021,10 +3021,60 @@ fn commit_incoming_handoff(
     true
 }
 
+/// A wire verdict **refusing** the request: the peer deciding no, not the peer
+/// breaking.
+///
+/// A caller cannot see the reasoning behind an admission function — the only
+/// thing that crosses the relay leg is this JSON — so, exactly as a refused turn
+/// is classified inside `gaugedesk-whip-runtime` while `HostRuntimeError` is
+/// still in hand, the classification is minted here, where the decision is
+/// actually taken. `refused` is the carrier that survives the wire seam, the
+/// moral equivalent of the `io::ErrorKind` that carries a refused turn out of
+/// the runtime, and [`verdict_refusal_reason`] reads it back at the route.
+///
+/// The flag is explicit rather than inferred from `ok: false` because the two
+/// answers that share that shape are opposites: a peer that *decided* not to
+/// admit will decide identically on every retry, while a peer that accepted the
+/// request and then broke part-way through may well succeed on the next one.
+/// Only a decision is stamped.
+fn refused_verdict(reason: &str) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "refused": true, "reason": reason })
+}
+
+/// Read back the [`refused_verdict`] stamp: `Some(reason)` when the peer says it
+/// *decided* against the request, `None` for everything else.
+///
+/// Reading the stamp rather than sniffing the reason text is the point — a
+/// string match would hold only until someone rewords the message. An unstamped
+/// verdict is never read as a refusal, so a peer built before the flag existed
+/// behaves exactly as it does today and only an explicit decision is ever moved
+/// out of the 5xx range.
+fn verdict_refusal_reason(verdict: &serde_json::Value) -> Option<&str> {
+    verdict
+        .get("refused")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        .then(|| verdict.get("reason").and_then(|value| value.as_str()))
+        .map(|reason| reason.unwrap_or_default())
+}
+
+/// The status for a peer verdict that declined: `403` when the peer *decided*,
+/// `502` when it broke. The plain form of the split [`relocation_verdict`] makes,
+/// for the routes that pass the peer's verdict through unchanged.
+fn refusal_status(verdict: &serde_json::Value) -> StatusCode {
+    match verdict_refusal_reason(verdict) {
+        Some(_) => StatusCode::FORBIDDEN,
+        None => StatusCode::BAD_GATEWAY,
+    }
+}
+
 /// Handle a received handoff message after authenticating it against the source's
 /// pinned grant (C-1 / INV-21 — the effective source key, an unexpired/unrevoked
 /// subkey or the pinned root, must verify the project-bound bytes). Returns the JSON
 /// verdict written back to the sender. Fail-closed on any check.
+///
+/// Every fail-closed check here is a *refusal* and says so on the wire via
+/// [`refused_verdict`]; a commit that starts and then fails is not.
 ///
 /// - `Offer` (origin→target): auto-accept if the target pre-authorized the source
 ///   (import + commit), else record a **pending** offer for explicit consent
@@ -3038,20 +3088,20 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
         .federation_ref()
         .and_then(|f| f.grant_for(&wire.source))
     else {
-        return serde_json::json!({ "ok": false, "reason": "unpaired source" });
+        return refused_verdict("unpaired source");
     };
     let claimed = PublicKey::new(wire.source_pubkey.clone());
     let Some(verify_key) = guard
         .federation_ref()
         .and_then(|f| effective_source_key(f, &wire.source, &grant, &claimed, &wire.delegation))
     else {
-        return serde_json::json!({ "ok": false, "reason": "bad source key" });
+        return refused_verdict("bad source key");
     };
     if !grant.is_valid(now_secs())
         || wire.signed_bytes != handoff_bytes(&wire.project, &wire.source_home)
         || verify_signature(&wire.signed_bytes, &wire.signature, &verify_key) != Ok(true)
     {
-        return serde_json::json!({ "ok": false, "reason": "verification failed" });
+        return refused_verdict("verification failed");
     }
     if wire.kind == HandoffMsgKind::Offer {
         // DEPLOY-4 / ITGOV-3: every offer crosses the placement floor before
@@ -3063,10 +3113,9 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
             .map(|org| org.effective_placement_policy())
             .unwrap_or_else(|_| gaugedesk_core::boundary_lifecycle::PlacementPolicy::open());
         if !handoff_placement_admitted(&placement_policy, &wire.log, &wire.project) {
-            return serde_json::json!({
-                "ok": false,
-                "reason": "the incoming project's deployment mode is not admitted by this org's placement policy",
-            });
+            return refused_verdict(
+                "the incoming project's deployment mode is not admitted by this org's placement policy",
+            );
         }
     }
     // `registered` = the target imported a relocated project (its library changed).
@@ -3203,6 +3252,41 @@ pub struct HandoffRelocateRequest {
     pub peer: String,
 }
 
+/// The status + body for a peer that answered the offer without taking it.
+///
+/// Two very different things arrive in the same shape — `committed: false,
+/// pending: false` — and the origin cannot tell them apart unaided:
+///
+/// - The peer **refused**: its placement policy declined the project's
+///   deployment mode, or an identity check failed closed. That is a decision,
+///   it answers `403`, and it carries the peer's own sentence.
+/// - The peer **broke**: it admitted the offer and then failed part-way through
+///   importing or committing it. That keeps `502`, and it is the only one of the
+///   two worth retrying.
+///
+/// Reporting the first as the second is expensive twice over — the same two
+/// costs that made a refused turn unreadable in `post_task`. A 5xx invites a
+/// retry of something that will be refused identically every time; and
+/// Cloudflare substitutes its own body for an origin 5xx, so the peer's
+/// explanation of *which* policy declined *which* project is replaced by "the
+/// origin is overloaded or misconfigured" before the caller ever sees it.
+///
+/// [`admit_handoff`] stamps `refused` on its decisions and [`verdict_refusal_reason`]
+/// reads it back; an unstamped verdict keeps `502`.
+fn relocation_verdict(verdict: &serde_json::Value) -> (StatusCode, serde_json::Value) {
+    let Some(reason) = verdict_refusal_reason(verdict) else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({ "error": "peer did not admit the handoff" }),
+        );
+    };
+    let error = match reason {
+        "" => "peer refused the handoff".to_string(),
+        reason => format!("peer refused the handoff: {reason}"),
+    };
+    (StatusCode::FORBIDDEN, serde_json::json!({ "error": error }))
+}
+
 /// Drive a project's relocation to a paired peer over the wire — the cross-machine
 /// carriage shared by `POST …/relocate` and the combined-invite receiver
 /// ([ADR 0047](../../../specs/decisions/0047-combined-pairing-and-handoff-invite.md)).
@@ -3210,6 +3294,9 @@ pub struct HandoffRelocateRequest {
 /// standing pre-auth, or a one-shot from an accepted invite) and commits → origin commits
 /// its side (becomes operator). A decline/failure rolls the origin back. Returns an HTTP
 /// status + the origin's resulting handoff state (or `{error}`).
+///
+/// A peer that did not admit is answered by [`relocation_verdict`], which keeps a
+/// refusal out of the 5xx range.
 async fn drive_relocate(
     wb: &SharedWorkbench,
     project: &str,
@@ -3359,10 +3446,7 @@ async fn drive_relocate(
                 let _ =
                     record_outgoing_handoff(guard.store_mut(), "resolved", project, peer.as_str());
                 let _ = apply_handoff(guard.store_mut(), project, HandoffCommand::AbortHandoff);
-                (
-                    StatusCode::BAD_GATEWAY,
-                    serde_json::json!({ "error": "peer did not admit the handoff" }),
-                )
+                relocation_verdict(&verdict)
             }
         }
         Err(e) => {
@@ -3679,18 +3763,23 @@ async fn invite_receive_once(
 /// Verify a target's `InviteAccept` against the pending invite (`INV-21`: the ticket's
 /// key signed the invite id), pin the target (mutual pairing), and mark the invite
 /// accepted. Returns the verdict (`ok` + the project to relocate). Fail-closed.
+///
+/// The two fail-closed checks are *decisions* and say so via [`refused_verdict`],
+/// so the accepting side can answer `403` rather than reporting a stale invite as
+/// a broken origin. An unconfigured federation is the origin being wrong, not the
+/// origin deciding, and is left unstamped.
 fn admit_invite_accept(wb: &SharedWorkbench, wire: &InviteAcceptWire) -> serde_json::Value {
     let project = {
         let mut guard = wb.lock_unpoisoned();
         let Some((project, _expiry)) = pending_invite(guard.store_ref(), &wire.invite_id) else {
-            return serde_json::json!({ "ok": false, "reason": "no pending invite" });
+            return refused_verdict("no pending invite");
         };
         // INV-21: the key in the returned ticket must have signed the invite id.
         let verify_key = PublicKey::new(wire.ticket.governance_pubkey.clone());
         if wire.signed_bytes != invite_accept_bytes(&wire.invite_id)
             || verify_signature(&wire.signed_bytes, &wire.signature, &verify_key) != Ok(true)
         {
-            return serde_json::json!({ "ok": false, "reason": "verification failed" });
+            return refused_verdict("verification failed");
         }
         // Pin the target (TOFU) — mutual pairing complete.
         let grant_id = crate::library::gen_id("grant");
@@ -3833,8 +3922,14 @@ pub async fn post_invite_accept(
             })),
         )
             .into_response(),
+        // The origin answered and declined. A stale or already-consumed invite,
+        // or an acceptance whose key did not sign the invite id, is the origin
+        // *deciding* — identically on every retry — so it answers `403` and
+        // keeps its own sentence, which a 5xx would lose at the edge. Anything
+        // unstamped is the origin being broken rather than deciding, and keeps
+        // `502`. Same split as [`relocation_verdict`].
         Ok(v) => (
-            StatusCode::BAD_GATEWAY,
+            refusal_status(&v),
             Json(serde_json::json!({ "ok": false, "reason": v.get("reason") })),
         )
             .into_response(),
@@ -4103,9 +4198,23 @@ pub async fn post_run_place(
             Json(serde_json::json!({ "status": "pending", "correlation": correlation })),
         )
             .into_response(),
+        // The host refused the placement. `RunPlaceVerdict` already says so in as
+        // many words, so unlike the handoff and invite legs nothing needs to be
+        // carried here — the classification survives the wire in the type, and
+        // the route simply stopped reading it. A refusal is the host's decision
+        // (unpaired source, bad key, failed verification, or the placement floor
+        // declining the project) and answers `403`.
+        Ok(v) if v.status == "refused" => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "status": "refused", "reason": v.reason })),
+        )
+            .into_response(),
+        // A status outside the three the type documents is the host being wrong,
+        // not the host deciding, and stays `502` — the same narrowness that keeps
+        // an unstamped handoff verdict out of the 4xx range.
         Ok(v) => (
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "status": "refused", "reason": v.reason })),
+            Json(serde_json::json!({ "status": v.status, "reason": v.reason })),
         )
             .into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("run place failed: {e}")).into_response(),
@@ -5652,5 +5761,129 @@ mod run_place_floor_tests {
             }),
         );
         assert!(!run_place_floor_admits(&store, &counterparty, "p2"));
+    }
+}
+
+#[cfg(test)]
+mod relocation_verdict_tests {
+    use super::{refused_verdict, relocation_verdict};
+    use axum::http::StatusCode;
+
+    /// The placement-policy refusal — the case `handoff_relocation.rs` pins.
+    /// An org whose policy requires attestation declines a relocation that
+    /// cannot prove it; that is the policy speaking, and it answers `403`.
+    #[test]
+    fn a_placement_policy_refusal_is_forbidden_not_a_gateway_failure() {
+        let refusal = refused_verdict(
+            "the incoming project's deployment mode is not admitted by this org's placement policy",
+        );
+        let (status, body) = relocation_verdict(&refusal);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not admitted by this org's placement policy"),
+            "the peer's own explanation must reach the caller: {body}",
+        );
+    }
+
+    /// The identity checks fail closed for reasons that are equally decisions —
+    /// each will decide the same way on every retry — so they answer `403` too.
+    #[test]
+    fn every_fail_closed_identity_check_is_a_refusal() {
+        for reason in ["unpaired source", "bad source key", "verification failed"] {
+            let (status, body) = relocation_verdict(&refused_verdict(reason));
+            assert_eq!(status, StatusCode::FORBIDDEN, "{reason} is a decision");
+            assert!(
+                body["error"].as_str().unwrap_or_default().contains(reason),
+                "{reason} must survive to the caller: {body}",
+            );
+        }
+    }
+
+    /// A target that admitted the offer and then **broke** while importing it
+    /// answers the same `committed: false, pending: false` shape as a refusal —
+    /// and must keep `502`. This is the retryable one, and the reason the flag
+    /// is explicit instead of inferred from `ok: false`.
+    #[test]
+    fn a_failed_commit_is_still_a_gateway_failure() {
+        let broke = serde_json::json!({
+            "ok": false,
+            "committed": false,
+            "pending": false,
+            "home": null,
+        });
+        let (status, body) = relocation_verdict(&broke);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "peer did not admit the handoff");
+    }
+
+    /// An unstamped verdict is never *read* as a refusal, however much its text
+    /// looks like one. Sniffing the reason is exactly what the carried flag
+    /// replaces, and defaulting to `502` keeps a peer built before the flag
+    /// existed behaving as it does today.
+    #[test]
+    fn an_unstamped_verdict_is_never_read_as_a_refusal() {
+        let unstamped = serde_json::json!({
+            "ok": false,
+            "reason": "the incoming project's deployment mode is not admitted",
+        });
+        assert_eq!(relocation_verdict(&unstamped).0, StatusCode::BAD_GATEWAY);
+    }
+
+    /// `refused: false` is not a refusal either — only an affirmative stamp moves
+    /// a verdict out of the 5xx range.
+    #[test]
+    fn only_an_affirmative_stamp_forbids() {
+        let not_refused = serde_json::json!({ "ok": false, "refused": false, "reason": "broke" });
+        assert_eq!(relocation_verdict(&not_refused).0, StatusCode::BAD_GATEWAY);
+    }
+
+    /// A stamped verdict that somehow carries no sentence still answers `403` —
+    /// the classification, not the prose, is what decides the status.
+    #[test]
+    fn a_refusal_without_a_reason_is_still_forbidden() {
+        let bare = serde_json::json!({ "ok": false, "refused": true });
+        let (status, body) = relocation_verdict(&bare);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "peer refused the handoff");
+    }
+}
+
+#[cfg(test)]
+mod invite_refusal_tests {
+    use super::{refusal_status, refused_verdict};
+    use axum::http::StatusCode;
+
+    /// A stale or already-consumed invite is the origin **deciding**: the
+    /// rendezvous it names is gone, and it will be gone on every retry. `403`.
+    #[test]
+    fn a_consumed_invite_is_forbidden_not_a_gateway_failure() {
+        assert_eq!(
+            refusal_status(&refused_verdict("no pending invite")),
+            StatusCode::FORBIDDEN,
+        );
+    }
+
+    /// An acceptance whose key did not sign the invite id fails `INV-21` closed.
+    /// That is the same kind of decision, and answers the same way.
+    #[test]
+    fn a_failed_invite_verification_is_forbidden() {
+        assert_eq!(
+            refusal_status(&refused_verdict("verification failed")),
+            StatusCode::FORBIDDEN,
+        );
+    }
+
+    /// An origin with no federation configured is the origin being *wrong*, not
+    /// the origin deciding — the same line #198 drew when it left `Incomplete`,
+    /// `UngovernedHandle` and `UnknownInstance` on `502`. It is left unstamped
+    /// and keeps `502`.
+    #[test]
+    fn an_unconfigured_origin_is_still_a_gateway_failure() {
+        let unconfigured =
+            serde_json::json!({ "ok": false, "reason": "federation not configured" });
+        assert_eq!(refusal_status(&unconfigured), StatusCode::BAD_GATEWAY);
     }
 }
