@@ -43,7 +43,13 @@ import type {
     OpaqueHomeRoute,
     CreatedHomeInvitation,
 } from "@gaugewright/control-plane-client";
-import { HomePool } from "@gaugewright/control-plane-client";
+import {
+    browserTunnelSocket,
+    HomePool,
+    openTunnel,
+    tunnelAvailable,
+    tunnelRouteJson,
+} from "@gaugewright/control-plane-client";
 import {
     browserRouteEventStream,
     browserRouteJson,
@@ -237,6 +243,13 @@ export class WorkbenchControlPlane implements ControlPlane {
         project: ProjectId,
     ): Promise<workbenchClient.WorkbenchTransport> {
         const pool = await this.homePool();
+        const route = pool.routeFor(project);
+        // A relay-only route is not dialable without a tunnel module. That is
+        // an absence of a usable route, not a broken connection, so it reads as
+        // one and the account's selected Home serves instead.
+        if (!route.endpoint && !(route.relay && tunnelAvailable())) {
+            throw new Error(`no granted Home route for project ${project}`);
+        }
         const connection = await pool.connectProject(project);
         return connection.api;
     }
@@ -250,6 +263,23 @@ export class WorkbenchControlPlane implements ControlPlane {
             routes,
             () => this.bearer,
             {
+                // A Home with no endpoint is reachable only through the relay.
+                // Serve it over the tunnel when this build registered a module;
+                // otherwise fall through, so a build without one behaves exactly
+                // as it did rather than failing in a new way (DESK-7).
+                routeJson: (endpoint, auth, route) => {
+                    const relay = route.relay;
+                    if (route.endpoint || !relay || !tunnelAvailable()) {
+                        return browserRouteJson(endpoint, auth);
+                    }
+                    return tunnelRouteJson({
+                        open: async () => {
+                            const { tunnel, handshake } = await openTunnel(relay);
+                            const url = `${relay.endpoint}/v1/relay/${relay.handle}`;
+                            return { tunnel, socket: await browserTunnelSocket(url, handshake) };
+                        },
+                    });
+                },
                 client: (context) => {
                     const auth = {
                         bearer: context.bearer,

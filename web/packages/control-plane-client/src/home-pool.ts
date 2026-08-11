@@ -50,6 +50,7 @@ export interface HomeConnection<Api> {
 interface MutableHomeConnection<Api> {
     readonly homeId: HomeId;
     readonly endpoint: string;
+    readonly route: OpaqueHomeRoute;
     readonly routeKey: string;
     readonly admission: string;
     readonly api: Api;
@@ -76,12 +77,16 @@ export interface HomePoolOptions<Api> {
     readonly idleMs?: number;
     readonly now?: () => number;
     readonly onStateChange?: (homeId: HomeId, state: HomeConnectionState) => void;
+    /** Build the transport for one Home. Receives the route as well as the
+     * resolved endpoint, because a relay-only Home has no endpoint to dial and
+     * is served over the tunnel instead (DESK-7). */
     readonly routeJson?: (
         endpoint: string,
         auth: {
             readonly bearer: () => string | null;
             readonly homeAdmission: () => string | null;
         },
+        route: OpaqueHomeRoute,
     ) => RouteJson;
     /** Turn an opaque route into something dialable. A native shell opens the
      * pinned tunnel and returns device loopback; the default takes the route's
@@ -264,7 +269,7 @@ export class HomePool<Api> {
         };
         const routeKey = opaqueHomeRouteKey(route);
         const endpoint = await this.resolveEndpoint(route);
-        const json = this.makeRouteJson(endpoint, auth);
+        const json = this.makeRouteJson(endpoint, auth, route);
         const result = (await json("POST", "/home/admissions")) as {
             home?: unknown;
             admission?: unknown;
@@ -307,6 +312,7 @@ export class HomePool<Api> {
         connection = {
             homeId: route.homeId,
             endpoint,
+            route,
             routeKey,
             admission,
             api,
@@ -337,7 +343,7 @@ export class HomePool<Api> {
             bearer: this.bearer,
             homeAdmission: () => connection.admission,
         };
-        await this.makeRouteJson(connection.endpoint, auth)(
+        await this.makeRouteJson(connection.endpoint, auth, connection.route)(
             "DELETE",
             "/home/admissions",
         ).catch(() => undefined);

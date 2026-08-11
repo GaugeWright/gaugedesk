@@ -46,10 +46,7 @@ function fakeSocket() {
 
 function build(tunnel: TunnelFacade, socket: TunnelSocket, timeoutMs = 30_000, clock?: () => number) {
     return tunnelRouteJson({
-        locator,
-        tunnel,
-        handshake: () => new Uint8Array(84),
-        connect: async () => socket,
+        open: async () => ({ tunnel, socket }),
         tick: async () => undefined,
         timeoutMs,
         ...(clock ? { now: clock } : {}),

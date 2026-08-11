@@ -481,3 +481,54 @@ describe("project-first Home resolution (DESK-3)", () => {
         expect(worked).toEqual(["z"]);
     });
 });
+
+describe("relay-only Homes over the tunnel (DESK-7)", () => {
+    /** A relay-only route has no endpoint to dial. With no tunnel module
+     * registered the build must behave as it always did rather than failing in
+     * a new way, so the route is simply not served over a tunnel. */
+    it("falls back to the selected Home when no tunnel module is registered", async () => {
+        const worked: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(JSON.stringify({
+                    routes: [{
+                        project: "proj-relay",
+                        home_id: "home:r",
+                        relay: {
+                            endpoint: "wss://relay.example",
+                            handle: "A".repeat(43),
+                            proof: "B".repeat(42) + "A",
+                            route_epoch: 1,
+                            home_fingerprint: "ab".repeat(32),
+                        },
+                    }],
+                }));
+            }
+            if (url === "https://hub.example/account/homes") {
+                return new Response(JSON.stringify({
+                    homes: [{ id: "home:z", kind: "cloud", endpoint: "https://z.example" }],
+                    selected_home: "home:z",
+                }));
+            }
+            if (url === "https://z.example/home/admissions" && init?.method === "POST") {
+                return new Response(JSON.stringify({ home: "home:z", admission: "t" }), { status: 201 });
+            }
+            if (url === "https://z.example/workspace") {
+                worked.push("z");
+                return new Response(JSON.stringify({
+                    archetypes: [], projects: [], recent: [], workstreams: [],
+                    work_targets: [], personal_placement: null,
+                }));
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        api.setBearer("person-token");
+        api.setCurrentProject("proj-relay" as never);
+        await api.getWorkspace();
+        // No tunnel, so the relay-only route yields nothing dialable and the
+        // account's selected Home serves — unchanged behaviour, not a new failure.
+        expect(worked).toEqual(["z"]);
+    });
+});
