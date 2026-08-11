@@ -42,6 +42,7 @@ import type {
     HomeId,
     OpaqueHomeRoute,
     CreatedHomeInvitation,
+    TunnelRoute,
 } from "@gaugewright/control-plane-client";
 import {
     browserTunnelSocket,
@@ -304,6 +305,11 @@ export class WorkbenchControlPlane implements ControlPlane {
     private async homePool(): Promise<HomePool<workbenchClient.WorkbenchTransport>> {
         if (this.pool) return this.pool;
         const routes = await this.homeRoutes();
+        // The live carrier per relay-only Home. A tunnel is not reclaimed by
+        // being forgotten: the Home stays spliced to a client that has gone and
+        // never re-parks, so the *next* attempt to reach it waits for a splice
+        // that cannot happen. The pool tells us when a Home is done with.
+        const tunnels = new Map<HomeId, TunnelRoute>();
         this.pool = new HomePool<workbenchClient.WorkbenchTransport>(
             routes,
             () => this.bearer,
@@ -317,13 +323,24 @@ export class WorkbenchControlPlane implements ControlPlane {
                     if (route.endpoint || !relay || !tunnelAvailable()) {
                         return browserRouteJson(endpoint, auth);
                     }
-                    return tunnelRouteJson({
+                    const carried = tunnelRouteJson({
                         open: async () => {
                             const { tunnel, handshake } = await openTunnel(relay);
                             const url = `${relay.endpoint}/v1/relay/${relay.handle}`;
                             return { tunnel, socket: await browserTunnelSocket(url, handshake) };
                         },
                     });
+                    // A re-admission after a rotation builds a new carrier for a
+                    // Home that already has one. Hang the old one up here rather
+                    // than waiting for a `closeRoute` that will name only the
+                    // survivor.
+                    tunnels.get(route.homeId)?.close();
+                    tunnels.set(route.homeId, carried);
+                    return carried;
+                },
+                closeRoute: async (homeId) => {
+                    tunnels.get(homeId)?.close();
+                    tunnels.delete(homeId);
                 },
                 client: (context) => {
                     const auth = {

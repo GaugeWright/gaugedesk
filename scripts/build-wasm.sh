@@ -28,12 +28,35 @@ if ! command -v "$CC_wasm32_unknown_unknown" >/dev/null; then
   echo "error: $CC_wasm32_unknown_unknown not found — ring needs clang for wasm32 (ADR 0130 §4)" >&2
   exit 1
 fi
+# The archiver is checked alongside the compiler because ring needs both, and
+# only one of them fails legibly. A missing `llvm-ar` surfaces as a cc-rs error
+# buried under a page of `cargo:rerun-if-env-changed` lines, which reads as a
+# broken crate rather than a missing tool — it cost a build in the Console lane
+# before this check existed.
+if ! command -v "$AR_wasm32_unknown_unknown" >/dev/null; then
+  echo "error: $AR_wasm32_unknown_unknown not found — ring needs an LLVM archiver for wasm32 (ADR 0130 §4)" >&2
+  exit 1
+fi
 if ! command -v wasm-bindgen >/dev/null; then
   echo "error: wasm-bindgen not found — cargo install wasm-bindgen-cli --version 0.2.126" >&2
   exit 1
 fi
 if ! command -v wasm-opt >/dev/null; then
   echo "error: wasm-opt not found — install binaryen" >&2
+  exit 1
+fi
+# An old optimizer does not fail; it emits a module that cannot be instantiated.
+# Binaryen 108 (what Ubuntu noble packages) produces a fixed-size function table,
+# and wasm-bindgen's glue grows that table at startup — so the module dies on
+# load with `WebAssembly.Table.grow(): failed to grow table by 4`, which reads as
+# a corrupt build rather than as a stale tool. Worse, it is silent everywhere
+# that never loads the module. 120 is the oldest version verified here; the CI
+# lane pins a release rather than taking the distribution's.
+minimum_binaryen=120
+binaryen_version="$(wasm-opt --version | grep -oE '[0-9]+' | head -n1)"
+if [ "${binaryen_version:-0}" -lt "$minimum_binaryen" ]; then
+  echo "error: wasm-opt is binaryen ${binaryen_version:-unknown}; ${minimum_binaryen} or newer is required" >&2
+  echo "       older releases emit a module whose function table cannot grow, and it fails at load, not here" >&2
   exit 1
 fi
 

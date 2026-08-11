@@ -51,12 +51,27 @@ export interface TunnelRouteOptions {
 class TunnelClosed extends Error {}
 
 /**
+ * A tunnel's `RouteJson`, plus the handle needed to hang it up.
+ *
+ * A direct route is closed by forgetting it — the browser owns the socket and
+ * reclaims it. A tunnel is not: the carrier holds a `WebSocket` and the Home
+ * holds a leg parked against it, and neither notices a caller losing interest.
+ * A Home that keeps a leg spliced to a client that has gone never re-parks, so
+ * *every later attempt to reach it waits for a splice that cannot happen*.
+ * Dropping the reference is therefore not a way to close this.
+ */
+export type TunnelRoute = RouteJson & {
+    /** Hang up: close the carrier and refuse further calls. Idempotent. */
+    close(): void;
+};
+
+/**
  * Build a `RouteJson` that carries each call over the pinned tunnel.
  *
  * Requests are serialized: the wire is one request/response at a time, so a
  * second caller waits rather than interleaving frames into the same session.
  */
-export function tunnelRouteJson(options: TunnelRouteOptions): RouteJson {
+export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
     const timeoutMs = options.timeoutMs ?? 30_000;
     const now = options.now ?? Date.now;
     const tick = options.tick ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
@@ -76,7 +91,11 @@ export function tunnelRouteJson(options: TunnelRouteOptions): RouteJson {
         return opened;
     }
 
-    return (method, path, body) => {
+    const route: TunnelRoute = Object.assign((
+        method: string,
+        path: string,
+        body?: unknown,
+    ) => {
         // One at a time: the tunnel carries a single stream, so interleaving two
         // requests would splice their frames together.
         const run = queue.then(async () => {
@@ -112,7 +131,15 @@ export function tunnelRouteJson(options: TunnelRouteOptions): RouteJson {
         // every later request behind it.
         queue = run.catch(() => undefined);
         return run;
-    };
+    }, {
+        close() {
+            closed = true;
+            const open = live;
+            live = null;
+            open?.socket.close();
+        },
+    });
+    return route;
 }
 
 /**

@@ -67,34 +67,62 @@ async fn main() -> std::io::Result<()> {
     serve_config(TcpListener::bind(CONFIG_ADDR).await?, Arc::new(body)).await
 }
 
-/// Answer the one call the journey makes, as the Home the route names.
+/// Answer the calls the journey makes, as the Home the route names.
+///
+/// **Keep-alive is load-bearing, not politeness.** One tunnel carries one
+/// connection here (`copy_bidirectional`), and a pool that admits also revokes:
+/// it opens with `POST /home/admissions` and hangs up with `DELETE`. A responder
+/// that closed after the first would leave the second waiting out its timeout
+/// against a Home that is working perfectly, which reads as a broken tunnel.
 async fn serve_admissions(listener: TcpListener) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
         tokio::spawn(async move {
-            let mut buffer = vec![0u8; 8192];
-            let read = stream.read(&mut buffer).await.unwrap_or(0);
-            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-            let body = if request.starts_with("POST /home/admissions") {
-                format!(r#"{{"home":"{HOME_ID}","admission":"hermetic-admission"}}"#)
-            } else {
-                // Anything else is a mistake in the test, and saying so beats a
-                // silent 200 that makes a broken journey look complete.
-                r#"{"error":"the hermetic Home serves admissions only"}"#.to_owned()
-            };
-            let status = if request.starts_with("POST /home/admissions") {
-                "201 Created"
-            } else {
-                "404 Not Found"
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                body.len(),
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.flush().await;
+            let mut pending = Vec::new();
+            let mut chunk = vec![0u8; 8192];
+            loop {
+                // Requests here are header-only, so a blank line ends one. The
+                // buffer is kept across reads because two can share a segment.
+                while !pending.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => pending.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let end = pending
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .expect("a complete request")
+                    + 4;
+                let request = String::from_utf8_lossy(&pending[..end]).to_string();
+                pending.drain(..end);
+
+                let (status, body) = if request.starts_with("POST /home/admissions") {
+                    (
+                        "201 Created",
+                        format!(r#"{{"home":"{HOME_ID}","admission":"hermetic-admission"}}"#),
+                    )
+                } else if request.starts_with("DELETE /home/admissions") {
+                    ("200 OK", "{}".to_owned())
+                } else {
+                    // Anything else is a mistake in the test, and saying so beats
+                    // a silent 200 that makes a broken journey look complete.
+                    (
+                        "404 Not Found",
+                        r#"{"error":"the hermetic Home serves admissions only"}"#.to_owned(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len(),
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+            }
         });
     }
 }

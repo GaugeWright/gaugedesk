@@ -53,6 +53,9 @@ interface MutableHomeConnection<Api> {
     readonly route: OpaqueHomeRoute;
     readonly routeKey: string;
     readonly admission: string;
+    /** The transport this admission was issued over. Revoking it must go back
+     * the same way: a tunnel builds a whole second carrier if asked again. */
+    readonly json: RouteJson;
     readonly api: Api;
     state: HomeConnectionState;
     lastUsedAt: number;
@@ -315,6 +318,7 @@ export class HomePool<Api> {
             route,
             routeKey,
             admission,
+            json,
             api,
             state: "live",
             lastUsedAt: this.now(),
@@ -339,14 +343,11 @@ export class HomePool<Api> {
         const connection = this.connections.get(homeId);
         if (!connection) return;
         this.connections.delete(homeId);
-        const auth = {
-            bearer: this.bearer,
-            homeAdmission: () => connection.admission,
-        };
-        await this.makeRouteJson(connection.endpoint, auth, connection.route)(
-            "DELETE",
-            "/home/admissions",
-        ).catch(() => undefined);
+        // Over the connection that holds the admission, not a fresh one. Asking
+        // `routeJson` again would build a second transport — for a tunnel, a
+        // whole second carrier and a second Home leg — to revoke a credential
+        // the first one is already holding, and then leak it.
+        await connection.json("DELETE", "/home/admissions").catch(() => undefined);
         await this.closeRoute(homeId).catch(() => undefined);
     }
 

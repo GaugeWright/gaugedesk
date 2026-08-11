@@ -104,3 +104,46 @@ describe("a stale route epoch is re-read once (ADR 0131 §5)", () => {
         expect(attempts).toHaveLength(1);
     });
 });
+
+describe("closing a connection releases the transport that held it", () => {
+    /** A pool that records every transport it is asked to build, and every Home
+     * it is asked to hang up. */
+    function lifecyclePool() {
+        const built: string[] = [];
+        const calls: string[] = [];
+        const closed: string[] = [];
+        const instance = new HomePool<{ endpoint: string }>(
+            routes("A".repeat(43)),
+            () => "token",
+            {
+                client: (context) => ({ endpoint: context.endpoint }),
+                resolveEndpoint: async () => "https://home.example",
+                routeJson: ((_endpoint: string, _auth: unknown, route: { homeId: string }) => {
+                    const id = `${route.homeId}#${built.length}`;
+                    built.push(id);
+                    return async (method: string) => {
+                        calls.push(`${id} ${method}`);
+                        return method === "POST"
+                            ? { home: "home:a", admission: "token" }
+                            : {};
+                    };
+                }) as never,
+                closeRoute: async (homeId) => { closed.push(homeId); },
+            },
+        );
+        return { instance, built, calls, closed };
+    }
+
+    it("revokes over the connection that holds the admission", async () => {
+        // Asking `routeJson` again would build a second transport to give back a
+        // credential the first one is holding. For a relay-only Home that is a
+        // whole second carrier and a second parked leg — both then leaked.
+        const { instance, built, calls, closed } = lifecyclePool();
+        await instance.connectProject("proj" as ProjectId);
+        await instance.closeAll();
+        expect(built).toEqual(["home:a#0"]);
+        expect(calls).toEqual(["home:a#0 POST", "home:a#0 DELETE"]);
+        expect(closed).toEqual(["home:a"]);
+        expect(instance.snapshot()).toHaveLength(0);
+    });
+});

@@ -107,6 +107,31 @@ describe("routeJson over the tunnel (DESK-7)", () => {
         expect(frames).toEqual([]);
     });
 
+    it("hangs the carrier up on close, and refuses to carry more", async () => {
+        // Closing matters more here than for a direct route: the Home stays
+        // spliced to a client that has gone and never re-parks, so a carrier
+        // that is merely forgotten makes the *next* attempt to reach that Home
+        // wait for a splice that cannot happen.
+        const tunnel = fakeTunnel([{ status: 200, body: '{"ok":true}' }]);
+        const { socket } = fakeSocket();
+        let closes = 0;
+        const json = build(tunnel, { ...socket, close: () => { closes += 1; } });
+        await expect(json("GET", "/workspace")).resolves.toEqual({ ok: true });
+        json.close();
+        expect(closes).toBe(1);
+        await expect(json("GET", "/workspace")).rejects.toThrow(/closed/);
+    });
+
+    it("closes nothing it never opened, and closes only once", async () => {
+        const tunnel = fakeTunnel([]);
+        const { socket } = fakeSocket();
+        let closes = 0;
+        const json = build(tunnel, { ...socket, close: () => { closes += 1; } });
+        json.close();
+        json.close();
+        expect(closes).toBe(0);
+    });
+
     it("does not wedge later requests behind a failed one", async () => {
         const tunnel = fakeTunnel([
             { status: 500, body: "boom" },
