@@ -49,7 +49,11 @@ export async function loadMobileHomeRoutes(
     const json = browserRouteJson(accountBase, { bearer });
     // Keep parsing at the shared transport boundary even though
     // accountHomeRoutes already returns the branded shape.
-    const routes = await accountHomeRoutes(json);
+    // The carve-out ADR 0133 §5 sequences: mobile does not read the signed
+    // record yet, so declaring the truth here would strip every relay locator
+    // and take its relay-only Machines offline. Removing it is this client's
+    // half of DESK-5g, not a default to flip.
+    const routes = await accountHomeRoutes(json, "signed");
     return parseOpaqueHomeRoutes({
         routes: routes.map((route) => ({
             project: route.project,

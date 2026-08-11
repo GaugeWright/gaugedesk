@@ -80,8 +80,10 @@ run_web() {
     # silently degrade a Home to unreachable. Built on absence, exactly the way
     # node_modules above is: a developer pays once, CI pays every run because
     # its checkout is always fresh.
-    [ -f web/packages/control-plane-client/src/generated/tunnel.js ] \
-        || scripts/build-wasm-tunnel.sh
+    # Both modules, because either one missing fails the build the same way.
+    { [ -f web/packages/control-plane-client/src/generated/tunnel.js ] \
+        && [ -f web/packages/control-plane-client/src/generated/directory.js ]; } \
+        || scripts/build-wasm.sh
     echo "== web typecheck =="
     npm --prefix web run typecheck
     npm --prefix web run typecheck:split

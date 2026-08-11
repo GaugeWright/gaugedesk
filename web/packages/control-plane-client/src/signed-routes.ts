@@ -29,8 +29,10 @@ export interface SignedRouteOptions {
     readonly subject: string;
     readonly directoryOrigin?: string;
     /** The wasm verifier — `verify_signed_put_json`. Injected so this is
-     * testable, and so the signing contract stays owned by the Rust crate. */
-    readonly verify: (json: string) => boolean;
+     * testable, and so the signing contract stays owned by the Rust crate.
+     * Async because a wasm module loads on demand; a synchronous stand-in
+     * satisfies it unchanged. */
+    readonly verify: (json: string) => boolean | Promise<boolean>;
     readonly fetchJson?: (url: string) => Promise<string | null>;
     readonly storage?: Pick<Storage, "getItem" | "setItem">;
 }
@@ -88,7 +90,7 @@ export async function signedHomeRoutes(
 
     const body = await fetchJson(`${origin}/directory/${encodeURIComponent(root)}`);
     if (!body) return null;
-    if (!options.verify(body)) {
+    if (!(await options.verify(body))) {
         throw new Error("the account directory record failed signature verification");
     }
     const put = JSON.parse(body) as {

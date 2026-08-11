@@ -47,7 +47,7 @@ export async function readAccountBootstrap(base: string) {
     return {
         tenants: await accountTenants(json),
         homes: await accountHomes(json),
-        homeRoutes: await accountHomeRoutes(json),
+        homeRoutes: await accountHomeRoutes(json, "unsigned"),
         facilities: await accountFacilities(json),
         invitations: await accountInvitations(json),
         devices: await accountDevices(json),
@@ -94,9 +94,9 @@ export async function mutateAccountBootstrap(base: string) {
         homeId,
         endpoint,
     });
-    const routesAfterPublish = await accountHomeRoutes(json);
+    const routesAfterPublish = await accountHomeRoutes(json, "unsigned");
     await accountDeleteHomeRoute(json, projectId);
-    const routesAfterDelete = await accountHomeRoutes(json);
+    const routesAfterDelete = await accountHomeRoutes(json, "unsigned");
     await accountUnregisterHome(json, homeId);
     const homesAfterDelete = await accountHomes(json);
 

@@ -173,6 +173,51 @@ export class WorkbenchControlPlane implements ControlPlane {
         this.bearer = token;
     }
 
+    /**
+     * The signed-in subject, read from the bearer's own claims (DESK-5g).
+     *
+     * It namespaces the root-key pin, nothing more: signing out as one person
+     * and in as another must not compare keys across them (ADR 0132 §5). No
+     * signature check is needed or wanted here — a forged subject would only
+     * pin under a namespace that grants nothing, while verifying would need a
+     * key this page has no way to hold.
+     */
+    private subject(): string {
+        const token = this.bearer;
+        if (!token) return "";
+        const claims = token.split(".")[1];
+        if (!claims) return "";
+        try {
+            const decoded = JSON.parse(atob(claims.replace(/-/g, "+").replace(/_/g, "/"))) as {
+                sub?: unknown;
+            };
+            return typeof decoded.sub === "string" ? decoded.sub : "";
+        } catch {
+            return "";
+        }
+    }
+
+    /**
+     * Project→Home routes across both channels (DESK-5g, ADR 0133 §3): the
+     * root-signed record where it verifies against the pinned root, the hub's
+     * table for endpoints otherwise. Every route read in this client goes
+     * through here, so provenance and pinning cannot diverge between call sites.
+     */
+    private async homeRoutes(): Promise<OpaqueHomeRoute[]> {
+        const resolved = await accountClient.resolveHomeRoutes({
+            json: this.route,
+            subject: this.subject(),
+            onRootKeyConflict: (error) => {
+                // Surfaced, never silently adopted: this is the substitution the
+                // pin exists to catch (ADR 0132 §2). Reachability is unaffected
+                // — the endpoints still work — so it is reported rather than
+                // thrown at a caller who was only opening a project.
+                console.error("[account] %s", error.message);
+            },
+        });
+        return resolved.routes;
+    }
+
     setHomeAdmission(token: string | null): void {
         this.homeAdmission = token;
     }
@@ -258,7 +303,7 @@ export class WorkbenchControlPlane implements ControlPlane {
      * refreshed whenever the account directory is re-read. */
     private async homePool(): Promise<HomePool<workbenchClient.WorkbenchTransport>> {
         if (this.pool) return this.pool;
-        const routes = await accountClient.accountHomeRoutes(this.route);
+        const routes = await this.homeRoutes();
         this.pool = new HomePool<workbenchClient.WorkbenchTransport>(
             routes,
             () => this.bearer,
@@ -295,7 +340,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                 // A Home rotates its locator on a schedule, which invalidates
                 // outstanding ones the moment it lands. Re-reading once turns
                 // that into a reconnect instead of an unreachable Home.
-                refreshRoutes: () => accountClient.accountHomeRoutes(this.route),
+                refreshRoutes: () => this.homeRoutes(),
             },
         );
         return this.pool;
@@ -343,7 +388,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             this.homeTransport = null;
             const [state, routes] = await Promise.all([
                 accountClient.accountHomes(this.route),
-                accountClient.accountHomeRoutes(this.route),
+                this.homeRoutes(),
             ]);
             return { kind: "none", homes: state.homes, routes };
         }

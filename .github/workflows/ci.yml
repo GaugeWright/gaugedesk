@@ -65,7 +65,7 @@ jobs:
       # generated from `crates/relay-transport` rather than committed. This
       # runner is fresh every time, so `check.sh web` builds it here — and that
       # needs the wasm32 toolchain. `ring` compiles C for wasm32, hence clang;
-      # `build-wasm-tunnel.sh` finishes with wasm-opt, hence binaryen. The same
+      # `build-wasm.sh` finishes with wasm-opt, hence binaryen. The same
       # set the private repo's browser-tunnel job installs.
       - name: Install Rust for the wasm32 target
         working-directory: .

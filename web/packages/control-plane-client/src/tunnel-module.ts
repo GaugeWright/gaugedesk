@@ -1,7 +1,7 @@
 /**
  * Wiring the browser tunnel's wasm module (DESK-7).
  *
- * The module is a *build artifact* — `scripts/build-wasm-tunnel.sh` produces it
+ * The module is a *build artifact* — `scripts/build-wasm.sh` produces it
  * and it is gitignored — so this package never imports it directly. It could
  * not: a fresh checkout has no such file, and an unresolvable import would
  * either break every typecheck or be dodged with a cast that stops describing
@@ -43,7 +43,7 @@ async function load(): Promise<TunnelModule> {
         // simply unreachable — sends someone to the network instead of the build.
         throw new Error(
             "the browser tunnel is not available: no module loader registered "
-                + "(run scripts/build-wasm-tunnel.sh and register it at startup)",
+                + "(run scripts/build-wasm.sh and register it at startup)",
         );
     }
     loaded ??= loader().catch((error) => {

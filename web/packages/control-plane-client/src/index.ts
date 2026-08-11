@@ -19,6 +19,8 @@ export * from "./tunnel-module";
 export * from "./tunnel-route-json";
 export * from "./home-routing";
 export * from "./signed-routes";
+export * from "./resolve-home-routes";
+export * from "./directory-module";
 export * from "./home-invitation";
 export * from "./management-environment";
 export * from "./placement-policy";

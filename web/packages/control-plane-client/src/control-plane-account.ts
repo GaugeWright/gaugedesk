@@ -4,6 +4,7 @@ import {
     parseOpaqueHomeRoutes,
     type OpaqueHomeRoute,
     type OpaqueRelayLocator,
+    type RouteProvenance,
 } from "./home-routing";
 
 export type AccountHomeKind = "local" | "registered" | "cloud";
@@ -89,22 +90,26 @@ export async function accountUnregisterHome(json: RouteJson, home: HomeId): Prom
 }
 
 /**
- * The hub's route table.
+ * The hub's route table, at a provenance the **caller** declares.
  *
- * **Temporary carve-out (DESK-5c).** ADR 0131 §3 says a client that has not
- * verified the account root's signature must refuse a route's certificate pin,
- * and this table is exactly the unsigned source that rule is about. The refusal
- * is implemented and tested in `home-routing.ts`; it is not applied *here* yet,
- * because no client can currently verify the signed directory record, and
- * flipping this before that lands would silently strip the locators native
- * mobile depends on and take working Homes offline.
+ * ADR 0131 §3 says a client that has not verified the account root's signature
+ * must refuse a route's certificate pin, and this table is exactly the unsigned
+ * source that rule is about — any holder of the person's session can write into
+ * it, `home_fingerprint` included.
  *
- * Removing this argument is the last step of DESK-5c, once clients read and
- * verify the signed record. It is deliberately spelled out rather than left as
- * a default so it cannot be mistaken for the intended posture.
+ * Provenance is a parameter rather than a constant because the two client
+ * families are at different points of the same migration (ADR 0133 §5). The
+ * browser reads the signed record and so tells the truth here — `resolve-home-routes.ts`
+ * passes `unsigned`. Native mobile does not verify yet, and flipping it there
+ * first would strip the locators its relay-only Homes depend on and take working
+ * Machines offline. It is spelled out at each call site so neither reading can be
+ * mistaken for the intended end state, which is `unsigned` everywhere.
  */
-export async function accountHomeRoutes(json: RouteJson): Promise<OpaqueHomeRoute[]> {
-    return parseOpaqueHomeRoutes(await json("GET", "/account/home-routes"), "signed");
+export async function accountHomeRoutes(
+    json: RouteJson,
+    provenance: RouteProvenance,
+): Promise<OpaqueHomeRoute[]> {
+    return parseOpaqueHomeRoutes(await json("GET", "/account/home-routes"), provenance);
 }
 
 /** Which root signs this account's directory record, and where it lives. */

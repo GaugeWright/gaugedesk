@@ -26,7 +26,8 @@
     "./project-home": "./src/project-home.ts",
     "./projection-carriage": "./src/projection-carriage.ts",
     "./workspace-delta": "./src/workspace-delta.ts",
-    "./generated/tunnel.js": "./src/generated/tunnel.js"
+    "./generated/tunnel.js": "./src/generated/tunnel.js",
+    "./generated/directory.js": "./src/generated/directory.js"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p ../../tsconfig.open-client.json"
