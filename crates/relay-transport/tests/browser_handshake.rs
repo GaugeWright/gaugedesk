@@ -58,3 +58,49 @@ fn browser_entropy_varies_between_sessions() {
         "two ClientHellos were identical — entropy is not reaching ring",
     );
 }
+
+use gaugedesk_relay_transport::browser::BrowserTunnel;
+
+/// The facade JavaScript actually holds: it must reject a malformed pin rather
+/// than start a session that can never verify.
+#[wasm_bindgen_test]
+fn the_facade_refuses_a_fingerprint_that_is_not_32_hex_bytes() {
+    assert!(BrowserTunnel::new("ab").is_err());
+    assert!(BrowserTunnel::new(&"zz".repeat(32)).is_err());
+    assert!(BrowserTunnel::new(&"ab".repeat(32)).is_ok());
+}
+
+/// The first frame on the socket is the fabric's, and it must be the same 84
+/// bytes every other carrier sends.
+#[wasm_bindgen_test]
+fn the_facade_emits_the_canonical_client_handshake() {
+    // A 43-character base64url value must leave its trailing bits zero, so the
+    // last character is one whose low bits are clear. `B` repeated is rejected
+    // by strict decoding, which is the validator doing its job.
+    let proof = format!("{}A", "B".repeat(42));
+    let handshake =
+        BrowserTunnel::relay_handshake("wss://relay.example", &"A".repeat(43), &proof, 3.0)
+            .expect("handshake");
+    assert_eq!(handshake.len(), 84);
+    assert_eq!(&handshake[..8], b"GWRWSS1\n");
+    assert_eq!(handshake[10], 2, "the client role");
+    assert_eq!(&handshake[12..20], &3u64.to_be_bytes());
+}
+
+/// A queued request must actually produce ciphertext to write, which is the
+/// whole contract the JavaScript loop depends on.
+#[wasm_bindgen_test]
+fn a_queued_request_produces_ciphertext_to_send() {
+    let mut tunnel = BrowserTunnel::new(&"ab".repeat(32)).expect("tunnel");
+    assert!(tunnel.is_handshaking());
+    tunnel
+        .send_request("POST", "/home/admissions", None)
+        .expect("queue");
+    let frame = tunnel.take_outgoing().expect("outgoing");
+    assert!(
+        !frame.is_empty(),
+        "the handshake must produce bytes to send"
+    );
+    assert_eq!(frame[0], 0, "framed as a relay DATA record");
+    assert_eq!(tunnel.poll_status().expect("poll"), None, "no reply yet");
+}
