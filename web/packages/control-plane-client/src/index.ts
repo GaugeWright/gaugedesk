@@ -15,6 +15,7 @@ export * from "./project-home";
 export * from "./registered-host";
 export * from "./fork-tree";
 export * from "./home-pool";
+export * from "./tunnel-module";
 export * from "./tunnel-route-json";
 export * from "./home-routing";
 export * from "./home-invitation";

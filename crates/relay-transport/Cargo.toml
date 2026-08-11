@@ -5,6 +5,11 @@ version.workspace = true
 license.workspace = true
 description = "Blind role-aware rendezvous and cert-pinned Home/client tunnel."
 
+# `cdylib` so the wasm32 build emits a module wasm-bindgen can process; `rlib`
+# so native dependents link it as they always have (DESK-7).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [features]
 test-relay = []
 
