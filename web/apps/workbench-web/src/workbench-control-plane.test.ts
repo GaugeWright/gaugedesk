@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setTunnelModuleLoader } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane } from "./workbench-control-plane";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -530,5 +531,44 @@ describe("relay-only Homes over the tunnel (DESK-7)", () => {
         // No tunnel, so the relay-only route yields nothing dialable and the
         // account's selected Home serves — unchanged behaviour, not a new failure.
         expect(worked).toEqual(["z"]);
+    });
+});
+
+describe("the tunnel payload is only fetched when it is needed (DESK-7)", () => {
+    /** The wasm module is ~650 KB. Nothing on the ordinary path may wait for it:
+     * a person whose Homes are all directly addressable must never fetch it. */
+    it("never loads the wasm module for a directly addressable Home", async () => {
+        let loads = 0;
+        setTunnelModuleLoader(async () => {
+            loads += 1;
+            throw new Error("the tunnel module must not be loaded here");
+        });
+        try {
+            vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = String(input);
+                if (url === "https://hub.example/account/home-routes") {
+                    return new Response(JSON.stringify({
+                        routes: [{ project: "proj-direct", home_id: "home:d", endpoint: "https://d.example" }],
+                    }));
+                }
+                if (url === "https://d.example/home/admissions" && init?.method === "POST") {
+                    return new Response(JSON.stringify({ home: "home:d", admission: "t" }), { status: 201 });
+                }
+                if (url === "https://d.example/workspace") {
+                    return new Response(JSON.stringify({
+                        archetypes: [], projects: [], recent: [], workstreams: [],
+                        work_targets: [], personal_placement: null,
+                    }));
+                }
+                throw new Error(`unexpected fetch ${url}`);
+            }));
+            const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+            api.setBearer("person-token");
+            api.setCurrentProject("proj-direct" as never);
+            await api.getWorkspace();
+            expect(loads).toBe(0);
+        } finally {
+            setTunnelModuleLoader(null);
+        }
     });
 });

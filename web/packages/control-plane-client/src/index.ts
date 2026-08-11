@@ -18,6 +18,7 @@ export * from "./home-pool";
 export * from "./tunnel-module";
 export * from "./tunnel-route-json";
 export * from "./home-routing";
+export * from "./signed-routes";
 export * from "./home-invitation";
 export * from "./management-environment";
 export * from "./placement-policy";
