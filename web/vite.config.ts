@@ -11,10 +11,47 @@ import { aliceCP, ports } from "./e2e/ports.mjs";
 // Under the fabric the control plane's port is chosen by the orchestrator, so
 // the proxy target follows it rather than the harness's fixed default.
 const controlPlane = process.env.GAUGEDESK_DEV_CONTROL_PLANE_TARGET ?? aliceCP;
-const proxy = {
-    "/scopes": controlPlane,
-    "/engagements": controlPlane,
-};
+
+// Every top-level path the control plane owns (`crates/app/src/local_routes.rs`
+// and its sibling route modules). The client's CP base is this same origin — the
+// fabric serves `desk` from this server — so anything missing here is answered by
+// Vite's SPA fallback instead of the backend: a 404 for an XHR, and index.html for
+// anything that accepts HTML, which surfaces as `Unexpected token '<'`. The
+// workbench has no client-side URL router, so no entry here can shadow a route of
+// the app's own.
+const controlPlanePrefixes = [
+    "/account",
+    "/archetypes",
+    "/auth",
+    "/boundaries",
+    "/chats",
+    "/collection-recipients",
+    "/console",
+    "/engagements",
+    "/federation",
+    "/file",
+    "/fork-tree",
+    "/health",
+    "/home",
+    "/mobile",
+    "/pairing-requests",
+    "/pairing-status",
+    "/placements",
+    "/projections",
+    "/projects",
+    "/public-deployments",
+    "/roster",
+    "/scopes",
+    "/search",
+    "/targets",
+    "/tasks",
+    "/work-items",
+    "/workspace",
+    "/workstreams",
+];
+const proxy = Object.fromEntries(
+    controlPlanePrefixes.map((prefix) => [prefix, controlPlane]),
+);
 
 // The cross-surface development fabric terminates TLS for every surface behind
 // one router and serves this client at the `desk` origin. Under it this server
