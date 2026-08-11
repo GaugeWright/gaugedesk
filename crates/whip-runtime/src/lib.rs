@@ -738,7 +738,7 @@ impl Harness for WhipHarness {
         let execution = self
             .runtime
             .run_turn(&command, &self.package, &self.provider, &resources)
-            .map_err(invalid_data);
+            .map_err(turn_failure);
         self.clear_cancellation();
         let execution = execution?;
         let evidence_pointers = execution.evidence_pointers();
@@ -1642,6 +1642,27 @@ fn invalid_data(error: impl fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
+/// Classify a turn failure while the runtime's own error type is still in hand.
+///
+/// `HostRuntimeError` distinguishes the runtime **refusing** a turn from the
+/// runtime **failing** at one, but the harness seam is `io::Result`, so the
+/// variant is gone one frame later. `io::ErrorKind` is the carrier that
+/// survives: a refusal becomes `PermissionDenied` and everything else keeps
+/// `InvalidData`. `EngineError::is_policy_denial` reads it back at the route,
+/// which is what keeps a refusal out of the 5xx range.
+///
+/// Only the two deliberate-decision variants qualify. `Incomplete`,
+/// `UngovernedHandle` and `UnknownInstance` are the runtime or its host being
+/// wrong, not the policy speaking, and stay where they were.
+fn turn_failure(error: whipplescript::host_runtime::HostRuntimeError) -> io::Error {
+    use whipplescript::host_runtime::HostRuntimeError as E;
+    let kind = match error {
+        E::Ifc(_) | E::PolicyRejected(_) => io::ErrorKind::PermissionDenied,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error.to_string())
+}
+
 /// A monotonically increasing GaugeDesk policy epoch.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PolicyEpoch(u64);
@@ -2305,5 +2326,60 @@ workflow Method {
             factory.credential_status("openai-codex", Some(test_credential_capability().as_ref())),
             CredentialProbe::Ready
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_failure_tests {
+    use super::turn_failure;
+    use crate::HostRuntimeError;
+    use std::io;
+
+    /// An information-flow denial is the policy speaking. It is carried out of
+    /// the runtime as `PermissionDenied` so the route can answer `403` rather
+    /// than reporting a refusal as a broken gateway.
+    #[test]
+    fn an_ifc_denial_is_carried_as_permission_denied() {
+        let error = HostRuntimeError::Ifc(vec![
+            "denied read in rule `converse`: the agent acts-for `authority:abc`".to_string(),
+        ]);
+        let carried = turn_failure(error);
+        assert_eq!(carried.kind(), io::ErrorKind::PermissionDenied);
+        assert!(carried.to_string().contains("denied read in rule"));
+    }
+
+    /// A rejected package is the same kind of decision and travels the same way.
+    #[test]
+    fn a_policy_rejection_is_carried_as_permission_denied() {
+        let carried = turn_failure(HostRuntimeError::PolicyRejected("no such rule".into()));
+        assert_eq!(carried.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// The runtime or its host being wrong is not a refusal. These keep
+    /// `InvalidData`, so they keep answering `502` — the reclassification is
+    /// deliberately narrow.
+    #[test]
+    fn runtime_faults_are_not_reclassified() {
+        for error in [
+            HostRuntimeError::UnknownInstance("inst-gone".into()),
+            HostRuntimeError::UngovernedHandle("handle".into()),
+            HostRuntimeError::Incomplete("turn".into()),
+            HostRuntimeError::Resolver("no package".into()),
+        ] {
+            assert_eq!(
+                turn_failure(error).kind(),
+                io::ErrorKind::InvalidData,
+                "only a deliberate policy decision may be reclassified",
+            );
+        }
+    }
+
+    /// The message survives the classification unchanged — the point is to add
+    /// a machine-readable kind, never to replace the runtime's explanation.
+    #[test]
+    fn the_runtime_explanation_survives() {
+        let error = HostRuntimeError::Ifc(vec!["outside `project`'s readers".to_string()]);
+        let expected = error.to_string();
+        assert_eq!(turn_failure(error).to_string(), expected);
     }
 }

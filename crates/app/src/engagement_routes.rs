@@ -1143,6 +1143,26 @@ pub(crate) struct TaskBody {
     images: Vec<gaugedesk_harness::ImageContent>,
 }
 
+/// The status a failed turn answers with.
+///
+/// A refusal is not a gateway failure. The runtime declining a turn on
+/// information-flow policy is a decision the caller must read and act on, so it
+/// answers `403`; only something actually breaking keeps `502`.
+///
+/// The distinction is not cosmetic, and getting it wrong is expensive twice
+/// over: a 5xx invites a retry of something that will be refused identically
+/// every time, and Cloudflare substitutes its own body for an origin 5xx — so
+/// the runtime's explanation of *which* rule denied *which* read is replaced by
+/// "the origin is overloaded or misconfigured" before the caller sees it. The
+/// production wiring canary read that as an origin outage for days.
+fn task_failure_status(error: &crate::engine::EngineError) -> StatusCode {
+    if error.is_policy_denial() {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
 /// Task an engagement: drive one governed WhippleScript turn in its worktree,
 /// streaming operational events live (SSE) and returning the diff + output.
 pub(crate) async fn post_task(
@@ -1199,8 +1219,8 @@ pub(crate) async fn post_task(
     match outcome {
         Ok(Ok(result)) => (StatusCode::OK, Json(result)).into_response(),
         Ok(Err(e)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": e })),
+            task_failure_status(&e),
+            Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "task panicked").into_response(),
@@ -1558,4 +1578,64 @@ pub(crate) async fn post_test_force_conflict(
         Json(serde_json::json!({ "force_conflict": body.on })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod task_failure_status_tests {
+    use super::task_failure_status;
+    use crate::engine::EngineError;
+    use axum::http::StatusCode;
+    use std::io;
+
+    /// The runtime refusing a turn on information-flow policy answers `403`.
+    ///
+    /// This is the case the wiring canary hit: `denied read in rule
+    /// `converse`` is the policy speaking, not a broken upstream, and it must
+    /// not be reported as one.
+    #[test]
+    fn a_policy_denial_is_forbidden_not_a_gateway_failure() {
+        let denied = EngineError::Harness(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "package violates the admitted information-flow policy: denied read in rule `converse`",
+        ));
+        assert!(denied.is_policy_denial());
+        assert_eq!(task_failure_status(&denied), StatusCode::FORBIDDEN);
+    }
+
+    /// A genuine transport death keeps `502`. The point of the change is to
+    /// separate the two, not to move everything out of the 5xx range.
+    #[test]
+    fn a_transport_failure_is_still_a_gateway_failure() {
+        let broken = EngineError::Harness(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "model transport died mid-turn",
+        ));
+        assert!(!broken.is_policy_denial());
+        assert_eq!(task_failure_status(&broken), StatusCode::BAD_GATEWAY);
+    }
+
+    /// The runtime being wrong — a malformed package, an unknown instance —
+    /// arrives as `InvalidData` and stays `502`. Only the two deliberate
+    /// decision variants are reclassified upstream.
+    #[test]
+    fn a_runtime_fault_is_still_a_gateway_failure() {
+        let invalid = EngineError::Harness(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown instance: inst-gone",
+        ));
+        assert!(!invalid.is_policy_denial());
+        assert_eq!(task_failure_status(&invalid), StatusCode::BAD_GATEWAY);
+    }
+
+    /// The message-only leg carries no classification and must not be guessed
+    /// at from its text — string-sniffing a denial is exactly what the typed
+    /// path replaces.
+    #[test]
+    fn a_message_leg_is_never_read_as_a_denial() {
+        let message = EngineError::Message(
+            "package violates the admitted information-flow policy: denied read".to_string(),
+        );
+        assert!(!message.is_policy_denial());
+        assert_eq!(task_failure_status(&message), StatusCode::BAD_GATEWAY);
+    }
 }

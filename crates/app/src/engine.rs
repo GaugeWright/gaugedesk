@@ -509,6 +509,10 @@ pub enum EngineError {
     Admit(AdmitError),
     Workspace(gaugedesk_workspace::WorkspaceError),
     Harness(std::io::Error),
+    /// A leg that only ever had a message. Carrying it keeps the turn chain on
+    /// one error type, so a classified failure is not flattened to `String` by
+    /// the first `?` that happens to sit above it.
+    Message(String),
 }
 impl From<AdmitError> for EngineError {
     fn from(e: AdmitError) -> Self {
@@ -520,16 +524,40 @@ impl From<gaugedesk_workspace::WorkspaceError> for EngineError {
         EngineError::Workspace(e)
     }
 }
+impl From<String> for EngineError {
+    fn from(e: String) -> Self {
+        EngineError::Message(e)
+    }
+}
 /// Human-readable turn-failure text — what the turn routes surface as the HTTP
-/// error body (`post_task` 502). The workspace/harness legs carry impl-minted
-/// messages; an admission error has no Display and keeps its Debug rendering.
+/// error body. The workspace/harness legs carry impl-minted messages; an
+/// admission error has no Display and keeps its Debug rendering.
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EngineError::Admit(e) => write!(f, "{e:?}"),
             EngineError::Workspace(e) => write!(f, "{e}"),
             EngineError::Harness(e) => write!(f, "{e}"),
+            EngineError::Message(e) => write!(f, "{e}"),
         }
+    }
+}
+impl EngineError {
+    /// Whether this failure is the runtime **refusing** the turn on policy — an
+    /// information-flow denial or a rejected package — as opposed to something
+    /// breaking.
+    ///
+    /// The distinction is not cosmetic. A refusal is a decision the caller must
+    /// see and act on, so it belongs in the 4xx range; reporting it as `502`
+    /// tells the caller to retry something that will be refused identically
+    /// every time, and — because Cloudflare substitutes its own body for origin
+    /// 5xx — replaces the runtime's explanation with "the origin is overloaded
+    /// or misconfigured". The wiring canary chased exactly that phantom.
+    ///
+    /// The classification is minted where the type still exists, in
+    /// `gaugedesk-whip-runtime`, as `io::ErrorKind::PermissionDenied`.
+    pub fn is_policy_denial(&self) -> bool {
+        matches!(self, EngineError::Harness(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
     }
 }
 
@@ -1129,7 +1157,7 @@ fn record_precheck_failure(
     task: &str,
     reason: String,
     code: &str,
-) -> Result<TaskResult, String> {
+) -> Result<TaskResult, EngineError> {
     // The run starts then immediately fails on the gate — the same lifecycle a turn
     // that reaches the harness and errors admits (RequestRun→AdmitRun→StartRun→FailRun),
     // minus the observations no turn produced.
@@ -1307,7 +1335,7 @@ pub fn run_engagement_turn(
     worktree: &Path,
     sender: &broadcast::Sender<ServerEvent>,
     input: EngagementTurnInput<'_>,
-) -> Result<TaskResult, String> {
+) -> Result<TaskResult, EngineError> {
     let EngagementTurnInput {
         task,
         images,
@@ -2196,7 +2224,7 @@ fn drive_persistent_turn(
     managed_billing_scope: Option<&str>,
     managed_funding_ref: Option<&str>,
     runtime_command_id: Option<&str>,
-) -> Result<TaskResult, String> {
+) -> Result<TaskResult, EngineError> {
     // 1. Check out this turn's resources under a brief lock, then drop it.
     let (mut store, engagement, harness, persistent, answers) = {
         let mut g = wb.lock_unpoisoned();
@@ -2266,8 +2294,7 @@ fn drive_persistent_turn(
             managed_billing_scope,
             managed_funding_ref,
             &answers,
-        )
-        .map_err(|e| e.to_string());
+        );
         clear_running_turn(id);
         result
     };
