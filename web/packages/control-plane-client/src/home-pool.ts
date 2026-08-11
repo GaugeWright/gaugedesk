@@ -88,6 +88,20 @@ export interface HomePoolOptions<Api> {
      * own endpoint. */
     readonly resolveEndpoint?: (route: OpaqueHomeRoute) => Promise<string>;
     readonly closeRoute?: (homeId: HomeId) => Promise<void>;
+    /** Re-read the account's routes. A rotation invalidates outstanding locators
+     * the moment it lands at the relay, so a client refused for a stale epoch
+     * re-reads once and retries rather than reporting the Home unreachable
+     * (ADR 0131 §5). Without this seam the pool simply does not retry. */
+    readonly refreshRoutes?: () => Promise<readonly OpaqueHomeRoute[]>;
+}
+
+/** Whether a failure looks like the relay refusing a superseded locator, rather
+ * than the Home refusing the person. Only the former is worth re-reading for:
+ * an admission refusal will refuse again just as fast. */
+export function isStaleRouteFailure(error: unknown): boolean {
+    return /stale|epoch|route proof|refused pairing/i.test(
+        error instanceof Error ? error.message : String(error ?? ""),
+    );
 }
 
 /** Map an authorization refusal onto a connection state. This is pool logic,
@@ -113,6 +127,7 @@ export class HomePool<Api> {
     private readonly makeRouteJson: NonNullable<HomePoolOptions<Api>["routeJson"]>;
     private readonly resolveEndpoint: NonNullable<HomePoolOptions<Api>["resolveEndpoint"]>;
     private readonly closeRoute: NonNullable<HomePoolOptions<Api>["closeRoute"]>;
+    private readonly refreshRoutes: HomePoolOptions<Api>["refreshRoutes"];
     private readonly onStateChange: NonNullable<HomePoolOptions<Api>["onStateChange"]>;
 
     constructor(
@@ -129,6 +144,7 @@ export class HomePool<Api> {
             options.routeJson ?? ((endpoint, auth) => browserRouteJson(endpoint, auth));
         this.resolveEndpoint = options.resolveEndpoint ?? (async (route) => route.endpoint);
         this.closeRoute = options.closeRoute ?? (async () => undefined);
+        this.refreshRoutes = options.refreshRoutes;
         this.replaceRoutes(routes);
     }
 
@@ -171,6 +187,26 @@ export class HomePool<Api> {
     }
 
     async connectProject(project: ProjectId): Promise<HomeConnection<Api>> {
+        try {
+            return await this.attemptProject(project);
+        } catch (error) {
+            // Exactly once. A rotation is a reachability event, so one re-read
+            // resolves it; a second would be a retry loop against a Home that is
+            // simply refusing.
+            if (!this.refreshRoutes || !isStaleRouteFailure(error)) throw error;
+            const refreshed = await this.refreshRoutes();
+            const current = this.routes.get(project);
+            const next = refreshed.find((route) => route.project === project);
+            if (!next || (current && opaqueHomeRouteKey(current) === opaqueHomeRouteKey(next))) {
+                // The route did not move, so the failure was not staleness.
+                throw error;
+            }
+            this.replaceRoutes(refreshed);
+            return this.attemptProject(project);
+        }
+    }
+
+    private async attemptProject(project: ProjectId): Promise<HomeConnection<Api>> {
         const route = this.routeFor(project);
         const existing = this.connections.get(route.homeId);
         if (existing) {

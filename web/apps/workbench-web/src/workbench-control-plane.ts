@@ -262,6 +262,10 @@ export class WorkbenchControlPlane implements ControlPlane {
                         events: browserRouteEventStream(context.endpoint, auth),
                     };
                 },
+                // A Home rotates its locator on a schedule, which invalidates
+                // outstanding ones the moment it lands. Re-reading once turns
+                // that into a reconnect instead of an unreachable Home.
+                refreshRoutes: () => accountClient.accountHomeRoutes(this.route),
             },
         );
         return this.pool;
