@@ -89,6 +89,12 @@
     --fs-ui: 12px;     /* controls, tree rows, tabs, table text */
     --fs-body: 13px;   /* transcript, inputs, body copy (the root size) */
     --fs-title: 15px;  /* modal / pane titles */
+    /* The reading measure. A ceiling, not a target: it only binds once a prose
+       column is wider than this, so a docked panel is unaffected and a maximised
+       window stops setting line length by accident. 1ch is the width of "0",
+       roughly 1.2x the average lowercase character, so this caps a line at about
+       104 characters rather than the 85 the value reads as. */
+    --prose-measure: 85ch;
     font-family: var(--ui);
     font-size: var(--fs-body);
     color-scheme: dark;
@@ -606,8 +612,13 @@ code, pre, textarea {
     margin: 0.9em 0 0.4em; line-height: 1.25; }
 .markdown-body h1 { font-size: 1.45em; } .markdown-body h2 { font-size: 1.25em; }
 .markdown-body h3 { font-size: 1.1em; }
+/* 0.55em put the step across a paragraph break at 1.37x the step within one, so
+   a multi-paragraph agent reply arrived as one undifferentiated block — the gap
+   that separates chunks was smaller than the gap inside them. 0.9em puts it at
+   1.6x, which is the distinction the eye needs to find the start of the next
+   block after a return sweep. */
 .markdown-body p, .markdown-body ul, .markdown-body ol, .markdown-body blockquote,
-.markdown-body table, .markdown-body pre { margin: 0.55em 0; }
+.markdown-body table, .markdown-body pre { margin: 0.9em 0; }
 .markdown-body ul, .markdown-body ol { padding-left: 1.4em; }
 .markdown-body li { margin: 0.15em 0; }
 .markdown-body code { font-family: var(--mono); font-size: 0.92em;
@@ -781,14 +792,22 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 .line.user::before { content: "you"; color: var(--muted); }
 .line.assistant::before { content: attr(data-agent-label); color: var(--accent); }
 
-/* Message prose uses the same safe GFM renderer as Markdown files. Keep its
-   block rhythm compact inside a chat row, and let wide tables scroll inside the
-   message rather than widening the panel or the embedding page. */
-.message-markdown { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+/* Message prose uses the same safe GFM renderer as Markdown files, and lets wide
+   tables scroll inside the message rather than widening the panel or the
+   embedding page. The measure is capped for the same reason the file viewer caps
+   its own: an uncapped column lets the window set line length, and a maximised
+   workbench ran an agent reply to 185 characters a line.
+
+   overflow-wrap is break-word rather than anywhere so that ordinary prose breaks
+   between words; the two places a token genuinely can exceed the measure — a bare
+   URL and an inline code span — opt into anywhere individually below. */
+.message-markdown { min-width: 0; max-width: min(100%, var(--prose-measure)); white-space: normal;
+    overflow-wrap: break-word; }
 .message-markdown > :first-child { margin-top: 0; }
 .message-markdown > :last-child { margin-bottom: 0; }
 .message-markdown table { display: block; max-width: 100%; overflow-x: auto; }
-.message-markdown a { overflow-wrap: anywhere; text-underline-offset: 2px; }
+.message-markdown a, .message-markdown code { overflow-wrap: anywhere; }
+.message-markdown a { text-underline-offset: 2px; }
 .message-markdown img { max-width: 100%; height: auto; }
 
 /* System / lifecycle notes (turn finished, kept into the shared copy, pulled in
