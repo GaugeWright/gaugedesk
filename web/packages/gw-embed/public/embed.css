@@ -43,8 +43,8 @@ gw-session {
      names the face the transcript is set in. All three are the published
      customization surface, so a host that overrides only one still gets a
      coherent panel. */
-  --gw-font: "Erewhon", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
-  --gw-serif: "Erewhon", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+  --gw-font: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+  --gw-serif: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
   --gw-prose: "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif;
   --gw-mono: "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --gw-font-size-label: 10px;

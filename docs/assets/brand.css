@@ -2,44 +2,46 @@
    SSOT (hub: brand/palette.css, brand/typography.css). Navy-led, brand-blue
    accent, one text family (DR-0071). Honest capability-status badges below. */
 
-/* Erewhon — the chrome face (GaugeWright DR-0072): headings, nav, tabs, labels.
+/* GaugeWright Chrome — self-hosted, OFL. A subset of Erewhon, renamed because
+   the OFL reserves that name for unmodified builds (GaugeWright brand/typography.md).
+   The chrome face (GaugeWright DR-0072): headings, nav, tabs, labels.
    Body copy stays IBM Plex Serif below, because documentation is read at length. */
 @font-face {
-  font-family: "Erewhon";
+  font-family: "GaugeWright Chrome";
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  src: url("fonts/erewhon-latin-regular.woff2") format("woff2");
+  src: url("fonts/gaugewright-chrome-latin-regular.woff2") format("woff2");
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
     U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
     U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
-  font-family: "Erewhon";
+  font-family: "GaugeWright Chrome";
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  src: url("fonts/erewhon-latin-ext-regular.woff2") format("woff2");
+  src: url("fonts/gaugewright-chrome-latin-ext-regular.woff2") format("woff2");
   unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
     U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
     U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 @font-face {
-  font-family: "Erewhon";
+  font-family: "GaugeWright Chrome";
   font-style: italic;
   font-weight: 400;
   font-display: swap;
-  src: url("fonts/erewhon-latin-italic.woff2") format("woff2");
+  src: url("fonts/gaugewright-chrome-latin-italic.woff2") format("woff2");
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
     U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
     U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
-  font-family: "Erewhon";
+  font-family: "GaugeWright Chrome";
   font-style: italic;
   font-weight: 400;
   font-display: swap;
-  src: url("fonts/erewhon-latin-ext-italic.woff2") format("woff2");
+  src: url("fonts/gaugewright-chrome-latin-ext-italic.woff2") format("woff2");
   unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
     U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
     U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
@@ -116,7 +118,7 @@
 :root {
   --gw-navy: #0e2d50;
   --gw-blue: #1f61c4;
-  --gw-serif: "Erewhon", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+  --gw-serif: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
   --md-text-font: "IBM Plex Serif", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
   --md-code-font: "CommitMono", "Commit Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
@@ -124,7 +126,7 @@
   --md-accent-fg-color: var(--gw-blue);
   --md-typeset-a-color: var(--gw-blue);
 
-  /* Erewhon ships one weight on purpose, and the theme asks for bold in chrome
+  /* The chrome face ships one weight on purpose, and the theme asks for bold in chrome
      it owns (nav titles, table headers). Refusing weight synthesis makes the
      no-bold rule structural instead of a smeared machine-drawn bold; prose keeps
      real bold, because IBM Plex Serif ships a 700 above. */
@@ -144,7 +146,7 @@
   --md-typeset-a-color: #6aa3ff;
 }
 
-/* Erewhon carries the chrome (DR-0072): headings, and every surface a person
+/* GaugeWright Chrome carries the chrome (DR-0072): headings, and every surface a person
    operates or scans rather than reads at length — the header, the tabs, the
    navigation and table of contents, the search field and its result labels, the
    footer, the repository/source labels, and buttons. `.md-typeset` body copy and
