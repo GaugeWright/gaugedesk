@@ -1,12 +1,43 @@
-# Public CI for the gaugedesk open-source mirror. Published AS ci.yml by
-# scripts/publish-public-mirror.sh. It runs only the lanes that need nothing but
-# public source: Rust fmt/clippy/test and the web/ee typecheck+build+unit tests.
-# The private repo's ci.yml additionally runs the Quint model checks, the
-# spec-audit tracker gate, and coverage — all of which need the private specs/.
+# The lanes that need nothing but public source: Rust fmt/clippy/test and the
+# web/ee typecheck+build+unit tests. Published AS ci.yml to the open-source
+# mirror by scripts/publish-public-mirror.sh. The private repo's ci.yml
+# additionally runs the Quint model checks, the spec-audit tracker gate, and
+# coverage — all of which need the private specs/.
+#
+# `rust` and `web` run in BOTH repositories, for two different reasons, and the
+# repository decides only which runner pays.
+#
+# On `-src` they are the gate. They belong where the pull requests are. Every
+# job here was previously conditioned on `github.event.repository.private ==
+# false`, which reads like "let the free runners do it" but means "do not run
+# here at all": both lanes reported `skipped` on every pull request, so a change
+# to web/ or a Cargo.toml bump merged without being typechecked or compiled by
+# anything. The mirror ran them afterwards, on trunk, where `mirror/ci` is
+# advisory — a report nobody is blocked by. That is how an embed reconnect fix
+# (#232) landed with a unit test no gate had executed, and it is why a lane can
+# sit red for a day unnoticed: the web lane broke on 2026-08-11 and every run
+# since failed on binaryen 108, so for that whole window nothing typechecked
+# this tree in either repository.
+#
+# On the mirror they are the check on the published projection.
+# `publish-public-mirror.sh` builds a curated tree, and this is the only place
+# that compiles and tests that tree as a whole, so `mirror-verdict.yml` has
+# something real to carry back to trunk. A private pass cannot stand in for it:
+# it proves the private tree builds, not that the projection is self-contained.
+#
+# The mirror stays on GitHub-hosted runners, because Actions is free for a
+# public repository and paying Blacksmith for that work buys nothing. The
+# repository check is spelled out in each job rather than hoisted into a
+# variable, because `env` is not available to `runs-on`. This is the shape
+# whipplescript already uses, for the same reasons.
 name: ci (public mirror)
 
 on:
+  # A pull request branch would otherwise run this twice — once for `push` and
+  # once for `pull_request`, under different concurrency groups. The mirror only
+  # ever receives pushes to main from the sync.
   push:
+    branches: [main]
   pull_request:
 
 concurrency:
@@ -20,9 +51,8 @@ concurrency:
 
 jobs:
   rust:
-    if: ${{ github.event.repository.private == false }}
     name: rust (fmt · clippy · test)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'GaugeWright/gaugedesk' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v4
       # rustup materializes the toolchain named in rust-toolchain.toml.
@@ -31,6 +61,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: scripts/check.sh rust
 
+  # Mirror-only, and deliberately unlike the two lanes around it: on `-src`
+  # these same two scripts already run inside `scripts/check.sh contracts`,
+  # which gates every pull request there. The mirror has no contracts job, so
+  # without this the projection would carry no boundary check at all.
   architecture:
     if: ${{ github.event.repository.private == false }}
     name: architecture boundaries
@@ -46,9 +80,13 @@ jobs:
         run: python3 scripts/check-license-boundary.py
 
   web:
-    if: ${{ github.event.repository.private == false }}
     name: web (typecheck · vitest)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'GaugeWright/gaugedesk' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    # The wasm toolchain below installs from apt, a binaryen release, crates.io,
+    # and npm, and any of them can hang rather than fail — the browser-tunnel
+    # job in ci.yml lost a runner to a fifty-minute `apt-get install` once. This
+    # is slack, not a deadline.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: web
@@ -72,9 +110,26 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup target add wasm32-unknown-unknown
-      - name: Install clang and binaryen for the wasm32 target
+      - name: Install clang for the wasm32 target
         working-directory: .
-        run: sudo apt-get update && sudo apt-get install -y clang llvm binaryen
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+      # Binaryen comes from its own releases at a pinned version, not from the
+      # distribution, exactly as ci.yml's browser-tunnel job takes it. apt ships
+      # 108 on both runners, and `build-wasm.sh` refuses anything below 120
+      # because `wasm-opt -Oz` there emits a module whose function table cannot
+      # grow — which wasm-bindgen's glue needs, so it dies at instantiation with
+      # `failed to grow table by 4`. Taking apt's is what broke this lane on
+      # 2026-08-11 and kept it red every run after.
+      - name: Install binaryen
+        working-directory: .
+        env:
+          BINARYEN_VERSION: version_131
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/binaryen.tar.gz \
+            "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          sudo tar -xzf /tmp/binaryen.tar.gz -C /usr/local --strip-components=1
+          wasm-opt --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install the matching wasm-bindgen CLI
         working-directory: .
