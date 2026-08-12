@@ -67,17 +67,34 @@ pub fn publish(http: &HttpClient, base: &str, put: &SignedDirectoryPut) -> Resul
 /// Fetch the readable record + opaque sealed blob for `root` (`GET {base}/directory/:root`).
 /// `Ok(None)` when the directory has nothing for `root` (404). The blob stays sealed — the caller
 /// opens it with [`crate::account::open_account_blob`] under the account key.
+///
+/// **Two shapes, deliberately.** The directory served a bare [`DirectoryEntry`]
+/// for this route and is moving to the whole [`SignedDirectoryPut`], because a
+/// reader that cannot see the signature cannot verify anything — which is
+/// exactly why a browser silently degraded to endpoint-only reachability
+/// (ADR 0131 §3). This machine authenticates by the sealed blob opening under
+/// its own account key rather than by that signature, so either shape serves it;
+/// accepting both is what lets the service move without stranding a desktop
+/// built before the change.
+///
+/// The two are unambiguous: a put has no `directory`/`sealed_blob` at the top
+/// level and an entry has no `entry`/`signature`, so neither parses as the
+/// other.
 pub fn fetch(http: &HttpClient, base: &str, root: &str) -> Result<Option<DirectoryEntry>, String> {
     let url = format!("{}/directory/{}", base.trim_end_matches('/'), root);
     match http.get_string(&url) {
-        Ok(body) => {
-            let entry = serde_json::from_str(&body).map_err(|e| format!("parse entry: {e}"))?;
-            Ok(Some(entry))
-        }
+        Ok(body) => Ok(Some(parse_fetched_entry(&body)?)),
         // get_string errors on non-2xx; a 404 (no record yet) is not a failure.
         Err(e) if e.contains("HTTP 404") => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+fn parse_fetched_entry(body: &str) -> Result<DirectoryEntry, String> {
+    if let Ok(put) = serde_json::from_str::<SignedDirectoryPut>(body) {
+        return Ok(put.entry);
+    }
+    serde_json::from_str(body).map_err(|e| format!("parse entry: {e}"))
 }
 
 impl crate::Workbench {
@@ -251,6 +268,27 @@ mod tests {
             signed_put(&k, AKEY, &seeded_account(), 0, vec![], vec![]).is_none(),
             "generation zero is reserved for reading legacy entries"
         );
+    }
+
+    /// The read shape is moving from a bare entry to the whole signed put,
+    /// because a reader that cannot see the signature cannot verify anything.
+    /// This machine must keep working across that change in either direction —
+    /// a desktop older than the service, and a service older than the desktop.
+    #[test]
+    fn a_fetched_record_parses_whether_or_not_it_carries_its_signature() {
+        let put = signed_put(&key(), AKEY, &seeded_account(), 1, vec![], vec![]).expect("seals");
+
+        let whole = serde_json::to_string(&put).expect("serializes");
+        let from_put = parse_fetched_entry(&whole).expect("a signed put is readable");
+        assert_eq!(from_put, put.entry);
+
+        let bare = serde_json::to_string(&put.entry).expect("serializes");
+        let from_entry = parse_fetched_entry(&bare).expect("a bare entry is readable");
+        assert_eq!(from_entry, put.entry);
+
+        // Neither shape is mistaken for the other, and neither is mistaken for
+        // something that is simply not a directory read.
+        assert!(parse_fetched_entry("{\"nope\":1}").is_err());
     }
 
     #[test]
