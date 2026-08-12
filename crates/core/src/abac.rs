@@ -155,6 +155,55 @@ impl Tenant {
 )]
 pub struct Clearance(pub u8);
 
+impl Clearance {
+    /// The clearance a directory role implies on its own.
+    ///
+    /// An IdP that asserts no clearance claim leaves [`Clearance::default()`],
+    /// which clears only `classification:public`. Since an unlabeled resource
+    /// is [`Classification::Regulated`] — fail-closed, the most protected —
+    /// default-actor against default-resource could never read, so an agent
+    /// turn over an ordinary project was refused for a reason no operator had
+    /// chosen. A role is the authorization fact the directory *does* carry, so
+    /// it supplies the floor.
+    ///
+    /// The mapping follows what each role already means elsewhere: `owner` is
+    /// documented as "may do everything" and `admin` administers the same
+    /// directory, so both reach `Regulated`; a `member` works with the org's
+    /// material but is not its administrator, so it stops below `Regulated`;
+    /// `viewer` is read-only; and `billing` "is never run/access authority"
+    /// (`INV-18`), so it implies nothing. An unrecognized role implies nothing
+    /// — a role invented later must be granted deliberately, not inherit the
+    /// most permissive branch by falling through.
+    pub fn implied_by(role: &Role) -> Self {
+        match role.as_str() {
+            "owner" | "admin" => Self(3),
+            "member" => Self(2),
+            "viewer" => Self(1),
+            _ => Self(0),
+        }
+    }
+}
+
+impl AuthorityAttributes {
+    /// The clearance to evaluate this authority at: the highest of what the IdP
+    /// asserted and what any of its roles implies.
+    ///
+    /// A **floor**, deliberately, not a replacement. An IdP that asserts a
+    /// higher clearance than the role implies keeps it, so an organization can
+    /// grant above the default; the role can only raise an authority that
+    /// arrived with nothing. The alternative — letting the claim replace the
+    /// role — would mean an IdP silently omitting the claim downgrades every
+    /// authority to `public`, which is the failure this exists to end.
+    pub fn effective_clearance(&self) -> Clearance {
+        self.roles
+            .iter()
+            .map(Clearance::implied_by)
+            .chain(std::iter::once(self.clearance))
+            .max()
+            .unwrap_or_default()
+    }
+}
+
 /// Attributes carried on a **resource** record (`data.md` extension): beyond
 /// stakeholders/provenance, a resource has a classification, a residency region,
 /// and purpose tags.
@@ -342,6 +391,75 @@ mod tests {
 
     fn roles(names: &[&str]) -> BTreeSet<Role> {
         names.iter().map(|s| Role::new(*s)).collect()
+    }
+
+    fn attributes(claimed: u8, role_names: &[&str]) -> AuthorityAttributes {
+        AuthorityAttributes {
+            clearance: Clearance(claimed),
+            roles: roles(role_names),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn each_role_implies_its_own_clearance() {
+        assert_eq!(Clearance::implied_by(&Role::owner()), Clearance(3));
+        assert_eq!(Clearance::implied_by(&Role::admin()), Clearance(3));
+        assert_eq!(Clearance::implied_by(&Role::member()), Clearance(2));
+        assert_eq!(Clearance::implied_by(&Role::viewer()), Clearance(1));
+        // Billing is never run/access authority (INV-18), so it implies nothing.
+        assert_eq!(Clearance::implied_by(&Role::billing()), Clearance(0));
+        // A role invented later must be granted deliberately rather than
+        // inherit the most permissive branch by falling through.
+        assert_eq!(Clearance::implied_by(&Role::new("auditor")), Clearance(0));
+    }
+
+    /// The case the production wiring canary hit: an OIDC actor carrying no
+    /// clearance claim, acting on an unlabeled — therefore `Regulated` —
+    /// project it owns. Before the role floor this cleared only `public`, so
+    /// the agent turn was refused for a reason no operator had chosen.
+    #[test]
+    fn an_owner_with_no_clearance_claim_reaches_regulated() {
+        assert_eq!(
+            attributes(0, &["owner"]).effective_clearance(),
+            Clearance(3)
+        );
+    }
+
+    #[test]
+    fn the_role_is_a_floor_the_claim_can_raise_but_not_lower() {
+        // A claim above the floor stands: an org may grant beyond the role.
+        assert_eq!(
+            attributes(3, &["viewer"]).effective_clearance(),
+            Clearance(3)
+        );
+        // A claim below the floor does not pull the role down — otherwise an
+        // IdP that simply omits the claim silently downgrades everyone.
+        assert_eq!(
+            attributes(0, &["member"]).effective_clearance(),
+            Clearance(2)
+        );
+        // The highest role wins when an authority holds several.
+        assert_eq!(
+            attributes(0, &["billing", "owner"]).effective_clearance(),
+            Clearance(3),
+        );
+    }
+
+    #[test]
+    fn no_role_and_no_claim_still_clears_nothing() {
+        // The fail-closed default is unchanged: this only lifts authorities the
+        // directory has actually placed in a role.
+        assert_eq!(attributes(0, &[]).effective_clearance(), Clearance(0));
+        assert_eq!(
+            AuthorityAttributes::default().effective_clearance(),
+            Clearance(0),
+        );
+        // An unrecognized role is not a grant.
+        assert_eq!(
+            attributes(0, &["auditor"]).effective_clearance(),
+            Clearance(0)
+        );
     }
 
     /// A decision builder for the readable unit tests.

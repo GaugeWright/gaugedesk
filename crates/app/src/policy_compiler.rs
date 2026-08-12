@@ -327,12 +327,18 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
     }
     let mut clearances = BTreeSet::new();
     clearances.insert("classification:public".to_owned());
+    // The role floor, not the raw claim: an IdP that asserts no clearance leaves
+    // `Clearance::default()`, which clears only `public`, while an unlabeled
+    // resource is fail-closed `Regulated` — so the default actor could not read
+    // the default resource and an agent turn over an ordinary project was
+    // refused for a reason nobody chose. See `Clearance::implied_by`.
+    let clearance = input.actor_attributes.effective_clearance();
     for (level, name) in [
         (1, "classification:internal"),
         (2, "classification:pii"),
         (3, "classification:regulated"),
     ] {
-        if input.actor_attributes.clearance.0 >= level {
+        if clearance.0 >= level {
             clearances.insert(name.to_owned());
         }
     }
@@ -444,6 +450,52 @@ mod tests {
             resources: Vec::new(),
             advancement_scopes: Vec::new(),
         }
+    }
+
+    /// The envelope an OIDC actor gets when the IdP asserts no clearance.
+    ///
+    /// This is the production case: the wiring canary's owner authenticated
+    /// through OIDC, whose claims carry no clearance, so the compiled epoch
+    /// cleared only `classification:public` while the project it owned was
+    /// unlabeled — therefore fail-closed `Regulated` — and the agent turn was
+    /// denied `denied read in rule \`converse\``. The role is the authorization
+    /// fact the directory carries, so it supplies the floor.
+    #[test]
+    fn an_owner_clears_regulated_without_a_clearance_claim() {
+        let mut owner = input();
+        owner.actor_attributes = AuthorityAttributes {
+            clearance: gaugedesk_core::abac::Clearance(0),
+            roles: BTreeSet::from([gaugedesk_core::abac::Role::owner()]),
+            ..AuthorityAttributes::default()
+        };
+        let epoch = compile_policy(&owner)
+            .expect("policy")
+            .to_json()
+            .expect("json");
+        for level in ["public", "internal", "pii", "regulated"] {
+            assert!(
+                epoch.contains(&format!("classification:{level}")),
+                "an owner must clear {level}: {epoch}",
+            );
+        }
+
+        // A billing-only authority is never run/access authority (INV-18), so
+        // the floor lifts it no further than the fail-closed default.
+        let mut billing = input();
+        billing.actor_attributes = AuthorityAttributes {
+            clearance: gaugedesk_core::abac::Clearance(0),
+            roles: BTreeSet::from([gaugedesk_core::abac::Role::billing()]),
+            ..AuthorityAttributes::default()
+        };
+        let epoch = compile_policy(&billing)
+            .expect("policy")
+            .to_json()
+            .expect("json");
+        assert!(epoch.contains("classification:public"), "{epoch}");
+        assert!(
+            !epoch.contains("classification:regulated"),
+            "billing must not reach regulated: {epoch}",
+        );
     }
 
     #[test]
