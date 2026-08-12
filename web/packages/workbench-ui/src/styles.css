@@ -1,14 +1,64 @@
-/* IBM Plex Serif — self-hosted, OFL. One text family carries every role a person
-   reads or operates (GaugeWright DR-0071); Commit Mono still carries data. Bundled
-   WOFF2 so the desktop app needs no Google Fonts CDN — it works offline and
-   respects Tauri's CSP.
+/* Erewhon — self-hosted, OFL. The chrome face (GaugeWright DR-0072): display,
+   interface and short text — headings, buttons, tabs, labels, the wordmark,
+   captions, inputs, metadata. Michael Sharpe's extension of the Utopia Adobe
+   donated to the TeX Users Group; Utopia itself is Type 1 only and cannot be a
+   webfont.
 
-   Three faces, and each earns its place. 400 is the whole interface. The italic is
-   drawn rather than sheared: the previous system loaded no italic at all, so every
-   emphasis an agent wrote came out as a browser-synthesized oblique, and that is
-   the defect this decision was made to fix. 700 exists only for semantic strong in
-   prose, where a bold lead-in is the strongest landmark a long reply has — chrome
-   never uses it. */
+   Regular and italic, and deliberately no bold. The operated roles are
+   forbidden weight, and not shipping the face makes that structural rather than
+   a rule to remember. Subset to kern, liga and tnum — the full feature set costs
+   a quarter more for capabilities nothing here invokes. tnum matters: it is what
+   makes the font-variant-numeric declarations below actually do something. */
+@font-face {
+    font-family: "Erewhon";
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url("./assets/fonts/erewhon-latin-regular.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+        U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+        U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: "Erewhon";
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url("./assets/fonts/erewhon-latin-ext-regular.woff2") format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+        U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+        U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+    font-family: "Erewhon";
+    font-style: italic;
+    font-weight: 400;
+    font-display: swap;
+    src: url("./assets/fonts/erewhon-latin-italic.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+        U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+        U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: "Erewhon";
+    font-style: italic;
+    font-weight: 400;
+    font-display: swap;
+    src: url("./assets/fonts/erewhon-latin-ext-italic.woff2") format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+        U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+        U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* IBM Plex Serif — self-hosted, OFL. The prose face (GaugeWright DR-0072): the
+   chat transcript in full and long-form body copy, and nothing else. A caption or
+   a form label is read but is not prose, and stays in the chrome face above.
+
+   The italic is drawn rather than sheared: before DR-0071 nothing loaded an
+   italic at all, so every emphasis an agent wrote came out as a browser-
+   synthesized oblique. 700 is for semantic strong in prose, where a bold lead-in
+   is the strongest landmark a long reply has. Bundled WOFF2, so the desktop app
+   needs no CDN and respects Tauri's CSP. */
 @font-face {
     font-family: "IBM Plex Serif";
     font-style: normal;
@@ -100,14 +150,14 @@
     --accent-contrast: #08111e;
     --warn: #e0b24e;
     --bad: #e0655c;
-    /* One text family for chrome and chat alike (GaugeWright DR-0071); code
-       surfaces (file view, editor, diff) stay monospace via --mono so alignment
-       holds. --serif and --ui both resolve to it: the split they were named for
-       is retired, and they stay as aliases only so no component style has to
-       change in the same commit that changes the face. */
-    --font-text: "IBM Plex Serif", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
-    --serif: var(--font-text);
-    --ui: var(--font-text);
+    /* Two faces (GaugeWright DR-0072), split on whether a person operates a
+       string or reads it at length. --serif and --ui alias the chrome face
+       because chrome is most of this app; only the transcript and rendered
+       Markdown take --prose. Code surfaces stay monospace via --mono. */
+    --font-chrome: "Erewhon", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+    --font-prose: "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif;
+    --serif: var(--font-chrome);
+    --ui: var(--font-chrome);
     --mono: "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     /* The type scale. Five steps; every font-size in the workbench should resolve
        to one of these (or an em relative to one). px sizes outside the scale are
@@ -123,6 +173,12 @@
        roughly 1.2x the average lowercase character, so this caps a line at about
        104 characters rather than the 85 the value reads as. */
     --prose-measure: 85ch;
+    /* The chrome face ships one weight on purpose. Anything still asking for
+       bold chrome — an unreset <strong>, a control this stylesheet does not
+       own — would otherwise be drawn as a smeared synthetic bold, so refuse the
+       synthesis and make the no-bold rule structural. Prose is unaffected: IBM
+       Plex Serif carries a real 700, and Commit Mono is variable to 700. */
+    font-synthesis-weight: none;
     font-family: var(--ui);
     font-size: var(--fs-body);
     color-scheme: dark;
@@ -276,7 +332,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .hub-new-organization input { width: 100%; padding: 8px 9px; border: 1px solid var(--edge); border-radius: 5px;
     background: var(--bg); color: var(--ink); font: 12px var(--ui); }
 .hub-new-organization button { justify-self: start; padding: 7px 9px; border: 1px solid var(--edge); border-radius: 5px;
-    background: var(--accent-strong); color: #fff; font: 700 10px var(--ui); cursor: pointer; }
+    background: var(--accent-strong); color: #fff; font: 400 10px var(--ui); cursor: pointer; }
 .hub-new-organization button:disabled { cursor: wait; opacity: .55; }
 .hub-new-organization p { margin: 0; color: var(--bad); font-size: var(--fs-label); }
 .hub-sidebar-state { margin: 12px 0; color: var(--muted); font-size: var(--fs-small); }
@@ -302,7 +358,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .hub-heading p:last-child { max-width: 650px; margin: 17px 0 0; color: var(--muted); font-size: 14px; line-height: 1.65; }
 .hub-open-gaugedesk { flex: 0 0 auto; min-height: 40px; padding: 10px 15px;
     border: 1px solid color-mix(in srgb, var(--accent) 72%, var(--edge)); border-radius: 7px;
-    background: var(--accent-strong); color: #fff; font: 700 11px var(--ui); cursor: pointer; }
+    background: var(--accent-strong); color: #fff; font: 400 11px var(--ui); cursor: pointer; }
 .hub-open-gaugedesk:hover { background: color-mix(in srgb, var(--accent-strong) 85%, white); }
 .hub-open-gaugedesk:disabled { cursor: wait; opacity: .58; }
 .hub-inline-error { margin: 18px 0 0; padding: 11px 13px; border-left: 2px solid var(--warn);
@@ -634,7 +690,7 @@ code, pre, textarea {
 /* Rendered markdown (the View tab for .md files). Overrides the .filebody
    plain-text posture: proportional type, document spacing; code spans/blocks
    drop back to the mono treatment. */
-.filebody.markdown-body { white-space: normal; font-family: inherit; font-size: var(--fs-body);
+.filebody.markdown-body { white-space: normal; font-family: var(--font-prose); font-size: var(--fs-body);
     line-height: 1.55; max-width: 72ch; }
 .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {
     margin: 0.9em 0 0.4em; line-height: 1.25; }
@@ -812,10 +868,17 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 /* A message turn: the author on its own small uppercased label line above the
    text, a role-coloured rail, and a gap above so consecutive turns separate. */
 .line.user, .line.assistant { color: var(--ink); margin-top: 9px;
-    padding: 4px 0 4px 10px; border-left: 2px solid var(--edge); }
+    padding: 4px 0 4px 10px; border-left: 2px solid var(--edge);
+    font-family: var(--font-prose); }
 .line.user { border-left-color: var(--muted); }
 .line.assistant { border-left-color: var(--accent); }
+/* A streaming reply arrives as an operational `text` line and is rendered as
+   Markdown by the same path an admitted turn takes, so it takes the prose face
+   too. Without this the live reply reads in the chrome face and switches faces
+   under the reader the moment the admitted `assistant` event replaces it. */
+.line.text { font-family: var(--font-prose); }
 .line.user::before, .line.assistant::before { display: block; margin-bottom: 2px;
+    font-family: var(--font-chrome);
     font-size: var(--fs-label); font-weight: 400; text-transform: uppercase; letter-spacing: 0.07em; }
 .line.user::before { content: "you"; color: var(--muted); }
 .line.assistant::before { content: attr(data-agent-label); color: var(--accent); }
@@ -1496,7 +1559,8 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .fork-note { margin: 4px 0 8px; padding: 7px 10px; font-size: var(--fs-ui); color: var(--muted);
     background: rgba(255, 255, 255, 0.03); border: 1px solid var(--edge); border-radius: 6px;
     line-height: 1.4; }
-.fork-note strong { color: var(--text); font-weight: 700; }
+/* No bold chrome face is shipped (DR-0072); colour carries this instead. */
+.fork-note strong { color: var(--ink); font-weight: 400; }
 .inline-edit { font: inherit; font-size: var(--fs-ui); padding: 1px 4px; background: var(--bg);
     color: var(--ink); border: 1px solid var(--accent); border-radius: 3px; }
 /* Placement lineage + pinned method version (ADR 0035 C1 pivot). */
@@ -1982,7 +2046,7 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
     background: var(--surface-2, var(--panel)); }
 .environment-metric span, .environment-field span { color: var(--muted); font-size: var(--fs-label);
     text-transform: uppercase; letter-spacing: .07em; }
-.environment-metric strong { color: var(--ink); font-size: 20px; font-weight: 700; }
+.environment-metric strong { color: var(--ink); font-size: 20px; font-weight: 400; }
 .environment-field code { color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
 .environment-notice { padding: 10px 12px; border: 1px solid var(--edge);
     border-radius: 8px; color: var(--muted); font-size: var(--fs-ui); line-height: 1.45; }

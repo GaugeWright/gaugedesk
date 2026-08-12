@@ -65,8 +65,10 @@ const embedThemeCss = (defaultMinHeight: string) => `
   --accent-contrast: var(--gw-accent-contrast, #08111e);
   --warn: var(--gw-warn, #e0a35a);
   --bad: var(--gw-bad, #e06a6a);
-  --ui: var(--gw-font, "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif);
-  --serif: var(--gw-serif, "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif);
+  --font-chrome: var(--gw-font, "Erewhon", "Palatino Linotype", Palatino, Georgia, ui-serif, serif);
+  --font-prose: var(--gw-prose, "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif);
+  --ui: var(--font-chrome);
+  --serif: var(--gw-serif, "Erewhon", "Palatino Linotype", Palatino, Georgia, ui-serif, serif);
   --mono: var(--gw-mono, "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   --fs-label: var(--gw-font-size-label, 10px);
   --fs-small: var(--gw-font-size-small, 11px);

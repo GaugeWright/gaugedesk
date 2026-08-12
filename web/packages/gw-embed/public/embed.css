@@ -38,11 +38,14 @@ gw-session {
   --gw-panel-shadow: 0 14px 36px rgb(0 0 0 / 22%);
 
   /* Typography */
-  /* One text family (GaugeWright DR-0071). --gw-font and --gw-serif are the
-     published customization surface, so both remain and both default to it; a
-     host that set only one still gets a coherent panel. */
-  --gw-font: "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif;
-  --gw-serif: "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif;
+  /* Two faces (GaugeWright DR-0072), split on operate-vs-read. --gw-font and
+     --gw-serif both name the chrome face, which is most of a panel; --gw-prose
+     names the face the transcript is set in. All three are the published
+     customization surface, so a host that overrides only one still gets a
+     coherent panel. */
+  --gw-font: "Erewhon", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+  --gw-serif: "Erewhon", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+  --gw-prose: "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif;
   --gw-mono: "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --gw-font-size-label: 10px;
   --gw-font-size-small: 11px;

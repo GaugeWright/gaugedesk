@@ -47,6 +47,7 @@ run_contracts() {
         scripts/wiring-canary/runners.test.mjs \
         scripts/wiring-canary/totp.test.mjs \
         scripts/wiring-canary/capture-provider-state.test.mjs \
+        scripts/wiring-canary/diagnostic.test.mjs \
         scripts/wiring-canary/hosted-account-session.test.mjs \
         scripts/wiring-canary/poll.test.mjs \
         web/e2e/production-account-session-canary.test.mjs \
