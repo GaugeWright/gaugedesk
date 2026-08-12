@@ -6,6 +6,14 @@ import type { JSX } from "solid-js";
  * button's text colour (incl. hover/active). Each icon is decorative — the
  * button it sits in carries the real label via `aria-label`/`title` — so the
  * <svg> is `aria-hidden` and not focusable. Size comes from CSS (`.icon`).
+ *
+ * Most glyphs are Lucide (https://lucide.dev) path data, inlined rather than
+ * imported: the desktop app and the embedded panels run under a strict CSP with
+ * no CDN and no runtime icon lookup, and a whole icon package would ship for the
+ * two dozen marks actually used. Lucide is ISC-licensed — see LICENSES.md.
+ * Hand-drawn marks (add-files, add-folder, robot, sources, …) predate the
+ * switch and are kept on the same 24px / 2px-stroke grid so the set reads as
+ * one hand.
  */
 export type IconName =
     | "add-files"
@@ -15,7 +23,16 @@ export type IconName =
     | "history"
     | "pull-latest"
     | "send"
+    | "fork"
+    | "steer"
     | "queue"
+    | "stash"
+    | "stop"
+    | "edit"
+    | "remove"
+    | "grip"
+    | "chevron"
+    | "more"
     | "filter"
     | "git-branch"
     | "robot"
@@ -48,7 +65,7 @@ const PATHS: Record<IconName, () => JSX.Element> = {
     // A paperclip — attach file(s) to the message being composed (their text is
     // inlined into the turn; message-scoped, not workspace context).
     paperclip: () => (
-        <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+        <path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551" />
     ),
     // Stacked layers — the context/sources the chat is working with.
     sources: () => (
@@ -75,26 +92,120 @@ const PATHS: Record<IconName, () => JSX.Element> = {
             <path d="M21 3v6h-6" />
         </>
     ),
-    // A paper plane — dispatch the composed message now.
+
+    /* --- the composer's delivery grammar -----------------------------------
+       Three families, each with one job, so nothing has to be decoded:
+
+       - ONE primary glyph, `send` (an up arrow). It never changes, because what
+         changes is *when* the message runs, and saying that is the mode's job.
+       - ONE halting glyph, `stop` (a filled square), used nowhere else.
+       - THREE mode glyphs naming when the next message runs: now, after this
+         turn, or not until you say.
+
+       The old rail mixed a paper plane, a play triangle and an outlined square,
+       which read as three unrelated metaphors for one decision. */
+
+    // An up arrow — dispatch the composed message. The single primary action.
     send: () => (
         <>
-            <path d="m22 2-7 20-4-9-9-4Z" />
-            <path d="M22 2 11 13" />
+            <path d="m5 12 7-7 7 7" />
+            <path d="M12 19V5" />
+        </>
+    ),
+    // A double chevron — steer mode: push straight through, now, interrupting the
+    // running turn. (Lucide's bolt is drawn as a filled silhouette; rendered as a
+    // 2px outline at rail size it collapses into an unreadable polygon. Every
+    // glyph in this set has to survive as pure stroke.)
+    steer: () => (
+        <>
+            <path d="m6 17 5-5-5-5" />
+            <path d="m13 17 5-5-5-5" />
+        </>
+    ),
+    // A branching fork — send this message down a new line of the conversation,
+    // leaving the current one where it is.
+    fork: () => (
+        <>
+            <circle cx="12" cy="18" r="3" />
+            <circle cx="6" cy="6" r="3" />
+            <circle cx="18" cy="6" r="3" />
+            <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9" />
+            <path d="M12 12v3" />
+        </>
+    ),
+    // A list with a plus — queue mode: the message joins the line and runs on
+    // its own once the current turn finishes.
+    queue: () => (
+        <>
+            <path d="M16 5H3" />
+            <path d="M11 12H3" />
+            <path d="M16 19H3" />
+            <path d="M18 9v6" />
+            <path d="M21 12h-6" />
+        </>
+    ),
+    // A lidded box — stash mode: the message joins the line and stays there.
+    // Nothing runs until it is released by hand.
+    stash: () => (
+        <>
+            <rect width="20" height="5" x="2" y="3" rx="1" />
+            <path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8" />
+            <path d="M10 12h4" />
+        </>
+    ),
+    // A filled square — halt the running turn. Filled, and the only member of
+    // its family: a 2px-stroked square at 15px reads as an empty box, and the
+    // one irreversible control in the rail should not be ambiguous.
+    stop: () => (
+        <rect width="15" height="15" x="4.5" y="4.5" rx="2.5" fill="currentColor" stroke="none" />
+    ),
+
+    /* --- queued-item row controls ------------------------------------------ */
+
+    // A pencil on a card — edit this queued message's text before it runs.
+    edit: () => (
+        <>
+            <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+            <path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z" />
+        </>
+    ),
+    // A cross — drop this queued message.
+    remove: () => (
+        <>
+            <path d="M18 6 6 18" />
+            <path d="m6 6 12 12" />
+        </>
+    ),
+    // Two dotted columns — the drag handle that reorders the queue.
+    grip: () => (
+        <>
+            <circle cx="9" cy="12" r="1" fill="currentColor" />
+            <circle cx="9" cy="5" r="1" fill="currentColor" />
+            <circle cx="9" cy="19" r="1" fill="currentColor" />
+            <circle cx="15" cy="12" r="1" fill="currentColor" />
+            <circle cx="15" cy="5" r="1" fill="currentColor" />
+            <circle cx="15" cy="19" r="1" fill="currentColor" />
+        </>
+    ),
+
+    /* --- menus -------------------------------------------------------------- */
+
+    // A small downward chevron — this text is a menu, not a label.
+    chevron: () => (
+        <path d="m6 9 6 6 6-6" />
+    ),
+    // A horizontal ellipsis — the one expander a narrow rail collapses its
+    // non-essential controls behind, so delivery never gets crushed.
+    more: () => (
+        <>
+            <circle cx="5" cy="12" r="1" fill="currentColor" />
+            <circle cx="12" cy="12" r="1" fill="currentColor" />
+            <circle cx="19" cy="12" r="1" fill="currentColor" />
         </>
     ),
     // A funnel — filter which event types the chat log shows.
     filter: () => (
         <path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3Z" />
-    ),
-    // A list with a plus — add the message to the run queue.
-    queue: () => (
-        <>
-            <path d="M11 12H3" />
-            <path d="M16 6H3" />
-            <path d="M16 18H3" />
-            <path d="M18 9v6" />
-            <path d="M21 12h-6" />
-        </>
     ),
     // A branching commit graph — a workstream is a shared line of work branching
     // from, and eventually promoting back into, its project mainline.

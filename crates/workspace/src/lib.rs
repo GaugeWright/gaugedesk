@@ -2104,3 +2104,206 @@ mod tests {
         assert!(worktrees.join("chat/.git").exists());
     }
 }
+
+#[cfg(test)]
+mod workspace_store_contention {
+    use whipplescript_store::vcs::NativeWorkspaceVcs;
+
+    /// The workspace store is opened afresh on **every** operation
+    /// ([`Workspace::store`]), so a single turn is many short-lived connections
+    /// rather than one long-lived handle. Each open re-runs
+    /// `PRAGMA journal_mode = WAL` *before* `PRAGMA busy_timeout`, which means
+    /// the prelude runs with a timeout of zero.
+    ///
+    /// That ordering looks like the cause of the `SQLITE_BUSY` seen on a task
+    /// that follows a stop (`CMP-17`), and it is not: `journal_mode` on a
+    /// database already in WAL is a read, and neither plain concurrency nor a
+    /// held write lock makes an open fail. This test exists to keep that answer
+    /// from having to be re-derived, and to catch the day the prelude does start
+    /// needing a lock.
+    /// Why `busy_timeout` does not save the write above, shown on raw SQLite.
+    ///
+    /// A **deferred** transaction takes SHARED on its first read and then tries
+    /// to upgrade on its first write. If another connection already holds the
+    /// write lock, SQLite returns `SQLITE_BUSY` *immediately* and deliberately
+    /// does not invoke the busy handler — waiting while holding SHARED is how
+    /// two connections deadlock. An **immediate** transaction takes the write
+    /// lock up front, with no SHARED to deadlock against, so the handler applies
+    /// and it waits.
+    ///
+    /// `whipplescript-store`'s `branches.rs` uses `connection.transaction()`,
+    /// which is rusqlite's deferred default. GaugeDesk's own store uses
+    /// `TransactionBehavior::Immediate` at every one of its transaction sites.
+    #[test]
+    fn deferred_upgrades_fail_instantly_where_immediate_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.sqlite");
+        let setup = rusqlite::Connection::open(&path).unwrap();
+        setup
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE rows (id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO rows (id, v) VALUES (1, 'seed');",
+            )
+            .unwrap();
+
+        let attempt = |behaviour: rusqlite::TransactionBehavior| {
+            let holder = rusqlite::Connection::open(&path).unwrap();
+            holder
+                .execute_batch("BEGIN IMMEDIATE; INSERT INTO rows (v) VALUES ('held');")
+                .unwrap();
+
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            // The same 5 s the dependency asks for.
+            writer
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let started = std::time::Instant::now();
+            let begin = match behaviour {
+                rusqlite::TransactionBehavior::Immediate => "BEGIN IMMEDIATE",
+                _ => "BEGIN DEFERRED",
+            };
+            let outcome = (|| -> rusqlite::Result<()> {
+                writer.execute_batch(begin)?;
+                // A read first, which is what makes a deferred transaction take
+                // SHARED and then have to upgrade.
+                let _: i64 = writer.query_row("SELECT count(*) FROM rows", [], |row| row.get(0))?;
+                writer.execute("INSERT INTO rows (v) VALUES ('writer')", [])?;
+                writer.execute_batch("COMMIT")
+            })();
+            let _ = writer.execute_batch("ROLLBACK");
+            let waited = started.elapsed().as_millis();
+            holder.execute_batch("ROLLBACK").unwrap();
+            (outcome.is_err(), waited)
+        };
+
+        let (deferred_failed, deferred_ms) = attempt(rusqlite::TransactionBehavior::Deferred);
+        assert!(
+            deferred_failed && deferred_ms < 500,
+            "expected a deferred upgrade to be refused at once; failed={deferred_failed} after {deferred_ms}ms",
+        );
+
+        let (immediate_failed, immediate_ms) = attempt(rusqlite::TransactionBehavior::Immediate);
+        assert!(
+            immediate_failed && immediate_ms >= 4_000,
+            "expected an immediate transaction to wait out busy_timeout; failed={immediate_failed} after {immediate_ms}ms",
+        );
+    }
+
+    /// The decisive CMP-17 experiment: does `busy_timeout` apply to a **write**
+    /// through this API, as opposed to an open?
+    ///
+    /// A second connection holds the write lock for 1.5 s. If the handler is in
+    /// force, the write waits and then succeeds. If it is not, the write fails
+    /// immediately — which is what the reproduction shows in the engine, where
+    /// six concurrent commits into one target fail about 20 ms after they begin
+    /// rather than after the 5 s the pragma asks for.
+    /// Fixed upstream in whipplescript-src#91, which opens every write
+    /// transaction in `branches.rs` and `workstreams.rs` `Immediate`. This
+    /// repository pins `whipplescript-store` 0.4.1 from crates.io by checksum,
+    /// so the fix does not arrive here until that crate is published; the
+    /// blocker is a release, not a code change. Un-ignore when the pin moves.
+    #[test]
+    #[ignore = "CMP-17: fixed in whipplescript-src#91, awaiting a published \
+                whipplescript-store release; run with `--ignored` after the pin moves"]
+    fn a_write_waits_for_a_held_lock_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let branches = dir.path().join("branches.sqlite");
+        let content = dir.path().join("content.sqlite");
+        let mut vcs = NativeWorkspaceVcs::open(branches.clone(), content.clone()).unwrap();
+        vcs.init(&crate::now_at()).unwrap();
+
+        let holding = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = {
+            let (branches, holding, released) = (
+                branches.clone(),
+                std::sync::Arc::clone(&holding),
+                std::sync::Arc::clone(&released),
+            );
+            std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(&branches).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                holding.wait();
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                released.store(true, std::sync::atomic::Ordering::SeqCst);
+                conn.execute_batch("COMMIT").unwrap();
+            })
+        };
+
+        holding.wait();
+        let started = std::time::Instant::now();
+        let mut changed = std::collections::BTreeMap::new();
+        changed.insert("probe.txt".to_string(), "hash-probe".to_string());
+        let outcome = vcs.import_diff(
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            &changed,
+            &[],
+            "cut-probe",
+            &crate::now_at(),
+        );
+        let waited = started.elapsed();
+        let saw_release = released.load(std::sync::atomic::Ordering::SeqCst);
+        holder.join().unwrap();
+
+        assert!(
+            outcome.is_ok(),
+            "the write failed after {}ms (lock released first: {saw_release}) — busy_timeout is \
+             not in force for this statement: {:?}",
+            waited.as_millis(),
+            outcome.err(),
+        );
+    }
+
+    #[test]
+    fn opening_the_store_survives_concurrency_and_a_held_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let branches = dir.path().join("branches.sqlite");
+        let content = dir.path().join("content.sqlite");
+        drop(NativeWorkspaceVcs::open(branches.clone(), content.clone()).unwrap());
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut failures: Vec<String> = Vec::new();
+        std::thread::scope(|scope| {
+            // Behaves like a turn committing: take the write lock, hold it
+            // briefly, release, repeat.
+            let writer = scope.spawn(|| {
+                let conn = rusqlite::Connection::open(&branches).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if conn.execute_batch("BEGIN IMMEDIATE").is_ok() {
+                        std::thread::sleep(std::time::Duration::from_millis(15));
+                        let _ = conn.execute_batch("COMMIT");
+                    }
+                }
+            });
+
+            let handles: Vec<_> = (0..6)
+                .map(|_| {
+                    let (b, c) = (branches.clone(), content.clone());
+                    scope.spawn(move || {
+                        let mut seen = Vec::new();
+                        for _ in 0..60 {
+                            if let Err(error) = NativeWorkspaceVcs::open(b.clone(), c.clone()) {
+                                seen.push(format!("{error:?}"));
+                            }
+                        }
+                        seen
+                    })
+                })
+                .collect();
+            for handle in handles {
+                failures.extend(handle.join().unwrap());
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            writer.join().unwrap();
+        });
+        assert!(
+            failures.is_empty(),
+            "{} of 360 opens failed under a concurrent writer; first: {}",
+            failures.len(),
+            failures.first().unwrap()
+        );
+    }
+}

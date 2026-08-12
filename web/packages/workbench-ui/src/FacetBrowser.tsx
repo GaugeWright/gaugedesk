@@ -1113,7 +1113,7 @@ export function FacetBrowser(props: {
                 old standalone status dot and the "editing" badge;
                 the change-count and conflict/sync lights wire in once the projection
                 carries them (WS-H b/c). */}
-            <StatusGem kind={chat.kind} tone={props.runToneOf?.(chat.id)} conflict={chat.conflict} changes={chat.changes} />
+            <StatusGem kind={chat.kind} tone={props.runToneOf?.(chat.id)} conflict={chat.conflict} />
             <Show
                 when={editingIs("rename-chat", chat.id)}
                 fallback={

@@ -1248,9 +1248,9 @@ function MobileSession(props: {
     }
     // The badge tap jumps to the *current* (first) navigable task; a no-op on an
     // empty queue. Onboarding `issue` tasks (ADR 0075) carry a whip work-item id,
-    // not an engagement, so they are skipped here — only `review` tasks jump.
+    // not an engagement, so they are skipped here — every other ask names a chat.
     function jumpToCurrentTask() {
-        const first = (tasks() ?? []).find((t) => t.kind === "review");
+        const first = (tasks() ?? []).find((t) => t.kind !== "issue");
         if (first) jumpToTask(first.id as EngagementId);
     }
 
@@ -1527,7 +1527,6 @@ function MobileSession(props: {
     }
 
     // ---- send (the one standing command the client may issue) ---------------
-    const [reviewNext, setReviewNext] = createSignal(false);
 
     // Every draft change is cached for the open chat, so a draft survives leaving
     // the chat, restarting, and going offline. The shared composer clears the
@@ -1617,17 +1616,15 @@ function MobileSession(props: {
     });
 
     // Bound here rather than left to ChatPanel's default so the draft routes
-    // through the account cache and the review toggle drives the phone's own
-    // signal. Everything else is the shared controller's.
+    // through the account cache. Everything else is the shared controller's.
     const composerController = createSessionComposerController({
         scope: () => String(engagement() ?? "none"),
         busy: session.busy,
         capabilities: session.composerCapabilities,
         canCommand: session.canCommand,
-        send: (text, images, turnOptions) => session.send(text, images, turnOptions),
+        send: (text, images) => session.send(text, images),
         stop: session.stop,
         draft: { value: draft, set: setDraft },
-        review: { value: reviewNext, set: setReviewNext },
         // The host owns the draft across selection changes: `selectEngagement`
         // restores the newly opened chat's cached draft itself. Letting the
         // controller clear on scope change would write that empty value straight

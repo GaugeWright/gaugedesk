@@ -5,9 +5,11 @@ import {
     createSessionComposerController,
 } from "./session-composer-controller";
 
+// Long enough to settle the store writes the controller now waits on: a row is
+// durable before it is dispatched, so every send is a few links further down the
+// microtask chain than the call that asked for it.
 const flush = async () => {
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let i = 0; i < 20; i++) await Promise.resolve();
 };
 
 function harness(send = vi.fn(async () => undefined)) {
@@ -33,6 +35,9 @@ function harness(send = vi.fn(async () => undefined)) {
 describe("createSessionComposerController", () => {
     it("queues while an authoritative turn is busy and drains after settlement", async () => {
         const h = harness();
+        // Stored rows arrive before anything is sent, so every test that expects
+        // a dispatch waits for the chat to finish hydrating first.
+        await flush();
         h.setBusy(true);
         h.controller.setDraft("follow up");
         h.controller.submit();
@@ -41,7 +46,7 @@ describe("createSessionComposerController", () => {
 
         h.setBusy(false);
         await flush();
-        expect(h.send).toHaveBeenCalledWith("follow up", [], { review: false });
+        expect(h.send).toHaveBeenCalledWith("follow up", [], expect.any(String));
         expect(h.controller.queue()).toHaveLength(0);
         h.dispose();
     });
@@ -52,6 +57,7 @@ describe("createSessionComposerController", () => {
             .mockImplementationOnce(() => new Promise<void>((resolve) => { finishFirst = resolve; }))
             .mockResolvedValueOnce(undefined);
         const h = harness(send);
+        await flush();
 
         h.controller.setDraft("original");
         h.controller.submit();
@@ -64,7 +70,7 @@ describe("createSessionComposerController", () => {
         finishFirst();
         await flush();
         await flush();
-        expect(send).toHaveBeenNthCalledWith(2, "redirect", [], { review: false });
+        expect(send).toHaveBeenNthCalledWith(2, "redirect", [], expect.any(String));
         h.dispose();
     });
 
@@ -97,11 +103,17 @@ describe("createSessionComposerController", () => {
             });
         });
 
+        await flush();
+
         controller.setDraft("remember this");
         controller.submit();
         await flush();
         expect(followUp).toHaveBeenCalledWith("remember this", []);
-        expect(controller.queue()).toEqual([{ id: "follow-1", text: "remember this" }]);
+        // The host's projection is text-only, so its rows cannot be withdrawn
+        // into the outbox without losing whatever was attached to them.
+        expect(controller.queue()).toEqual([
+            { id: "follow-1", text: "remember this", held: false, canHold: false },
+        ]);
 
         controller.setDraft("change direction");
         controller.steer();
@@ -111,14 +123,16 @@ describe("createSessionComposerController", () => {
         dispose();
     });
 
-    it("stages, edits, reorders, removes, and releases queued messages", async () => {
+    it("stashes, edits, reorders, removes, and releases held messages", async () => {
         const h = harness();
-        h.controller.toggleGate();
+        await flush();
         h.controller.setDraft("one");
-        h.controller.submit();
+        h.controller.stash();
         h.controller.setDraft("two");
-        h.controller.submit();
+        h.controller.stash();
         expect(h.controller.queue().map(({ text }) => text)).toEqual(["one", "two"]);
+        // Nothing ran: a stash that dispatched would not be a stash.
+        expect(h.send).not.toHaveBeenCalled();
 
         h.controller.reorderQueue(1, 0);
         const first = h.controller.queue()[0]!;
@@ -126,9 +140,163 @@ describe("createSessionComposerController", () => {
         h.controller.removeQueued(h.controller.queue()[1]!.id);
         expect(h.controller.queue().map(({ text }) => text)).toEqual(["two edited"]);
 
-        h.controller.toggleGate();
+        h.controller.holdQueued(h.controller.queue()[0]!.id, false);
         await flush();
-        expect(h.send).toHaveBeenCalledWith("two edited", [], { review: false });
+        expect(h.send).toHaveBeenCalledWith("two edited", [], expect.any(String));
+        h.dispose();
+    });
+
+    it("steps over held rows and runs the next ready one", async () => {
+        const h = harness();
+        await flush();
+        h.setBusy(true);
+        h.controller.setDraft("jotted");
+        h.controller.stash();
+        h.controller.setDraft("meant to run");
+        h.controller.submit();
+        expect(h.controller.queue().map(({ text, held }) => [text, held === true])).toEqual([
+            ["jotted", true],
+            ["meant to run", false],
+        ]);
+
+        h.setBusy(false);
+        await flush();
+        // The held row is stepped over, not blocking — and it is still there.
+        expect(h.send).toHaveBeenCalledTimes(1);
+        expect(h.send).toHaveBeenCalledWith("meant to run", [], expect.any(String));
+        expect(h.controller.queue().map(({ text }) => text)).toEqual(["jotted"]);
+        h.dispose();
+    });
+
+    it("refuses to stash or hold where the Environment does not declare it", () => {
+        const [scope] = createSignal("chat-1");
+        const [busy] = createSignal(false);
+        let dispose!: () => void;
+        const controller = createRoot((rootDispose) => {
+            dispose = rootDispose;
+            return createSessionComposerController({
+                scope,
+                busy,
+                capabilities: () => ({ ...UNIVERSAL_COMPOSER_CAPABILITIES, hold: false }),
+                send: vi.fn(async () => undefined),
+            });
+        });
+        expect(controller.canHold()).toBe(false);
+        controller.setDraft("jot this");
+        controller.stash();
+        // Refused whole: the draft is still there rather than swallowed into a
+        // queue the Environment could never release it from.
+        expect(controller.queue()).toHaveLength(0);
+        expect(controller.draft()).toBe("jot this");
+        dispose();
+    });
+
+    it("withdraws a host-owned row into the outbox instead of holding it there", async () => {
+        const remove = vi.fn(async () => undefined);
+        const image = { name: "screenshot.png", mimeType: "image/png", data: "AAAA" };
+        // The projection carries the attachments, so the whole message can be
+        // reconstructed here, which is what licenses the withdrawal at all.
+        const [queue, setQueue] = createSignal([
+            { id: "srv-1", text: "on the host", images: [image] },
+        ]);
+        let dispose!: () => void;
+        const controller = createRoot((rootDispose) => {
+            dispose = rootDispose;
+            return createSessionComposerController({
+                scope: () => "chat-1",
+                busy: () => false,
+                capabilities: () => UNIVERSAL_COMPOSER_CAPABILITIES,
+                send: vi.fn(async () => undefined),
+                runtime: {
+                    queue,
+                    followUp: async () => undefined,
+                    steer: async () => undefined,
+                    edit: async () => undefined,
+                    remove,
+                    reorder: async () => undefined,
+                    promote: async () => undefined,
+                },
+            });
+        });
+        await flush();
+
+        // There is no host-side held state to set (ADR 0137 §5): the row comes out
+        // of the host's queue and reappears in the outbox, held.
+        controller.holdQueued("srv-1", true);
+        await flush();
+        expect(remove).toHaveBeenCalledWith("srv-1");
+        setQueue([]);
+        await flush();
+        expect(controller.queue().map(({ text, held }) => [text, held])).toEqual([
+            ["on the host", true],
+        ]);
+        // Withdrawn whole: the attachment came back with the words, so releasing
+        // it runs the message that was queued rather than a text-only shadow.
+        expect(controller.queue()).toHaveLength(1);
+        dispose();
+    });
+
+    it("refuses to withdraw a host row whose attachments the queue does not carry", async () => {
+        const remove = vi.fn(async () => undefined);
+        // A text-only projection cannot say whether this row had images, and
+        // withdrawing it would delete the host's copy and keep only the words.
+        const [queue] = createSignal([{ id: "srv-1", text: "with a screenshot" }]);
+        let dispose!: () => void;
+        const controller = createRoot((rootDispose) => {
+            dispose = rootDispose;
+            return createSessionComposerController({
+                scope: () => "chat-1",
+                busy: () => false,
+                capabilities: () => UNIVERSAL_COMPOSER_CAPABILITIES,
+                send: vi.fn(async () => undefined),
+                runtime: {
+                    queue,
+                    followUp: async () => undefined,
+                    steer: async () => undefined,
+                    edit: async () => undefined,
+                    remove,
+                    reorder: async () => undefined,
+                    promote: async () => undefined,
+                },
+            });
+        });
+        await flush();
+
+        // The control is withheld for that row rather than offered and lossy...
+        expect(controller.queue().map(({ canHold }) => canHold)).toEqual([false]);
+        controller.holdQueued("srv-1", true);
+        await flush();
+        // ...and asking anyway changes nothing on the host.
+        expect(remove).not.toHaveBeenCalled();
+        expect(controller.error()).toMatch(/attached/i);
+        dispose();
+    });
+
+    it("hands the composed message to a host that will deliver it elsewhere", () => {
+        const h = harness();
+        h.controller.setDraft("try this on a new branch");
+        const composed = h.controller.takeComposed()!;
+        expect(composed.text).toBe("try this on a new branch");
+        // Taken means taken: the box is empty, exactly as any other destination
+        // would leave it.
+        expect(h.controller.draft()).toBe("");
+        expect(h.send).not.toHaveBeenCalled();
+
+        // ...but a delivery that fails puts it back rather than eating it.
+        composed.restore();
+        expect(h.controller.draft()).toBe("try this on a new branch");
+        h.dispose();
+    });
+
+    it("keeps the mode per chat and falls back to the host default", () => {
+        const h = harness();
+        expect(h.controller.mode()).toBe("steer");
+        h.controller.setMode("stash");
+        h.setScope("chat-2");
+        // A stashing spell in one conversation must not redirect the next one.
+        expect(h.controller.mode()).toBe("steer");
+        h.setScope("chat-1");
+        expect(h.controller.mode()).toBe("stash");
         h.dispose();
     });
 
@@ -138,22 +306,24 @@ describe("createSessionComposerController", () => {
             .mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectFirst = reject; }))
             .mockResolvedValueOnce(undefined);
         const h = harness(send);
+        await flush();
         h.controller.setDraft("first");
         h.controller.submit();
         h.controller.setDraft("second");
         h.controller.submit();
+        await flush();
 
         rejectFirst(new Error("provider unavailable"));
         await flush();
         await flush();
         expect(h.controller.error()).toBe("provider unavailable");
-        expect(send).toHaveBeenNthCalledWith(2, "second", [], { review: false });
+        expect(send).toHaveBeenNthCalledWith(2, "second", [], expect.any(String));
         h.dispose();
     });
 
     it("retires client-only state when the Session scope changes", async () => {
         const h = harness();
-        h.controller.toggleGate();
+        h.setBusy(true);
         h.controller.setDraft("draft");
         h.controller.submit();
         h.controller.setDraft("not carried");
@@ -162,7 +332,6 @@ describe("createSessionComposerController", () => {
         await flush();
         expect(h.controller.queue()).toHaveLength(0);
         expect(h.controller.draft()).toBe("new chat draft");
-        expect(h.controller.gated()).toBe(false);
         h.dispose();
     });
 
@@ -173,6 +342,7 @@ describe("createSessionComposerController", () => {
             .mockImplementationOnce(() => new Promise<void>((resolve) => { finishFirst = resolve; }))
             .mockImplementationOnce(() => new Promise<void>((resolve) => { finishSecond = resolve; }));
         const h = harness(send);
+        await flush();
 
         h.controller.setDraft("alpha");
         h.controller.submit();
@@ -183,8 +353,9 @@ describe("createSessionComposerController", () => {
         expect(h.controller.busy()).toBe(false);
         h.controller.setDraft("beta");
         h.controller.submit();
-        expect(send).toHaveBeenCalledTimes(2);
         expect(h.controller.busy()).toBe(true);
+        await flush();
+        expect(send).toHaveBeenCalledTimes(2);
 
         finishFirst();
         await flush();
@@ -217,16 +388,20 @@ describe("createSessionComposerController", () => {
     });
 
     describe("a transport that cannot carry a standing command", () => {
-        it("refuses the send and keeps the draft where the writer can see it", () => {
+        it("takes the message into the outbox rather than refusing it", async () => {
             const h = harness();
+            await flush();
             h.setCanCommand(false);
             h.controller.setDraft("written while offline");
             h.controller.submit();
+            await flush();
             expect(h.controller.blocked()).toBe(true);
+            // Nothing is sent, and nothing is lost: composing offline is the point
+            // of the outbox (ADR 0137), so the message waits durably instead of
+            // the draft being held hostage in the box.
             expect(h.send).not.toHaveBeenCalled();
-            // The refusal must not consume the text. Clearing it would lose work
-            // to a condition the writer did not cause and cannot see here.
-            expect(h.controller.draft()).toBe("written while offline");
+            expect(h.controller.queue().map(({ text }) => text)).toEqual(["written while offline"]);
+            expect(h.controller.draft()).toBe("");
             h.dispose();
         });
 
@@ -250,6 +425,7 @@ describe("createSessionComposerController", () => {
 
         it("drains what was staged during the outage once the transport returns", async () => {
             const h = harness();
+            await flush();
             // Staged while able, held by a turn already running.
             h.setBusy(true);
             h.controller.setDraft("queued before the drop");
@@ -268,7 +444,7 @@ describe("createSessionComposerController", () => {
             // silently swallowed.
             h.setCanCommand(true);
             await flush();
-            expect(h.send).toHaveBeenCalledWith("queued before the drop", [], { review: false });
+            expect(h.send).toHaveBeenCalledWith("queued before the drop", [], expect.any(String));
             expect(h.controller.queue()).toHaveLength(0);
             h.dispose();
         });

@@ -12,22 +12,6 @@ Feature: Round 10 — honest improve-chat vocabulary, a legible status, clearer 
   structural and verified by typecheck/build; there is no DOM assertion for "the
   compositor no longer wedges".)
 
-  Scenario: an improve chat's keep button speaks method terms, not project terms
-    Given the workbench is open
-    When I create an edit chat under the archetype "Default"
-    And I request review for the next change
-    And I task the agent with "make a change"
-    And I open the "diff" tab
-    Then I see the button "save to the archetype"
-    And I do not see the button "keep this work"
-
-  Scenario: a work chat's keep button still reads "keep this work"
-    Given a new engagement
-    When I request review for the next change
-    And I task the agent with "make a change"
-    And I open the "diff" tab
-    Then I see the button "keep this work"
-
   Scenario: the per-chat status badge is a legible review call-to-action
     Given a new engagement
     Then the chat status badge reads "Ready"
@@ -35,8 +19,7 @@ Feature: Round 10 — honest improve-chat vocabulary, a legible status, clearer 
 
   Scenario: the changes header has no hidden runtime-config disclosure
     Given a new engagement
-    When I request review for the next change
-    And I task the agent with "make a change"
+    When I task the agent with "make a change"
     Then the run phase is "Completed"
     When I open the "diff" tab
     Then the review offers no internal-file toggle

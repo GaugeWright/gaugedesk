@@ -159,7 +159,9 @@ Then("the unselected files and viewer panels are not composed", async ({ page })
 
 When("I send {string} in the embedded chat", async ({ page }, msg: string) => {
     await page.locator("[data-embed-composer]").fill(msg);
-    await page.locator("[data-embed-send]").click();
+    // ⏎, not the button: the destination menu covers the primary once hovered.
+    // See `sendDraft` in steps.ts.
+    await page.locator("[data-embed-composer]").press("Enter");
 });
 
 When("I send a Markdown message in the embedded chat", async ({ page }) => {
@@ -170,7 +172,7 @@ When("I send a Markdown message in the embedded chat", async ({ page }) => {
         "| --- | --- |",
         "| Markdown | working |",
     ].join("\n"));
-    await page.locator("[data-embed-send]").click();
+    await page.locator("[data-embed-composer]").press("Enter");
 });
 
 const TINY_PASTED_PNG =
@@ -199,7 +201,7 @@ Then("the embedded composer shows the pasted image", async ({ page }) => {
 });
 
 When("I send the pasted image in the embedded chat", async ({ page }) => {
-    await page.locator("[data-embed-send]").click();
+    await page.locator("[data-embed-composer]").press("Enter");
 });
 
 Then("the embedded turn carries the pasted image bytes", async ({ page }) => {
@@ -233,7 +235,7 @@ Then("the embedded composer shows the attached text file", async ({ page }) => {
 });
 
 When("I send the attached text file in the embedded chat", async ({ page }) => {
-    await page.locator("[data-embed-send]").click();
+    await page.locator("[data-embed-composer]").press("Enter");
 });
 
 Then("the embedded turn carries the attached text", async ({ page }) => {
@@ -253,8 +255,11 @@ Then("the embedded composer offers steer, queue, and stop", async ({ page }) => 
 });
 
 When("I queue {string} in the embedded chat", async ({ page }, message: string) => {
-    await page.locator("[data-embed-composer]").fill(message);
-    await page.getByTestId("queue-msg").click();
+    const composer = page.locator("[data-embed-composer]");
+    await composer.fill(message);
+    // The chord that always reaches the queue, whatever mode the composer rests
+    // in — which is also the only route that does not go through the overlay.
+    await composer.press("Control+Enter");
 });
 
 Then("the embedded queue shows {string}", async ({ page }, message: string) => {
@@ -262,8 +267,9 @@ Then("the embedded queue shows {string}", async ({ page }, message: string) => {
 });
 
 When("I steer the embedded chat with {string}", async ({ page }, message: string) => {
-    await page.locator("[data-embed-composer]").fill(message);
-    await page.getByTestId("steer-turn").click();
+    const composer = page.locator("[data-embed-composer]");
+    await composer.fill(message);
+    await composer.press("Control+Shift+Enter");
 });
 
 Then("the embedded turn is not interrupted", async ({ page }) => {

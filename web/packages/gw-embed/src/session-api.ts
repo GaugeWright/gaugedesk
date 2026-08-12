@@ -34,7 +34,15 @@ export interface EmbedSessionApi {
     engagementDiff(id: EngagementId): Promise<string>;
     getMerge(id: EngagementId): Promise<MergeState>;
     runEmbedTurn(id: EngagementId, prompt: string, images?: { data: string; mimeType: string }[]): Promise<unknown>;
-    runTask(id: EngagementId, prompt: string, images?: { data: string; mimeType: string }[]): Promise<unknown>;
+    /** `composedId` carries the outbox identity so a resend is idempotent
+     *  (ADR 0137 §3). An implementation that cannot key on it may ignore it;
+     *  what it must not do is treat two sends of the same id as two turns. */
+    runTask(
+        id: EngagementId,
+        prompt: string,
+        images?: { data: string; mimeType: string }[],
+        composedId?: string,
+    ): Promise<unknown>;
     mergeCommand(id: EngagementId, action: MergeAction): Promise<MergeState>;
     getFile(id: EngagementId, path: string): Promise<string>;
     getFileWithCut?(

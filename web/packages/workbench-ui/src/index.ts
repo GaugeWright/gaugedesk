@@ -18,7 +18,11 @@ export type { ChatPanelProps } from "./ChatPanel";
 export { ChatPaneHeader } from "./ChatPaneHeader";
 export type { ChatPaneHeaderProps } from "./ChatPaneHeader";
 export { ChatComposer } from "./ChatComposer";
-export type { ChatComposerProps, ComposerQueueItem } from "./ChatComposer";
+export type { ChatComposerProps, ComposerMode, ComposerQueueItem } from "./ChatComposer";
+export { ComposerModelBar } from "./ComposerModelBar";
+export type { ComposerModelBarProps } from "./ComposerModelBar";
+export { ContextMeter } from "./ContextMeter";
+export type { ContextUsage } from "./ContextMeter";
 export {
     BASIC_COMPOSER_CAPABILITIES,
     UNIVERSAL_COMPOSER_CAPABILITIES,
@@ -29,10 +33,12 @@ export type {
     ComposerCapabilities,
     ComposerRuntimeCommands,
     ComposerRuntimeQueueItem,
-    ComposerTurnOptions,
     SessionComposerController,
     SessionComposerControllerOptions,
 } from "./session-composer-controller";
+export { DEFAULT_COMPOSER_MODE, loadDefaultMode as loadDefaultComposerMode, saveDefaultMode as saveDefaultComposerMode } from "./composer-mode";
+export { createIndexedDbOutboxStore, createMemoryOutboxStore, newOutboxId, OUTBOX_RETENTION_MS } from "./composer-outbox";
+export type { OutboxRow, OutboxStore } from "./composer-outbox";
 export { ChatApprovalCard } from "./ChatApprovalCard";
 export type { ChatApprovalCardProps } from "./ChatApprovalCard";
 export { ConfigEditor } from "./ConfigEditor";

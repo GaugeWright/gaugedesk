@@ -117,10 +117,13 @@ export async function getWorkspaceDeltaCarriage(
 }
 
 /** The human task queue (top bar): onboarding issues + ask-typed chat tasks
- *  (ADR 0082 §2 — `review`/`answer`/`repair`). Chat-ask ids are engagement ids;
+ *  (ADR 0082 §2 — `answer`/`repair`/`reply`). Chat-ask ids are engagement ids;
  *  `issue` ids are whip work-item ids (`WS-N`), so we keep `id` a raw string
  *  here and narrow on `kind` at the use site. An unknown kind degrades to
- *  `review` (the always-safe ask: it just opens the chat). */
+ *  `reply` — the always-safe ask, because it just opens the chat and offers no
+ *  action the server did not ask for. It used to degrade to `review`, which
+ *  carried a one-click keep: the wrong thing to offer for an ask you could not
+ *  identify, and moot now that ADR 0136 has retired that kind entirely. */
 export async function getTasks(transport: WorkbenchTransport): Promise<HumanTask[]> {
     const o = (await transport.json("GET", "/tasks")) as {
         tasks: {
@@ -134,12 +137,12 @@ export async function getTasks(transport: WorkbenchTransport): Promise<HumanTask
             waiting?: number;
         }[];
     };
-    const kinds = new Set(["review", "answer", "repair", "reply", "issue", "screen"]);
+    const kinds = new Set(["answer", "repair", "reply", "issue", "screen"]);
     return o.tasks.map((t) => ({
         id: t.id,
         title: t.title,
         agent: t.agent,
-        kind: (kinds.has(t.kind) ? t.kind : "review") as HumanTask["kind"],
+        kind: (kinds.has(t.kind) ? t.kind : "reply") as HumanTask["kind"],
         assignee: t.assignee,
         boundary: t.boundary,
         project: t.project,
@@ -637,19 +640,32 @@ export async function createEngagement(
     return { id: engagementId(o.id), branch: o.branch, path: o.path };
 }
 
+/** Run one turn.
+ *
+ *  `composedId` is the outbox id the message was composed under (ADR 0137 §3).
+ *  Passing it makes the turn idempotent under the composed identity rather than
+ *  under a key minted per attempt: a client that dies between handing the
+ *  message to the transport and hearing back can resend it and be told the turn
+ *  already ran, instead of having to choose between losing the message and
+ *  running it twice. Omitting it keeps the old behaviour — a fresh key per
+ *  attempt, so every send is a distinct command. */
 export async function runTask(
     transport: WorkbenchTransport,
     id: EngagementId,
     prompt: string,
     images: { data: string; mimeType: string }[] = [],
-    review = false,
+    composedId?: string,
 ): Promise<unknown> {
     const body = {
         prompt,
         ...(images.length ? { images } : {}),
-        ...(review ? { review: true } : {}),
     };
-    return transport.json("POST", `/chats/${id}/task`, body);
+    return transport.json(
+        "POST",
+        `/chats/${id}/task`,
+        body,
+        composedId ? { idempotencyKey: composedId } : undefined,
+    );
 }
 
 export async function stopTurn(

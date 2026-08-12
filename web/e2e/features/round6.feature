@@ -24,20 +24,8 @@ Feature: Round 6 — plain-language history, a keep guard, and consistent archet
     And I reveal the raw event log
     Then the audit timeline shows "RunCompleted"
 
-  Scenario: keeping work from the task bar requires a confirming second click
-    Given a new engagement
-    When I request review for the next change
-    And I task the agent with "make a change"
-    Then the task bar shows a review
-    When I click keep on the task bar review
-    Then the task bar keep is armed for confirmation
-    And the review is still pending in the task bar
-    When I click keep on the task bar review
-    Then the review is cleared from the task bar
-
   Scenario: runtime settings never enter the target review
     Given a new engagement
-    When I request review for the next change
     And I task the agent with "make a change"
     Then the run phase is "Completed"
     When I open the "diff" tab

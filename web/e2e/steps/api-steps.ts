@@ -115,14 +115,6 @@ When("the agent runs a turn in {string}", async ({ request }, id: string) => {
     expect(res.ok(), "task turn").toBeTruthy();
 });
 
-When("the agent runs a reviewed turn in {string}", async ({ request }, id: string) => {
-    world.eng = id;
-    const res = await request.post(`${CP}/chats/${id}/task`, {
-        headers: mutationHeaders(),
-        data: { prompt: "go", review: true },
-    });
-    expect(res.ok(), "reviewed task turn").toBeTruthy();
-});
 
 Then("{string} has an {string} resource", async ({ request }, id: string, kind: string) => {
     const list = (await (await request.get(`${CP}/chats/${id}/resources`)).json()) as Array<{ id: string; kind: string }>;

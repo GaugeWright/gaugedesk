@@ -1124,35 +1124,17 @@ async fn unconsumed_package_http_facades_are_absent() {
 }
 
 #[tokio::test]
-async fn merge_lifecycle_clean_admit_advances_main() {
+async fn merge_lifecycle_advances_then_integrates_to_mainline() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = workbench();
     let app = open_control_plane(wb);
 
     send(&app, "POST", "/chats", Some(r#"{"id":"m1"}"#)).await;
-    // a (fake) turn leaves the merge awaiting review: Clean.
-    let (s, body) = send(
-        &app,
-        "POST",
-        "/chats/m1/task",
-        Some(r#"{"prompt":"go","review":true}"#),
-    )
-    .await;
+    // A clean turn settles itself — there is no hold to admit past (ADR 0136).
+    let (s, body) = send(&app, "POST", "/chats/m1/task", Some(r#"{"prompt":"go"}"#)).await;
     assert_eq!(s, StatusCode::OK, "got {body}");
-    assert!(body.contains("\"merge_phase\":\"Clean\""), "got {body}");
 
     let (_, body) = send(&app, "GET", "/chats/m1/merge", None).await;
-    assert!(body.contains("\"phase\":\"Clean\""), "got {body}");
-
-    // the human admits → the real merge runs → main advances.
-    let (s, body) = send(
-        &app,
-        "POST",
-        "/chats/m1/merge/command",
-        Some(r#"{"action":"admit"}"#),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "got {body}");
     assert!(body.contains("\"phase\":\"Advanced\""), "got {body}");
 
     // WS-1: integrate the advanced workstream into the shared mainline. The hop
@@ -3785,55 +3767,38 @@ async fn delete_agent_refuses_default_and_survives_restart_rehydration() {
     );
 }
 
+/// ADR 0136 §3: a clean turn queues nothing. This replaces the review lifecycle
+/// this test used to walk (hold → queued `review` task → keep clears it); the
+/// point now is that the queue stays out of it entirely, which is the behaviour
+/// the retired signal would otherwise creep back into.
 #[tokio::test]
-async fn task_queue_lists_a_pending_review_then_clears_on_keep() {
+async fn a_clean_turn_queues_no_task() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = seeded_workbench();
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"q1"}"#)).await;
 
-    // no work yet → no review task. (A fresh workbench seeds onboarding `issue`
-    // tasks, ADR 0075; this lifecycle is about `review` tasks specifically.)
-    let (s, body) = send(&app, "GET", "/tasks", None).await;
+    // A fresh workbench seeds onboarding `issue` tasks (ADR 0075); this is about
+    // what a *turn* contributes.
+    let (s, before) = send(&app, "GET", "/tasks", None).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(
-        !body.contains(r#""kind":"review""#),
-        "no review yet: {body}"
-    );
+    assert!(!before.contains(r#""id":"q1""#), "no task yet: {before}");
 
-    // a finished turn leaves a clean diff → a review task queues.
-    send(
-        &app,
-        "POST",
-        "/chats/q1/task",
-        Some(r#"{"prompt":"go","review":true}"#),
-    )
-    .await;
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
-    assert!(
-        body.contains(r#""id":"q1""#) && body.contains(r#""kind":"review""#),
-        "queued: {body}"
-    );
+    send(&app, "POST", "/chats/q1/task", Some(r#"{"prompt":"go"}"#)).await;
 
-    // keeping the work (admit→advance) clears it from the queue.
-    send(
-        &app,
-        "POST",
-        "/chats/q1/merge/command",
-        Some(r#"{"action":"admit"}"#),
-    )
-    .await;
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    let (_, after) = send(&app, "GET", "/tasks", None).await;
     assert!(
-        !body.contains(r#""kind":"review""#),
-        "review cleared: {body}"
+        !after.contains(r#""id":"q1""#),
+        "a clean turn settles itself and asks for nothing: {after}"
     );
+    let (_, merge) = send(&app, "GET", "/chats/q1/merge", None).await;
+    assert!(merge.contains("Advanced"), "and it advanced: {merge}");
 }
 
-/// ADR 0096: ordinary clean turns auto-sync regardless of whether they changed a
-/// file; review is an explicit per-change hold and does not leak to the next turn.
+/// ADR 0096 as amended by ADR 0136: every clean turn auto-syncs, whether or not
+/// it changed a file. There is no per-change hold to opt out with.
 #[tokio::test]
-async fn noop_turn_auto_advances_instead_of_queuing_review() {
+async fn every_clean_turn_auto_advances_without_queuing() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = seeded_workbench();
     let app = open_control_plane(wb);
@@ -3875,19 +3840,71 @@ async fn noop_turn_auto_advances_instead_of_queuing_review() {
         !body.contains(r#""kind":"review""#),
         "a normal change auto-syncs: {body}"
     );
+}
 
-    // Opting this candidate into review holds it, and only it.
-    send(
+/// ADR 0137 §3: a message composed once runs at most once, however many times
+/// it is submitted.
+///
+/// The composer mints an outbox id when a message is *composed* and sends it as
+/// the turn's `Idempotency-Key`. A client that dies between handing the message
+/// to the transport and hearing back can therefore resend it: the command
+/// envelope recognises the key and refuses, rather than the client having to
+/// choose between losing the message and running the turn twice.
+///
+/// Reading the transcript is the assertion that matters. A refused *request* is
+/// only evidence about HTTP; one user line in durable truth is evidence about
+/// what actually happened to the chat.
+#[tokio::test]
+async fn a_message_resent_under_its_composed_id_runs_exactly_one_turn() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    send(&app, "POST", "/chats", Some(r#"{"id":"idem1"}"#)).await;
+
+    let composed = "outbox-9f2c";
+    let body = r#"{"prompt":"[no-write] book the room"}"#;
+    let (first, first_body) =
+        send_with_key(&app, "POST", "/chats/idem1/task", Some(body), composed).await;
+    assert_eq!(
+        first,
+        StatusCode::OK,
+        "the first submission runs: {first_body}"
+    );
+
+    // The resend after an uncertain dispatch. Same composed id, same bytes.
+    let (second, second_body) =
+        send_with_key(&app, "POST", "/chats/idem1/task", Some(body), composed).await;
+    assert_eq!(
+        second,
+        StatusCode::CONFLICT,
+        "a resend under the composed id must be refused, not run: {second_body}"
+    );
+    assert!(
+        second_body.contains(r#""command_status":"applied""#),
+        "the refusal has to say the turn already ran — `applied` is what lets the \
+         composer clear the message instead of setting it aside: {second_body}"
+    );
+
+    let (_, transcript) = send(&app, "GET", "/chats/idem1/transcript", None).await;
+    assert_eq!(
+        transcript.matches("book the room").count(),
+        1,
+        "one composed message, one user line in durable truth: {transcript}"
+    );
+
+    // A *different* composed message is a different command and still runs.
+    let (other, other_body) = send_with_key(
         &app,
         "POST",
-        "/chats/noop1/task",
-        Some(r#"{"prompt":"review this","review":true}"#),
+        "/chats/idem1/task",
+        Some(r#"{"prompt":"[no-write] and the projector"}"#),
+        "outbox-4a11",
     )
     .await;
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
-    assert!(
-        body.contains(r#""id":"noop1""#) && body.contains(r#""kind":"review""#),
-        "explicit review queues: {body}"
+    assert_eq!(
+        other,
+        StatusCode::OK,
+        "dedupe is per composed id, not a lock on the chat: {other_body}"
     );
 }
 
@@ -3901,18 +3918,14 @@ async fn task_queue_types_asks_repair_and_answer() {
     let wb2 = std::sync::Arc::clone(&wb);
     let app = open_control_plane(wb);
 
-    // Two chats off the same base: hold rb's candidate first, then advance ra.
-    // rb cannot auto-pull over its candidate, so admitting rb detects the
-    // add/add race and makes rb the incoming conflict owner.
+    // Two chats cut from the same base. rb runs first and its clean turn settles
+    // itself into Main; ra then writes the same file from the stale base, so ra's
+    // own auto-sync hits the add/add race and ra owns the repair. (Before ADR 0136
+    // this was staged by holding rb for review — with no hold left, the ordinary
+    // settle order produces the same race.)
     send(&app, "POST", "/chats", Some(r#"{"id":"ra"}"#)).await;
     send(&app, "POST", "/chats", Some(r#"{"id":"rb"}"#)).await;
-    send(
-        &app,
-        "POST",
-        "/chats/rb/task",
-        Some(r#"{"prompt":"beta","review":true}"#),
-    )
-    .await;
+    send(&app, "POST", "/chats/rb/task", Some(r#"{"prompt":"beta"}"#)).await;
     send(
         &app,
         "POST",
@@ -3920,27 +3933,38 @@ async fn task_queue_types_asks_repair_and_answer() {
         Some(r#"{"prompt":"alpha"}"#),
     )
     .await;
-    send(
-        &app,
-        "POST",
-        "/chats/rb/merge/command",
-        Some(r#"{"action":"admit"}"#),
-    )
-    .await;
+    // Put ra's merge into the conflicted state directly. Before ADR 0136 this test
+    // manufactured the add/add race by holding rb's candidate for review, which
+    // stopped rb auto-pulling; with every clean turn settling itself there is no
+    // lever to stage that race from the outside. The subject here is ask *typing*
+    // — which durable state produces which task kind — so the state is admitted
+    // the same way the open question below is.
+    {
+        let mut guard = wb2.lock_unpoisoned();
+        let store = guard.store_mut();
+        store
+            .admit::<gaugedesk_core::merge::MergeState>(
+                "ra",
+                gaugedesk_core::merge::MergeCommand::StartMerge,
+            )
+            .expect("re-enter the merge lifecycle");
+        store
+            .admit::<gaugedesk_core::merge::MergeState>(
+                "ra",
+                gaugedesk_core::merge::MergeCommand::WorkspaceConflict,
+            )
+            .expect("the workspace reports a conflict");
+    }
     let (_, body) = send(&app, "GET", "/tasks", None).await;
     assert!(
-        body.contains(r#""id":"rb""#) && body.contains(r#""kind":"repair""#),
+        body.contains(r#""id":"ra""#) && body.contains(r#""kind":"repair""#),
         "conflicted chat queues repair: {body}"
-    );
-    assert!(
-        !body.contains(r#""kind":"review""#),
-        "the conflict is not mislabeled review: {body}"
     );
 
     // An agent's open question outranks the chat's merge state (ADR 0111: the
     // question is a tracker item now, not a parked run phase).
     wb2.lock_unpoisoned()
-        .ask_question("rb", "Which environment?", &[], None, false)
+        .ask_question("ra", "Which environment?", &[], None, false)
         .expect("the agent asks");
     let (_, body) = send(&app, "GET", "/tasks", None).await;
     assert!(
@@ -3961,26 +3985,39 @@ async fn task_queue_types_asks_repair_and_answer() {
 async fn attention_rules_reshape_queue_and_badges() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = seeded_workbench();
+    let wb2 = std::sync::Arc::clone(&wb);
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"at1"}"#)).await;
-    send(
-        &app,
-        "POST",
-        "/chats/at1/task",
-        Some(r#"{"prompt":"go","review":true}"#),
-    )
-    .await;
+    send(&app, "POST", "/chats/at1/task", Some(r#"{"prompt":"go"}"#)).await;
+    // Conflict is the signal this exercises now that `changes` is retired
+    // (ADR 0136 §3). Admitted directly: the point is the rules, not the race.
+    {
+        let mut guard = wb2.lock_unpoisoned();
+        let store = guard.store_mut();
+        store
+            .admit::<gaugedesk_core::merge::MergeState>(
+                "at1",
+                gaugedesk_core::merge::MergeCommand::StartMerge,
+            )
+            .expect("re-enter the merge lifecycle");
+        store
+            .admit::<gaugedesk_core::merge::MergeState>(
+                "at1",
+                gaugedesk_core::merge::MergeCommand::WorkspaceConflict,
+            )
+            .expect("the workspace reports a conflict");
+    }
 
-    // Defaults: the clean merge queues `review`; no `reply` pill.
+    // Defaults: the conflict queues `repair`; no `reply` pill.
     let (_, body) = send(&app, "GET", "/tasks", None).await;
     assert!(
-        body.contains(r#""kind":"review""#) && !body.contains(r#""kind":"reply""#),
+        body.contains(r#""kind":"repair""#) && !body.contains(r#""kind":"reply""#),
         "defaults hold: {body}"
     );
 
-    // Mute `changes`, opt `turn-settled` into the queue.
+    // Mute `conflict`, opt `turn-settled` into the queue.
     let rules = serde_json::json!({
-        "value": r#"{"version":1,"rules":[{"signal":"changes","attention":"mute"},{"signal":"turn-settled","attention":"queue"}]}"#
+        "value": r#"{"version":1,"rules":[{"signal":"conflict","attention":"mute"},{"signal":"turn-settled","attention":"queue"}]}"#
     })
     .to_string();
     let (s, _) = send(
@@ -3993,7 +4030,7 @@ async fn attention_rules_reshape_queue_and_badges() {
     assert_eq!(s, StatusCode::OK);
 
     let (_, body) = send(&app, "GET", "/tasks", None).await;
-    assert!(!body.contains(r#""kind":"review""#), "review muted: {body}");
+    assert!(!body.contains(r#""kind":"repair""#), "repair muted: {body}");
     assert!(
         body.contains(r#""id":"at1""#) && body.contains(r#""kind":"reply""#),
         "reply queued via fall-through: {body}"
@@ -4008,8 +4045,8 @@ async fn attention_rules_reshape_queue_and_badges() {
         .expect("at1 in recent")
         .clone();
     assert_eq!(
-        chat["changes"], false,
-        "muted changes shows no badge: {chat}"
+        chat["conflict"], false,
+        "muted conflict shows no badge: {chat}"
     );
 }
 
@@ -4064,24 +4101,6 @@ async fn advancement_rules_auto_advance_covered_turns_only() {
     assert!(
         merge.contains("Advanced"),
         "ordinary turn auto-syncs: {merge}"
-    );
-
-    send(
-        &app,
-        "POST",
-        "/chats/adv2/task",
-        Some(r#"{"prompt":"hold this","review":true}"#),
-    )
-    .await;
-    let (_, merge) = send(&app, "GET", "/chats/adv2/merge", None).await;
-    assert!(
-        merge.contains("Clean") && merge.contains(r#""review_requested":true"#),
-        "explicit hold survives advancement policy: {merge}"
-    );
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
-    assert!(
-        body.contains(r#""id":"adv2""#) && body.contains(r#""kind":"review""#),
-        "held turn queues review: {body}"
     );
 }
 
@@ -4304,5 +4323,119 @@ async fn assignment_binds_to_the_roster_and_never_gates_a_claim() {
     assert!(
         wb.lock_unpoisoned().task_queue_value()["tasks"][0]["assignee"].is_null(),
         "the task projection must read admitted assignment, not synthesize the acting owner",
+    );
+}
+
+/// CMP-17 reproduction under instrumentation.
+///
+/// Chats on one placement share a target workspace, so their turns contend on a
+/// single `branches.sqlite` / `content.sqlite`. A steer is `task → stop → task`,
+/// which puts one turn's workspace commit against the next turn's materialize.
+/// This drives that shape hard and records the wall time of anything that fails,
+/// because the timing is what distinguishes the two candidate mechanisms:
+/// a `busy_timeout` of 5 s expiring looks like a ~5 s failure, and an immediate
+/// `SQLITE_BUSY` (no handler, or a deadlock SQLite refuses to wait on) looks like
+/// a fast one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "CMP-17: reproduces an upstream defect and fails until it is fixed; \
+            run with `--ignored` to reproduce or to check"]
+async fn cmp17_busy_under_steer_pressure() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+
+    const CHATS: usize = 6;
+    const ROUNDS: usize = 4;
+
+    let mut chats = Vec::new();
+    for n in 0..CHATS {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/chats",
+            Some(&format!(r#"{{"id":"busy{n}"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create busy{n}: {body}");
+        chats.push(format!("busy{n}"));
+    }
+
+    let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, u128, String)>::new()));
+    for round in 0..ROUNDS {
+        let mut handles = Vec::new();
+        for chat in &chats {
+            let app = app.clone();
+            let chat = chat.clone();
+            let failures = std::sync::Arc::clone(&failures);
+            handles.push(tokio::spawn(async move {
+                let record =
+                    |what: &str, started: std::time::Instant, status: StatusCode, body: String| {
+                        if status != StatusCode::OK && status != StatusCode::CREATED {
+                            failures.lock().unwrap().push((
+                                format!("{what} r{round}"),
+                                started.elapsed().as_millis(),
+                                body,
+                            ));
+                        }
+                    };
+                // A turn that holds itself open, so the stop lands mid-flight.
+                let slow = tokio::spawn({
+                    let app = app.clone();
+                    let chat = chat.clone();
+                    async move {
+                        let at = std::time::Instant::now();
+                        let (s, b) = send(
+                            &app,
+                            "POST",
+                            &format!("/chats/{chat}/task"),
+                            Some(r#"{"prompt":"[slow] original"}"#),
+                        )
+                        .await;
+                        (at, s, b)
+                    }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let at = std::time::Instant::now();
+                let (s, b) = send(&app, "POST", &format!("/chats/{chat}/stop"), None).await;
+                record("stop", at, s, b);
+
+                let (at, s, b) = slow.await.unwrap();
+                record("slow-task", at, s, b);
+
+                // The steered message: lands while the stopped turn is settling.
+                let at = std::time::Instant::now();
+                let (s, b) = send(
+                    &app,
+                    "POST",
+                    &format!("/chats/{chat}/task"),
+                    Some(r#"{"prompt":"redirect"}"#),
+                )
+                .await;
+                record("steered-task", at, s, b);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    let failures = failures.lock().unwrap();
+    let busy: Vec<_> = failures
+        .iter()
+        .filter(|(_, _, body)| body.contains("DatabaseBusy"))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} request(s) failed, {} of them SQLITE_BUSY:\n{}",
+        failures.len(),
+        busy.len(),
+        failures
+            .iter()
+            .map(|(what, ms, body)| format!(
+                "  {what} after {ms}ms: {}",
+                body.chars().take(160).collect::<String>()
+            ))
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
 }

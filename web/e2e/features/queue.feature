@@ -42,22 +42,31 @@ Feature: Send queue & steering
     When I open the "diff" tab
     Then the diff shows "redirect"
 
-  Scenario: the stage-gate holds messages until released (#24)
+  Scenario: stash mode puts what Enter sends into the queue, held (#24)
     Given a new engagement
-    When I enable the stage-gate
-    And I queue the message "staged-one"
-    And I queue the message "staged-two"
-    Then the queue shows 2 messages
+    When I set the composer mode to "stash"
+    And I send the message "staged-one"
+    And I send the message "staged-two"
+    Then the queue settles to 2 held messages
     And the run phase is "Init"
-    When I release the stage-gate
+    When I release the held message "staged-one"
+    And I release the held message "staged-two"
     And the agent finishes
     Then the run phase is "Completed"
 
+  Scenario: a held message does not hold up the ones meant to run
+    Given a new engagement
+    When I stash the message "jotted for later"
+    And I start tasking the agent with "[slow] the real work"
+    Then the agent is working
+    When I queue the message "the follow-up"
+    Then the queue shows 2 messages
+    And the queue settles to 1 held message
+
   Scenario: send now runs one held message immediately, ahead of the rest
     Given a new engagement
-    When I enable the stage-gate
-    And I queue the message "held-one"
-    And I queue the message "held-two"
+    When I stash the message "held-one"
+    And I stash the message "held-two"
     Then the queue shows 2 messages
     And the run phase is "Init"
     When I send now the queued message "held-two"

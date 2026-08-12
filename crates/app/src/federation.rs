@@ -966,7 +966,6 @@ fn engine_peer_turn(
             tenant_scope: crate::org::ORG_SCOPE,
             runtime_command_id: None,
             harness_factory: None,
-            review_requested: false,
         },
     ) {
         Ok(r) => r.assistant_text,

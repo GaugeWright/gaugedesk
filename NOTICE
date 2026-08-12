@@ -15,5 +15,12 @@ its applicable license text.
 
 Third-party components and assets remain under their respective licenses.
 
+The workbench icon set (`web/packages/workbench-ui/src/icons.tsx`) inlines path
+data from Lucide (https://lucide.dev), Copyright (c) Lucide Contributors,
+licensed under the ISC License. Lucide itself derives from Feather
+(Copyright (c) Cole Bemis, MIT). The paths are inlined rather than imported so
+the desktop app and embedded panels need no CDN under their content-security
+policy; they are otherwise unmodified.
+
 GaugeWright LLC also offers commercial licenses for uses that do not comply
 with the public license. Contact licensing@gaugewright.com.

@@ -18,10 +18,3 @@ Feature: On-ramps and plain language (round 1)
   Scenario: an open chat shows a plain-language status badge
     Given a new engagement
     Then the chat status badge reads "Ready"
-
-  Scenario: the changes review speaks plain language
-    Given a new engagement
-    When I request review for the next change
-    And I task the agent with "make a change"
-    And I open the "diff" tab
-    Then I see the button "keep this work"

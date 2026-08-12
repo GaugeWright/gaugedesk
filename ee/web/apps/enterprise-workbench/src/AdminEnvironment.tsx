@@ -426,7 +426,13 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
             queue: true,
             steer: false,
             stop: false,
-            stage: true,
+            // `stage` became `hold` when holding stopped being a server verb and
+            // became the client act of not submitting (ADR 0137 §2). Same offer to
+            // the reader: a queued instruction can be kept out of the running order.
+            hold: true,
+            // Administration chats have one line. There is no fork tree here to
+            // branch into, so the composer must not offer to mint one.
+            fork: false,
             attachments: [],
         }),
         // Same-origin HTTP to the Administration Environment: no separately
@@ -549,7 +555,6 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
                             const item = attention().find((candidate) => `admin:${candidate.id}` === String(id));
                             if (item) selectFile(item.path);
                         }}
-                        onComplete={() => undefined}
                     />
                 )}
                 nav={() => (

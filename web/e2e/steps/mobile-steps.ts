@@ -108,12 +108,6 @@ Then("it shows up as a work chat in the desktop's Personal project", async ({ pa
     await desktop.close();
 });
 
-When("I request review for the next mobile change", async ({ page }) => {
-    const review = page.locator("[data-review-next]");
-    await review.click();
-    await expect(review).toHaveAttribute("aria-pressed", "true");
-});
-
 // ---- offline / online send gate ---------------------------------------------
 
 When("I go offline", async ({ page }) => {
@@ -156,26 +150,3 @@ Then("I can send {string}", async ({ page }, text: string) => {
 
 // ---- the human task queue (the top bar's Next ③ affordance) ------------------
 
-Then("the task queue badge appears", async ({ page }) => {
-    // A finished turn queues a review (GET /tasks); the top-bar badge counts it.
-    // Auto-retry waits for the turn to settle and the queue to refetch.
-    await expect(page.locator("[data-next-task]")).toBeVisible();
-});
-
-When("I open the task queue", async ({ page }) => {
-    // The `⌄` chevron is the pull-down: it opens the full queue sheet.
-    await page.locator("[data-open-queue]").click();
-    await expect(page.locator("[data-queue-sheet]")).toBeVisible();
-});
-
-Then("the task queue lists a review", async ({ page }) => {
-    const item = page.locator("[data-queue-sheet] [data-queue-task]").first();
-    await expect(item).toBeVisible();
-    await expect(item).toContainText("review");
-});
-
-When("I jump to the first task from the queue", async ({ page }) => {
-    await page.locator("[data-queue-sheet] [data-queue-task]").first().click();
-    // The sheet dismisses on jump (the host closes it as it routes to the chat).
-    await expect(page.locator("[data-queue-sheet]")).toHaveCount(0);
-});

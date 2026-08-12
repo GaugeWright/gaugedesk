@@ -1132,10 +1132,6 @@ pub(crate) async fn workspace_events(
 #[derive(Deserialize)]
 pub(crate) struct TaskBody {
     prompt: String,
-    /// Opt this one candidate into human review. Default shared-line behavior is
-    /// automatic settlement; this flag never becomes a sticky chat preference.
-    #[serde(default)]
-    review: bool,
     /// Native image content blocks attached to this message (UX-14). Resolved by
     /// WhippleScript as message-scoped model input; never recorded in the durable
     /// transcript. Absent ⇒ a text turn.
@@ -1191,7 +1187,6 @@ pub(crate) async fn post_task(
     let wb2 = wb.clone();
     let task = body.prompt;
     let images = body.images;
-    let review_requested = body.review;
     let actor = actor.map(|axum::extract::Extension(actor)| actor.0);
     let id2 = id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1210,7 +1205,6 @@ pub(crate) async fn post_task(
                 tenant_scope: &tenant_scope,
                 runtime_command_id: None,
                 harness_factory: None,
-                review_requested,
             },
         )
     })

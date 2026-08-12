@@ -1252,8 +1252,6 @@ pub struct EngagementTurnInput<'a> {
     /// with a command-scoped transport (for example a Home-signed private
     /// Durable workflow). Foreground turns use the workbench default.
     pub harness_factory: Option<Arc<dyn HarnessFactory>>,
-    /// Explicit per-change review hold. False is the shared-line auto-sync default.
-    pub review_requested: bool,
 }
 
 /// Non-secret, immutable inputs a managed Isolated-workspace scheduler must
@@ -1346,7 +1344,6 @@ pub fn run_engagement_turn(
         tenant_scope,
         runtime_command_id,
         harness_factory,
-        review_requested,
     } = input;
     let config = {
         let g = wb.lock_unpoisoned();
@@ -1844,28 +1841,13 @@ pub fn run_engagement_turn(
 
     // Every chat targets one shared line: implicit Main or a named workstream. A clean
     // completion greedily advances that target and reconciles its siblings; named lines
-    // additionally record membership attribution. Review is an explicit hold, never the
-    // default behavior of Main (ADR 0096).
-    if review_requested {
-        let mut g = wb.lock_unpoisoned();
-        if g.store_mut()
-            .admit::<MergeState>(id, MergeCommand::RequestReview)
-            .is_ok()
-        {
-            let event = ServerEvent::Admitted {
-                kind: "review".into(),
-                text: "held this change for review".into(),
-            };
-            record_transcript(g.store_mut(), id, &event);
-            let _ = sender.send(event);
-        }
-    } else {
-        greedy_autosync(wb, id, sender, contribution_by);
-    }
+    // additionally record membership attribution. There is no per-change hold —
+    // work is held by line, not by change (ADR 0136).
+    greedy_autosync(wb, id, sender, contribution_by);
 
     // Legacy advancement rules are evaluated only if a future/older path leaves a
-    // non-held clean candidate behind. The shared-line path above normally settles
-    // every clean turn, while an explicit review request always wins (ADR 0096).
+    // clean candidate behind. The shared-line path above normally settles every
+    // clean turn.
     auto_advance_turn(wb, id, sender, &result.guarantee_outcomes);
 
     let _ = sender.send(ServerEvent::Admitted {
@@ -1961,7 +1943,7 @@ impl Workbench {
         // reducer already moved it to Rejected/Repairing) for repair.
         if store
             .fold::<MergeState>(id)
-            .map(|m| m.phase != MergePhase::Clean || m.review_requested)
+            .map(|m| m.phase != MergePhase::Clean)
             .unwrap_or(true)
         {
             return;
@@ -2081,7 +2063,7 @@ impl Workbench {
         if self
             .store
             .fold::<MergeState>(id)
-            .map(|m| m.phase != MergePhase::Clean || m.review_requested)
+            .map(|m| m.phase != MergePhase::Clean)
             .unwrap_or(true)
         {
             return;
@@ -3224,7 +3206,6 @@ mod tests {
                 tenant_scope: crate::org::ORG_SCOPE,
                 runtime_command_id: None,
                 harness_factory: None,
-                review_requested: false,
             },
         )
         .unwrap();
@@ -3295,7 +3276,6 @@ mod tests {
                 tenant_scope: crate::org::ORG_SCOPE,
                 runtime_command_id: None,
                 harness_factory: None,
-                review_requested: false,
             },
         )
         .unwrap();

@@ -99,10 +99,10 @@ export interface ChatNode {
     readonly targetCapabilities: TargetCapabilities;
     readonly candidateRevision: string;
     readonly availableActs: readonly TargetActKind[];
-    /** Per-chat status for the nav gem (WS-H b/c), folded from the chat's merge scope.
-     *  `changes` = a finished turn's diff awaits the human's keep; `conflict` = an
-     *  auto-sync / merge hit a conflict being repaired. */
-    readonly changes: boolean;
+    /** Per-chat status for the nav gem (WS-H b/c), folded from the chat's merge
+     *  scope: an auto-sync / merge hit a conflict being repaired. The companion
+     *  `changes` dot went with per-change review (ADR 0136) — a clean candidate
+     *  always settles now, so there is nothing for it to report. */
     readonly conflict: boolean;
     /** True while re-homing would discard/transplant a candidate workspace. */
     readonly rehomeBlocked: boolean;
@@ -309,7 +309,6 @@ export interface RecentChat {
     readonly candidateRevision: string;
     readonly availableActs: readonly TargetActKind[];
     /** Per-chat nav-gem status (WS-H b/c); see {@link ChatNode}. */
-    readonly changes: boolean;
     readonly conflict: boolean;
     readonly rehomeBlocked: boolean;
 }
@@ -369,7 +368,9 @@ export function isWorkspaceRecord(v: unknown): v is WorkspaceChange["record"] {
  *  awaiting keep/reject (`review`), an onboarding checklist item from the
  *  per-boundary whip tracker (`issue`), or inbound material a project's gate
  *  has parked on a person (`screen`, ADR 0110 §7). */
-export type TaskKind = "review" | "answer" | "repair" | "reply" | "issue" | "screen";
+/** `review` is absent by design: ADR 0136 retired that ask with the per-change
+ *  hold. A server that still sends it degrades to `reply` in {@link getTasks}. */
+export type TaskKind = "answer" | "repair" | "reply" | "issue" | "screen";
 
 /** One item in the human task queue (the top bar). The kind is the **ask** —
  *  the verb the human is being asked to perform (ADR 0082 §2): `review` a clean
@@ -485,7 +486,6 @@ const parseChat = (c: RawChat): ChatNode => ({
     targetCapabilities: parseTargetCapabilities(c.target_capabilities, "chat.target_capabilities"),
     candidateRevision: requiredString(c.candidate_revision, "chat.candidate_revision"),
     availableActs: parseTargetActs(c.available_acts, "chat.available_acts"),
-    changes: c.changes ?? false,
     conflict: c.conflict ?? false,
     rehomeBlocked: c.rehome_blocked ?? true,
 });
@@ -626,8 +626,7 @@ export function parseWorkspace(raw: unknown): Workspace {
             targetAdapter: requiredString(c.target_adapter, "recent.target_adapter"),
             candidateRevision: requiredString(c.candidate_revision, "recent.candidate_revision"),
             availableActs: parseTargetActs(c.available_acts, "recent.available_acts"),
-            changes: c.changes ?? false,
-            conflict: c.conflict ?? false,
+                conflict: c.conflict ?? false,
             rehomeBlocked: c.rehome_blocked ?? true,
         })),
         workstreams: (o.workstreams ?? []).map(parseWorkstream),
@@ -672,9 +671,27 @@ export interface Engagement {
 
 /** A rejected command is a receipt, not a fact (`INV-2`). */
 export class Rejected extends Error {
-    constructor(public readonly reason: string) {
+    constructor(
+        public readonly reason: string,
+        /** The command-receipt status behind an idempotency refusal, when the
+         *  refusal came from the command envelope: `applied` means the request
+         *  already ran to completion, `processing` means its fate is still
+         *  unknown. A caller retrying under a stable key needs that difference —
+         *  "it already happened" and "it might be happening" are opposite
+         *  answers, and the reason string alone conflates them. */
+        public readonly commandStatus?: string,
+    ) {
         super(`rejected: ${reason}`);
     }
+}
+
+/** Did this refusal mean the command had already run to completion?
+ *
+ *  Only true for a receipt the server settled as `applied`. Every other status —
+ *  `processing`, `received`, `rejected`, `expired` — leaves the outcome open, and
+ *  a caller must not treat any of them as success. */
+export function alreadyApplied(error: unknown): boolean {
+    return error instanceof Rejected && error.commandStatus === "applied";
 }
 
 /** Phrase a failed command for the user, keeping the `INV-2` distinction the
@@ -788,9 +805,6 @@ export interface MergeState {
     readonly phase: MergePhase;
     readonly thread_state: string;
     readonly git_outcome: GitOutcome;
-    /** This clean candidate was explicitly held for per-change review. A clean
-     * workspace verdict alone does not imply human attention (ADR 0096). */
-    readonly review_requested: boolean;
 }
 export type MergeAction = "admit" | "reject" | "repair" | "retry" | "integrate";
 
@@ -810,7 +824,6 @@ export function parseMergeState(raw: unknown): MergeState {
         phase: o.phase,
         thread_state: typeof o.thread_state === "string" ? o.thread_state : "",
         git_outcome,
-        review_requested: o.review_requested === true,
     };
 }
 

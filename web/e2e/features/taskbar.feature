@@ -1,24 +1,10 @@
 @transport
 Feature: The human task queue (top bar)
 
-  As a user, finished agent work that needs my review surfaces in the top bar as
-  a task queue — current-first — so I can review and keep it without hunting for
-  it (navigation.md B1, the human task queue).
-
-  Scenario: a finished turn queues a review, completed from the task bar
-    Given a new engagement
-    When I request review for the next change
-    And I task the agent with "make a change"
-    Then the task bar shows a review
-    When I complete the review from the task bar
-    Then the review is cleared from the task bar
-
-  Scenario: a review task is tagged with its archetype, so the bar can colour it (#22)
-    Given a new engagement
-    When I request review for the next change
-    And I task the agent with "make a change"
-    Then the task bar shows a review
-    And the review task carries its archetype tag
+  As a user, work that needs me surfaces in the top bar as a task queue —
+  current-first — so I can act on it without hunting for it (navigation.md B1).
+  The `review` ask is gone with the per-change hold (ADR 0136); what remains here
+  is assignment. `answer` and `repair` are covered in round6/queue.
 
   # roster-assignment-production-client
   @transport

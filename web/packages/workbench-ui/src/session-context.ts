@@ -31,7 +31,6 @@ import { type ImageRef } from "./attachments";
 import {
     type ComposerCapabilities,
     type ComposerRuntimeCommands,
-    type ComposerTurnOptions,
 } from "./session-composer-controller";
 
 export interface SessionApi {
@@ -245,12 +244,23 @@ export interface Session {
     readonly onContentSaved: () => void;
     /** Send exactly one message and settle only when the authoritative turn has
      *  completed, failed, or been interrupted. Queue orchestration lives above
-     *  this primitive in the shared composer controller. */
+     *  this primitive in the shared composer controller.
+     *
+     *  `composedId` is the outbox id this message was composed under (ADR 0137
+     *  §3). A Session whose transport can carry an idempotency key must send it,
+     *  so that resending after an uncertain dispatch is answered rather than
+     *  guessed. A Session that cannot may ignore it — but must not let one
+     *  composed id become two turns. */
     readonly send: (
         text: string,
         images?: readonly ImageRef[],
-        options?: ComposerTurnOptions,
+        composedId?: string,
     ) => Promise<void>;
+    /** Does {@link send} carry `composedId` through to a host that applies it at
+     *  most once? Only then may an unsettled dispatch be recovered by resending
+     *  it; otherwise the composer sets that message aside for a person. Absent
+     *  means no — the guarantee has to be claimed, not assumed. */
+    readonly appliesComposedIdOnce?: boolean;
     /** Cooperatively cancel the current durable turn. */
     readonly stop?: () => Promise<void>;
     /** Fork at an exact durable user/assistant boundary. Owner environments

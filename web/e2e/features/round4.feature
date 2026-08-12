@@ -20,15 +20,7 @@ Feature: Round 4 — ownership-safe editing, legible diffs, and one canonical ch
 
   Scenario: the split diff toggle is hidden when the review panel is too narrow
     Given a new engagement
-    When I request review for the next change
-    And I task the agent with "make a change"
+    When I task the agent with "make a change"
     Then the run phase is "Completed"
     When I open the "diff" tab
     Then the split diff toggle is not offered at the default panel width
-
-  Scenario: a finished turn surfaces in the task bar without the raw "new chat" placeholder
-    Given a new engagement
-    When I request review for the next change
-    And I task the agent with "make a change"
-    Then the task bar shows a review
-    And the task bar shows no chat literally titled "new chat"

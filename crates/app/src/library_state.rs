@@ -3279,31 +3279,30 @@ impl Workbench {
         Some(updated)
     }
 
-    /// The nav-badge flags for a chat — the **badge** attention surface
+    /// The nav-badge flag for a chat — the **badge** attention surface
     /// (ADR 0082 §3): a signal the operator muted shows no dot either; `queue`
     /// and `badge` both keep it (the task bar is the only thing `badge` drops).
-    fn library_chat_status(
+    ///
+    /// Conflict is the only one left. The companion `changes` dot went with the
+    /// per-change review hold it reported (ADR 0136): a clean candidate now
+    /// always settles, so there is no state for that dot to describe.
+    fn library_chat_conflicted(
         &self,
         chat_id: &str,
         rules: &crate::attention::AttentionRules,
-    ) -> (bool, bool) {
+    ) -> bool {
         use crate::attention::{Attention, Signal};
         if !self.engagement_index.contains_key(chat_id) {
-            return (false, false);
+            return false;
         }
         let merge = self
             .store_ref()
             .fold::<MergeState>(chat_id)
             .unwrap_or_default();
-        (
-            merge.phase == gaugedesk_core::merge::MergePhase::Clean
-                && merge.review_requested
-                && rules.attention(Signal::Changes) != Attention::Mute,
-            ((merge.phase == gaugedesk_core::merge::MergePhase::Rejected
-                && merge.workspace_outcome == gaugedesk_core::merge::WorkspaceOutcome::Conflict)
-                || merge.phase == gaugedesk_core::merge::MergePhase::Repairing)
-                && rules.attention(Signal::Conflict) != Attention::Mute,
-        )
+        ((merge.phase == gaugedesk_core::merge::MergePhase::Rejected
+            && merge.workspace_outcome == gaugedesk_core::merge::WorkspaceOutcome::Conflict)
+            || merge.phase == gaugedesk_core::merge::MergePhase::Repairing)
+            && rules.attention(Signal::Conflict) != Attention::Mute
     }
 
     /// Whether moving this chat would discard or transplant workspace state. This is
@@ -3325,7 +3324,7 @@ impl Workbench {
             .get(&chat.instance_id)
             .map(|instance| instance.kind.chat_kind())
             .unwrap_or("work");
-        let (changes, conflict) = self.library_chat_status(&chat.id, rules);
+        let conflict = self.library_chat_conflicted(&chat.id, rules);
         let rehome_blocked = self.library_chat_rehome_blocked(&chat.id);
         let binding = self
             .library
@@ -3364,7 +3363,6 @@ impl Workbench {
             "candidate_revision": candidate_revision,
             "available_acts": available_acts,
             "workstream": chat_ws.get(&chat.id),
-            "changes": changes,
             "conflict": conflict,
             "rehome_blocked": rehome_blocked,
         })
@@ -3531,7 +3529,7 @@ impl Workbench {
                 let kind = inst
                     .map(|instance| instance.kind.chat_kind())
                     .unwrap_or("work");
-                let (changes, conflict) = self.library_chat_status(&chat.id, &rules);
+                let conflict = self.library_chat_conflicted(&chat.id, &rules);
                 let binding = lib
                     .chat_targets
                     .get(&chat.id)
@@ -3565,8 +3563,7 @@ impl Workbench {
                     "candidate_revision": candidate_revision,
                     "available_acts": self.available_target_acts(&chat.id),
                     "workstream": chat_ws.get(&chat.id),
-                    "changes": changes,
-                    "conflict": conflict,
+                            "conflict": conflict,
                     "rehome_blocked": self.library_chat_rehome_blocked(&chat.id),
                 })
             })
@@ -3865,9 +3862,6 @@ impl Workbench {
                         if m.phase == gaugedesk_core::merge::MergePhase::Rejected
                             && m.workspace_outcome
                                 == gaugedesk_core::merge::WorkspaceOutcome::Conflict),
-                    Signal::Changes => matches!(&merge, Some(m)
-                        if m.phase == gaugedesk_core::merge::MergePhase::Clean
-                            && m.review_requested),
                     // A newer attempt appends a newer summary, so reply clears
                     // by construction when the human speaks/runs again.
                     Signal::TurnSettled => {

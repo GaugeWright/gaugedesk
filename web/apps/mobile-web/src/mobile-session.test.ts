@@ -46,7 +46,8 @@ describe("createMobileSession", () => {
             queue: false,
             steer: false,
             stop: true,
-            stage: false,
+            hold: false,
+            fork: false,
             attachments: [],
         });
     });
@@ -61,23 +62,16 @@ describe("createMobileSession", () => {
         h.dispose();
     });
 
-    it("carries the review flag through to the turn", async () => {
-        const h = harness();
-        await h.session.send("hold this one", [], { review: true });
-        expect(h.api.runTask).toHaveBeenCalledWith(CHAT, "hold this one", [], true);
-        h.dispose();
-    });
-
     it("settles the sibling projections a turn may have changed", async () => {
         const h = harness();
-        await h.session.send("go", [], {});
+        await h.session.send("go", []);
         expect(h.onSettled).toHaveBeenCalledTimes(1);
         h.dispose();
     });
 
     it("gives a failed send's text back rather than dropping it", async () => {
         const h = harness({ runTask: async () => { throw new Error("relay dropped"); } });
-        await expect(h.session.send("typed with thumbs", [], {})).rejects.toThrow("relay dropped");
+        await expect(h.session.send("typed with thumbs", [])).rejects.toThrow("relay dropped");
         expect(h.onSendFailed).toHaveBeenCalledWith("typed with thumbs");
         // And the Session settles: a failure must not leave the composer busy.
         expect(h.session.busy()).toBe(false);
@@ -88,7 +82,7 @@ describe("createMobileSession", () => {
         const h = harness({ runTask: () => new Promise(() => {}) });
         expect(h.session.turnActivity()).toEqual({ state: "idle" });
 
-        void h.session.send("what changed?", [], {});
+        void h.session.send("what changed?", []);
         expect(h.session.busy()).toBe(true);
         // Dispatched, nothing streamed back yet.
         expect(h.session.turnActivity()).toEqual({ state: "awaiting_model" });
@@ -108,7 +102,7 @@ describe("createMobileSession", () => {
     it("refuses a send with no chat open instead of inventing one", async () => {
         const h = harness();
         h.setEngagement(null);
-        await expect(h.session.send("into the void", [], {})).rejects.toThrow(/Open a chat/);
+        await expect(h.session.send("into the void", [])).rejects.toThrow(/Open a chat/);
         expect(h.api.runTask).not.toHaveBeenCalled();
         h.dispose();
     });

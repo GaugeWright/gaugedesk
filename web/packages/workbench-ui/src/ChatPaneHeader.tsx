@@ -34,8 +34,6 @@ export interface ChatPaneHeaderProps {
     readonly tone?: ChatRunTone;
     /** The chat hit a sync conflict (projection, WS-H c) — gem input, not a second flag. */
     readonly conflict?: boolean;
-    /** The chat has a finished turn's changes awaiting keep (projection, WS-H b). */
-    readonly changes?: boolean;
     /** The state as words, for assistive technology and the run-phase lane. */
     readonly statusLabel?: string;
     /** The raw engine phase, carried through for the browser lane's assertions. */
@@ -104,7 +102,6 @@ export function ChatPaneHeader(props: ChatPaneHeaderProps): JSX.Element {
                             kind={kind()}
                             tone={props.tone}
                             conflict={props.conflict}
-                            changes={props.changes}
                         />
                         {/* The state in words. Visually redundant with the gem's colour,
                             which is the point: colour is never the only carrier. */}

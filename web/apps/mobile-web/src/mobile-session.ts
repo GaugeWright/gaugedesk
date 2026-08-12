@@ -55,7 +55,8 @@ export const MOBILE_COMPOSER_CAPABILITIES: ComposerCapabilities = Object.freeze(
     queue: false,
     steer: false,
     stop: true,
-    stage: false,
+    hold: false,
+    fork: false,
     attachments: [] as const,
 });
 
@@ -67,7 +68,6 @@ export interface MobileSessionApi {
         id: EngagementId,
         text: string,
         images?: { data: string; mimeType: string }[],
-        review?: boolean,
     ): Promise<unknown>;
     stopTurn(id: EngagementId): Promise<{ stopped: boolean }>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
@@ -117,13 +117,13 @@ export function createMobileSession(options: MobileSessionOptions): Session {
     // `images` is ignored rather than dropped silently: the capability set above
     // declares no attachments, so the shared composer never offers a way to
     // produce one and this parameter is always empty.
-    const send: Session["send"] = async (text, _images, turnOptions) => {
+    const send: Session["send"] = async (text) => {
         const id = options.engagementId();
         if (id === null) throw new Error("Open a chat before sending.");
         setDispatching(true);
         options.onStatus(`send: ${text}`);
         try {
-            await api.runTask(id, text, [], turnOptions?.review ?? false);
+            await api.runTask(id, text, []);
             options.onStatus("turn complete");
             options.onSettled();
         } catch (cause) {

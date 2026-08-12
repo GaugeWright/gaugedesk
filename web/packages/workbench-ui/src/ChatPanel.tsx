@@ -7,7 +7,8 @@
  * Session-backed composer. The panel shell and transcript are shared either way.
  */
 import {createSignal, Show, type JSX} from "solid-js";
-import { ChatComposer } from "./ChatComposer";
+import { ChatComposer, type ComposerMode } from "./ChatComposer";
+import { type ContextUsage } from "./ContextMeter";
 import { AudienceChats } from "./AudienceChats";
 import {
     createSessionComposerController,
@@ -84,6 +85,14 @@ export interface ChatPanelProps {
     readonly agentName?: string;
     /** Desktop already owns the panel container; preserve direct flex children. */
     readonly bare?: boolean;
+    /** Fork at the head, carrying the draft — the *composer's* fork. Distinct
+     *  from `Session.forkAt`, which the transcript uses to branch from a line you
+     *  are reading, and which this panel wires up separately. */
+    readonly onForkWithDraft?: () => void;
+    /** The standing default the per-chat mode falls back to, and a way to change
+     *  it. Omitted by hosts that do not persist a preference. */
+    readonly defaultMode?: ComposerMode;
+    readonly onSetDefaultMode?: (mode: ComposerMode) => void;
 }
 
 export function SessionComposer(props: {
@@ -94,6 +103,20 @@ export function SessionComposer(props: {
     controller?: SessionComposerController;
     inputRef?: (element: HTMLTextAreaElement) => void;
     quickStart?: boolean;
+    /** Context-window usage for the meter at the end of the rail. Hosts that
+     *  cannot measure it (the audience embed) leave it undefined. */
+    context?: ContextUsage;
+    /** Send the draft down a new branch of the conversation. The Session's
+     *  `forkAt` branches from an existing transcript entry, which is a different
+     *  primitive — this one forks at the head and carries the draft with it, so
+     *  it stays undefined until the runtime grows it rather than rendering a
+     *  button that cannot do anything. */
+    onFork?: () => void;
+    /** The standing default the per-chat mode falls back to, and a way to change
+     *  it. Hosts that do not persist a preference omit both and the menu row
+     *  does not appear. */
+    defaultMode?: ComposerMode;
+    onSetDefaultMode?: (mode: ComposerMode) => void;
 }): JSX.Element {
     if (!props.session && !props.controller) {
         throw new Error("SessionComposer requires a Session or a bound controller");
@@ -103,14 +126,20 @@ export function SessionComposer(props: {
         scope: () => String(session!.engagementId() ?? "session"),
         busy: session!.busy,
         capabilities: session!.composerCapabilities,
-        send: (text, images, options) => session!.send(text, images, options),
+        send: (text, images, composedId) => session!.send(text, images, composedId),
         stop: session!.stop,
         runtime: session!.composerRuntime,
         canCommand: session!.canCommand,
+        appliesComposedIdOnce: () => session!.appliesComposedIdOnce === true,
     });
     const hasAttachments = () => controller.capabilities().attachments.length > 0;
     const hasQueue = () => controller.capabilities().queue;
     const canSteer = () => controller.capabilities().steer;
+    // Stashing and the per-row hold are the same capability seen from two ends —
+    // keeping a queued message out of the running order — so they are offered
+    // together or not at all. Where the queue is runtime-owned neither appears
+    // yet, rather than appearing and silently doing nothing.
+    const canHold = () => hasQueue() && controller.canHold();
     return (
         <ChatComposer
             draft={controller.draft()}
@@ -119,20 +148,32 @@ export function SessionComposer(props: {
             attachments={controller.attachments()}
             busy={controller.busy()}
             blocked={controller.blocked()}
-            gated={controller.gated()}
-            reviewNext={controller.reviewNext()}
+            mode={controller.mode()}
+            onPickMode={controller.setMode}
+            defaultMode={props.defaultMode}
+            onSetDefaultMode={props.onSetDefaultMode}
             canSubmit={controller.canSubmit()}
             error={controller.error()}
             attaching={controller.attaching()}
             audience={props.audience}
             quickStart={props.quickStart}
             modelToolbar={controller.modelToolbar?.()}
+            modelToolbarStacked={controller.modelToolbar?.(true)}
+            context={props.context}
             onDraft={controller.setDraft}
-            onSubmit={controller.submit}
-            onSteer={canSteer() ? controller.steer : undefined}
+            onSubmit={(destination) => {
+                if (destination === "fork") props.onFork?.();
+                else if (destination === "stash") controller.stash();
+                // Steering during a running turn is the Session's steer, where it
+                // offers one; `submit` otherwise queues, which is the same
+                // destination the controller has always had.
+                else if (destination === "steer" && controller.busy() && canSteer()) controller.steer();
+                else controller.submit();
+            }}
             onStop={controller.capabilities().stop ? controller.stop : undefined}
-            onToggleGate={controller.capabilities().stage ? controller.toggleGate : undefined}
-            onToggleReview={controller.toggleReview}
+            onStash={canHold() ? controller.stash : undefined}
+            onHoldQueued={canHold() ? controller.holdQueued : undefined}
+            onFork={controller.capabilities().fork ? props.onFork : undefined}
             onAttachInput={hasAttachments() ? (event) => {
                 const input = event.currentTarget;
                 const files = Array.from(input.files ?? []);
@@ -235,6 +276,9 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                 placeholder={props.composerPlaceholder}
                 controller={props.composerController}
                 inputRef={props.composerInputRef}
+                onFork={props.onForkWithDraft}
+                defaultMode={props.defaultMode}
+                onSetDefaultMode={props.onSetDefaultMode}
             />
         </>
     );

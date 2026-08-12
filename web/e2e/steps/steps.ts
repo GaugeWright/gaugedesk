@@ -12,7 +12,7 @@
  * project is explicit and carries the zero-setup default placement.
  */
 
-import { expect, type Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -116,16 +116,10 @@ When("I task the agent with {string}", async ({ page }, prompt: string) => {
     // a placeholder match silently fails in edit chats (round10:6).
     const composer = page.locator('[data-desktop-composer] textarea[aria-label="Message"]');
     await composer.fill(prompt);
-    await composer.locator("xpath=following::button[normalize-space()='Send'][1]").click();
+    await sendDraft(composer);
     // Fake agent returns instantly; a real-model (@live) turn can take ~20s. The turn's
     // completion shows on the chat-status badge reaching the terminal run phase.
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Completed", { timeout: 45_000 });
-});
-
-When("I request review for the next change", async ({ page }) => {
-    const review = page.locator("[data-review-next]");
-    await review.click();
-    await expect(review).toHaveAttribute("aria-pressed", "true");
 });
 
 // ---- run lifecycle ----
@@ -135,34 +129,6 @@ Then("the run phase is {string}", async ({ page }, phase: string) => {
 });
 
 // ---- human task queue (top bar) ----
-
-Then("the task bar shows a review", async ({ page }) => {
-    await expect(page.locator("[data-testid=taskbar] [data-task]").first()).toBeVisible();
-});
-
-When("I complete the review from the task bar", async ({ page }) => {
-    // the active task carries the keep control; the just-tasked chat is selected.
-    // Keeping merges permanently, so the pill now arms on the first click and
-    // commits on the second (round-6 #2 two-click guard).
-    const keep = page.locator("[data-testid=taskbar] [data-task-keep]").first();
-    await keep.click();
-    await expect(keep).toHaveAttribute("data-arming", "1");
-    await keep.click();
-});
-
-Then("the review is cleared from the task bar", async ({ page }) => {
-    // The kept chat stays selected, so if its review were still pending it would
-    // show the active keep control. No keep control ⇒ its review cleared. (The
-    // queue is global, so other chats' pending reviews may legitimately remain.)
-    await expect(page.locator("[data-testid=taskbar] [data-task-keep]")).toHaveCount(0);
-});
-
-Then("the review task carries its archetype tag", async ({ page }) => {
-    // #22: the tab exposes its owning archetype as data-task-agent; the accent
-    // colour is keyed off it. Asserting the attribute is present proves the colour
-    // has a basis.
-    await expect(page.locator("[data-testid=taskbar] [data-task-agent]").first()).toBeVisible();
-});
 
 Given("an assignable onboarding task", async ({ page, request }) => {
     const response = await request.post(`${aliceCP}/test/reset?assignable_task=true`, {
@@ -851,11 +817,6 @@ Then("the diff shows {string}", async ({ page }, text: string) => {
     await expect(page.locator(".diff", { hasText: text })).toBeVisible();
 });
 
-// The merge review: the human admits the turn's diff (advance main).
-When("I keep the work", async ({ page }) => {
-    await page.locator("[data-merge-admit]").click();
-});
-
 // ---- the review/audit shelf (an overlay surface) ----
 
 When("I open the audit shelf", async ({ page }) => {
@@ -1067,19 +1028,99 @@ Then("the composer has no pending attachments", async ({ page }) => {
 // Start a turn without waiting for it to settle, so the queue can be exercised
 // while the agent is busy. Pair with a `[slow]` prompt to widen that window.
 When("I start tasking the agent with {string}", async ({ page }, prompt: string) => {
-    await page.getByPlaceholder("task the agent…").fill(prompt);
-    await page.getByRole("button", { name: /^send$/i }).click();
+    const composer = page.getByPlaceholder("task the agent…");
+    await composer.fill(prompt);
+    await sendDraft(composer);
 });
 
 Then("the agent is working", async ({ page }) => {
     await expect(page.getByTestId("agent-working")).toBeVisible();
 });
 
-// Type into the composer while busy and queue it (Enter == queue mid-turn).
+/** What a pointer aiming at the send button actually reaches.
+ *
+ *  The destination menu opens on hover and deliberately lays its **active row
+ *  over the button** (round 10), so that moving toward the menu never crosses an
+ *  un-hovered gap and a click without moving still hits the destination the
+ *  button was offering. Both dispatch the same thing, so for a person the two
+ *  are one control.
+ *
+ *  Playwright is stricter than a person: it hovers, the menu opens, the row is
+ *  now the hit target, and it refuses to click an element something else
+ *  intercepts — reporting the row's own glyph as the interceptor and retrying
+ *  until the test times out. Clicking the row is not a workaround for that; the
+ *  row is the honest target, because it is what the pointer lands on. */
+/** Send the draft the way the composer is built to be driven: ⏎ follows the mode,
+ *  and these steps all run in the default one.
+ *
+ *  Clicking the primary is deliberately awkward to automate, and the awkwardness
+ *  is the design rather than a defect. The destination menu lays its active row
+ *  over the button (round 10) so the pointer never crosses an un-hovered gap —
+ *  which means at rest the row's own centre is over the *textarea*, and hovered
+ *  it is over the button. Either way Playwright's hit-test finds something other
+ *  than the element it was asked to click and retries until the test times out.
+ *  The pointer path is real and is covered once, in `composer.feature`; every
+ *  other step here just needs the message sent. */
+const sendDraft = (composer: Locator) => composer.press("Enter");
+
+/** The delivery cluster: the primary button plus the destination menu that opens
+ *  over it. Hovering the *stack* is what arms the menu, so the pointer path has
+ *  to be driven in that order — hover the cluster, then act on what it shows. */
+const deliveryStack = (page: Page) =>
+    page.locator('[data-desktop-composer] .deliver-stack').last();
+
+When("I type {string} into the composer", async ({ page }, text: string) => {
+    await page.locator('[data-desktop-composer] textarea[aria-label="Message"]').fill(text);
+});
+
+When("I click the primary destination", async ({ page }) => {
+    const stack = deliveryStack(page);
+    // Hover first: at rest the menu is `pointer-events: none`, so the row that
+    // will receive this click is not yet the hit target.
+    await stack.hover();
+    await stack.locator(".deliver-option.primary").click();
+});
+
+When("I hover the primary destination", async ({ page }) => {
+    await deliveryStack(page).hover();
+});
+
+Then("the destination menu offers {string}", async ({ page }, destination: string) => {
+    // Assert against the whole offered set rather than one locator: a missing
+    // destination then fails with the list that *was* offered, which is the
+    // difference between "something is wrong" and knowing which capability the
+    // Environment declined. Scoped to the desktop composer — an unselected shell
+    // also mounts a quick-start composer.
+    const offered = page.locator("[data-desktop-composer] [data-deliver-option]");
+    await expect(offered.first()).toBeAttached();
+    const ids = await offered.evaluateAll((els) =>
+        els.map((el) => el.getAttribute("data-deliver-option")));
+    expect(ids, "destinations offered by the composer").toContain(destination);
+});
+
+// Enter follows the composer's mode, so a step that means "queue this" says so
+// with the chord that always reaches the queue whatever mode is set. Queueing
+// needs something to queue behind: use this only while a turn is running.
 When("I queue the message {string}", async ({ page }, text: string) => {
     await page.getByPlaceholder("task the agent…").fill(text);
-    await page.getByPlaceholder("task the agent…").press("Enter");
+    await page.getByPlaceholder("task the agent…").press("Control+Enter");
     await expect(page.getByTestId("queue-item").filter({ hasText: text })).toBeVisible();
+});
+
+// The same, for the destination that holds: joins the queue but nothing runs it.
+When("I stash the message {string}", async ({ page }, text: string) => {
+    await page.getByPlaceholder("task the agent…").fill(text);
+    await page.getByPlaceholder("task the agent…").press("Alt+Enter");
+    await expect(
+        page.getByTestId("queue-item").filter({ hasText: text }),
+    ).toHaveAttribute("data-held", "");
+});
+
+// Plain Enter, deliberately: this is the step for asserting what the *mode* does
+// with a message, so it must not name a destination.
+When("I send the message {string}", async ({ page }, text: string) => {
+    await page.getByPlaceholder("task the agent…").fill(text);
+    await page.getByPlaceholder("task the agent…").press("Enter");
 });
 
 // Stop a running turn (run-chat.md): abort, the composer re-enables.
@@ -1087,7 +1128,7 @@ When("I stop the turn", async ({ page }) => {
     await page.getByTestId("stop-turn").click();
 });
 Then("the composer is ready to send again", async ({ page }) => {
-    await expect(page.getByRole("button", { name: /^send$/i })).toBeVisible();
+    await expect(page.getByTestId("send-msg")).toBeVisible();
 });
 // Panel header labels.
 Then("the run pane is labelled {string}", async ({ page }, label) => {
@@ -1146,27 +1187,47 @@ Then("the {string} panel collapse control faces {string}", async ({ page }, titl
     await expect(icon).toHaveAttribute("data-direction", direction);
 });
 
-// The stage-gate (#24): stage messages without running them, then release. The
-// control is a single inline chip left of `send` (⏸ hold / ▶ release) — always
-// present when idle, no separate disclosure to reveal first.
-When("I enable the stage-gate", async ({ page }) => {
-    await page.locator("[data-queue-gate]").click();
-    await expect(page.locator("[data-queue-gate].gated")).toBeVisible();
-});
-When("I release the stage-gate", async ({ page }) => {
-    await page.locator("[data-queue-gate]").click();
+// The delivery mode (#24, superseding the stage-gate): what the primary button
+// and Enter do with the draft. The picker sits on the settings rail and never
+// folds into the compact expander, so there is nothing to reveal first.
+When("I set the composer mode to {string}", async ({ page }, mode: string) => {
+    await page.locator("[data-mode-picker]").click();
+    await page.locator(`[data-mode-menu] [data-mode-option="${mode}"]`).click();
+    await expect(page.locator("[data-mode-picker]")).toContainText(mode);
 });
 
-// Steer: send now, interrupting the running turn (front of the queue).
+// Put one held row back in the running order. Releasing the row at the head of
+// the line starts it, so the row may leave the queue as this returns.
+When("I release the held message {string}", async ({ page }, text: string) => {
+    await page.getByTestId("queue-item").filter({ hasText: text }).getByTestId("queue-hold").click();
+});
+
+// The whole point of holding: the runner takes the ready messages and steps over
+// the held ones, so the queue comes to rest holding exactly those. Counting with
+// a retry rather than waiting for idle — the gap between one turn settling and
+// the next draining is real, and `agent-working` is briefly hidden inside it.
+Then("the queue settles to {int} held message(s)", async ({ page }, n: number) => {
+    const rows = page.getByTestId("queue-item");
+    await expect(rows).toHaveCount(n, { timeout: 45_000 });
+    const held = await rows.evaluateAll((nodes) =>
+        nodes.every((node) => node.hasAttribute("data-held")));
+    expect(held).toBe(true);
+});
+
+// Steer: send now, interrupting the running turn (front of the queue). Driven by
+// its fixed chord rather than the primary button — while a turn runs the primary
+// wears the steer glyph and the destination menu covers it, so a click cannot
+// land (see `sendDraft`). The chord reaches steer from any mode by design.
 When("I steer with {string}", async ({ page }, text: string) => {
-    await page.getByPlaceholder("task the agent…").fill(text);
-    await page.getByTestId("steer-turn").click();
+    const composer = page.getByPlaceholder("task the agent…");
+    await composer.fill(text);
+    await composer.press("Control+Shift+Enter");
     // Steering interrupts one run and starts another asynchronously. Do not let
     // the following "agent finishes" observe the old run's brief idle edge
-    // before the redirected turn has been admitted.
-    await expect(
-        page.locator(".run .transcript .line.user", { hasText: text }),
-    ).toBeVisible();
+    // before the redirected turn has been admitted. Watching the composer take
+    // the draft is the earliest honest signal that it did: the steered turn's
+    // own user line is not a durable record the transcript re-read keeps.
+    await expect(composer).toHaveValue("");
 });
 
 Then(/^the queue shows (\d+) messages?$/, async ({ page }, n: string) => {
@@ -1217,11 +1278,6 @@ Then("the agent is idle", async ({ page }) => {
 // The chat-status badge (#4): a real coloured pill whose visible text is plain.
 Then("the chat status badge reads {string}", async ({ page }, label: string) => {
     await expect(page.getByTestId("run-phase")).toContainText(label);
-});
-
-// Generic: a visible button with the given (plain-language) label exists.
-Then("I see the button {string}", async ({ page }, label: string) => {
-    await expect(page.getByRole("button", { name: label, exact: true })).toBeVisible();
 });
 
 // ---- the place picker (#1, round 2) ----
@@ -1276,32 +1332,14 @@ Then("a chat titled {string} appears in the nav", async ({ page }, title: string
     await expect(page.locator("[data-chat].active .leaf-label", { hasText: title })).toBeVisible();
 });
 
-// ---- the hold (stage) control (#24): a single inline chip beside send ----
+// ---- holding messages before running (#24): a mode, not a chip ----
 
-Then("I can hold messages before running", async ({ page }) => {
-    await expect(page.locator("[data-queue-gate]")).toBeVisible();
+Then("I can stash messages before running", async ({ page }) => {
+    await page.locator("[data-mode-picker]").click();
+    await expect(page.locator('[data-mode-menu] [data-mode-option="stash"]')).toBeVisible();
 });
 
 // ---- round 3: honest discard, settings link, grouped all-chats ----
-
-// Discard the reviewed change (#1). The change must be reviewable (phase Clean).
-When("I discard the work", async ({ page }) => {
-    await page.locator("[data-merge-reject]").click();
-});
-
-// The honest end-state (#1): one plain "discarded" message, no "couldn't be kept"
-// blame, and a clear "it's gone" state instead of a stale diff to keep again.
-Then("the changes show an honest discarded state", async ({ page }) => {
-    await expect(page.locator("[data-merge-phase]")).toContainText("discarded");
-    await expect(page.locator(".merge-review")).not.toContainText("couldn't be kept");
-    await expect(page.locator(".discarded-note")).toBeVisible();
-});
-
-// After discarding, the only follow-up is to start over — not "fix it up" (#1).
-Then("I am offered to start over, not to fix it up", async ({ page }) => {
-    await expect(page.getByRole("button", { name: "start over", exact: true })).toBeVisible();
-    await expect(page.locator(".merge-review")).not.toContainText("fix it up");
-});
 
 // An archetype's settings open from its right-click menu (the empty-state hint
 // link was removed — settings/edit now live in the context menu).
@@ -1365,24 +1403,7 @@ Then("the split diff toggle is not offered at the default panel width", async ({
     await expect(page.locator(".diff-mode")).toHaveCount(0);
 });
 
-// The TASKS bar shows one canonical title, never the raw "new chat" placeholder (#4).
-Then("the task bar shows no chat literally titled {string}", async ({ page }, title: string) => {
-    await expect(
-        page.locator("[data-testid=taskbar] .task-title", { hasText: new RegExp(`^${title}$`) }),
-    ).toHaveCount(0);
-});
-
 // ---- round 5 ----
-
-// After a discard, the View tab must stop being silently contradictory (#1, the
-// deepest honest-feedback violation: Changes said "thrown away" while View showed
-// it present). Discard *isolates* the work (the backend keeps the engagement's
-// files), so View honestly still shows the text — but it now says so explicitly
-// rather than rendering it as if nothing happened.
-Then("the View tab explains the discarded changes are still on the private copy", async ({ page }) => {
-    await expect(page.locator("[data-view-discarded]")).toBeVisible();
-    await expect(page.locator("[data-view-discarded]")).toContainText("won't be kept");
-});
 
 // The tree rows are real treeitems a keyboard/SR user can reach and activate (#4).
 // Target the chat we just opened (the active row), not the first chat anywhere —
@@ -1470,22 +1491,6 @@ When("I reveal the raw event log", async ({ page }) => {
     await page.locator("[data-raw-log-toggle]").click();
 });
 
-// The top-bar keep arms on the first click and commits on the second (#2).
-When("I click keep on the task bar review", async ({ page }) => {
-    await page.locator("[data-testid=taskbar] [data-task-keep]").first().click();
-});
-
-Then("the task bar keep is armed for confirmation", async ({ page }) => {
-    await expect(page.locator("[data-testid=taskbar] [data-task-keep]").first()).toHaveAttribute(
-        "data-arming",
-        "1",
-    );
-});
-
-Then("the review is still pending in the task bar", async ({ page }) => {
-    await expect(page.locator("[data-testid=taskbar] [data-task]").first()).toBeVisible();
-});
-
 // The internal config file is folded out of the review by default (#4): the
 // changed-files count reads "1 file changed" and only the deliverable shows.
 Then("the changed-files review hides the internal settings file", async ({ page }) => {
@@ -1534,7 +1539,7 @@ When("the window is a short frame", async ({ page }) => {
 // The single most important control must be fully within the viewport — not
 // clipped off-panel and not scrolled below the fold.
 Then("the send button is fully on screen", async ({ page }) => {
-    const send = page.getByRole("button", { name: /^send$/i });
+    const send = page.getByTestId("send-msg");
     await expect(send).toBeVisible();
     const box = await send.boundingBox();
     const vp = page.viewportSize();
@@ -1647,11 +1652,6 @@ Then("the rename field has the existing name selected", async ({ page }) => {
 
 // ---- round 10: honest improve vocabulary, legible status, clearer review chrome ----
 
-// A button that must NOT be present (the work-chat verb inside an improve chat).
-Then("I do not see the button {string}", async ({ page }, label: string) => {
-    await expect(page.getByRole("button", { name: label, exact: true })).toHaveCount(0);
-});
-
 // #4 — the per-chat status was a 10px grey whisper; it must read at a legible size.
 Then("the status badge text is at least {int}px", async ({ page }, px: number) => {
     const size = await page
@@ -1748,7 +1748,7 @@ Then("the withheld context source is available", async ({ page }) => {
 When("I task the agent and let the turn settle", async ({ page }) => {
     const composer = page.locator('[data-desktop-composer] textarea[aria-label="Message"]');
     await composer.fill("produce something");
-    await composer.locator("xpath=following::button[normalize-space()='Send'][1]").click();
+    await sendDraft(composer);
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Completed", { timeout: 45_000 });
 });
 

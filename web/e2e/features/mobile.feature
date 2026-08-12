@@ -43,18 +43,3 @@ Feature: Mobile projection client — pair, navigate, send (offline + online)
     When I go online
     Then the offline banner is gone
     And I can send "do the work"
-
-  Scenario: the human task queue is reachable from the top bar
-    # mobile-client.md, "Top bar" → Next ③: the human task queue is a header
-    # affordance (not a carousel stop). A finished turn queues a review; the badge
-    # counts it, the ⌄ pull-down opens the full queue sheet (current-first), and a
-    # tap jumps to that task's chat. Previously the phone surfaced no tasks at all.
-    Given I have paired with the ticket "gaugewright-pair://demo-env/device:web-harness"
-    When I start a new chat on the device
-    And I request review for the next mobile change
-    And I can send "make a change"
-    Then the task queue badge appears
-    When I open the task queue
-    Then the task queue lists a review
-    When I jump to the first task from the queue
-    Then the chat composer is shown

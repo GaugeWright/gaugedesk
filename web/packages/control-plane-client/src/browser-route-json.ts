@@ -172,8 +172,8 @@ export function browserRouteJson(
             body: body !== undefined ? JSON.stringify(body) : undefined,
         });
         if (res.status === 409) {
-            const r = (await res.json()) as { rejected?: string };
-            throw new Rejected(r.rejected ?? "unknown");
+            const r = (await res.json()) as { rejected?: string; command_status?: string };
+            throw new Rejected(r.rejected ?? "unknown", r.command_status);
         }
         if (!res.ok) throw new Error(await routeError(method, path, res));
         return res.status === 204 ? null : res.json();

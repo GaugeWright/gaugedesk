@@ -1051,45 +1051,214 @@ input {
 .status-badge .status-dot { width: 7px; height: 7px; border-radius: 50%;
     background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
 
-/* The message is its own calm, full-width field. Decisions and delivery live in
-   the row below, so typing never competes with controls for horizontal space. */
-.composer-message { display: flex; min-width: 0; }
+/* The composer is ONE field. Every stroke inside it was removed: the textarea's
+   own border, the bordered pill around the action group, the attach divider, the
+   two `<select>` outlines, and the filled Send. What's left is a single edge that
+   lights on focus, with a chrome-free control rail sitting inside it. Controls
+   are separated by spacing, not by boxes. */
+.composer-field { display: flex; flex-direction: column; min-width: 0;
+    border: 1px solid var(--edge); border-radius: 10px; background: var(--bg);
+    box-shadow: 0 1px 0 rgba(255,255,255,0.025) inset;
+    transition: border-color 120ms ease, box-shadow 120ms ease; }
+.composer-field:focus-within { border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
 /* The textarea speaks at body size — the old 16px placeholder shouted over every
    other surface in the app. Comfortable target height comes from padding, not
    an inflated glyph size. It wraps and grows with the draft until the component's
    measured half-panel cap, then scrolls internally. */
-.composer-message textarea { box-sizing: border-box; width: 100%; min-width: 0; min-height: 36px;
-    padding: 8px 12px; border: 1px solid var(--edge); border-radius: 7px;
-    background: var(--bg); color: var(--ink); font: inherit; font-size: var(--fs-body);
-    line-height: 1.4; resize: none; white-space: pre-wrap; overflow-wrap: anywhere;
-    box-shadow: 0 1px 0 rgba(255,255,255,0.025) inset; }
-.composer-message textarea:focus { outline: none; border-color: var(--accent);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
-/* Model selection and message controls share a dedicated lower toolbar. The
-   model stays at the reading start; actions collect at the delivery end. */
-.composer-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; min-width: 0; }
-.composer-models { display: flex; align-items: center; gap: 8px; min-width: 0; overflow: auto hidden;
-    scrollbar-width: thin; }
-.composer-models > .model-picker:first-child { display: grid; grid-template-columns: auto minmax(0, 1fr);
-    flex: 1 1 auto; min-width: 0; }
-.composer-actions { margin-left: auto; display: flex; align-items: center; gap: 0; flex: 0 0 auto;
-    padding: 2px; border: 1px solid var(--edge); border-radius: 8px; background: var(--bg); }
-.model-picker { display: inline-flex; align-items: center; gap: 5px; font-size: var(--fs-small);
-    color: var(--muted); cursor: pointer; }
-.model-picker-tag { text-transform: uppercase; letter-spacing: 0.06em; font-size: var(--fs-label);
-    opacity: 0.7; }
-/* `color-scheme: dark` makes the browser render the native control AND its option
-   popup in dark mode (otherwise the popup defaults to a white sheet, leaving the
-   light `--ink` option text unreadable); the explicit option colours are a fallback
-   for engines that don't honour it on the popup. */
-.model-picker select { box-sizing: border-box; width: 100%; max-width: 100%; min-width: 0;
-    min-height: 28px; font-size: var(--fs-ui); color: var(--ink); background: transparent;
-    color-scheme: dark;
-    border: 1px solid var(--edge); border-radius: 6px; padding: 2px 6px; cursor: pointer; }
-.model-picker select option { background: var(--panel); color: var(--ink); }
-.model-picker select:hover { border-color: var(--accent); }
-/* The effort toggle sits beside the model picker; a thin divider keeps the two legible. */
-.effort-picker { padding-left: 8px; border-left: 1px solid var(--edge); }
+/* Delivery rides with the text. The gate and send sit at the end of the entry
+   line — bottom-aligned, so they track the last line as the draft grows — which
+   keeps the decision about *this message* beside the message. */
+.composer-entry { display: flex; align-items: flex-end; gap: 4px; min-width: 0;
+    padding: 0 5px 0 0; }
+.composer-input { box-sizing: border-box; flex: 1 1 auto; min-width: 0; min-height: 34px;
+    padding: 9px 2px 5px 11px; border: 0; background: transparent; color: var(--ink);
+    font: inherit; font-size: var(--fs-body); line-height: 1.45; resize: none;
+    white-space: pre-wrap; overflow-wrap: anywhere; }
+.composer-input:focus { outline: none; }
+.composer-input::placeholder { color: var(--muted); }
+.composer-deliver { display: flex; align-items: center; gap: 1px; flex: 0 0 auto;
+    padding-bottom: 4px; }
+
+/* The rail carries what the turn runs *on*, and how much of the window it is
+   carrying. It never wraps: below COMPACT_RAIL_WIDTH the component folds tools
+   and settings behind one expander instead, so delivery is never crushed. */
+.composer-rail { display: flex; align-items: center; gap: 8px; min-width: 0;
+    padding: 0 5px 4px 4px; }
+.composer-tools { display: flex; align-items: center; gap: 2px; min-width: 0; }
+/* Everything describing the next turn collects at the far end: model, effort,
+   what Enter does, and how full the window is. One statement about the run,
+   rather than settings scattered either side of an empty middle. */
+.composer-settings { display: flex; align-items: center; gap: 4px; margin-left: auto;
+    flex: 0 0 auto; }
+.composer-models { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.composer-models.stacked { display: grid; gap: 2px; }
+
+/* Every rail control is the same object: a muted glyph on nothing, which gains a
+   faint wash on hover. One grammar — the old rail mixed 11px/600 word buttons
+   ("review", "Queue") with icon buttons at the same weight. */
+.composer-icon { display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto;
+    padding: 3px; border: 0; border-radius: 5px; background: transparent;
+    color: var(--muted); cursor: pointer; transition: color 90ms ease, background 90ms ease; }
+.composer-icon:hover:not(:disabled) { color: var(--ink);
+    background: color-mix(in srgb, var(--ink) 9%, transparent); }
+.composer-icon:disabled { opacity: 0.4; cursor: default; }
+.composer-icon .icon { width: 15px; height: 15px; }
+/* An armed hold or review is a visible state, not a silent change to how send
+   behaves — it keeps the warn tone the bordered buttons used to carry. */
+.composer-icon.on { color: var(--warn); }
+.composer-icon.on:hover:not(:disabled) { color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 15%, transparent); }
+.composer-count { font: 600 var(--fs-label)/1 var(--ui); font-variant-numeric: tabular-nums;
+    padding-right: 1px; }
+/* Send is the one destination on the field. The rarer routes stack above it and
+   surface on hover or keyboard focus — four permanent glyphs made the ordinary
+   case (type, press send) look like a decision. Each row names its shortcut, so
+   the menu teaches its own way out of existence. */
+.deliver-stack { position: relative; display: inline-flex; flex: 0 0 auto; }
+/* The menu grows *from* the primary button rather than floating above it: its
+   last row — always the active mode's, see `destinations()` — sits *on* the
+   button. So there is no un-hovered gap for the pointer to cross, and a click
+   without moving hits the destination the button was already offering.
+   The offsets cancel the menu's border, its padding and the row's, so that row's
+   glyph lands exactly on the button's glyph rather than 104px to its left. */
+.deliver-menu { position: absolute; bottom: -2px; right: -8px; z-index: 61;
+    display: flex; flex-direction: column; gap: 1px; padding: 3px;
+    border: 1px solid var(--edge); border-radius: 8px; background: var(--panel);
+    box-shadow: 0 12px 30px rgba(0,0,0,0.44);
+    opacity: 0; pointer-events: none; transform: translateY(2px);
+    transition: opacity 110ms ease, transform 110ms ease; }
+/* The row standing in for the button keeps the button's tone, so the thing under
+   the pointer does not change meaning as the menu opens. */
+.deliver-option.primary { color: var(--accent); }
+.deliver-option.primary .icon { color: var(--accent); }
+.send-btn.holding ~ .deliver-menu .deliver-option.primary,
+.deliver-menu:has(~ .send-btn.holding) .deliver-option.primary { color: var(--warn); }
+.deliver-menu:has(~ .send-btn.holding) .deliver-option.primary .icon { color: var(--warn); }
+/* Revealed by hovering the cluster or tabbing into it. The rows stay in the DOM
+   at zero opacity rather than display:none, so `:focus-within` can fire — a
+   hidden button cannot be focused, and a keyboard-only route to three of the
+   four destinations is not optional. */
+.deliver-stack:hover .deliver-menu,
+.deliver-stack:focus-within .deliver-menu { opacity: 1; pointer-events: auto; transform: none; }
+/* label · shortcut · glyph — the glyph on the right so it sits over the button's.
+   The row is built to the button's exact height (15px glyph + 3px padding either
+   side = 21px) and carries the same 15px glyph. Matching the box beats nudging
+   offsets: a row 4px taller than the button can only be centred on it to within
+   a rounding error, and that error moves with the text. */
+.deliver-option { display: grid; grid-template-columns: 1fr auto auto; align-items: center;
+    gap: 10px; padding: 3px 7px; border: 0; border-radius: 5px; background: transparent;
+    color: var(--ink); font: 400 var(--fs-ui)/15px var(--ui); text-align: left;
+    white-space: nowrap; cursor: pointer; }
+.deliver-option:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+.deliver-option:disabled { opacity: 0.45; cursor: default; }
+.deliver-option .icon { width: 15px; height: 15px; color: var(--muted); }
+.deliver-option kbd { color: var(--muted); font: 400 var(--fs-label) var(--mono);
+    letter-spacing: 0.02em; }
+/* A settings menu whose value is itself iconic (the standing default mode). */
+.composer-menu-btn .lead { width: 13px; height: 13px; flex: 0 0 auto; opacity: 0.9; }
+/* Destination rows: glyph plus label. The consequence rides the tooltip — spelled
+   out under every row it turned a three-item menu into a paragraph. */
+.mode-option { justify-content: flex-start; gap: 9px; }
+.mode-option .icon { width: 15px; height: 15px; flex: 0 0 auto; color: var(--muted); }
+.mode-option.selected .icon { color: var(--accent); }
+/* The primary is the only accent in the composer, and it earns it only when
+   there is something to deliver. Enter already delivers; this is a reminder,
+   not a plea. In stash mode it takes the warn tone the held work carries
+   everywhere else, so a composer that will *not* run what you type says so
+   without being read. */
+.send-btn:not(:disabled) { color: var(--accent); }
+.send-btn:not(:disabled):hover { color: var(--accent-hover);
+    background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.send-btn.holding:not(:disabled) { color: var(--warn); }
+.send-btn.holding:not(:disabled):hover { color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 18%, transparent); }
+.stop-btn:not(:disabled) { color: var(--bad); }
+.stop-btn:not(:disabled):hover { color: var(--bad);
+    background: color-mix(in srgb, var(--bad) 16%, transparent); }
+.composer-working { padding: 4px 6px; color: var(--muted);
+    font: 400 var(--fs-small) var(--serif); }
+
+/* Model and effort are settings, not actions: the same quiet text button opening
+   the same menu, so the rail reads as one register. They sit in the sans (--ui)
+   face — these report values (a model id, a level), and values are read, not
+   operated. The model was a `flex: 1` native select, i.e. the widest element in
+   the composer. */
+.composer-menu-anchor { position: relative; display: inline-flex; min-width: 0; }
+.composer-menu-btn { display: inline-flex; align-items: center; gap: 3px; min-width: 0;
+    max-width: 22ch; padding: 2px 4px; border: 0; border-radius: 6px; background: transparent;
+    color: var(--muted); font: 500 var(--fs-small) var(--ui); cursor: pointer;
+    transition: color 90ms ease, background 90ms ease; }
+.composer-menu-btn:hover, .composer-menu-btn[aria-expanded="true"] { color: var(--ink);
+    background: color-mix(in srgb, var(--ink) 9%, transparent); }
+.composer-menu-btn > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-menu-btn .chev { width: 10px; height: 10px; flex: 0 0 auto; opacity: 0.7; }
+.composer-menu { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 61;
+    min-width: 220px; max-height: 44vh; overflow: auto; padding: 4px;
+    border: 1px solid var(--edge); border-radius: 8px; background: var(--panel);
+    box-shadow: 0 14px 36px rgba(0,0,0,0.42); }
+/* Right-anchored: the mode control sits at the delivery end of the field, so a
+   left-anchored menu hangs off the panel. The settings menus at the reading end
+   anchor left for the same reason, mirrored. */
+.composer-menu.mode-menu { left: auto; right: 0; min-width: 244px; }
+/* Settings live at the delivery end of the rail now, so their menus hang off the
+   right of the button. Left-anchored, effort and Enter opened past the panel
+   edge. The compact expander keeps its own left anchor — it sits at the reading
+   start, where there is room to the right. */
+.composer-settings .composer-menu { left: auto; right: 0; }
+.composer-menu-item { display: flex; width: 100%; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 5px 7px; border: 0; border-radius: 5px; background: transparent;
+    color: var(--ink); font: 400 var(--fs-ui) var(--ui); text-align: left; cursor: pointer; }
+.composer-menu-item:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.composer-menu-item:disabled { opacity: 0.45; cursor: default; }
+.composer-menu-item.selected { color: var(--accent); }
+/* The standing choice, named beside the momentary one. Muted and small: it
+   reports which row a new chat would land on, it is not a second thing to pick. */
+.composer-menu-note { flex: 0 0 auto; color: var(--muted); font-size: var(--fs-label);
+    letter-spacing: 0.02em; text-transform: lowercase; }
+/* Set-the-default sits under a rule, because it acts on every future chat rather
+   than on this one — a different kind of act, not a fourth mode. */
+.composer-menu-item.foot { margin-top: 4px; padding-top: 7px; color: var(--muted);
+    border-top: 1px solid var(--edge); border-radius: 0 0 5px 5px; }
+.composer-menu-item.foot:hover:not(:disabled) { color: var(--ink); }
+.composer-menu-item > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-menu-item small { flex: 0 0 auto; color: var(--muted); font-size: var(--fs-label);
+    text-transform: uppercase; letter-spacing: 0.05em; }
+/* Free-text model entry (ADR 0083) belongs with the models it competes with, not
+   as a second control in the rail. */
+.composer-menu-custom { display: grid; gap: 4px; margin-top: 4px; padding: 6px 7px 4px;
+    border-top: 1px solid var(--edge); color: var(--muted); font-size: var(--fs-label);
+    text-transform: uppercase; letter-spacing: 0.05em; }
+.composer-menu-custom input { min-width: 0; padding: 4px 6px; border: 1px solid var(--edge);
+    border-radius: 5px; background: var(--bg); color: var(--ink);
+    font: 400 var(--fs-ui) var(--ui); text-transform: none; letter-spacing: normal; }
+.composer-menu-custom input:focus { outline: none; border-color: var(--accent); }
+/* Inside the compact expander the two settings become labelled rows. */
+.composer-menu-anchor.row { display: grid; grid-template-columns: auto minmax(0, 1fr);
+    align-items: center; gap: 8px; padding: 2px 3px; }
+.composer-menu-row-label { color: var(--muted); font-size: var(--fs-label);
+    text-transform: uppercase; letter-spacing: 0.05em; }
+.composer-menu-anchor.row .composer-menu-btn { justify-self: end; }
+
+/* The narrow-rail expander. Its menu lets the settings' own menus escape rather
+   than clipping them, so the nested popovers still open above the field. */
+.composer-more-anchor { position: relative; display: inline-flex; }
+.composer-more { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 61;
+    min-width: 232px; overflow: visible; padding: 4px;
+    border: 1px solid var(--edge); border-radius: 8px; background: var(--panel);
+    box-shadow: 0 14px 36px rgba(0,0,0,0.42); }
+
+/* Context window: a bare ring at the far end of the rail. A gauge is read as a
+   fraction, which is the whole reason to glance at it — the digits said the same
+   thing more slowly. Exact counts live in the title. */
+.context-meter { display: inline-flex; align-items: center; flex: 0 0 auto;
+    padding: 2px; color: var(--muted); cursor: default; }
+.context-ring { width: 14px; height: 14px; flex: 0 0 auto; }
+.context-ring-track { fill: none; stroke: var(--edge); stroke-width: 2; }
+.context-ring-fill { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: butt; }
+.context-meter[data-tone="ok"] { color: var(--muted); }
+.context-meter[data-tone="warn"] { color: var(--warn); }
+.context-meter[data-tone="bad"] { color: var(--bad); }
 
 /* Account panel: the "models in the picker" checklist — a scrollable list of toggles. */
 .model-checklist { max-height: 280px; overflow: auto; margin: 0; padding: 0; list-style: none; }
@@ -1097,17 +1266,6 @@ input {
 .model-check { display: flex; align-items: center; gap: 8px; cursor: pointer; flex: 1; min-width: 0; }
 .model-check span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-check input { accent-color: var(--accent); flex: 0 0 auto; }
-.composer-action, .composer-primary { flex: 0 0 auto; min-height: 28px; white-space: nowrap;
-    display: inline-flex; align-items: center; justify-content: center; gap: 5px;
-    border-radius: 5px; font: 400 11px var(--ui); }
-.composer-action { padding: 3px 8px; color: var(--muted); background: transparent; border: 0; }
-.composer-action:hover:not(:disabled) { color: var(--ink); background: var(--edge); }
-.composer-action:disabled, .composer-primary:disabled { opacity: 0.55; cursor: default; }
-.composer-primary { margin-left: 2px; padding: 3px 10px; color: #fff; background: var(--accent); border: 1px solid var(--accent); }
-.composer-primary:hover:not(:disabled) { filter: brightness(1.1); }
-.composer-primary.stop-btn { color: var(--bad); background: transparent; border-color: var(--bad); }
-.composer-actions .attach-btn { width: 28px; padding: 3px; border-right: 1px solid var(--edge); border-radius: 4px 0 0 4px; }
-
 /* Pending message attachments: removable chips above the composer box. */
 .composer-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .composer-error { margin-bottom: 6px; padding: 6px 8px; border: 1px solid color-mix(in srgb, var(--bad) 55%, var(--edge));
@@ -1603,58 +1761,69 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
    transcript (flex:1) absorbs all slack, so the dock never scrolls out of view
    regardless of transcript length or window height. It's the bottom flex item
    and refuses to shrink, so the input is always reachable. */
-.composer-dock { flex: 0 0 auto; margin-top: 10px;
+/* The dock carries no rule of its own: the field's single edge already separates
+   the composer from the transcript, and a border on top of a border is exactly
+   the stacking this pass removes. */
+.composer-dock { flex: 0 0 auto; margin-top: 8px;
     display: flex; flex-direction: column; gap: 8px;
-    background: var(--panel); border-top: 1px solid var(--edge);
-    padding: 10px 0 4px; }
+    background: var(--panel); padding: 6px 0 4px; }
 
-/* The queue stage-gate (#24): a single inline chip in the composer, left of the
-   primary action — `⏸ hold` lines messages up without running them; `▶ release·N`
-   drains them in order. Quiet (muted) when idle; warn-toned while actively holding
-   so the held state is never silent. */
-.composer-actions .review-toggle.active { color: var(--warn); border-color: var(--warn);
-    background: color-mix(in srgb, var(--warn) 10%, transparent); }
-/* Armed hold is a visible state in the control bar, not a silent change to how
-   send works. */
-.composer-actions .queue-gate.gated { color: var(--warn); border-color: var(--warn);
-    background: color-mix(in srgb, var(--warn) 10%, transparent); }
-@media (max-width: 560px) {
-    .composer-toolbar { display: flex; align-items: flex-start; flex-wrap: wrap; }
-    .composer-models { flex: 1 1 100%; overflow: visible; }
-    .model-picker select { width: min(250px, 100%); }
-    .composer-actions { margin-left: 0; }
-}
 
 
 /* Queued messages stack on top of the box — next-to-run first. */
 .queue-stack { display: flex; flex-direction: column; gap: 4px; }
 .queue-cap { font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.06em;
     color: var(--muted); padding-left: 2px; }
-.queue-item { display: flex; align-items: center; gap: 8px; padding: 4px 8px;
+/* Held work is a promise, and this group header is the only place that state
+   lives now — the composer buttons stopped carrying it when the mode selector
+   went away. */
+.queue-cap.held { color: var(--warn); margin-top: 4px; }
+/* A held row is recessed rather than dimmed: it is not disabled, it is out of
+   the running order. Its controls stay at full strength. */
+.queue-item.held { border-style: dashed;
+    border-color: color-mix(in srgb, var(--warn) 42%, var(--edge));
+    background: color-mix(in srgb, var(--warn) 5%, var(--bg)); }
+.queue-hold-btn { color: var(--muted); }
+.queue-hold-btn:hover { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); }
+.queue-hold-btn.on { color: var(--warn); }
+/* Rows top-align now that the text wraps: on a three-line message, centred
+   controls float in the middle of the row with nothing to align to. */
+.queue-item { display: flex; align-items: flex-start; gap: 6px; padding: 4px 7px;
     background: var(--bg); border: 1px solid var(--edge); border-radius: 5px;
     font-size: var(--fs-ui); }
 .queue-item.dragging { opacity: 0.4; }
 .queue-item.over { border-color: var(--accent); box-shadow: 0 -2px 0 var(--accent) inset; }
-.queue-grip { cursor: grab; color: var(--muted); user-select: none; line-height: 1; }
+.queue-grip { display: inline-flex; align-items: center; height: 18px; cursor: grab;
+    color: var(--muted); user-select: none; }
+.queue-grip .icon { width: 13px; height: 13px; }
 .queue-grip:active { cursor: grabbing; }
-.queue-pos { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 1ch;
-    text-align: right; }
-.queue-review { color: var(--warn); font-size: var(--fs-label); text-transform: uppercase;
-    letter-spacing: 0.05em; }
-.queue-text { flex: 1; cursor: text; overflow: hidden; text-overflow: ellipsis;
-    white-space: nowrap; }
-.queue-edit { flex: 1; font-size: var(--fs-ui); padding: 2px 6px; }
-.queue-send-now { color: var(--muted); border-color: transparent; background: transparent;
-    padding: 0 6px; line-height: 1.4; font-size: var(--fs-label); }
-.queue-send-now:hover { color: var(--accent); border-color: var(--accent); }
-.queue-remove { color: var(--muted); border-color: transparent; background: transparent;
-    padding: 0 6px; line-height: 1.4; }
-.queue-remove:hover { color: var(--bad); border-color: var(--bad); }
+.queue-pos { flex: 0 0 auto; min-width: 1ch; height: 18px; line-height: 18px;
+    color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+/* Queued messages wrap. Truncating them hid the difference between two similar
+   instructions at exactly the moment you are deciding which to reorder, edit or
+   drop — and a queued message is short enough that showing it costs a line. */
+.queue-text { flex: 1; min-width: 0; cursor: text; white-space: pre-wrap;
+    overflow-wrap: anywhere; line-height: 1.35; }
+.queue-edit { flex: 1; min-width: 0; font-size: var(--fs-ui); padding: 2px 6px; }
+/* Row controls carry the same colour semantics as the composer rail, so a glyph
+   means the same thing wherever it appears: accent = dispatch, bad = destroy,
+   ink = an ordinary edit, muted = a passive handle. They are tinted at rest, not
+   only on hover — three identical grey glyphs make the destructive one findable
+   solely by position. */
+.queue-icon { display: inline-flex; align-items: center; flex: 0 0 auto; height: 18px; padding: 2px; border: 0;
+    border-radius: 5px; background: transparent; cursor: pointer;
+    transition: color 90ms ease, background 90ms ease; }
+.queue-icon .icon { width: 13px; height: 13px; }
+.queue-edit-btn { color: var(--ink); }
+.queue-edit-btn:hover { background: color-mix(in srgb, var(--ink) 13%, transparent); }
+/* The same up arrow as the composer's send, in the same accent: running a queued
+   message now is the same act, aimed at one row. */
+.queue-send-now { color: var(--accent); }
+.queue-send-now:hover { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.queue-remove { color: var(--bad); }
+.queue-remove:hover { background: color-mix(in srgb, var(--bad) 16%, transparent); }
 
 /* Steer is the assertive action (it interrupts) — tint it like stop. */
-.steer-btn { color: var(--warn); border-color: var(--warn); }
-.steer-btn:hover:not(:disabled) { background: var(--warn); color: #0f1115; border-color: var(--warn); }
-.steer-btn:disabled, .queue-btn:disabled { opacity: 0.45; cursor: default; }
 
 /* --- right-click context menu --- */
 .context-menu { position: fixed; z-index: 50; background: var(--panel); border: 1px solid var(--edge);

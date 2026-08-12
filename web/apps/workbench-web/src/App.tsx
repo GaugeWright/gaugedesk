@@ -73,10 +73,12 @@ import {
     FreshnessBanner,
     fromSnapshot,
     type ImageRef,
+    ComposerModelBar,
     Icon,
     initialFreshness,
     isPlaceholderTitle,
     loadTranscriptFilterPrefs as loadPrefs,
+    type ComposerMode,
     modelAcceptsImages,
     modelKey,
     modelOptions,
@@ -91,11 +93,13 @@ import {
     readChatModel,
     readChatProvider,
     readChatThinking,
-    readPolicyDiff,
     reduceFreshness,
     reduceTranscript as reduce,
     localTurnActivity,
     saveTranscriptFilterPrefs as savePrefs,
+    createIndexedDbOutboxStore,
+    loadDefaultComposerMode,
+    saveDefaultComposerMode,
     searchWithChat,
     searchWithFile,
     SessionProvider,
@@ -610,14 +614,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             setStatus(`couldn't set reasoning effort — ${String(e)}`);
         }
     }
-    // Whether the selected chat's pending change *loosens* the assistant's
-    // permissions (#5 round-4). The in-panel keep already gates this behind a
-    // confirm; the always-visible TASKS-bar pill must not be a one-click bypass for
-    // the same change. App owns the diff, so it can tell the pill to route a
-    // loosening change through the review instead of committing it from the bar.
-    const selectedLoosening = createMemo(() =>
-        readPolicyDiff(diff() ?? "").notes.some((n) => n.direction === "loosen"),
-    );
     // The files a turn actually changed, read from the diff (round-7 #3). The
     // Changes tab auto-renders the diff; View should not sit empty with a "pick a
     // file" hint when the turn touched exactly one file. When it did, and nothing
@@ -655,7 +651,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         // The gem's inputs, read from the same projection fields the
                         // navigation row reads, so the two cannot disagree.
                         conflict: c.conflict,
-                        changes: c.changes,
                         // The line this chat's work lands on: its workstream when it is
                         // homed to one, else the work target — the default mainline is a
                         // workstream of one.
@@ -686,7 +681,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     // An edit chat's context is the method it edits.
                     context: a.name,
                     conflict: c.conflict,
-                    changes: c.changes,
                     workstream: ws.workstreams.find((w) => w.id === c.workstream)?.name
                         ?? target?.name ?? String(c.targetId),
                     title: c.title,
@@ -874,9 +868,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         return undefined;
     };
     const busy = () => runToneOf(selected()) === "working";
-    // Per-change opt-in review (ADR 0096). It is captured into the queued message,
-    // then reset so the next turn returns to the shared-line auto-sync default.
-    const [reviewNext, setReviewNext] = createSignal(false);
     const [activity, setActivity] = createSignal(""); // what the agent is doing now
     // The agent's pending approvals from the last turn (UX-3): an `extension_ui_request`
     // the runtime surfaced but did not auto-confirm — answered out-of-band via the
@@ -899,6 +890,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // Persist the current filter as the user's default (the "Save as default"
     // action). Reverting to it is just re-seeding from storage.
     const saveFilterDefault = () => savePrefs(filterStorage, filterPrefs());
+    // The composer's *default* delivery mode. The mode itself is per chat and the
+    // controller owns it; this is only what a chat you have not chosen for opens
+    // as, so it is one value with one write — set from the mode menu, not from a
+    // settings screen built for a single preference.
+    const [defaultComposerMode, setDefaultComposerMode] = createSignal(
+        loadDefaultComposerMode(filterStorage),
+    );
+    const makeModeDefault = (mode: ComposerMode) => {
+        setDefaultComposerMode(mode);
+        saveDefaultComposerMode(filterStorage, mode);
+    };
     const [selectedFile, setSelectedFile] = createSignal<string | null>(null);
     // The inbound queue the content pane is showing (ADR 0110 §7). The queue is
     // the *project's*; the chat is only where a reviewer acts from — so both are
@@ -942,7 +944,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (reviewing() && reviewing()!.chat !== id) setReviewing(null);
         setSnapshot(empty);
         setLive(empty);
-        setReviewNext(false);
         void loadSnapshot(id);
         const unsubscribe = api.subscribe(
             id,
@@ -1015,7 +1016,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // Start a fresh chat on the hidden Personal default placement (ADR 0036) — the
     // same "just start typing" path as the nav's "+ new chat". Wired to the mobile
     // carousel's Chat tab so it's never a dead control when no chat is open yet.
-    async function startNewChat(initialPrompt?: string, images: ImageRef[] = [], review = false) {
+    async function startNewChat(initialPrompt?: string, images: ImageRef[] = []) {
         const prompt = initialPrompt?.trim();
         try {
             const eng = await api.createEngagement();
@@ -1042,7 +1043,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             if (prompt) {
                 // Let the selected-chat effect subscribe before the first turn starts;
                 // otherwise an eager turn can race the fresh transcript reset.
-                queueMicrotask(() => void runPrompt(eng.id, prompt, images, review).catch(() => undefined));
+                queueMicrotask(() => void runPrompt(eng.id, prompt, images).catch(() => undefined));
             }
         } catch (e) {
             setStatus(`couldn't start a chat — ${String(e)}`);
@@ -1071,7 +1072,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         id: EngagementId,
         prompt: string,
         images: ImageRef[] = [],
-        review = false,
+        // The outbox id this message was composed under (ADR 0137 §3). It becomes
+        // the turn's idempotency key, so a resend after an uncertain dispatch is
+        // answered by the receipt rather than guessed at by the client.
+        composedId?: string,
     ) {
         // This turn may run in the background while the user looks at a different
         // chat, so every *display-mutating* side effect is gated on `isCurrent()` —
@@ -1095,7 +1099,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         await maybeAutoTitle(id, prompt);
         setPendingApprovals([]); // a fresh turn clears the prior turn's pending approvals
         try {
-            const res = (await api.runTask(id, prompt, images, review)) as {
+            const res = (await api.runTask(id, prompt, images, composedId)) as {
                 pending_approvals?: string[];
                 run_phase?: string;
                 diff?: string;
@@ -1277,15 +1281,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // and its own inputs, and the two disagreed: the row could paint `error`, which
     // this could not express, so an errored turn showed a red row beside a calm
     // "Ready". Feed one fold from one set of inputs and agreement is structural.
+    //
+    // That fold also took a `changes` input until ADR 0136 retired the per-change
+    // review hold. A clean candidate no longer waits for a person, so the input could
+    // only ever be false; the run tone is the one thing left that can say "review".
     const chatConflict = () => chatInfo()?.conflict
         || merge()?.phase === "Repairing"
         || (merge()?.phase === "Rejected" && merge()?.git_outcome === "Conflict");
-    const chatChanges = () => chatInfo()?.changes
-        || (merge()?.phase === "Clean" && merge()?.review_requested);
     const chatState = createMemo<GemState>(() => gemState({
         tone: runToneOf(selected()),
         conflict: chatConflict(),
-        changes: chatChanges(),
     }));
     // The state as words — for assistive technology and the browser lane. Colour is
     // never the only carrier of the state.
@@ -1414,81 +1419,95 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         </div>
     );
 
-    const composerModelToolbar = () => (
-        <>
-            <label class="model-picker" title="Model for this chat — overrides the archetype's default for this conversation only">
-                <select
-                    data-model-picker
-                    aria-label="Model for this chat"
-                    value={modelValue()}
-                    onChange={(event) => void pickModel(event.currentTarget.value)}
-                >
-                    <For each={modelChoices()}>
-                        {(model) => <option value={model.id ? modelKey(model) : ""}>{model.label}</option>}
-                    </For>
-                </select>
-            </label>
-            <Show when={showCustomModel()}>
-                <label class="model-picker" title="Model id for your OpenAI-compatible endpoint — press Enter to pin it for this chat">
-                    <span class="model-picker-tag" aria-hidden="true">custom</span>
-                    <input
-                        data-custom-model
-                        aria-label="Custom model id for this chat"
-                        placeholder="model id (e.g. llama-3.3-70b)"
-                        value={customModel()}
-                        onInput={(event) => setCustomModel(event.currentTarget.value)}
-                        onKeyDown={(event) => event.key === "Enter" && void pinCustomModel(event.currentTarget.value)}
-                    />
-                </label>
-            </Show>
-            <Show when={showEffort()}>
-                <label class="model-picker effort-picker" title="Reasoning effort for this chat — higher is more deliberate (slower, costlier); Default uses the model's own setting">
-                    <span class="model-picker-tag" aria-hidden="true">effort</span>
-                    <select
-                        data-effort-picker
-                        aria-label="Reasoning effort for this chat"
-                        value={selected() ? chatThinking() : pendingThinking()}
-                        onChange={(event) => void pickThinking(event.currentTarget.value)}
-                    >
-                        <option value="">Default</option>
-                        <For each={effortLevels()}>
-                            {(level) => <option value={level}>{level}</option>}
-                        </For>
-                    </select>
-                </label>
-            </Show>
-        </>
+    const composerModelToolbar = (stacked?: boolean) => (
+        <ComposerModelBar
+            options={modelChoices()}
+            value={modelValue()}
+            onPick={(key) => void pickModel(key)}
+            effortLevels={showEffort() ? effortLevels() : []}
+            effort={selected() ? chatThinking() : pendingThinking()}
+            onPickEffort={(level) => void pickThinking(level)}
+            stacked={stacked}
+            customModel={showCustomModel()
+                ? {
+                    value: customModel(),
+                    onInput: setCustomModel,
+                    onCommit: (value) => void pinCustomModel(value),
+                }
+                : undefined}
+        />
     );
 
     // One controller drives both the selected Session and quick-start. The
     // Environment changes only its explicit capabilities and turn primitive.
     const desktopComposerController = createSessionComposerController({
+        defaultMode: defaultComposerMode,
+        // Durable on the owner's own machine (ADR 0137): a queued or stashed
+        // message survives a reload, a chat switch and an outage. IndexedDB
+        // rather than a string store because attachments are bytes.
+        outbox: createIndexedDbOutboxStore(),
         scope: () => selected() ? String(selected()) : "quick-start",
         busy: () => selected() ? busy() : false,
         capabilities: () => selected()
             ? UNIVERSAL_COMPOSER_CAPABILITIES
             : BASIC_COMPOSER_CAPABILITIES,
-        send: async (text, images, options) => {
+        send: async (text, images, composedId) => {
             const id = selected();
             if (id) {
-                await runPrompt(id, text, [...images], options.review ?? false);
+                await runPrompt(id, text, [...images], composedId);
             } else {
-                await startNewChat(text, [...images], options.review ?? false);
+                await startNewChat(text, [...images]);
             }
         },
+        // With a chat selected this sends a turn, which carries the composed id as
+        // its idempotency key and is refused on a second application (ADR 0137
+        // §3). With nothing selected it *creates a chat* and then runs a turn, and
+        // only the turn half is keyed — so a resend there would mint a second
+        // chat, which is worse than the message waiting for a person. The
+        // guarantee is claimed exactly where it holds.
+        appliesComposedIdOnce: () => Boolean(selected()),
         stop: stopTurn,
         draft: { value: paneDraft, set: setPaneDraft },
         retainDraftOnScopeChange: true,
-        review: { value: reviewNext, set: setReviewNext },
         modelToolbar: composerModelToolbar,
         acceptsImages: () => modelAcceptsImages({ id: chatModel(), provider: chatProvider() }),
         onStatus: setStatus,
     });
 
+    /** The composer's fork, which is not `forkAt`. `forkAt` branches from an
+     *  existing transcript entry and leaves you reading history; this branches at
+     *  the head and carries what you were *about* to say into the new line, so
+     *  the message you drafted is the first thing the branch runs.
+     *
+     *  The draft goes; the queue does not. What is queued was queued for this
+     *  conversation — silently moving it would be the composer deciding that the
+     *  messages you lined up here belong somewhere else. Attachments travel with
+     *  the draft because they are part of that one composed message.
+     *
+     *  Refuses rather than half-acts: if the branch cannot be made, the draft
+     *  stays where it is and the failure is reported. */
+    async function forkWithDraft() {
+        const id = selected();
+        if (!id) return;
+        const composed = desktopComposerController.takeComposed();
+        if (!composed) return;
+        try {
+            const branch = await api.forkChat(id);
+            openChat(branch);
+            await runPrompt(branch, composed.text, [...composed.images]);
+        } catch (error) {
+            composed.restore();
+            setStatus(`couldn't fork this chat — ${String(error)}`);
+        }
+    }
+
     const paneComposer = () => (
         <SessionComposer
             audience={false}
             controller={desktopComposerController}
+            onFork={selected() ? () => void forkWithDraft() : undefined}
+            defaultMode={defaultComposerMode()}
+            onSetDefaultMode={makeModeDefault}
             quickStart={!selected()}
             placeholder={selected() && chatKind() === "edit"
                 ? `Describe what to change about ${methodName() || "this archetype"}…`
@@ -1605,7 +1624,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 kind={selected() ? chatKind() : undefined}
                 tone={selected() ? runToneOf(selected()) : undefined}
                 conflict={selected() ? chatConflict() : undefined}
-                changes={selected() ? chatChanges() : undefined}
                 statusLabel={selected() ? STATE_LABEL[chatState()] : undefined}
                 statusPhase={selected() ? phase() : undefined}
                 context={selected() ? headerContext() : undefined}
@@ -1717,6 +1735,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     }
                     composerController={desktopComposerController}
                     composerInputRef={(element) => { composerEl = element; }}
+                    onForkWithDraft={selected() ? () => void forkWithDraft() : undefined}
+                    defaultMode={defaultComposerMode()}
+                    onSetDefaultMode={makeModeDefault}
                 />
             </Show>
         </>
@@ -1854,12 +1875,15 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         canCommand: () => true,
         merge: (action) => void onMerge(action),
         onContentSaved: () => void Promise.all([refetchDiff(), refetchMerge()]),
-        send: async (text, images = [], options = {}) => {
+        send: async (text, images = [], composedId) => {
             // A leaf may outlive one render turn during a selection change. Refuse
             // to route its command to a different engagement.
             if (selected() !== id) throw new Error("This chat is no longer selected.");
-            await runPrompt(id, text, [...images], options.review ?? false);
+            await runPrompt(id, text, [...images], composedId);
         },
+        // This leaf always has an engagement, so the composed id is always the
+        // turn's idempotency key and a resend is always answerable (ADR 0137 §3).
+        appliesComposedIdOnce: true,
         stop: async () => {
             if (selected() !== id) throw new Error("This chat is no longer selected.");
             await stopTurn();
@@ -2187,9 +2211,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             api={api}
                             selected={selected()}
                             refreshKey={navRefresh()}
-                            selectedLoosening={selectedLoosening()}
                             onSelect={openChat}
-                            onComplete={(id) => onMerge("admit", id)}
                             onReviewInbound={(project, id) => setReviewingProject(project, id)}
                         />
                     )}

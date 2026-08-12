@@ -35,7 +35,6 @@ export interface ControlPlane {
         id: EngagementId,
         prompt: string,
         images?: { data: string; mimeType: string }[],
-        review?: boolean,
     ): Promise<unknown>;
     stopTurn(id: EngagementId): Promise<{ stopped: boolean }>;
     engagementDiff(id: EngagementId): Promise<string>;
@@ -233,9 +232,8 @@ export class RemoteControlPlane implements ControlPlane {
         id: EngagementId,
         prompt: string,
         images: { data: string; mimeType: string }[] = [],
-        review = false,
     ) {
-        return workbench.runTask(this.transport(), id, prompt, images, review);
+        return workbench.runTask(this.transport(), id, prompt, images);
     }
 
     stopTurn(id: EngagementId) {

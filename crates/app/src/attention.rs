@@ -41,8 +41,6 @@ pub enum Signal {
     Question,
     /// The merge conflicted → ask `repair`.
     Conflict,
-    /// A clean merge awaits keep/reject → ask `review`.
-    Changes,
     /// The turn settled and the human hasn't spoken since → ask `reply`.
     /// Default **mute**: queuing every settled turn is exactly the noise
     /// ADR 0082 exists to kill — the operator opts in.
@@ -51,19 +49,13 @@ pub enum Signal {
 
 impl Signal {
     /// Every signal, in priority order (see the enum docs).
-    pub const ALL: [Signal; 4] = [
-        Signal::Question,
-        Signal::Conflict,
-        Signal::Changes,
-        Signal::TurnSettled,
-    ];
+    pub const ALL: [Signal; 3] = [Signal::Question, Signal::Conflict, Signal::TurnSettled];
 
     /// The wire/config name of this signal.
     pub fn key(self) -> &'static str {
         match self {
             Signal::Question => "question",
             Signal::Conflict => "conflict",
-            Signal::Changes => "changes",
             Signal::TurnSettled => "turn-settled",
         }
     }
@@ -73,7 +65,6 @@ impl Signal {
         match self {
             Signal::Question => "answer",
             Signal::Conflict => "repair",
-            Signal::Changes => "review",
             Signal::TurnSettled => "reply",
         }
     }
@@ -157,7 +148,6 @@ mod tests {
         let rules = AttentionRules::parse(None);
         assert_eq!(rules.attention(Signal::Question), Attention::Queue);
         assert_eq!(rules.attention(Signal::Conflict), Attention::Queue);
-        assert_eq!(rules.attention(Signal::Changes), Attention::Queue);
         assert_eq!(rules.attention(Signal::TurnSettled), Attention::Mute);
     }
 
@@ -166,13 +156,30 @@ mod tests {
         let rules = AttentionRules::parse(Some(
             r#"{"version":1,"rules":[
                 {"signal":"turn-settled","attention":"queue"},
-                {"signal":"changes","attention":"badge"},
-                {"signal":"changes","attention":"mute"}
+                {"signal":"conflict","attention":"badge"},
+                {"signal":"conflict","attention":"mute"}
             ]}"#,
         ));
         assert_eq!(rules.attention(Signal::TurnSettled), Attention::Queue);
-        assert_eq!(rules.attention(Signal::Changes), Attention::Badge);
+        assert_eq!(rules.attention(Signal::Conflict), Attention::Badge);
         // unnamed signals keep their defaults
+        assert_eq!(rules.attention(Signal::Question), Attention::Queue);
+    }
+
+    /// A rules document written before ADR 0136 can still name `changes`. The
+    /// parser already drops rules for signals it does not know — the same
+    /// tolerance that makes it forward-compatible with a newer writer makes it
+    /// backward-compatible with a retired signal, so a stored config does not
+    /// have to be migrated to keep working.
+    #[test]
+    fn a_rule_naming_the_retired_changes_signal_is_ignored() {
+        let rules = AttentionRules::parse(Some(
+            r#"{"version":1,"rules":[
+                {"signal":"changes","attention":"mute"},
+                {"signal":"conflict","attention":"badge"}
+            ]}"#,
+        ));
+        assert_eq!(rules.attention(Signal::Conflict), Attention::Badge);
         assert_eq!(rules.attention(Signal::Question), Attention::Queue);
     }
 
@@ -182,11 +189,11 @@ mod tests {
             "not json",
             "{}",
             r#"{"rules":"nope"}"#,
-            r#"{"rules":[{"signal":"unknown","attention":"queue"},{"signal":"changes"},{"signal":"changes","attention":"loud"}]}"#,
+            r#"{"rules":[{"signal":"unknown","attention":"queue"},{"signal":"conflict"},{"signal":"conflict","attention":"loud"}]}"#,
         ] {
             let rules = AttentionRules::parse(Some(raw));
             // every unusable rule is ignored; defaults hold
-            assert_eq!(rules.attention(Signal::Changes), Attention::Queue, "{raw}");
+            assert_eq!(rules.attention(Signal::Conflict), Attention::Queue, "{raw}");
             assert_eq!(
                 rules.attention(Signal::TurnSettled),
                 Attention::Mute,

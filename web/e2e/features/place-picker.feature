@@ -26,6 +26,6 @@ Feature: Choosing what to place, and quieter power controls (round 2)
     When I task the agent with "draft a spring campaign tagline"
     Then a chat titled "draft a spring campaign tagline" appears in the nav
 
-  Scenario: the hold control sits inline beside send
+  Scenario: messages can be held before they run
     Given a new engagement
-    Then I can hold messages before running
+    Then I can stash messages before running

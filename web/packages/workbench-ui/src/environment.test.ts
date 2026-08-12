@@ -28,13 +28,11 @@ function controlPlane(): ControlPlane {
             phase: "Idle",
             thread_state: "idle",
             git_outcome: "Unknown",
-            review_requested: false,
         })),
         mergeCommand: vi.fn(async () => ({
             phase: "Idle",
             thread_state: "idle",
             git_outcome: "Unknown",
-            review_requested: false,
         })),
         getTree: vi.fn(async () => []),
         getFile: vi.fn(async () => ""),

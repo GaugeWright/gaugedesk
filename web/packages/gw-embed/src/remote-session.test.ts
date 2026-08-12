@@ -8,7 +8,6 @@ const idleMerge: MergeState = {
     phase: "Idle",
     thread_state: "",
     git_outcome: "Unknown",
-    review_requested: false,
 };
 
 /** Minimal fake edge API that captures live events and records commands. */

@@ -48,20 +48,26 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         setTurnActivity(observation),
     );
     const busy = () => dispatching() || turnActivity().state !== "idle";
-    const [turnQueue, setTurnQueue] = createSignal(
-        (api.getTurnQueue?.() ?? []).map((item) => ({
-            id: item.command_id,
-            text: item.text,
-        })),
-    );
+    const asRow = (item: { command_id: string; text: string }) => ({
+        id: item.command_id,
+        text: item.text,
+    });
+    const [turnQueue, setTurnQueue] = createSignal((api.getTurnQueue?.() ?? []).map(asRow));
     const unsubscribeQueue = api.subscribeTurnQueue?.((queue) => {
-        setTurnQueue(queue.map((item) => ({ id: item.command_id, text: item.text })));
+        setTurnQueue(queue.map(asRow));
     });
     const composerCapabilities = {
         ...UNIVERSAL_COMPOSER_CAPABILITIES,
         queue: Boolean(api.followUpTurn),
         steer: Boolean(api.steerTurn),
         stop: Boolean(api.stopTurn),
+        // Inherited from the universal set rather than negotiated: since ADR 0137
+        // a held row is simply one the outbox has not submitted, so holding needs
+        // nothing from the host and a visitor can stash wherever they can queue.
+        hold: Boolean(api.followUpTurn),
+        // A visitor's chat is one line of a hosted deployment; branching it is
+        // not a visitor's act, and no session verb offers it.
+        fork: false,
     };
     const composerRuntime =
         api.followUpTurn &&

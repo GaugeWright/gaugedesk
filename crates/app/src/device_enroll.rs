@@ -325,9 +325,21 @@ mod tests {
         assert_eq!(open_sealed(&device, &sealed).as_deref(), Some(&secret[..]));
         // A different subkey cannot open it (fail-closed AEAD under a different ECDH secret).
         assert_eq!(open_sealed(&wrong, &sealed), None);
-        // A tampered ciphertext fails to authenticate.
+        // A tampered ciphertext fails to authenticate. The tamper flips a bit
+        // rather than assigning a constant: `seal_to_subkey` draws a fresh random
+        // ECDH ephemeral key per call, so the ciphertext differs every run, and
+        // overwriting the first byte with "00" changed nothing on the 1-in-256
+        // seal that already began with it — the blob then decrypted correctly and
+        // the assertion below failed. Rare enough to read as a crypto defect
+        // rather than as the flaky test it was.
         let mut bad = sealed.clone();
-        bad.ciphertext.replace_range(0..2, "00");
+        let first = u8::from_str_radix(&sealed.ciphertext[0..2], 16).expect("hex ciphertext");
+        bad.ciphertext
+            .replace_range(0..2, &format!("{:02x}", first ^ 0xff));
+        assert_ne!(
+            bad.ciphertext, sealed.ciphertext,
+            "a tamper that does not change the blob proves nothing"
+        );
         assert_eq!(open_sealed(&device, &bad), None);
     }
 

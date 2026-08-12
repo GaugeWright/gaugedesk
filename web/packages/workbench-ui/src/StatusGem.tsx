@@ -38,17 +38,20 @@ const STATE_TITLE: Record<GemState, string | null> = {
 
 /** Fold the row's signals into the single most important state, most-urgent first:
  *  a **conflict** demands resolution; a live turn (working / error) is the most
- *  current fact; a finished turn or pending changes need **review**; else idle. Pure,
- *  so the precedence is unit-tested without rendering. */
+ *  current fact; a chat with an open ask needs **review**; else idle. Pure, so the
+ *  precedence is unit-tested without rendering.
+ *
+ *  The run tone is the only source of "review" now. It used to be joined by a
+ *  `changes` projection flag reporting a clean candidate held for per-change
+ *  review; ADR 0136 retired the hold, so that flag could only ever be false. */
 export function gemState(opts: {
     readonly tone?: ChatRunTone;
     readonly conflict?: boolean;
-    readonly changes?: boolean;
 }): GemState {
     if (opts.conflict) return "conflict";
     if (opts.tone === "working") return "working";
     if (opts.tone === "error") return "error";
-    if (opts.changes || opts.tone === "review") return "review";
+    if (opts.tone === "review") return "review";
     return "idle";
 }
 
@@ -58,8 +61,6 @@ export function StatusGem(props: {
     readonly tone?: ChatRunTone;
     /** The chat hit a sync/merge conflict being repaired (projection, WS-H c). */
     readonly conflict?: boolean;
-    /** The chat has a finished turn's changes awaiting keep (projection, WS-H b). */
-    readonly changes?: boolean;
 }): JSX.Element {
     const state = () => gemState(props);
     // When the row has a live state, its hover text names it; idle falls back to the

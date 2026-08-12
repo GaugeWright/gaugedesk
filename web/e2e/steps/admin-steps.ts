@@ -810,7 +810,9 @@ Then("the Admin Environment shows the serving machine as live", async ({ page })
 When("I ask the admin agent about Machines", async ({ page }) => {
     const composer = page.getByPlaceholder("task the admin agent…");
     await composer.fill("Which Machines, Homes, projects, and placements are under control?");
-    await composer.locator("xpath=following::button[normalize-space()='Send'][1]").click();
+    // ⏎ follows the composer's mode; see `sendDraft` in steps.ts for why the
+    // primary button is not clicked here.
+    await composer.press("Enter");
 });
 
 Then("the admin agent answers from admitted Home projections", async ({ page }) => {
@@ -822,7 +824,9 @@ Then("the admin agent answers from admitted Home projections", async ({ page }) 
 When("I ask the Administration agent to propose inviting {string}", async ({ page }, authority: string) => {
     const composer = page.getByPlaceholder("task the admin agent…");
     await composer.fill(`/propose member.invite ${JSON.stringify({ authority, email: authority, role: "member" })}`);
-    await composer.locator("xpath=following::button[normalize-space()='Send'][1]").click();
+    // ⏎ follows the composer's mode; see `sendDraft` in steps.ts for why the
+    // primary button is not clicked here.
+    await composer.press("Enter");
 });
 
 Then("the Administration agent opens a reviewable member proposal for {string}", async ({ page }, authority: string) => {

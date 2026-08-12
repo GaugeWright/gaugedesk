@@ -949,9 +949,9 @@ export class WorkbenchControlPlane implements ControlPlane {
         id: EngagementId,
         prompt: string,
         images: { data: string; mimeType: string }[] = [],
-        review = false,
+        composedId?: string,
     ): Promise<unknown> {
-        return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images, review);
+        return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images, composedId);
     }
 
     stopTurn(id: EngagementId): Promise<{ stopped: boolean }> {

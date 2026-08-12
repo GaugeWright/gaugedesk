@@ -153,4 +153,23 @@ describe("browserRouteJson error surfacing", () => {
         const json = browserRouteJson("http://cp");
         await expect(json("POST", "/scopes/s/run", {})).rejects.toThrowError(Rejected);
     });
+
+    it("carries the command-receipt status, which is what separates ran from running", async () => {
+        // A caller retrying under a stable key has to tell "it already happened"
+        // from "it might be happening" (ADR 0137 §3). The reason string conflates
+        // them; the receipt status does not.
+        stubFetch(
+            new Response(
+                JSON.stringify({
+                    rejected: "command already applied; refresh its projection",
+                    command_status: "applied",
+                }),
+                { status: 409, headers: { "content-type": "application/json" } },
+            ),
+        );
+        const json = browserRouteJson("http://cp");
+        await expect(json("POST", "/chats/c/task", {})).rejects.toMatchObject({
+            commandStatus: "applied",
+        });
+    });
 });

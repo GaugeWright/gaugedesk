@@ -272,9 +272,8 @@ export class MobileControlPlane implements FacetBrowserApi {
         id: EngagementId,
         prompt: string,
         images: { data: string; mimeType: string }[] = [],
-        review = false,
     ): Promise<unknown> {
-        return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images, review);
+        return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images);
     }
 
     stopTurn(id: EngagementId): Promise<{ stopped: boolean }> {

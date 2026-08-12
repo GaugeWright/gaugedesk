@@ -7,6 +7,7 @@ import {
     getResourceReview,
     resourceExportCommand,
     resourceReviewCommand,
+    runTask,
 } from "./control-plane-workbench";
 
 describe("resource protection routes", () => {
@@ -71,5 +72,32 @@ describe("exportResourceToDisk", () => {
         await expect(
             exportResourceToDisk(transport, engagementId("chat-1"), "out-1", "/tmp/delivery"),
         ).rejects.toThrow("malformed exported files");
+    });
+});
+
+describe("running a turn", () => {
+    it("keys the turn on the composed id, so a resend is the same command", async () => {
+        // ADR 0137 §3. The key has to be the id the message was *composed* under,
+        // not one minted per attempt — that is the difference between a resend the
+        // host recognises and a second turn.
+        const json = vi.fn().mockResolvedValue({});
+        const transport = { base: "", json } as WorkbenchTransport;
+        await runTask(transport, engagementId("chat-1"), "go", [], "outbox-7");
+        expect(json).toHaveBeenCalledWith(
+            "POST",
+            "/chats/chat-1/task",
+            { prompt: "go" },
+            { idempotencyKey: "outbox-7" },
+        );
+    });
+
+    it("leaves the key to the transport when no composed id is offered", async () => {
+        // A caller with no outbox still gets a fresh key per attempt from the
+        // request edge. Sending `undefined` here rather than a fabricated id keeps
+        // "this is one identified message" from being claimed falsely.
+        const json = vi.fn().mockResolvedValue({});
+        const transport = { base: "", json } as WorkbenchTransport;
+        await runTask(transport, engagementId("chat-1"), "go");
+        expect(json).toHaveBeenCalledWith("POST", "/chats/chat-1/task", { prompt: "go" }, undefined);
     });
 });
