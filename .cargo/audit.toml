@@ -10,21 +10,30 @@ ignore = [
   # RUSTSEC-2023-0071 — "Marvin Attack: key recovery through timing sidechannels"
   # in `rsa` 0.9.x (no fixed upgrade available upstream).
   #
-  # Reachability: `rsa` is a transitive dependency of `sev` (SEV-SNP attestation),
-  # used ONLY for public-key VERIFICATION of AMD's built-in ARK/ASK certificate
-  # chain and the attestation report signature
-  # (`crates/app/src/sev_snp_verifier.rs` — `(&chain, &report).verify()`).
+  # Reachability: `rsa` reaches this repository through `jsonwebtoken` 11, and
+  # through nothing else — `jsonwebtoken 11.0.0 -> rsa 0.9.10` is the only edge
+  # into it in either lockfile. It is used for RS256 id-token signature
+  # VERIFICATION at the OIDC boundary: `crates/app/src/identity_oidc.rs` builds
+  # `DecodingKey::from_rsa_pem` and `DecodingKey::from_rsa_components` from an
+  # issuer's published JWKS, and verifies with a public key.
   #
   # The Marvin attack recovers an RSA *private* key via a timing oracle on RSA
-  # *decryption / private-key* operations. This codebase performs NO RSA
-  # private-key operation: it only verifies signatures over AMD-controlled
-  # certificates with public keys. The attack is therefore not applicable.
+  # *decryption / private-key* operations. Product code performs none. The only
+  # `EncodingKey::from_rsa_pem` calls in the tree are inside the `#[cfg(test)]`
+  # module of `crates/app/src/auth_oidc.rs`, which mints fixture tokens for the
+  # verifier's own tests against a throwaway key. The attack does not apply.
   #
-  # Defense in depth: the SEV-SNP verifier path is only active under real
-  # attestation (`AttestationMode::RealRequired` against a confidential VM,
-  # D-ATTEST — deferred), not in the default product surface.
+  # Re-triaged 2026-08-12, and the previous rationale was wrong about this
+  # repository. It said `rsa` arrived via `sev` (SEV-SNP attestation) and cited
+  # `crates/app/src/sev_snp_verifier.rs`. Neither exists here: `sev` is absent
+  # from both lockfiles and no such file is tracked. That analysis describes
+  # `gaugewright-cloud`, which does carry the attestation crate, and was
+  # evidently carried across. The conclusion happened to survive the correction
+  # — verification-only either way — but it was resting on the wrong evidence,
+  # and a triage record that names a dependency path the repository does not
+  # have cannot be audited by the next reader.
   #
-  # Triaged 2026-06-26. Re-evaluate if `rsa` ever lands on a private-key path or
-  # a fixed release ships.
+  # Re-evaluate if `rsa` ever lands on a private-key path — signing RS256 or
+  # PS256 in product code, or an RSA decryption — or if a fixed release ships.
   "RUSTSEC-2023-0071",
 ]

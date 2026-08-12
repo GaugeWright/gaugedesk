@@ -102,6 +102,11 @@ pub use app_support::{
     AttestationMode, RuntimePackageDescriptor, DEFAULT_AGENT, DEFAULT_INSTANCE, DEFAULT_PLACEMENT,
     DEFAULT_PROJECT, LOCAL_AUTHORITY,
 };
+// The desktop shell reads its prefixed environment through this. The
+// architecture boundary allows `gaugedesk-desktop -> gaugedesk-app` and nothing
+// else local, so the shell reaches the env accessor the same way it reaches
+// every other crate behind this one: re-exported here, not depended on directly.
+pub use gaugedesk_env::var;
 pub use gaugedesk_whip_runtime::{
     AdmittedPolicyEpoch, DoHostConfig, DoHostRequest, DoHostResponse, DoHostTransport,
     PolicyAdmissionError, PolicyEpoch, WhipHarnessFactory,

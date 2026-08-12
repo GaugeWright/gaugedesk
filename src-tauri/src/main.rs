@@ -55,8 +55,8 @@ fn main() {
             // client's data — db, workspaces, transcripts — onto the consultant's unmanaged
             // endpoint, the exact leak thin mode exists to prevent). Hard-exit with a clear
             // operator message instead of degrading open.
-            let org_cp = gaugedesk_env::var("ORG_CP");
-            let require_org_cp = gaugedesk_env::var("REQUIRE_ORG_CP").as_deref() == Some("1");
+            let org_cp = gaugedesk_app::var("ORG_CP");
+            let require_org_cp = gaugedesk_app::var("REQUIRE_ORG_CP").as_deref() == Some("1");
             let decision =
                 cp_launch_decision(org_cp.as_deref(), require_org_cp).unwrap_or_else(|msg| {
                     eprintln!("[gaugewright] FATAL: {msg}");
