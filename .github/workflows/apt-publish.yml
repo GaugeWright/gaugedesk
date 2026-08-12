@@ -22,6 +22,7 @@ jobs:
   publish:
     name: promote Debian release
     runs-on: ${{ github.repository == 'GaugeWright/gaugedesk' && 'ubuntu-22.04' || 'blacksmith-4vcpu-ubuntu-2204' }}
+    timeout-minutes: 30
     environment: production
     env:
       AWS_REGION: auto

@@ -53,6 +53,7 @@ jobs:
   rust:
     name: rust (fmt · clippy · test)
     runs-on: ${{ github.repository == 'GaugeWright/gaugedesk' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       # rustup materializes the toolchain named in rust-toolchain.toml.
@@ -69,6 +70,7 @@ jobs:
     if: ${{ github.event.repository.private == false }}
     name: architecture boundaries
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v7
