@@ -345,26 +345,110 @@ pub fn contains_secret(value: &Value) -> bool {
     }
 }
 
+/// Vendor token prefixes whose body is strictly alphanumeric, with the length
+/// the whole word must reach. Kept apart from [`MIXED_BODY_PREFIXES`] because a
+/// dash would otherwise make `asia-southeast1-something`, an ordinary GCP
+/// hostname, read as an AWS key id — the AWS prefixes are the ones that need
+/// the charset to be narrow, and both of theirs are exactly 20 alphanumerics.
+const ALPHANUMERIC_BODY_PREFIXES: &[(&str, usize)] = &[
+    ("akia", 20), // AWS access key id: exactly 20 characters
+    ("asia", 20), // AWS temporary access key id
+];
+
+/// Vendor token prefixes whose body may carry `-` or `_`.
+const MIXED_BODY_PREFIXES: &[(&str, usize)] = &[
+    // Google API keys are `AIza` plus 35 characters drawn from an alphabet that
+    // includes `-` and `_`, so this one cannot take the narrow charset above.
+    // Its length floor is what keeps prose out, and at 35 characters that is
+    // enough on its own.
+    ("aiza", 35),
+    ("sk-", 15),         // OpenAI and Anthropic, including `sk-ant-`
+    ("ghp_", 20),        // GitHub personal access token, classic
+    ("gho_", 20),        // GitHub OAuth
+    ("ghu_", 20),        // GitHub user-to-server
+    ("ghs_", 20),        // GitHub server-to-server
+    ("ghr_", 20),        // GitHub refresh
+    ("github_pat_", 20), // GitHub fine-grained
+    ("glpat-", 20),      // GitLab
+    ("xoxb-", 15),       // Slack bot
+    ("xoxp-", 15),       // Slack user
+    ("xoxa-", 15),       // Slack app
+    ("xoxs-", 15),       // Slack session
+    ("npm_", 20),        // npm automation
+    ("dop_v1_", 20),     // DigitalOcean
+    ("whsec_", 20),      // Stripe webhook signing secret
+    ("sk_live_", 20),    // Stripe secret key
+    ("rk_live_", 20),    // Stripe restricted key
+];
+
+/// Keys whose assigned value is a credential by construction.
+const CREDENTIAL_KEYS: &[&str] = &[
+    "api_key",
+    "access_token",
+    "refresh_token",
+    "private_key",
+    "client_secret",
+    "secret_key",
+    "aws_secret_access_key",
+];
+
+/// Strip the punctuation a token picks up from prose and serialization —
+/// `"AKIA…",` in JSON, `(sk-…)` in a sentence — without eating the `-` and `_`
+/// the tokens themselves contain.
+fn token_word(word: &str) -> &str {
+    word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+}
+
+/// Best-effort detection of secret-shaped text, so a turn that would persist a
+/// credential into a transcript fails closed (`SECAUD-10`).
+///
+/// **This is a denylist and cannot be complete.** Base64, a line split, or a
+/// vendor prefix nobody has published yet all pass it. It is defence in depth
+/// behind [`contains_secret`], which admits tool arguments by key name and is
+/// the check that actually holds the boundary. Widen this when a format turns
+/// up; never read a pass as proof that there is no secret.
+///
+/// Every pattern carries a length floor, and the vendor prefixes constrain the
+/// shape of the body, because a false positive here rejects a turn a person
+/// asked for. `Asia`, `skew`, and "no API key is projected here" must all
+/// survive.
 pub fn contains_secret_text(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    lower.contains("-----begin private key")
-        || lower
-            .split_whitespace()
-            .any(|word| word.starts_with("sk-") && word.len() >= 15)
-        || lower.split("bearer ").skip(1).any(|tail| {
-            tail.split_whitespace()
-                .next()
-                .is_some_and(|token| token.len() >= 12)
-        })
-        || ["api_key", "access_token", "refresh_token", "private_key"]
+
+    // Any PEM private key, not just the unlabelled PKCS#8 header: RSA, EC, DSA,
+    // and OPENSSH each put their own label between the dashes, and the previous
+    // exact match on `-----begin private key` let all of them through.
+    let pem = lower.split("-----begin ").skip(1).any(|tail| {
+        tail.split("-----")
+            .next()
+            .is_some_and(|label| label.contains("private key"))
+    });
+
+    let vendor = lower.split_whitespace().map(token_word).any(|word| {
+        ALPHANUMERIC_BODY_PREFIXES.iter().any(|(prefix, minimum)| {
+            word.len() >= *minimum
+                && word.starts_with(prefix)
+                && word.bytes().all(|b| b.is_ascii_alphanumeric())
+        }) || MIXED_BODY_PREFIXES
             .iter()
-            .any(|key| {
-                lower.find(key).is_some_and(|index| {
-                    lower[index + key.len()..]
-                        .trim_start()
-                        .starts_with([':', '='])
-                })
-            })
+            .any(|(prefix, minimum)| word.len() >= *minimum && word.starts_with(prefix))
+    });
+
+    let bearer = lower.split("bearer ").skip(1).any(|tail| {
+        tail.split_whitespace()
+            .next()
+            .is_some_and(|token| token.len() >= 12)
+    });
+
+    let assigned = CREDENTIAL_KEYS.iter().any(|key| {
+        lower.find(key).is_some_and(|index| {
+            lower[index + key.len()..]
+                .trim_start()
+                .starts_with([':', '='])
+        })
+    });
+
+    pem || vendor || bearer || assigned
 }
 
 enum AgentCredential {
@@ -970,6 +1054,97 @@ mod tests {
         assert!(!contains_secret_text(
             "No API key is projected into this Environment."
         ));
+    }
+
+    #[test]
+    fn every_pem_private_key_label_is_secret_shaped() {
+        // The check used to match `-----begin private key` exactly, so every
+        // labelled variant — which is to say most real keys — walked past it.
+        for label in [
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+            "PGP PRIVATE KEY BLOCK",
+        ] {
+            assert!(
+                contains_secret_text(&format!("-----BEGIN {label}-----")),
+                "{label} was not recognized"
+            );
+        }
+        // A public key is not a credential and must not cost someone a turn.
+        assert!(!contains_secret_text("-----BEGIN PUBLIC KEY-----"));
+        assert!(!contains_secret_text("-----BEGIN CERTIFICATE-----"));
+    }
+
+    /// Fixtures are joined from a prefix and a body rather than written as
+    /// whole literals. GitHub's push protection rejects a file containing a
+    /// complete Stripe-shaped key and refused this very commit — which is the
+    /// right call on its part, and the neatest possible statement of the
+    /// problem: a realistic fixture for a secret detector is indistinguishable
+    /// from the thing it detects. Splitting the literal keeps the test honest
+    /// about the shape without putting a scannable token in the tree.
+    fn vendor_token(prefix: &str, body: &str) -> String {
+        format!("{prefix}{body}")
+    }
+
+    #[test]
+    fn vendor_token_prefixes_are_secret_shaped() {
+        for (prefix, body) in [
+            ("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            ("github_pat_", "11ABCDEFG0abcdefghijklmnop"),
+            ("glpat-", "abcdefghijklmnopqrst"),
+            ("xoxb-", "1234567890-abcdefghijkl"),
+            ("AKIA", "IOSFODNN7EXAMPLE"),
+            ("ASIA", "IOSFODNN7EXAMPLE"),
+            ("AIza", "SyD-abcdefghijklmnopqrstuvwxyz0123456"),
+            ("npm_", "abcdefghijklmnopqrstuvwxyz0123"),
+            ("whsec_", "abcdefghijklmnopqrstuvwx"),
+            ("sk_live_", "abcdefghijklmnopqrstuvwx"),
+            ("sk-ant-api03-", "abcdefghijklmnopqrst"),
+        ] {
+            let token = vendor_token(prefix, body);
+            assert!(
+                contains_secret_text(&format!("the value is {token}")),
+                "{prefix} was not recognized"
+            );
+        }
+    }
+
+    #[test]
+    fn token_shaped_prose_and_hostnames_survive() {
+        // Each of these starts with a vendor prefix and must not cost a turn:
+        // the length floors and the alphanumeric-body rule are what save them.
+        for benign in [
+            "Asia",
+            "asia-southeast1-gaugewright.example.com",
+            "asia-east1",
+            "skew is expected here",
+            "sk-1234",
+            "npm_ is not a token",
+            "The akia prefix identifies an AWS key id.",
+            "Set up a GitHub token before publishing.",
+        ] {
+            assert!(!contains_secret_text(benign), "{benign} was rejected");
+        }
+    }
+
+    #[test]
+    fn punctuation_around_a_token_does_not_hide_it() {
+        // Serialized and quoted forms are how a credential actually arrives,
+        // and splitting on whitespace alone saw `"AKIA...",` as a word that
+        // matched no prefix. Assembled, per `vendor_token`.
+        let aws = vendor_token("AKIA", "IOSFODNN7EXAMPLE");
+        let github = vendor_token("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789");
+        assert!(contains_secret_text(&format!(
+            r#"{{"aws_access_key_id": "{aws}"}}"#
+        )));
+        assert!(contains_secret_text(&format!("({github})")));
+        assert!(contains_secret_text(&format!(
+            "use {github}, then rotate it"
+        )));
     }
 
     #[test]

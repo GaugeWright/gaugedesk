@@ -71,6 +71,15 @@ run_contracts() {
     echo "== client calls =="
     node scripts/check-client-calls.mjs
 
+    # The projection is default-deny, so a published workflow can reference a
+    # path that is not published and nothing here notices — the private tree
+    # builds and every private gate is green. It breaks on the mirror, after the
+    # merge, where `mirror-verdict` reports it (DR-0069 OPS-8). This runs in
+    # `contracts` because that is a required context and this needs the private
+    # tree to know what was withheld.
+    echo "== mirror projection =="
+    node scripts/check-mirror-projection.mjs
+
     echo "== spec audit =="
     python3 scripts/audit-gate.py
 }
