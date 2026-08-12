@@ -2085,6 +2085,91 @@ async fn attached_target_response_matches_the_workspace_projection() {
     assert_eq!(&attached, projected);
 }
 
+/// A minted **context** is owned by the authority the agent will act-for, so the
+/// information-flow envelope permits the very read the ingest exists to enable.
+///
+/// `engine.rs` resolves the turn's principal as
+/// `authenticated_actor.unwrap_or_else(|| authority())`. Both context mint sites
+/// used the instance's `authority()` unconditionally, so the two agreed only in
+/// solo — where there is no IdP and both collapse to the same value — and
+/// disagreed on every deployment with an IdP. There the agent acts-for the
+/// signed-in person while the context it must read is owned by the instance, and
+/// the read is denied in rule `converse`.
+///
+/// That is what the `home-chat` and `home-resource` wiring canaries hit in
+/// production: an agent refused the project its own operator had just uploaded.
+/// Solo passing is exactly why it survived — this test uses an IdP, where the
+/// actor and the instance authority are deliberately different.
+#[tokio::test]
+async fn a_minted_context_is_owned_by_the_authority_the_agent_acts_for() {
+    use crate::identity::LoopbackIdentityProvider;
+    use gaugedesk_core::abac::AuthorityAttributes;
+    use gaugedesk_core::ids::AuthorityId;
+
+    let idp = LoopbackIdentityProvider::new().enroll(
+        "operator-token",
+        AuthorityId::new("operator-auth"),
+        AuthorityAttributes::default(),
+    );
+    // Seed first (a chat needs a placement and a work target), then attach the
+    // IdP, so this is an ordinary workbench that has simply been signed in to.
+    let (_d, wb) = seeded_workbench();
+    let instance_authority = {
+        let mut guard = wb.lock_unpoisoned();
+        guard.set_identity_provider(Some(Arc::new(idp)));
+        guard.authority().as_str().to_owned()
+    };
+    assert_ne!(
+        instance_authority, "operator-auth",
+        "the test only means something while the actor and the instance differ",
+    );
+    // The enterprise stack resolves the signed-in person and inserts this
+    // extension (`ee/app/src/org_routes.rs`); the open stack has no such layer,
+    // so supply it directly rather than standing up all of `ee` to assert one
+    // ownership rule.
+    let app = open_control_plane(wb.clone()).layer(axum::extract::Extension(
+        crate::identity::AuthenticatedActor(AuthorityId::new("operator-auth")),
+    ));
+
+    let chat = "acts-for-chat";
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/chats",
+        Some(&serde_json::json!({ "id": chat }).to_string()),
+        "operator-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "chat created: {body}");
+
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        &format!("/chats/{chat}/context/upload"),
+        Some(r##"{"files":[{"name":"brief.md","content":"# the brief"}]}"##),
+        "operator-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "upload accepted: {body}");
+
+    let owners: Vec<String> = {
+        let guard = wb.lock_unpoisoned();
+        crate::resource_store::list(&guard.store, chat)
+            .expect("the engagement's resources are readable")
+            .into_iter()
+            .map(|record| record.resource.owner.as_str().to_owned())
+            .collect()
+    };
+    assert!(!owners.is_empty(), "the upload minted a context resource");
+    for owner in &owners {
+        assert_eq!(
+            owner, "operator-auth",
+            "a minted context must be owned by the signed-in actor, not the \
+             instance authority `{instance_authority}`",
+        );
+    }
+}
+
 /// ENTSEC-5: context can be ingested from an **upload** (not just a server-local path) — the
 /// enterprise thin-client's context-in. The uploaded file lands in the engagement worktree
 /// and a context resource is minted.

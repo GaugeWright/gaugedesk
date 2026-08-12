@@ -673,6 +673,7 @@ pub(crate) fn context_attributes(
 pub(crate) async fn post_context(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
     Json(body): Json<ContextBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
@@ -694,7 +695,16 @@ pub(crate) async fn post_context(
         None => return (StatusCode::NOT_FOUND, "no such engagement").into_response(),
         Some(Err(e)) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
     };
-    let owner = wb.authority().as_str().to_string();
+    // A minted context must be owned by the authority the agent will act-for,
+    // or the information-flow envelope denies the very read this ingest exists
+    // to enable. `engine.rs` resolves that principal as
+    // `authenticated_actor.unwrap_or_else(|| authority())`, so this mirrors it
+    // exactly. Solo is unchanged — with no IdP both sides collapse to the
+    // instance authority — while an IdP deployment now agrees instead of
+    // minting under the instance and acting-for the signed-in person.
+    let owner = actor
+        .map(|axum::extract::Extension(actor)| actor.0.as_str().to_owned())
+        .unwrap_or_else(|| wb.authority().as_str().to_string());
     let attributes = context_attributes(body.classification.as_deref(), body.region.as_deref());
     let rec = match wb.mint_resource_context(&id, &owner, &body.path, &commit, attributes) {
         Ok(r) => r,
@@ -743,6 +753,7 @@ pub(crate) struct ContextUploadBody {
 pub(crate) async fn post_context_upload(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
     Json(body): Json<ContextUploadBody>,
 ) -> impl IntoResponse {
     if body.files.is_empty() {
@@ -759,7 +770,16 @@ pub(crate) async fn post_context_upload(
         None => return (StatusCode::NOT_FOUND, "no such engagement").into_response(),
         Some(Err(e)) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
     };
-    let owner = wb.authority().as_str().to_string();
+    // A minted context must be owned by the authority the agent will act-for,
+    // or the information-flow envelope denies the very read this ingest exists
+    // to enable. `engine.rs` resolves that principal as
+    // `authenticated_actor.unwrap_or_else(|| authority())`, so this mirrors it
+    // exactly. Solo is unchanged — with no IdP both sides collapse to the
+    // instance authority — while an IdP deployment now agrees instead of
+    // minting under the instance and acting-for the signed-in person.
+    let owner = actor
+        .map(|axum::extract::Extension(actor)| actor.0.as_str().to_owned())
+        .unwrap_or_else(|| wb.authority().as_str().to_string());
     let attributes = context_attributes(body.classification.as_deref(), body.region.as_deref());
     let label = format!("uploaded: {n} file(s)");
     let rec = match wb.mint_resource_context(&id, &owner, &label, &commit, attributes) {
