@@ -40,6 +40,13 @@ pub async fn open_serve(addr: &str, root: &std::path::Path) -> std::io::Result<(
 struct ParkedLeg {
     availability: tokio::task::JoinHandle<()>,
     rotation: tokio::task::JoinHandle<()>,
+    /// What this Home is currently reachable at, so the route set can be
+    /// re-authored when the projects it serves change without the leg moving.
+    /// It watches the same channel the availability loop dials on rather than
+    /// holding a clone, because rotation replaces the route every 24 hours and
+    /// re-authoring a superseded epoch would point every project at a locator
+    /// the relay has already invalidated.
+    route: tokio::sync::watch::Receiver<gaugedesk_relay_transport::RelayRoute>,
 }
 
 impl ParkedLeg {
@@ -80,6 +87,15 @@ pub(crate) async fn supervise_home_reachability(
         return;
     };
     let changed = wb.lock_unpoisoned().publication_changed();
+    // A route is authored *per project*, so the set has to be re-authored when
+    // the projects change and not only when reachability does — DESK-5a's
+    // "re-authors on project create/relocate/delete". The library already
+    // announces every such change on its own stream, so this listens rather
+    // than adding a second signal beside it.
+    let mut library = wb
+        .lock_unpoisoned()
+        .sender(crate::library::LIBRARY_SCOPE)
+        .subscribe();
     let mut parked: Option<ParkedLeg> = None;
     loop {
         // Read and release: this is a std mutex, and holding it across the wait
@@ -107,7 +123,37 @@ pub(crate) async fn supervise_home_reachability(
             }
             _ => {}
         }
-        changed.notified().await;
+        // Re-author whenever the served set may have moved. `author_home_routes`
+        // compares against what is already published and writes only the
+        // difference, so running it more often than strictly needed costs a
+        // comparison and never an event.
+        if let Some(leg) = parked.as_ref() {
+            let route = leg.route.borrow().clone();
+            crate::home_reachability::republish(&wb, &route);
+        }
+
+        // Wait for something that can change the answer. The library stream
+        // carries every workspace event, most of which cannot — a chat message
+        // must not wake this.
+        loop {
+            tokio::select! {
+                _ = changed.notified() => break,
+                event = library.recv() => match event {
+                    Ok(crate::stream::ServerEvent::WorkspaceChanged { record, .. })
+                        if record == "project" => break,
+                    Ok(_) => continue,
+                    // A lagged receiver missed events it cannot name, so it
+                    // reconciles rather than guessing which.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                    // Nothing will arrive here again; the publication signal is
+                    // still live, so wait on that alone.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        changed.notified().await;
+                        break;
+                    }
+                },
+            }
+        }
     }
 }
 
@@ -132,6 +178,7 @@ fn start_home_relay(
     let parked = config.relay_route(&identity)?;
     crate::home_reachability::republish(wb, &parked);
     let (routes, route_reader) = tokio::sync::watch::channel(parked);
+    let current = routes.subscribe();
     let rotation_identity = identity.clone();
     let rotation_directory = directory.clone();
     let rotation_workbench = wb.clone();
@@ -171,6 +218,7 @@ fn start_home_relay(
     Ok(ParkedLeg {
         availability,
         rotation,
+        route: current,
     })
 }
 
@@ -348,6 +396,33 @@ mod reachability_tests {
         assert!(
             settle(&wb, 1).await,
             "publishing was turned on and the running Home never authored a locator",
+        );
+
+        // A project created *after* the leg parked must get a route too
+        // (DESK-5a: re-author on project create). This is the step the
+        // production canary stopped on: it enables publishing, then creates the
+        // project it means to reach, and polled for a locator that was only
+        // ever authored for the projects that existed when the leg went up.
+        let before = live_locators(&wb);
+        // Resolved before the write: `lock_unpoisoned` is a std mutex and taking
+        // it twice in one expression deadlocks on itself.
+        let home_id = wb.lock_unpoisoned().home_id().clone();
+        wb.lock_unpoisoned()
+            .write_project_record(crate::library::ProjectRecord {
+                schema: crate::library::LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+                id: "proj-after-parking".to_owned(),
+                op: crate::library::RecordOp::Upsert,
+                name: "created after the leg parked".to_owned(),
+                is_default: false,
+                home_id,
+                network_isolated: false,
+                run_purpose: None,
+                deployment_mode: None,
+            });
+        assert!(
+            settle(&wb, before + 1).await,
+            "a project created after the leg parked never got a route",
         );
 
         wb.lock_unpoisoned()
