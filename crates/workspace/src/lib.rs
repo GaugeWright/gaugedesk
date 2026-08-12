@@ -2199,13 +2199,17 @@ mod workspace_store_contention {
     /// six concurrent commits into one target fail about 20 ms after they begin
     /// rather than after the 5 s the pragma asks for.
     /// Fixed upstream in whipplescript-src#91, which opens every write
-    /// transaction in `branches.rs` and `workstreams.rs` `Immediate`. This
-    /// repository pins `whipplescript-store` 0.4.1 from crates.io by checksum,
-    /// so the fix does not arrive here until that crate is published; the
-    /// blocker is a release, not a code change. Un-ignore when the pin moves.
+    /// transaction in `branches.rs` and `workstreams.rs` `Immediate`, and
+    /// released as `whipplescript-store` 0.4.2 — a single-crate backport off
+    /// 0.4.1, because `main` has since moved rusqlite 0.32 → 0.40 and
+    /// `libsqlite3-sys` declares `links = "sqlite3"`, so this repository could
+    /// not have resolved a store built against 0.40 at all.
+    ///
+    /// This is the durable guard that the fix is present: it fails after ~1 ms
+    /// against a store without it, and waits out the full hold with it. Keep it
+    /// running rather than ignored — a dependency bump that silently reverted the
+    /// behaviour would otherwise be invisible until it reached a user.
     #[test]
-    #[ignore = "CMP-17: fixed in whipplescript-src#91, awaiting a published \
-                whipplescript-store release; run with `--ignored` after the pin moves"]
     fn a_write_waits_for_a_held_lock_instead_of_failing() {
         let dir = tempfile::tempdir().unwrap();
         let branches = dir.path().join("branches.sqlite");

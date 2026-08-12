@@ -2624,6 +2624,17 @@ async fn base_carrying_save_merges_concurrent_edits_and_folds_conflicts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // Read it back before saving against the older base. Without this, a save
+    // that reports a plain write instead of a merge is ambiguous between "the
+    // merge did not happen" and "there was nothing to merge with, because the
+    // agent's write never became current" — and the two have nothing to do with
+    // each other. A CI-only failure here was undiagnosable for exactly that
+    // reason.
+    let (_, current) = send(&app, "GET", "/chats/sub6/file?path=notes.md", None).await;
+    assert_eq!(
+        current, "The swift brown fox jumps over the lazy dog tonight.",
+        "the agent's write must be current before the editor saves against the older base"
+    );
     // The editor saves a draft based on the ORIGINAL content, editing a
     // distant word: the save merges, keeping both edits.
     let save = serde_json::json!({
@@ -2634,7 +2645,12 @@ async fn base_carrying_save_merges_concurrent_edits_and_folds_conflicts() {
     let (status, body) = send(&app, "PUT", "/chats/sub6/file?path=notes.md", Some(&save)).await;
     assert_eq!(status, StatusCode::OK, "merged save: {body}");
     let merged: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(merged["merged"], true);
+    assert_eq!(
+        merged["merged"], true,
+        "the base-carrying save must report a three-way merge, not a plain write. \
+         `merged` absent means the store found no divergence from the base, so the \
+         base cut lookup missed. Response: {body}"
+    );
     assert_eq!(
         merged["content"],
         "The swift brown fox jumps over the lazy dog today."
@@ -4336,9 +4352,25 @@ async fn assignment_binds_to_the_roster_and_never_gates_a_claim() {
 /// a `busy_timeout` of 5 s expiring looks like a ~5 s failure, and an immediate
 /// `SQLITE_BUSY` (no handler, or a deadlock SQLite refuses to wait on) looks like
 /// a fast one.
+///
+/// **CMP-17 is fixed as of `whipplescript-store` 0.4.2** — this run now reports
+/// zero `SQLITE_BUSY`. It still fails, on a *different* mechanism the BUSY
+/// failures were hiding: `Conflict("branch head moved during the import;
+/// retry")`. That is the store's optimistic compare-and-swap on the branch head
+/// (`AdvanceOutcome::Stale`) behaving exactly as designed and asking to be
+/// retried, and nothing on this side retries it. Six chats on one placement
+/// share a target workspace, so their boundary cuts genuinely do contend for one
+/// head; before the fix the loser failed early with BUSY instead of getting far
+/// enough to notice.
+///
+/// Left `#[ignore]`d rather than relaxed to "no BUSY": an assertion that
+/// tolerated the head conflict would bake a known defect into a green test. The
+/// durable guard for the fix itself is
+/// `gaugedesk_workspace::workspace_store_contention::a_write_waits_for_a_held_lock_instead_of_failing`,
+/// which is no longer ignored.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "CMP-17: reproduces an upstream defect and fails until it is fixed; \
-            run with `--ignored` to reproduce or to check"]
+#[ignore = "reproduces the un-retried branch-head CAS conflict that CMP-17's \
+            SQLITE_BUSY was masking; run with `--ignored`"]
 async fn cmp17_busy_under_steer_pressure() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = seeded_workbench();

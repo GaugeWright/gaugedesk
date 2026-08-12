@@ -79,7 +79,7 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 # run (no FD passed ⇒ normal bind). Dev ergonomics only; no production behaviour.
 listenfd = "1"
 tempfile = "3"
-whipplescript-store = { version = "0.4.1" }
+whipplescript-store = { version = "0.4.2" }
 
 [dev-dependencies]
 gaugedesk-pi-bridge = { path = "../pi-bridge" }

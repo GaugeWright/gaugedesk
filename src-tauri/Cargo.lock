@@ -6825,9 +6825,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-store"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31b8aa05e16d94f940440dad1f9b1e018eb0e9a856c708179faa1590c36a7b85"
+checksum = "f791ffccb6c92e04468890f796755830cf5c7f20b3537be2409528c3f0729a23"
 dependencies = [
  "rusqlite",
  "serde",

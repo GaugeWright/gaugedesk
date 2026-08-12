@@ -24,7 +24,7 @@ whipplescript-parser = { version = "0.4.1" }
 # running a project's gate is a third host on the same path rather than a bypass
 # of the CLI crate's narrower re-export list.
 whipplescript-kernel = { version = "0.4.1" }
-whipplescript-store = { version = "0.4.1" }
+whipplescript-store = { version = "0.4.2" }
 
 [dev-dependencies]
 tempfile = "3"
