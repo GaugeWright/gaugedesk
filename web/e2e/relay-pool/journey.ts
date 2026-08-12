@@ -113,6 +113,9 @@ function poolFor(route: OpaqueHomeRoute): HomePool<{ json: RouteJson }> {
 }
 
 export async function runJourney(): Promise<JourneyResult> {
+    // The harness answers on loopback, on a port this process started itself;
+    // there is no transport to encrypt and no name to authenticate.
+    // nosemgrep: typescript.react.security.react-insecure-request.react-insecure-request
     const response = await fetch(CONFIG_URL);
     if (!response.ok) throw new Error(`the hermetic harness answered ${response.status}`);
     const description = (await response.json()) as HarnessDescription;

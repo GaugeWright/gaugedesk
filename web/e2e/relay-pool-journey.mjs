@@ -67,6 +67,9 @@ export async function runRelayPoolJourney() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
+    // The harness answers on loopback, on a port this process started itself;
+    // there is no transport to encrypt and no name to authenticate.
+    // nosemgrep: typescript.react.security.react-insecure-request.react-insecure-request
     const probe = await fetch(CONFIG_URL).catch(() => null);
     assert(
         probe?.ok,
