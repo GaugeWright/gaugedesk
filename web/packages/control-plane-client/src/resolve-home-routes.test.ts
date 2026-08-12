@@ -222,3 +222,60 @@ describe("resolving routes across both channels (DESK-5g)", () => {
         expect(routes.routes).toEqual([]);
     });
 });
+
+describe("a degradation says why (DESK-7 diagnosis)", () => {
+    it("names the step that declined, for each way of declining", async () => {
+        // Every one of these produces the same result — the hub's endpoints and
+        // `verified: false` — which is why the reason has to be reported. A
+        // relay-only Home is unreachable in all of them, silently.
+        const reasons: string[] = [];
+        const collect = (reason: string) => reasons.push(reason);
+
+        // A verifier has to be registered first: absence of one is itself a
+        // degradation, and it is checked before the projection is even read.
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        await resolveHomeRoutes({
+            json: plane({ directory: null }),
+            subject: "person-1",
+            storage: memoryStorage(),
+            onDegraded: collect,
+        });
+
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => false }));
+        await resolveHomeRoutes({
+            json: plane({ directory: { root_pubkey: ROOT, origin: "" } }),
+            subject: "person-1",
+            storage: memoryStorage(),
+            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+            onDegraded: collect,
+        });
+
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        await resolveHomeRoutes({
+            json: plane({ directory: { root_pubkey: ROOT, origin: "" } }),
+            subject: "person-1",
+            storage: memoryStorage(),
+            fetchJson: async () => null,
+            onDegraded: collect,
+        });
+
+        expect(reasons).toHaveLength(3);
+        expect(reasons[0]).toMatch(/published no directory root/);
+        expect(reasons[1]).toMatch(/refused/);
+        expect(reasons[2]).toMatch(/no record for the pinned root/);
+    });
+
+    it("says nothing when the signed record is used", async () => {
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        const reasons: string[] = [];
+        const routes = await resolveHomeRoutes({
+            json: plane({ directory: { root_pubkey: ROOT, origin: "" } }),
+            subject: "person-1",
+            storage: memoryStorage(),
+            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+            onDegraded: (reason) => reasons.push(reason),
+        });
+        expect(routes.verified).toBe(true);
+        expect(reasons).toEqual([]);
+    });
+});

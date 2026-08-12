@@ -209,6 +209,14 @@ export class WorkbenchControlPlane implements ControlPlane {
         const resolved = await accountClient.resolveHomeRoutes({
             json: this.route,
             subject: this.subject(),
+            // Said once, at warning level: a browser that cannot use the signed
+            // record falls back to endpoint-only reachability, which is correct
+            // and indistinguishable from having no signed routes at all. Every
+            // relay-only Home is unreachable in that state, so it must not be
+            // silent (ADR 0131 §3).
+            onDegraded: (reason) => {
+                console.warn("[account] no signed Home routes: %s", reason);
+            },
             onRootKeyConflict: (error) => {
                 // Surfaced, never silently adopted: this is the substitution the
                 // pin exists to catch (ADR 0132 §2). Reachability is unaffected

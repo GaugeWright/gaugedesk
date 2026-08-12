@@ -50,6 +50,16 @@ export interface ResolveHomeRoutesOptions {
     /** Report a root key that changed. Never thrown at the caller, because a
      * substitution must not also take away the reachability the person had. */
     readonly onRootKeyConflict?: (error: RootKeyConflict) => void;
+    /**
+     * Report that no signed routes were used, and why.
+     *
+     * Degrading is correct (see the note above) but degrading *silently* is
+     * how a browser can be unable to reach any relay-only Home for weeks with
+     * nothing anywhere saying so — every cause looks identical to an account
+     * that simply has no signed routes. The reason is structural, never a
+     * payload: which step declined, not what it was carrying.
+     */
+    readonly onDegraded?: (reason: string) => void;
 }
 
 export interface ResolvedHomeRoutes {
@@ -68,13 +78,17 @@ async function hubRoutes(json: RouteJson): Promise<OpaqueHomeRoute[]> {
 export async function resolveHomeRoutes(
     options: ResolveHomeRoutesOptions,
 ): Promise<ResolvedHomeRoutes> {
-    const hub = await hubRoutes(options.json);
-    if (!options.subject || !directoryVerifierAvailable()) {
+    const degraded = (reason: string): ResolvedHomeRoutes => {
+        options.onDegraded?.(reason);
         return { routes: hub, verified: false };
-    }
+    };
+
+    const hub = await hubRoutes(options.json);
+    if (!options.subject) return degraded("no signed-in subject to pin against");
+    if (!directoryVerifierAvailable()) return degraded("this build registered no verifier");
 
     const projection = await accountDirectory(options.json);
-    if (!projection) return { routes: hub, verified: false };
+    if (!projection) return degraded("the account has published no directory root");
 
     const seam = {
         subject: options.subject,
@@ -90,7 +104,7 @@ export async function resolveHomeRoutes(
         );
         // Refuse the record, keep the endpoints. A substitution is a reason to
         // stop honouring pins, not a reason to strand the person.
-        return { routes: hub, verified: false };
+        return degraded("the pinned root key changed");
     }
 
     let signed: OpaqueHomeRoute[] | null;
@@ -101,9 +115,13 @@ export async function resolveHomeRoutes(
         // A directory outage, a malformed record, a failed signature, a verifier
         // that would not load: every one means *no signed routes*. None of them
         // means a broken account, so each degrades to the hub's endpoints.
-        return { routes: hub, verified: false };
+        return degraded(
+            `the signed record was refused: ${
+                error instanceof Error ? error.message : String(error)
+            }`,
+        );
     }
-    if (!signed) return { routes: hub, verified: false };
+    if (!signed) return degraded("the directory holds no record for the pinned root");
 
     // Signed wins per project; the hub still answers for projects the record
     // does not mention, because a person may reach a project through an
