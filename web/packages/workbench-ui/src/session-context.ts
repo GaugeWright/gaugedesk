@@ -91,7 +91,7 @@ export interface SessionApi {
     embedGetConfig?(): Promise<{ white_label: boolean }>;
 }
 
-/** The provider-neutral live-turn vocabulary (ADR 0133; WhippleScript
+/** The provider-neutral live-turn vocabulary (ADR 0135; WhippleScript
  *  `spec/agent-harness.md` "Live Turn Observation"). One list, declared once:
  *  the panel's labels, the transport's frame validation, and every producer all
  *  derive from it, so a runtime state cannot be added in one place and silently
@@ -205,7 +205,7 @@ export interface Session {
     /** Ephemeral provider-neutral observation of the active turn. Durable
      * transcript and terminal output remain authoritative.
      *
-     * Required, not optional: ADR 0133 makes this a shared-panel presentation
+     * Required, not optional: ADR 0135 makes this a shared-panel presentation
      * for every Environment, and an optional member is exactly how a producer
      * silently opts out while still typechecking. An Environment whose runtime
      * reports nothing finer than busy/idle says so by returning those two —
