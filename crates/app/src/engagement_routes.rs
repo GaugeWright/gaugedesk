@@ -1143,7 +1143,9 @@ pub(crate) struct TaskBody {
 ///
 /// A refusal is not a gateway failure. The runtime declining a turn on
 /// information-flow policy is a decision the caller must read and act on, so it
-/// answers `403`; only something actually breaking keeps `502`.
+/// answers `403`; a chat that is already running answers `409`, because the
+/// caller's message is fine and only its timing was wrong (ADR 0138 §2); only
+/// something actually breaking keeps `502`.
 ///
 /// The distinction is not cosmetic, and getting it wrong is expensive twice
 /// over: a 5xx invites a retry of something that will be refused identically
@@ -1152,10 +1154,13 @@ pub(crate) struct TaskBody {
 /// "the origin is overloaded or misconfigured" before the caller sees it. The
 /// production wiring canary read that as an origin outage for days.
 fn task_failure_status(error: &crate::engine::EngineError) -> StatusCode {
-    if error.is_policy_denial() {
-        StatusCode::FORBIDDEN
-    } else {
-        StatusCode::BAD_GATEWAY
+    match error {
+        // Conflict, not failure: the chat is busy and the same message will be
+        // accepted once it is not. `409` is what tells the composer to hold it as
+        // a follow-up rather than surface a broken turn (ADR 0138 §4).
+        crate::engine::EngineError::AlreadyRunning => StatusCode::CONFLICT,
+        error if error.is_policy_denial() => StatusCode::FORBIDDEN,
+        _ => StatusCode::BAD_GATEWAY,
     }
 }
 
@@ -1212,11 +1217,18 @@ pub(crate) async fn post_task(
 
     match outcome {
         Ok(Ok(result)) => (StatusCode::OK, Json(result)).into_response(),
-        Ok(Err(e)) => (
-            task_failure_status(&e),
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(Err(e)) => {
+            let status = task_failure_status(&e);
+            let mut body = serde_json::json!({ "error": e.to_string() });
+            // A 409 is read as a refusal by the browser transport, which looks for
+            // `rejected` and reports "unknown" without it. Carrying the reason is
+            // the difference between the composer saying why a message is waiting
+            // and saying nothing (`INV-2`; ADR 0138 §2).
+            if status == StatusCode::CONFLICT {
+                body["rejected"] = serde_json::Value::String(e.to_string());
+            }
+            (status, Json(body)).into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "task panicked").into_response(),
     }
 }

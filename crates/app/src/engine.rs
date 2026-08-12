@@ -25,33 +25,82 @@ use crate::workbench_state::SharedHarness;
 /// `GAUGEDESK_TEST_RESET`); cleared by `POST /test/reset`. Inert in a normal run.
 static FORCE_MERGE_CONFLICT: AtomicBool = AtomicBool::new(false);
 
-/// Registry of in-flight turns to their [`InterruptHandle`], kept outside the
+/// The chats with a turn executing **in this process**, each mapped to its
+/// [`InterruptHandle`] if the harness driving it offers one. Kept outside the
 /// workbench mutex so a Stop request can terminate a running turn's runtime
 /// without blocking on the lock the turn itself holds.
+///
+/// *Presence* is the liveness record the one-turn-per-chat refusal keys on
+/// (ADR 0138 §6): an entry means a turn is executing here, whether or not it can
+/// be interrupted. Those two facts used to be one — the map was written only when
+/// a harness had an interrupt handle, so a turn that could not be interrupted was
+/// invisible to it.
+///
+/// Deliberately in-process, and deliberately not durable. A run left `Running` by
+/// a process that died has no entry here after a restart, which is exactly what
+/// stops a crashed turn from refusing its chat forever.
 static RUNNING_TURNS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, InterruptHandle>>,
+    std::sync::Mutex<std::collections::HashMap<String, Option<InterruptHandle>>>,
 > = std::sync::OnceLock::new();
 
-fn running_turns() -> &'static std::sync::Mutex<std::collections::HashMap<String, InterruptHandle>>
-{
+fn running_turns(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<InterruptHandle>>> {
     RUNNING_TURNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Record a turn's interrupt handle for out-of-band Stop handling.
-pub(crate) fn register_running_turn(id: &str, interrupt: InterruptHandle) {
-    running_turns()
-        .lock_unpoisoned()
-        .insert(id.to_string(), interrupt);
+/// An exclusive claim on a chat's one live turn (ADR 0138 §1).
+///
+/// Held for the whole execution and released on drop, so an early return, an
+/// error path or a panic cannot strand the chat as permanently busy.
+pub(crate) struct TurnClaim {
+    chat: String,
 }
 
-/// Clear a turn's interrupt handle after the turn exits.
-pub(crate) fn clear_running_turn(id: &str) {
-    running_turns().lock_unpoisoned().remove(id);
+impl Drop for TurnClaim {
+    fn drop(&mut self) {
+        running_turns().lock_unpoisoned().remove(&self.chat);
+    }
 }
 
-/// The interrupt handle for a running turn, if any.
+/// Claim this chat's turn slot, or `None` when a turn is already executing for
+/// it — the refusal ADR 0138 §2 makes a normal outcome rather than a race.
+pub(crate) fn claim_turn(id: &str) -> Option<TurnClaim> {
+    let mut turns = running_turns().lock_unpoisoned();
+    if turns.contains_key(id) {
+        return None;
+    }
+    turns.insert(id.to_string(), None);
+    Some(TurnClaim {
+        chat: id.to_string(),
+    })
+}
+
+/// Attach a running turn's interrupt handle to its claim, so a concurrent Stop
+/// can reach it. A harness with nothing to interrupt never calls this; the claim
+/// is what records that the turn is live, not the handle.
+pub(crate) fn bind_turn_interrupt(id: &str, interrupt: InterruptHandle) {
+    if let Some(slot) = running_turns().lock_unpoisoned().get_mut(id) {
+        *slot = Some(interrupt);
+    }
+}
+
+/// Whether a turn is executing for this chat **in this process** — the liveness
+/// half of the one-turn-per-chat rule (ADR 0138 §6). Distinct from the run's
+/// durable phase, which stays `Running` after a process dies mid-turn.
+///
+/// Observation only, so it is test-only: production reads this fact by *taking*
+/// the claim, and a separate read would be a race — free when checked, taken by
+/// the time it was acted on.
+#[cfg(test)]
+pub(crate) fn turn_is_live(id: &str) -> bool {
+    running_turns().lock_unpoisoned().contains_key(id)
+}
+
+/// The interrupt handle for a running turn, if it has one. `None` covers both
+/// "no turn running" and "running but not interruptible"; Stop treats them the
+/// same, because neither can be interrupted.
 pub fn running_turn_interrupt(id: &str) -> Option<InterruptHandle> {
-    running_turns().lock_unpoisoned().get(id).cloned()
+    running_turns().lock_unpoisoned().get(id).cloned().flatten()
 }
 
 /// Clear all running-turn interrupt handles, used by the test reset route
@@ -513,6 +562,11 @@ pub enum EngineError {
     /// one error type, so a classified failure is not flattened to `String` by
     /// the first `?` that happens to sit above it.
     Message(String),
+    /// Not a failure: a turn is already executing for this chat, so this one was
+    /// refused rather than started (ADR 0138 §2). `INV-2` — a refusal is a normal
+    /// outcome carrying its reason, which is why the routes answer it 409 rather
+    /// than 502, and why nothing about the chat changed.
+    AlreadyRunning,
 }
 impl From<AdmitError> for EngineError {
     fn from(e: AdmitError) -> Self {
@@ -539,6 +593,9 @@ impl std::fmt::Display for EngineError {
             EngineError::Workspace(e) => write!(f, "{e}"),
             EngineError::Harness(e) => write!(f, "{e}"),
             EngineError::Message(e) => write!(f, "{e}"),
+            EngineError::AlreadyRunning => {
+                write!(f, "a turn is already running for this chat")
+            }
         }
     }
 }
@@ -645,6 +702,12 @@ fn run_task_streaming_billed<G: EgressGate>(
         RunPhase::Admitted => {
             store.admit::<RunState>(scope, RunCommand::StartRun)?;
         }
+        // Reachable only for a run whose process died mid-turn: a live turn holds
+        // this chat's claim, so a concurrent one is refused before it gets here
+        // (ADR 0138 §6). `Running` with nothing executing is therefore a crashed
+        // run, and re-entering it is the recovery — which is why this stays a
+        // pass-through rather than becoming the refusal. Refusing on the durable
+        // phase alone would strand that chat forever.
         RunPhase::Running => {}
         RunPhase::Completed | RunPhase::Failed | RunPhase::Canceled => {
             store.admit::<RunState>(scope, RunCommand::RetryRun)?;
@@ -1327,7 +1390,30 @@ pub fn isolated_turn_descriptor(
     })
 }
 
+/// Drive one turn for a chat, refusing if one is already running.
+///
+/// The refusal lives here rather than on a route because a route is not the only
+/// way in — a federated crossing drives turns through this same function — and a
+/// guard bolted to one entry point would make the invariant true of that caller
+/// and false of the next (ADR 0138 §3).
+///
+/// The claim is released when this returns, by its guard, so an error path or a
+/// panic cannot leave a chat permanently busy.
 pub fn run_engagement_turn(
+    wb: &SharedWorkbench,
+    id: &str,
+    worktree: &Path,
+    sender: &broadcast::Sender<ServerEvent>,
+    input: EngagementTurnInput<'_>,
+) -> Result<TaskResult, EngineError> {
+    let Some(_claim) = claim_turn(id) else {
+        return Err(EngineError::AlreadyRunning);
+    };
+    run_claimed_engagement_turn(wb, id, worktree, sender, input)
+}
+
+/// The turn itself, with this chat's claim already held.
+fn run_claimed_engagement_turn(
     wb: &SharedWorkbench,
     id: &str,
     worktree: &Path,
@@ -2258,10 +2344,11 @@ fn drive_persistent_turn(
         harness.bind_authenticated_actor(actor_ref);
         harness.bind_runtime_command_id(runtime_command_id);
         // Publish this turn's interrupt handle so a concurrent Stop can terminate it
-        // out-of-band (unblocking `recv`). A harness with nothing to interrupt
-        // registers nothing.
+        // out-of-band (unblocking `recv`). A harness with nothing to interrupt binds
+        // nothing — the claim taken in `run_engagement_turn` is what records that a
+        // turn is live, so an uninterruptible one is still visible (ADR 0138 §6).
         if let Some(interrupt) = harness.interrupt_handle() {
-            register_running_turn(id, interrupt);
+            bind_turn_interrupt(id, interrupt);
         }
         let mut sink = live_sink(sender);
         let result = run_task_streaming_billed(
@@ -2277,7 +2364,9 @@ fn drive_persistent_turn(
             managed_funding_ref,
             &answers,
         );
-        clear_running_turn(id);
+        // The claim is released by its guard when the turn returns, not here: the
+        // bookkeeping below is still part of this turn, and freeing the chat before
+        // it finished would let the next turn in mid-way through.
         result
     };
 

@@ -13,6 +13,7 @@ use crate::test_support::fake_agent_env;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use gaugedesk_core::instance::InstanceCommand;
+use gaugedesk_core::run::{RunCommand, RunState};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -3470,19 +3471,195 @@ async fn edit_chat_tasks_run_without_a_project_binding() {
 
 #[test]
 fn running_turn_registry_round_trips() {
-    // the out-of-band registry the Stop route reads (no workbench lock): the
-    // registered interrupt handle comes back invokable, and clear removes it.
+    // The out-of-band registry the Stop route reads (no workbench lock): a claim
+    // makes the chat live, the bound interrupt handle comes back invokable, and
+    // dropping the claim frees the chat.
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = fired.clone();
-    engine::register_running_turn(
+    let claim = engine::claim_turn("eng-x").expect("chat is free");
+    engine::bind_turn_interrupt(
         "eng-x",
         std::sync::Arc::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst)),
     );
-    let interrupt = engine::running_turn_interrupt("eng-x").expect("handle registered");
+    let interrupt = engine::running_turn_interrupt("eng-x").expect("handle bound");
     interrupt();
     assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
-    engine::clear_running_turn("eng-x");
+    drop(claim);
     assert!(engine::running_turn_interrupt("eng-x").is_none());
+}
+
+/// ADR 0138 §1/§6: the claim, not the interrupt handle, is what says a turn is
+/// live — and it is released even when the turn leaves by an error path.
+#[test]
+fn a_claim_holds_the_chat_whether_or_not_the_turn_can_be_interrupted() {
+    let claim = engine::claim_turn("eng-uninterruptible").expect("chat is free");
+    // Nothing binds a handle: a harness with nothing to interrupt. The chat is
+    // still claimed, which is the fact this registry exists to carry. Reading it
+    // through the Stop lens would say "not running" and be wrong.
+    assert!(engine::running_turn_interrupt("eng-uninterruptible").is_none());
+    assert!(
+        engine::claim_turn("eng-uninterruptible").is_none(),
+        "an uninterruptible turn must still exclude a second one"
+    );
+    drop(claim);
+    assert!(
+        engine::claim_turn("eng-uninterruptible").is_some(),
+        "the claim must be released on drop, so an error path cannot strand a chat"
+    );
+}
+
+/// Claims are per chat. Serializing turns on one chat must not serialize the
+/// whole workbench — that would trade a race for a queue nobody asked for.
+#[test]
+fn a_claim_on_one_chat_leaves_every_other_chat_free() {
+    let held = engine::claim_turn("eng-busy").expect("chat is free");
+    let other = engine::claim_turn("eng-idle");
+    assert!(other.is_some(), "a different chat must still start a turn");
+    drop(held);
+    drop(other);
+}
+
+/// ADR 0138 §2: a chat runs one turn at a time, and the second request is
+/// refused rather than started.
+///
+/// The refusal is the whole point: before this, both turns ran, wrote the same
+/// worktree, and raced each other's workspace commit. A `409` says the message is
+/// fine and only its timing was wrong, which is what lets the composer hold it as
+/// a follow-up instead of surfacing a broken turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_turn_on_a_busy_chat_is_refused() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    send(&app, "POST", "/chats", Some(r#"{"id":"busy1"}"#)).await;
+
+    // A turn that holds itself open, so the second genuinely overlaps it rather
+    // than arriving after it settled.
+    let running = tokio::spawn({
+        let app = app.clone();
+        async move {
+            send(
+                &app,
+                "POST",
+                "/chats/busy1/task",
+                Some(r#"{"prompt":"[slow] think"}"#),
+            )
+            .await
+        }
+    });
+    // Wait for the turn to be live rather than sleeping a guessed interval: a
+    // sleep that is too short tests nothing and reads as a pass.
+    for _ in 0..200 {
+        if engine::turn_is_live("busy1") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        engine::turn_is_live("busy1"),
+        "the first turn never started, so this test proves nothing"
+    );
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/chats/busy1/task",
+        Some(r#"{"prompt":"and again"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a second turn must be refused, not run: {body}"
+    );
+    assert!(
+        body.contains("already running"),
+        "the refusal must say why, or the composer has nothing to show: {body}"
+    );
+
+    let (status, body) = running.await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the first turn still settles: {body}"
+    );
+
+    // The refused message left no trace: exactly one turn ran.
+    let (_, transcript) = send(&app, "GET", "/chats/busy1/transcript", None).await;
+    assert!(
+        !transcript.contains("and again"),
+        "a refused turn must not reach the transcript: {transcript}"
+    );
+
+    // And the chat is free again the moment it settles.
+    assert!(!engine::turn_is_live("busy1"));
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/chats/busy1/task",
+        Some(r#"{"prompt":"now it is my turn"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a settled chat accepts again: {body}"
+    );
+}
+
+/// ADR 0138 §6: a run whose process died mid-turn must not refuse its chat
+/// forever.
+///
+/// This is the hazard the refusal introduces. `RunPhase::Running` is durable and
+/// survives the process; the liveness record does not. Keying the refusal on the
+/// durable phase alone would turn one crashed turn into a chat nobody can ever
+/// use again — strictly worse than the intermittent race it replaced.
+#[tokio::test]
+async fn a_run_left_running_by_a_dead_process_still_accepts_the_next_turn() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb.clone());
+    send(&app, "POST", "/chats", Some(r#"{"id":"crashed1"}"#)).await;
+    send(
+        &app,
+        "POST",
+        "/chats/crashed1/task",
+        Some(r#"{"prompt":"go"}"#),
+    )
+    .await;
+
+    // Drive the run back to `Running` and leave it there with nothing executing —
+    // which is exactly the state a process that died mid-turn leaves behind.
+    {
+        let mut g = wb.lock_unpoisoned();
+        let store = g.store_mut();
+        store
+            .admit::<RunState>("crashed1", RunCommand::RetryRun)
+            .expect("retry");
+        store
+            .admit::<RunState>("crashed1", RunCommand::AdmitRun)
+            .expect("admit");
+        store
+            .admit::<RunState>("crashed1", RunCommand::StartRun)
+            .expect("start");
+    }
+    assert!(
+        !engine::turn_is_live("crashed1"),
+        "nothing is executing — that is the point of the case"
+    );
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/chats/crashed1/task",
+        Some(r#"{"prompt":"after the crash"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a crashed run must be re-entered, not refused forever: {body}"
+    );
 }
 
 #[tokio::test]
