@@ -19,15 +19,18 @@
 # path-triggered gate — run `scripts/check-models.sh both` when you change
 # anything under specs/models.
 #
-# The desktop shell *is* in `all`, because the `desktop-shell` job makes it an
-# enforced pull-request gate and a local green bar that omits an enforced gate
-# is a lie. It is the one section with a prerequisite a change gate cannot
-# assume — Tauri links GTK and WebKit through pkg-config on Linux — so it is
+# Both native shells *are* in `all`, because the `native-shells` job makes them
+# enforced pull-request gates and a local green bar that omits an enforced gate
+# is a lie. They are the sections with a prerequisite a change gate cannot
+# assume — Tauri links GTK and WebKit through pkg-config on Linux — so each is
 # split: the lockfile-drift half resolves the graph and runs everywhere, and the
 # compile runs wherever those libraries are present, which is every CI runner
-# and every machine that has ever built the shell. On a Linux box without them
-# `all` says so loudly and names the packages; `scripts/check.sh desktop` (what
-# CI runs) refuses to skip. Leaving the shell out of CI entirely was worse: #125
+# and every machine that has ever built a shell. On a Linux box without them
+# `all` says so loudly and names the packages; `scripts/check.sh desktop` and
+# `scripts/check.sh mobile` (what CI runs) refuse to skip. The mobile shell
+# reached this gate later than the desktop one and for the same two reasons: its
+# lockfile had drifted from its manifest, and only `mobile-release.yml` — on
+# dispatch — ever compiled it. Leaving a shell out of CI entirely was worse: #125
 # landed a call to a crate the shell does not depend on, and nothing noticed for
 # a week because only `release.yml` ever built it.
 set -euo pipefail
@@ -187,18 +190,96 @@ run_desktop() {
     fi
 
     echo "-- desktop shell compile SKIPPED: GTK/WebKit development libraries absent --" >&2
-    echo "   the lockfile check above still ran, and the desktop-shell CI job compiles it on every" >&2
+    echo "   the lockfile check above still ran, and the native-shells CI job compiles it on every" >&2
+    echo "   pull request. To close the gap locally: sudo apt-get install -y $missing" >&2
+}
+
+# The mobile shell is a third cargo workspace, and it had the same two problems
+# the desktop one did: its lockfile had drifted from its manifest, and nothing
+# compiled it on a change — only `mobile-release.yml`, on dispatch.
+#
+# It compiles twice, because no single compile sees both halves of the crate.
+# `--target aarch64-linux-android` is the half that matters, and a host check
+# cannot stand in for it: only the mobile target sets `cfg(mobile)` and
+# `target_os = "android"`, so only it compiles
+# `plugins/device-identity/src/mobile.rs`, the plugin's command layer against
+# that implementation rather than the desktop one, and the barcode-scanner
+# registration behind the `cfg(any(target_os = "android", target_os = "ios"))`
+# target table. Those are the release-critical paths, and a host check omits
+# every one of them. The host check stays for what the mobile target drops in
+# turn — `plugins/device-identity/src/desktop.rs`, which no other workspace
+# compiles.
+#
+# Neither compile needs an Android NDK. `cargo check` emits metadata and never
+# links a target artifact, so the graph's one C dependency — `ring`, through
+# `rustls` — only needs a compiler that accepts its sources; nothing consumes
+# the objects. `gcc-aarch64-linux-gnu` supplies one for the ~30 MB an apt
+# package costs, against the ~1 GB of an SDK this check does not otherwise use.
+# The iOS-only bindings and the generated platform projects still belong to
+# `mobile-release.yml`, which has the SDKs and is where they are genuinely
+# required.
+mobile_target_prerequisites_present() {
+    rustup target list --installed 2>/dev/null | grep -qx aarch64-linux-android || return 1
+    command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || return 1
+    command -v aarch64-linux-gnu-ar >/dev/null 2>&1
+}
+
+run_mobile() {
+    local prerequisites="${1:-required}"
+    echo "== mobile shell =="
+
+    echo "-- lockfile is in sync with the manifest --"
+    cargo metadata --manifest-path src-tauri-mobile/Cargo.toml --locked --format-version 1 >/dev/null
+
+    local install_target="rustup target add aarch64-linux-android && sudo apt-get install -y gcc-aarch64-linux-gnu"
+    echo "-- mobile cfg paths compile for an Android target --"
+    if mobile_target_prerequisites_present; then
+        # cc-rs looks up an `aarch64-linux-android-` prefixed toolchain by name,
+        # which only an NDK installs; name the cross toolchain instead so
+        # `ring`'s build script runs. Nothing links what it emits.
+        CC_aarch64_linux_android=aarch64-linux-gnu-gcc \
+        AR_aarch64_linux_android=aarch64-linux-gnu-ar \
+            cargo check --manifest-path src-tauri-mobile/Cargo.toml --locked \
+            --target aarch64-linux-android
+    elif [ "$prerequisites" = required ]; then
+        echo "mobile target compile requires the Android standard library and an aarch64 cross toolchain." >&2
+        echo "install: $install_target" >&2
+        exit 1
+    else
+        echo "-- mobile target compile SKIPPED: Android std or aarch64 cross toolchain absent --" >&2
+        echo "   this is the half that compiles the mobile-only code; the native-shells CI job runs" >&2
+        echo "   it on every pull request. To close the gap locally: $install_target" >&2
+    fi
+
+    # Same Tauri crates as the desktop shell, so the same native libraries and
+    # the same predicate.
+    echo "-- host compile --"
+    if desktop_prerequisites_present; then
+        cargo check --manifest-path src-tauri-mobile/Cargo.toml --locked
+        return
+    fi
+
+    local missing="libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev"
+    if [ "$prerequisites" = required ]; then
+        echo "mobile shell host compile requires GTK and WebKit development libraries." >&2
+        echo "install: sudo apt-get install -y $missing" >&2
+        exit 1
+    fi
+
+    echo "-- mobile shell host compile SKIPPED: GTK/WebKit development libraries absent --" >&2
+    echo "   the lockfile check above still ran, and the native-shells CI job compiles it on every" >&2
     echo "   pull request. To close the gap locally: sudo apt-get install -y $missing" >&2
 }
 
 case "$section" in
-    all) run_contracts; run_dependencies; run_rust; run_web; run_desktop best-effort ;;
+    all) run_contracts; run_dependencies; run_rust; run_web; run_desktop best-effort; run_mobile best-effort ;;
     contracts) run_contracts ;;
     dependencies) run_dependencies ;;
     desktop) run_desktop ;;
+    mobile) run_mobile ;;
     rust) run_rust ;;
     web) run_web ;;
-    *) echo "usage: scripts/check.sh [all|contracts|dependencies|desktop|rust|web]" >&2; exit 2 ;;
+    *) echo "usage: scripts/check.sh [all|contracts|dependencies|desktop|mobile|rust|web]" >&2; exit 2 ;;
 esac
 
 echo "== gaugedesk green bar PASSED ($section) =="

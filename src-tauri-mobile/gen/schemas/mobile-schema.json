@@ -135,6 +135,174 @@
           "type": "object",
           "allOf": [
             {
+              "if": {
+                "properties": {
+                  "identifier": {
+                    "anyOf": [
+                      {
+                        "description": "This permission set allows opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application\nas well as reveal file in directories using default file explorer\n#### This default permission set includes:\n\n- `allow-open-url`\n- `allow-reveal-item-in-dir`\n- `allow-default-urls`",
+                        "type": "string",
+                        "const": "opener:default",
+                        "markdownDescription": "This permission set allows opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application\nas well as reveal file in directories using default file explorer\n#### This default permission set includes:\n\n- `allow-open-url`\n- `allow-reveal-item-in-dir`\n- `allow-default-urls`"
+                      },
+                      {
+                        "description": "This enables opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application.",
+                        "type": "string",
+                        "const": "opener:allow-default-urls",
+                        "markdownDescription": "This enables opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application."
+                      },
+                      {
+                        "description": "Enables the open_path command without any pre-configured scope.",
+                        "type": "string",
+                        "const": "opener:allow-open-path",
+                        "markdownDescription": "Enables the open_path command without any pre-configured scope."
+                      },
+                      {
+                        "description": "Enables the open_url command without any pre-configured scope.",
+                        "type": "string",
+                        "const": "opener:allow-open-url",
+                        "markdownDescription": "Enables the open_url command without any pre-configured scope."
+                      },
+                      {
+                        "description": "Enables the reveal_item_in_dir command without any pre-configured scope.",
+                        "type": "string",
+                        "const": "opener:allow-reveal-item-in-dir",
+                        "markdownDescription": "Enables the reveal_item_in_dir command without any pre-configured scope."
+                      },
+                      {
+                        "description": "Denies the open_path command without any pre-configured scope.",
+                        "type": "string",
+                        "const": "opener:deny-open-path",
+                        "markdownDescription": "Denies the open_path command without any pre-configured scope."
+                      },
+                      {
+                        "description": "Denies the open_url command without any pre-configured scope.",
+                        "type": "string",
+                        "const": "opener:deny-open-url",
+                        "markdownDescription": "Denies the open_url command without any pre-configured scope."
+                      },
+                      {
+                        "description": "Denies the reveal_item_in_dir command without any pre-configured scope.",
+                        "type": "string",
+                        "const": "opener:deny-reveal-item-in-dir",
+                        "markdownDescription": "Denies the reveal_item_in_dir command without any pre-configured scope."
+                      }
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "allow": {
+                    "items": {
+                      "title": "OpenerScopeEntry",
+                      "description": "Opener scope entry.",
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "url"
+                          ],
+                          "properties": {
+                            "app": {
+                              "description": "An application to open this url with, for example: firefox.",
+                              "allOf": [
+                                {
+                                  "$ref": "#/definitions/Application"
+                                }
+                              ]
+                            },
+                            "url": {
+                              "description": "A URL that can be opened by the webview when using the Opener APIs.\n\nWildcards can be used following the UNIX glob pattern.\n\nExamples:\n\n- \"https://*\" : allows all HTTPS origin\n\n- \"https://*.github.com/tauri-apps/tauri\": allows any subdomain of \"github.com\" with the \"tauri-apps/api\" path\n\n- \"https://myapi.service.com/users/*\": allows access to any URLs that begins with \"https://myapi.service.com/users/\"",
+                              "type": "string"
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "path"
+                          ],
+                          "properties": {
+                            "app": {
+                              "description": "An application to open this path with, for example: xdg-open.",
+                              "allOf": [
+                                {
+                                  "$ref": "#/definitions/Application"
+                                }
+                              ]
+                            },
+                            "path": {
+                              "description": "A path that can be opened by the webview when using the Opener APIs.\n\nThe pattern can start with a variable that resolves to a system base directory. The variables are: `$AUDIO`, `$CACHE`, `$CONFIG`, `$DATA`, `$LOCALDATA`, `$DESKTOP`, `$DOCUMENT`, `$DOWNLOAD`, `$EXE`, `$FONT`, `$HOME`, `$PICTURE`, `$PUBLIC`, `$RUNTIME`, `$TEMPLATE`, `$VIDEO`, `$RESOURCE`, `$APP`, `$LOG`, `$TEMP`, `$APPCONFIG`, `$APPDATA`, `$APPLOCALDATA`, `$APPCACHE`, `$APPLOG`.",
+                              "type": "string"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "deny": {
+                    "items": {
+                      "title": "OpenerScopeEntry",
+                      "description": "Opener scope entry.",
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "url"
+                          ],
+                          "properties": {
+                            "app": {
+                              "description": "An application to open this url with, for example: firefox.",
+                              "allOf": [
+                                {
+                                  "$ref": "#/definitions/Application"
+                                }
+                              ]
+                            },
+                            "url": {
+                              "description": "A URL that can be opened by the webview when using the Opener APIs.\n\nWildcards can be used following the UNIX glob pattern.\n\nExamples:\n\n- \"https://*\" : allows all HTTPS origin\n\n- \"https://*.github.com/tauri-apps/tauri\": allows any subdomain of \"github.com\" with the \"tauri-apps/api\" path\n\n- \"https://myapi.service.com/users/*\": allows access to any URLs that begins with \"https://myapi.service.com/users/\"",
+                              "type": "string"
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "path"
+                          ],
+                          "properties": {
+                            "app": {
+                              "description": "An application to open this path with, for example: xdg-open.",
+                              "allOf": [
+                                {
+                                  "$ref": "#/definitions/Application"
+                                }
+                              ]
+                            },
+                            "path": {
+                              "description": "A path that can be opened by the webview when using the Opener APIs.\n\nThe pattern can start with a variable that resolves to a system base directory. The variables are: `$AUDIO`, `$CACHE`, `$CONFIG`, `$DATA`, `$LOCALDATA`, `$DESKTOP`, `$DOCUMENT`, `$DOWNLOAD`, `$EXE`, `$FONT`, `$HOME`, `$PICTURE`, `$PUBLIC`, `$RUNTIME`, `$TEMPLATE`, `$VIDEO`, `$RESOURCE`, `$APP`, `$LOG`, `$TEMP`, `$APPCONFIG`, `$APPDATA`, `$APPLOCALDATA`, `$APPCACHE`, `$APPLOG`.",
+                              "type": "string"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "properties": {
+                "identifier": {
+                  "description": "Identifier of the permission or permission set.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/Identifier"
+                    }
+                  ]
+                }
+              }
+            },
+            {
               "properties": {
                 "identifier": {
                   "description": "Identifier of the permission or permission set.",
@@ -2325,16 +2493,28 @@
           "markdownDescription": "Denies the unregister command without any pre-configured scope."
         },
         {
-          "description": "Use the native device identity, launch URL, and Machine credential vault.\n#### This default permission set includes:\n\n- `allow-get-identity`\n- `allow-get-launch-url`\n- `allow-sign-challenge`\n- `allow-store-machine-credential`\n- `allow-get-machine-credential`\n- `allow-clear-machine-credential`",
+          "description": "Use the native device identity, launch URL, and Machine credential vault.\n#### This default permission set includes:\n\n- `allow-get-identity`\n- `allow-get-launch-url`\n- `allow-sign-challenge`\n- `allow-store-machine-credential`\n- `allow-get-machine-credential`\n- `allow-clear-machine-credential`\n- `allow-list-machine-credentials`\n- `allow-remove-machine-credential`\n- `allow-store-account-session`\n- `allow-get-account-session`\n- `allow-clear-account-session`",
           "type": "string",
           "const": "gaugedesk-device-identity:default",
-          "markdownDescription": "Use the native device identity, launch URL, and Machine credential vault.\n#### This default permission set includes:\n\n- `allow-get-identity`\n- `allow-get-launch-url`\n- `allow-sign-challenge`\n- `allow-store-machine-credential`\n- `allow-get-machine-credential`\n- `allow-clear-machine-credential`"
+          "markdownDescription": "Use the native device identity, launch URL, and Machine credential vault.\n#### This default permission set includes:\n\n- `allow-get-identity`\n- `allow-get-launch-url`\n- `allow-sign-challenge`\n- `allow-store-machine-credential`\n- `allow-get-machine-credential`\n- `allow-clear-machine-credential`\n- `allow-list-machine-credentials`\n- `allow-remove-machine-credential`\n- `allow-store-account-session`\n- `allow-get-account-session`\n- `allow-clear-account-session`"
+        },
+        {
+          "description": "Enables the clear_account_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "gaugedesk-device-identity:allow-clear-account-session",
+          "markdownDescription": "Enables the clear_account_session command without any pre-configured scope."
         },
         {
           "description": "Enables the clear_machine_credential command without any pre-configured scope.",
           "type": "string",
           "const": "gaugedesk-device-identity:allow-clear-machine-credential",
           "markdownDescription": "Enables the clear_machine_credential command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_account_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "gaugedesk-device-identity:allow-get-account-session",
+          "markdownDescription": "Enables the get_account_session command without any pre-configured scope."
         },
         {
           "description": "Enables the get_identity command without any pre-configured scope.",
@@ -2355,10 +2535,28 @@
           "markdownDescription": "Enables the get_machine_credential command without any pre-configured scope."
         },
         {
+          "description": "Enables the list_machine_credentials command without any pre-configured scope.",
+          "type": "string",
+          "const": "gaugedesk-device-identity:allow-list-machine-credentials",
+          "markdownDescription": "Enables the list_machine_credentials command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_machine_credential command without any pre-configured scope.",
+          "type": "string",
+          "const": "gaugedesk-device-identity:allow-remove-machine-credential",
+          "markdownDescription": "Enables the remove_machine_credential command without any pre-configured scope."
+        },
+        {
           "description": "Enables the sign_challenge command without any pre-configured scope.",
           "type": "string",
           "const": "gaugedesk-device-identity:allow-sign-challenge",
           "markdownDescription": "Enables the sign_challenge command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the store_account_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "gaugedesk-device-identity:allow-store-account-session",
+          "markdownDescription": "Enables the store_account_session command without any pre-configured scope."
         },
         {
           "description": "Enables the store_machine_credential command without any pre-configured scope.",
@@ -2367,10 +2565,22 @@
           "markdownDescription": "Enables the store_machine_credential command without any pre-configured scope."
         },
         {
+          "description": "Denies the clear_account_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "gaugedesk-device-identity:deny-clear-account-session",
+          "markdownDescription": "Denies the clear_account_session command without any pre-configured scope."
+        },
+        {
           "description": "Denies the clear_machine_credential command without any pre-configured scope.",
           "type": "string",
           "const": "gaugedesk-device-identity:deny-clear-machine-credential",
           "markdownDescription": "Denies the clear_machine_credential command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_account_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "gaugedesk-device-identity:deny-get-account-session",
+          "markdownDescription": "Denies the get_account_session command without any pre-configured scope."
         },
         {
           "description": "Denies the get_identity command without any pre-configured scope.",
@@ -2391,16 +2601,82 @@
           "markdownDescription": "Denies the get_machine_credential command without any pre-configured scope."
         },
         {
+          "description": "Denies the list_machine_credentials command without any pre-configured scope.",
+          "type": "string",
+          "const": "gaugedesk-device-identity:deny-list-machine-credentials",
+          "markdownDescription": "Denies the list_machine_credentials command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_machine_credential command without any pre-configured scope.",
+          "type": "string",
+          "const": "gaugedesk-device-identity:deny-remove-machine-credential",
+          "markdownDescription": "Denies the remove_machine_credential command without any pre-configured scope."
+        },
+        {
           "description": "Denies the sign_challenge command without any pre-configured scope.",
           "type": "string",
           "const": "gaugedesk-device-identity:deny-sign-challenge",
           "markdownDescription": "Denies the sign_challenge command without any pre-configured scope."
         },
         {
+          "description": "Denies the store_account_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "gaugedesk-device-identity:deny-store-account-session",
+          "markdownDescription": "Denies the store_account_session command without any pre-configured scope."
+        },
+        {
           "description": "Denies the store_machine_credential command without any pre-configured scope.",
           "type": "string",
           "const": "gaugedesk-device-identity:deny-store-machine-credential",
           "markdownDescription": "Denies the store_machine_credential command without any pre-configured scope."
+        },
+        {
+          "description": "This permission set allows opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application\nas well as reveal file in directories using default file explorer\n#### This default permission set includes:\n\n- `allow-open-url`\n- `allow-reveal-item-in-dir`\n- `allow-default-urls`",
+          "type": "string",
+          "const": "opener:default",
+          "markdownDescription": "This permission set allows opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application\nas well as reveal file in directories using default file explorer\n#### This default permission set includes:\n\n- `allow-open-url`\n- `allow-reveal-item-in-dir`\n- `allow-default-urls`"
+        },
+        {
+          "description": "This enables opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application.",
+          "type": "string",
+          "const": "opener:allow-default-urls",
+          "markdownDescription": "This enables opening `mailto:`, `tel:`, `https://` and `http://` urls using their default application."
+        },
+        {
+          "description": "Enables the open_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "opener:allow-open-path",
+          "markdownDescription": "Enables the open_path command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_url command without any pre-configured scope.",
+          "type": "string",
+          "const": "opener:allow-open-url",
+          "markdownDescription": "Enables the open_url command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reveal_item_in_dir command without any pre-configured scope.",
+          "type": "string",
+          "const": "opener:allow-reveal-item-in-dir",
+          "markdownDescription": "Enables the reveal_item_in_dir command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "opener:deny-open-path",
+          "markdownDescription": "Denies the open_path command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_url command without any pre-configured scope.",
+          "type": "string",
+          "const": "opener:deny-open-url",
+          "markdownDescription": "Denies the open_url command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reveal_item_in_dir command without any pre-configured scope.",
+          "type": "string",
+          "const": "opener:deny-reveal-item-in-dir",
+          "markdownDescription": "Denies the reveal_item_in_dir command without any pre-configured scope."
         }
       ]
     },
@@ -2495,6 +2771,23 @@
           "enum": [
             "iOS"
           ]
+        }
+      ]
+    },
+    "Application": {
+      "description": "Opener scope application.",
+      "anyOf": [
+        {
+          "description": "Open in default application.",
+          "type": "null"
+        },
+        {
+          "description": "If true, allow open with any application.",
+          "type": "boolean"
+        },
+        {
+          "description": "Allow specific application to open with.",
+          "type": "string"
         }
       ]
     }
