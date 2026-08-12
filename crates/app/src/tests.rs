@@ -4353,24 +4353,23 @@ async fn assignment_binds_to_the_roster_and_never_gates_a_claim() {
 /// `SQLITE_BUSY` (no handler, or a deadlock SQLite refuses to wait on) looks like
 /// a fast one.
 ///
-/// **CMP-17 is fixed as of `whipplescript-store` 0.4.2** — this run now reports
-/// zero `SQLITE_BUSY`. It still fails, on a *different* mechanism the BUSY
-/// failures were hiding: `Conflict("branch head moved during the import;
-/// retry")`. That is the store's optimistic compare-and-swap on the branch head
-/// (`AdvanceOutcome::Stale`) behaving exactly as designed and asking to be
-/// retried, and nothing on this side retries it. Six chats on one placement
-/// share a target workspace, so their boundary cuts genuinely do contend for one
-/// head; before the fix the loser failed early with BUSY instead of getting far
-/// enough to notice.
+/// **Both mechanisms it found are now fixed, and it passes.** `SQLITE_BUSY` went
+/// with `whipplescript-store` 0.4.2 (deferred → `Immediate` transactions). What
+/// that uncovered underneath — `Conflict("branch head moved during the import;
+/// retry")`, the store's head compare-and-swap refusing a second writer — went
+/// with the per-branch writer lock in `gaugedesk_workspace::sync_in`. It failed
+/// 7 runs in 8 before that lock and 8 in 8 after.
 ///
-/// Left `#[ignore]`d rather than relaxed to "no BUSY": an assertion that
-/// tolerated the head conflict would bake a known defect into a green test. The
-/// durable guard for the fix itself is
-/// `gaugedesk_workspace::workspace_store_contention::a_write_waits_for_a_held_lock_instead_of_failing`,
-/// which is no longer ignored.
+/// Still `#[ignore]`d, now only for cost: it spends about 18 seconds in
+/// deliberate `[slow]` holds, which is what opens the overlap window, and the
+/// gate runs on every change. The standing guard is
+/// `gaugedesk_workspace::tests::concurrent_importers_on_one_branch_all_land_and_none_is_lost`,
+/// which proves the same property in 0.1 s and fails with this exact error when
+/// the lock is removed. Keep this one for when the question is "does the whole
+/// engine hold up under steer pressure", which no unit test answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "reproduces the un-retried branch-head CAS conflict that CMP-17's \
-            SQLITE_BUSY was masking; run with `--ignored`"]
+#[ignore = "end-to-end steer-pressure reproduction; ~18s of deliberate holds, so \
+            it is run on demand with `--ignored` rather than in the gate"]
 async fn cmp17_busy_under_steer_pressure() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = seeded_workbench();

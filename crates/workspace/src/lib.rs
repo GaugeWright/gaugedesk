@@ -15,9 +15,11 @@
 //! (kept open across merges via `merge_keeping`), `workstream/<id>/main` is
 //! a stream line.
 
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use whipplescript_store::branches::{CreateBranchOutcome, RetargetOutcome, MAINLINE_BRANCH_ID};
 use whipplescript_store::content::ContentBlobs;
@@ -1083,6 +1085,40 @@ fn persist_scratch(store_root: &Path, branch: &str, cache: &StatCache) -> Result
     std::fs::write(path, cache.to_json()).map_err(WorkspaceError::io)
 }
 
+/// One importer at a time per branch — the single writer the store assumes.
+///
+/// `whipplescript_store::vcs` states its concurrency model plainly: *"The CLI
+/// process is the single writer per workspace (the mediator); optimistic head
+/// guards make a racing writer a refused normal outcome rather than a lost
+/// update."* The guard is a backstop, not a merge — the same paragraph rules out
+/// a "fake auto-merge" — so a racing writer is refused and expected not to exist.
+///
+/// GaugeDesk runs many turns in one process and so has to supply that single
+/// writer itself. Where it did not, two turns importing into one branch raced
+/// between `import_diff`'s head read and its compare-and-swap, and the loser's
+/// turn died with `Conflict("branch head moved during the import; retry")`.
+///
+/// It stayed invisible because it was masked twice. `SQLITE_BUSY` failed those
+/// same writes earlier until whipplescript-store 0.4.2; and turns on one chat are
+/// *incidentally* serialized by the **agent-session** mutex whenever the harness
+/// is reused across turns. That coupling is accidental and conditional: an
+/// adapter reporting `reuse_across_turns() == false` gets a fresh mutex per turn,
+/// which serializes nothing. Workspace integrity must not depend on how an agent
+/// adapter caches sessions, so the lock is taken here.
+///
+/// Keyed per `(store_root, branch)`, so chats on different branches still import
+/// concurrently and only genuine same-branch writers wait. Held across the whole
+/// read-modify-write — scan, delta, head read, swap — because splitting it is the
+/// bug. Nothing this function calls re-enters it, so the plain mutex cannot
+/// deadlock against itself, and no caller holds it.
+fn workspace_writer(store_root: &Path, branch: &str) -> Arc<Mutex<()>> {
+    static WRITERS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = format!("{}\u{0}{branch}", store_root.display());
+    let writers = WRITERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = writers.lock().unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(guard.entry(key).or_default())
+}
+
 /// Scan the worktree and commit what changed as ONE cut on the branch.
 /// `None` = nothing changed (no cut minted). A missing worktree directory
 /// imports nothing — it means "not checked out here", never "everything
@@ -1096,6 +1132,8 @@ fn sync_in(
     if !root.is_dir() {
         return Ok(None);
     }
+    let writer = workspace_writer(store_root, branch);
+    let _writing = writer.lock().unwrap_or_else(PoisonError::into_inner);
     let scratch = load_scratch(vcs, store_root, branch);
     let import = whipplescript_store::materialize::import_scratch(
         root,
@@ -2102,6 +2140,91 @@ mod tests {
             "rejection must not mutate old state"
         );
         assert!(worktrees.join("chat/.git").exists());
+    }
+
+    /// Several turns importing into ONE branch must all land, and none may lose
+    /// another's work.
+    ///
+    /// `whipplescript_store::vcs` assumes a single writer per workspace and
+    /// refuses a racing one rather than merging it — so GaugeDesk has to be that
+    /// single writer. Where it was not, the loser of the race between
+    /// `import_diff`'s head read and its compare-and-swap failed its whole turn
+    /// with `Conflict("branch head moved during the import; retry")`.
+    ///
+    /// Two things hid it. `SQLITE_BUSY` failed these writes earlier still, until
+    /// whipplescript-store 0.4.2. And turns on one chat are *incidentally*
+    /// serialized by the agent-session mutex whenever the harness is reused
+    /// across turns — so with a reusing adapter the race cannot be observed at
+    /// all, and with a non-reusing one it fires constantly. A test that went
+    /// through the engine would therefore be testing the adapter's caching
+    /// policy; this one drives the workspace directly and does not care.
+    ///
+    /// The manifest assertion is the load-bearing half. Serializing the writers
+    /// so that none *errors* would be easy and wrong — the question is whether
+    /// every writer's file survived, which is what "rather than a lost update"
+    /// means.
+    #[test]
+    fn concurrent_importers_on_one_branch_all_land_and_none_is_lost() {
+        const WRITERS: usize = 6;
+        let (_directory, instance) = instance();
+        // One id, so one branch and one worktree: these are turns on a single
+        // chat, not chats on a single target.
+        let engagements: Vec<Engagement> = (0..WRITERS)
+            .map(|_| instance.create_engagement("shared").expect("engagement"))
+            .collect();
+
+        let barrier = std::sync::Barrier::new(WRITERS);
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = engagements
+                .iter()
+                .enumerate()
+                .map(|(index, engagement)| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        // Write inside the thread, after the barrier, so the
+                        // scans genuinely overlap. Writing everything up front
+                        // would let the first importer carry every file and
+                        // leave the rest with an empty delta and no head swap —
+                        // a test that never reaches the contended path.
+                        barrier.wait();
+                        engagement
+                            .write_file(&format!("note-{index}.md"), &format!("body {index}"))
+                            .expect("seed");
+                        engagement.commit_turn("turn")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("writer thread"))
+                .collect()
+        });
+
+        for (index, outcome) in outcomes.iter().enumerate() {
+            assert!(
+                outcome.is_ok(),
+                "writer {index} was refused, so a turn would have died: {outcome:?}"
+            );
+        }
+
+        let engagement = &engagements[0];
+        let vcs = NativeWorkspaceVcs::open(
+            engagement.store_root.join("branches.sqlite"),
+            engagement.store_root.join("content.sqlite"),
+        )
+        .expect("open store");
+        let manifest = vcs
+            .manifest(&engagement.branch)
+            .expect("manifest")
+            .unwrap_or_default();
+        for index in 0..WRITERS {
+            let path = format!("note-{index}.md");
+            assert!(
+                manifest.contains_key(&path),
+                "`{path}` never reached the branch manifest, so a writer's work was lost: {:?}",
+                manifest.keys().collect::<Vec<_>>()
+            );
+        }
     }
 }
 
