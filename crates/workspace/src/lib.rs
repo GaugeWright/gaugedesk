@@ -178,6 +178,37 @@ fn now_at() -> String {
     now_nanos().to_string()
 }
 
+/// How coarse a worktree's filesystem clock may be. Timestamps come from a
+/// second-granular filesystem (ext3-class) or, on a busy host, from the
+/// kernel's tick-granular coarse clock, never from the nanosecond clock
+/// `now_nanos` reads. One second covers both.
+const FILESYSTEM_CLOCK_GRANULE_NANOS: i128 = 1_000_000_000;
+
+/// The stamp a stat cache records as the boundary of its racy window:
+/// for the import scan and, equally, for the cache materialization leaves
+/// behind.
+///
+/// The stat cache trusts a size+mtime fingerprint only while that mtime is
+/// strictly older than the previous scan's stamp; anything at or after it
+/// is re-hashed, because a write landing in the recorded granule is a
+/// same-size, same-mtime change no fingerprint can see. That rule is only
+/// as sound as the stamp: a wall-clock instant is finer than the clock the
+/// filesystem actually stamped the file with, so a write moments before
+/// the stamp gets an mtime that already looks strictly older, and the next
+/// write inside that same granule is trusted away and silently lost. The
+/// files materialization itself just wrote are the same story: their
+/// mtimes come from that same coarse clock, so they can land below a
+/// nanosecond stamp taken before the write.
+///
+/// So hold the recorded stamp back by one granule. Anything touched within
+/// a second of the scan is re-hashed next time (cheap: it is bounded by
+/// what a turn just wrote or what materialization just laid down), and the
+/// O(touched) trust path still carries every file that has been quiet
+/// longer than that.
+fn scan_stamp() -> i128 {
+    now_nanos().saturating_sub(FILESYSTEM_CLOCK_GRANULE_NANOS)
+}
+
 fn fresh_cut_id(kind: &str) -> String {
     format!(
         "cut-{kind}-{:x}-{:x}",
@@ -1139,7 +1170,7 @@ fn sync_in(
         root,
         &scratch,
         vcs.content_store(),
-        now_nanos(),
+        scan_stamp(),
     )?;
     let manifest = vcs.manifest(branch)?.unwrap_or_default();
     let mut changed = import.changed;
@@ -1213,7 +1244,7 @@ fn sync_out(
         let _ = std::fs::remove_dir(root.join(&entry.path));
     }
     let scratch = vcs
-        .materialize_branch(branch, root, now_nanos())?
+        .materialize_branch(branch, root, scan_stamp())?
         .ok_or_else(|| WorkspaceError::msg(format!("no line `{branch}` to materialize")))?;
     persist_scratch(store_root, branch, &scratch.cache)
 }
@@ -1746,6 +1777,90 @@ mod tests {
             eng.read_file("notes.md").expect("read"),
             "The swift brown fox jumps over the lazy tiger today.",
             "a conflicted save writes nothing"
+        );
+    }
+
+    /// A write the filesystem clock cannot distinguish from the previous
+    /// one still reaches the store. Two same-size bodies written inside a
+    /// single timestamp granule carry the SAME size and the SAME mtime, so
+    /// a stat fingerprint alone cannot tell them apart; the importer's
+    /// escape is the racy-granule rule, which only holds while the cache
+    /// stamp is conservative about how coarse that clock may be. Pinning
+    /// the mtime back is exactly what a second-granular (or tick-granular,
+    /// under load) filesystem reports on its own.
+    ///
+    /// Losing this drops an agent's write silently: the head keeps the
+    /// stale body, so the editor's next base-carrying save sees no
+    /// divergence to merge and overwrites bytes that were never recorded.
+    #[test]
+    fn a_write_inside_one_timestamp_granule_is_still_imported() {
+        let (_directory, instance) = instance();
+        let eng = instance.create_engagement("granule").expect("engagement");
+        let base = "The quick brown fox jumps over the lazy dog tonight.";
+        let agent = "The swift brown fox jumps over the lazy dog tonight.";
+        assert_eq!(base.len(), agent.len(), "size cannot betray the rewrite");
+        eng.write_file("notes.md", base).expect("seed");
+        eng.commit_turn("seed").expect("seed cut");
+
+        let file = eng.path().join("notes.md");
+        let granule = std::fs::metadata(&file)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        eng.write_file("notes.md", agent).expect("agent write");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open")
+            .set_times(std::fs::FileTimes::new().set_modified(granule))
+            .expect("pin the mtime into the previous granule");
+        eng.commit_turn("agent turn").expect("agent cut");
+
+        // The editor saved from the pre-agent body: the agent's write has
+        // to be in the head for this to have anything to merge against.
+        let outcome = eng
+            .save_file_with_base(
+                "notes.md",
+                "The quick brown fox jumps over the lazy dog today.",
+                SaveBase::Content(base),
+                &[],
+            )
+            .expect("save");
+        let SaveFileOutcome::Merged { content, .. } = &outcome else {
+            panic!("the agent's write never reached the store: {outcome:?}");
+        };
+        assert_eq!(
+            content,
+            "The swift brown fox jumps over the lazy dog today."
+        );
+    }
+
+    /// The same granule rule for the OTHER producer of a stat cache:
+    /// materialization. `sync_out` writes files whose mtimes come from the
+    /// same coarse filesystem clock, so a cache it stamps with a bare
+    /// nanosecond instant can already sit ahead of the bytes it just laid
+    /// down, and the next same-size edit inside that granule is trusted
+    /// away by the following `sync_in`.
+    #[test]
+    fn a_materialized_cache_records_the_conservative_stamp() {
+        let (_directory, instance) = instance();
+        let eng = instance
+            .create_engagement("materialized")
+            .expect("engagement");
+        eng.write_file("notes.md", "The quick brown fox.")
+            .expect("seed");
+        eng.commit_turn("seed").expect("seed cut");
+        // Merging re-materializes the worktree, so the cache left behind
+        // is the one `sync_out` stamped.
+        eng.merge_into_main().expect("merge");
+
+        let body = std::fs::read_to_string(scratch_cache_path(&eng.store_root, &eng.branch))
+            .expect("materialized cache");
+        let cache = StatCache::from_json(&body).expect("cache json");
+        assert!(
+            cache.stamp_unix_nanos <= now_nanos() - FILESYSTEM_CLOCK_GRANULE_NANOS,
+            "materialized cache stamp {} is inside the filesystem clock granule",
+            cache.stamp_unix_nanos
         );
     }
 
