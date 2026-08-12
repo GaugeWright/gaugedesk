@@ -1,46 +1,70 @@
-/* Manrope — self-hosted variable font, OFL. Bundled WOFF2 so the
-   desktop app needs no Google Fonts CDN (works offline, respects Tauri's CSP). */
+/* IBM Plex Serif — self-hosted, OFL. One text family carries every role a person
+   reads or operates (GaugeWright DR-0071); Commit Mono still carries data. Bundled
+   WOFF2 so the desktop app needs no Google Fonts CDN — it works offline and
+   respects Tauri's CSP.
+
+   Three faces, and each earns its place. 400 is the whole interface. The italic is
+   drawn rather than sheared: the previous system loaded no italic at all, so every
+   emphasis an agent wrote came out as a browser-synthesized oblique, and that is
+   the defect this decision was made to fix. 700 exists only for semantic strong in
+   prose, where a bold lead-in is the strongest landmark a long reply has — chrome
+   never uses it. */
 @font-face {
-    font-family: "Manrope";
+    font-family: "IBM Plex Serif";
     font-style: normal;
-    font-weight: 200 800;
+    font-weight: 400;
     font-display: swap;
-    src: url("./assets/fonts/manrope-latin.woff2") format("woff2");
+    src: url("./assets/fonts/ibm-plex-serif-latin-400.woff2") format("woff2");
     unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
         U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
         U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
-    font-family: "Manrope";
+    font-family: "IBM Plex Serif";
     font-style: normal;
-    font-weight: 200 800;
+    font-weight: 400;
     font-display: swap;
-    src: url("./assets/fonts/manrope-latin-ext.woff2") format("woff2");
+    src: url("./assets/fonts/ibm-plex-serif-latin-ext-400.woff2") format("woff2");
     unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
         U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
         U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
-
-/* STIX Two Text — self-hosted variable serif, OFL. The brand's operable voice
-   (headings, facet tabs, labels — see GaugeWright/brand/typography.md); without
-   this the whole serif register silently fell back to whatever serif the OS
-   had, which on most Linux/Windows machines is none of the stack. */
 @font-face {
-    font-family: "STIX Two Text";
-    font-style: normal;
-    font-weight: 400 700;
+    font-family: "IBM Plex Serif";
+    font-style: italic;
+    font-weight: 400;
     font-display: swap;
-    src: url("./assets/fonts/stix-two-text-latin.woff2") format("woff2");
+    src: url("./assets/fonts/ibm-plex-serif-latin-400-italic.woff2") format("woff2");
     unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
         U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
         U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
-    font-family: "STIX Two Text";
-    font-style: normal;
-    font-weight: 400 700;
+    font-family: "IBM Plex Serif";
+    font-style: italic;
+    font-weight: 400;
     font-display: swap;
-    src: url("./assets/fonts/stix-two-text-latin-ext.woff2") format("woff2");
+    src: url("./assets/fonts/ibm-plex-serif-latin-ext-400-italic.woff2") format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+        U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+        U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+    font-family: "IBM Plex Serif";
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url("./assets/fonts/ibm-plex-serif-latin-700.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+        U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+        U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+    font-family: "IBM Plex Serif";
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url("./assets/fonts/ibm-plex-serif-latin-ext-700.woff2") format("woff2");
     unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
         U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
         U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
@@ -76,10 +100,14 @@
     --accent-contrast: #08111e;
     --warn: #e0b24e;
     --bad: #e0655c;
-    /* UI chrome + chat in Manrope; code surfaces (file view, editor, diff) stay
-       monospace via --mono so alignment holds. */
-    --serif: "STIX Two Text", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
-    --ui: "Manrope", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    /* One text family for chrome and chat alike (GaugeWright DR-0071); code
+       surfaces (file view, editor, diff) stay monospace via --mono so alignment
+       holds. --serif and --ui both resolve to it: the split they were named for
+       is retired, and they stay as aliases only so no component style has to
+       change in the same commit that changes the face. */
+    --font-text: "IBM Plex Serif", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+    --serif: var(--font-text);
+    --ui: var(--font-text);
     --mono: "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     /* The type scale. Five steps; every font-size in the workbench should resolve
        to one of these (or an em relative to one). px sizes outside the scale are
@@ -112,17 +140,17 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     padding: 0 clamp(22px, 5vw, 72px); border-bottom: 1px solid var(--edge);
     background: color-mix(in srgb, var(--bg) 88%, transparent); }
 .console-brand { display: inline-flex; align-items: center; gap: 11px; color: var(--ink);
-    font-size: var(--fs-title); font-weight: 700; text-decoration: none; letter-spacing: -.01em; }
+    font-size: var(--fs-title); font-weight: 400; text-decoration: none; letter-spacing: -.01em; }
 .console-mark { display: inline-grid; place-items: center; width: 30px; height: 30px;
     border-radius: 9px; background: linear-gradient(145deg, var(--accent), var(--gw-navy));
-    color: #fff; font-size: var(--fs-body); font-weight: 800; box-shadow: inset 0 0 0 1px rgba(255,255,255,.18); }
+    color: #fff; font-size: var(--fs-body); font-weight: 400; box-shadow: inset 0 0 0 1px rgba(255,255,255,.18); }
 .console-account-menu { position: relative; }
 .console-header-actions { display: flex; align-items: center; gap: 10px; }
 .console-header-actions .console-notifications { margin-left: 0; }
 .console-account-menu .settings-anchor { position: relative; }
 .console-account-menu .settings-gear { min-width: 82px; padding: 7px 12px; border: 1px solid var(--edge);
     border-radius: 7px; background: color-mix(in srgb, var(--panel) 85%, transparent); color: var(--ink);
-    font: 650 12px var(--ui); cursor: pointer; }
+    font: 400 12px var(--ui); cursor: pointer; }
 .console-account-menu .settings-gear:hover, .console-account-menu .settings-gear.active {
     border-color: color-mix(in srgb, var(--accent) 62%, var(--edge)); color: var(--accent); }
 .console-account-menu .settings-popover { right: 0; bottom: auto; left: auto; top: calc(100% + 8px); }
@@ -134,7 +162,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .console-workbench-nav { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .console-workspace-current, .console-workspace-switch, .console-section-link { min-height: 30px; padding: 6px 9px;
     border: 1px solid transparent; border-radius: 5px; color: var(--muted); background: transparent;
-    font: 650 11px var(--ui); text-decoration: none; white-space: nowrap; }
+    font: 400 11px var(--ui); text-decoration: none; white-space: nowrap; }
 .console-workspace-current { color: var(--ink); max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 .console-workspace-switch { border-color: var(--edge); color: var(--ink); cursor: pointer; }
 .console-workspace-switch:hover, .console-section-link:hover { color: var(--ink); border-color: var(--edge); }
@@ -145,25 +173,25 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .console-workspace-popover { position: absolute; z-index: 61; top: calc(100% + 7px); left: 0; min-width: 216px;
     padding: 5px; border: 1px solid var(--edge); border-radius: 8px; background: var(--panel); box-shadow: 0 14px 36px rgba(0,0,0,.34); }
 .console-workspace-popover button { display: flex; width: 100%; align-items: center; justify-content: space-between;
-    gap: 18px; padding: 8px; border: 0; border-radius: 5px; background: transparent; color: var(--ink); text-align: left; cursor: pointer; font: 600 11px var(--ui); }
+    gap: 18px; padding: 8px; border: 0; border-radius: 5px; background: transparent; color: var(--ink); text-align: left; cursor: pointer; font: 400 11px var(--ui); }
 .console-workspace-popover button:hover, .console-workspace-popover button.active { background: color-mix(in srgb, var(--accent) 13%, transparent); }
 .console-workspace-popover small { color: var(--muted); font-size: var(--fs-label); text-transform: capitalize; }
 .console-workspace-popover p { margin: 6px 4px 2px; color: var(--bad); font-size: var(--fs-label); }
 .console-notifications { position: relative; margin-left: auto; }
-.console-notifications-trigger { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 6px 9px; border: 1px solid var(--edge); border-radius: 5px; background: transparent; color: var(--ink); font: 650 11px var(--ui); cursor: pointer; }
+.console-notifications-trigger { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 6px 9px; border: 1px solid var(--edge); border-radius: 5px; background: transparent; color: var(--ink); font: 400 11px var(--ui); cursor: pointer; }
 .console-notifications-trigger:hover { border-color: color-mix(in srgb, var(--accent) 62%, var(--edge)); color: var(--accent); }
 .console-notifications-trigger span { display: inline-grid; place-items: center; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px; background: var(--accent); color: #fff; font-size: 9px; }
 .console-notifications-catcher { position: fixed; inset: 0; z-index: 60; }
 .console-notifications-popover { position: absolute; z-index: 61; top: calc(100% + 7px); right: 0; width: min(330px, calc(100vw - 24px)); padding: 7px; border: 1px solid var(--edge); border-radius: 8px; background: var(--panel); box-shadow: 0 14px 36px rgba(0,0,0,.34); }
 .console-notifications-popover > div { display: flex; align-items: center; justify-content: space-between; padding: 3px 4px 7px; color: var(--ink); font-size: var(--fs-small); }
-.console-notifications-popover > div button { border: 0; background: transparent; color: var(--accent); font: 650 10px var(--ui); cursor: pointer; }
-.console-notifications-popover > button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 7px; border: 0; border-radius: 5px; background: transparent; color: var(--ink); text-align: left; cursor: pointer; font: 600 11px var(--ui); }
+.console-notifications-popover > div button { border: 0; background: transparent; color: var(--accent); font: 400 10px var(--ui); cursor: pointer; }
+.console-notifications-popover > button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 7px; border: 0; border-radius: 5px; background: transparent; color: var(--ink); text-align: left; cursor: pointer; font: 400 11px var(--ui); }
 .console-notifications-popover > button:hover { background: color-mix(in srgb, var(--accent) 13%, transparent); }
 .console-notifications-popover small { display: block; margin-top: 2px; color: var(--muted); font-size: var(--fs-label); font-weight: 400; }
 .console-notification-unavailable { color: var(--warn, #b9802c); }
 .console-notifications-popover > p { margin: 6px 4px 2px; color: var(--bad); font-size: var(--fs-label); }
 .console-new-organization { display: grid; gap: 6px; margin: 6px 3px 2px; padding: 9px 5px 3px; border-top: 1px solid var(--edge); }
-.console-new-organization label { color: var(--muted); font-size: var(--fs-label); font-weight: 700; }
+.console-new-organization label { color: var(--muted); font-size: var(--fs-label); font-weight: 400; }
 .console-new-organization input { width: 100%; padding: 6px 7px; border: 1px solid var(--edge); border-radius: 5px; background: var(--bg); color: var(--ink); font: 11px var(--ui); }
 .console-workspace-popover .console-new-organization button { width: auto; justify-self: start; padding: 6px 8px; border: 1px solid var(--edge); background: var(--panel); color: var(--ink); }
 .console-workbench-main { height: calc(100vh - 52px); }
@@ -188,15 +216,15 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .computer-connect button { justify-self: start; }
 .console-main { width: min(880px, calc(100% - 44px)); margin: 0 auto; padding: clamp(64px, 10vh, 112px) 0; }
 .console-heading { max-width: 610px; margin-bottom: 34px; }
-.console-eyebrow { margin: 0 0 12px; color: var(--accent); font-size: var(--fs-label); font-weight: 750;
+.console-eyebrow { margin: 0 0 12px; color: var(--accent); font-size: var(--fs-label); font-weight: 400;
     letter-spacing: .11em; text-transform: uppercase; }
 .console-heading h1 { margin: 0; font: 400 clamp(34px, 5vw, 52px)/1.05 var(--serif); letter-spacing: -.035em; }
 .console-heading > p:last-child { margin: 18px 0 0; color: var(--muted); font-size: var(--fs-title); line-height: 1.6; }
 .new-organization { display: grid; gap: 8px; max-width: 610px; margin: 0 0 24px; padding: 16px; border: 1px solid var(--edge); border-radius: 12px; background: color-mix(in srgb, var(--panel) 92%, var(--accent)); }
-.new-organization > label { color: var(--ink); font-size: var(--fs-body); font-weight: 750; }
+.new-organization > label { color: var(--ink); font-size: var(--fs-body); font-weight: 400; }
 .new-organization > div { display: flex; gap: 8px; }
 .new-organization input { min-width: 0; flex: 1; padding: 9px 10px; border: 1px solid var(--edge); border-radius: 6px; background: var(--bg); color: var(--ink); font: 13px var(--ui); }
-.new-organization button { padding: 9px 11px; border: 1px solid color-mix(in srgb, var(--accent) 75%, var(--edge)); border-radius: 6px; background: var(--accent-strong); color: white; font: 700 12px var(--ui); cursor: pointer; white-space: nowrap; }
+.new-organization button { padding: 9px 11px; border: 1px solid color-mix(in srgb, var(--accent) 75%, var(--edge)); border-radius: 6px; background: var(--accent-strong); color: white; font: 400 12px var(--ui); cursor: pointer; white-space: nowrap; }
 .new-organization button:disabled { cursor: wait; opacity: .64; }
 .new-organization > p { margin: 0; color: var(--muted); font-size: var(--fs-small); }
 .new-organization > .new-organization-error { color: var(--bad); }
@@ -217,7 +245,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .workspace-copy { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 5px; }
 .workspace-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-title); }
 .workspace-copy span { color: var(--muted); font-size: var(--fs-small); text-transform: capitalize; }
-.workspace-open { flex: 0 0 auto; color: var(--accent); font-size: var(--fs-small); font-weight: 700; }
+.workspace-open { flex: 0 0 auto; color: var(--accent); font-size: var(--fs-small); font-weight: 400; }
 .console-state { padding: 22px; border: 1px solid var(--edge); border-radius: 12px;
     background: var(--panel); color: var(--muted); font-size: var(--fs-body); }
 .console-open-error { margin-bottom: 14px; border-color: color-mix(in srgb, var(--bad) 54%, var(--edge));
@@ -225,7 +253,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .console-home-setup { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 0 0 14px; }
 .console-home-setup p { margin: 0; }
 .console-home-setup-actions { display: flex; flex: 0 0 auto; gap: 8px; }
-.console-home-setup-actions button { padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--accent) 70%, var(--edge)); border-radius: 6px; background: var(--accent-strong); color: #fff; font: 700 11px var(--ui); cursor: pointer; }
+.console-home-setup-actions button { padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--accent) 70%, var(--edge)); border-radius: 6px; background: var(--accent-strong); color: #fff; font: 400 11px var(--ui); cursor: pointer; }
 .console-error p { margin: 0 0 12px; }
 .console-error button { padding: 7px 11px; border: 1px solid var(--edge); border-radius: 6px;
     background: var(--bg); color: var(--ink); cursor: pointer; }
@@ -241,14 +269,14 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .hub-sidebar-heading { min-height: 32px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .hub-sidebar-heading .console-eyebrow { margin: 7px 0 0; }
 .hub-sidebar-heading > button { padding: 5px 7px; border: 0; background: transparent; color: var(--accent);
-    font: 650 10px var(--ui); cursor: pointer; }
+    font: 400 10px var(--ui); cursor: pointer; }
 .hub-new-organization { display: grid; gap: 7px; margin: 12px 0 16px; padding: 12px;
     border: 1px solid var(--edge); border-radius: 9px; background: var(--panel); }
 .hub-new-organization label { color: var(--muted); font-size: var(--fs-label); }
 .hub-new-organization input { width: 100%; padding: 8px 9px; border: 1px solid var(--edge); border-radius: 5px;
     background: var(--bg); color: var(--ink); font: 12px var(--ui); }
 .hub-new-organization button { justify-self: start; padding: 7px 9px; border: 1px solid var(--edge); border-radius: 5px;
-    background: var(--accent-strong); color: #fff; font: 650 10px var(--ui); cursor: pointer; }
+    background: var(--accent-strong); color: #fff; font: 700 10px var(--ui); cursor: pointer; }
 .hub-new-organization button:disabled { cursor: wait; opacity: .55; }
 .hub-new-organization p { margin: 0; color: var(--bad); font-size: var(--fs-label); }
 .hub-sidebar-state { margin: 12px 0; color: var(--muted); font-size: var(--fs-small); }
@@ -295,7 +323,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .hub-service-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .hub-service-card:disabled { cursor: default; opacity: .58; transform: none; }
 .hub-service-card .hub-service-kicker { margin-bottom: auto; color: var(--accent); font-size: 9px;
-    font-weight: 750; letter-spacing: .09em; text-transform: uppercase; }
+    font-weight: 400; letter-spacing: .09em; text-transform: uppercase; }
 .hub-service-card strong { font-size: var(--fs-title); }
 .hub-service-card > span:not(.hub-service-kicker) { color: var(--ink); font-size: var(--fs-small); }
 .hub-service-card small { color: var(--muted); font-size: var(--fs-label); line-height: 1.5; }
@@ -380,8 +408,8 @@ code, pre, textarea {
    the only case worth spending colour on. */
 .chat-workstream { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0;
     flex: 0 4 auto; overflow: hidden; white-space: nowrap; font-size: var(--fs-label); }
-.chat-workstream-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
-.chat-workstream-state { color: var(--muted); font-weight: 500; }
+.chat-workstream-name { font-weight: 400; overflow: hidden; text-overflow: ellipsis; }
+.chat-workstream-state { color: var(--muted); font-weight: 400; }
 .chat-workstream[data-connection="fresh"] .chat-workstream-name { color: var(--muted); }
 .chat-workstream[data-connection="stale"] .chat-workstream-name { color: var(--warn); }
 .chat-workstream[data-connection="stuck"] .chat-workstream-name { color: var(--bad); }
@@ -403,7 +431,7 @@ code, pre, textarea {
 .chat-state .status-gem[data-state="idle"] { color: var(--muted); }
 .chat-state .status-gem-mark { position: absolute; top: -3px; right: -4px; font-size: 9px;
     line-height: 1; border-radius: 999px; background: var(--bad); color: #fff;
-    font-weight: 700; padding: 0 3px; }
+    font-weight: 400; padding: 0 3px; }
 .chat-state-label { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
     overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .tasks { grid-column: 1 / -1; background: linear-gradient(90deg, #0e2d50, var(--panel) 34%, var(--panel));
@@ -434,7 +462,7 @@ code, pre, textarea {
 .fed-peers, .fed-inbox { list-style: none; margin: 0; padding: 0; }
 .fed-peer { display: flex; align-items: center; gap: 8px; padding: 4px 0;
     border-bottom: 1px solid var(--edge); }
-.fed-peer-name { font-weight: 600; }
+.fed-peer-name { font-weight: 400; }
 .fed-peer-grant { color: var(--muted); font-size: var(--fs-ui); }
 .fed-peer .tree-action { width: auto; margin-left: auto; }
 .fed-peer .tree-action + .tree-action { margin-left: 0; }
@@ -536,7 +564,7 @@ code, pre, textarea {
 .task-keep.warn { color: var(--warn); border-color: var(--warn); }
 /* The two-click keep guard (round-6 #2): the armed state reads "confirm keep" in
    a warn tone so a permanent merge from the top bar is never a single blind click. */
-.task-keep.confirming { color: var(--warn); border-color: var(--warn); font-weight: 600; }
+.task-keep.confirming { color: var(--warn); border-color: var(--warn); font-weight: 400; }
 
 /* Drag handles between panels (a thin grid column each). */
 .resizer { background: var(--edge); cursor: col-resize; }
@@ -567,7 +595,7 @@ code, pre, textarea {
 .embed-chat-toolbar .audience-chats { min-width: 0; margin-right: auto; border-bottom: 0; }
 .embed-chat-toolbar .audience-chats-toggle { width: auto; padding: 5px 8px; }
 .embed-new-session { flex: 0 0 auto; padding: 5px 9px; border: 1px solid var(--edge);
-    border-radius: 6px; background: transparent; color: var(--muted); font: 600 var(--fs-small) var(--ui); }
+    border-radius: 6px; background: transparent; color: var(--muted); font: 400 var(--fs-small) var(--ui); }
 .embed-new-session:hover:not(:disabled) { border-color: var(--accent); color: var(--ink); }
 .embed-new-session:disabled { opacity: 0.55; cursor: default; }
 .embed-new-session-error { color: var(--bad); font-size: var(--fs-small); }
@@ -761,7 +789,7 @@ code, pre, textarea {
 /* "keep this work" is the primary review action — clearly accented, but a calm
    tinted/outlined primary rather than a saturated solid fill shouting next to the
    neutral "discard" (round-12: rebalanced the pair). */
-.merge-review .keep-btn { color: var(--accent); font-weight: 600;
+.merge-review .keep-btn { color: var(--accent); font-weight: 400;
     background: color-mix(in srgb, var(--accent) 16%, transparent);
     border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
 .merge-review .keep-btn:hover { color: var(--ink);
@@ -788,7 +816,7 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 .line.user { border-left-color: var(--muted); }
 .line.assistant { border-left-color: var(--accent); }
 .line.user::before, .line.assistant::before { display: block; margin-bottom: 2px;
-    font-size: var(--fs-label); font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; }
+    font-size: var(--fs-label); font-weight: 400; text-transform: uppercase; letter-spacing: 0.07em; }
 .line.user::before { content: "you"; color: var(--muted); }
 .line.assistant::before { content: attr(data-agent-label); color: var(--accent); }
 
@@ -835,7 +863,7 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 .tool-head { display: flex; align-items: center; gap: 6px; cursor: default; }
 .tool-head.expandable { cursor: pointer; }
 .tool-caret { opacity: 0.6; width: 0.9em; flex: 0 0 auto; }
-.tool-name { font-weight: 600; flex: 0 0 auto; }
+.tool-name { font-weight: 400; flex: 0 0 auto; }
 .tool-target {
     background: none; border: none; padding: 0; margin: 0; cursor: pointer;
     color: var(--accent); font: inherit; text-decoration: underline; text-underline-offset: 2px;
@@ -878,7 +906,7 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 .turn { margin-top: 9px; border-left: 2px solid var(--accent); padding-left: 8px; }
 .turn-head { display: flex; align-items: baseline; gap: 6px; cursor: pointer; user-select: none; }
 .turn-caret { color: var(--muted); width: 0.9em; flex: 0 0 auto; }
-.turn-label { font-size: var(--fs-label); font-weight: 600; text-transform: uppercase;
+.turn-label { font-size: var(--fs-label); font-weight: 400; text-transform: uppercase;
     letter-spacing: 0.07em; color: var(--accent); flex: 0 0 auto; }
 .turn-summary { color: var(--muted); font-size: var(--fs-ui); overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
@@ -915,7 +943,7 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 
 .bar { display: flex; gap: 8px; align-items: center; }
 .task { background: var(--edge); border-radius: 4px; padding: 4px 8px; color: var(--ink); }
-.task.current { background: var(--accent); color: #0f1115; font-weight: 600; }
+.task.current { background: var(--accent); color: #0f1115; font-weight: 400; }
 
 button {
     background: color-mix(in srgb, var(--edge) 84%, var(--bg)); color: var(--ink); border: 1px solid var(--edge);
@@ -940,7 +968,7 @@ input {
    the most weight (a solid warn fill + subtle ring) because it is a call to
    action, while "Ready" recedes to a quiet outline. */
 .status-badge { display: inline-flex; align-items: center; gap: 5px; margin-left: 10px;
-    font-size: 12px; letter-spacing: 0.02em; font-weight: 600;
+    font-size: 12px; letter-spacing: 0.02em; font-weight: 400;
     /* The pill lives inside the serif h2 header — pin it back to the UI sans so a
        status reads as a control state, not a heading fragment. */
     font-family: var(--ui); text-transform: none;
@@ -950,12 +978,12 @@ input {
 .status-badge[data-status="working"] { color: var(--accent); border-color: var(--accent);
     background: rgba(106, 163, 255, 0.16); }
 .status-badge[data-status="review"] { color: #1b1205; border-color: var(--warn);
-    background: var(--warn); font-weight: 700;
+    background: var(--warn); font-weight: 400;
     box-shadow: 0 0 0 3px rgba(224, 163, 90, 0.18); }
 /* Conflict (WS-H c): the most urgent badge — a turn's auto-sync hit a conflict the
    human must resolve in the Changes view. */
 .status-badge[data-status="conflict"] { color: #fff; border-color: var(--bad);
-    background: var(--bad); font-weight: 700;
+    background: var(--bad); font-weight: 400;
     box-shadow: 0 0 0 3px rgba(229, 115, 115, 0.22); }
 .status-badge .status-dot { width: 7px; height: 7px; border-radius: 50%;
     background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
@@ -1008,7 +1036,7 @@ input {
 .model-check input { accent-color: var(--accent); flex: 0 0 auto; }
 .composer-action, .composer-primary { flex: 0 0 auto; min-height: 28px; white-space: nowrap;
     display: inline-flex; align-items: center; justify-content: center; gap: 5px;
-    border-radius: 5px; font: 600 11px var(--ui); }
+    border-radius: 5px; font: 400 11px var(--ui); }
 .composer-action { padding: 3px 8px; color: var(--muted); background: transparent; border: 0; }
 .composer-action:hover:not(:disabled) { color: var(--ink); background: var(--edge); }
 .composer-action:disabled, .composer-primary:disabled { opacity: 0.55; cursor: default; }
@@ -1175,7 +1203,7 @@ input {
 /* The chat's own name leads the header (round-6 #6) — readable, not the muted
    uppercase the surrounding h2 uses, so it's clearly the chat's title. */
 .chat-title { text-transform: none; letter-spacing: normal; font-size: var(--fs-body);
-    font-family: var(--ui); font-weight: 600; color: var(--ink);
+    font-family: var(--ui); font-weight: 400; color: var(--ink);
     /* Auto-titled chats are whole sentences: one ellipsised line, never a wrap
        that folds the header onto four rows. The title yields last (it keeps at
        least ~12ch while lineage/target shrink first). */
@@ -1320,7 +1348,7 @@ input {
    filtered list shows why each surviving row stayed. */
 mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); color: inherit;
     border-radius: 2px; padding: 0 1px; }
-.tree-node .node-label { font-weight: 600; font-size: var(--fs-ui);
+.tree-node .node-label { font-weight: 400; font-size: var(--fs-ui);
     /* One line, ellipsized (round-6 #6): a long method name used to wrap onto two
        lines and make rows uneven. Let it shrink and truncate instead. */
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
@@ -1378,7 +1406,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     top: -3px; right: -4px; font-size: 8px; line-height: 1; padding: 0 2px;
     border-radius: 6px; color: #0f1115; font-variant-numeric: tabular-nums; }
 .tree-leaf .status-gem-count { background: var(--warn); }
-.tree-leaf .status-gem-mark { background: var(--bad); font-weight: 700; padding: 0 3px; }
+.tree-leaf .status-gem-mark { background: var(--bad); font-weight: 400; padding: 0 3px; }
 /* The row's demoted-facet tag (ADR 0112): under a flat lens the archetype
    survives as a quiet serif chip on the row instead of a tree level. */
 .tree-leaf .leaf-meta { margin-left: auto; flex: 0 0 auto; color: var(--muted);
@@ -1417,7 +1445,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .row-act:hover { color: var(--accent); background: var(--bg); border: 0; }
 .row-act .icon { width: 13px; height: 13px; }
 .row-act-plus { position: absolute; right: 1px; top: -2px; font-style: normal;
-    font-size: 9px; font-weight: 700; line-height: 1; color: var(--accent); }
+    font-size: 9px; font-weight: 400; line-height: 1; color: var(--accent); }
 .lens-toggle { flex: 0 0 auto; display: inline-flex; align-items: center;
     border: 1px solid var(--edge); border-radius: 3px; padding: 1px 6px; margin-right: 2px;
     background: transparent; color: var(--muted); cursor: pointer; white-space: nowrap;
@@ -1468,7 +1496,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .fork-note { margin: 4px 0 8px; padding: 7px 10px; font-size: var(--fs-ui); color: var(--muted);
     background: rgba(255, 255, 255, 0.03); border: 1px solid var(--edge); border-radius: 6px;
     line-height: 1.4; }
-.fork-note strong { color: var(--text); font-weight: 600; }
+.fork-note strong { color: var(--text); font-weight: 700; }
 .inline-edit { font: inherit; font-size: var(--fs-ui); padding: 1px 4px; background: var(--bg);
     color: var(--ink); border: 1px solid var(--accent); border-radius: 3px; }
 /* Placement lineage + pinned method version (ADR 0035 C1 pivot). */
@@ -1486,7 +1514,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .policy-callout { border: 1px solid var(--edge); border-left: 3px solid var(--muted);
     border-radius: 4px; padding: 8px 10px; margin-bottom: 10px; background: var(--panel); }
 .policy-callout.loosen { border-left-color: var(--warn); }
-.policy-callout-head { font-size: var(--fs-ui); font-weight: 600; color: var(--ink); margin-bottom: 4px; }
+.policy-callout-head { font-size: var(--fs-ui); font-weight: 400; color: var(--ink); margin-bottom: 4px; }
 .policy-callout-list { margin: 0 0 4px; padding-left: 18px; font-size: var(--fs-ui); color: var(--ink); }
 .policy-callout-list li.loosen { color: var(--warn); }
 .merge-review .keep-btn.warn { background: var(--warn); border-color: var(--warn); color: var(--bg); }
@@ -1804,7 +1832,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .sso-wizard { max-width: 580px; }
 .wizard-steps { list-style: none; display: flex; gap: 12px; padding: 0; margin: 0 0 14px; font-size: var(--fs-ui); flex-wrap: wrap; }
 .wizard-steps li { color: var(--muted); }
-.wizard-steps li.active { color: var(--fg); font-weight: 600; }
+.wizard-steps li.active { color: var(--fg); font-weight: 400; }
 .wizard-steps li.done { color: #3a9; }
 .wizard-pane { display: flex; flex-direction: column; gap: 8px; }
 .wizard-nav { display: flex; justify-content: space-between; margin-top: 14px; }
@@ -1836,16 +1864,16 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     border: 1px solid var(--edge); border-radius: 12px; padding: 28px 26px;
     display: flex; flex-direction: column; gap: 14px;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45); }
-.firstrun-title { margin: 0; font-size: 20px; font-weight: 600; color: var(--ink); }
+.firstrun-title { margin: 0; font-size: 20px; font-weight: 400; color: var(--ink); }
 .firstrun-lede { margin: 0; font-size: var(--fs-body); line-height: 1.5; color: var(--muted); }
 .firstrun-section { display: flex; flex-direction: column; gap: 8px; margin: 0;
     padding-top: 12px; border-top: 1px solid var(--edge); }
-.firstrun-section-label { margin: 0; font-size: var(--fs-label); font-weight: 600;
+.firstrun-section-label { margin: 0; font-size: var(--fs-label); font-weight: 400;
     text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 .firstrun-note { margin: 0; font-size: var(--fs-ui); line-height: 1.5; color: var(--muted); }
 .firstrun-account-state { display: flex; align-items: center; gap: 8px; margin: 0;
     font-size: var(--fs-body); color: var(--ink); }
-.firstrun-account-check { color: var(--accent); font-weight: 600; }
+.firstrun-account-check { color: var(--accent); font-weight: 400; }
 .firstrun-key { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
 .firstrun-field { display: flex; flex-direction: column; gap: 4px; }
 .firstrun-label { font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.06em;
@@ -1854,7 +1882,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     background: var(--bg); color: var(--ink); border: 1px solid var(--edge);
     border-radius: 6px; }
 .firstrun-select:focus, .firstrun-input:focus { outline: none; border-color: var(--accent); }
-.firstrun-connect { padding: 9px 14px; font-size: var(--fs-body); font-weight: 600;
+.firstrun-connect { padding: 9px 14px; font-size: var(--fs-body); font-weight: 400;
     background: var(--accent); color: #0b1220; border: none; border-radius: 6px;
     cursor: pointer; }
 .firstrun-connect:disabled { opacity: 0.5; cursor: default; }
@@ -1883,13 +1911,13 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     flex-direction: column; gap: 16px; border: 1px solid var(--edge);
     border-radius: 14px; background: var(--panel); box-shadow: 0 18px 60px rgba(0,0,0,.35); }
 .homegate-kicker { margin: 0; color: var(--accent); font-size: var(--fs-small);
-    font-weight: 700; text-transform: uppercase; letter-spacing: .09em; }
+    font-weight: 400; text-transform: uppercase; letter-spacing: .09em; }
 .homegate-card h1 { margin: -8px 0 0; font-size: 24px; color: var(--ink); }
 .homegate-lede { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
 .homegate-notice { padding: 10px 12px; border: 1px solid var(--edge); border-radius: 8px;
     background: var(--bg); color: var(--muted); font-size: var(--fs-ui); line-height: 1.45; }
 .homegate-homes, .homegate-field { display: flex; flex-direction: column; gap: 7px; }
-.homegate-label { color: var(--muted); font-size: var(--fs-label); font-weight: 650;
+.homegate-label { color: var(--muted); font-size: var(--fs-label); font-weight: 400;
     text-transform: uppercase; letter-spacing: .07em; }
 .homegate-home { display: flex; align-items: flex-start; justify-content: space-between;
     gap: 16px; padding: 9px 11px; border: 1px solid var(--edge); border-radius: 7px;
@@ -1899,7 +1927,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .homegate-connect-row input { flex: 1; min-width: 0; padding: 9px 10px; border: 1px solid var(--edge);
     border-radius: 7px; background: var(--bg); color: var(--ink); }
 .homegate-connect-row button, .homegate-cloud button { padding: 9px 14px; border: 0;
-    border-radius: 7px; background: var(--accent); color: #0b1220; font-weight: 650; cursor: pointer; }
+    border-radius: 7px; background: var(--accent); color: #0b1220; font-weight: 400; cursor: pointer; }
 .homegate-connect-row button:disabled, .homegate-cloud button:disabled { opacity: .45; cursor: default; }
 .homegate-cloud { display: flex; align-items: center; justify-content: space-between; gap: 18px;
     padding-top: 14px; border-top: 1px solid var(--edge); }
@@ -1954,7 +1982,7 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
     background: var(--surface-2, var(--panel)); }
 .environment-metric span, .environment-field span { color: var(--muted); font-size: var(--fs-label);
     text-transform: uppercase; letter-spacing: .07em; }
-.environment-metric strong { color: var(--ink); font-size: 20px; font-weight: 600; }
+.environment-metric strong { color: var(--ink); font-size: 20px; font-weight: 700; }
 .environment-field code { color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
 .environment-notice { padding: 10px 12px; border: 1px solid var(--edge);
     border-radius: 8px; color: var(--muted); font-size: var(--fs-ui); line-height: 1.45; }
@@ -1963,7 +1991,7 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .environment-table { width: 100%; border-collapse: collapse; font-size: var(--fs-ui); }
 .environment-table th, .environment-table td { padding: 8px; border-bottom: 1px solid var(--edge);
     text-align: left; vertical-align: top; overflow-wrap: anywhere; }
-.environment-table th { color: var(--muted); font-size: var(--fs-label); font-weight: 500;
+.environment-table th { color: var(--muted); font-size: var(--fs-label); font-weight: 400;
     text-transform: uppercase; letter-spacing: .06em; }
 @media (max-width: 760px) { .environment-grid { grid-template-columns: 1fr; } }
 

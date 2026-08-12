@@ -56,8 +56,8 @@ export function createWorkbenchShellState(options: WorkbenchShellOptions): Workb
     };
     const storedCollapsed = (key: string) => storage?.getItem(`${prefix}.${key}`) === "collapsed";
 
-    // 206px keeps the three serif facet tabs on one row with slack across the
-    // serif fallback stack's metric spread (STIX absent → wider Palatino/Noto).
+    // 206px keeps the three facet tabs on one row with slack across the text
+    // fallback stack's metric spread (Plex Serif absent → wider Palatino/Noto).
     const [navWidth, setNavWidth] = createSignal(storedNumber("navW", 206));
     const [filesWidth, setFilesWidth] = createSignal(storedNumber("wsW", 230));
     const [chatFraction, setChatFraction] = createSignal(storedNumber("runFr", 0.5));
