@@ -47,7 +47,10 @@ run_contracts() {
         scripts/wiring-canary/runners.test.mjs \
         scripts/wiring-canary/totp.test.mjs \
         scripts/wiring-canary/capture-provider-state.test.mjs \
-        web/e2e/production-account-session-canary.test.mjs
+        scripts/wiring-canary/hosted-account-session.test.mjs \
+        scripts/wiring-canary/poll.test.mjs \
+        web/e2e/production-account-session-canary.test.mjs \
+        web/e2e/production-native-session-canary.test.mjs
 
     echo "== client calls =="
     node scripts/check-client-calls.mjs

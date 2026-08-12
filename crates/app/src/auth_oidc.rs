@@ -84,16 +84,39 @@ pub struct PendingAuth {
     pub native_handoff_challenge: Option<String>,
 }
 
+/// How long a minted `state` may await its callback. A browser crossing the
+/// provider returns in well under this; anything older is an abandoned or
+/// never-followed login, and its verifier authorizes nothing worth keeping.
+const PENDING_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// A ceiling that holds even when nothing has expired yet. The TTL bounds the
+/// store by the rate of recent logins, and `/auth/login` is unauthenticated —
+/// so without this a caller can mint pending state faster than it ages out.
+const PENDING_AUTH_MAX: usize = 512;
+
+/// One login leg's [`PendingAuth`] and the moment it stops being redeemable.
+struct PendingEntry {
+    pending: PendingAuth,
+    expires_at: Instant,
+}
+
 /// In-flight `/auth/login` → `/auth/callback` PKCE state, keyed by CSRF `state`
 /// (`ID-3`). Single-process, held behind the [`AuthShellState`] mutex. A
 /// `state` authorizes exactly one callback: [`take`](Self::take) removes it,
-/// so a replayed or forged `state` finds nothing (fail-closed, `INV-20`). Loopback
+/// so a replayed or forged `state` finds nothing (fail-closed, `INV-20`).
+///
+/// A callback is the only thing that consumes an entry, and not every login
+/// leg reaches one: a person can abandon the provider screen, and the deployed
+/// account-session canary reads the redirect deliberately without following
+/// it. So entries also expire after [`PENDING_AUTH_TTL`] and are swept on the
+/// next [`begin`](Self::begin) — the store is bounded by the rate of *recent*
+/// logins rather than by every login the process has ever started. Loopback
 /// scaffold: a real multi-node deployment backs this with shared, TTL-bounded
 /// storage behind the same seam (mirroring
 /// [`SessionStore`](crate::session::SessionStore)).
 #[derive(Default)]
 pub struct PendingAuthStore {
-    by_state: BTreeMap<String, PendingAuth>,
+    by_state: BTreeMap<String, PendingEntry>,
 }
 
 impl PendingAuthStore {
@@ -102,15 +125,39 @@ impl PendingAuthStore {
         Self::default()
     }
 
-    /// Record the pending PKCE state a login leg minted, keyed by its CSRF `state`.
-    pub fn begin(&mut self, state: impl Into<String>, pending: PendingAuth) {
-        self.by_state.insert(state.into(), pending);
+    /// Record the pending PKCE state a login leg minted, keyed by its CSRF
+    /// `state`, and drop whatever has expired by `now`.
+    pub fn begin(&mut self, state: impl Into<String>, pending: PendingAuth, now: Instant) {
+        self.by_state.retain(|_, entry| entry.expires_at > now);
+        // Drop the oldest, never the newest: evicting the entry just minted
+        // would break the person who has only this moment clicked sign in.
+        while self.by_state.len() >= PENDING_AUTH_MAX {
+            let oldest = self
+                .by_state
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(state, _)| state.clone());
+            match oldest {
+                Some(state) => {
+                    self.by_state.remove(&state);
+                }
+                None => break,
+            }
+        }
+        self.by_state.insert(
+            state.into(),
+            PendingEntry {
+                pending,
+                expires_at: now + PENDING_AUTH_TTL,
+            },
+        );
     }
 
     /// Consume the pending state for a callback's `state` (single-use). `None` for an
-    /// unknown / already-redeemed / forged `state` — the CSRF guard.
-    pub fn take(&mut self, state: &str) -> Option<PendingAuth> {
-        self.by_state.remove(state)
+    /// unknown / already-redeemed / forged / expired `state` — the CSRF guard.
+    pub fn take(&mut self, state: &str, now: Instant) -> Option<PendingAuth> {
+        let entry = self.by_state.remove(state)?;
+        (entry.expires_at > now).then_some(entry.pending)
     }
 
     /// How many logins are awaiting their callback.
@@ -979,7 +1026,8 @@ pub async fn get_login(
     pending.native_return = native_return;
     pending.native_handoff_challenge = query.handoff_challenge;
 
-    auth.pending_auth_mut().begin(state, pending);
+    auth.pending_auth_mut()
+        .begin(state, pending, Instant::now());
     Redirect::to(&url).into_response()
 }
 
@@ -1081,8 +1129,9 @@ pub async fn get_callback(
         return (StatusCode::BAD_REQUEST, "missing code or state").into_response();
     };
 
-    // Single-use take: an unknown / replayed `state` finds nothing (CSRF guard).
-    let pending = auth.pending_auth_mut().take(&state);
+    // Single-use take: an unknown / replayed / expired `state` finds nothing
+    // (CSRF guard).
+    let pending = auth.pending_auth_mut().take(&state, Instant::now());
     let Some(pending) = pending else {
         throttle.record_failure(&tenant, now);
         return (StatusCode::BAD_REQUEST, "unknown or expired state").into_response();
@@ -1604,10 +1653,8 @@ iqlTEKVISscuchxZtKQJ4k8=
         }
     }
 
-    #[test]
-    fn pending_store_take_is_single_use() {
-        let mut store = PendingAuthStore::new();
-        let pending = PendingAuth {
+    fn pending_auth() -> PendingAuth {
+        PendingAuth {
             verifier: "v".into(),
             token_endpoint: TOKEN_ENDPOINT.into(),
             jwks_uri: JWKS_URI.into(),
@@ -1618,15 +1665,117 @@ iqlTEKVISscuchxZtKQJ4k8=
             client_secret: None,
             native_return: None,
             native_handoff_challenge: None,
-        };
-        store.begin("state-1", pending);
-        assert_eq!(store.len(), 1);
-        assert!(store.take("state-1").is_some(), "first take redeems");
+        }
+    }
+
+    /// A login the callback never comes for must not be held forever.
+    ///
+    /// `take` is the only consumer, and not every login leg reaches one — an
+    /// abandoned consent screen, or the account-session canary reading the
+    /// redirect without following it. Before the sweep, each of those kept a
+    /// PKCE verifier and the client secret for the life of the process.
+    #[test]
+    fn an_abandoned_login_is_swept_by_the_next_one() {
+        let mut store = PendingAuthStore::new();
+        let start = Instant::now();
+        store.begin("abandoned", pending_auth(), start);
+
+        // Still inside its own window: reading a consent screen takes time.
+        let soon = start + Duration::from_secs(60);
+        store.begin("in-flight", pending_auth(), soon);
+        assert_eq!(store.len(), 2);
         assert!(
-            store.take("state-1").is_none(),
+            store.take("abandoned", soon).is_some(),
+            "a live login is still redeemable"
+        );
+
+        // Past `in-flight`'s window — measured from when it began, not from the
+        // first login.
+        let later = soon + PENDING_AUTH_TTL + Duration::from_secs(1);
+        store.begin("later", pending_auth(), later);
+        assert_eq!(
+            store.len(),
+            1,
+            "the swept login is gone, not merely unredeemable"
+        );
+        assert!(store.take("in-flight", later).is_none());
+        assert!(store.take("later", later).is_some());
+    }
+
+    /// An expired `state` is refused even if nothing has swept it yet, so the
+    /// guarantee does not depend on another login arriving.
+    #[test]
+    fn an_expired_state_is_refused_before_any_sweep() {
+        let mut store = PendingAuthStore::new();
+        let start = Instant::now();
+        store.begin("stale", pending_auth(), start);
+        assert!(store
+            .take("stale", start + PENDING_AUTH_TTL + Duration::from_secs(1))
+            .is_none());
+    }
+
+    /// `/auth/login` is unauthenticated, so the TTL alone is not a bound.
+    #[test]
+    fn pending_logins_are_capped_even_when_none_have_expired() {
+        let mut store = PendingAuthStore::new();
+        let start = Instant::now();
+        for index in 0..(PENDING_AUTH_MAX + 40) {
+            store.begin(
+                format!("state-{index:04}"),
+                pending_auth(),
+                start + Duration::from_millis(index as u64),
+            );
+        }
+        // The sweep runs before each insert, so this is the size the store
+        // settles at rather than one it stays strictly under.
+        assert!(
+            store.len() <= PENDING_AUTH_MAX,
+            "the ceiling holds: {}",
+            store.len()
+        );
+        let newest = format!("state-{:04}", PENDING_AUTH_MAX + 39);
+        assert!(
+            store
+                .take(&newest, start + Duration::from_secs(1))
+                .is_some(),
+            "the cap drops the oldest, so the newest login still works",
+        );
+    }
+
+    #[test]
+    fn pending_store_take_is_single_use() {
+        let now = Instant::now();
+        let mut store = PendingAuthStore::new();
+        store.begin("state-1", pending_auth(), now);
+        assert_eq!(store.len(), 1);
+        assert!(store.take("state-1", now).is_some(), "first take redeems");
+        assert!(
+            store.take("state-1", now).is_none(),
             "second take is empty (single-use)"
         );
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_login_leg_that_never_reaches_its_callback_does_not_accumulate() {
+        // Only `/auth/callback` consumes an entry, and the deployed
+        // account-session canary reads the login redirect without following
+        // it. Without expiry every such probe would be held for the process
+        // lifetime.
+        let now = Instant::now();
+        let mut store = PendingAuthStore::new();
+        store.begin("abandoned", pending_auth(), now);
+
+        let later = now + PENDING_AUTH_TTL + Duration::from_secs(1);
+        assert!(
+            store.take("abandoned", later).is_none(),
+            "an expired state authorizes no callback"
+        );
+
+        store.begin("abandoned", pending_auth(), now);
+        store.begin("current", pending_auth(), later);
+        assert_eq!(store.len(), 1, "the sweep on begin drops what expired");
+        assert!(store.take("current", later).is_some());
     }
 
     #[test]
@@ -1679,7 +1828,7 @@ iqlTEKVISscuchxZtKQJ4k8=
     fn unknown_state_finds_nothing() {
         let mut store = PendingAuthStore::new();
         // The CSRF guard: a forged `state` the server never minted finds no verifier.
-        assert!(store.take("forged").is_none());
+        assert!(store.take("forged", Instant::now()).is_none());
     }
 
     #[test]
