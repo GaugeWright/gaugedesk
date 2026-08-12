@@ -22,6 +22,13 @@ APACHE_LICENSES = {
     Path("web/packages/control-plane-client/LICENSE"),
     Path("web/packages/gw-embed/LICENSE"),
 }
+# Directories that are never part of this checkout's licensed surface. `.claude`
+# holds agent worktrees — whole nested copies of this repository — and the root
+# AGENTS.md forbids committing it. A nested copy is the sharp case: the Apache
+# SDK exceptions above are keyed by exact relative path, so the same two
+# packages read as unlicensed AGPL violations at any other prefix, and the check
+# fails on files that are not in the repository at all.
+EXCLUDED_DIRS = {".claude", ".git", "dist", "node_modules", "target"}
 PUBLIC_DRIFT_TERMS = ("BUSL-1.1", "Business Source License", "Enterprise Use Grant")
 PUBLIC_DRIFT_ROOTS = (
     Path("README.public.md"),
@@ -39,15 +46,29 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def excluded(path: Path) -> bool:
+    """True when a path lies inside a directory that is not licensed surface.
+
+    Only the part of the path below ROOT is inspected. The checkout itself may
+    sit inside an excluded directory — an agent worktree under `.claude` is
+    exactly that — and those enclosing components say nothing about whether the
+    file is part of this checkout's licensed surface.
+    """
+    try:
+        relative = path.relative_to(ROOT)
+    except ValueError:
+        return False
+    return any(
+        part in EXCLUDED_DIRS or part.startswith("dist-") for part in relative.parts
+    )
+
+
 def text_files(path: Path):
     if path.is_file():
         yield path
         return
     for candidate in sorted(path.rglob("*")):
-        if not candidate.is_file() or any(
-            part in {"node_modules", "target", "dist"} or part.startswith("dist-")
-            for part in candidate.parts
-        ):
+        if not candidate.is_file() or excluded(candidate):
             continue
         try:
             candidate.read_text(encoding="utf-8")
@@ -79,7 +100,7 @@ def check(errors: list[str]) -> None:
     if workspace.get("workspace", {}).get("package", {}).get("license") != AGPL:
         errors.append(f"Cargo workspace license must be {AGPL}")
     for manifest in sorted(ROOT.rglob("Cargo.toml")):
-        if any(part in {"node_modules", "target"} for part in manifest.parts):
+        if excluded(manifest):
             continue
         data = tomllib.loads(manifest.read_text(encoding="utf-8"))
         package = data.get("package")
@@ -91,7 +112,7 @@ def check(errors: list[str]) -> None:
         errors.append(f"{manifest.relative_to(ROOT)} must declare or inherit {AGPL}")
 
     for manifest in sorted(ROOT.rglob("package.json")):
-        if any(part in {"node_modules", "target"} for part in manifest.parts):
+        if excluded(manifest):
             continue
         relative = manifest.relative_to(ROOT)
         data = json.loads(manifest.read_text(encoding="utf-8"))
