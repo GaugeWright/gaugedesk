@@ -51,6 +51,18 @@ permissions:
 jobs:
   bundle:
     name: tauri bundle (${{ matrix.os-label }})
+    # The mirror is the release origin. `specs/systems.md` states that GaugeDesk
+    # releases are projected to the public `gaugedesk` mirror and tagged there,
+    # and the shipped clients agree: `src-tauri/tauri.conf.json` points the
+    # updater at that repository's releases, so what it publishes is what an
+    # installed GaugeDesk fetches.
+    #
+    # This file is published verbatim to the mirror, so it must stay here to be
+    # projected — but it must not build here. Tagging `v*` on `-src` produced a
+    # second release of the same version, in a repository no client reads, and
+    # that second origin is why the unrotatable updater signing key had to exist
+    # in two places. Both repositories published v0.4.5.
+    if: github.repository == 'GaugeWright/gaugedesk'
     environment: production
     strategy:
       fail-fast: false

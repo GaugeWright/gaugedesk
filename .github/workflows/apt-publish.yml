@@ -21,6 +21,11 @@ permissions:
 jobs:
   publish:
     name: promote Debian release
+    # Mirror only, for the same reason as release.yml: it fires on the `release`
+    # event, and once `-src` stops publishing releases this would never fire
+    # here anyway. Stating it means the Debian promotion cannot be resurrected
+    # on the private trunk by someone tagging there.
+    if: github.repository == 'GaugeWright/gaugedesk'
     runs-on: ${{ github.repository == 'GaugeWright/gaugedesk' && 'ubuntu-22.04' || 'blacksmith-4vcpu-ubuntu-2204' }}
     timeout-minutes: 30
     environment: production
