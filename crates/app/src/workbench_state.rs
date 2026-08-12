@@ -147,6 +147,9 @@ pub struct Workbench {
     /// Machine-scoped controller invitations, challenges, and short-lived
     /// sessions. Durable grant records live in `store`; raw credentials do not.
     pub(crate) machine_controllers: crate::mobile_machine_session::MachineControllerRuntime,
+    /// Woken when the publication facility changes, so reachability can follow
+    /// it while the Home runs rather than only at the moment it started.
+    pub(crate) publication_changed: Arc<tokio::sync::Notify>,
 }
 
 pub type SharedWorkbench = Arc<Mutex<Workbench>>;
@@ -316,7 +319,25 @@ impl Workbench {
             enroll_broker: None,
             recovered_account_key: None,
             machine_controllers: crate::mobile_machine_session::MachineControllerRuntime::default(),
+            publication_changed: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Signalled whenever an account facility is attached or revoked.
+    ///
+    /// Reachability follows the person's publication choice (ADR 0131 §6), and a
+    /// choice made while the Home is running has to take effect while it is
+    /// running. This is what tells the reachability supervisor to look again.
+    ///
+    /// `notify_one` rather than `notify_waiters`, so a change that lands between
+    /// a supervisor's read and its wait is not lost: the permit is stored and
+    /// the next wait returns immediately.
+    pub fn publication_changed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.publication_changed)
+    }
+
+    pub(crate) fn signal_publication_changed(&self) {
+        self.publication_changed.notify_one();
     }
 
     /// The provider that constructs/opens this instance's workspace.

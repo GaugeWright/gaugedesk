@@ -1115,7 +1115,13 @@ impl Workbench {
         scope: &str,
         record: &crate::facility::FacilityRecord,
     ) -> Result<(), AdmitError> {
-        self.write_account_record_in(scope, crate::facility::FACILITY_KIND, &record.id, record)
+        self.write_account_record_in(scope, crate::facility::FACILITY_KIND, &record.id, record)?;
+        // Publication is a facility, and reachability follows it (ADR 0131 §6).
+        // Signalled here rather than in the HTTP handler so every writer counts —
+        // a route, a test, a future sync — and none can turn publishing on
+        // without the Home noticing.
+        self.signal_publication_changed();
+        Ok(())
     }
 
     /// Attach or update one account-level facility (default scope).
@@ -1141,6 +1147,7 @@ impl Workbench {
         record.op = RecordOp::Tombstone;
         let id = record.id.clone();
         self.write_account_record_in(scope, crate::facility::FACILITY_KIND, &id, &record)?;
+        self.signal_publication_changed();
         Ok(Some(record))
     }
 
