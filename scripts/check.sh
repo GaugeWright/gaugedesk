@@ -109,12 +109,43 @@ run_web() {
     npm --prefix ee/sidecar/saml-verify test
 }
 
+# The dependency audit lives here rather than in a workflow step so that the
+# documented local green bar and the enforced gate stay the same command. It is
+# its own section because it is the one part of this script that needs the
+# network and the advisory database rather than the toolchain, and because the
+# security-baseline schedule runs exactly this and nothing else.
+#
+# `src-tauri/Cargo.lock` is deliberately absent: it fails today on
+# RUSTSEC-2026-0194 and RUSTSEC-2026-0195, two high-severity denial-of-service
+# advisories against `quick-xml` 0.39.4 reaching the shipped desktop binary
+# through `tauri` -> `plist`. `plist` 1.10.0 closes both, but that lockfile has
+# drifted from its manifest, so the bump re-resolves 35 packages in the artifact
+# users install and adds `rsa`, whose advisory is risk-accepted here on a
+# rationale written for a different codepath. Add the line in the same change
+# that lands the bump. `.cargo/audit.toml` carries the triage record.
+run_dependencies() {
+    echo "== production dependency advisories =="
+    command -v cargo-audit >/dev/null || {
+        echo "cargo-audit is not installed; run: cargo install cargo-audit" >&2
+        exit 1
+    }
+    cargo audit --file Cargo.lock
+    cargo audit --file src-tauri-mobile/Cargo.lock
+
+    # Production only. The dev trees are vite, wrangler, and playwright, none of
+    # which reach a user.
+    while IFS= read -r lock; do
+        npm --prefix "${lock%/package-lock.json}" audit --omit=dev
+    done < <(find . -name package-lock.json -not -path '*/node_modules/*' -print)
+}
+
 case "$section" in
-    all) run_contracts; run_rust; run_web ;;
+    all) run_contracts; run_dependencies; run_rust; run_web ;;
     contracts) run_contracts ;;
+    dependencies) run_dependencies ;;
     rust) run_rust ;;
     web) run_web ;;
-    *) echo "usage: scripts/check.sh [all|contracts|rust|web]" >&2; exit 2 ;;
+    *) echo "usage: scripts/check.sh [all|contracts|dependencies|rust|web]" >&2; exit 2 ;;
 esac
 
 echo "== gaugedesk green bar PASSED ($section) =="

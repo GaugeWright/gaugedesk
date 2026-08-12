@@ -1,8 +1,15 @@
 # The lanes that need nothing but public source: Rust fmt/clippy/test and the
 # web/ee typecheck+build+unit tests. Published AS ci.yml to the open-source
-# mirror by scripts/publish-public-mirror.sh. The private repo's ci.yml
-# additionally runs the Quint model checks, the spec-audit tracker gate, and
-# coverage — all of which need the private specs/.
+# mirror by scripts/publish-public-mirror.sh.
+#
+# This file and the private repo's own ci.yml are two halves of one green bar,
+# not an inner and an outer one. `scripts/check.sh` has three sections: ci.yml
+# runs `contracts`, and the two jobs below run `rust` and `web`. Neither file is
+# a superset of the other, so reading one tells you nothing about what the other
+# gates. This header used to claim ci.yml "additionally" ran the Quint models,
+# the spec audit, and coverage; only the spec audit is in it — the models are
+# their own path-triggered gate in formal-models.yml, and ci.yml's coverage job
+# runs on a schedule or a dispatch, never on a pull request.
 #
 # `rust` and `web` run in BOTH repositories, for two different reasons, and the
 # repository decides only which runner pays.
@@ -18,6 +25,15 @@
 # sit red for a day unnoticed: the web lane broke on 2026-08-11 and every run
 # since failed on binaryen 108, so for that whole window nothing typechecked
 # this tree in either repository.
+#
+# Running was only half of it. Both were left out of `main`'s required-check
+# list under the rule that a permanently skipped check must not be required —
+# correct while they were skipped, stale the moment they were not, and for a day
+# they ran and passed while a red one would still have merged. `rust (fmt ·
+# clippy · test)` and `web (typecheck · vitest)` are now required contexts on
+# `-src`. A required check is matched by the job's `name:`, so editing either
+# name here silently drops its requirement: change the name and the protection
+# together (DR-0069 `OPS-1`, `OPS-18`).
 #
 # On the mirror they are the check on the published projection.
 # `publish-public-mirror.sh` builds a curated tree, and this is the only place
