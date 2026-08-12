@@ -1823,7 +1823,8 @@ fn run_claimed_engagement_turn(
                         .map(gaugedesk_core::abac::Region::new),
                     ..gaugedesk_core::abac::AuthorityAttributes::default()
                 },
-                |idp| idp.claims(&actor),
+                // The directory supplies the role the IdP does not carry (RBAC-5).
+                |idp| org.with_directory_role(idp.claims(&actor), actor.as_str()),
             );
             g.compile_whipple_policy(PolicyCompilationInput {
                 chat_id: id.to_owned(),

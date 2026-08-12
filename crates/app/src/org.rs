@@ -625,6 +625,35 @@ impl Org {
             .map(|m| Role::new(m.role.as_str()))
     }
 
+    /// The attributes to evaluate an authenticated authority at: what the IdP
+    /// asserted, with the directory's role joined on when the IdP asserted none.
+    ///
+    /// This is the join [`role_of`](Self::role_of) exists for (`RBAC-5`), performed
+    /// where the attributes are actually materialized. Authentication and
+    /// authorization are different records: an OIDC provider populates roles only
+    /// when a `roles_claim` is configured *and* the token carries it, and a Google
+    /// id-token carries none — so an actor arrived role-less and every
+    /// role-derived attribute evaluated as if the person held no standing, while
+    /// the directory recorded them an active owner. In production that denied an
+    /// agent turn over the person's own project.
+    ///
+    /// Only fills when the IdP asserted nothing, so a provider that does map roles
+    /// stays authoritative and an org that configured `roles_claim` is unaffected.
+    /// An inactive or absent member still contributes nothing — `role_of` is
+    /// already fail-closed on `Active`.
+    pub fn with_directory_role(
+        &self,
+        mut attributes: gaugedesk_core::abac::AuthorityAttributes,
+        authority: &str,
+    ) -> gaugedesk_core::abac::AuthorityAttributes {
+        if attributes.roles.is_empty() {
+            if let Some(role) = self.role_of(authority) {
+                attributes.roles.insert(role);
+            }
+        }
+        attributes
+    }
+
     /// The project ids a member has been explicitly granted (`ENTSEC-2`). Owner/admin are not
     /// represented here — they bypass scoping; this is the explicit set for everyone else.
     pub fn granted_project_ids(&self, authority: &str) -> std::collections::BTreeSet<String> {
@@ -678,6 +707,7 @@ pub fn sha256_hex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn store_with(records: &[(&str, &str)]) -> Store {
         let mut s = Store::open_in_memory().unwrap();
@@ -700,6 +730,61 @@ mod tests {
             team: None,
         })
         .unwrap()
+    }
+
+    /// The production case: an OIDC actor arrives with no roles, because a
+    /// provider only maps them when a `roles_claim` is configured and a Google
+    /// id-token carries none. The directory records the same authority an active
+    /// owner, and that is the record authorization is supposed to read (RBAC-5).
+    #[test]
+    fn the_directory_supplies_the_role_an_idp_did_not_assert() {
+        use gaugedesk_core::abac::AuthorityAttributes;
+
+        let store = store_with(&[(
+            "membership",
+            &membership("m1", "auth-owner", "owner", MembershipStatus::Active),
+        )]);
+        let org = Org::rebuild(&store).expect("org");
+
+        let joined = org.with_directory_role(AuthorityAttributes::default(), "auth-owner");
+        assert_eq!(joined.roles, BTreeSet::from([Role::owner()]));
+
+        // An IdP that does assert roles stays authoritative — the directory does
+        // not override a provider an org deliberately configured.
+        let asserted = AuthorityAttributes {
+            roles: BTreeSet::from([Role::viewer()]),
+            ..AuthorityAttributes::default()
+        };
+        assert_eq!(
+            org.with_directory_role(asserted, "auth-owner").roles,
+            BTreeSet::from([Role::viewer()]),
+        );
+
+        // An authority the directory does not know gains nothing.
+        assert!(org
+            .with_directory_role(AuthorityAttributes::default(), "auth-stranger")
+            .roles
+            .is_empty());
+    }
+
+    /// An inactive member has no standing, so the join must not manufacture one.
+    #[test]
+    fn an_inactive_member_contributes_no_role() {
+        use gaugedesk_core::abac::AuthorityAttributes;
+
+        for status in [MembershipStatus::Invited, MembershipStatus::Deprovisioned] {
+            let store = store_with(&[(
+                "membership",
+                &membership("m1", "auth-pending", "owner", status),
+            )]);
+            let org = Org::rebuild(&store).expect("org");
+            assert!(
+                org.with_directory_role(AuthorityAttributes::default(), "auth-pending")
+                    .roles
+                    .is_empty(),
+                "{status:?} must carry no role",
+            );
+        }
     }
 
     #[test]

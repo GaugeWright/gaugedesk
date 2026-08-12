@@ -644,7 +644,7 @@ impl Workbench {
         let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
             return Err((StatusCode::UNAUTHORIZED, "authenticate to export"));
         };
-        let actor = idp.claims(&authority);
+        let actor = org.with_directory_role(idp.claims(&authority), authority.as_str());
         // A local/unattested egress edge: a `Pii` resource requires an attested ceiling,
         // so it is denied here (an attested boundary integration would pass `true`).
         let context = gaugedesk_core::abac::Context {
@@ -701,7 +701,7 @@ impl Workbench {
         let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
             return Err((StatusCode::UNAUTHORIZED, "authenticate to grant access"));
         };
-        let actor = idp.claims(&authority);
+        let actor = org.with_directory_role(idp.claims(&authority), authority.as_str());
         let context = gaugedesk_core::abac::Context {
             ceiling_attested: false,
         };
