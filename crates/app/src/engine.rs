@@ -3322,6 +3322,76 @@ mod tests {
         );
     }
 
+    /// A settled turn leaves a listable derived output (`MINT-1`).
+    ///
+    /// MINT-1's own verification criterion is this module's tests, and none of
+    /// them asserted the mint it names — so the only thing checking it was a
+    /// production canary whose predicate read a shape the endpoint does not
+    /// answer, which could neither pass nor fail meaningfully. The claim now has
+    /// a check that runs on every commit.
+    #[test]
+    fn a_settled_turn_mints_a_listable_output_resource() {
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::broadcast;
+
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("e1").unwrap();
+        let worktree = eng.path().to_path_buf();
+        let store = Store::open_in_memory().unwrap();
+        let wb = Arc::new(Mutex::new(crate::Workbench::with_target(
+            "inst-test",
+            inst,
+            store,
+        )));
+        wb.lock()
+            .unwrap()
+            .register_engagement("e1", "inst-test", Box::new(eng));
+
+        let _fake_agent = fake_agent_env();
+        let (tx, _rx) = broadcast::channel(16);
+        let result = run_engagement_turn(
+            &wb,
+            "e1",
+            &worktree,
+            &tx,
+            EngagementTurnInput {
+                task: "do the thing",
+                images: &[],
+                mode: ChatMode::Use,
+                authenticated_actor: None,
+                contribution_by: None,
+                account_scope: crate::account::ACCOUNT_SCOPE,
+                tenant_scope: crate::org::ORG_SCOPE,
+                runtime_command_id: None,
+                harness_factory: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.run_phase, RunPhase::Completed);
+
+        // The id the route surfaces and the canary looks for.
+        let listed = wb.lock().unwrap().list_resource_contexts("e1").unwrap();
+        let ids: Vec<String> = listed
+            .iter()
+            .map(|(record, _)| record.resource.id.as_str().to_string())
+            .collect();
+        assert!(
+            ids.contains(&"out-e1".to_string()),
+            "a settled turn minted no listable output resource: {ids:?}",
+        );
+
+        // Owned by the scope's authority (MINT-1), not a hardcoded local constant.
+        let output = listed
+            .iter()
+            .find(|(record, _)| record.resource.id.as_str() == "out-e1")
+            .expect("output resource");
+        assert_eq!(
+            output.0.resource.owner.as_str(),
+            gaugedesk_core::determine_scope_authority("e1").as_str(),
+        );
+    }
+
     /// A target-local file cannot override control-plane runtime policy.
     #[test]
     fn fake_agent_ignores_target_local_runtime_config() {
