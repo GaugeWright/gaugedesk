@@ -31,10 +31,19 @@ const MAX_PROVIDER_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TOOL_ROUNDS: usize = 8;
 pub const ENVIRONMENT_AGENT_MESSAGE_KIND: &str = "environment_agent_message";
 
-fn environment_flag(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
+/// A boolean setting, read the way every other setting in this codebase is
+/// read: `gaugedesk_env::var` prefixes the suffix with `GAUGEDESK_` and falls
+/// back to the `GAUGEWRIGHT_` name with a deprecation warning.
+///
+/// This used to take a whole variable name and call `std::env::var` directly,
+/// which meant it alone had no legacy fallback and no warning — a flag left on
+/// the old prefix silently read as *unset* rather than as deprecated. The hosted
+/// Hub carried `GAUGEWRIGHT_MANAGEMENT_AGENT_MANAGED=1` next to an already
+/// migrated `GAUGEDESK_MANAGEMENT_AGENT_MODEL`, so GaugeWright-funded model
+/// access was switched off by a name for as long as that line survived the
+/// rename, and every Administration agent turn answered `NoModelAccess`.
+fn environment_flag(suffix: &str) -> bool {
+    gaugedesk_env::var(suffix).is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -510,7 +519,7 @@ fn resolve_agent_credential(
         .get("openai")
         .filter(|record| record.admits(ModelExecutionClass::PrivateHome))
     else {
-        if environment_flag("GAUGEDESK_MANAGEMENT_AGENT_MANAGED") {
+        if environment_flag("MANAGEMENT_AGENT_MANAGED") {
             let token = gaugedesk_env::var("MANAGEMENT_AGENT_OPENAI_KEY")
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
@@ -915,7 +924,7 @@ pub fn run_environment_agent_turn(
     // and exact-scope session without distributing a production provider key.
     // Release builds cannot activate this path, even if the variable leaks
     // into their environment.
-    if cfg!(debug_assertions) && environment_flag("GAUGEDESK_FAKE_MANAGEMENT_AGENT") {
+    if cfg!(debug_assertions) && environment_flag("FAKE_MANAGEMENT_AGENT") {
         return Ok(development_environment_agent_turn(&context, message));
     }
     let credential = resolve_agent_credential(workbench, &context.session.actor)?;
@@ -1433,5 +1442,51 @@ data: {\"type\":\"response.completed\",\"response\":{\"ok\":true}}\r\n\r\n";
         // Multibyte text must not be cut mid-character.
         let wide = provider_complaint(&"é".repeat(2000));
         assert!(wide.ends_with("… (truncated)"));
+    }
+
+    // A flag left on the `GAUGEWRIGHT_` prefix must read as *set and deprecated*,
+    // never as unset. It read as unset on the hosted Hub, which switched
+    // GaugeWright-funded model access off by a name and answered every
+    // Administration turn with `NoModelAccess`. Serialised because the process
+    // environment is global.
+    #[test]
+    fn a_flag_is_honoured_under_either_prefix_and_off_by_default() {
+        static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENVIRONMENT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current = "GAUGEDESK_WIRING_FLAG_UNDER_TEST";
+        let legacy = "GAUGEWRIGHT_WIRING_FLAG_UNDER_TEST";
+        for name in [current, legacy] {
+            std::env::remove_var(name);
+        }
+        assert!(
+            !environment_flag("WIRING_FLAG_UNDER_TEST"),
+            "unset must be off"
+        );
+
+        // The exact shape the hosted Hub carried.
+        std::env::set_var(legacy, "1");
+        assert!(
+            environment_flag("WIRING_FLAG_UNDER_TEST"),
+            "a legacy-prefixed flag read as unset, which is the whole defect"
+        );
+        std::env::remove_var(legacy);
+
+        std::env::set_var(current, "true");
+        assert!(environment_flag("WIRING_FLAG_UNDER_TEST"));
+        std::env::set_var(current, "yes");
+        assert!(environment_flag("WIRING_FLAG_UNDER_TEST"));
+        // Anything else is off, and whitespace does not change that either way.
+        std::env::set_var(current, " 1 ");
+        assert!(environment_flag("WIRING_FLAG_UNDER_TEST"));
+        for off in ["0", "false", "", "on"] {
+            std::env::set_var(current, off);
+            assert!(
+                !environment_flag("WIRING_FLAG_UNDER_TEST"),
+                "{off} must be off"
+            );
+        }
+        std::env::remove_var(current);
     }
 }
