@@ -183,6 +183,19 @@ export async function accountSignInMethod(json: RouteJson): Promise<AccountSignI
     return parseAccountSignInMethod(await json("GET", "/auth/session"));
 }
 
+/** Delete an organization the caller owns and is alone in
+ * (`DELETE /account/tenants/{id}`).
+ *
+ * Refused while any other member is still active: `409`. The others leave
+ * first, then the last owner deletes — so removing an organization can never
+ * quietly revoke someone else's access. */
+export async function deleteOrganization(
+    json: RouteJson,
+    tenantId: string,
+): Promise<void> {
+    await json("DELETE", `/account/tenants/${encodeURIComponent(tenantId)}`);
+}
+
 /** Create an organization tenant with the caller as its only active owner. */
 export async function createOrganization(
     json: RouteJson,

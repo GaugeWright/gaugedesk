@@ -20,6 +20,20 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="$root/web/packages/control-plane-client/src/generated"
 profile="${1:-release}"
 
+# Where cargo will actually put the artifact. This script used to assume
+# `$root/target`, which is wrong exactly when the org's own worktree rule is
+# followed: that rule says to give each worktree its own CARGO_TARGET_DIR, and
+# under it cargo wrote where it was told while this looked where it guessed, so
+# a correct build failed with "was not produced" naming a path nothing had
+# reason to write. A relative value is resolved by cargo against the invoking
+# directory, so it is resolved the same way here rather than against $root.
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  target_dir="$(cd "$(dirname "$CARGO_TARGET_DIR")" 2>/dev/null && pwd)/$(basename "$CARGO_TARGET_DIR")" \
+    || target_dir="$CARGO_TARGET_DIR"
+else
+  target_dir="$root/target"
+fi
+
 # Debian and Ubuntu install LLVM's binaries under versioned names — `llvm-ar-21`
 # in `/usr/lib/llvm-21/bin` — and only the unversioned `llvm` package adds the
 # plain `llvm-ar`. `clang` is usually there under its plain name and `llvm-ar`
@@ -124,8 +138,16 @@ build_module() {
   local crate="$1" artifact="$2" name="$3"
   shift 3
   cargo build -p "$crate" --target wasm32-unknown-unknown "${flags[@]}" "$@"
-  local wasm="$root/target/wasm32-unknown-unknown/$profile/$artifact.wasm"
-  [ -f "$wasm" ] || { echo "error: $wasm was not produced" >&2; exit 1; }
+  local wasm="$target_dir/wasm32-unknown-unknown/$profile/$artifact.wasm"
+  if [ ! -f "$wasm" ]; then
+    # Name where it looked and why it looked there. The old message named a
+    # path and left the reader to work out which of cargo and this script was
+    # wrong about it.
+    echo "error: $wasm was not produced" >&2
+    echo "       target directory: $target_dir${CARGO_TARGET_DIR:+ (from CARGO_TARGET_DIR)}" >&2
+    echo "       if cargo wrote somewhere else, that is the disagreement to fix" >&2
+    exit 1
+  fi
   # `--target web` emits an init() taking the module URL, which is what a bundler
   # and a strict CSP both want: no eval, no inline blob.
   wasm-bindgen "$wasm" --target web --out-dir "$out" --out-name "$name"

@@ -32,6 +32,9 @@ pub fn routes() -> Router<SharedWorkbench> {
         // The tenant switcher (ADR 0077 §9): the person's tenants. Empty on the solo desktop
         // path (no personal tenant is provisioned there) — that is the org-free solo shape.
         .route("/account/tenants", get(get_tenants).post(post_tenant))
+        // The counterpart to the create above. Without it an organization made
+        // by mistake was permanent — see `delete_tenant`.
+        .route("/account/tenants/{id}", delete(delete_tenant))
         // Invitation truth stays in each tenant directory. These account routes
         // expose/accept only the current person's metadata pointer.
         .route("/account/invitations", get(get_invitations))
@@ -167,9 +170,10 @@ pub async fn post_tenant(
     // A retry must not become a second organization. Every other account
     // mutation is keyed by a caller-supplied id and upserts, so a repeat is
     // harmless; this route mints a fresh random id, so a repeat is a *new*
-    // organization the caller never asked for and cannot remove — there is no
-    // route that deletes one. A synthetic account accumulated nine identical
-    // organizations this way, one per retry, before anyone looked.
+    // organization the caller never asked for. A synthetic account accumulated
+    // nineteen identical organizations this way, one per retry, and at the time
+    // could shed none of them — `delete_tenant` now exists, but a duplicate
+    // nobody notices is still a duplicate nobody deletes.
     //
     // The key is honoured only when the caller sends one. The browser console
     // sends none today, so requiring one would refuse every organization it
@@ -206,6 +210,65 @@ pub async fn post_tenant(
         idempotency_key.as_deref(),
     ) {
         Ok(tenant) => (StatusCode::CREATED, Json(json!({ "tenant": tenant }))).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+/// Delete one organization the caller owns and is alone in.
+///
+/// Nothing removed an organization before this. `leave-organization` refuses a
+/// sole active owner so an organization cannot be orphaned, which left the
+/// person who created one as the only person who could neither leave it nor
+/// remove it — a mistyped name was permanent. One account accumulated nineteen
+/// identical organizations from a retry bug and could shed none of them.
+///
+/// It refuses while any other active member remains, so a delete can never
+/// silently revoke someone else's access, and while any tenant-level facility is
+/// still active, so a billable standing service is never orphaned past the
+/// tenant that pays for it. The refusals are distinct statuses because each is a
+/// different thing to do next: leave the others first, detach the facilities,
+/// ask an owner, or you are not in this organization at all.
+pub async fn delete_tenant(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    use crate::tenancy::DeleteOrganizationRefusal as Refusal;
+    let mut wb = wb.lock_unpoisoned();
+    let account_scope = wb.account_scope_for(net_http::bearer(&headers));
+    let actor = wb.actor(net_http::bearer(&headers));
+    if actor == "anonymous" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "authenticate to delete an organization",
+        )
+            .into_response();
+    }
+    match crate::tenancy::delete_organization_in(wb.store_mut(), &actor, &account_scope, &id) {
+        Ok(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(Refusal::NoSuchOrganization)) => {
+            (StatusCode::NOT_FOUND, "no such organization").into_response()
+        }
+        Ok(Err(Refusal::Personal)) => (
+            StatusCode::CONFLICT,
+            "Personal is your own space and cannot be deleted",
+        )
+            .into_response(),
+        Ok(Err(Refusal::NotAnOwner)) => (
+            StatusCode::FORBIDDEN,
+            "only an active owner can delete an organization",
+        )
+            .into_response(),
+        Ok(Err(Refusal::OtherMembersRemain(_))) => (
+            StatusCode::CONFLICT,
+            "every other member must leave before this organization can be deleted",
+        )
+            .into_response(),
+        Ok(Err(Refusal::FacilitiesRemain(_))) => (
+            StatusCode::CONFLICT,
+            "detach this organization's facilities before deleting it",
+        )
+            .into_response(),
         Err(e) => err_response(e),
     }
 }
@@ -355,6 +418,10 @@ mod tests {
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
+    fn urlencoding(id: &str) -> String {
+        id.replace(':', "%3A")
+    }
+
     fn tenant_id(body: &str) -> String {
         let value: serde_json::Value = serde_json::from_str(body).unwrap();
         value["tenant"]["id"].as_str().unwrap().to_owned()
@@ -397,6 +464,43 @@ mod tests {
             3,
             "four creates, three organizations: {listed}",
         );
+    }
+
+    /// The route half: an organization the caller made can be removed again, and
+    /// the switcher stops listing it.
+    #[tokio::test]
+    async fn an_organization_can_be_deleted_by_the_owner_who_is_alone_in_it() {
+        let app = router();
+        let (status, created) = create_tenant(&app, "Acme", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = tenant_id(&created);
+
+        let uri = format!("/account/tenants/{}", urlencoding(&id));
+        let (status, body) = send(&app, "DELETE", &uri, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "delete: {body}");
+
+        let (_, listed) = send(&app, "GET", "/account/tenants", None).await;
+        assert!(
+            !listed.contains(&id),
+            "the switcher still lists it: {listed}"
+        );
+
+        // Deleting it again reads as absent, not as a second success.
+        let (status, _) = send(&app, "DELETE", &uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_organization_the_caller_is_not_in_is_a_404() {
+        let app = router();
+        let (status, _) = send(
+            &app,
+            "DELETE",
+            "/account/tenants/organization%3Asomeone-else",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

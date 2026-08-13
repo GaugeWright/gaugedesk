@@ -1395,6 +1395,10 @@ export class WorkbenchControlPlane implements ControlPlane {
         return accountClient.createOrganization(this.routeJson(), displayName);
     }
 
+    deleteOrganization(tenantId: string): Promise<void> {
+        return accountClient.deleteOrganization(this.routeJson(), tenantId);
+    }
+
     accountDevices(): Promise<accountClient.AccountDevice[]> {
         return accountClient.accountDevices(this.routeJson());
     }

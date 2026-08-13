@@ -23,6 +23,7 @@ import {
     browserRouteJson,
     codexStatus,
     createOrganization,
+    deleteOrganization,
     defaultModel,
     endSession,
     exchangeMobileAccountHandoff,
@@ -62,7 +63,9 @@ export async function readAccountBootstrap(base: string) {
 
 /** Mutate and read back a disposable person-owned account lifecycle through
  * exact production clients. Cleanup uses those same clients and leaves only
- * the deliberately durable organization and setting records. */
+ * the deliberately durable setting record: the organization this creates is
+ * removed again through `deleteOrganization`, so a probe run no longer leaves
+ * an organization behind that nothing could remove. */
 export async function mutateAccountBootstrap(base: string) {
     const json = browserRouteJson(base);
     const tenant = await createOrganization(json, "Wiring Organization");
@@ -99,9 +102,12 @@ export async function mutateAccountBootstrap(base: string) {
     const routesAfterDelete = await accountHomeRoutes(json, "unsigned");
     await accountUnregisterHome(json, homeId);
     const homesAfterDelete = await accountHomes(json);
+    await deleteOrganization(json, tenant.id);
+    const tenantsAfterDelete = await accountTenants(json);
 
     return {
         tenant,
+        tenantDeleted: tenantsAfterDelete.every((entry) => entry.id !== tenant.id),
         setting: settings["wiring.account-bootstrap"],
         facility,
         facilityAttached: facilitiesAfterAttach.some((entry) =>

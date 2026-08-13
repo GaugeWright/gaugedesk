@@ -476,6 +476,7 @@ try {
         || accountMutation.routePublished !== true
         || accountMutation.routeDeleted !== true
         || accountMutation.homeDeleted !== true
+        || accountMutation.tenantDeleted !== true
     ) {
         throw new Error(
             `production account mutation readback failed: ${JSON.stringify(accountMutation)}`,

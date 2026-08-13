@@ -2586,6 +2586,42 @@
       }
     },
     {
+      "id": "account.tenants.delete",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "DELETE",
+      "path": "/account/tenants/:id",
+      "producer": "gaugedesk-app facility_routes",
+      "consumer": "deleteOrganization via @gaugewright/control-plane-client",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "delete-own-organization-tenant-when-sole-active-member",
+      "requestSchema": "http/path-tenant-id",
+      "responseSchema": "http/no-content",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/e2e/authenticated-account-session.mjs#production-authenticated-account-mutation-readback"
+        ],
+        "authority": [
+          "web/e2e/authenticated-account-session.mjs#account-mutation-cookie-authority-properties"
+        ],
+        "journey": [
+          "web/e2e/authenticated-account-session.mjs#production-authenticated-account-mutation-readback"
+        ],
+        "deployed": [],
+        "property": [
+          "web/e2e/authenticated-account-session.mjs#account-mutation-cookie-authority-properties"
+        ]
+      }
+    },
+    {
       "id": "account.invitations.accept",
       "jurisdiction": "hosted-person-account",
       "transport": "http-json",

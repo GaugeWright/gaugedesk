@@ -423,11 +423,354 @@ pub fn provision_organization(
     Ok(tenant)
 }
 
+/// Why a delete was refused. Each arm is a different thing for a person to do
+/// next, which is why the caller gets these rather than one "no".
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteOrganizationRefusal {
+    /// The person does not belong to a tenant by that id. Deliberately does not
+    /// distinguish "no such organization" from "not yours", matching
+    /// [`accept_tenant_invitation_in`].
+    NoSuchOrganization,
+    /// The personal tenant-of-one is the person's own space, not an organization
+    /// they created, and deleting it would leave the account with no context.
+    Personal,
+    /// Only an active owner may delete.
+    NotAnOwner,
+    /// Someone else is still an active member. Deleting would revoke their access
+    /// without their knowing, so they leave (or are deactivated) first.
+    OtherMembersRemain(usize),
+    /// A tenant-level facility is still active in this tenant. Every one of them
+    /// bills to the tenant (`FacilityRecord::is_tenant_billable`) and its
+    /// lifecycle controls are reached *through* the tenant, so deleting first
+    /// would leave a live, billing service nobody can retire. Detach them first.
+    FacilitiesRemain(usize),
+}
+
+/// Delete one organization the caller owns and is alone in.
+///
+/// The counterpart to [`provision_organization`]. Without it an organization
+/// created by mistake was permanent: nothing removed one, and
+/// `leave-organization` refuses a sole active owner precisely so an organization
+/// cannot be orphaned — which left the person who made it the one person who
+/// could neither leave nor remove it. One synthetic account accumulated nineteen.
+///
+/// Deliberately narrow. It refuses while any other active member remains, so a
+/// delete can never silently revoke someone else's access: the others leave, and
+/// the last owner deletes. That composes with the existing flow instead of
+/// competing with it, and leaves the harder "delete an organization people are
+/// working in" — notice, export, grace — to a design that can afford it.
+///
+/// It refuses on the same grounds while any tenant-level facility is still
+/// active. Those are the tenant's billable standing services, and their
+/// retention/deletion lifecycle is reached through the tenant, so removing the
+/// tenant around them would leave a live facility still charging with nobody
+/// left who can retire it. The facilities are detached first, exactly as the
+/// other members leave first.
+///
+/// Writes in one transaction: the directory record is tombstoned, so the
+/// organization stops resolving and no invitation into it can be accepted; the
+/// caller's membership is deprovisioned; and the switcher entry is tombstoned.
+/// Future-only revocation throughout (`INV-18`) — nothing is erased, so the
+/// audit trail stays intact.
+pub fn delete_organization_in(
+    store: &mut Store,
+    authority: &str,
+    account_scope: &str,
+    tenant_id: &str,
+) -> Result<Result<TenantRef, DeleteOrganizationRefusal>, AdmitError> {
+    let tenancy = Tenancy::rebuild_in(store, account_scope)?;
+    let Some(tenant) = tenancy.tenants.get(tenant_id).cloned() else {
+        return Ok(Err(DeleteOrganizationRefusal::NoSuchOrganization));
+    };
+    if tenant.personal {
+        return Ok(Err(DeleteOrganizationRefusal::Personal));
+    }
+    let scope = tenant_scope(tenant_id);
+    // The singleton local directory is not a hosted organization and has no
+    // switcher entry to remove.
+    if scope == crate::org::ORG_SCOPE {
+        return Ok(Err(DeleteOrganizationRefusal::NoSuchOrganization));
+    }
+    let org = Org::rebuild_in(store, &scope)?;
+    let Some(member) = org.member_by_authority(authority).cloned() else {
+        return Ok(Err(DeleteOrganizationRefusal::NoSuchOrganization));
+    };
+    if member.status != MembershipStatus::Active || member.role != "owner" {
+        return Ok(Err(DeleteOrganizationRefusal::NotAnOwner));
+    }
+    let others = org
+        .members
+        .values()
+        .filter(|m| m.status == MembershipStatus::Active && m.authority != authority)
+        .count();
+    if others > 0 {
+        return Ok(Err(DeleteOrganizationRefusal::OtherMembersRemain(others)));
+    }
+    // Facilities live in this same tenant scope and bill to the tenant. An
+    // active one is a standing service, so it is retired through its own
+    // lifecycle before the tenant that pays for it disappears.
+    let facilities = crate::facility::Facilities::rebuild_in(store, &scope)?
+        .active()
+        .count();
+    if facilities > 0 {
+        return Ok(Err(DeleteOrganizationRefusal::FacilitiesRemain(facilities)));
+    }
+
+    let mut retired = member;
+    retired.status = MembershipStatus::Deprovisioned;
+    let directory = OrgRecord {
+        id: ORG_ID.into(),
+        op: RecordOp::Tombstone,
+        ..Default::default()
+    };
+    let dropped = TenantRef {
+        id: tenant_id.to_owned(),
+        op: RecordOp::Tombstone,
+        ..tenant.clone()
+    };
+
+    let directory_json = serde_json::to_string(&directory)?;
+    let retired_json = serde_json::to_string(&retired)?;
+    let dropped_json = serde_json::to_string(&dropped)?;
+    store.append_records_atomically(&[
+        (scope.as_str(), "org", directory_json.as_str()),
+        (scope.as_str(), "membership", retired_json.as_str()),
+        (account_scope, TENANT_REF_KIND, dropped_json.as_str()),
+    ])?;
+    Ok(Ok(tenant))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const ROOT: &str = "pubkey-abc";
+
+    /// Deleting must remove the organization from the directory as well as from
+    /// the switcher. Dropping only the switcher entry would leave an
+    /// organization that still resolves, so an invitation into it could still be
+    /// accepted by someone who held the id.
+    #[test]
+    fn deleting_retires_the_directory_the_membership_and_the_switcher_entry() {
+        let mut s = Store::open_in_memory().unwrap();
+        let account_scope = crate::account::account_scope(ROOT);
+        let tenant =
+            provision_organization(&mut s, ROOT, &account_scope, "Acme Studio", None).unwrap();
+
+        let deleted = delete_organization_in(&mut s, ROOT, &account_scope, &tenant.id).unwrap();
+        assert_eq!(deleted.unwrap().id, tenant.id);
+
+        assert!(!Tenancy::rebuild_in(&s, &account_scope)
+            .unwrap()
+            .contains(&tenant.id));
+        let org = Org::rebuild_in(&s, &tenant_scope(&tenant.id)).unwrap();
+        assert!(org.org.is_none(), "the directory record still resolves");
+        assert_eq!(
+            org.member_by_authority(ROOT).unwrap().status,
+            MembershipStatus::Deprovisioned,
+        );
+        // And an invitation into it can no longer be accepted.
+        assert!(accept_tenant_invitation_in(&mut s, ROOT, &tenant.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn deleting_is_refused_for_an_organization_someone_else_is_still_in() {
+        let mut s = Store::open_in_memory().unwrap();
+        let account_scope = crate::account::account_scope(ROOT);
+        let tenant =
+            provision_organization(&mut s, ROOT, &account_scope, "Acme Studio", None).unwrap();
+        let colleague = MembershipRecord {
+            id: "person:other".into(),
+            op: RecordOp::Upsert,
+            org_id: tenant.id.clone(),
+            authority: "person:other".into(),
+            email: String::new(),
+            role: "member".into(),
+            status: MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        };
+        s.append_record(
+            &tenant_scope(&tenant.id),
+            "membership",
+            &serde_json::to_string(&colleague).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            delete_organization_in(&mut s, ROOT, &account_scope, &tenant.id)
+                .unwrap()
+                .unwrap_err(),
+            DeleteOrganizationRefusal::OtherMembersRemain(1),
+        );
+        assert!(Tenancy::rebuild_in(&s, &account_scope)
+            .unwrap()
+            .contains(&tenant.id));
+
+        // Once they are gone the last owner can delete — the two flows compose.
+        let mut departed = colleague;
+        departed.status = MembershipStatus::Deprovisioned;
+        s.append_record(
+            &tenant_scope(&tenant.id),
+            "membership",
+            &serde_json::to_string(&departed).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            delete_organization_in(&mut s, ROOT, &account_scope, &tenant.id)
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    /// A tenant-level facility bills to the tenant and is retired through its own
+    /// lifecycle. Deleting the tenant around one would leave a live, charging
+    /// service with nobody left who can reach its controls, so the delete refuses
+    /// until it is detached — the same shape as waiting for the other members.
+    #[test]
+    fn deleting_is_refused_while_a_billable_facility_is_still_attached() {
+        use crate::facility::{
+            FacilityKind, FacilityOwner, FacilityRecord, FacilityStatus, FACILITY_KIND,
+        };
+
+        let mut s = Store::open_in_memory().unwrap();
+        let account_scope = crate::account::account_scope(ROOT);
+        let tenant =
+            provision_organization(&mut s, ROOT, &account_scope, "Acme Studio", None).unwrap();
+        let mut facility = FacilityRecord {
+            id: "hosted-home".into(),
+            op: RecordOp::Upsert,
+            kind: FacilityKind::HostedHomeNode,
+            owner: FacilityOwner::Tenant,
+            status: FacilityStatus::Active,
+            display_name: "Hosted Home".into(),
+            config: serde_json::Value::Null,
+        };
+        assert!(facility.is_tenant_billable());
+        s.append_record(
+            &tenant_scope(&tenant.id),
+            FACILITY_KIND,
+            &serde_json::to_string(&facility).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            delete_organization_in(&mut s, ROOT, &account_scope, &tenant.id)
+                .unwrap()
+                .unwrap_err(),
+            DeleteOrganizationRefusal::FacilitiesRemain(1),
+        );
+        assert!(Tenancy::rebuild_in(&s, &account_scope)
+            .unwrap()
+            .contains(&tenant.id));
+
+        // Detaching it clears the refusal: future-only revocation, so the
+        // facility's own record stays in the log.
+        facility.op = RecordOp::Tombstone;
+        s.append_record(
+            &tenant_scope(&tenant.id),
+            FACILITY_KIND,
+            &serde_json::to_string(&facility).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            delete_organization_in(&mut s, ROOT, &account_scope, &tenant.id)
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_personal_tenant_and_other_peoples_organizations_are_refused() {
+        let mut s = Store::open_in_memory().unwrap();
+        let account_scope = crate::account::account_scope(ROOT);
+        let personal = provision_personal_tenant(&mut s, ROOT, "Personal").unwrap();
+        assert_eq!(
+            delete_organization_in(&mut s, ROOT, &account_scope, &personal)
+                .unwrap()
+                .unwrap_err(),
+            DeleteOrganizationRefusal::Personal,
+        );
+
+        // A tenant this person does not belong to is indistinguishable from one
+        // that does not exist, the same posture invitation acceptance takes.
+        assert_eq!(
+            delete_organization_in(&mut s, ROOT, &account_scope, "organization:someone-else")
+                .unwrap()
+                .unwrap_err(),
+            DeleteOrganizationRefusal::NoSuchOrganization,
+        );
+
+        // A member who is not an owner is refused, and the organization stands.
+        let tenant =
+            provision_organization(&mut s, ROOT, &account_scope, "Acme Studio", None).unwrap();
+        let other_scope = crate::account::account_scope("person:member");
+        let member = MembershipRecord {
+            id: "person:member".into(),
+            op: RecordOp::Upsert,
+            org_id: tenant.id.clone(),
+            authority: "person:member".into(),
+            email: String::new(),
+            role: "member".into(),
+            status: MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        };
+        s.append_record(
+            &tenant_scope(&tenant.id),
+            "membership",
+            &serde_json::to_string(&member).unwrap(),
+        )
+        .unwrap();
+        s.append_record(
+            &other_scope,
+            TENANT_REF_KIND,
+            &serde_json::to_string(&TenantRef {
+                id: tenant.id.clone(),
+                op: RecordOp::Upsert,
+                display_name: "Acme Studio".into(),
+                role: "member".into(),
+                personal: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            delete_organization_in(&mut s, "person:member", &other_scope, &tenant.id)
+                .unwrap()
+                .unwrap_err(),
+            DeleteOrganizationRefusal::NotAnOwner,
+        );
+        assert!(Org::rebuild_in(&s, &tenant_scope(&tenant.id))
+            .unwrap()
+            .org
+            .is_some());
+    }
+
+    /// A key whose organization is gone must not replay it: the claim outlives
+    /// the tenant, and returning a deleted organization would be worse than
+    /// making a new one.
+    #[test]
+    fn a_claim_whose_organization_was_deleted_does_not_replay() {
+        let mut s = Store::open_in_memory().unwrap();
+        let account_scope = crate::account::account_scope(ROOT);
+        let tenant =
+            provision_organization(&mut s, ROOT, &account_scope, "Acme", Some("key-one")).unwrap();
+        assert_eq!(
+            organization_claimed_by(&s, &account_scope, "key-one")
+                .unwrap()
+                .map(|t| t.id),
+            Some(tenant.id.clone()),
+        );
+        delete_organization_in(&mut s, ROOT, &account_scope, &tenant.id)
+            .unwrap()
+            .unwrap();
+        assert!(organization_claimed_by(&s, &account_scope, "key-one")
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn personal_tenant_id_is_deterministic_and_namespaced() {
