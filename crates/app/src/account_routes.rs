@@ -296,6 +296,21 @@ pub async fn put_selected_home(
     }
 }
 
+/// Unregister one Home, clearing the selection if it pointed at that Home.
+///
+/// Dropping the record alone leaves `selected_home` naming a Home the registry
+/// no longer holds — a state [`put_selected_home`] refuses to create ("Home is
+/// not registered") but this route could reach anyway. Every consumer that
+/// resolves the account's selected Home then fails on an account that looks
+/// registered, and no ordinary call repairs it: re-selecting needs a
+/// registration, and the browser has nothing left to offer. A synthetic account
+/// reached exactly this state on 2026-08-13 and took thirteen canary suites
+/// down with it.
+///
+/// So the two writes go together, in one transaction: the selection cannot
+/// survive the Home it names. Clearing rather than reassigning is deliberate —
+/// choosing a replacement is the person's, and a silent switch to some other
+/// registered Home would send work somewhere they did not pick.
 pub async fn delete_home(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
@@ -310,8 +325,36 @@ pub async fn delete_home(
         endpoint: String::new(),
         relay: None,
     };
-    match wb.write_account_record_in(&scope, "home", record.id.as_str(), &record) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    let selected = match crate::account::Account::rebuild_in(wb.store_ref(), &scope) {
+        Ok(account) => account
+            .settings
+            .get("selected_home")
+            .is_some_and(|setting| setting.value == record.id.as_str()),
+        Err(error) => return err_response(error),
+    };
+    let home_json = serde_json::to_string(&record).expect("home record serializes");
+    let mut writes: Vec<(&str, &str, String)> = vec![(scope.as_str(), "home", home_json)];
+    if selected {
+        let cleared = SettingRecord {
+            id: "selected_home".into(),
+            op: RecordOp::Tombstone,
+            value: String::new(),
+        };
+        writes.push((
+            scope.as_str(),
+            "setting",
+            serde_json::to_string(&cleared).expect("setting record serializes"),
+        ));
+    }
+    let borrowed: Vec<(&str, &str, &str)> = writes
+        .iter()
+        .map(|(scope, kind, payload)| (*scope, *kind, payload.as_str()))
+        .collect();
+    match wb.store_mut().append_records_atomically(&borrowed) {
+        Ok(_) => {
+            wb.notify_library_changed("account", record.id.as_str(), "upsert");
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => err_response(error),
     }
 }

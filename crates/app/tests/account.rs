@@ -159,3 +159,47 @@ async fn managed_plan_and_usage_projection_round_trip() {
     assert_eq!(body["usage"]["runs"], 0);
     assert_eq!(body["usage"]["included_tokens"], 250000);
 }
+
+/// Unregistering the selected Home must not leave the selection naming it.
+///
+/// `PUT /account/homes/selected` refuses a Home that is not registered, so a
+/// selection pointing at nothing is a state the account's own write path calls
+/// invalid — but the unregister route could reach it, and every reader that
+/// resolves the selected Home then failed on an account that still looked
+/// registered. Nothing ordinary repaired it either: re-selecting needs a
+/// registration, so the account was stuck until someone re-registered by hand.
+#[tokio::test]
+async fn unregistering_the_selected_home_clears_the_selection() {
+    let (_dir, app) = workbench();
+    let register = |id: &str| {
+        format!(r#"{{"id":"{id}","kind":"registered","endpoint":"https://home.example.test"}}"#)
+    };
+    for id in ["home:one", "home:two"] {
+        let (status, _) = send(&app, "POST", "/account/homes", Some(&register(id))).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/account/homes/selected",
+        Some(r#"{"home_id":"home:one"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Unregistering some *other* Home leaves the selection exactly alone.
+    let (status, _) = send(&app, "DELETE", "/account/homes/home:two", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = send(&app, "GET", "/account/homes", None).await;
+    assert_eq!(body["selected_home"], "home:one");
+
+    // Unregistering the selected one clears it rather than dangling.
+    let (status, _) = send(&app, "DELETE", "/account/homes/home:one", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = send(&app, "GET", "/account/homes", None).await;
+    assert_eq!(body["homes"].as_array().unwrap().len(), 0);
+    assert!(
+        body["selected_home"].is_null(),
+        "the selection outlived the Home it named: {body}",
+    );
+}
