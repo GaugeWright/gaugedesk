@@ -1221,7 +1221,6 @@ input {
    don't keep the compositor busy (or jank scrolling) for users/environments that
    ask for stillness — they fall back to a static, still-legible "working" dot. */
 @media (prefers-reduced-motion: reduce) {
-    .status-badge .status-dot,
     .tree-leaf .status-gem[data-state="working"],
     .working .pulse,
     .turn-activity-dots i { animation: none; opacity: 0.85; }
@@ -1316,7 +1315,7 @@ input {
 
 .shelf h3 { font-family: var(--serif); font-size: var(--fs-small); font-weight: 400; text-transform: uppercase;
     letter-spacing: 0.08em; color: #c5d1e2; margin: 0 0 6px; }
-.console-heading h1 :is(b, strong), .workspace-avatar :is(b, strong),
+.workspace-avatar :is(b, strong),
 .taskbar-label :is(b, strong), h2 > :is(b, strong):not(.chat-title),
 .facet :is(b, strong), .shelf h3 :is(b, strong) { font-weight: inherit; }
 .shelf .bar { flex-wrap: wrap; gap: 6px; }
