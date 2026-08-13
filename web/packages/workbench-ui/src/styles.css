@@ -141,17 +141,17 @@
     --gw-blue: #1f61c4;
     --gw-gold: #c6952f;
     --gw-red: #b5342b;
-    --bg: #0c1a2e;
-    --panel: #12233b;
-    --edge: #24344e;
-    --ink: #e6ebf2;
-    --muted: #8b98ab;
-    --accent: #4f8fe6;
+    --bg: #142238;
+    --panel: #1b2c46;
+    --edge: #2f4059;
+    --ink: #d3dbe6;
+    --muted: #93a1b5;
+    --accent: #5f9bee;
     --accent-strong: #2a6fce;
-    --accent-hover: #6ba3ee;
+    --accent-hover: #7fb0f2;
     --accent-contrast: #08111e;
     --warn: #e0b24e;
-    --bad: #e0655c;
+    --bad: #e87b74;
     /* Two faces (GaugeWright DR-0072), split on whether a person operates a
        string or reads it at length. --serif and --ui alias the chrome face
        because chrome is most of this app; only the transcript and rendered

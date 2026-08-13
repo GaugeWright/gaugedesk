@@ -141,8 +141,8 @@
 
 /* Dark scheme: lighten accents for contrast on deep navy. */
 [data-md-color-scheme="slate"] {
-  --md-primary-fg-color: #0c1a2e;
-  --md-accent-fg-color: #4f8fe6;
+  --md-primary-fg-color: #142238;
+  --md-accent-fg-color: #5f9bee;
   --md-typeset-a-color: #6aa3ff;
 }
 
@@ -205,4 +205,4 @@
 [data-md-color-scheme="slate"] .status.available { color: #7fd6a6; }
 [data-md-color-scheme="slate"] .status.built     { color: #6aa3ff; }
 [data-md-color-scheme="slate"] .status.planned   { color: #e0b24e; }
-[data-md-color-scheme="slate"] .status.none      { color: #e0655c; }
+[data-md-color-scheme="slate"] .status.none      { color: #e87b74; }
