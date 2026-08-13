@@ -214,6 +214,11 @@ jobs:
           npm --prefix ee/web ci
           npm --prefix ee/web run build
           node -e "const fs = require('node:fs'); const entry = 'ee/web/dist-enterprise-workbench/index.html'; if (!fs.statSync(entry).isFile()) throw new Error('desktop frontend entry missing: ' + entry)"
+          # The build's own postbuild step already stamped the identity, but it
+          # tolerates a dirty tree so ordinary local builds work. A released
+          # bundle may not: it must name a revision someone can check out.
+          node scripts/build-release-identity.mjs --require-clean
+          node -e "const fs = require('node:fs'); const identity = JSON.parse(fs.readFileSync('ee/web/dist-enterprise-workbench/gaugewright-release.json', 'utf8')); if (identity.dirty) throw new Error('released bundle carries a dirty release identity'); if (!/^[0-9a-f]{64}$/.test(identity.platformManifestSha256)) throw new Error('released bundle has no contract digest')"
 
       - name: verify Apple signing inputs
         if: matrix.os-label == 'macos'

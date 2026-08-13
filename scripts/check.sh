@@ -51,6 +51,13 @@ run_contracts() {
     echo "== product contracts =="
     node scripts/check-product-contracts.mjs --enforce-local-evidence
 
+    # The artifact side of the same manifest: what a built bundle says about the
+    # contract it holds, and the canonical digest both this section and the
+    # hosted surfaces compare (DR-0051). A test no section names is a test
+    # nothing runs, which is the state this one was committed in.
+    echo "== release identity =="
+    node --test scripts/build-release-identity.test.mjs
+
     echo "== production canary contract =="
     node scripts/check-production-canaries.mjs
     node --test \

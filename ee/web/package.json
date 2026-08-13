@@ -12,6 +12,7 @@
   "scripts": {
     "dev": "vite --config apps/enterprise-workbench/vite.config.ts",
     "build": "vite build --config apps/enterprise-workbench/vite.config.ts",
+    "postbuild": "node ../../scripts/build-release-identity.mjs",
     "typecheck": "npm run typecheck:enterprise-client && npm run typecheck:enterprise-ui",
     "typecheck:enterprise-client": "tsc --noEmit -p tsconfig.enterprise-client.json",
     "typecheck:enterprise-ui": "tsc --noEmit -p tsconfig.enterprise-ui.json"
