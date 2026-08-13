@@ -46,6 +46,13 @@ type PendingQueueOperation = PendingAck & {
     payload: Record<string, unknown>;
 };
 
+/** A stop is keyed by the turn it aims at, and carries the operation id the
+ *  host echoes back on a refusal — the only thread tying that refusal to this
+ *  request. */
+type PendingStop = PendingAck & {
+    operationId: string;
+};
+
 export interface EmbedChatControls {
     create(): Promise<void>;
     open?(chat: string): Promise<void>;
@@ -70,7 +77,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
     private openPromise: Promise<WebSocket> | null = null;
     private readonly listeners = new Set<(event: StreamEvent) => void>();
     private readonly pendingTurns = new Map<string, PendingTurn>();
-    private readonly pendingStops = new Map<string, PendingAck>();
+    private readonly pendingStops = new Map<string, PendingStop>();
     private readonly pendingQueueOperations = new Map<string, PendingQueueOperation>();
     private readonly queueListeners = new Set<(queue: readonly EmbedQueuedTurn[]) => void>();
     private readonly activityListeners = new Set<(activity: TurnObservation) => void>();
@@ -535,6 +542,14 @@ export class EdgeSessionApi implements EmbedSessionApi {
                 this.pendingQueueOperations.delete(message.operation_id);
                 pending.reject(new Error(String(message.error ?? "queue command failed")));
             }
+            // A refused stop arrives the same way — an `error` carrying only the
+            // operation id it was sent with. Matched here or its promise waits
+            // forever, and a caller waiting forever reports nothing at all.
+            for (const [requestId, stop] of this.pendingStops) {
+                if (stop.operationId !== message.operation_id) continue;
+                this.pendingStops.delete(requestId);
+                stop.reject(new Error(String(message.error ?? "the turn could not be stopped")));
+            }
             return "error";
         }
         if (
@@ -655,17 +670,29 @@ export class EdgeSessionApi implements EmbedSessionApi {
         return this.lastUsage;
     }
 
+    /** Ask the host to end the running turn, and wait for it to say whether it
+     *  did.
+     *
+     *  The stop carries an `operation_id` for the same reason every queue
+     *  command does: a host that refuses answers `{type: "error"}` with no
+     *  `request_id` — the runtime rejects a cancellation for anything that is
+     *  not `running` — and without the id there is nothing to match that error
+     *  to. The promise then never settled at all, so the caller's `.catch` never
+     *  ran, and a Stop the host had refused was indistinguishable from one it
+     *  had honoured. Silence is the one answer an interrupt must never give. */
     async stopTurn(): Promise<void> {
         const requestId = this.pendingTurns.keys().next().value as string | undefined;
         if (!requestId) throw new Error("session has no active turn");
+        const operationId = newIdempotencyKey().replaceAll("-", "_");
         const socket = await this.connect();
         const admitted = new Promise<void>((resolve, reject) => {
-            this.pendingStops.set(requestId, { resolve, reject });
+            this.pendingStops.set(requestId, { resolve, reject, operationId });
         });
         socket.send(
             JSON.stringify({
                 type: "stop",
                 request_id: requestId,
+                operation_id: operationId,
                 after: this.cursor,
             }),
         );

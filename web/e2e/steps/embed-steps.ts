@@ -276,6 +276,14 @@ Then("the embedded turn is not interrupted", async ({ page }) => {
     await expect(page.locator("body")).not.toHaveAttribute("data-fixture-stopped", "true");
 });
 
+// The fixture sets this only from `stopTurn`, so it is the one assertion here a
+// turn cannot satisfy by simply finishing. "No activity row" cannot tell the
+// two apart: the delayed fixture turn settles in 1200ms and the wait for that
+// row to clear allows 15s, so it passes whether or not the stop ever landed.
+Then("the embedded turn is interrupted", async ({ page }) => {
+    await expect(page.locator("body")).toHaveAttribute("data-fixture-stopped", "true");
+});
+
 async function fixtureTurnPrompts(page: import("@playwright/test").Page): Promise<string[]> {
     const raw = await page.locator("body").getAttribute("data-fixture-turns");
     if (!raw) return [];
@@ -448,6 +456,52 @@ When("the delayed turn completes", async ({ page }) => {
 
 When("I stop the embedded turn", async ({ page }) => {
     await page.locator("[data-testid='stop-turn']").click();
+});
+
+// Escape from wherever sending left focus, which for the embed is its own
+// composer field inside the shadow root.
+When("I press Escape in the embedded composer", async ({ page }) => {
+    await page.keyboard.press("Escape");
+});
+
+When("I aim at the embedded stop button with the delivery menu open", async ({ page }) => {
+    await page.locator(".deliver-stack").hover();
+    await expect(page.locator("[data-deliver-menu]")).toHaveCSS("opacity", "1");
+});
+
+// The desktop's version of this reads `document.elementFromPoint`; inside a
+// shadow tree that only ever answers with the host element, so the hit test has
+// to descend through each root it lands in to reach what the pointer would
+// actually strike.
+Then("every part of the embedded stop button reaches stop", async ({ page }) => {
+    const covered = await page.evaluate(() => {
+        const deepest = (x: number, y: number): Element | null => {
+            let node = document.elementFromPoint(x, y);
+            for (;;) {
+                const inner = node?.shadowRoot?.elementFromPoint(x, y);
+                if (!inner || inner === node) return node;
+                node = inner;
+            }
+        };
+        const roots: (Document | ShadowRoot)[] = [document];
+        let stop: Element | null = null;
+        while (roots.length && !stop) {
+            const root = roots.shift()!;
+            stop = root.querySelector('[data-testid="stop-turn"]');
+            for (const element of root.querySelectorAll("*")) {
+                if (element.shadowRoot) roots.push(element.shadowRoot);
+            }
+        }
+        if (!stop) throw new Error("the embedded composer is not showing a stop button");
+        const box = stop.getBoundingClientRect();
+        return [0.05, 0.25, 0.5, 0.75, 0.95]
+            .filter((across) => {
+                const at = deepest(box.left + box.width * across, box.top + box.height / 2);
+                return !(at && stop!.contains(at));
+            })
+            .map((across) => `${Math.round(across * 100)}%`);
+    });
+    expect(covered, "these points across the stop button hit something else").toEqual([]);
 });
 
 Then("the embedded chat shows no activity row", async ({ page }) => {

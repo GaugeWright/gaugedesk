@@ -40,7 +40,27 @@ Feature: Embedded panels (EMBED-2)
     When I send "never mind" in the embedded chat
     Then the embedded chat says the agent is thinking
     When I stop the embedded turn
-    Then the embedded chat shows no activity row
+    Then the embedded turn is interrupted
+    And the embedded chat shows no activity row
+
+  # The two ways a stop was unreachable in the workbench (#310) are both in the
+  # shared composer, so a visitor inherits them or inherits their repair. The
+  # embed renders in a shadow root, which is its own reason to check rather than
+  # assume: nothing about the desktop's geometry carries across on its own.
+  Scenario: Escape interrupts the embedded turn
+    Given a delayed embedded chat is open
+    When I send "never mind" in the embedded chat
+    Then the embedded chat says the agent is thinking
+    When I press Escape in the embedded composer
+    Then the embedded turn is interrupted
+    And the embedded chat shows no activity row
+
+  Scenario: the whole of the embedded stop button is the stop button
+    Given a delayed embedded chat is open
+    When I send "never mind" in the embedded chat
+    Then the embedded chat says the agent is thinking
+    When I aim at the embedded stop button with the delivery menu open
+    Then every part of the embedded stop button reaches stop
 
   Scenario: stopping a turn cancels the work it had already scheduled
     Given a delayed embedded chat running the "bash" tool is open

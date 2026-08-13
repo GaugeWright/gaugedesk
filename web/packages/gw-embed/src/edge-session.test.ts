@@ -328,11 +328,15 @@ describe("EdgeSessionApi", () => {
         });
         const stop = api.stopTurn();
         await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(3));
-        expect(JSON.parse(sockets[0]!.sent[2]!)).toEqual({
+        const stopCommand = JSON.parse(sockets[0]!.sent[2]!) as Record<string, unknown>;
+        expect(stopCommand).toMatchObject({
             type: "stop",
             request_id: sent.request_id,
             after: 6,
         });
+        // The host echoes only this id when it refuses a stop, so without it a
+        // refusal cannot be matched to the request that earned it.
+        expect(typeof stopCommand.operation_id).toBe("string");
         sockets[0]!.emit("message", {
             data: JSON.stringify({
                 type: "turn_stop_requested",
@@ -432,6 +436,71 @@ describe("EdgeSessionApi", () => {
             "/d/theory-a/sessions/sess_0123456789abcdef0123456789abcdef/state",
         ]);
         api.dispose();
+    });
+
+    it("reports a stop the host refused instead of waiting on it forever", async () => {
+        // The runtime rejects a cancellation for anything that is not `running`,
+        // and that refusal comes back as an `error` carrying only the operation
+        // id — no `request_id`. Unmatched, the stop's promise never settled, so
+        // the caller's `.catch` never ran and a refused Stop looked exactly like
+        // one that worked: the composer said nothing and the turn ran on.
+        const sockets: FakeWebSocket[] = [];
+        vi.stubGlobal("fetch", vi.fn());
+        vi.stubGlobal(
+            "WebSocket",
+            class extends FakeWebSocket {
+                constructor(url: string) {
+                    super(url);
+                    sockets.push(this);
+                }
+            },
+        );
+        const api = new EdgeSessionApi(
+            "https://panels.gaugewright.com/d/theory-a",
+            "sess_0123456789abcdef0123456789abcdef" as EngagementId,
+            "resume-capability",
+            "connection-capability",
+            Date.now() + 15 * 60 * 1000,
+            null,
+            false,
+        );
+        const ready = api.ready();
+        sockets[0]!.emit("open");
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "session_ready",
+                snapshot: { cursor: 0, transcript: [], files: [] },
+            }),
+        });
+        await ready;
+
+        const turn = api.runEmbedTurn("ignored" as EngagementId, "run something");
+        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(1));
+        const sent = JSON.parse(sockets[0]!.sent[0]!) as { request_id: string };
+
+        const stop = api.stopTurn();
+        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(2));
+        const command = JSON.parse(sockets[0]!.sent[1]!) as { operation_id: string };
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "error",
+                error: "effect is completed; cancellation requests require running work",
+                operation_id: command.operation_id,
+            }),
+        });
+        await expect(stop).rejects.toThrow(/cancellation requests require running work/);
+
+        // The turn itself is untouched by its stop being refused.
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "turn_terminal",
+                sequence: 1,
+                request_id: sent.request_id,
+                status: 200,
+                body: { outcome: "terminal" },
+            }),
+        });
+        await expect(turn).resolves.toEqual({ outcome: "terminal" });
     });
 
     it("retries an interrupted turn with the same request id after reconnect", async () => {
