@@ -49,6 +49,59 @@ permissions:
   attestations: write # persist provenance for the signed release bundles
 
 jobs:
+  # The workbench bundle imports @gaugewright/control-plane-client/generated/*,
+  # which scripts/build-wasm.sh produces and .gitignore excludes. scripts/check.sh
+  # guards that — it builds the modules when they are absent — and this workflow
+  # did not, so from 2026-08-11, when pull request 226 added the import, every
+  # bundle leg failed to resolve it. The macOS leg was already failing earlier at
+  # the Apple preflight, so the breakage stayed invisible until that was fixed.
+  #
+  # Built once here rather than in each matrix leg. The output is
+  # platform-independent JavaScript and wasm, and build-wasm.sh needs a GNU
+  # toolchain the macOS and Windows runners do not carry: clang, llvm-ar,
+  # binaryen 120 or newer, and `stat -c%s`.
+  wasm:
+    name: browser modules (wasm32)
+    if: github.repository == 'GaugeWright/gaugedesk'
+    runs-on: ${{ github.repository == 'GaugeWright/gaugedesk' && 'ubuntu-22.04' || 'blacksmith-4vcpu-ubuntu-2204' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add wasm32-unknown-unknown
+      # ring compiles C for wasm32 and needs both the compiler and an LLVM
+      # archiver; only one of them fails legibly (ADR 0130 §4).
+      - name: Install clang for the wasm32 target
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+      # Pinned rather than taken from the distribution: binaryen 108 emits a
+      # module whose function table cannot grow, which fails at load rather than
+      # at build. build-wasm.sh rejects anything below 120.
+      - name: Install binaryen
+        env:
+          BINARYEN_VERSION: version_131
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 12 --retry-delay 10 --retry-max-time 600 \
+            --retry-all-errors -o /tmp/binaryen.tar.gz \
+            "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          sudo tar -xzf /tmp/binaryen.tar.gz -C /usr/local --strip-components=1
+          wasm-opt --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install matching wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: build the browser modules
+        run: scripts/build-wasm.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: control-plane-client-generated
+          path: web/packages/control-plane-client/src/generated
+          if-no-files-found: error
+          retention-days: 1
+
   bundle:
     name: tauri bundle (${{ matrix.os-label }})
     # The mirror is the release origin. `specs/systems.md` states that GaugeDesk
@@ -63,6 +116,7 @@ jobs:
     # that second origin is why the unrotatable updater signing key had to exist
     # in two places. Both repositories published v0.4.5.
     if: github.repository == 'GaugeWright/gaugedesk'
+    needs: wasm
     environment: production
     strategy:
       fail-fast: false
@@ -147,6 +201,13 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev patchelf lintian
 
+      # Restores what the wasm job produced. Without it the bundle cannot resolve
+      # @gaugewright/control-plane-client/generated/tunnel.js, which is generated
+      # and gitignored.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: control-plane-client-generated
+          path: web/packages/control-plane-client/src/generated
       - name: build enterprise workbench bundle
         run: |
           npm --prefix web ci
