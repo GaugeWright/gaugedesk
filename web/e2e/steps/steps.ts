@@ -1378,10 +1378,11 @@ When("I steer with {string}", async ({ page }, text: string) => {
     await composer.press("Control+Shift+Enter");
     // Steering interrupts one run and starts another asynchronously. Do not let
     // the following "agent finishes" observe the old run's brief idle edge
-    // before the redirected turn has been admitted. Watching the composer take
-    // the draft is the earliest honest signal that it did: the steered turn's
-    // own user line is not a durable record the transcript re-read keeps.
+    // before the redirected turn has been admitted.
     await expect(composer).toHaveValue("");
+    // CMP-19: the steering message is a user line like any other, and survives a
+    // transcript re-read. Assert the durable record, not the optimistic echo.
+    await expect(page.locator(".run .transcript .line.user", { hasText: text })).toBeVisible();
 });
 
 Then(/^the queue shows (\d+) messages?$/, async ({ page }, n: string) => {

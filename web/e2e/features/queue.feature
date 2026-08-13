@@ -41,6 +41,8 @@ Feature: Send queue & steering
     Then the run phase is "Completed"
     When I open the "diff" tab
     Then the diff shows "redirect"
+    When I reload the workbench
+    Then the transcript echoes my message "redirect"
 
   Scenario: queue mode is set before the turn it governs, and holds through it
     Given a new engagement
