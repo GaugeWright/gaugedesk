@@ -22,6 +22,22 @@ broker.sh            launches the rendezvous broker (federation scenarios)
 - **Live suite** (`npm run e2e:live`) — opt-in. Runs only `@live` scenarios against
   **WhippleScript with a real model** (the OpenAI Codex endpoint via OAuth). Slow, costs tokens — for the
   cases where the model's actual behavior drives the app (real tool-use → diff).
+
+  It needs a credential you supply, and it refuses to launch without one:
+
+  ```sh
+  GW_E2E_LIVE_TOKEN="$(cat ~/codex-oauth-bundle.json)" npm run e2e:live
+  ```
+
+  The lane links that material through the production `POST /account/credentials`
+  route after **every** per-scenario reset, because the control plane wipes its
+  state root at startup and the reset wipes it again, so a credential linked
+  interactively never survives to the first turn. `GW_E2E_LIVE_PROVIDER` selects
+  the provider (default `openai-codex`) and also pins the turn's provider to it.
+  For `openai-codex` the token is the GaugeDesk-owned OAuth bundle
+  (`{"access","refresh","expires","accountId"}`; an expired `access` is fine, the
+  turn refreshes it); for a BYOK provider it is that provider's API key. Nothing
+  is committed and nothing is logged.
 - **Enterprise-composition lane** (`npm run e2e:enterprise`) — the same default
   suite, but the preview origin serves the **combined enterprise workbench**
   (`ee/web`) instead of the open bundle. Every shipped surface — desktop

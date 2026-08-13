@@ -67,6 +67,25 @@ const env = {
 if (process.env.GW_E2E_LIVE) {
     // The live lane exercises the selected WhippleScript runtime and a real model.
     delete env.GAUGEDESK_FAKE_AGENT;
+    // And a real model needs a credential the lane can actually produce. The
+    // control plane wipes its state root at startup and the per-scenario reset
+    // wipes it again, so an interactively-linked credential never survives to the
+    // first turn: the suite re-links this material after every reset
+    // (`linkLiveModelCredential`). Refuse to launch without it rather than run a
+    // suite that is known to fail closed on a missing credential.
+    if (!process.env.GW_E2E_LIVE_TOKEN) {
+        console.error(
+            "[e2e] the live lane needs GW_E2E_LIVE_TOKEN (and optionally GW_E2E_LIVE_PROVIDER, " +
+                "default openai-codex). See web/e2e/README.md. Without it every live turn fails " +
+                "closed on a missing model credential.",
+        );
+        process.exit(1);
+    }
+    // Pin the turn's provider to the one whose credential is linked, so a lane
+    // given an Anthropic key cannot silently run against the Codex default and
+    // fail as though nothing were linked at all.
+    env.GAUGEDESK_MODEL_PROVIDER =
+        process.env.GAUGEDESK_MODEL_PROVIDER ?? process.env.GW_E2E_LIVE_PROVIDER ?? "openai-codex";
 } else {
     env.GAUGEDESK_FAKE_AGENT = process.env.GAUGEDESK_FAKE_AGENT ?? "1";
     env.GAUGEDESK_FAKE_MANAGEMENT_AGENT =

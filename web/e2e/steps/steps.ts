@@ -12,7 +12,7 @@
  * project is explicit and carries the zero-setup default placement.
  */
 
-import { expect, type Locator, type Page } from "@playwright/test";
+import { expect, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -32,7 +32,43 @@ const { Given, When, Then, Before } = createBdd();
 Before(async ({ request }) => {
     const res = await request.post(`${aliceCP}/test/reset`, { headers: mutationHeaders() });
     if (!res.ok()) throw new Error(`control-plane reset failed: ${res.status()} ${await res.text()}`);
+    await linkLiveModelCredential(request);
 });
+
+/** Link the live lane's model credential, through the production link route.
+ *
+ *  The lane has to do this per scenario, not once per run: the control plane
+ *  wipes its state root at startup and the reset above wipes it again, and a
+ *  linked credential lives in that state. So nothing linked interactively
+ *  survives to the first turn, which is why every `@live-provider` scenario met
+ *  the fresh-state scrim (modal, intercepting pointer events) and then, past it,
+ *  a turn that failed closed with "No GaugeDesk-owned Codex OAuth credential is
+ *  linked". Re-linking here is what makes the lane reach the provider at all,
+ *  and so what makes the cancellation scenario cover the path it claims to.
+ *
+ *  The material is the operator's and stays theirs: `run.mjs` requires
+ *  `GW_E2E_LIVE_TOKEN` before it will launch the lane, nothing is committed, and
+ *  nothing is logged. For `openai-codex` the token is the GaugeDesk-owned OAuth
+ *  bundle (`{"access","refresh","expires","accountId"}`, and an expired `access`
+ *  is fine because the turn refreshes it); for a BYOK provider it is the API key. */
+async function linkLiveModelCredential(request: APIRequestContext): Promise<void> {
+    if (!process.env.GW_E2E_LIVE) return;
+    const token = process.env.GW_E2E_LIVE_TOKEN;
+    if (!token) {
+        throw new Error(
+            "the live lane needs GW_E2E_LIVE_TOKEN (see web/e2e/README.md); without it every turn fails closed on a missing credential",
+        );
+    }
+    const provider = process.env.GW_E2E_LIVE_PROVIDER ?? "openai-codex";
+    const res = await request.post(`${aliceCP}/account/credentials`, {
+        headers: mutationHeaders(),
+        data: { provider, token },
+    });
+    // The status and the provider name are safe to report; the token is not.
+    if (!res.ok()) {
+        throw new Error(`linking the live ${provider} credential failed: ${res.status()}`);
+    }
+}
 
 // A fresh, uniquely-named project per call: the control plane is shared across
 // scenarios (serial, single worker), so unique names keep them isolated.
@@ -95,6 +131,11 @@ Then("the empty chat composer is ready", async ({ page }) => {
 
 // A new engagement is a usable WORK chat: a chat rooted on a placement (an
 // archetype installed on a project), opened and ready to task.
+//
+// Neither lane meets the fresh-state scrim, and neither dismisses one: the
+// mock-LLM control plane answers `credentialRequired` false, and the live lane
+// arrives with a credential linked (`linkLiveModelCredential`), so the overlay's
+// condition (a run that needs a credential and has none) is false in both.
 Given("a new engagement", async ({ page }) => {
     await page.goto("/");
     const project = await placeArchetypeOnFreshProject(page);
@@ -1025,9 +1066,29 @@ Then("the composer has no pending attachments", async ({ page }) => {
 
 // ---- send queue & steering (composer dock) ----
 
+// How the turn route answered each turn this scenario started, in order. It is
+// the one value carrying the *reason* a turn ended: the engine classifies the
+// outcome and the status carries that classification out (499 for a stop, 502 for
+// a fault, 403 for a refusal, 200 for a turn that ran to a phase). Recorded from
+// the moment the turn starts, so an answer cannot arrive while nothing is
+// listening.
+let turnOutcomes: number[] = [];
+const recordingTurnOutcomes = new WeakSet<Page>();
+function recordTurnOutcomes(page: Page): void {
+    turnOutcomes = [];
+    if (recordingTurnOutcomes.has(page)) return;
+    recordingTurnOutcomes.add(page);
+    page.on("response", (response) => {
+        if (response.request().method() !== "POST") return;
+        if (!/^\/chats\/[^/]+\/task$/.test(new URL(response.url()).pathname)) return;
+        turnOutcomes.push(response.status());
+    });
+}
+
 // Start a turn without waiting for it to settle, so the queue can be exercised
 // while the agent is busy. Pair with a `[slow]` prompt to widen that window.
 When("I start tasking the agent with {string}", async ({ page }, prompt: string) => {
+    recordTurnOutcomes(page);
     const composer = page.getByPlaceholder("task the agent…");
     await composer.fill(prompt);
     await sendDraft(composer);
@@ -1132,6 +1193,46 @@ When("I stop the turn", async ({ page }) => {
 // ended because it was interrupted, not because its window expired.
 Then("the turn ends promptly", async ({ page }) => {
     await expect(page.getByTestId("agent-working")).toBeHidden({ timeout: 8_000 });
+});
+
+// A real cancellation crosses a store and a provider delegate, so it is slower
+// than the fake's condvar — but it is still an interrupt, not a wait: the turn
+// it stops would run for minutes.
+Then("the real turn ends within twenty seconds", async ({ page }) => {
+    await expect(page.getByTestId("agent-working")).toBeHidden({ timeout: 20_000 });
+});
+
+// The counterfactual, which is what makes the assertion above mean anything: a
+// turn that ran to the end would have said its closing word.
+//
+// Scoped to what the agent said, not to the transcript: the prompt asking for
+// that closing word is itself in the transcript, so the whole-pane form could
+// never pass — it read its own instruction back as the agent's answer.
+Then("the agent never says {string}", async ({ page }, marker: string) => {
+    await expect(page.locator(".run .transcript .line.assistant")).not.toContainText(marker);
+});
+
+// The receipt that says *cancelled*, instead of leaving cancellation inferred
+// from timing plus the absence of model-controlled text. A real provider has
+// other ways to go quiet inside the assertion window (a rate limit, a dropped
+// transport, a refusal, a turn that simply finished early), and every one of them
+// would also hide `agent-working` and omit the closing marker.
+//
+// None of them answers this. `499` (`TURN_STOPPED_STATUS`, minted by
+// `task_failure_status`) is reached for exactly one leg,
+// `EngineError::Interrupted`, and the engine reaches that leg only by asking the
+// claim that recorded the interrupt landing: the harness stream died AND this
+// turn was stopped on purpose. A fault answers `502`, a policy refusal `403`, and
+// a turn that reached a phase answers `200`, so a provider that ignored the
+// interrupt cannot pass this step.
+const TURN_STOPPED_STATUS = 499;
+Then("the stop is receipted as a cancellation", async () => {
+    await expect
+        .poll(() => turnOutcomes, {
+            message: "what the turn route answered for this scenario's turns",
+            timeout: 25_000,
+        })
+        .toEqual([TURN_STOPPED_STATUS]);
 });
 
 Then("the composer shows no error", async ({ page }) => {
