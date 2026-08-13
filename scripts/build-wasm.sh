@@ -20,12 +20,60 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="$root/web/packages/control-plane-client/src/generated"
 profile="${1:-release}"
 
+# Debian and Ubuntu install LLVM's binaries under versioned names — `llvm-ar-21`
+# in `/usr/lib/llvm-21/bin` — and only the unversioned `llvm` package adds the
+# plain `llvm-ar`. `clang` is usually there under its plain name and `llvm-ar`
+# usually is not, so a machine with a complete, working toolchain failed this
+# check and was told to install what it already had. CI installs `clang llvm`
+# and so never saw it; every fresh worktree here did.
+#
+# So look for the plain names first, and fall back to the newest versioned
+# directory that carries *both*. Both, because pairing one release's compiler
+# with another's archiver is a harder failure to read than either being absent.
+llvm_toolchain_dir() {
+  local dir
+  # `sort -V` so llvm-9 does not sort above llvm-21.
+  for dir in $(ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -Vr); do
+    if [ -x "$dir/clang" ] && [ -x "$dir/llvm-ar" ]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# An explicit override always wins: a caller naming a tool has a reason, and
+# discovering a different one behind their back is worse than failing. Only the
+# tools that are both unset and unresolvable are discovered, and only those are
+# reported — a message naming a toolchain the build did not actually take sends
+# the next reader to the wrong LLVM.
+discovered=()
+if { [ -z "${CC_wasm32_unknown_unknown:-}" ] && ! command -v clang >/dev/null; } \
+  || { [ -z "${AR_wasm32_unknown_unknown:-}" ] && ! command -v llvm-ar >/dev/null; }; then
+  llvm_dir="$(llvm_toolchain_dir || true)"
+  if [ -n "$llvm_dir" ]; then
+    if [ -z "${CC_wasm32_unknown_unknown:-}" ] && ! command -v clang >/dev/null; then
+      CC_wasm32_unknown_unknown="$llvm_dir/clang"
+      discovered+=(clang)
+    fi
+    if [ -z "${AR_wasm32_unknown_unknown:-}" ] && ! command -v llvm-ar >/dev/null; then
+      AR_wasm32_unknown_unknown="$llvm_dir/llvm-ar"
+      discovered+=(llvm-ar)
+    fi
+    if [ ${#discovered[@]} -gt 0 ]; then
+      echo "using ${discovered[*]} from $llvm_dir" >&2
+    fi
+  fi
+fi
+
 : "${CC_wasm32_unknown_unknown:=clang}"
 : "${AR_wasm32_unknown_unknown:=llvm-ar}"
 export CC_wasm32_unknown_unknown AR_wasm32_unknown_unknown
 
 if ! command -v "$CC_wasm32_unknown_unknown" >/dev/null; then
   echo "error: $CC_wasm32_unknown_unknown not found — ring needs clang for wasm32 (ADR 0130 §4)" >&2
+  echo "       looked for clang on PATH and for /usr/lib/llvm-*/bin holding both clang and llvm-ar" >&2
+  echo "       install clang and llvm, or set CC_wasm32_unknown_unknown" >&2
   exit 1
 fi
 # The archiver is checked alongside the compiler because ring needs both, and
@@ -35,6 +83,9 @@ fi
 # before this check existed.
 if ! command -v "$AR_wasm32_unknown_unknown" >/dev/null; then
   echo "error: $AR_wasm32_unknown_unknown not found — ring needs an LLVM archiver for wasm32 (ADR 0130 §4)" >&2
+  echo "       looked for llvm-ar on PATH and for /usr/lib/llvm-*/bin holding both clang and llvm-ar" >&2
+  echo "       Debian and Ubuntu ship it as llvm-ar-<version>; the unversioned name comes from the llvm package" >&2
+  echo "       install llvm, or set AR_wasm32_unknown_unknown" >&2
   exit 1
 fi
 if ! command -v wasm-bindgen >/dev/null; then

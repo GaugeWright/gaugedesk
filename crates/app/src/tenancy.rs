@@ -294,14 +294,77 @@ pub fn provision_personal_tenant(
     Ok(tid)
 }
 
+/// The record kind, in the person's [`ACCOUNT_SCOPE`], binding one caller-supplied
+/// idempotency key to the organization that key created.
+pub const TENANT_CLAIM_KIND: &str = "tenant_claim";
+
+/// One key → organization binding, so a retried create returns the organization
+/// the first attempt made instead of making a second one.
+///
+/// It lives in the person's own account scope, and is therefore keyed by the
+/// *person*, not by the credential they presented. That distinction is the whole
+/// point: a bearer rotates — a hosted session mints a fresh id token on every
+/// refresh — so anything keyed by the credential treats one person's retry as a
+/// different caller and dedupes nothing.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TenantClaimRecord {
+    /// The caller's idempotency key.
+    pub id: String,
+    pub op: RecordOp,
+    pub tenant_id: String,
+}
+
+/// The organization a previous create with this key made, if the person still
+/// belongs to it.
+///
+/// A claim whose tenant has since left the switcher — the person left the
+/// organization — is treated as absent rather than replayed: returning a tenant
+/// they no longer belong to would be a worse answer than making a new one.
+pub fn organization_claimed_by(
+    store: &Store,
+    account_scope: &str,
+    key: &str,
+) -> Result<Option<TenantRef>, AdmitError> {
+    let mut claims: BTreeMap<String, TenantClaimRecord> = BTreeMap::new();
+    for row in store.records(account_scope, TENANT_CLAIM_KIND)? {
+        let record: TenantClaimRecord = serde_json::from_str(&row)?;
+        match record.op {
+            RecordOp::Tombstone => {
+                claims.remove(&record.id);
+            }
+            RecordOp::Upsert => {
+                claims.insert(record.id.clone(), record);
+            }
+        }
+    }
+    let Some(claim) = claims.get(key) else {
+        return Ok(None);
+    };
+    Ok(Tenancy::rebuild_in(store, account_scope)?
+        .tenants
+        .get(&claim.tenant_id)
+        .cloned())
+}
+
 /// Provision one named organization for `root` and index its single owner membership in that
 /// person's switcher. The tenant id is server-generated so a caller can name an organization
 /// without choosing, probing, or colliding with another tenant's isolation scope.
+///
+/// `claim` is the caller's idempotency key, when they supplied one. It is recorded
+/// alongside the organization so a retry can find it — see
+/// [`organization_claimed_by`], which callers consult *before* reaching here. The
+/// key is deliberately not folded into the id: deriving the id from a
+/// caller-chosen string would make it guessable by anyone who could guess the
+/// key, and unguessability is what the random id is for.
+///
+/// All four records land in one transaction. Before, a failure between them could
+/// leave an organization with no membership, or a membership no switcher listed.
 pub fn provision_organization(
     store: &mut Store,
     root: &str,
     account_scope: &str,
     display: &str,
+    claim: Option<&str>,
 ) -> Result<TenantRef, AdmitError> {
     let id = format!(
         "organization:{}",
@@ -316,8 +379,6 @@ pub fn provision_organization(
         display_name: display_name.clone(),
         ..Default::default()
     };
-    store.append_record(&scope, "org", &serde_json::to_string(&org)?)?;
-
     let owner = MembershipRecord {
         id: root.to_string(),
         op: RecordOp::Upsert,
@@ -329,20 +390,36 @@ pub fn provision_organization(
         managed_by_scim: false,
         team: None,
     };
-    store.append_record(&scope, "membership", &serde_json::to_string(&owner)?)?;
-
     let tenant = TenantRef {
-        id,
+        id: id.clone(),
         op: RecordOp::Upsert,
         display_name,
         role: "owner".to_string(),
         personal: false,
     };
-    store.append_record(
-        account_scope,
-        TENANT_REF_KIND,
-        &serde_json::to_string(&tenant)?,
-    )?;
+
+    let org_json = serde_json::to_string(&org)?;
+    let owner_json = serde_json::to_string(&owner)?;
+    let tenant_json = serde_json::to_string(&tenant)?;
+    let claim_json = claim
+        .map(|key| {
+            serde_json::to_string(&TenantClaimRecord {
+                id: key.to_owned(),
+                op: RecordOp::Upsert,
+                tenant_id: id.clone(),
+            })
+        })
+        .transpose()?;
+
+    let mut records: Vec<(&str, &str, &str)> = vec![
+        (scope.as_str(), "org", org_json.as_str()),
+        (scope.as_str(), "membership", owner_json.as_str()),
+        (account_scope, TENANT_REF_KIND, tenant_json.as_str()),
+    ];
+    if let Some(claim_json) = &claim_json {
+        records.push((account_scope, TENANT_CLAIM_KIND, claim_json.as_str()));
+    }
+    store.append_records_atomically(&records)?;
     Ok(tenant)
 }
 
@@ -407,7 +484,8 @@ mod tests {
     fn organization_provisioning_creates_an_isolated_owner_workspace() {
         let mut s = Store::open_in_memory().unwrap();
         let account_scope = crate::account::account_scope(ROOT);
-        let created = provision_organization(&mut s, ROOT, &account_scope, "Acme Studio").unwrap();
+        let created =
+            provision_organization(&mut s, ROOT, &account_scope, "Acme Studio", None).unwrap();
         assert!(created.id.starts_with("organization:"));
         assert_eq!(created.display_name, "Acme Studio");
         assert_eq!(created.role, "owner");
@@ -482,7 +560,8 @@ mod tests {
     fn tenant_invitation_is_metadata_only_and_acceptance_is_atomic_and_idempotent() {
         let mut s = Store::open_in_memory().unwrap();
         let owner_scope = crate::account::account_scope(ROOT);
-        let tenant = provision_organization(&mut s, ROOT, &owner_scope, "Acme Studio").unwrap();
+        let tenant =
+            provision_organization(&mut s, ROOT, &owner_scope, "Acme Studio", None).unwrap();
         let invited = MembershipRecord {
             id: "invitee-record".into(),
             op: RecordOp::Upsert,

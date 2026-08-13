@@ -164,11 +164,46 @@ pub async fn post_tenant(
         )
             .into_response();
     }
+    // A retry must not become a second organization. Every other account
+    // mutation is keyed by a caller-supplied id and upserts, so a repeat is
+    // harmless; this route mints a fresh random id, so a repeat is a *new*
+    // organization the caller never asked for and cannot remove — there is no
+    // route that deletes one. A synthetic account accumulated nine identical
+    // organizations this way, one per retry, before anyone looked.
+    //
+    // The key is honoured only when the caller sends one. The browser console
+    // sends none today, so requiring one would refuse every organization it
+    // creates; an absent key keeps exactly the old behaviour.
+    let idempotency_key = match headers
+        .get("idempotency-key")
+        .map(|value| value.to_str().unwrap_or_default().trim())
+    {
+        None => None,
+        Some(key) if key.is_empty() || key.len() > 200 => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Idempotency-Key must be 1..200 characters",
+            )
+                .into_response()
+        }
+        Some(key) => Some(key.to_owned()),
+    };
+    if let Some(key) = &idempotency_key {
+        match crate::tenancy::organization_claimed_by(wb.store_ref(), &account_scope, key) {
+            // `200`, not `201`: this call created nothing.
+            Ok(Some(tenant)) => {
+                return (StatusCode::OK, Json(json!({ "tenant": tenant }))).into_response()
+            }
+            Ok(None) => {}
+            Err(e) => return err_response(e),
+        }
+    }
     match crate::tenancy::provision_organization(
         wb.store_mut(),
         &actor,
         &account_scope,
         display_name,
+        idempotency_key.as_deref(),
     ) {
         Ok(tenant) => (StatusCode::CREATED, Json(json!({ "tenant": tenant }))).into_response(),
         Err(e) => err_response(e),
@@ -303,6 +338,76 @@ mod tests {
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    async fn create_tenant(app: &Router, name: &str, key: Option<&str>) -> (StatusCode, String) {
+        let mut rb = Request::builder()
+            .method("POST")
+            .uri("/account/tenants")
+            .header("content-type", "application/json");
+        if let Some(key) = key {
+            rb = rb.header("idempotency-key", key);
+        }
+        let req = rb
+            .body(Body::from(format!(r#"{{"display_name":"{name}"}}"#)))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn tenant_id(body: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        value["tenant"]["id"].as_str().unwrap().to_owned()
+    }
+
+    /// A retried create must not become a second organization.
+    ///
+    /// This route mints a fresh random id, so unlike every other account
+    /// mutation — all keyed by a caller-supplied id, so all upserts — a repeat
+    /// here is a *new* organization the caller never asked for and cannot
+    /// remove, because no route deletes one. A synthetic account accumulated
+    /// nine identical organizations this way before anyone looked.
+    #[tokio::test]
+    async fn a_repeated_idempotency_key_returns_the_first_organization() {
+        let app = router();
+        let (status, first) = create_tenant(&app, "Acme", Some("key-one")).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+
+        // `200`, not `201`: the retry created nothing.
+        let (status, again) = create_tenant(&app, "Acme", Some("key-one")).await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(tenant_id(&first), tenant_id(&again));
+
+        // A different key is a different organization, even with the same name.
+        let (status, other) = create_tenant(&app, "Acme", Some("key-two")).await;
+        assert_eq!(status, StatusCode::CREATED, "{other}");
+        assert_ne!(tenant_id(&first), tenant_id(&other));
+
+        // No key at all keeps the old behaviour, which the browser relies on:
+        // it sends none, and refusing it would refuse every organization the
+        // console creates.
+        let (status, keyless) = create_tenant(&app, "Acme", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{keyless}");
+        assert_ne!(tenant_id(&first), tenant_id(&keyless));
+
+        let (_, listed) = send(&app, "GET", "/account/tenants", None).await;
+        let value: serde_json::Value = serde_json::from_str(&listed).unwrap();
+        assert_eq!(
+            value["tenants"].as_array().unwrap().len(),
+            3,
+            "four creates, three organizations: {listed}",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_idempotency_key_is_refused_rather_than_ignored() {
+        let app = router();
+        let (status, _) = create_tenant(&app, "Acme", Some("   ")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = create_tenant(&app, "Acme", Some(&"k".repeat(201))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn tenants_is_empty_on_the_solo_path() {
         // No personal tenant is provisioned on desktop (provisioning runs in the hub login flow),
@@ -364,6 +469,7 @@ mod tests {
             owner,
             &crate::account::account_scope(owner),
             "Acme Studio",
+            None,
         )
         .unwrap();
         let membership = crate::org::MembershipRecord {
