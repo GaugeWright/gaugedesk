@@ -344,9 +344,17 @@ fn account_id_from_jwt(token: &str) -> Option<String> {
         .decode(payload)
         .ok()?;
     let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    // The issuer nests this under a namespaced claim object rather than putting
+    // it at the top level. Both call sites below reach this only when the
+    // `auth.json` the CLI wrote carries no `tokens.account_id`, so a wrong path
+    // here fails open into "stored no ChatGPT account id" rather than anything
+    // louder — which is how it survived: the two tests that cover this function
+    // supply `tokens.account_id` too, so neither ever took the fallback.
     claims
+        .get("https://api.openai.com/auth")?
         .get("chatgpt_account_id")
         .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
         .map(str::to_owned)
 }
 
@@ -1082,6 +1090,44 @@ mod tests {
         assert_eq!(credential.account_id, "acct-home");
         assert_eq!(credential.expires, 4_102_444_800_000);
         assert_eq!(credential.refresh, "refresh-home");
+    }
+
+    // Exercises the JWT fallback, which every other test here skips by supplying
+    // `tokens.account_id`. The payload is the shape the issuer really mints: the
+    // account id sits inside the `https://api.openai.com/auth` claim object, so
+    // a reader that looks for a top-level `chatgpt_account_id` finds nothing.
+    #[test]
+    fn account_id_falls_back_to_the_namespaced_access_token_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            br#"{"exp":4102444800,"https://api.openai.com/auth":{"chatgpt_account_id":"acct-nested","chatgpt_plan_type":"pro"}}"#,
+        );
+        let access = format!("{header}.{claims}.signature");
+        std::fs::write(
+            root.path().join("auth.json"),
+            json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": access,
+                    "access_token": access,
+                    "refresh_token": "refresh-nested"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let credential = read_codex_auth(root.path()).unwrap();
+        assert_eq!(credential.account_id, "acct-nested");
+    }
+
+    #[test]
+    fn account_id_is_not_read_from_a_flat_claim_the_issuer_never_mints() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"exp":4102444800,"chatgpt_account_id":"acct-flat"}"#);
+        let access = format!("{header}.{claims}.signature");
+        assert_eq!(account_id_from_jwt(&access), None);
     }
 
     #[test]
