@@ -26,7 +26,12 @@
  * turn's caption.
  */
 import { createSignal, type Accessor } from "solid-js";
-import { type EngagementId, type FileEntry } from "@gaugewright/control-plane-client";
+import {
+    turnStopped,
+    type EngagementId,
+    type FileEntry,
+    type StopTurnResult,
+} from "@gaugewright/control-plane-client";
 import {
     localTurnActivity,
     type Session,
@@ -69,7 +74,7 @@ export interface MobileSessionApi {
         text: string,
         images?: { data: string; mimeType: string }[],
     ): Promise<unknown>;
-    stopTurn(id: EngagementId): Promise<{ stopped: boolean }>;
+    stopTurn(id: EngagementId): Promise<StopTurnResult>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
     getFile(id: EngagementId, path: string): Promise<string>;
 }
@@ -98,10 +103,28 @@ export interface MobileSessionOptions {
     readonly onStatus: (message: string) => void;
 }
 
+/** How long a Stop keeps asking while the turn it aims at is still registering.
+ *  Matches the workbench's window: the same gap, for the same reason. */
+const STOP_REGISTRATION_GRACE_MS = 1500;
+
+/** The turn this client has in flight, as far as it can know one.
+ *
+ *  `stopTurn` carries only the engagement id, so a retry cannot name the turn it
+ *  aims at; the identity is held locally instead, so the grace loop can stop
+ *  asking the moment it no longer knows that the turn it aimed at is the one a
+ *  second ask would reach. `seq` separates successive local turns, and `lines` is
+ *  the transcript length at dispatch — the first event of this turn is the
+ *  registration the grace window waits for, so observing one also closes it. */
+interface DispatchedTurn {
+    readonly seq: number;
+    readonly lines: number;
+}
+
 export function createMobileSession(options: MobileSessionOptions): Session {
     const { api } = options;
-    const [dispatching, setDispatching] = createSignal(false);
-    const busy = () => dispatching();
+    const [dispatched, setDispatched] = createSignal<DispatchedTurn | null>(null);
+    let dispatches = 0;
+    const busy = () => dispatched() !== null;
 
     // The phone reads files but has no write route: `MobileControlPlane` serves
     // no putFile. Refusing explicitly beats a silent no-op — nothing in the chat
@@ -120,18 +143,28 @@ export function createMobileSession(options: MobileSessionOptions): Session {
     const send: Session["send"] = async (text) => {
         const id = options.engagementId();
         if (id === null) throw new Error("Open a chat before sending.");
-        setDispatching(true);
+        setDispatched({ seq: ++dispatches, lines: options.transcript().lines.length });
         options.onStatus(`send: ${text}`);
         try {
             await api.runTask(id, text, []);
             options.onStatus("turn complete");
             options.onSettled();
         } catch (cause) {
+            // A stopped turn is not a failed send. Handing the text back is
+            // right for a dropped relay and wrong here: the reader cancelled
+            // this message, and refilling the composer with it proposes the very
+            // thing they just called off. The turn still settled, so the sibling
+            // projections are re-derived exactly as they are for a completed one.
+            if (turnStopped(cause)) {
+                options.onStatus("turn stopped");
+                options.onSettled();
+                throw cause;
+            }
             options.onStatus(`turn error: ${String(cause)}`);
             options.onSendFailed(text);
             throw cause;
         } finally {
-            setDispatching(false);
+            setDispatched(null);
         }
     };
 
@@ -159,13 +192,53 @@ export function createMobileSession(options: MobileSessionOptions): Session {
         merge: () => undefined,
         onContentSaved: () => undefined,
         send,
+        // Stop says whether it landed.
+        //
+        // This was a best-effort abort inherited from the retired composer: it
+        // discarded the `{ stopped }` answer and swallowed every error, so a
+        // refused Stop was indistinguishable from an honoured one on the surface
+        // with the least room for a person to check by other means. The shared
+        // controller reports a rejection on the composer's own error line, which
+        // is the only place a phone has to say it.
+        //
+        // A stop can also outrun the turn it aims at: this Session reads as busy
+        // from the moment the task request goes out, while the runtime registers
+        // the turn a little later, so a fast tap can arrive before there is
+        // anything to interrupt. Ask again across that gap — bounded, and bound
+        // to the turn the tap was aimed at.
+        //
+        // Local request liveness alone is not that binding. A stop that races a
+        // natural completion is answered `nothing running` after the runtime has
+        // released the turn while this client's task request is still pending, so
+        // this Session still reads as busy — and `stopTurn` names only the chat,
+        // so a later iteration would interrupt whatever turn is running by then,
+        // including one another client started during the window. The retry
+        // therefore also requires that not one event of the aimed-at turn has
+        // been seen: before registration there is nothing to have ended, and the
+        // first event both proves the turn registered and ends the ambiguity.
         stop: async () => {
             const id = options.engagementId();
             if (id === null) return;
-            try {
-                await api.stopTurn(id);
-            } catch {
-                /* best-effort abort, as the retired composer's stop was */
+            const aimedAt = dispatched();
+            const deadline = Date.now() + STOP_REGISTRATION_GRACE_MS;
+            for (;;) {
+                const result = await api.stopTurn(id);
+                if (result.stopped) return;
+                const sameUnregisteredTurn = aimedAt !== null
+                    && dispatched()?.seq === aimedAt.seq
+                    && options.transcript().lines.length === aimedAt.lines;
+                const worthRetrying = result.reason === "nothing running"
+                    && Date.now() < deadline
+                    && options.engagementId() === id
+                    && sameUnregisteredTurn;
+                if (!worthRetrying) {
+                    throw new Error(
+                        result.reason === "nothing running"
+                            ? "nothing is running to stop"
+                            : "this turn cannot be interrupted",
+                    );
+                }
+                await new Promise((settle) => setTimeout(settle, 100));
             }
         },
     };

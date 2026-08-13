@@ -1,6 +1,6 @@
 import { createRoot, createSignal } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
-import { type EngagementId } from "@gaugewright/control-plane-client";
+import { TurnStopped, type EngagementId } from "@gaugewright/control-plane-client";
 import { empty as emptyTranscript, reduce } from "@gaugewright/workbench-ui/transcript";
 import { type ConnectionStatus } from "@gaugewright/workbench-ui/connection";
 import { createMobileSession, MOBILE_COMPOSER_CAPABILITIES } from "./mobile-session";
@@ -74,6 +74,61 @@ describe("createMobileSession", () => {
         await expect(h.session.send("typed with thumbs", [])).rejects.toThrow("relay dropped");
         expect(h.onSendFailed).toHaveBeenCalledWith("typed with thumbs");
         // And the Session settles: a failure must not leave the composer busy.
+        expect(h.session.busy()).toBe(false);
+        h.dispose();
+    });
+
+    it("says so when the host refuses the stop, instead of abandoning it", async () => {
+        // The refusal came back 200 with `stopped: false` and was discarded
+        // along with every transport error, so a Stop that did not land looked
+        // exactly like one that did — on the surface with the least room for a
+        // person to check by other means.
+        const h = harness();
+        h.api.stopTurn = vi.fn(async () => ({ stopped: false, reason: "not interruptible" }));
+        await expect(h.session.stop!()).rejects.toThrow(/cannot be interrupted/);
+        h.dispose();
+    });
+
+    it("asks again across the gap while the turn it aimed at is still registering", async () => {
+        // A fast tap arrives before the runtime has registered the turn, which is
+        // the whole point of Stop. Nothing of the turn has been seen yet, so
+        // `nothing running` describes the gap rather than a refusal.
+        const h = harness({ runTask: () => new Promise(() => {}) });
+        let asks = 0;
+        h.api.stopTurn = vi.fn(async () =>
+            ++asks === 1 ? { stopped: false, reason: "nothing running" } : { stopped: true },
+        );
+        void h.session.send("go", []);
+        await expect(h.session.stop!()).resolves.toBeUndefined();
+        expect(h.api.stopTurn).toHaveBeenCalledTimes(2);
+        h.dispose();
+    });
+
+    it("stops asking once the turn it aimed at has been seen running", async () => {
+        // A stop that races natural completion is answered `nothing running`
+        // while this client's task request is still pending, so local liveness is
+        // no proof the same turn is still there to stop — and `stopTurn` names
+        // only the chat, so asking again could interrupt a turn another client
+        // started meanwhile. Any event of the aimed-at turn ends the grace window.
+        const h = harness({ runTask: () => new Promise(() => {}) });
+        h.api.stopTurn = vi.fn(async () => ({ stopped: false, reason: "nothing running" }));
+        void h.session.send("go", []);
+        h.setTranscript((t) => reduce(t, { type: "text", delta: "on it" }));
+        await expect(h.session.stop!()).rejects.toThrow(/nothing is running to stop/);
+        expect(h.api.stopTurn).toHaveBeenCalledTimes(1);
+        h.dispose();
+    });
+
+    it("does not hand a stopped message back as a failed send", async () => {
+        // A phone puts a failed send's text back in the draft, which is right
+        // for a dropped relay and wrong for a stop: the reader cancelled this
+        // message, and refilling the composer with it proposes the very thing
+        // they just called off.
+        const h = harness({
+            runTask: async () => { throw new TurnStopped(); },
+        });
+        await expect(h.session.send("never mind", [])).rejects.toBeInstanceOf(TurnStopped);
+        expect(h.onSendFailed).not.toHaveBeenCalled();
         expect(h.session.busy()).toBe(false);
         h.dispose();
     });

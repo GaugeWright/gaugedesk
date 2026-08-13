@@ -148,5 +148,55 @@ Then("I can send {string}", async ({ page }, text: string) => {
     await expect(draftBox(page)).toHaveValue("");
 });
 
+// ---- stopping a turn from the device ----------------------------------------
+
+// Sent without waiting for the turn to settle, so the stop control can be
+// exercised while it runs. `[hold]` opens a window nothing outlasts, so nothing
+// here can pass by waiting the turn out.
+When("I send {string} from the device", async ({ page }, text: string) => {
+    await draftBox(page).fill(text);
+    await sendButton(page).click();
+    await expect(draftBox(page)).toHaveValue("");
+});
+
+Then("the device shows a stop control", async ({ page }) => {
+    await expect(page.locator(".mobile-chat [data-testid='stop-turn']")).toBeVisible();
+});
+
+// The desktop's delivery menu overhung its stop button and swallowed clicks
+// aimed at the leading third (#310). A phone declares no queue, stash or fork,
+// so it should never render that menu at all — which is worth asserting rather
+// than assuming, because it is a consequence of the capability set rather than
+// anything the mobile code says for itself.
+Then("every part of the device's stop control reaches stop", async ({ page }) => {
+    const covered = await page.evaluate(() => {
+        const stop = document.querySelector('.mobile-chat [data-testid="stop-turn"]');
+        if (!stop) throw new Error("the device is not showing a stop control");
+        const box = stop.getBoundingClientRect();
+        return [0.05, 0.25, 0.5, 0.75, 0.95]
+            .filter((across) => {
+                const at = document.elementFromPoint(
+                    box.left + box.width * across,
+                    box.top + box.height / 2,
+                );
+                return !stop.contains(at);
+            })
+            .map((across) => `${Math.round(across * 100)}%`);
+    });
+    expect(covered, "these points across the stop control hit something else").toEqual([]);
+});
+
+When("I stop the turn from the device", async ({ page }) => {
+    await page.locator(".mobile-chat [data-testid='stop-turn']").click();
+});
+
+Then("the device's turn ends promptly", async ({ page }) => {
+    await expect(page.locator(".mobile-chat [data-testid='stop-turn']")).toHaveCount(0, {
+        timeout: 8_000,
+    });
+    // And the message it stopped is not handed back as a failed send.
+    await expect(draftBox(page)).toHaveValue("");
+});
+
 // ---- the human task queue (the top bar's Next ③ affordance) ------------------
 

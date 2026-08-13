@@ -34,6 +34,19 @@ Feature: Mobile projection client — pair, navigate, send (offline + online)
     When I start a new chat on the device
     Then it shows up as a work chat in the desktop's Personal project
 
+  # A phone has the least room to check by other means: no console, no second
+  # window, no way to tell a Stop that did nothing from one that worked. So the
+  # one standing command that ends a turn has to land, and has to be reachable
+  # across the whole of the control that offers it.
+  Scenario: a running turn can be stopped from the device
+    Given I have paired with the ticket "gaugewright-pair://demo-env/device:web-harness"
+    When I open the chat pane
+    And I send "[hold] until I stop it" from the device
+    Then the device shows a stop control
+    And every part of the device's stop control reaches stop
+    When I stop the turn from the device
+    Then the device's turn ends promptly
+
   Scenario: send is refused offline and restored online
     Given I have paired with the ticket "gaugewright-pair://demo-env/device:web-harness"
     When I open the chat pane

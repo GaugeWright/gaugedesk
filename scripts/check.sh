@@ -90,6 +90,14 @@ run_contracts() {
     python3 scripts/check-gate-enforcement.py
     python3 scripts/check-gate-enforcement.py --self-test
 
+    # Every place a failure is allowed not to count says which kind it is:
+    # re-raised downstream, or tolerated. Whether a tolerated one has ever
+    # actually worked is asked across every repository at once by
+    # `tools/never-succeeded.mjs` in the GaugeWright repository, not here.
+    echo "== suppressions =="
+    python3 scripts/check-suppressions.py
+    python3 scripts/check-suppressions.py --self-test
+
     # The projection is default-deny, so a published workflow can reference a
     # path that is not published and nothing here notices — the private tree
     # builds and every private gate is green. It breaks on the mirror, after the
