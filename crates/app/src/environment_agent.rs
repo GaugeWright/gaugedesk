@@ -464,6 +464,13 @@ impl AgentCredential {
         }
     }
 
+    /// The ChatGPT backend serves this endpoint only as an event stream and
+    /// rejects anything else with `400 Stream must be set to true`. The OpenAI
+    /// endpoint answers both ways, so it keeps the simpler transport.
+    fn requires_stream(&self) -> bool {
+        matches!(self, Self::Codex { .. })
+    }
+
     fn authorize(&self, request: ureq::Request) -> ureq::Request {
         match self {
             Self::OpenAi(token) => request.set("authorization", &format!("Bearer {token}")),
@@ -551,6 +558,88 @@ fn canonical_tool(name: &str) -> Option<&'static str> {
     }
 }
 
+/// What the provider said about refusing, bounded and on one line. A bare
+/// status is what the failing turn used to report, and it costs a round trip
+/// through a human to learn anything from it.
+fn provider_complaint(body: &str) -> String {
+    const LIMIT: usize = 300;
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|parsed| {
+            ["error", "detail", "message"]
+                .iter()
+                .find_map(|key| match parsed.get(key) {
+                    Some(Value::String(text)) => Some(text.clone()),
+                    Some(object) => object
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    None => None,
+                })
+        })
+        .unwrap_or_else(|| body.to_owned());
+    let flattened = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.is_empty() {
+        return "(no response body)".into();
+    }
+    match flattened.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}… (truncated)", &flattened[..cut]),
+        None => flattened,
+    }
+}
+
+/// The completed response carried by a Responses API event stream.
+///
+/// The final `response.completed` event carries exactly the object the
+/// non-streaming endpoint returns as its whole body, so every caller downstream
+/// of this reads the same shape whichever transport was used.
+fn response_from_event_stream(stream: &str) -> Result<Value, String> {
+    let normalized = stream.replace("\r\n", "\n");
+    let mut failure = None;
+    for block in normalized.split("\n\n") {
+        let payload = block
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.strip_prefix(' ').unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(&payload) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed") => {
+                if let Some(response) = event.get("response") {
+                    return Ok(response.clone());
+                }
+            }
+            // A stream that ends without completing has already said why, and
+            // that sentence is worth more than "no completed response". The
+            // standard events carry it inside the response object — as `error`
+            // when it failed, as `incomplete_details` when it stopped short —
+            // so read that before falling back to the raw event, which would
+            // otherwise be flattened and truncated away.
+            Some("response.failed" | "response.incomplete" | "error") => {
+                failure.get_or_insert_with(|| {
+                    let nested = event.get("response").and_then(|response| {
+                        ["error", "incomplete_details"]
+                            .iter()
+                            .find_map(|key| response.get(key))
+                    });
+                    match nested {
+                        Some(reason) => provider_complaint(&reason.to_string()),
+                        None => provider_complaint(&payload),
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+    Err(failure.unwrap_or_else(|| "event stream carried no completed response".into()))
+}
+
 fn provider_request(
     credential: &AgentCredential,
     body: &Value,
@@ -559,22 +648,60 @@ fn provider_request(
         .timeout(Duration::from_secs(130))
         .redirects(0)
         .build();
-    let serialized = serde_json::to_string(body)
+    // The ChatGPT backend refuses a non-streaming turn outright — `400 Stream
+    // must be set to true` — so the Codex credential has never been able to
+    // complete one here. The production wiring canary caught it on 2026-08-13;
+    // nothing else did, because the failure needs a real Codex credential and
+    // that path is founder-gated. The OpenAI endpoint answers either way and is
+    // left alone.
+    let streaming = credential.requires_stream();
+    let sent = if streaming {
+        let mut streamed = body.clone();
+        match streamed.as_object_mut() {
+            Some(fields) => {
+                fields.insert("stream".into(), Value::Bool(true));
+            }
+            None => {
+                return Err(EnvironmentAgentError::InvalidOutput(
+                    "provider request body is not an object".into(),
+                ));
+            }
+        }
+        streamed
+    } else {
+        body.clone()
+    };
+    let serialized = serde_json::to_string(&sent)
         .map_err(|error| EnvironmentAgentError::InvalidOutput(error.to_string()))?;
     let request = credential.authorize(
         agent
             .post(credential.endpoint())
-            .set("content-type", "application/json"),
+            .set("content-type", "application/json")
+            .set(
+                "accept",
+                if streaming {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            ),
     );
     let response = match request.send_string(&serialized) {
         Ok(response) => response,
-        Err(ureq::Error::Status(status, _response)) => {
+        Err(ureq::Error::Status(status, response)) => {
+            // The provider's own explanation used to be dropped on the floor
+            // here, leaving `HTTP 400` and no way to act on it.
+            let complaint = response
+                .into_string()
+                .map(|body| provider_complaint(&body))
+                .unwrap_or_else(|error| format!("(unreadable response body: {error})"));
             tracing::warn!(
                 status,
+                complaint,
                 "management Environment agent provider rejected request"
             );
             return Err(EnvironmentAgentError::Provider(format!(
-                "provider returned HTTP {status}"
+                "provider returned HTTP {status}: {complaint}"
             )));
         }
         Err(ureq::Error::Transport(error)) => {
@@ -591,6 +718,11 @@ fn provider_request(
         return Err(EnvironmentAgentError::Provider(
             "response exceeded size cap".into(),
         ));
+    }
+    if streaming {
+        let stream = std::str::from_utf8(&bytes)
+            .map_err(|_| EnvironmentAgentError::Provider("event stream was not UTF-8".into()))?;
+        return response_from_event_stream(stream).map_err(EnvironmentAgentError::Provider);
     }
     serde_json::from_slice(&bytes)
         .map_err(|_| EnvironmentAgentError::Provider("response was not valid JSON".into()))
@@ -1184,5 +1316,122 @@ mod tests {
                 Err(EnvironmentAgentRejection::UndeclaredTool),
             );
         }
+    }
+
+    // The ChatGPT backend serves this endpoint only as an event stream, and the
+    // Codex path never asked for one: every turn it ever attempted came back
+    // `400 Stream must be set to true`. Caught by the production wiring canary
+    // on 2026-08-13, because completing a real turn needs a real Codex
+    // credential and nothing else in the check set has one.
+    #[test]
+    fn the_codex_endpoint_is_asked_for_a_stream_and_the_openai_one_is_not() {
+        assert!(AgentCredential::Codex {
+            access: "access".into(),
+            account_id: "account".into(),
+        }
+        .requires_stream());
+        assert!(!AgentCredential::OpenAi("key".into()).requires_stream());
+    }
+
+    #[test]
+    fn the_completed_event_carries_the_response_the_caller_expects() {
+        let stream = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"output\":[]}}\n",
+            "\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\"}]}}\n",
+            "\n",
+            "data: [DONE]\n",
+            "\n",
+        );
+        let response = response_from_event_stream(stream).unwrap();
+        // The same shape the non-streaming endpoint returns whole, so nothing
+        // downstream has to know which transport was used.
+        assert_eq!(
+            response
+                .get("output")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_stream_is_read_the_same_with_carriage_returns() {
+        let stream = "event: response.completed\r\n\
+data: {\"type\":\"response.completed\",\"response\":{\"ok\":true}}\r\n\r\n";
+        assert_eq!(
+            response_from_event_stream(stream).unwrap(),
+            serde_json::json!({ "ok": true })
+        );
+    }
+
+    // A stream that stops early has already said why, and that sentence beats
+    // "no completed response" for whoever reads the log.
+    #[test]
+    fn a_failed_stream_reports_what_the_provider_said() {
+        let stream = concat!(
+            "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"model not available\"}}\n",
+            "\n",
+        );
+        let error = response_from_event_stream(stream).unwrap_err();
+        assert!(error.contains("model not available"), "{error}");
+    }
+
+    // The standard event nests the sentence under `response.error`, and reading
+    // the event whole would flatten it into a fragment the limit can cut off.
+    #[test]
+    fn a_failed_stream_reads_the_error_nested_in_the_response() {
+        let filler = "z".repeat(400);
+        let stream = format!(
+            "data: {{\"type\":\"response.failed\",\"response\":{{\"id\":\"resp_{filler}\",\
+\"status\":\"failed\",\"error\":{{\"code\":\"server_error\",\
+\"message\":\"Stream must be set to true\"}}}}}}\n\n"
+        );
+        assert_eq!(
+            response_from_event_stream(&stream).unwrap_err(),
+            "Stream must be set to true"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_never_completes_is_an_error_not_an_empty_turn() {
+        let stream = "data: {\"type\":\"response.created\",\"response\":{}}\n\n";
+        assert!(response_from_event_stream(stream)
+            .unwrap_err()
+            .contains("no completed response"));
+        assert!(response_from_event_stream("").is_err());
+    }
+
+    // The exact refusal that reached the canary, reported as the provider wrote
+    // it rather than as a bare status.
+    #[test]
+    fn a_refusal_is_reported_in_the_providers_own_words() {
+        assert_eq!(
+            provider_complaint(r#"{"error":{"message":"Stream must be set to true"}}"#),
+            "Stream must be set to true"
+        );
+        assert_eq!(provider_complaint(r#"{"detail":"no access"}"#), "no access");
+        // An unrecognised shape is when the raw text matters most.
+        assert_eq!(
+            provider_complaint("<html>gateway</html>"),
+            "<html>gateway</html>"
+        );
+        assert_eq!(provider_complaint(""), "(no response body)");
+        assert_eq!(provider_complaint("   \n  "), "(no response body)");
+        // A provider answering with an error page must not bury the log.
+        let long = provider_complaint(&"x".repeat(2000));
+        assert!(
+            long.len() < 340 && long.ends_with("… (truncated)"),
+            "{long}"
+        );
+        // Multibyte text must not be cut mid-character.
+        let wide = provider_complaint(&"é".repeat(2000));
+        assert!(wide.ends_with("… (truncated)"));
     }
 }
