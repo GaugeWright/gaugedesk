@@ -98,9 +98,12 @@ export interface ChatComposerProps {
     readonly attachments?: readonly Attachment[];
     readonly busy: boolean;
     /** The mode the composer rests in: what the primary button and Enter do, and
-     *  which glyph the primary wears. Defaults to `steer`, and falls back to it
-     *  whenever the chosen mode is not currently available (queueing with nothing
-     *  running). Someone who mostly jots should not re-choose every message. */
+     *  which glyph the primary wears. It is a standing choice about the turn in
+     *  flight — where a message written while the agent is working goes — so it
+     *  does not follow the moment. Resting in `queue` on an idle chat is how the
+     *  *next* turn's follow-up is arranged for in advance. Defaults to `steer`,
+     *  and falls back to it only where the Environment cannot honour the chosen
+     *  mode at all. */
     readonly mode?: ComposerMode;
     readonly onPickMode?: (mode: ComposerMode) => void;
     /** The mode a chat opens in. Shown in the mode menu so the standing choice is
@@ -162,30 +165,31 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
         props.onReorderQueue && props.onEditQueue && props.onRemoveQueue && props.onSendNow;
     const audienceBusy = () => props.busy && !hasQueueCommands() && !props.onStop;
 
-    // Queueing needs a *later* to queue into. A running turn is one; so is a dead
-    // transport, which is why composing offline lands in the queue rather than
-    // being refused (ADR 0137). Idle and connected, "after the current turn" and
-    // "now" are the same instant and the button would be a second Send.
-    const canQueue = () =>
-        (props.busy || props.blocked === true) && Boolean(hasQueueCommands());
+    // Queueing is a capability, not a moment. The message joins the same line
+    // whenever it is written — behind a running turn, behind a dead transport
+    // (ADR 0137), or behind nothing at all, in which case the drain takes it
+    // straight out. Gating this on the moment is what made the mode look broken:
+    // choosing Queue on an idle chat collapsed back to Steer before the turn it
+    // was chosen for ever started, so the one moment the choice matters could
+    // never be arranged for in advance.
+    const canQueue = () => Boolean(hasQueueCommands());
     const canStash = () => Boolean(props.onStash);
-    // The mode holds only where its destination is actually reachable right now;
-    // otherwise the composer falls back to steering rather than resting in a
-    // state it cannot act on.
+    // The mode is a standing choice about the turn in flight, so it holds
+    // wherever the Environment can honour it at all. It falls back to steering
+    // only where the destination does not exist here — never merely because this
+    // instant does not distinguish it from steering.
     const mode = (): ComposerMode => {
         const chosen = props.mode ?? "steer";
         if (chosen === "queue" && !canQueue()) return "steer";
         if (chosen === "stash" && !canStash()) return "steer";
         return chosen;
     };
-    /** The modes this Environment can rest in at all — a capability question, not
-     *  a moment one. `canQueue` is false whenever nothing is running, but queue
-     *  mode is still a choice you can make *now* for later; an Environment with
-     *  no queue commands can never honour it, and offering it there is a control
-     *  that quietly does nothing. Below two, there is no choice to present. */
+    /** The modes this Environment can rest in at all — a capability question, and
+     *  now only that. An Environment with no queue commands, or no way to hold a
+     *  row back, can never honour those modes, and offering one there is a
+     *  control that quietly does nothing. Below two, there is no choice to make. */
     const offeredModes = () => COMPOSER_MODES.filter((entry) =>
-        (entry.id !== "queue" || Boolean(hasQueueCommands()))
-        && (entry.id !== "stash" || canStash()));
+        (entry.id !== "queue" || canQueue()) && (entry.id !== "stash" || canStash()));
     // Nothing to command with: no queue, no stop. Say so instead of offering a
     // primary that cannot land.
     const inert = () => props.busy && !hasQueueCommands() && !props.onStop;
@@ -193,8 +197,16 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
     // turn is in flight, "now" means cutting into it, and that is worth saying.
     const steerDetail = () =>
         props.busy ? "Run it now, interrupting the turn in flight" : "Run it now";
+    // Queueing likewise reaches one destination — the line — and what that costs
+    // depends only on whether anything is ahead of it.
+    const queueDetail = () =>
+        props.blocked === true ? "Wait in the queue until the connection is back"
+        : props.busy ? "Run on its own once the current turn finishes"
+        : "Join the line — nothing is ahead of it, so it runs";
     const primaryDetail = () =>
-        mode() === "steer" ? steerDetail() : MODE_BY_ID.get(mode())!.detail;
+        mode() === "steer" ? steerDetail()
+        : mode() === "queue" ? queueDetail()
+        : MODE_BY_ID.get(mode())!.detail;
 
     /** The destinations currently reachable.
      *
@@ -203,13 +215,17 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
      *  order, hovering the stash button and clicking without moving dispatched
      *  *steer* — the row that happened to sit at the bottom — which sends a
      *  message you meant to put away. The row under the pointer has to be the
-     *  one the pointer was already aiming at. */
+     *  one the pointer was already aiming at.
+     *
+     *  For the same reason the rows no longer come and go with the moment: Queue
+     *  is listed wherever the Environment has a queue, running or not, so a turn
+     *  starting under an open menu cannot slide a row beneath the pointer. */
     const destinations = () => {
         const active = mode();
         const all = [
             ...(props.onFork ? [{ id: "fork" as const, label: "Fork", detail: "Send down a new branch, leaving this chat as it is" }] : []),
             ...(canStash() ? [{ id: "stash" as const, label: "Stash", detail: "Join the queue held — nothing runs it until you release it" }] : []),
-            ...(canQueue() ? [{ id: "queue" as const, label: "Queue", detail: "Run on its own once the current turn finishes" }] : []),
+            ...(canQueue() ? [{ id: "queue" as const, label: "Queue", detail: queueDetail() }] : []),
             { id: "steer" as const, label: "Steer", detail: steerDetail() },
         ].map((entry) => ({
             ...entry,
@@ -224,11 +240,6 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
         return [...all.filter((entry) => entry.id !== active), ...all.filter((entry) => entry.id === active)];
     };
 
-    /** Route a dispatch, doing nothing at all for a destination the Environment
-     *  cannot currently reach. It used to fall back to steering, which meant
-     *  Ctrl+Enter on an idle chat *sent* the message — a control quietly doing
-     *  something other than what it says, which is the one failure this whole
-     *  pass is about. A shortcut either does its thing or does nothing. */
     /** A destination the transport has to carry cannot be offered while it is
      *  down; one the outbox can hold can. Used for the control's disabled state
      *  and by `dispatch`, so what a button looks like and what it does cannot
@@ -237,6 +248,12 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
         !props.canSubmit
         || (props.blocked === true && destination !== "queue" && destination !== "stash");
 
+    /** Route a dispatch, doing nothing at all for a destination this Environment
+     *  cannot reach. The refusals below are capability questions: a destination
+     *  that exists here always does its own thing — queueing on an idle chat
+     *  joins an empty line, which then runs — and one that does not exist does
+     *  nothing rather than quietly falling back to another destination. That
+     *  fallback is what once made Ctrl+Enter on an idle chat *steer*. */
     const dispatch = (destination: ComposerDestination) => {
         if (unreachable(destination)) return;
         if (destination === "queue" && !canQueue()) return;

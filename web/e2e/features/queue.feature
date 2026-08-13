@@ -42,6 +42,16 @@ Feature: Send queue & steering
     When I open the "diff" tab
     Then the diff shows "redirect"
 
+  Scenario: queue mode is set before the turn it governs, and holds through it
+    Given a new engagement
+    When I set the composer mode to "queue"
+    And I start tasking the agent with "[slow] alpha"
+    Then the agent is working
+    When I send the message "beta"
+    Then the queue shows 1 message
+    And the agent finishes
+    And the run phase is "Completed"
+
   Scenario: stash mode puts what Enter sends into the queue, held (#24)
     Given a new engagement
     When I set the composer mode to "stash"
