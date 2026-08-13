@@ -1081,6 +1081,14 @@ input {
 .composer-input::placeholder { color: var(--muted); }
 .composer-deliver { display: flex; align-items: center; gap: 1px; flex: 0 0 auto;
     padding-bottom: 4px; }
+/* Stop keeps clear of the delivery menu's overhang.
+   The menu is anchored `right: -8px` so its active row's glyph lands on the send
+   button's; that overhang used to fall across the left third of Stop, and while
+   the cluster was hovered a click there hit a *disabled* destination row — the
+   button did nothing, silently, which is exactly what an interrupt must never
+   do. The gap is what the overhang needs (8px) plus a pixel, so the whole of
+   Stop is Stop. */
+.composer-deliver .stop-btn { margin-left: 9px; }
 
 /* The rail carries what the turn runs *on*, and how much of the window it is
    carrying. It never wraps: below COMPACT_RAIL_WIDTH the component folds tools

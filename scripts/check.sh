@@ -71,6 +71,25 @@ run_contracts() {
     echo "== client calls =="
     node scripts/check-client-calls.mjs
 
+    # Absence has no line number: a crate nothing compiles and a lockfile
+    # nothing audits look exactly like a crate and a lockfile. This enumerates
+    # what is tracked, reads coverage out of this script, and fails on the
+    # difference — which is how `src-tauri` and `src-tauri-mobile` should have
+    # been found, rather than by a release and an advisory finding them.
+    # Rendered from tools/shared-checks/build-coverage.mjs in the GaugeWright
+    # repository, which owns it and tests it. A local edit fails here.
+    echo "== build coverage =="
+    node scripts/check-build-coverage.mjs
+
+    # A job either blocks a merge or says why it does not, and a blocking job has
+    # to be one that always reports (DR-0069 OPS-21). Reconciling the tables with
+    # branch protection needs a token that can read it, which the workflow token
+    # cannot, so that half is an operator command:
+    #   python3 scripts/check-gate-enforcement.py --verify-protection GaugeWright/gaugedesk-src
+    echo "== gate enforcement =="
+    python3 scripts/check-gate-enforcement.py
+    python3 scripts/check-gate-enforcement.py --self-test
+
     # The projection is default-deny, so a published workflow can reference a
     # path that is not published and nothing here notices — the private tree
     # builds and every private gate is green. It breaks on the mirror, after the
@@ -82,6 +101,22 @@ run_contracts() {
 
     echo "== spec audit =="
     python3 scripts/audit-gate.py
+
+    # `validation.anchors: warn` in mkdocs.yml only rejects a broken heading
+    # link if something runs the strict build *before* the merge. Until this,
+    # nothing did: `docs.yml` builds on push to `main`, so the deploy log was
+    # the first place a broken link could appear, and by then the change that
+    # introduced it had already landed. It runs in `contracts` because that is
+    # the section whose gate already installs `docs/requirements.txt` (DOCS-1).
+    #
+    # Output goes to the gitignored `site/`, the same directory `docs.yml`
+    # deploys from, so a local run and the deploy build produce the same thing.
+    echo "== documentation =="
+    command -v mkdocs >/dev/null || {
+        echo "mkdocs is not installed; run: python3 -m pip install -r docs/requirements.txt" >&2
+        exit 1
+    }
+    mkdocs build --strict
 }
 
 run_rust() {

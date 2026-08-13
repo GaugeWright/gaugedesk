@@ -668,11 +668,20 @@ export async function runTask(
     );
 }
 
+/** What Stop actually did. `stopped: false` is a refusal, not a quiet success:
+ *  either nothing was running or the running turn carries no interrupt handle.
+ *  Callers must say which — a Stop that reports nothing is the one failure a
+ *  person cannot tell apart from the turn simply continuing. */
+export interface StopTurnResult {
+    readonly stopped: boolean;
+    readonly reason?: string;
+}
+
 export async function stopTurn(
     transport: WorkbenchTransport,
     id: EngagementId,
-): Promise<{ stopped: boolean }> {
-    return (await transport.json("POST", `/chats/${id}/stop`)) as { stopped: boolean };
+): Promise<StopTurnResult> {
+    return (await transport.json("POST", `/chats/${id}/stop`)) as StopTurnResult;
 }
 
 export async function syncFromMain(

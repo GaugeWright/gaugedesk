@@ -13,6 +13,7 @@
  * build.
  */
 
+import { TurnStopped, TURN_STOPPED_STATUS } from "./control-plane-domain";
 import type { RouteJson } from "./control-plane-transport";
 
 /** The `BrowserTunnel` facade, as a structural type so a test can stand one in
@@ -115,6 +116,13 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
                 const status = tunnel.pollStatus();
                 if (status !== undefined) {
                     const text = tunnel.takeBody();
+                    // A stopped turn is not a delivery failure on this transport
+                    // either. The hosted split composition carries `/task` through
+                    // here whenever a project's Home is relay-only, so decoding
+                    // `499` only in the direct browser route would leave exactly
+                    // those turns reported as broken — and the composer holding
+                    // the cancelled message for a retry nobody asked for.
+                    if (status === TURN_STOPPED_STATUS) throw new TurnStopped();
                     if (status >= 400) {
                         throw new Error(`${method} ${path}: ${status} ${text}`.trim());
                     }

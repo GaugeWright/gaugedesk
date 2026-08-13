@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { TurnStopped, TURN_STOPPED_STATUS } from "./control-plane-domain";
 import { tunnelRouteJson, type TunnelFacade, type TunnelSocket } from "./tunnel-route-json";
 
 /** A tunnel that answers after `afterPumps` pumps, so the loop's polling is
@@ -130,6 +131,15 @@ describe("routeJson over the tunnel (DESK-7)", () => {
         json.close();
         json.close();
         expect(closes).toBe(0);
+    });
+
+    it("reports a stopped turn as stopped, not as a delivery failure", async () => {
+        // A relay-only Home carries `/task` here, so a `499` decoded only by the
+        // direct route would make exactly those Stops look like breakage.
+        const tunnel = fakeTunnel([{ status: TURN_STOPPED_STATUS, body: '{"error":"stopped"}' }]);
+        const { socket } = fakeSocket();
+        await expect(build(tunnel, socket)("POST", "/chats/c1/task"))
+            .rejects.toBeInstanceOf(TurnStopped);
     });
 
     it("does not wedge later requests behind a failed one", async () => {

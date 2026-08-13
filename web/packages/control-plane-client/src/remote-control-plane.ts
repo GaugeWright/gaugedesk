@@ -17,6 +17,7 @@ import type {
 } from "./control-plane-domain";
 import { newIdempotencyKey, type RouteJson } from "./control-plane-transport";
 import * as workbench from "./control-plane-workbench";
+import type { StopTurnResult } from "./control-plane-workbench";
 
 /** The placement-neutral product transport shared by desktop, managed web,
  * embeds, and future in-page environments (ADR 0076). */
@@ -36,7 +37,7 @@ export interface ControlPlane {
         prompt: string,
         images?: { data: string; mimeType: string }[],
     ): Promise<unknown>;
-    stopTurn(id: EngagementId): Promise<{ stopped: boolean }>;
+    stopTurn(id: EngagementId): Promise<StopTurnResult>;
     engagementDiff(id: EngagementId): Promise<string>;
     getMerge(id: EngagementId): Promise<MergeState>;
     mergeCommand(

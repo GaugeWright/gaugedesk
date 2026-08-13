@@ -24,7 +24,22 @@ export function ComposerMenuButton(props: {
 }): JSX.Element {
     const [open, setOpen] = createSignal(false);
     return (
-        <span class="composer-menu-anchor" classList={{ row: props.stacked }}>
+        <span
+            class="composer-menu-anchor"
+            classList={{ row: props.stacked }}
+            /* On the anchor, not the menu: opening this leaves focus on the
+               button, so an Escape aimed at the menu is delivered to the button
+               and a handler on the menu itself never sees it. The composer dock
+               behind reads Escape as "interrupt the running turn" — so a handler
+               in the wrong place does not merely fail to close the menu, it
+               stops the agent. Escape closes the innermost thing that can be
+               dismissed, and goes no further. */
+            onKeyDown={(event) => {
+                if (event.key !== "Escape" || !open()) return;
+                event.stopPropagation();
+                setOpen(false);
+            }}
+        >
             <Show when={props.stacked}>
                 <span class="composer-menu-row-label">{props.rowLabel}</span>
             </Show>
@@ -45,11 +60,13 @@ export function ComposerMenuButton(props: {
             </button>
             <Show when={open()}>
                 <div class="popover-catcher" onClick={() => setOpen(false)} />
+                {/* Escape is handled on the anchor above, which is an ancestor of
+                    both this menu and the button that opens it — the only place
+                    that catches the keystroke wherever focus happens to be. */}
                 <div
                     class="composer-menu"
                     role="menu"
                     {...{ [`data-${props.testAttr}-menu`]: "" }}
-                    onKeyDown={(event) => event.key === "Escape" && setOpen(false)}
                 >
                     {props.children(() => setOpen(false))}
                 </div>

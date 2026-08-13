@@ -1127,6 +1127,59 @@ When("I send the message {string}", async ({ page }, text: string) => {
 When("I stop the turn", async ({ page }) => {
     await page.getByTestId("stop-turn").click();
 });
+
+// Paired with a `[hold]` prompt, which nothing outlasts: a turn that ends here
+// ended because it was interrupted, not because its window expired.
+Then("the turn ends promptly", async ({ page }) => {
+    await expect(page.getByTestId("agent-working")).toBeHidden({ timeout: 8_000 });
+});
+
+Then("the composer shows no error", async ({ page }) => {
+    await expect(page.locator("[data-composer-error]")).toHaveCount(0);
+});
+
+// The pointer path a person takes to Stop crosses the delivery cluster, which
+// opens the destination menu over it. Hover the cluster first, so the hit test
+// below asks the question that actually bit: not "is the button there" but "is
+// the button reachable once the menu it sits beside is open".
+When("I aim at the stop button with the delivery menu open", async ({ page }) => {
+    await page.locator(".deliver-stack").hover();
+    await expect(page.locator("[data-deliver-menu]")).toHaveCSS("opacity", "1");
+});
+
+Then("every part of the stop button reaches stop", async ({ page }) => {
+    const covered = await page.evaluate(() => {
+        const stop = document.querySelector('[data-testid="stop-turn"]')!;
+        const box = stop.getBoundingClientRect();
+        return [0.05, 0.25, 0.5, 0.75, 0.95]
+            .filter((across) => {
+                const at = document.elementFromPoint(
+                    box.left + box.width * across,
+                    box.top + box.height / 2,
+                );
+                return !stop.contains(at);
+            })
+            .map((across) => `${Math.round(across * 100)}%`);
+    });
+    expect(covered, "these points across the stop button hit something else").toEqual([]);
+});
+
+// Escape wherever the previous step left focus, which is the point: sending the
+// turn leaves it in the field, opening a menu leaves it on that menu's button,
+// and Escape has to mean the right thing from both. Forcing focus somewhere
+// first would test a state no one can actually be in.
+When("I press Escape in the composer", async ({ page }) => {
+    await page.keyboard.press("Escape");
+});
+
+When("I open the composer mode menu", async ({ page }) => {
+    await page.locator("[data-mode-picker]").click();
+    await expect(page.locator("[data-mode-menu]")).toBeVisible();
+});
+
+Then("the composer mode menu is closed", async ({ page }) => {
+    await expect(page.locator("[data-mode-menu]")).toHaveCount(0);
+});
 Then("the composer is ready to send again", async ({ page }) => {
     await expect(page.getByTestId("send-msg")).toBeVisible();
 });

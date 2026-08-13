@@ -369,6 +369,19 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
             data-chat-composer
             data-desktop-composer={props.audience ? undefined : ""}
             data-empty-chat-composer={props.quickStart ? "" : undefined}
+            /* Escape interrupts the running turn. It is bound here rather than on
+               the field so it reaches Stop from anywhere in the composer, and
+               here rather than on the window so it cannot fire for a keystroke
+               that was aimed at something else entirely. Anything inside that
+               owns Escape for itself — an open menu, a queue row being edited —
+               stops it propagating, so the innermost thing Escape can dismiss is
+               the thing it dismisses. */
+            onKeyDown={(event) => {
+                if (event.key !== "Escape" || !props.busy || !props.onStop) return;
+                if (props.blocked) return;
+                event.preventDefault();
+                props.onStop();
+            }}
         >
             <Show when={queue().length > 0 && hasQueueCommands()}>
                 <ComposerQueue
@@ -467,6 +480,8 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                         }}
                         onKeyDown={(event) => {
                             if (event.key !== "Enter" || event.isComposing) return;
+                            // (Escape is handled on the dock, so it reaches Stop
+                            // from anywhere in the composer, not only the field.)
                             const control = event.ctrlKey || event.metaKey;
                             // Shift+Enter stays a newline. Control is what promotes
                             // it to a command, which is the only reason Steer can
@@ -594,7 +609,17 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                         >
                             {/* One expander, not a wrapped second row: a narrow rail
                                 keeps delivery and the meter, and folds the rest. */}
-                            <span class="composer-more-anchor">
+                            <span
+                                class="composer-more-anchor"
+                                /* Escape on the anchor, not the menu: opening the
+                                   expander leaves focus on its button, and the
+                                   dock behind reads Escape as "stop the turn". */
+                                onKeyDown={(event) => {
+                                    if (event.key !== "Escape" || !moreOpen()) return;
+                                    event.stopPropagation();
+                                    setMoreOpen(false);
+                                }}
+                            >
                                 <button
                                     class="composer-icon more-btn"
                                     classList={{ on: moreOpen() }}
@@ -614,7 +639,6 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                                         class="composer-more"
                                         role="menu"
                                         data-composer-more-menu
-                                        onKeyDown={(event) => event.key === "Escape" && setMoreOpen(false)}
                                     >
                                         <Show when={props.onAttachInput}>
                                             <button
@@ -751,6 +775,9 @@ function ComposerQueue(props: {
                             props.onEdit(entry.item.id, event.currentTarget.value);
                             setEditId(null);
                         } else if (event.key === "Escape") {
+                            // Abandoning an edit is all this Escape does — it must
+                            // not carry on to the dock and stop the turn.
+                            event.stopPropagation();
                             setEditId(null);
                         }
                     }}

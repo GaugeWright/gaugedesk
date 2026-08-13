@@ -1,4 +1,4 @@
-import { Rejected } from "./control-plane-domain";
+import { Rejected, TurnStopped, TURN_STOPPED_STATUS } from "./control-plane-domain";
 import { newIdempotencyKey, type RouteJson } from "./control-plane-transport";
 import { reportedClientBuild, type ClientBuildDeclaration } from "./client-build";
 
@@ -175,6 +175,7 @@ export function browserRouteJson(
             const r = (await res.json()) as { rejected?: string; command_status?: string };
             throw new Rejected(r.rejected ?? "unknown", r.command_status);
         }
+        if (res.status === TURN_STOPPED_STATUS) throw new TurnStopped();
         if (!res.ok) throw new Error(await routeError(method, path, res));
         return res.status === 204 ? null : res.json();
     };

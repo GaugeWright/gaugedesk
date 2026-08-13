@@ -15,12 +15,57 @@ Feature: Tasking the agent
     When I open the "diff" tab
     Then the diff shows "agent-note.txt"
 
-  Scenario: stopping a running turn re-enables the composer
+  Scenario: stopping a running turn ends it and re-enables the composer
     Given a new engagement
-    When I start tasking the agent with "[slow] long running task"
+    When I start tasking the agent with "[hold] until I stop it"
     Then the agent is working
     When I stop the turn
-    Then the composer is ready to send again
+    Then the turn ends promptly
+    And the composer is ready to send again
+
+  # The button was covered along its leading edge by the delivery menu, which
+  # opens on hover and whose rows are disabled with an empty draft — so a click
+  # aimed at Stop hit a disabled row and did nothing at all, in silence.
+  Scenario: the whole of the stop button is the stop button
+    Given a new engagement
+    When I start tasking the agent with "[hold] until I stop it"
+    Then the agent is working
+    When I aim at the stop button with the delivery menu open
+    Then every part of the stop button reaches stop
+    When I stop the turn
+    Then the turn ends promptly
+
+  # Stopping your own turn is not a fault and not a failed delivery: no error on
+  # the composer, and the cancelled message is not handed back to be run again.
+  Scenario: a stopped turn leaves no error, and what was queued behind it runs
+    Given a new engagement
+    When I start tasking the agent with "[hold] until I stop it"
+    Then the agent is working
+    When I queue the message "the follow-up"
+    And I stop the turn
+    Then the turn ends promptly
+    And the composer shows no error
+    And the agent finishes
+
+  Scenario: Escape interrupts the running turn
+    Given a new engagement
+    When I start tasking the agent with "[hold] until I stop it"
+    Then the agent is working
+    When I press Escape in the composer
+    Then the turn ends promptly
+
+  # Escape dismisses the innermost thing it can, and goes no further: with a
+  # composer menu open it closes the menu, and the turn keeps running.
+  Scenario: Escape closes an open composer menu before it reaches the turn
+    Given a new engagement
+    When I start tasking the agent with "[hold] until I stop it"
+    Then the agent is working
+    When I open the composer mode menu
+    And I press Escape in the composer
+    Then the composer mode menu is closed
+    And the agent is working
+    When I press Escape in the composer
+    Then the turn ends promptly
 
   Scenario: a streaming tool line expands to show its detail (O2)
     Given a new engagement

@@ -23,6 +23,54 @@ pub fn factory_for_turn(whip: WhipHarnessFactory) -> Arc<dyn HarnessFactory> {
     }
 }
 
+/// The interruptible half of the fake's `[slow]` hold.
+///
+/// The hold is the only thing the scripted fake does that takes any time, and it
+/// runs *before* a harness exists — so there was nothing for Stop to reach, and
+/// `POST /stop` answered "nothing running" while a turn was plainly running.
+/// Every e2e scenario that appeared to cover Stop was really watching the sleep
+/// expire. Now the engine binds one of these as the turn's interrupt handle for
+/// the duration of the hold, so Stop lands in the fake path exactly as it does
+/// against a real runtime, and a test can tell the difference.
+#[derive(Default)]
+pub struct SlowHold {
+    stopped: std::sync::Mutex<bool>,
+    woken: std::sync::Condvar,
+}
+
+impl SlowHold {
+    /// Wait out `hold`, or return early the moment [`Self::stop`] is called.
+    /// `true` means it was stopped rather than served.
+    pub fn wait(&self, hold: std::time::Duration) -> bool {
+        let stopped = self
+            .stopped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (stopped, _) = self
+            .woken
+            .wait_timeout_while(stopped, hold, |stopped| !*stopped)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *stopped
+    }
+
+    /// Whether the hold was released by a Stop rather than served in full.
+    pub fn was_stopped(&self) -> bool {
+        *self
+            .stopped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Release the hold. Safe to call when nothing is waiting.
+    pub fn stop(&self) {
+        *self
+            .stopped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.woken.notify_all();
+    }
+}
+
 /// The mock-LLM adapter (`GAUGEDESK_FAKE_AGENT`): no runtime, no model call.
 /// A fresh neutral [`ScriptedHarness`] projects deterministic observations and
 /// tool calls through the real membrane every turn. No WhippleScript runtime or
@@ -45,10 +93,26 @@ impl ScriptedFakeFactory {
     /// the blocking pool, pre-lock): the e2e suite opens chats and queues
     /// messages DURING the `[slow]` window, so holding the workbench mutex
     /// through the sleep would serialize what the tests observe as concurrent.
-    pub fn pre_turn(worktree: &Path, task: &str) -> Result<(), String> {
+    pub fn pre_turn(worktree: &Path, task: &str, hold: &SlowHold) -> Result<(), String> {
         use std::io::Write;
-        if task.contains("[slow]") {
-            std::thread::sleep(std::time::Duration::from_millis(3500));
+        // `[slow]` opens a window wide enough to observe a busy composer and
+        // queue behind it. `[hold]` opens one nothing outlasts, so a test of
+        // *Stop* cannot pass by waiting: the turn ends when it is interrupted or
+        // the scenario fails. The distinction matters — while the hold was not
+        // interruptible at all, the one scenario covering Stop passed by
+        // watching `[slow]` expire on its own.
+        let holds_for = if task.contains("[hold]") {
+            Some(std::time::Duration::from_secs(30))
+        } else if task.contains("[slow]") {
+            Some(std::time::Duration::from_millis(3500))
+        } else {
+            None
+        };
+        if holds_for.is_some_and(|window| hold.wait(window)) {
+            // Stopped mid-hold. Return without the note append and let the caller
+            // read the hold: an interrupted turn is not a failed one, and only
+            // the caller can say so in the turn's own vocabulary.
+            return Ok(());
         }
         // A `[no-write]` task skips the note append — the deterministic **no-op
         // turn** (a settled turn with an empty diff), so tests can drive the

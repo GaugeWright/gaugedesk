@@ -1,5 +1,5 @@
 import { createComputed, createEffect, createMemo, createSignal, on, type Accessor, type JSX } from "solid-js";
-import { alreadyApplied } from "@gaugewright/control-plane-client";
+import { alreadyApplied, turnStopped } from "@gaugewright/control-plane-client";
 import {
     buildOutgoing,
     classifyAttachment,
@@ -486,6 +486,15 @@ export function createSessionComposerController(
                 // attempt ran it; the row is done. Reporting it as an error would
                 // teach the reader to distrust a mechanism that just worked.
                 if (alreadyApplied(cause)) {
+                    drop(next.id);
+                    return;
+                }
+                // Stopped is not failed. The message was delivered and the turn
+                // it ran ended because the reader ended it, so the row is done:
+                // setting it aside would offer their own cancellation back to
+                // them as work to retry, and reporting it would call a decision
+                // a fault.
+                if (turnStopped(cause)) {
                     drop(next.id);
                     return;
                 }

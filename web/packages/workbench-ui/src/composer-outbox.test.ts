@@ -1,6 +1,6 @@
 import { createRoot, createSignal } from "solid-js";
 import { describe, expect, it, vi, type Mock } from "vitest";
-import { Rejected } from "@gaugewright/control-plane-client";
+import { Rejected, TurnStopped } from "@gaugewright/control-plane-client";
 import type { ImageRef } from "./attachments";
 import {
     createMemoryOutboxStore,
@@ -282,6 +282,26 @@ describe("the composer outbox", () => {
         await flush();
 
         expect(h.send).toHaveBeenCalledTimes(1);
+        expect(h.controller.queue()).toHaveLength(0);
+        expect(store.rows()).toHaveLength(0);
+        expect(h.controller.error()).toBe("");
+        h.dispose();
+    });
+
+    it("clears a message whose turn the reader stopped, rather than offering it back", async () => {
+        // Stopping your own turn is not a delivery failure. Held, the cancelled
+        // message came back as a queue row waiting to be released — the composer
+        // proposing to run the very thing its reader had just called off.
+        const send = vi.fn(async () => {
+            throw new TurnStopped();
+        });
+        const store = sharedStore();
+        const h = harness({ store, send });
+        await flush();
+        h.controller.setDraft("run this");
+        h.controller.submit();
+        await flush();
+
         expect(h.controller.queue()).toHaveLength(0);
         expect(store.rows()).toHaveLength(0);
         expect(h.controller.error()).toBe("");

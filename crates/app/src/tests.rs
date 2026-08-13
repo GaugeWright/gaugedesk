@@ -3431,10 +3431,69 @@ async fn stop_is_a_no_op_when_nothing_is_running() {
         .as_str()
         .unwrap()
         .to_string();
-    // no turn running → stop is a clean no-op.
+    // no turn running → stop is a clean no-op, and says which refusal it is.
     let (s, body) = send(&app, "POST", &format!("/chats/{chat}/stop"), None).await;
     assert_eq!(s, StatusCode::OK, "got {body}");
     assert!(body.contains("\"stopped\":false"), "got {body}");
+    assert!(
+        body.contains("\"reason\":\"nothing running\""),
+        "got {body}"
+    );
+}
+
+/// A refusal has to name itself. "Nothing is running" and "this turn cannot be
+/// interrupted" are different facts, and the composer says them differently —
+/// while both answered `"nothing running"` the second was indistinguishable from
+/// success to every client, which is how a Stop that did nothing stayed silent.
+#[tokio::test]
+async fn stopping_a_live_but_uninterruptible_turn_says_so() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (_s, body) = send(
+        &app,
+        "POST",
+        "/archetypes/agent-default/chats",
+        Some(r#"{"title":"s"}"#),
+    )
+    .await;
+    let chat = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A claim with no interrupt handle: a turn is executing and cannot be cut short.
+    let claim = engine::claim_turn(&chat).expect("chat is free");
+    let (s, body) = send(&app, "POST", &format!("/chats/{chat}/stop"), None).await;
+    assert_eq!(s, StatusCode::OK, "got {body}");
+    assert!(body.contains("\"stopped\":false"), "got {body}");
+    assert!(
+        body.contains("\"reason\":\"not interruptible\""),
+        "a running turn that cannot be interrupted must not report `nothing running`; got {body}"
+    );
+    drop(claim);
+}
+
+/// The fake's `[slow]` hold is the only thing it does that takes time, and it is
+/// what every e2e Stop scenario runs against. It must actually answer Stop —
+/// while it did not, those scenarios passed by waiting the hold out.
+#[test]
+fn the_fake_slow_hold_returns_the_moment_it_is_stopped() {
+    let hold = std::sync::Arc::new(crate::harness_select::SlowHold::default());
+    let released = std::sync::Arc::clone(&hold);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        released.stop();
+    });
+    let started = std::time::Instant::now();
+    let stopped = hold.wait(std::time::Duration::from_secs(30));
+    assert!(
+        stopped,
+        "the hold must report that it was stopped, not served"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the hold must return on the stop, not wait out its full duration"
+    );
 }
 
 #[tokio::test]
@@ -3486,6 +3545,32 @@ fn running_turn_registry_round_trips() {
     assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
     drop(claim);
     assert!(engine::running_turn_interrupt("eng-x").is_none());
+}
+
+/// A production harness cannot report "someone stopped me": killing its runtime
+/// ends the stream, and a dead stream is an `io` error or a `Failed` phase either
+/// way. So Stop records that it fired the handle, and the engine reads that to
+/// classify the outcome as an interrupt instead of a fault.
+#[test]
+fn taking_the_interrupt_for_a_stop_records_that_the_turn_was_stopped() {
+    let claim = engine::claim_turn("eng-stopped").expect("chat is free");
+    engine::bind_turn_interrupt("eng-stopped", std::sync::Arc::new(|| {}));
+    assert!(!engine::turn_was_stopped("eng-stopped"));
+    assert!(engine::take_turn_interrupt_for_stop("eng-stopped").is_some());
+    assert!(engine::turn_was_stopped("eng-stopped"));
+    drop(claim);
+    assert!(!engine::turn_was_stopped("eng-stopped"));
+}
+
+/// A turn nothing can interrupt keeps running, so a Stop against it must not
+/// leave a mark: attributing that turn's own later failure to a cancellation
+/// would tell the composer a broken turn was withdrawn on purpose.
+#[test]
+fn a_refused_stop_leaves_an_uninterruptible_turn_unmarked() {
+    let claim = engine::claim_turn("eng-stop-refused").expect("chat is free");
+    assert!(engine::take_turn_interrupt_for_stop("eng-stop-refused").is_none());
+    assert!(!engine::turn_was_stopped("eng-stop-refused"));
+    drop(claim);
 }
 
 /// ADR 0138 §1/§6: the claim, not the interrupt handle, is what says a turn is

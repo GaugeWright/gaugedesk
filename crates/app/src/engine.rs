@@ -40,11 +40,22 @@ static FORCE_MERGE_CONFLICT: AtomicBool = AtomicBool::new(false);
 /// a process that died has no entry here after a restart, which is exactly what
 /// stops a crashed turn from refusing its chat forever.
 static RUNNING_TURNS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, Option<InterruptHandle>>>,
+    std::sync::Mutex<std::collections::HashMap<String, LiveTurn>>,
 > = std::sync::OnceLock::new();
 
-fn running_turns(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<InterruptHandle>>> {
+/// What is known about one chat's live turn while it executes here.
+#[derive(Default)]
+struct LiveTurn {
+    /// Its interrupt handle, when the harness driving it offers one.
+    interrupt: Option<InterruptHandle>,
+    /// Whether a Stop actually fired that handle. A real harness reports a turn
+    /// cut short the only way it can — a dead stream — and that is
+    /// indistinguishable from breaking, so **who ended it** is recorded here
+    /// rather than inferred from the outcome.
+    stopped: bool,
+}
+
+fn running_turns() -> &'static std::sync::Mutex<std::collections::HashMap<String, LiveTurn>> {
     RUNNING_TURNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -69,7 +80,7 @@ pub(crate) fn claim_turn(id: &str) -> Option<TurnClaim> {
     if turns.contains_key(id) {
         return None;
     }
-    turns.insert(id.to_string(), None);
+    turns.insert(id.to_string(), LiveTurn::default());
     Some(TurnClaim {
         chat: id.to_string(),
     })
@@ -79,8 +90,8 @@ pub(crate) fn claim_turn(id: &str) -> Option<TurnClaim> {
 /// can reach it. A harness with nothing to interrupt never calls this; the claim
 /// is what records that the turn is live, not the handle.
 pub(crate) fn bind_turn_interrupt(id: &str, interrupt: InterruptHandle) {
-    if let Some(slot) = running_turns().lock_unpoisoned().get_mut(id) {
-        *slot = Some(interrupt);
+    if let Some(live) = running_turns().lock_unpoisoned().get_mut(id) {
+        live.interrupt = Some(interrupt);
     }
 }
 
@@ -88,10 +99,12 @@ pub(crate) fn bind_turn_interrupt(id: &str, interrupt: InterruptHandle) {
 /// half of the one-turn-per-chat rule (ADR 0138 §6). Distinct from the run's
 /// durable phase, which stays `Running` after a process dies mid-turn.
 ///
-/// Observation only, so it is test-only: production reads this fact by *taking*
-/// the claim, and a separate read would be a race — free when checked, taken by
-/// the time it was acted on.
-#[cfg(test)]
+/// Never admit a turn on this: production takes the *claim* to do that, and a
+/// separate read would be a race — free when checked, taken by the time it was
+/// acted on. Stop reads it for the opposite purpose, after its interrupt came
+/// back empty, to say **why** — "nothing is running" and "this turn cannot be
+/// interrupted" are different facts and the composer says them differently. A
+/// stale answer there costs a slightly wrong sentence, not a second turn.
 pub(crate) fn turn_is_live(id: &str) -> bool {
     running_turns().lock_unpoisoned().contains_key(id)
 }
@@ -100,7 +113,38 @@ pub(crate) fn turn_is_live(id: &str) -> bool {
 /// "no turn running" and "running but not interruptible"; Stop treats them the
 /// same, because neither can be interrupted.
 pub fn running_turn_interrupt(id: &str) -> Option<InterruptHandle> {
-    running_turns().lock_unpoisoned().get(id).cloned().flatten()
+    running_turns()
+        .lock_unpoisoned()
+        .get(id)
+        .and_then(|live| live.interrupt.clone())
+}
+
+/// The interrupt handle for a running turn, recording under the same lock that a
+/// Stop is about to fire it. Returned rather than called here so an arbitrary
+/// handle never runs while this mutex is held.
+///
+/// Nothing is recorded when there is no handle: a turn that cannot be
+/// interrupted keeps running, and marking it stopped would make its own later
+/// failure — whatever caused it — read as someone's deliberate cancellation.
+pub(crate) fn take_turn_interrupt_for_stop(id: &str) -> Option<InterruptHandle> {
+    let mut turns = running_turns().lock_unpoisoned();
+    let live = turns.get_mut(id)?;
+    let interrupt = live.interrupt.clone()?;
+    live.stopped = true;
+    Some(interrupt)
+}
+
+/// Whether a Stop fired this chat's live turn's interrupt.
+///
+/// Read once the turn has returned, while its claim is still held, to tell "it
+/// broke" from "you stopped it". A production harness cannot say which: killing
+/// its runtime ends the stream, and a dead stream is reported as an `io` error
+/// or a `Failed` phase either way.
+pub(crate) fn turn_was_stopped(id: &str) -> bool {
+    running_turns()
+        .lock_unpoisoned()
+        .get(id)
+        .is_some_and(|live| live.stopped)
 }
 
 /// Clear all running-turn interrupt handles, used by the test reset route
@@ -567,6 +611,13 @@ pub enum EngineError {
     /// outcome carrying its reason, which is why the routes answer it 409 rather
     /// than 502, and why nothing about the chat changed.
     AlreadyRunning,
+    /// Not a failure either: someone stopped this turn on purpose. It ends
+    /// incomplete, but a person asking for exactly this outcome and being shown a
+    /// gateway error for it is the composer calling their own decision a fault —
+    /// and, worse, the message they cancelled being kept for a retry they did not
+    /// ask for. Carried as its own leg so every layer above can tell "it broke"
+    /// from "you stopped it".
+    Interrupted,
 }
 impl From<AdmitError> for EngineError {
     fn from(e: AdmitError) -> Self {
@@ -596,6 +647,7 @@ impl std::fmt::Display for EngineError {
             EngineError::AlreadyRunning => {
                 write!(f, "a turn is already running for this chat")
             }
+            EngineError::Interrupted => write!(f, "stopped"),
         }
     }
 }
@@ -1488,7 +1540,19 @@ fn run_claimed_engagement_turn(
     // effects — the `[slow]` hold and the note append — run here, in the
     // blocking pool BEFORE any lock is taken (see `ScriptedFakeFactory::pre_turn`).
     let result = if factory.kind() == ScriptedFakeFactory::KIND {
-        ScriptedFakeFactory::pre_turn(worktree, task)?;
+        // The hold is the fake's whole duration and it runs before any harness
+        // exists, so bind it as this turn's interrupt handle for as long as it
+        // lasts. Without this the one moment a fake turn is interruptible is the
+        // one moment Stop could not reach it.
+        let hold = std::sync::Arc::new(crate::harness_select::SlowHold::default());
+        let releases = std::sync::Arc::clone(&hold);
+        bind_turn_interrupt(id, std::sync::Arc::new(move || releases.stop()));
+        // A real failure in here is still a failure; only the hold being cut
+        // short is an interrupt.
+        ScriptedFakeFactory::pre_turn(worktree, task, &hold)?;
+        if hold.was_stopped() {
+            return Err(EngineError::Interrupted);
+        }
         // The fake ignores the runtime config; the spec carries the shell's
         // minimal base policy for the seam's sake. Provider resolution and the
         // fail-closed credential precheck are real-run policy, skipped here as
@@ -1884,7 +1948,7 @@ fn run_claimed_engagement_turn(
             // needs the directory, and the turn deliberately holds no lock.
             roster: roster_for_spec,
         };
-        drive_persistent_turn(
+        let outcome = drive_persistent_turn(
             wb,
             id,
             &gate,
@@ -1899,7 +1963,24 @@ fn run_claimed_engagement_turn(
                 .as_ref()
                 .map(|_| resolved_funding_ref.as_str()),
             runtime_command_id,
-        )?
+        );
+        // A real harness reports a turn Stop cut short as its stream dying —
+        // either an `io` error or a `Failed` phase — and neither says who ended
+        // it. The claim does: it recorded the interrupt landing. Without asking
+        // it, the `Interrupted` leg (and so the `499` this whole path exists for)
+        // would be reachable only by the scripted fake, and every production Stop
+        // would still surface as a failed delivery whose message the composer
+        // keeps for a retry nobody asked for.
+        match outcome {
+            Err(error) if turn_was_stopped(id) => {
+                tracing::debug!(chat = %id, %error, "turn ended by Stop");
+                return Err(EngineError::Interrupted);
+            }
+            Ok(result) if result.run_phase == RunPhase::Failed && turn_was_stopped(id) => {
+                return Err(EngineError::Interrupted);
+            }
+            other => other?,
+        }
     };
 
     // A completed candidate is a `propose` act, independent from any later

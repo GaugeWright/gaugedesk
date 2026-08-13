@@ -1159,6 +1159,11 @@ fn task_failure_status(error: &crate::engine::EngineError) -> StatusCode {
         // accepted once it is not. `409` is what tells the composer to hold it as
         // a follow-up rather than surface a broken turn (ADR 0138 §4).
         crate::engine::EngineError::AlreadyRunning => StatusCode::CONFLICT,
+        // Asked for, not broken: this turn ended because someone stopped it.
+        // `499` is nginx's "client closed the request" and reads the same way —
+        // the caller withdrew, so nothing here failed. A 502 would tell the
+        // composer to keep the cancelled message for a retry nobody wanted.
+        crate::engine::EngineError::Interrupted => StatusCode::from_u16(499).unwrap(),
         error if error.is_policy_denial() => StatusCode::FORBIDDEN,
         _ => StatusCode::BAD_GATEWAY,
     }
@@ -1261,25 +1266,41 @@ pub(crate) async fn post_sync(
 
 /// Stop a running turn (`run-chat.md`: Stop = abort the run). Fires the turn's
 /// out-of-band interrupt handle so its blocking `recv` returns and the run fails;
-/// the session is retired and the next turn respawns. A no-op if nothing is
-/// running (or in fake-agent mode, where turns are instant).
+/// the session is retired and the next turn respawns.
+///
+/// A refusal names which refusal it is. Both were `"nothing running"`, and the
+/// client discarded the body entirely, so the one case a person actually meets —
+/// a turn that is plainly running and simply cannot be interrupted (the scripted
+/// fake's `[slow]` hold binds no handle) — was indistinguishable from success:
+/// the button reported nothing, the console stayed clean, and the turn ran on.
 pub(crate) async fn post_stop(
     State(_wb): State<SharedWorkbench>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match engine::running_turn_interrupt(&id) {
+    match engine::take_turn_interrupt_for_stop(&id) {
         Some(interrupt) => {
             // The handle was captured at turn start. WhippleScript records a
             // cooperative cancellation request on an independent store
             // connection, so durable thread state survives the interrupted turn.
+            //
+            // Taking it also recorded that this turn was stopped on purpose, so
+            // the engine can classify the dead stream that follows as an
+            // interrupt rather than a fault.
             interrupt();
             (StatusCode::OK, Json(serde_json::json!({ "stopped": true }))).into_response()
         }
-        None => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "stopped": false, "reason": "nothing running" })),
-        )
-            .into_response(),
+        None => {
+            let reason = if engine::turn_is_live(&id) {
+                "not interruptible"
+            } else {
+                "nothing running"
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "stopped": false, "reason": reason })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1606,6 +1627,19 @@ mod task_failure_status_tests {
         ));
         assert!(denied.is_policy_denial());
         assert_eq!(task_failure_status(&denied), StatusCode::FORBIDDEN);
+    }
+
+    /// A turn someone stopped is not a turn that broke. It answers `499` so the
+    /// composer can tell the two apart — as a `502` it reported the reader's own
+    /// Stop back to them as a failure and kept the cancelled message to retry.
+    #[test]
+    fn a_stopped_turn_is_not_a_gateway_failure() {
+        assert_eq!(
+            task_failure_status(&EngineError::Interrupted).as_u16(),
+            499,
+            "a deliberate stop must not answer in the 5xx range"
+        );
+        assert_eq!(format!("{}", EngineError::Interrupted), "stopped");
     }
 
     /// A genuine transport death keeps `502`. The point of the change is to

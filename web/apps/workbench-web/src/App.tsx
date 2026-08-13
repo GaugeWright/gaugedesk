@@ -29,6 +29,7 @@ import {
     reportedClientBuild,
     type ArchetypeId,
     describeFailure,
+    turnStopped,
     type EngagementId,
     type ProjectId,
     Rejected,
@@ -1053,14 +1054,42 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
 
     // Stop a running turn (run-chat.md): requests WhippleScript cancellation; the in-flight
     // task POST then resolves as failed and the composer re-enables.
+    //
+    // A refusal is raised, not swallowed. `{ stopped: false }` comes back 200 —
+    // it is a well-formed answer meaning the interrupt did not land — and this
+    // used to discard the body, leaving "stopping…" on the rail while the turn
+    // ran on. Throwing hands it to the composer's own error line, which is where
+    // the person is looking, and is what the Stop button doing nothing at all
+    // looked like from the outside.
+    // A Stop can outrun the turn it is aimed at. This chat reads as working from
+    // the moment its task request goes out, while the runtime registers the turn
+    // a moment later — so Escape pressed straight after Enter, which is the whole
+    // point of Escape, can arrive when there is genuinely nothing to interrupt
+    // yet. Ask again across that gap instead of reporting a refusal that only
+    // describes it. Bounded, and only while this chat still reads as working, so
+    // it cannot reach past the turn it was aimed at.
+    const STOP_REGISTRATION_GRACE_MS = 1500;
     async function stopTurn() {
         const id = selected();
         if (!id) return;
         setActivity("stopping…");
-        try {
-            await api.stopTurn(id);
-        } catch (e) {
-            setStatus(`stop error: ${String(e)}`);
+        const deadline = Date.now() + STOP_REGISTRATION_GRACE_MS;
+        for (;;) {
+            const result = await api.stopTurn(id);
+            if (result.stopped) return;
+            const worthRetrying = result.reason === "nothing running"
+                && Date.now() < deadline
+                && selected() === id
+                && busy();
+            if (!worthRetrying) {
+                setActivity("");
+                throw new Error(
+                    result.reason === "nothing running"
+                        ? "nothing is running to stop"
+                        : "this turn cannot be interrupted",
+                );
+            }
+            await new Promise((settle) => setTimeout(settle, 100));
         }
     }
 
@@ -1128,11 +1157,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             }
             if (failed) throw new Error(res?.error || "The turn failed.");
         } catch (e) {
-            setRunTone(id, "error");
+            // A turn someone stopped did not go wrong: it reached the end they
+            // chose for it. Marking the chat with the error tone and announcing
+            // a failure would dress their own decision up as a fault — the
+            // repair below still runs, because an interrupted turn leaves the
+            // same dangling optimistic echo a failed one does.
+            const stopped = turnStopped(e);
+            setRunTone(id, stopped ? null : "error");
             if (isCurrent()) {
                 // A rejection (INV-2) surfaces its reason; either way repair from the
                 // durable snapshot so a failed turn leaves no dangling optimistic echo.
-                setStatus(describeFailure("run that turn", e));
+                setStatus(stopped ? "stopped" : describeFailure("run that turn", e));
                 await loadSnapshot(id);
                 // A rejected command will never acquire a later admitted user event,
                 // so do not carry the pending echo beyond this repair.

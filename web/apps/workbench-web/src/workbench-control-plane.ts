@@ -43,6 +43,7 @@ import type {
     OpaqueHomeRoute,
     CreatedHomeInvitation,
     TunnelRoute,
+    StopTurnResult,
 } from "@gaugewright/control-plane-client";
 import {
     browserTunnelSocket,
@@ -962,7 +963,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images, composedId);
     }
 
-    stopTurn(id: EngagementId): Promise<{ stopped: boolean }> {
+    stopTurn(id: EngagementId): Promise<StopTurnResult> {
         return workbenchClient.stopTurn(this.workbenchTransport(), id);
     }
 

@@ -685,6 +685,30 @@ export class Rejected extends Error {
     }
 }
 
+/** The status a turn route answers when the turn was **stopped on purpose**.
+ *  nginx's "client closed the request", and it means the same thing here: the
+ *  caller withdrew, so nothing failed. */
+export const TURN_STOPPED_STATUS = 499;
+
+/** A turn that ended because someone stopped it.
+ *
+ *  Its own type because every layer above has to tell it from a failure, and a
+ *  status code alone does not survive the trip: as a generic error it surfaced
+ *  as `POST /chats/…/task: 502 turn interrupted` on the composer's error line —
+ *  the composer calling the reader's own decision a fault — and the outbox kept
+ *  the cancelled message, held, for a retry nobody asked for. */
+export class TurnStopped extends Error {
+    constructor() {
+        super("stopped");
+        this.name = "TurnStopped";
+    }
+}
+
+/** Was this rejection simply the turn being stopped? */
+export function turnStopped(error: unknown): boolean {
+    return error instanceof TurnStopped;
+}
+
 /** Did this refusal mean the command had already run to completion?
  *
  *  Only true for a receipt the server settled as `applied`. Every other status —
