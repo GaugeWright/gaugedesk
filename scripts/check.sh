@@ -171,6 +171,13 @@ run_web() {
     node scripts/check-brand-tokens.mjs
     node web/scripts/render-embed-theme.mjs --check
 
+    # A stylesheet with no renderer is invisible to everything else here: the
+    # brand-token scan reads it, the typecheck compiles around it, vite bundles
+    # it, and the minifier ships it to a customer. Nothing asked whether anything
+    # drew it, which is how two component removals left 219 rules behind.
+    echo "== css renderers =="
+    node scripts/check-css-renderers.mjs
+
     echo "== web typecheck =="
     npm --prefix web run typecheck
     npm --prefix web run typecheck:split
