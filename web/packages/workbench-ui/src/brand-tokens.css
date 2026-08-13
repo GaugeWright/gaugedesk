@@ -1,0 +1,42 @@
+/* GENERATED FILE — do not edit. sha256:181317932e20bf8414ea53e4a35e62c9fe9b8504e3b7ba26e7c3a039c84d4dff
+ *
+ * The GaugeWright brand tokens, owned by brand/palette.css and
+ * brand/typography.css in the GaugeWright repository and rendered here by
+ * tools/palette.mjs. Change a value there and re-render; a local edit fails
+ * this repository's gate.
+ *
+ * These are defaults, not the public surface. A surface aliases them into its
+ * own vocabulary rather than consuming them directly:
+ *
+ *   :root { --bg: var(--gw-default-bg); }                  a document
+ *   :host { --bg: var(--gw-bg, var(--gw-default-bg)); }    a shadow root, where
+ *                                                          the public --gw-bg
+ *                                                          stays overridable
+ *
+ * The selector carries both so one file serves both cases; `:root` never
+ * matches inside a shadow tree, and `:host` never matches outside one.
+ */
+:root, :host {
+  --gw-default-navy: #0e2d50;
+  --gw-default-blue: #1f61c4;
+  --gw-default-gold: #c6952f;
+  --gw-default-red: #b5342b;
+  --gw-default-accent-gradient: linear-gradient(135deg, var(--gw-default-blue), var(--gw-default-navy));
+  --gw-default-brand-gradient: linear-gradient(120deg, var(--gw-default-blue), var(--gw-default-gold) 55%, var(--gw-default-red));
+  --gw-default-bg: #142238;
+  --gw-default-panel: #1b2c46;
+  --gw-default-edge: #2f4059;
+  --gw-default-ink: #d3dbe6;
+  --gw-default-muted: #93a1b5;
+  --gw-default-accent: #5f9bee;
+  --gw-default-accent-strong: #2a6fce;
+  --gw-default-accent-hover: #7fb0f2;
+  --gw-default-on-accent: #08111e;
+  --gw-default-success: #7fd6a6;
+  --gw-default-info: #6aa3ff;
+  --gw-default-warn: #e0b24e;
+  --gw-default-danger: #e87b74;
+  --gw-default-font-chrome: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+  --gw-default-font-prose: "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif;
+  --gw-default-font-mono: "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}

@@ -39,37 +39,63 @@ import {
 import { SessionProvider, type Session } from "@gaugewright/workbench-ui/session-context";
 import { Workspace } from "@gaugewright/workbench-ui/Workspace";
 import appCss from "@gaugewright/workbench-ui/styles.css?inline";
+// Also imported on its own for the Turnstile gate, which is a separate shadow
+// tree in the light DOM: it inherits nothing from a panel's shadow root, so it
+// needs its own copy of the token declarations rather than its own copy of the
+// values. `styles.css` @imports the same file, so the panels already have it.
+import brandTokensCss from "@gaugewright/workbench-ui/brand-tokens.css?inline";
 
 /**
  * The shadow-root theme bridge. The workbench palette is defined on `:root`
  * (`styles.css`), which does **not** apply inside a shadow tree — so we re-declare
  * the workbench's internal palette vars on `:host` (custom properties *do* inherit
  * across the shadow boundary), each sourced from a consultant-facing `--gw-*`
- * token with the workbench default as fallback. A consultant themes the embed by
- * setting any `--gw-*` on `<gw-session>` (or any ancestor); it cascades into every
- * panel's shadow root. Injected before `styles.css` so its `var(--bg)` etc. resolve.
+ * token. A consultant themes the embed by setting any `--gw-*` on `<gw-session>`
+ * (or any ancestor); it cascades into every panel's shadow root. Injected before
+ * `styles.css` so its `var(--bg)` etc. resolve.
+ *
+ * **No value is written here.** The defaults come from `brand-tokens.css`, which
+ * rides in with `styles.css` and declares `--gw-default-*` on `:host` as well as
+ * `:root` (GaugeWright `DR-0077`). This block used to carry its own hexes, and
+ * they were a fork: when the company eased the dark ramp off black, `:root` moved
+ * and this did not, so every embedded panel spent the interval drawing a grey
+ * ground inside a navy page. Reaching a default through `--gw-default-*` rather
+ * than declaring the public `--gw-*` here is what keeps a host page able to
+ * override it — a `:host` declaration would beat the inherited value outright.
+ *
+ * Three public names were reconciled with the company palette and three more
+ * with the type families. The former names still work: a customer who vendored
+ * an older `embed.css` and set `--gw-bad` keeps the colour they chose.
  */
 const embedThemeCss = (defaultMinHeight: string) => `
 :host {
   /* Public theme tokens. Internal aliases are declared here so unrelated host
-     variables with generic names such as --panel or --muted cannot leak in. */
-  --gw-navy: var(--gw-brand-navy, #0e2d50);
-  --bg: var(--gw-bg, #0f1115);
-  --panel: var(--gw-panel, #161922);
-  --edge: var(--gw-edge, #262b36);
-  --ink: var(--gw-ink, #d8dee9);
-  --muted: var(--gw-muted, #7d869c);
-  --accent: var(--gw-accent, #6aa3ff);
-  --accent-strong: var(--gw-accent-strong, #2a6fce);
-  --accent-hover: var(--gw-accent-hover, #8ab8ff);
-  --accent-contrast: var(--gw-accent-contrast, #08111e);
-  --warn: var(--gw-warn, #e0a35a);
-  --bad: var(--gw-bad, #e06a6a);
-  --font-chrome: var(--gw-font, "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif);
-  --font-prose: var(--gw-prose, "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif);
+     variables with generic names such as --panel or --muted cannot leak in.
+     --navy is internal for the same reason it is not --gw-navy: that name is
+     the public one, and a host page setting the documented token must not
+     collide with the alias the stylesheet reads. */
+  --navy: var(--gw-navy, var(--gw-brand-navy, var(--gw-default-navy)));
+  --bg: var(--gw-bg, var(--gw-default-bg));
+  --panel: var(--gw-panel, var(--gw-default-panel));
+  --edge: var(--gw-edge, var(--gw-default-edge));
+  --ink: var(--gw-ink, var(--gw-default-ink));
+  --muted: var(--gw-muted, var(--gw-default-muted));
+  --accent: var(--gw-accent, var(--gw-default-accent));
+  --accent-strong: var(--gw-accent-strong, var(--gw-default-accent-strong));
+  --accent-hover: var(--gw-accent-hover, var(--gw-default-accent-hover));
+  --accent-contrast: var(--gw-on-accent, var(--gw-accent-contrast, var(--gw-default-on-accent)));
+  --warn: var(--gw-warn, var(--gw-default-warn));
+  --bad: var(--gw-danger, var(--gw-bad, var(--gw-default-danger)));
+  --font-chrome: var(--gw-font-chrome, var(--gw-font, var(--gw-serif, var(--gw-default-font-chrome))));
+  --font-prose: var(--gw-font-prose, var(--gw-prose, var(--gw-default-font-prose)));
   --ui: var(--font-chrome);
-  --serif: var(--gw-serif, "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif);
-  --mono: var(--gw-mono, "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  /* The chrome face used to be two public names, and a customer on an older
+     embed.css has both set — possibly to different stacks. So the serif alias
+     reads --gw-serif ahead of --gw-font rather than taking --font-chrome, which
+     prefers --gw-font and would discard the serif they chose. The current name
+     still overrides both. */
+  --serif: var(--gw-font-chrome, var(--gw-serif, var(--gw-font, var(--gw-default-font-chrome))));
+  --mono: var(--gw-font-mono, var(--gw-mono, var(--gw-default-font-mono)));
   --fs-label: var(--gw-font-size-label, 10px);
   --fs-small: var(--gw-font-size-small, 11px);
   --fs-ui: var(--gw-font-size-ui, 12px);
@@ -261,12 +287,13 @@ export class GwSessionElement extends HTMLElement {
         const root = gate.attachShadow({ mode: "closed" });
         root.innerHTML = `
             <style>
+              ${brandTokensCss}
               :host { display: block !important; box-sizing: border-box !important; width: 100% !important; margin: 0 0 10px !important; }
-              .gate { box-sizing: border-box; display: grid; place-items: center; gap: 8px; min-height: 82px; padding: 12px; border: 1px solid var(--gw-edge, #262b36); border-radius: var(--gw-panel-radius, 12px); background: var(--gw-bg, #0f1115); color: var(--gw-ink, #d8dee9); font: 12px/1.45 var(--gw-font, ui-sans-serif, system-ui, sans-serif); text-align: center; color-scheme: var(--gw-color-scheme, dark); }
+              .gate { box-sizing: border-box; display: grid; place-items: center; gap: 8px; min-height: 82px; padding: 12px; border: 1px solid var(--gw-edge, var(--gw-default-edge)); border-radius: var(--gw-panel-radius, 12px); background: var(--gw-bg, var(--gw-default-bg)); color: var(--gw-ink, var(--gw-default-ink)); font: 12px/1.45 var(--gw-font-chrome, var(--gw-font, var(--gw-default-font-chrome))); text-align: center; color-scheme: var(--gw-color-scheme, dark); }
               .label { margin: 0; }
               .widget { width: min(100%, 300px); min-height: 65px; }
-              .retry { padding: 7px 12px; border: 1px solid var(--gw-edge, #262b36); border-radius: 7px; background: var(--gw-panel, #161922); color: inherit; font: inherit; cursor: pointer; }
-              .retry:hover { border-color: var(--gw-accent, #6aa3ff); }
+              .retry { padding: 7px 12px; border: 1px solid var(--gw-edge, var(--gw-default-edge)); border-radius: 7px; background: var(--gw-panel, var(--gw-default-panel)); color: inherit; font: inherit; cursor: pointer; }
+              .retry:hover { border-color: var(--gw-accent, var(--gw-default-accent)); }
             </style>
             <div class="gate" role="status" aria-live="polite">
               <p class="label">One quick check before starting a new session.</p>

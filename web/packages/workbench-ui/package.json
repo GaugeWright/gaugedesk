@@ -92,7 +92,8 @@
     "./transcript-filter": "./src/transcript-filter.ts",
     "./transcript": "./src/transcript.ts",
     "./workstream-grouping": "./src/workstream-grouping.ts",
-    "./styles.css": "./src/styles.css"
+    "./styles.css": "./src/styles.css",
+    "./brand-tokens.css": "./src/brand-tokens.css"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p ../../tsconfig.workbench-ui.json"

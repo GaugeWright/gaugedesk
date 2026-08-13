@@ -101,7 +101,28 @@ gw-chat::part(panel) {
 ```
 
 The public settings are grouped plainly in `embed.css`: colors, actions and
-status, panel frame, typography, and the default height of each panel.
+status, panel frame, typography, and the default height of each panel. That file
+is generated from the panels' own defaults, so it always states what a panel
+does when you change nothing — re-download it rather than assuming an older copy
+still describes the current defaults. Your saved copy is yours; nothing
+regenerates it.
+
+### Renamed settings
+
+Seven settings were renamed to match the GaugeWright palette. **The former names
+still work**, so a copy of `embed.css` saved before the rename keeps doing
+exactly what it did, and there is nothing you need to change.
+
+| Former name | Current name |
+|---|---|
+| `--gw-brand-navy` | `--gw-navy` |
+| `--gw-accent-contrast` | `--gw-on-accent` |
+| `--gw-bad` | `--gw-danger` |
+| `--gw-font`, `--gw-serif` | `--gw-font-chrome` |
+| `--gw-prose` | `--gw-font-prose` |
+| `--gw-mono` | `--gw-font-mono` |
+
+Where both are set, the current name wins.
 
 Every panel exposes `::part(panel)` plus a panel-specific alias such as
 `::part(panel-chat)` or `::part(panel-files)`. The single branding owner also

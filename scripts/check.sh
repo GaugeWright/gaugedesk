@@ -155,6 +155,15 @@ run_web() {
     { [ -f web/packages/control-plane-client/src/generated/tunnel.js ] \
         && [ -f web/packages/control-plane-client/src/generated/directory.js ]; } \
         || scripts/build-wasm.sh
+    # Both guard the same rule from opposite ends: nothing here writes a brand
+    # value by hand. The first fails on a hex the vendored company tokens
+    # already name; the second fails when the published customization file is
+    # not what the panel defaults actually resolve to. The embed carried a
+    # forked palette for as long as neither existed.
+    echo "== brand tokens =="
+    node scripts/check-brand-tokens.mjs
+    node web/scripts/render-embed-theme.mjs --check
+
     echo "== web typecheck =="
     npm --prefix web run typecheck
     npm --prefix web run typecheck:split

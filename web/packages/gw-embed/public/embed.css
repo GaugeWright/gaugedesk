@@ -10,24 +10,38 @@
  * Change the values below; do not remove the `--gw-` prefixes. Variables set on
  * `gw-session` apply to every panel inside it. A value set directly on one panel
  * changes only that panel.
+ *
+ * Your copy is yours to edit. This original is generated (@gw-projection) from
+ * the panel's own defaults, so it always states what a panel actually does when
+ * you change nothing — re-download it to see the current values.
+ *
+ * Some tokens were renamed to match the GaugeWright palette. The former names
+ * still work, so an older copy of this file keeps doing what it did:
+ *   --gw-brand-navy is now --gw-navy
+ *   --gw-accent-contrast is now --gw-on-accent
+ *   --gw-bad is now --gw-danger
+ *   --gw-font is now --gw-font-chrome
+ *   --gw-serif is now --gw-font-chrome
+ *   --gw-prose is now --gw-font-prose
+ *   --gw-mono is now --gw-font-mono
  */
 
 gw-session {
   /* Main colors */
-  --gw-bg: #0f1115;                 /* Panel background */
-  --gw-panel: #161922;              /* Raised controls and composer */
-  --gw-edge: #262b36;               /* Borders and dividers */
-  --gw-ink: #d8dee9;                /* Primary text */
-  --gw-muted: #7d869c;              /* Secondary text */
-  --gw-brand-navy: #0e2d50;         /* GaugeDesk brand detail */
+  --gw-bg: #142238;                /* Panel background */
+  --gw-panel: #1b2c46;             /* Raised controls and composer */
+  --gw-edge: #2f4059;              /* Borders and dividers */
+  --gw-ink: #d3dbe6;               /* Primary text */
+  --gw-muted: #93a1b5;             /* Secondary text */
+  --gw-navy: #0e2d50;              /* GaugeWright brand detail */
 
   /* Actions and status */
-  --gw-accent: #6aa3ff;
+  --gw-accent: #5f9bee;
   --gw-accent-strong: #2a6fce;
-  --gw-accent-hover: #8ab8ff;
-  --gw-accent-contrast: #08111e;
-  --gw-warn: #e0a35a;
-  --gw-bad: #e06a6a;
+  --gw-accent-hover: #7fb0f2;
+  --gw-on-accent: #08111e;         /* Text and icons on an accent fill */
+  --gw-warn: #e0b24e;
+  --gw-danger: #e87b74;
 
   /* Panel frame */
   --gw-panel-width: 100%;
@@ -38,15 +52,14 @@ gw-session {
   --gw-panel-shadow: 0 14px 36px rgb(0 0 0 / 22%);
 
   /* Typography */
-  /* Two faces (GaugeWright DR-0072), split on operate-vs-read. --gw-font and
-     --gw-serif both name the chrome face, which is most of a panel; --gw-prose
-     names the face the transcript is set in. All three are the published
-     customization surface, so a host that overrides only one still gets a
-     coherent panel. */
-  --gw-font: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
-  --gw-serif: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
-  --gw-prose: "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif;
-  --gw-mono: "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* Two faces (GaugeWright DR-0072), split on operate-vs-read.
+     --gw-font-chrome is most of a panel — controls, labels, headings;
+     --gw-font-prose is the face the transcript is set in. Both are the
+     published customization surface, so a host that overrides only one still
+     gets a coherent panel. */
+  --gw-font-chrome: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+  --gw-font-prose: "IBM Plex Serif", "Iowan Old Style", Georgia, ui-serif, serif;
+  --gw-font-mono: "CommitMono", "Commit Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --gw-font-size-label: 10px;
   --gw-font-size-small: 11px;
   --gw-font-size-ui: 12px;
