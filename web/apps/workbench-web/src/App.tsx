@@ -67,6 +67,9 @@ import {
     EngagementPane,
     Environment,
     ENABLED_MODELS_SETTING,
+    ENDPOINT_MODELS_SETTING,
+    catalogWithEndpointModels,
+    parseEndpointModels,
     fileFromSearch,
     freshnessEventForMarker,
     FacetBrowser,
@@ -331,6 +334,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const keepAlive = window.setInterval(() => void refetchHubSession(), 5 * 60 * 1000);
         onCleanup(() => window.clearInterval(keepAlive));
     }
+    // Who the account menu names. The trigger *is* the identity, so this has to be able
+    // to say "nobody" — `null` is the signed-out state, not a value still loading. An
+    // address is split so the trigger carries a name and the menu head the proof of
+    // which account it is, rather than printing the same string twice.
+    const menuIdentity = createMemo(() => {
+        const person = authority() ?? hubSession()?.person ?? null;
+        if (!person) return null;
+        const at = person.indexOf("@");
+        return at > 0
+            ? { name: person.slice(0, at), email: person }
+            : { name: person };
+    });
     // What the signed-in account reaches (ADR 0114): Homes and opaque
     // project-to-Home routes, proxied by the control plane with its sealed
     // bearer. Only fetched while a live session exists.
@@ -542,6 +557,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         return ps;
     });
     const enabledModels = createMemo(() => parseEnabledModels(acctSettings()?.[ENABLED_MODELS_SETTING]));
+    // An OpenAI-compatible endpoint (ADR 0083) has no listing, so its models are the ones
+    // the operator declared in Settings. They join the catalog here rather than at each
+    // call below, so the picker, the effort toggle and the vision check all see one set.
+    const modelCatalog = createMemo(() =>
+        catalogWithEndpointModels(parseEndpointModels(acctSettings()?.[ENDPOINT_MODELS_SETTING])),
+    );
     // The engine's resolved no-pin default (provider + model), so the picker's
     // first row names what "Default" actually runs. Startup-time server truth (it
     // changes only with host config); a failed probe degrades to the blind
@@ -561,7 +582,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             linkedAccounts(),
             enabledModels(),
             paneModel(),
-            undefined,
+            modelCatalog(),
             resolvedDefault() ?? null,
         ),
     );
@@ -569,7 +590,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const modelValue = () => (paneModel().id ? modelKey(paneModel()) : "");
     // The reasoning-effort options follow the pinned model; the toggle only shows when the
     // model supports thinking (more than just "off"). "" = the model's own default effort.
-    const effortLevels = createMemo(() => thinkingLevelsFor(linkedAccounts(), paneModel().id, paneModel().provider));
+    const effortLevels = createMemo(() =>
+        thinkingLevelsFor(linkedAccounts(), paneModel().id, paneModel().provider, modelCatalog()));
     const showEffort = createMemo(() => effortLevels().some((l) => l !== "off"));
     // openai-generic (ADR 0083) has no catalog — its model id is free-text. Offer the
     // entry when such an account is linked; typing one pins `openai-generic:<id>`.
@@ -1394,7 +1416,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // (fail-closed). Clicking toggles it for that project. With no project-rooted
     // chat open (an edit chat / the Personal default) there's nothing to manage, so
     // it shows a muted, read-only hint.
-    const networkBar = () => (
+    const navFooter = () => (
+        <div class="nav-footer">
         <div class="network-bar" classList={{ isolated: !!currentProject()?.networkIsolated }}>
             <div class="network-bar-status">
                 <Show
@@ -1423,7 +1446,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         </button>
                     )}
                 </Show>
-                <span class="network-version" data-app-version>GaugeDesk v{clientBuild.version}</span>
+                {/* The build reports itself in the account menu, not here: a version that
+                    never changes does not earn permanent space beside the network state.
+                    An *available update* is different — that is news, and stays. */}
                 <Show when={desktopUpdate()?.kind === "available"}>
                     <button class="desktop-update" data-desktop-update type="button" onClick={() => void installDesktopUpdate()}>
                         Update to v{desktopUpdate()?.version}
@@ -1438,19 +1463,26 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     </span>
                 </Show>
             </div>
-            {/* Settings (FED-7): a gear to the right of the network toggle; opens the
-                settings menu → Devices, the single device-management modal. */}
+        </div>
+        {/* The account menu sits at the very foot of the column, on its own row: the
+            trigger *is* the identity, so it needs the full width the network strip beside
+            it would not have left it. */}
+        <div class="account-bar">
             <SettingsMenu
                 api={api}
                 placementPolicy={props.placementPolicy}
                 codexLoginAvailable={codexLoginAvailable}
                 managedInferenceEditable={import.meta.env.VITE_HOME_SPLIT !== "true"}
                 librarySyncAvailable={import.meta.env.VITE_HOME_SPLIT !== "true"}
+                identity={menuIdentity}
+                version={clientBuild.version}
+                hubUrl={props.hubUrl}
                 openAccount={accountRequest}
                 openInvite={inviteDeepLink}
                 onSignOut={signOutAccount}
                 environmentAction={props.environmentAction}
             />
+        </div>
         </div>
     );
 
@@ -2251,7 +2283,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         />
                     )}
                     nav={navPane}
-                    navFooter={networkBar}
+                    navFooter={navFooter}
                     chat={chatPane}
                     content={contentPane}
                     files={filesPane}

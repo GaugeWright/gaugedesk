@@ -3,7 +3,8 @@
   "include": [],
   "files": [
     "packages/workbench-ui/src/AccessRequestPanel.tsx",
-    "packages/workbench-ui/src/AccountPanel.tsx",
+    "packages/workbench-ui/src/account-api.ts",
+    "packages/workbench-ui/src/AccountMenu.tsx",
     "packages/workbench-ui/src/AgentSettings.tsx",
     "packages/workbench-ui/src/attachments.ts",
     "packages/workbench-ui/src/AuditTimeline.tsx",
@@ -61,6 +62,8 @@
     "packages/workbench-ui/src/resource-catalog.ts",
     "packages/workbench-ui/src/DevicesModal.tsx",
     "packages/workbench-ui/src/session-context.ts",
+    "packages/workbench-ui/src/SettingsPanel.tsx",
+    "packages/workbench-ui/src/SettingsSurface.tsx",
     "packages/workbench-ui/src/Shelf.tsx",
     "packages/workbench-ui/src/StatusGem.tsx",
     "packages/workbench-ui/src/TaskBar.tsx",

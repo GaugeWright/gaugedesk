@@ -8,6 +8,7 @@
 import { expect } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
 import { aliceCP, hubURL } from "../ports.mjs";
+import { closeSettings, openSettings } from "./settings-nav";
 
 const { When, Then } = createBdd();
 
@@ -49,9 +50,8 @@ When("the OS delivers the sign-in return {string}", async ({ page }, url: string
 
 Then("the account section shows me signed in as {string}", async ({ page }, person: string) => {
     // Reopen the panel so it reads the fresh server truth.
-    await page.getByRole("button", { name: "close", exact: true }).click();
-    await page.locator("[data-settings]").click();
-    await page.locator("[data-settings-account]").click();
+    await closeSettings(page);
+    await openSettings(page, "account");
     await expect(page.locator("[data-hub-session-state='linked']")).toBeVisible();
     await expect(page.locator("[data-hub-session]")).toContainText(person);
 });

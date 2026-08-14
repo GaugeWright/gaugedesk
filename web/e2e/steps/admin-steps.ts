@@ -7,6 +7,7 @@ import { expect, type APIRequestContext } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
 import { enterpriseAppURL, enterpriseCP } from "../ports.mjs";
 import { mutationHeaders } from "./idempotency";
+import { openAccountMenu } from "./settings-nav";
 
 const { Given, When, Then } = createBdd();
 const ownerToken = "gw-e2e-owner-token";
@@ -318,12 +319,11 @@ Then("the Administration route family enforces identity and capability", async (
 });
 
 When("I open the settings menu", async ({ page }) => {
-    await page.locator("[data-settings]").click();
-    await expect(page.locator("[data-settings-menu]")).toBeVisible();
+    await openAccountMenu(page);
 });
 
 Then("the organization admin entry is not offered", async ({ page }) => {
-    await expect(page.locator("[data-settings-environment]")).toHaveCount(0);
+    await expect(page.locator('[data-account-menu-item="environment"]')).toHaveCount(0);
 });
 
 When("I return to work", async ({ page }) => {
@@ -336,11 +336,11 @@ Then("the ordinary Work Environment is shown", async ({ page }) => {
 });
 
 Then("the Administration entry is offered", async ({ page }) => {
-    await expect(page.locator("[data-settings-environment]")).toHaveText("Administration");
+    await expect(page.locator('[data-account-menu-item="environment"]')).toHaveText("Administration");
 });
 
 When("I choose Administration", async ({ page }) => {
-    await page.locator("[data-settings-environment]").click();
+    await page.locator('[data-account-menu-item="environment"]').click();
 });
 
 Then("the Admin Environment is shown", async ({ page }) => {
@@ -764,8 +764,8 @@ Then("the shipped desktop updater reads the tenant software policy", async () =>
 });
 
 When("I preview an unattested engagement in the shipped Devices UI", async ({ page }) => {
-    await page.locator("[data-settings]").click();
-    await page.locator("[data-settings-devices]").click();
+    await openAccountMenu(page);
+    await page.locator('[data-account-menu-item="devices"]').click();
     const payload = JSON.stringify({
         invite_id: "policy-client-journey",
         ticket: { authority: "counterparty" },

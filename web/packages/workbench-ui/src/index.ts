@@ -4,8 +4,19 @@ export { AccessRequestPanel } from "./AccessRequestPanel";
 export type { AccessRequestPanelProps } from "./AccessRequestPanel";
 export { initialAccessRequest, presentAccessRequest, reduceAccessRequest } from "./access-request";
 export type { AccessRequestEvent, AccessRequestPresentation, AccessRequestState } from "./access-request";
-export { AccountPanel } from "./AccountPanel";
-export type { AccountPanelApi } from "./AccountPanel";
+export type { AccountPanelApi } from "./account-api";
+export { SettingsPanel, deviceAddedLabel, expiresSoon, managedInferenceWriteAvailable, signInMethodLabel } from "./SettingsPanel";
+export type { SettingsPanelApi, SettingsPanelProps } from "./SettingsPanel";
+export { SettingsSurface } from "./SettingsSurface";
+export type {
+    ManagedPlanState,
+    SettingsActions,
+    SettingsModel,
+    SettingsRoom,
+    SettingsSurfaceProps,
+} from "./SettingsSurface";
+export { AccountMenu } from "./AccountMenu";
+export type { AccountMenuItem, AccountMenuProps, MenuComposition, MenuIdentity } from "./AccountMenu";
 export { FirstRunOverlay } from "./FirstRunOverlay";
 export type { FirstRunAccount, FirstRunApi } from "./FirstRunOverlay";
 export { AgentSettings, plainConfigError, readFormConfig, writeFormConfig } from "./AgentSettings";
@@ -150,7 +161,7 @@ export type { AccessPhase, FileNode, FilePresentation } from "./mobile-files";
 export { ADVANCEMENT_RULES_SETTING, parseAdvancementScopes, serializeAdvancementScopes } from "./advancement";
 export { ATTENTION_RULES_SETTING, ATTENTION_SIGNALS, parseAttentionRules, serializeAttentionRules } from "./attention";
 export type { AttentionLevel, AttentionSignal, AttentionSignalMeta } from "./attention";
-export { defaultOption, defaultVisibleKeys, DEFAULT_OPTION, ENABLED_MODELS_SETTING, isDefaultVisible, modelAcceptsImages, modelKey, modelOptions, parseEnabledModels, pickableModels, serializeEnabledModels, thinkingLevelsFor } from "./model-picker";
+export { catalogWithEndpointModels, defaultOption, defaultVisibleKeys, DEFAULT_OPTION, ENABLED_MODELS_SETTING, ENDPOINT_MODELS_SETTING, isDefaultVisible, modelAcceptsImages, modelKey, modelOptions, parseEnabledModels, parseEndpointModels, pickableModels, serializeEnabledModels, serializeEndpointModels, thinkingLevelsFor } from "./model-picker";
 export type { ModelOption, PickableModel, ResolvedDefault } from "./model-picker";
 export { SettingsMenu as OpenSettingsMenu } from "./OpenSettingsMenu";
 export type { SettingsMenuApi as OpenSettingsMenuApi } from "./OpenSettingsMenu";

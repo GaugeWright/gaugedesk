@@ -1,27 +1,34 @@
 /**
- * "Your account" steps (ACCT-1, ADR 0053): open the account panel from
- * Settings ▸ Your account and link an LLM provider account.
+ * Account steps (ACCT-1, ADR 0053): reach the operator's own settings from the account
+ * menu and link an LLM provider credential.
  */
 
 import { expect } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
+import { closeSettings, openSettings } from "./settings-nav";
 
 const { When, Then } = createBdd();
 
 When("I open my account", async ({ page }) => {
-    await page.locator("[data-settings]").click();
-    await page.locator("[data-settings-account]").click();
-    await expect(page.locator("[data-account-panel]")).toBeVisible();
+    await openSettings(page, "account");
+});
+
+When("I open my model access", async ({ page }) => {
+    await openSettings(page, "models");
 });
 
 When("I link the {string} account with token {string}", async ({ page }, provider: string, token: string) => {
+    // Adding a credential is a deliberate act behind its own control, so the room is not
+    // a permanently open form over the list of what is already linked.
+    await page.locator("[data-add-credential-open]").click();
     await page.locator("[data-account-provider]").selectOption(provider);
     await page.locator("[data-account-token]").fill(token);
     await page.locator("[data-account-link]").click();
 });
 
 Then("{string} shows as a linked account", async ({ page }, provider: string) => {
-    await expect(page.locator(`[data-linked="${provider}"]`)).toBeVisible();
+    // The store keys a credential by its provider, so the provider is the row's id.
+    await expect(page.locator(`[data-credential="${provider}"]`)).toBeVisible();
 });
 
 When(
@@ -32,7 +39,7 @@ When(
         await managed.getByRole("combobox", { name: "status", exact: true }).selectOption(status);
         await managed.getByRole("spinbutton", { name: "included tokens", exact: true })
             .fill(String(includedTokens));
-        await managed.getByRole("button", { name: "save managed plan", exact: true }).click();
+        await managed.getByRole("button", { name: "save plan", exact: true }).click();
         await expect(page.locator("[data-account-status]")).toHaveText(`managed plan ${status} ✓`);
     },
 );
@@ -40,9 +47,8 @@ When(
 Then(
     "the managed inference plan {string} is durably {string} with {int} included tokens",
     async ({ page }, plan: string, status: string, includedTokens: number) => {
-        await page.getByRole("button", { name: "close", exact: true }).click();
-        await page.locator("[data-settings]").click();
-        await page.locator("[data-settings-account]").click();
+        await closeSettings(page);
+        await openSettings(page, "models");
         const managed = page.locator("[data-managed-inference]");
         await expect(managed.getByRole("textbox", { name: "plan", exact: true }))
             .toHaveValue(plan);

@@ -13,6 +13,7 @@ import { expect, type Page } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
 import { aliceCP, bobCP } from "../ports.mjs";
 import { mutationHeaders } from "./idempotency";
+import { openAccountMenu, openSettings } from "./settings-nav";
 
 const { Given, When, Then } = createBdd();
 
@@ -54,8 +55,8 @@ function recordProductionClientResponses(
 // Device management lives under Settings ▸ Devices (FED-7): the gear in the Browse
 // bottom bar → the Devices option → the single Devices modal.
 async function openPairedDevices(page: Page): Promise<void> {
-    await page.locator("[data-settings]").click();
-    await page.locator("[data-settings-devices]").click();
+    await openAccountMenu(page);
+    await page.locator('[data-account-menu-item="devices"]').click();
     await expect(page.locator("[data-devices-modal]")).toBeVisible();
     // The separate-party pairing ticket is minted async on mount; wait for it.
     await expect(page.locator("[data-pd-ticket]")).toHaveText(/.+/);
@@ -366,7 +367,7 @@ When("the target accepts the combined invite", async ({ page }) => {
 Then("the target manages the invited project's data and operator grant", async () => {
     const bob = bobPage!;
     await bob.reload();
-    await expect(bob.locator("[data-settings]")).toBeVisible();
+    await expect(bob.locator("[data-account-menu-trigger]")).toBeVisible();
     await openEngagement(bob, "Invite Engagement");
     await expect(bob.locator("[data-engagement-phase]")).toContainText("committed");
 
@@ -586,9 +587,8 @@ Then("both shipped clients complete the same-code authorization", async ({ page 
     await expect(page.locator("[data-enroll-host-done]")).toBeVisible();
     await expect(bob.locator("[data-enroll-join-done]")).toBeVisible();
     await page.locator("[data-devices-modal] .modal-head button").click();
-    await page.locator("[data-settings]").click();
-    await page.locator("[data-settings-account]").click();
-    const enrolledDevice = page.locator("[data-account-panel] [data-device]").first();
+    await openSettings(page, "devices");
+    const enrolledDevice = page.locator("[data-settings-surface] [data-device]").first();
     await expect(enrolledDevice).toBeVisible();
     await expect(enrolledDevice.locator(".member-status")).toHaveText("active");
 
@@ -614,7 +614,7 @@ Then("both shipped clients complete the same-code authorization", async ({ page 
 });
 
 When("the owner disconnects the peer through the shipped Devices UI", async ({ page }) => {
-    const account = page.locator("[data-account-panel]");
+    const account = page.locator("[data-settings-surface]");
     if (await account.isVisible()) {
         await account.locator(".modal-head button").click();
     }

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GaugeDesk — account menu lab</title>
+    <style>
+      /* Bench chrome only. Everything inside a stage is the product stylesheet;
+         nothing here may style a product class, or the prototype would flatter
+         itself and the agreed result would not survive the move into the app. */
+      body { margin: 0; background: var(--bg, #0c1a2e); color: var(--ink, #e6ebf2);
+             font-family: var(--ui), sans-serif; }
+      .lab { max-width: 1040px; margin: 0 auto; padding: 32px 24px 96px; }
+      .lab-head h1 { font-size: 20px; margin: 0 0 6px; font-weight: 650; }
+      .lab-head p, .lab-note { color: var(--muted); font-size: var(--fs-body, 13px);
+             max-width: 68ch; line-height: 1.5; margin: 0 0 18px; }
+      .lab-row { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+      .lab-case { flex: 1 1 300px; min-width: 292px; }
+      .lab-case h2 { font-size: var(--fs-ui, 12px); text-transform: uppercase;
+             letter-spacing: 0.08em; color: var(--muted); margin: 0 0 6px; }
+      .lab-case .lab-note { font-size: var(--fs-small, 11px); margin-bottom: 10px; min-height: 3em; }
+      /* The stage stands the trigger where it really sits: the foot of the nav
+         column, popover opening upward. */
+      .lab-stage { background: var(--bg); border: 1px solid var(--edge);
+             border-radius: 8px; padding: 10px; height: 300px;
+             display: flex; align-items: flex-end; }
+      .lab-settings { margin-top: 48px; }
+      .lab-settings h2 { font-size: var(--fs-title, 15px); margin: 0 0 6px; }
+      .lab-actions { display: flex; align-items: center; gap: 14px; }
+      .lab-toggle { display: inline-flex; align-items: center; gap: 6px;
+             color: var(--muted); font-size: var(--fs-ui, 12px); cursor: pointer; }
+      .lab-settings-shell { display: flex; border: 1px solid var(--edge);
+             border-radius: 8px; overflow: hidden; background: var(--panel); min-height: 260px; }
+      .lab-settings-nav { flex: 0 0 176px; border-right: 1px solid var(--edge);
+             padding: 8px; display: flex; flex-direction: column; gap: 2px; }
+      .lab-settings-tab { text-align: left; background: transparent; border: none;
+             border-radius: 5px; padding: 8px 10px; color: var(--muted);
+             font-size: var(--fs-ui, 12px); cursor: pointer; font-family: inherit; }
+      .lab-settings-tab:hover { background: var(--edge); color: var(--ink); }
+      .lab-settings-tab.active { background: var(--edge); color: var(--ink); font-weight: 600; }
+      .lab-settings-body { flex: 1 1 auto; padding: 18px 22px; }
+      .lab-settings-body h3 { margin: 0 0 6px; font-size: var(--fs-title, 15px); }
+      .lab-from-label { font-size: var(--fs-label, 10px); text-transform: uppercase;
+             letter-spacing: 0.08em; color: var(--muted); margin: 18px 0 6px; }
+      .lab-from { margin: 0; padding-left: 18px; color: var(--ink);
+             font-size: var(--fs-ui, 12px); line-height: 1.9; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/apps/workbench-web/src/settings-lab.tsx"></script>
+  </body>
+</html>

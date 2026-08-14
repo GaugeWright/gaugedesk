@@ -35,9 +35,11 @@ const ACCOUNT_SOURCES: Record<string, AccountSource> = {
     openai: { pin: "openai", primary: ["openai"], secondary: [] },
     anthropic: { pin: "anthropic", primary: ["anthropic"], secondary: [] },
     // openai-generic (ADR 0083) points at a user-configured endpoint whose model set
-    // GaugeDesk cannot enumerate — there is no catalog, so no primary/secondary. Its
-    // models come from a free-text entry the user types (see `providerTakesCustomModel`).
-    "openai-generic": { pin: "openai-generic", primary: [], secondary: [] },
+    // GaugeDesk cannot enumerate — there is no shipped catalog for it. Its models are
+    // the ones the operator declares in Settings (see `endpointCatalog`), which enter
+    // the catalog under this same provider key; with none declared it contributes
+    // nothing, and a model id may still be typed per chat (`providerTakesCustomModel`).
+    "openai-generic": { pin: "openai-generic", primary: ["openai-generic"], secondary: [] },
 };
 
 /** A friendly provider name for the `(provider)` disambiguator suffix. */
@@ -130,8 +132,12 @@ export function pickableModels(
 const SNAPSHOT = /\d{6,8}|\d{4}-\d{2}-\d{2}/;
 
 /** The default-visible set when the operator hasn't curated their models: the account's
- *  **primary**, reasoning-capable, non-snapshot models — the modern, agent-suitable ones. */
+ *  **primary**, reasoning-capable, non-snapshot models — the modern, agent-suitable ones.
+ *  A declared endpoint model is already the operator's own choice — they typed the id —
+ *  so it is visible without a second act of curation, and without us guessing at
+ *  capabilities an unlistable endpoint never reported. */
 export function isDefaultVisible(m: PickableModel): boolean {
+    if (providerTakesCustomModel(m.provider)) return true;
     return m.primary && m.reasoning && !SNAPSHOT.test(m.id);
 }
 
@@ -236,6 +242,62 @@ export function serializeEnabledModels(enabled: ReadonlySet<string>): string {
     return JSON.stringify([...enabled].sort());
 }
 
+// --- the operator's declared endpoint models (ADR 0083) ----------------------------
+// An OpenAI-compatible endpoint has no listing GaugeDesk trusts and no shipped catalog,
+// so the ids are the operator's to declare. They are stored per account rather than per
+// chat: the same endpoint serves every chat, and re-typing the id into each composer is
+// the papercut this replaces.
+
+/** The account-settings key holding the declared endpoint model ids (a JSON array). */
+export const ENDPOINT_MODELS_SETTING = "model_picker.endpoint_models";
+
+/** Parse the declared ids. Absent/blank/malformed → none: an unreadable value must not
+ *  become a fictional model the picker offers and the engine cannot bind. */
+export function parseEndpointModels(raw: string | null | undefined): string[] {
+    if (!raw) return [];
+    try {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) {
+            return [...new Set(arr.filter((x): x is string => typeof x === "string" && x.trim() !== ""))];
+        }
+    } catch {
+        /* fall through */
+    }
+    return [];
+}
+
+/** Serialize declared ids for the account-settings store (deduped + sorted → stable). */
+export function serializeEndpointModels(ids: readonly string[]): string {
+    return JSON.stringify([...new Set(ids.map((id) => id.trim()).filter(Boolean))].sort());
+}
+
+/** The declared ids as catalog entries. Their capabilities are unknown — the endpoint
+ *  reports none — so they claim none: no reasoning levels beyond `off`, and text input
+ *  only, a placeholder `modelAcceptsImages` deliberately declines to read as a refusal. */
+function endpointCatalog(ids: readonly string[]): CatalogModel[] {
+    const declared = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+    return declared.map((id) => ({
+        provider: "openai-generic",
+        id,
+        name: id,
+        reasoning: false,
+        thinking: ["off"],
+        input: ["text"],
+    }));
+}
+
+/** The catalog every picker call in an account should use: the shipped snapshot plus the
+ *  operator's declared endpoint models. One helper rather than an exported `MODEL_CATALOG`
+ *  and a spread at each call site, so a surface cannot half-remember the declared ids and
+ *  offer a model the neighbouring surface does not. */
+export function catalogWithEndpointModels(
+    declaredEndpointModels: readonly string[],
+    catalog: readonly CatalogModel[] = MODEL_CATALOG,
+): readonly CatalogModel[] {
+    const extra = endpointCatalog(declaredEndpointModels);
+    return extra.length ? [...catalog, ...extra] : catalog;
+}
+
 /** The `provider:id` keys of the default-visible models — the checklist's initial state when
  *  the operator hasn't curated yet (so the settings UI reflects what the picker shows). */
 export function defaultVisibleKeys(
@@ -271,6 +333,10 @@ export function modelAcceptsImages(
     catalog: readonly CatalogModel[] = MODEL_CATALOG,
 ): boolean {
     if (!pinned?.id) return true; // default model — take the runtime's word
+    // A declared endpoint model is in the catalog because the operator typed its id, not
+    // because anything reported its modalities. Its `input` is a placeholder, so reading
+    // it as "cannot see images" would be exactly the claim this function refuses to make.
+    if (providerTakesCustomModel(pinned.provider)) return true;
     const m = catalog.find((c) => c.id === pinned.id && c.provider === pinned.provider);
     if (!m) return true; // unknown to the catalog — don't pre-block
     return m.input.includes("image");
