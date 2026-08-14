@@ -60,7 +60,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/GaugeWright/gaugedesk/releases/latest/download/latest.json"
+        "https://updates.gaugewright.com/update/{{target}}/{{arch}}/{{current_version}}"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYxNTg4RUI0OUEyMDE5QwpSV1NjQWFKSjY0Z1ZCdXdXMXN0VGRvSnp1SVR0RzhTbU5maUMxMEtPY3ZWbUp2ZllNOUdJZVY2Kwo="
     },

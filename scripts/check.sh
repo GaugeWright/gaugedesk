@@ -51,6 +51,14 @@ run_contracts() {
     echo "== product contracts =="
     node scripts/check-product-contracts.mjs --enforce-local-evidence
 
+    # The updater endpoint is compiled into every shipped binary and cannot be
+    # corrected for a client that already has it, so its mistakes are permanent
+    # in the field and silent at build time. In particular an endpoint missing
+    # {{current_version}} keeps working — right up until a key rotation strands
+    # every client not already on the current key (DR-0080).
+    echo "== updater endpoint =="
+    node scripts/check-updater-endpoint.mjs
+
     # The artifact side of the same manifest: what a built bundle says about the
     # contract it holds, and the canonical digest both this section and the
     # hosted surfaces compare (DR-0051). A test no section names is a test
