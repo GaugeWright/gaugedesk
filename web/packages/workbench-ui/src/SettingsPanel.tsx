@@ -399,15 +399,11 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
 
                 signInToProvider: () => void startCodexSignIn(),
                 cancelSignIn: () => {
-                    // Only a device login is a thing the server is holding open. A browser
-                    // flow left this runtime the moment the tab opened; there is nothing
-                    // there to cancel, so dropping our own waiting state is the whole act.
-                    const wasDevice = pendingSignIn()?.mode === "device";
+                    // Both modes leave the server holding something: a device login it is
+                    // polling for, or a browser helper sitting on the fixed loopback
+                    // callback port. Dropping only our own waiting state left that port
+                    // held, and the next sign-in failed on it.
                     setPendingSignIn(undefined);
-                    if (!wasDevice) {
-                        setStatus("sign-in cancelled");
-                        return;
-                    }
                     void act("cancel the sign-in", async () => {
                         await props.api.codexLoginCancel();
                         return "sign-in cancelled";

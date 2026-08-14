@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::account::{
@@ -663,9 +663,65 @@ pub async fn post_home_codex_login_cancel(
 /// dev/test seam for substituting a fake helper.
 const HELPER_SOURCE: &str = include_str!("../../../sidecar/codex-oauth-login.mjs");
 
+/// The browser helper waiting for its callback, if one is.
+///
+/// Its loopback port is fixed and registered with OpenAI, so at most one helper
+/// can be live and a second one fails outright with `EADDRINUSE`. Holding the
+/// child here is what lets this process end an attempt: a new start supersedes
+/// the one it replaces, and the cancel route ends one a person walked away from.
+/// Without it the only way back to a working sign-in was to kill the helper by
+/// hand — and if the app had exited, the orphan outlived every route that could
+/// have known about it.
+fn browser_login() -> &'static Mutex<Option<Arc<Mutex<Child>>>> {
+    static LOGIN: OnceLock<Mutex<Option<Arc<Mutex<Child>>>>> = OnceLock::new();
+    LOGIN.get_or_init(|| Mutex::new(None))
+}
+
+/// End whichever browser helper is current. Returns whether there was one.
+fn end_browser_login() -> bool {
+    // Take the child out from under the slot lock before touching the process:
+    // the reader thread holds the child lock across its final `wait`, so holding
+    // both here in the other order is a deadlock.
+    let Some(child) = browser_login().lock().ok().and_then(|mut slot| slot.take()) else {
+        return false;
+    };
+    if let Ok(mut process) = child.lock() {
+        let _ = process.kill();
+        let _ = process.wait();
+    }
+    true
+}
+
+/// Drop `child` from the slot if it is still the current helper. A later start
+/// may already have superseded it, and that one is not this thread's to clear.
+fn forget_browser_login(child: &Arc<Mutex<Child>>) {
+    if let Ok(mut slot) = browser_login().lock() {
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, child))
+        {
+            *slot = None;
+        }
+    }
+}
+
+/// End this particular helper: the failure paths of a start that already
+/// registered one, where killing whatever is current could kill a later attempt.
+fn end_browser_login_child(child: &Arc<Mutex<Child>>) {
+    if let Ok(mut process) = child.lock() {
+        let _ = process.kill();
+        let _ = process.wait();
+    }
+    forget_browser_login(child);
+}
+
 /// Start the helper, return the authorization URL, then retain its private pipe
 /// in a background thread until the credential bundle can be sealed.
 fn start_login_blocking(wb: SharedWorkbench) -> Result<String, String> {
+    // An earlier attempt still holds the callback port, and the person asking for
+    // this one is not going back to it. Superseding here is what keeps a start
+    // from failing on the wait the previous start is still doing.
+    end_browser_login();
     let mut command = Command::new(node_bin());
     let override_path = gaugedesk_env::var("CODEX_LOGIN");
     match &override_path {
@@ -701,6 +757,13 @@ fn start_login_blocking(wb: SharedWorkbench) -> Result<String, String> {
         .take()
         .ok_or_else(|| "Codex login helper exposed no output pipe".to_owned())?;
     let mut stderr = child.stderr.take();
+    // Current from here on, not from the URL: the helper binds the callback port
+    // before it emits one, so a start that fails after this point has something
+    // to reclaim too.
+    let child = Arc::new(Mutex::new(child));
+    if let Ok(mut slot) = browser_login().lock() {
+        *slot = Some(Arc::clone(&child));
+    }
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     for _ in 0..6 {
@@ -708,18 +771,20 @@ fn start_login_blocking(wb: SharedWorkbench) -> Result<String, String> {
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {}
-            Err(error) => return Err(format!("Codex login helper read: {error}")),
+            Err(error) => {
+                end_browser_login_child(&child);
+                return Err(format!("Codex login helper read: {error}"));
+            }
         }
         let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
         match event.get("event").and_then(Value::as_str) {
             Some("auth_url") => {
-                let url = event
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "Codex login helper returned no URL".to_owned())?
-                    .to_owned();
+                let Some(url) = event.get("url").and_then(Value::as_str).map(str::to_owned) else {
+                    end_browser_login_child(&child);
+                    return Err("Codex login helper returned no URL".to_owned());
+                };
                 // Drain stderr so a chatty helper can never block on a full pipe.
                 if let Some(mut pipe) = stderr.take() {
                     std::thread::spawn(move || {
@@ -744,22 +809,27 @@ fn start_login_blocking(wb: SharedWorkbench) -> Result<String, String> {
                         }
                         result.clear();
                     }
-                    let _ = child.wait();
+                    // Stdout closed, so the helper is on its way out either way:
+                    // it linked, it timed out, or a cancel killed it.
+                    if let Ok(mut process) = child.lock() {
+                        let _ = process.wait();
+                    }
+                    forget_browser_login(&child);
                 });
                 return Ok(url);
             }
             Some("error") => {
+                end_browser_login_child(&child);
                 return Err(event
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("Codex login failed")
-                    .to_owned())
+                    .to_owned());
             }
             _ => {}
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    end_browser_login_child(&child);
     // The helper died before emitting a URL; its stderr is the actual reason
     // (e.g. a missing node module) — surface it instead of a blind 502.
     let mut detail = String::new();
@@ -775,6 +845,19 @@ fn start_login_blocking(wb: SharedWorkbench) -> Result<String, String> {
             "Codex login helper produced no authorization URL: {detail}"
         ))
     }
+}
+
+/// End the desktop browser sign-in.
+///
+/// The helper holds the fixed loopback callback port for as long as it waits, so
+/// an abandoned sign-in has to be endable from the UI: its own timeout is
+/// measured in minutes, and until this route existed the browser half of the
+/// cancel button dropped the waiting state locally and left the port held.
+/// Answers 204 either way — "there is no sign-in in flight" is the state the
+/// caller asked for.
+pub async fn post_codex_login_cancel() -> impl IntoResponse {
+    let _ = tokio::task::spawn_blocking(end_browser_login).await;
+    StatusCode::NO_CONTENT
 }
 
 pub async fn post_codex_login_start(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
@@ -1258,5 +1341,54 @@ IFS= read -r done
             &crate::account::account_scope("person:someone-else")
         )
         .contains_key(PROVIDER));
+    }
+
+    /// The browser helper holds one fixed loopback port for as long as it waits,
+    /// so a helper this process forgets about is a sign-in nobody can start.
+    ///
+    /// Observed 2026-08-14: a helper spawned hours earlier still held
+    /// `127.0.0.1:1455`, its app long gone, and every attempt after it failed
+    /// with `EADDRINUSE`. Nothing here could end one — the browser flow had no
+    /// cancel route and start did not supersede.
+    ///
+    /// One test for both ends because the slot is process-global; two would race
+    /// each other rather than the thing they describe.
+    #[cfg(unix)]
+    #[test]
+    fn a_browser_sign_in_is_superseded_by_the_next_and_endable_by_cancel() {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        // Stands in for a helper that has emitted its URL and is now waiting on a
+        // browser that never comes back.
+        let helper = root.path().join("fake-login.mjs");
+        std::fs::write(
+            &helper,
+            r#"process.stdout.write(JSON.stringify({ event: "auth_url", url: "https://example.invalid/authorize" }) + "\n");
+setInterval(() => {}, 60000);
+"#,
+        )
+        .unwrap();
+        std::env::set_var("GAUGEDESK_CODEX_LOGIN", &helper);
+
+        let url = start_login_blocking(workbench.clone()).unwrap();
+        assert_eq!(url, "https://example.invalid/authorize");
+        let first = browser_login().lock().unwrap().clone().unwrap();
+
+        start_login_blocking(workbench.clone()).unwrap();
+        let second = browser_login().lock().unwrap().clone().unwrap();
+        assert_ne!(first.lock().unwrap().id(), second.lock().unwrap().id());
+        // Killed and reaped by the start that replaced it, not merely dropped:
+        // dropping a `Child` leaves the process running, which is the whole bug.
+        assert!(first.lock().unwrap().try_wait().unwrap().is_some());
+
+        assert!(end_browser_login());
+        assert!(second.lock().unwrap().try_wait().unwrap().is_some());
+        assert!(browser_login().lock().unwrap().is_none());
+        // Cancelling nothing is the state the caller asked for, not a failure.
+        assert!(!end_browser_login());
+
+        std::env::remove_var("GAUGEDESK_CODEX_LOGIN");
     }
 }

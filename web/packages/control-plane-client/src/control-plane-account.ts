@@ -551,8 +551,9 @@ export async function codexLoginStart(json: RouteJson): Promise<CodexLoginStart>
     throw new Error("OpenAI sign-in returned an unsupported login response");
 }
 
-/** Cancel the authenticated person's active hosted device-code attempt. Local
- * browser login does not expose a cancellation endpoint. */
+/** Cancel the sign-in this control plane is holding open: a hosted device-code
+ * attempt, or the desktop browser helper waiting on its loopback callback port.
+ * 204 either way, including when there is nothing in flight. */
 export async function codexLoginCancel(json: RouteJson): Promise<void> {
     await json("POST", "/account/oauth/openai-codex/cancel", {});
 }

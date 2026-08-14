@@ -13,11 +13,35 @@ import { createServer } from "node:http";
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
 const TOKEN_URL = "https://auth.openai.com/oauth/token";
-const REDIRECT_URI = "http://localhost:1455/auth/callback";
 const SCOPE = "openid profile email offline_access";
 const JWT_CLAIM = "https://api.openai.com/auth";
 
+/** The loopback callback address. Both halves are overridable so the test suite
+ *  can run this helper without contending for the real port, and the redirect is
+ *  derived from them so the authorize request and the listener can never name
+ *  different places. OpenAI has 1455 registered for this client, so overriding
+ *  the port in production only breaks that client's own sign-in. */
+const CALLBACK_PORT = Number(process.env.GAUGEDESK_OAUTH_CALLBACK_PORT || 1455);
+const CALLBACK_HOST = process.env.GAUGEDESK_OAUTH_CALLBACK_HOST || "127.0.0.1";
+const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}/auth/callback`;
+
+/** How long the listener waits for the browser to come back. The port is fixed,
+ *  so exactly one helper can hold it: a sign-in someone abandons in the browser
+ *  must not keep it until the app is restarted, which is what made the next
+ *  attempt fail with EADDRINUSE. */
+const CALLBACK_TIMEOUT_MS = Number(process.env.GAUGEDESK_OAUTH_CALLBACK_TIMEOUT_MS || 600_000);
+
+/** GaugeDesk reads the credential bundle over this helper's private stdout pipe.
+ *  Once that process is gone the bundle has nowhere to land, so continuing to
+ *  wait only holds the port against the next attempt — the state a crashed or
+ *  restarted app left behind. Reparenting is the portable signal: the kernel
+ *  hands an orphan to init or to the session's subreaper. */
+const PARENT_POLL_MS = 500;
+
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+// Writing to a pipe whose reader has exited is not a crash worth a stack trace:
+// there is no longer anyone to tell, so leave.
+process.stdout.on("error", () => process.exit(1));
 const fail = (error) => {
     emit({ event: "error", message: String(error?.message || error) });
     process.exit(1);
@@ -94,11 +118,44 @@ try {
             }
             response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
             response.end("GaugeDesk authentication completed. You can close this window.");
-            server.close();
+            release();
             resolve(value);
         });
-        server.once("error", reject);
-        server.listen(1455, process.env.GAUGEDESK_OAUTH_CALLBACK_HOST || "127.0.0.1", () => {
+        let timeout;
+        let watchdog;
+        // Every exit from the wait runs through here, so the port is released at
+        // the moment the wait ends rather than whenever the process happens to.
+        const release = () => {
+            clearTimeout(timeout);
+            clearInterval(watchdog);
+            server.close();
+        };
+        const abandon = (message) => {
+            release();
+            reject(new Error(message));
+        };
+        server.once("error", (error) => {
+            release();
+            reject(
+                error?.code === "EADDRINUSE"
+                    ? new Error(
+                        `the sign-in callback port ${CALLBACK_PORT} is already held by another `
+                        + "process — an earlier sign-in is still waiting for its browser",
+                    )
+                    : error,
+            );
+        });
+        server.listen(CALLBACK_PORT, CALLBACK_HOST, () => {
+            const parent = process.ppid;
+            timeout = setTimeout(
+                () => abandon("the browser sign-in was not completed in time"),
+                CALLBACK_TIMEOUT_MS,
+            );
+            watchdog = setInterval(() => {
+                if (process.ppid !== parent) {
+                    abandon("GaugeDesk exited before the sign-in completed");
+                }
+            }, PARENT_POLL_MS);
             emit({ event: "auth_url", url: authorize.toString() });
         });
     });

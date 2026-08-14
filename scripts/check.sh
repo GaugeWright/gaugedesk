@@ -58,6 +58,13 @@ run_contracts() {
     echo "== release identity =="
     node --test scripts/build-release-identity.test.mjs
 
+    # The desktop sign-in helper. It is plain node with no npm tree of its own, so
+    # it runs here rather than in `web`. What it guards is the fixed loopback
+    # callback port: every way the helper can fail to let go of it is a way to
+    # break the next sign-in, and nothing ran this file's subject before.
+    echo "== codex login helper =="
+    node --test sidecar/codex-oauth-login.test.mjs
+
     echo "== production canary contract =="
     node scripts/check-production-canaries.mjs
     node --test \

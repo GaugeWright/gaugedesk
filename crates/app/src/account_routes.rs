@@ -113,6 +113,12 @@ pub fn runtime_credential_routes() -> Router<SharedWorkbench> {
             "/account/oauth/openai-codex/start",
             post(codex_oauth::post_codex_login_start),
         )
+        // The desktop helper holds a fixed loopback port while it waits, so an
+        // abandoned sign-in blocks the next one until it is ended.
+        .route(
+            "/account/oauth/openai-codex/cancel",
+            post(codex_oauth::post_codex_login_cancel),
+        )
         // Desktop → Hub account sign-in: the native device handoff's local half
         // (ADR 0123, LOGIN-2). Account identity, not a model credential — the
         // sealed session stays in this control plane; routes carry no token.
