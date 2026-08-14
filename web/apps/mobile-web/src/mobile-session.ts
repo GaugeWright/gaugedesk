@@ -227,16 +227,11 @@ export function createMobileSession(options: MobileSessionOptions): Session {
                 const sameUnregisteredTurn = aimedAt !== null
                     && dispatched()?.seq === aimedAt.seq
                     && options.transcript().lines.length === aimedAt.lines;
-                const worthRetrying = result.reason === "nothing running"
-                    && Date.now() < deadline
+                const worthRetrying = Date.now() < deadline
                     && options.engagementId() === id
                     && sameUnregisteredTurn;
                 if (!worthRetrying) {
-                    throw new Error(
-                        result.reason === "nothing running"
-                            ? "nothing is running to stop"
-                            : "this turn cannot be interrupted",
-                    );
+                    throw new Error("nothing is running to stop");
                 }
                 await new Promise((settle) => setTimeout(settle, 100));
             }

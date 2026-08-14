@@ -1268,39 +1268,39 @@ pub(crate) async fn post_sync(
 /// out-of-band interrupt handle so its blocking `recv` returns and the run fails;
 /// the session is retired and the next turn respawns.
 ///
-/// A refusal names which refusal it is. Both were `"nothing running"`, and the
-/// client discarded the body entirely, so the one case a person actually meets —
-/// a turn that is plainly running and simply cannot be interrupted (the scripted
-/// fake's `[slow]` hold binds no handle) — was indistinguishable from success:
-/// the button reported nothing, the console stayed clean, and the turn ran on.
+/// Stop is a standing intent recorded against the turn's claim, not a call on a
+/// handle that must already exist. It used to be the latter, and so its answer
+/// described how far turn startup had got rather than anything true about the
+/// turn: for the 124-222ms before a handle was bound it refused a plainly
+/// running turn as `"not interruptible"`, and in the moment after, while the
+/// handle's own cancellation surface was still empty, it reported success and
+/// did nothing at all — the turn ran to completion behind a composer that had
+/// been told it was stopping.
+///
+/// Recording the intent removes both. A claimed turn is always stoppable, so
+/// `"nothing running"` is the only refusal left: the turn is ended by whichever
+/// mechanism reaches the intent first — a startup checkpoint, the bind that
+/// fires a newly-arrived handle, or this call firing one that is already there.
 pub(crate) async fn post_stop(
     State(_wb): State<SharedWorkbench>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match engine::take_turn_interrupt_for_stop(&id) {
+    match engine::request_turn_stop(&id) {
         Some(interrupt) => {
-            // The handle was captured at turn start. WhippleScript records a
-            // cooperative cancellation request on an independent store
-            // connection, so durable thread state survives the interrupted turn.
-            //
-            // Taking it also recorded that this turn was stopped on purpose, so
-            // the engine can classify the dead stream that follows as an
-            // interrupt rather than a fault.
-            interrupt();
+            // A handle already bound is fired now, out of band, so a turn
+            // blocked in provider I/O does not have to reach a checkpoint to
+            // notice. WhippleScript records the cancellation on an independent
+            // store connection, so durable thread state survives it.
+            if let Some(interrupt) = interrupt {
+                interrupt();
+            }
             (StatusCode::OK, Json(serde_json::json!({ "stopped": true }))).into_response()
         }
-        None => {
-            let reason = if engine::turn_is_live(&id) {
-                "not interruptible"
-            } else {
-                "nothing running"
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "stopped": false, "reason": reason })),
-            )
-                .into_response()
-        }
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "stopped": false, "reason": "nothing running" })),
+        )
+            .into_response(),
     }
 }
 

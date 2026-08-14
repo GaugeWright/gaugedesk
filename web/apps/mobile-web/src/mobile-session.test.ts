@@ -83,9 +83,15 @@ describe("createMobileSession", () => {
         // along with every transport error, so a Stop that did not land looked
         // exactly like one that did — on the surface with the least room for a
         // person to check by other means.
+        //
+        // The refusal it once asserted, `not interruptible`, no longer exists:
+        // the host records a Stop against the turn's claim, so a claimed turn is
+        // stoppable whether or not it has reached anything interruptible. Only
+        // "no turn at all" is left, and outside the registration gap it is a
+        // refusal like any other.
         const h = harness();
-        h.api.stopTurn = vi.fn(async () => ({ stopped: false, reason: "not interruptible" }));
-        await expect(h.session.stop!()).rejects.toThrow(/cannot be interrupted/);
+        h.api.stopTurn = vi.fn(async () => ({ stopped: false, reason: "nothing running" }));
+        await expect(h.session.stop!()).rejects.toThrow(/nothing is running to stop/);
         h.dispose();
     });
 

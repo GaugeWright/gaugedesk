@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -272,6 +273,7 @@ pub(crate) fn create_harness(
         turn_sequence: 0,
         runtime_command_id: None,
         active_command: Arc::new(Mutex::new(None)),
+        cancel_requested: Arc::new(AtomicBool::new(false)),
         synced_paths: BTreeSet::new(),
     };
     let push_started = Instant::now();
@@ -446,6 +448,13 @@ struct DoHarness {
     turn_sequence: u64,
     runtime_command_id: Option<String>,
     active_command: Arc<Mutex<Option<String>>>,
+    /// That a Stop has been asked for, held apart from the command id that
+    /// performs it. A turn publishes its command id only once it is about to
+    /// start streaming, so a Stop landing during the turn's assembly had
+    /// nothing to name and did nothing at all — silently, since the cancel
+    /// POST's own outcome was discarded too. Recorded intent survives that
+    /// window; `run_turn` performs it when the id appears.
+    cancel_requested: Arc<AtomicBool>,
     synced_paths: BTreeSet<String>,
 }
 
@@ -545,6 +554,18 @@ impl Harness for DoHarness {
             .active_command
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(command_id.clone());
+        // A Stop that arrived while this turn was being assembled found no
+        // command to name. It is performed here, off this thread so the cancel
+        // does not have to wait for the turn it is cancelling to start.
+        if self.cancel_requested.load(Ordering::SeqCst) {
+            let config = self.config.clone();
+            let placement = self.placement.clone();
+            let instance = self.instance_ref.clone();
+            let command = command_id.clone();
+            std::thread::spawn(move || {
+                cancel_hosted_turn(&config, &placement, &instance, &command)
+            });
+        }
         let (started, streamed_text, stream_timing) = post_json_with_turn_stream(
             &self.config,
             &self.placement,
@@ -559,6 +580,7 @@ impl Harness for DoHarness {
                 .active_command
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = None;
+            self.cancel_requested.store(false, Ordering::SeqCst);
             return Err(invalid_data("hosted WhippleScript turn failed"));
         }
         let result_started = Instant::now();
@@ -576,6 +598,9 @@ impl Harness for DoHarness {
             .active_command
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
+        // A harness serves more than one turn; this turn's Stop must not cancel
+        // the next.
+        self.cancel_requested.store(false, Ordering::SeqCst);
         let pull_started = Instant::now();
         self.pull_workspace()?;
         let pull_workspace_ms = pull_started.elapsed().as_secs_f64() * 1000.0;
@@ -624,19 +649,15 @@ impl Harness for DoHarness {
         let placement = self.placement.clone();
         let instance = self.instance_ref.clone();
         let active = Arc::clone(&self.active_command);
+        let requested = Arc::clone(&self.cancel_requested);
         Some(Arc::new(move || {
+            // Recorded before the attempt and never cleared by a failed one, so
+            // a Stop that beat the turn's command id into existence is
+            // performed when it appears rather than dropped.
+            requested.store(true, Ordering::SeqCst);
             let command = active.lock().unwrap_or_else(|p| p.into_inner()).clone();
             if let Some(command) = command {
-                let _ = post_json(
-                    &config,
-                    &placement,
-                    &format!(
-                        "/host/instances/{}/turns/{}/cancel",
-                        encode(&instance),
-                        encode(&command)
-                    ),
-                    &json!({}),
-                );
+                cancel_hosted_turn(&config, &placement, &instance, &command);
             }
         }))
     }
@@ -1108,6 +1129,39 @@ fn require_success(response: DoHostResponse) -> io::Result<Vec<u8>> {
         )
     }))
 }
+
+/// Ask the placement to cancel one hosted turn, and keep asking briefly if it
+/// does not yet know the turn.
+///
+/// The outcome used to be discarded, so a cancel the placement refused looked
+/// exactly like one it honoured. It is still not surfaced to the caller — a
+/// Stop is out-of-band and has no reply channel — but a refusal is now retried
+/// rather than assumed away, and the engine reports a turn that ran to
+/// completion despite a Stop.
+fn cancel_hosted_turn(config: &DoHostConfig, placement: &str, instance: &str, command: &str) {
+    let route = format!(
+        "/host/instances/{}/turns/{}/cancel",
+        encode(instance),
+        encode(command)
+    );
+    let deadline = Instant::now() + HOSTED_CANCEL_PURSUIT;
+    loop {
+        if post_json(config, placement, &route, &json!({})).is_ok() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(HOSTED_CANCEL_RETRY);
+    }
+}
+
+/// How long a cancel keeps asking before it gives up on the placement.
+const HOSTED_CANCEL_PURSUIT: Duration = Duration::from_secs(10);
+
+/// The interval between attempts. Each is one HTTP round trip, so it is longer
+/// than the native path's.
+const HOSTED_CANCEL_RETRY: Duration = Duration::from_millis(250);
 
 fn post_json(
     config: &DoHostConfig,

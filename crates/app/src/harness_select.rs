@@ -83,6 +83,30 @@ impl ScriptedFakeFactory {
     /// precheck, and run [`Self::pre_turn`] first.
     pub const KIND: &'static str = "scripted-fake";
 
+    /// How long a `[startup]` task spends between its claim and its interrupt
+    /// handle. Comfortably wider than a driver's Enter-then-Stop, and wider
+    /// than the 124-222ms a real turn measured, so the window is pressed rather
+    /// than raced.
+    const STARTUP_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    /// Reproduce a real turn's uninterruptible startup, for a `[startup]` task.
+    ///
+    /// A real turn resolves a provider, prechecks a credential over the network
+    /// twice, takes the workbench lock and builds a harness before it has
+    /// anything Stop can fire. The fake does none of that, so the gap a person
+    /// actually presses Stop in did not exist in the lane that gates every
+    /// merge — the defect it hid was reachable only by the opt-in live lane,
+    /// which costs tokens and is not run on a pull request.
+    ///
+    /// Called BEFORE the hold is bound as the interrupt handle, because that is
+    /// the whole point: a Stop landing in here has nothing to fire and must be
+    /// honoured by the claim's own checkpoint.
+    pub fn startup_window(task: &str) {
+        if task.contains("[startup]") {
+            std::thread::sleep(Self::STARTUP_WINDOW);
+        }
+    }
+
     /// The fake's pre-turn side effects, verbatim from the pre-seam engine: a
     /// `[slow]` task holds the turn open (so the client's busy state — and the
     /// send queue stacked on top of the composer — is observable to the e2e

@@ -1090,6 +1090,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // yet. Ask again across that gap instead of reporting a refusal that only
     // describes it. Bounded, and only while this chat still reads as working, so
     // it cannot reach past the turn it was aimed at.
+    //
+    // That gap is now the *only* refusal. A turn that has been claimed answers
+    // `stopped` whether or not it has got as far as anything interruptible, so
+    // the retry covers a task request still in flight and nothing else.
     const STOP_REGISTRATION_GRACE_MS = 1500;
     async function stopTurn() {
         const id = selected();
@@ -1099,17 +1103,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         for (;;) {
             const result = await api.stopTurn(id);
             if (result.stopped) return;
-            const worthRetrying = result.reason === "nothing running"
-                && Date.now() < deadline
-                && selected() === id
-                && busy();
+            const worthRetrying = Date.now() < deadline && selected() === id && busy();
             if (!worthRetrying) {
                 setActivity("");
-                throw new Error(
-                    result.reason === "nothing running"
-                        ? "nothing is running to stop"
-                        : "this turn cannot be interrupted",
-                );
+                throw new Error("nothing is running to stop");
             }
             await new Promise((settle) => setTimeout(settle, 100));
         }

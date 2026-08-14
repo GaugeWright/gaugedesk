@@ -46,13 +46,21 @@ static RUNNING_TURNS: std::sync::OnceLock<
 /// What is known about one chat's live turn while it executes here.
 #[derive(Default)]
 struct LiveTurn {
-    /// Its interrupt handle, when the harness driving it offers one.
+    /// Its interrupt handle, when the harness driving it offers one. Absent for
+    /// the whole of turn startup — provider resolution, the credential
+    /// precheck, the workbench lock, the harness build — which is exactly the
+    /// stretch a person presses Stop in, having just changed their mind.
     interrupt: Option<InterruptHandle>,
-    /// Whether a Stop actually fired that handle. A real harness reports a turn
-    /// cut short the only way it can — a dead stream — and that is
-    /// indistinguishable from breaking, so **who ended it** is recorded here
-    /// rather than inferred from the outcome.
-    stopped: bool,
+    /// Whether a Stop was asked for. Recorded against the *claim*, which exists
+    /// for the whole turn, rather than against the handle, which does not: an
+    /// intent that outlives the moment it arrived in is honoured by whichever
+    /// mechanism reaches it first, so Stop's answer stops depending on how far
+    /// startup happened to have got.
+    ///
+    /// It is also the only record of **who ended the turn**. A real harness
+    /// reports a turn cut short the only way it can — a dead stream — and that
+    /// is indistinguishable from breaking.
+    stop_requested: bool,
 }
 
 fn running_turns() -> &'static std::sync::Mutex<std::collections::HashMap<String, LiveTurn>> {
@@ -89,9 +97,27 @@ pub(crate) fn claim_turn(id: &str) -> Option<TurnClaim> {
 /// Attach a running turn's interrupt handle to its claim, so a concurrent Stop
 /// can reach it. A harness with nothing to interrupt never calls this; the claim
 /// is what records that the turn is live, not the handle.
+///
+/// A Stop that already landed is fired here, the instant there is something to
+/// fire. Without that, an intent recorded during startup would be honoured only
+/// by the checkpoints — and the last checkpoint is before the harness exists, so
+/// a Stop arriving between it and this line would have been kept and never
+/// acted on.
 pub(crate) fn bind_turn_interrupt(id: &str, interrupt: InterruptHandle) {
-    if let Some(live) = running_turns().lock_unpoisoned().get_mut(id) {
-        live.interrupt = Some(interrupt);
+    let already_stopped = {
+        let mut turns = running_turns().lock_unpoisoned();
+        match turns.get_mut(id) {
+            Some(live) => {
+                live.interrupt = Some(Arc::clone(&interrupt));
+                live.stop_requested
+            }
+            None => false,
+        }
+    };
+    // Fired with the registry lock released: an arbitrary handle must never run
+    // while this mutex is held.
+    if already_stopped {
+        interrupt();
     }
 }
 
@@ -101,10 +127,9 @@ pub(crate) fn bind_turn_interrupt(id: &str, interrupt: InterruptHandle) {
 ///
 /// Never admit a turn on this: production takes the *claim* to do that, and a
 /// separate read would be a race — free when checked, taken by the time it was
-/// acted on. Stop reads it for the opposite purpose, after its interrupt came
-/// back empty, to say **why** — "nothing is running" and "this turn cannot be
-/// interrupted" are different facts and the composer says them differently. A
-/// stale answer there costs a slightly wrong sentence, not a second turn.
+/// acted on. Stop read it too, to tell its two refusals apart; it has only one
+/// refusal now, so this is left to the tests that assert the invariant itself.
+#[cfg(test)]
 pub(crate) fn turn_is_live(id: &str) -> bool {
     running_turns().lock_unpoisoned().contains_key(id)
 }
@@ -119,32 +144,52 @@ pub fn running_turn_interrupt(id: &str) -> Option<InterruptHandle> {
         .and_then(|live| live.interrupt.clone())
 }
 
-/// The interrupt handle for a running turn, recording under the same lock that a
-/// Stop is about to fire it. Returned rather than called here so an arbitrary
-/// handle never runs while this mutex is held.
+/// Record that this chat's live turn is to be stopped, and hand back its
+/// interrupt handle if one is already bound. Returned rather than called here so
+/// an arbitrary handle never runs while this mutex is held.
 ///
-/// Nothing is recorded when there is no handle: a turn that cannot be
-/// interrupted keeps running, and marking it stopped would make its own later
-/// failure — whatever caused it — read as someone's deliberate cancellation.
-pub(crate) fn take_turn_interrupt_for_stop(id: &str) -> Option<InterruptHandle> {
+/// `None` means there is no claim — nothing is running. The inner `None` is not
+/// a refusal: the intent is recorded either way, and the turn is ended by the
+/// next mechanism to reach it (a startup checkpoint, or `bind_turn_interrupt`
+/// firing the handle the moment it exists). A turn under a claim is always
+/// stoppable, so "running but not interruptible" is no longer a state this can
+/// be in.
+pub(crate) fn request_turn_stop(id: &str) -> Option<Option<InterruptHandle>> {
     let mut turns = running_turns().lock_unpoisoned();
     let live = turns.get_mut(id)?;
-    let interrupt = live.interrupt.clone()?;
-    live.stopped = true;
-    Some(interrupt)
+    live.stop_requested = true;
+    Some(live.interrupt.clone())
 }
 
-/// Whether a Stop fired this chat's live turn's interrupt.
+/// Whether a Stop was asked for against this chat's live turn.
 ///
 /// Read once the turn has returned, while its claim is still held, to tell "it
 /// broke" from "you stopped it". A production harness cannot say which: killing
 /// its runtime ends the stream, and a dead stream is reported as an `io` error
 /// or a `Failed` phase either way.
+///
+/// Also read *during* the turn, at the startup checkpoints below, where it is
+/// the whole mechanism: a turn interrupts itself at the next boundary it
+/// crosses, needing no handle at all.
 pub(crate) fn turn_was_stopped(id: &str) -> bool {
     running_turns()
         .lock_unpoisoned()
         .get(id)
-        .is_some_and(|live| live.stopped)
+        .is_some_and(|live| live.stop_requested)
+}
+
+/// Fail this turn now if a Stop has landed against its claim.
+///
+/// Called at each boundary turn startup already crosses. Startup is the stretch
+/// with no interrupt handle to fire — measured at 124-222ms against a real
+/// provider, most of it two credential round trips — so this is what makes a
+/// Stop pressed straight after Enter end the turn rather than be refused by it.
+fn stop_checkpoint(id: &str) -> Result<(), EngineError> {
+    if turn_was_stopped(id) {
+        tracing::debug!(chat = %id, "turn stopped before it reached its harness");
+        return Err(EngineError::Interrupted);
+    }
+    Ok(())
 }
 
 /// Clear all running-turn interrupt handles, used by the test reset route
@@ -1487,6 +1532,7 @@ fn run_claimed_engagement_turn(
         let g = wb.lock_unpoisoned();
         AgentConfig::from_json(&g.effective_agent_config_for_chat(id)?).unwrap_or_default()
     };
+    stop_checkpoint(id)?;
     let gate = MembraneGate::new(&config, default_external_tools()).with_mode(mode);
 
     // GaugeDesk keeps credential custody. The selected provider material is
@@ -1529,6 +1575,8 @@ fn run_claimed_engagement_turn(
         ChatMode::Use => None,
     };
 
+    stop_checkpoint(id)?;
+
     // The one harness decision point (SUB-0): which adapter drives this turn.
     // Consulted per turn — tests flip `GAUGEDESK_FAKE_AGENT` against a live
     // workbench, so the selection must never be cached at startup.
@@ -1546,6 +1594,14 @@ fn run_claimed_engagement_turn(
         // one moment Stop could not reach it.
         let hold = std::sync::Arc::new(crate::harness_select::SlowHold::default());
         let releases = std::sync::Arc::clone(&hold);
+        // A real turn spends 124-222ms between its claim and its handle. The
+        // fake binds in microseconds, so the window that actually bit a person
+        // did not exist in the lane that gates every merge, and only the
+        // opt-in live lane could fail on it. `[startup]` reproduces the shape
+        // deliberately: the wait is before the bind, so a Stop pressed during
+        // it has nothing to fire and must be honoured by a checkpoint.
+        ScriptedFakeFactory::startup_window(task);
+        stop_checkpoint(id)?;
         bind_turn_interrupt(id, std::sync::Arc::new(move || releases.stop()));
         // A real failure in here is still a failure; only the hold being cut
         // short is an interrupt.
@@ -1621,6 +1677,9 @@ fn run_claimed_engagement_turn(
                 );
             }
         }
+        // The credential legs are the widest part of startup — two provider
+        // round trips before anything interruptible exists.
+        stop_checkpoint(id)?;
         let credential_ref = {
             let g = wb.lock_unpoisoned();
             g.credential_ref_for_chat_in_class(
@@ -1666,6 +1725,7 @@ fn run_claimed_engagement_turn(
                 effective_execution_class,
             )
         };
+        stop_checkpoint(id)?;
         let model = resolve_turn_model(gaugedesk_env::var("MODEL"), config.model.clone());
         // openai-generic (ADR 0083) carries its endpoint with the linked credential;
         // resolve it nearest-scope-wins so the descriptor derives the admitted host
@@ -1978,6 +2038,20 @@ fn run_claimed_engagement_turn(
             }
             Ok(result) if result.run_phase == RunPhase::Failed && turn_was_stopped(id) => {
                 return Err(EngineError::Interrupted);
+            }
+            // A turn that ran to a *successful* end despite a Stop is the one
+            // residual failure of this whole path: every mechanism that should
+            // have ended it — the checkpoints, the bind, the runtime's own
+            // cancellation — was passed and none took. Its work is durable, so
+            // it is reported as what it is rather than dressed as a stop; but
+            // it is a broken promise and it says so here.
+            Ok(result) if turn_was_stopped(id) => {
+                tracing::warn!(
+                    chat = %id,
+                    phase = ?result.run_phase,
+                    "a stopped turn ran to completion anyway",
+                );
+                result
             }
             other => other?,
         }
@@ -2432,6 +2506,10 @@ fn drive_persistent_turn(
         if let Some(interrupt) = harness.interrupt_handle() {
             bind_turn_interrupt(id, interrupt);
         }
+        // The last checkpoint, and the only one past the bind: a turn stopped
+        // while it waited for another turn's harness lock must not now go and
+        // call a model. Past this line the handle carries it.
+        stop_checkpoint(id)?;
         let mut sink = live_sink(sender);
         let result = run_task_streaming_billed(
             &mut store,

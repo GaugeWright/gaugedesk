@@ -47,6 +47,27 @@ Feature: Tasking the agent
     And the composer shows no error
     And the agent finishes
 
+  # Every scenario above presses Stop against a turn that already has something
+  # to interrupt: the fake binds its hold in microseconds. A real turn spends
+  # 124-222ms first — resolving a provider, prechecking a credential over the
+  # network twice, taking the workbench lock, building a harness — and a Stop
+  # landing in there was refused outright as "not interruptible" while the turn
+  # ran on. That window existed only in the opt-in live lane, which costs tokens
+  # and does not gate a merge, so nothing here could fail on it.
+  #
+  # `[startup]` reproduces the window in the lane that gates every merge. No
+  # `[hold]`: the turn behind it is short, so a Stop that was dropped shows up
+  # as a turn that *completed*, and the receipt is what tells the two apart.
+  Scenario: a turn stopped before it reaches its harness still ends
+    Given a new engagement
+    When I start tasking the agent with "[startup] a turn to stop during startup"
+    Then the agent is working
+    When I stop the turn
+    Then the stop is receipted as a cancellation
+    And the turn ends promptly
+    And the composer shows no error
+    And the composer is ready to send again
+
   Scenario: Escape interrupts the running turn
     Given a new engagement
     When I start tasking the agent with "[hold] until I stop it"

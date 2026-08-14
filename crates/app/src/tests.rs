@@ -3441,12 +3441,16 @@ async fn stop_is_a_no_op_when_nothing_is_running() {
     );
 }
 
-/// A refusal has to name itself. "Nothing is running" and "this turn cannot be
-/// interrupted" are different facts, and the composer says them differently —
-/// while both answered `"nothing running"` the second was indistinguishable from
-/// success to every client, which is how a Stop that did nothing stayed silent.
+/// A claimed turn with no handle yet is the whole of turn startup — 124-222ms
+/// against a real provider, most of it credential round trips, and exactly when
+/// a person who has just changed their mind presses Stop.
+///
+/// This asserted the opposite until the intent model replaced it: Stop answered
+/// `"not interruptible"`, the client raised it as an error, and the turn ran on.
+/// A claim is now enough. The refusal it used to name does not exist, because
+/// the request no longer needs anything to have been published to land.
 #[tokio::test]
-async fn stopping_a_live_but_uninterruptible_turn_says_so() {
+async fn stopping_a_turn_that_has_not_reached_its_harness_is_recorded() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = seeded_workbench();
     let app = open_control_plane(wb);
@@ -3461,16 +3465,49 @@ async fn stopping_a_live_but_uninterruptible_turn_says_so() {
         .as_str()
         .unwrap()
         .to_string();
-    // A claim with no interrupt handle: a turn is executing and cannot be cut short.
+    // A claim with no interrupt handle: the turn is executing, and everything
+    // that could carry a Stop is still being assembled.
     let claim = engine::claim_turn(&chat).expect("chat is free");
     let (s, body) = send(&app, "POST", &format!("/chats/{chat}/stop"), None).await;
     assert_eq!(s, StatusCode::OK, "got {body}");
-    assert!(body.contains("\"stopped\":false"), "got {body}");
     assert!(
-        body.contains("\"reason\":\"not interruptible\""),
-        "a running turn that cannot be interrupted must not report `nothing running`; got {body}"
+        body.contains("\"stopped\":true"),
+        "a claimed turn is always stoppable, handle or not; got {body}"
+    );
+    assert!(
+        engine::turn_was_stopped(&chat),
+        "the intent must be recorded against the claim, so a checkpoint can honour it"
     );
     drop(claim);
+}
+
+/// The intent has to survive the moment it arrived in. A Stop recorded before
+/// the harness exists is fired by the bind itself — otherwise it would be kept
+/// and never acted on, since the last checkpoint is before the bind and the
+/// turn is inside the model call after it.
+#[test]
+fn a_handle_bound_after_a_stop_is_fired_at_once() {
+    let _guard = crate::engine::claim_turn("eng-late-bind").expect("chat is free");
+    assert!(engine::request_turn_stop("eng-late-bind").is_some());
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let arms = std::sync::Arc::clone(&fired);
+    engine::bind_turn_interrupt(
+        "eng-late-bind",
+        std::sync::Arc::new(move || arms.store(true, std::sync::atomic::Ordering::SeqCst)),
+    );
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "binding a handle to a turn already asked to stop must fire it immediately"
+    );
+}
+
+/// Stop against a chat with no claim is the one refusal left. The client retries
+/// it briefly, because a `POST /task` still in flight has not taken its claim
+/// yet — that race is real and is not what this change is about.
+#[test]
+fn stopping_a_chat_with_no_claim_is_refused() {
+    assert!(engine::request_turn_stop("eng-never-claimed").is_none());
+    assert!(!engine::turn_was_stopped("eng-never-claimed"));
 }
 
 /// The fake's `[slow]` hold is the only thing it does that takes time, and it is
@@ -3549,28 +3586,19 @@ fn running_turn_registry_round_trips() {
 
 /// A production harness cannot report "someone stopped me": killing its runtime
 /// ends the stream, and a dead stream is an `io` error or a `Failed` phase either
-/// way. So Stop records that it fired the handle, and the engine reads that to
-/// classify the outcome as an interrupt instead of a fault.
+/// way. So Stop records the intent against the claim, and the engine reads that
+/// to classify the outcome as an interrupt instead of a fault.
 #[test]
-fn taking_the_interrupt_for_a_stop_records_that_the_turn_was_stopped() {
+fn requesting_a_stop_records_that_the_turn_was_stopped() {
     let claim = engine::claim_turn("eng-stopped").expect("chat is free");
     engine::bind_turn_interrupt("eng-stopped", std::sync::Arc::new(|| {}));
     assert!(!engine::turn_was_stopped("eng-stopped"));
-    assert!(engine::take_turn_interrupt_for_stop("eng-stopped").is_some());
+    assert!(engine::request_turn_stop("eng-stopped").is_some());
     assert!(engine::turn_was_stopped("eng-stopped"));
+    // The mark lives and dies with the claim, so the next turn on this chat
+    // starts unmarked rather than inheriting the last one's cancellation.
     drop(claim);
     assert!(!engine::turn_was_stopped("eng-stopped"));
-}
-
-/// A turn nothing can interrupt keeps running, so a Stop against it must not
-/// leave a mark: attributing that turn's own later failure to a cancellation
-/// would tell the composer a broken turn was withdrawn on purpose.
-#[test]
-fn a_refused_stop_leaves_an_uninterruptible_turn_unmarked() {
-    let claim = engine::claim_turn("eng-stop-refused").expect("chat is free");
-    assert!(engine::take_turn_interrupt_for_stop("eng-stop-refused").is_none());
-    assert!(!engine::turn_was_stopped("eng-stop-refused"));
-    drop(claim);
 }
 
 /// ADR 0138 §1/§6: the claim, not the interrupt handle, is what says a turn is

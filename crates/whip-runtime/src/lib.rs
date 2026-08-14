@@ -9,8 +9,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use gaugedesk_core::ids::{AuthorityId, PublicKey};
@@ -530,6 +531,8 @@ impl WhipHarnessFactory {
             turn_sequence: 0,
             next_command_id: None,
             cancellation: Arc::new(Mutex::new(None)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            pursuing_cancel: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -692,6 +695,16 @@ struct WhipHarness {
     turn_sequence: u64,
     next_command_id: Option<String>,
     cancellation: Arc<Mutex<Option<HostCancellationHandle>>>,
+    /// That a cancellation has been asked for, held separately from the handle
+    /// that performs it. The handle exists only from `install_cancellation` to
+    /// the end of the turn, and the store refuses a request for an effect that
+    /// is not yet `running`, so a Stop can arrive at two moments where the
+    /// request cannot yet be made. Recording the *intent* lets those moments
+    /// resolve themselves instead of dropping the Stop.
+    cancel_requested: Arc<AtomicBool>,
+    /// Whether a deferred pursuit is already running, so pressing Stop twice
+    /// does not start a second one.
+    pursuing_cancel: Arc<AtomicBool>,
 }
 
 impl Harness for WhipHarness {
@@ -772,14 +785,15 @@ impl Harness for WhipHarness {
 
     fn interrupt_handle(&self) -> Option<gaugedesk_harness::InterruptHandle> {
         let cancellation = Arc::clone(&self.cancellation);
+        let requested = Arc::clone(&self.cancel_requested);
+        let pursuing = Arc::clone(&self.pursuing_cancel);
         Some(Arc::new(move || {
-            if let Some(handle) = cancellation
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_ref()
-            {
-                let _ = handle.request();
-            }
+            // The intent is recorded before the attempt, and never cleared by a
+            // failed attempt: `install_cancellation` reads it, so a Stop that
+            // beat the turn's cancellation surface into existence is performed
+            // the moment that surface appears rather than lost.
+            requested.store(true, Ordering::SeqCst);
+            pursue_cancellation(&cancellation, &pursuing);
         }))
     }
 }
@@ -865,6 +879,11 @@ impl WhipHarness {
             self.runtime
                 .cancellation_handle(&command.instance_ref, &command.command_id),
         );
+        // A Stop that landed during the turn's assembly found no handle here and
+        // returned having done nothing. It set the flag; this performs it.
+        if self.cancel_requested.load(Ordering::SeqCst) {
+            pursue_cancellation(&self.cancellation, &self.pursuing_cancel);
+        }
     }
 
     fn clear_cancellation(&self) {
@@ -872,7 +891,83 @@ impl WhipHarness {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
+        // A harness is reused across turns; one turn's Stop must not cancel the
+        // next. Dropping the handle is also what retires any pursuit still
+        // waiting on it.
+        self.cancel_requested.store(false, Ordering::SeqCst);
     }
+}
+
+/// How long a pursuit keeps asking. The effect became `running` within 38ms of
+/// the handle appearing in every measurement; this is slack, not an expectation.
+const CANCELLATION_PURSUIT: Duration = Duration::from_secs(10);
+
+/// The interval between attempts. Each is one small `IMMEDIATE` transaction on
+/// an independent connection.
+const CANCELLATION_RETRY: Duration = Duration::from_millis(20);
+
+/// Ask the runtime to cancel the running effect, and keep asking until it can
+/// accept.
+///
+/// One attempt is not enough. The store refuses a cancellation request for an
+/// effect that is not `running` — the kernel creates that row *after* the handle
+/// is installed — so a Stop arriving in between is answered
+/// `"effect does not exist"`. That error used to be discarded, which is what
+/// made a Stop report success while the turn ran on to completion.
+///
+/// The pursuit is bounded by the turn itself: it gives up as soon as the handle
+/// is cleared, which `clear_cancellation` does when the turn ends.
+fn pursue_cancellation(
+    cancellation: &Arc<Mutex<Option<HostCancellationHandle>>>,
+    pursuing: &Arc<AtomicBool>,
+) {
+    let Some(handle) = current_cancellation(cancellation) else {
+        // Not installed yet. `install_cancellation` reads the intent flag and
+        // calls this again, so there is nothing to pursue here.
+        return;
+    };
+    if handle.request().is_ok() {
+        return;
+    }
+    // Refused: the effect is not `running` yet. Not an error to report — the
+    // kernel simply has not created the row. A turn that is never cancelled
+    // despite this pursuit is caught by the engine, which can see the turn's
+    // outcome and says so there.
+    // Already being pursued: a second Stop press joins the first rather than
+    // racing it.
+    if pursuing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let cancellation = Arc::clone(cancellation);
+    let pursuing = Arc::clone(pursuing);
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + CANCELLATION_PURSUIT;
+        loop {
+            std::thread::sleep(CANCELLATION_RETRY);
+            let Some(handle) = current_cancellation(&cancellation) else {
+                // The turn ended under us. Whether it ended because an earlier
+                // attempt landed or for its own reasons, there is nothing left
+                // to cancel.
+                break;
+            };
+            if handle.request().is_ok() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        pursuing.store(false, Ordering::SeqCst);
+    });
+}
+
+fn current_cancellation(
+    cancellation: &Mutex<Option<HostCancellationHandle>>,
+) -> Option<HostCancellationHandle> {
+    cancellation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 fn project_turn_execution(
