@@ -46,7 +46,7 @@
           "/usr/share/doc/gauge-desk/changelog.gz": "linux/changelog.gz",
           "/usr/share/doc/gauge-desk/copyright": "linux/copyright"
         },
-        "provides": ["gauge-bench", "gaugebench"],
+        "provides": ["gauge-bench", "gaugebench", "gaugedesk"],
         "conflicts": ["gauge-bench", "gaugebench"],
         "replaces": ["gauge-bench", "gaugebench"]
       }
