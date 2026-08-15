@@ -33,6 +33,12 @@ pub trait RelayByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> RelayByteStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 pub type BoxedRelayByteStream = Box<dyn RelayByteStream>;
 
+/// How long a leg that has sent its `FIN` waits for the peer's `FIN`/`FIN-ACK`
+/// before closing the relay socket anyway. Bounds `shutdown` against a peer that
+/// died mid-crossing: without it, a crash on one side would hang the survivor's
+/// teardown, and that teardown now runs inside a request handler.
+const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Ordered byte stream backed by bounded binary WebSocket frames. Closing or
 /// dropping it terminates the pump; no reconnect can silently join two TLS
 /// streams. Callers retry by establishing a fresh pinned-TLS session.
@@ -42,7 +48,19 @@ pub struct WebSocketByteStream {
     // duplex side, allowing the pump to flush already accepted bytes and send
     // the WebSocket close in order. Aborting here would discard the final
     // application frame after a successful `shutdown`.
-    _pump: tokio::task::JoinHandle<()>,
+    //
+    // `shutdown` drives it to completion instead of detaching, so a caller that
+    // shuts down cleanly knows the relay has been told the leg is finished. A
+    // route handle is derived from the authority pair alone, so the *next*
+    // crossing between the same two authorities is the same route object and
+    // arrives at a route still holding two legs if this is left in flight. That
+    // is what answered `409 route already has two legs` to a second
+    // `/federation/run/place`, with both legs of the previous crossing already
+    // shut down at their own ends.
+    //
+    // An `Option` because a `JoinHandle` may be polled to completion only once;
+    // dropping it still detaches, which is what an un-shut-down stream wants.
+    pump: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AsyncRead for WebSocketByteStream {
@@ -71,11 +89,29 @@ impl AsyncWrite for WebSocketByteStream {
         std::pin::Pin::new(&mut self.stream).poll_flush(cx)
     }
 
+    /// Returns once the relay has been told this leg is finished, not merely
+    /// once the local side stopped writing.
+    ///
+    /// Closing the duplex side makes the pump send `FIN`, exchange `FIN-ACK`,
+    /// and close the WebSocket — but the pump is a detached task, so a caller
+    /// that shut down and moved on used to race its own teardown. The pump
+    /// bounds that wait itself (`TEARDOWN_GRACE`), so a dead peer delays this by
+    /// seconds rather than indefinitely.
     fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+        // Every field is `Unpin`, so the projection is a plain borrow.
+        let this = self.get_mut();
+        std::task::ready!(std::pin::Pin::new(&mut this.stream).poll_shutdown(cx))?;
+        let Some(pump) = this.pump.as_mut() else {
+            return std::task::Poll::Ready(Ok(()));
+        };
+        // A pump that panicked or was cancelled still means the leg is over, so
+        // the join result is deliberately not an error here.
+        let _joined = std::task::ready!(std::future::Future::poll(std::pin::Pin::new(pump), cx));
+        this.pump = None;
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -143,16 +179,31 @@ where
         let mut sent_fin = false;
         let mut received_fin = false;
         let mut fin_acknowledged = false;
+        // Set once this side has sent its `FIN`. `shutdown` waits on this task
+        // now, so a peer that died mid-crossing must not be able to hold the
+        // waiter open: after the grace the socket closes regardless, which is
+        // what tells the relay the leg is free.
+        let mut teardown_deadline = None;
         loop {
             if sent_fin && received_fin && fin_acknowledged {
                 let _ = socket.close(None).await;
                 break;
             }
             tokio::select! {
+                () = async {
+                    match teardown_deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = socket.close(None).await;
+                    break;
+                }
                 read = pump_side.read(&mut outgoing), if !sent_fin => {
                     match read {
                         Ok(0) => {
                             sent_fin = true;
+                            teardown_deadline = Some(tokio::time::Instant::now() + TEARDOWN_GRACE);
                             if socket.send(Message::Binary(vec![WSS_FIN].into())).await.is_err() {
                                 break;
                             }
@@ -201,7 +252,7 @@ where
     });
     Ok(WebSocketByteStream {
         stream: application,
-        _pump: pump,
+        pump: Some(pump),
     })
 }
 
@@ -1047,5 +1098,127 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         HomeRelayConfig::load_or_mint(directory.path(), "wss://relay.example").unwrap();
         assert!(HomeRelayConfig::load_or_mint(directory.path(), "wss://other.example").is_err());
+    }
+
+    /// A clean teardown completes through the `FIN` exchange, not by waiting out
+    /// the dead-peer grace.
+    ///
+    /// Deliberately *not* the regression test for the detached pump: it passes
+    /// against the old fire-and-forget `shutdown` too, because the detached
+    /// pump still delivered the close, just later than its caller. Checked by
+    /// mutation, so the name claims only what it proves.
+    /// `a_dead_peer_bounds_the_survivors_teardown` is the test that fails when
+    /// `shutdown` stops waiting for the pump.
+    ///
+    /// What this guards is the cost: `shutdown` now runs inside a request
+    /// handler, so a break in `FIN`/`FIN-ACK` handling that quietly routed every
+    /// teardown through the grace would put five seconds into every crossing.
+    #[tokio::test]
+    async fn a_clean_crossing_tears_down_without_waiting_out_the_grace() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let relay = tokio::spawn(async move {
+            let (source_tcp, _) = listener.accept().await.unwrap();
+            let mut source = accept_async(source_tcp).await.unwrap();
+            let (target_tcp, _) = listener.accept().await.unwrap();
+            let mut target = accept_async(target_tcp).await.unwrap();
+            let _ = source.next().await.unwrap().unwrap();
+            let _ = target.next().await.unwrap().unwrap();
+            source
+                .send(Message::Binary(WSS_READY.to_vec().into()))
+                .await
+                .unwrap();
+            target
+                .send(Message::Binary(WSS_READY.to_vec().into()))
+                .await
+                .unwrap();
+            // Splice until the source's WebSocket close arrives. That close is
+            // the event the next crossing's admission depends on.
+            loop {
+                tokio::select! {
+                    from_source = source.next() => match from_source {
+                        Some(Ok(Message::Binary(bytes))) => {
+                            target.send(Message::Binary(bytes)).await.unwrap();
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        _ => {}
+                    },
+                    from_target = target.next() => match from_target {
+                        Some(Ok(Message::Binary(bytes))) => {
+                            source.send(Message::Binary(bytes)).await.unwrap();
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        _ => {}
+                    },
+                }
+            }
+            let _ = closed_tx.send(());
+        });
+
+        let route = one_shot_websocket_route(&format!("ws://{address}"), [7u8; TOKEN_LEN]).unwrap();
+        // Both legs must be in flight together: `READY` is what pairing sends,
+        // so connecting them in sequence deadlocks on the first one's wait.
+        let (source, target) = tokio::join!(
+            connect_websocket_stream(&route, WebSocketRelayRole::Source),
+            connect_websocket_stream(&route, WebSocketRelayRole::Target),
+        );
+        let mut source = source.unwrap();
+        let mut target = target.unwrap();
+
+        // Both ends shut down, exactly as a completed crossing does.
+        let started = tokio::time::Instant::now();
+        let (source_shutdown, target_shutdown) = tokio::join!(source.shutdown(), target.shutdown());
+        source_shutdown.unwrap();
+        target_shutdown.unwrap();
+
+        // The relay observes the close essentially at once, because it was
+        // already sent before shutdown returned. A bound rather than
+        // `now_or_never`: the relay is another task and still has to be polled,
+        // so an immediate probe would be testing the scheduler.
+        tokio::time::timeout(Duration::from_secs(2), closed_rx)
+            .await
+            .expect("the relay was never told the leg was finished")
+            .expect("the relay task ended without reporting the close");
+        // And it got there by completing the `FIN` exchange, not by waiting out
+        // the dead-peer deadline.
+        assert!(
+            started.elapsed() < TEARDOWN_GRACE,
+            "a clean teardown should not need the grace period",
+        );
+        relay.await.unwrap();
+    }
+
+    /// A peer that dies mid-crossing must not hold the survivor's teardown
+    /// open: `shutdown` now runs inside a request handler.
+    #[tokio::test]
+    async fn a_dead_peer_bounds_the_survivors_teardown() {
+        tokio::time::pause();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(tcp).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Binary(WSS_READY.to_vec().into()))
+                .await
+                .unwrap();
+            // Never answers the `FIN`: the peer is gone.
+            std::future::pending::<()>().await;
+        });
+
+        let route = one_shot_websocket_route(&format!("ws://{address}"), [9u8; TOKEN_LEN]).unwrap();
+        let mut leg = connect_websocket_stream(&route, WebSocketRelayRole::Source)
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        leg.shutdown().await.unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited >= TEARDOWN_GRACE && waited < TEARDOWN_GRACE * 3,
+            "teardown waited {waited:?}, which is not the bounded grace",
+        );
+        relay.abort();
     }
 }

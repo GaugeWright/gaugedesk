@@ -46,6 +46,10 @@ web-sys = { version = "0.3", features = ["BinaryType", "CloseEvent", "ErrorEvent
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` gives the teardown-grace test a paused clock, so proving the bound
+# exists costs no wall time. Dev-only: a paused clock must never reach a build
+# that ships.
+tokio = { version = "1", features = ["test-util"] }
 
 # The integration tests drive a real relay, which lives behind `test-relay` so it
 # never ships. A self dev-dependency turns the feature on for this crate's own

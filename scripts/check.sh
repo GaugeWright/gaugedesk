@@ -284,6 +284,16 @@ run_desktop() {
     echo "   pull request. To close the gap locally: sudo apt-get install -y $missing" >&2
 }
 
+# The release ships an MSI, and every gate above is Linux, so a change breaking
+# the Windows build passes all of them and fails at release (DEVOPS.md OPS-26).
+# The command lives in the script because the `windows-compiles` CI job runs
+# that same script, so the two cannot drift. On a non-Windows host it says why
+# it cannot answer instead of passing silently.
+run_windows() {
+    echo "== windows compile =="
+    scripts/check-windows-compile.sh
+}
+
 # The mobile shell is a third cargo workspace, and it had the same two problems
 # the desktop one did: its lockfile had drifted from its manifest, and nothing
 # compiled it on a change — only `mobile-release.yml`, on dispatch.
@@ -362,14 +372,15 @@ run_mobile() {
 }
 
 case "$section" in
-    all) run_contracts; run_dependencies; run_rust; run_web; run_desktop best-effort; run_mobile best-effort ;;
+    all) run_contracts; run_dependencies; run_rust; run_web; run_desktop best-effort; run_mobile best-effort; run_windows ;;
     contracts) run_contracts ;;
     dependencies) run_dependencies ;;
     desktop) run_desktop ;;
     mobile) run_mobile ;;
     rust) run_rust ;;
     web) run_web ;;
-    *) echo "usage: scripts/check.sh [all|contracts|dependencies|desktop|mobile|rust|web]" >&2; exit 2 ;;
+    windows) run_windows ;;
+    *) echo "usage: scripts/check.sh [all|contracts|dependencies|desktop|mobile|rust|web|windows]" >&2; exit 2 ;;
 esac
 
 echo "== gaugedesk green bar PASSED ($section) =="
