@@ -1614,8 +1614,21 @@ pub fn send_publisher_request_with(
     if (200..300).contains(&status) {
         Ok(response)
     } else {
+        // The status the edge actually gave, recorded where it is still known.
+        //
+        // Everything downstream loses it. This message inlines the edge's
+        // response body, so the `502` it becomes carries a payload large enough
+        // that Cloudflare — in front of this Home — judges the reply invalid or
+        // incomplete and substitutes its own error page. The canary then reports
+        // Cloudflare's sentence, which names no origin and no status, and the
+        // first failure in the chain is unrecoverable from any log.
+        //
+        // Status and method only: a path here carries a deployment id, and this
+        // is a diagnostic rather than an audit trail.
+        tracing::warn!(status, method, "edge publisher rejected a command");
         Err(io::Error::other(format!(
-            "edge publisher rejected command ({status}): {response}"
+            "edge publisher rejected command ({status}): {}",
+            bounded_upstream(&response)
         )))
     }
 }
@@ -1670,6 +1683,30 @@ fn send_publisher_response_with(
             Ok((status, detail))
         }
         Err(error) => Err(io::Error::other(error)),
+    }
+}
+
+/// The upstream's explanation, bounded to a diagnostic.
+///
+/// This string is inlined into an error that becomes a `502` response body. An
+/// edge behind Cloudflare answers a rejection with a full HTML error page, so
+/// inlining it whole made the Home's reply large enough to be worth nobody's
+/// time to read and — with Cloudflare in front of this Home — large enough to
+/// be judged invalid or incomplete and replaced by Cloudflare's own error page.
+/// The reply that named the failing origin was therefore the reply most likely
+/// to be discarded before anyone saw it.
+///
+/// Whitespace is collapsed before the bound because a character bound is not a
+/// line bound: 400 characters of pretty-printed HTML is still 400 log lines.
+fn bounded_upstream(response: &str) -> String {
+    const LIMIT: usize = 300;
+    let flattened = response.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.is_empty() {
+        return "(no response body)".to_owned();
+    }
+    match flattened.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}… (truncated)", &flattened[..cut]),
+        None => flattened,
     }
 }
 
@@ -1877,5 +1914,37 @@ mod publisher_tests {
         );
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].path, "discipline/discipline.json");
+    }
+
+    /// The rejection body is a diagnostic, not a payload.
+    ///
+    /// An edge behind Cloudflare answers with a full HTML error page. Inlined
+    /// whole, that made the Home's `502` large enough for Cloudflare to judge
+    /// the reply invalid or incomplete and substitute its own error page — so
+    /// the canary reported Cloudflare's sentence, which names neither the
+    /// origin nor its status, and the first failure in the chain was lost.
+    #[test]
+    fn an_upstream_rejection_is_bounded_to_a_diagnostic() {
+        assert_eq!(
+            bounded_upstream("collection not ready"),
+            "collection not ready"
+        );
+        assert_eq!(bounded_upstream(""), "(no response body)");
+        assert_eq!(bounded_upstream("   \n\t "), "(no response body)");
+
+        // A character bound is not a line bound.
+        assert_eq!(bounded_upstream("a\n\nb   c"), "a b c");
+
+        // The shape that caused this: a large HTML page.
+        let page = format!("<html>{}</html>", "x".repeat(5_000));
+        let bounded = bounded_upstream(&page);
+        assert!(bounded.len() < 340, "still {} bytes", bounded.len());
+        assert!(bounded.ends_with("… (truncated)"));
+        // Enough survives to name the upstream.
+        assert!(bounded.starts_with("<html>"));
+
+        // Multibyte text must not be cut mid-character.
+        let wide = bounded_upstream(&"é".repeat(5_000));
+        assert!(wide.ends_with("… (truncated)"));
     }
 }
