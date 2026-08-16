@@ -22,6 +22,7 @@ pub mod content_erasure;
 pub mod delegation;
 pub mod deployment_entitlement;
 pub mod device_enrollment;
+pub mod envelope_supply;
 pub mod federated_delivery;
 pub mod federated_envelope;
 pub mod federation;

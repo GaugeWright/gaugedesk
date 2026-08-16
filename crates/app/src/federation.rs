@@ -4066,6 +4066,55 @@ fn admit_run_place(
                     "the run's deployment mode is not admitted by this org's placement policy",
                 );
             }
+            // ADR 0139 §5 layer 3 (SUPPLY-1..3): assemble the envelope set this
+            // run is governed by. Restrict-only like the two layers above, and
+            // last only because it is the one that needs the set assembled
+            // first. Derivation reads records this home holds, never the
+            // submission — a set the submitter names is a set it can shorten.
+            let host = guard.authority().clone();
+            let host_root = FileKeyStore::new(guard_root(&guard).join("keys"))
+                .signing_key(&host)
+                .public_key();
+            // Today the host executes its own admitted runs, so the executor
+            // coincides with it and the set absorbs the duplicate. Once
+            // execution is leased off-box they diverge, and the authority
+            // running the code is a stakeholder in what it can observe.
+            let executor = host.clone();
+            let stakeholders = match crate::envelope_supply::derive_stakeholders(
+                guard.store_ref(),
+                wire.target_chat.as_deref(),
+                &host,
+                &executor,
+            ) {
+                Ok(stakeholders) => stakeholders,
+                Err(refusal) => return refused(&refusal.to_string()),
+            };
+            let supplied =
+                crate::envelope_supply::registered_envelopes(guard.store_ref(), &wire.project);
+            let federation = guard.federation_ref();
+            let supply = match gaugedesk_core::envelope_supply::assemble(
+                &stakeholders,
+                &supplied,
+                |authority| {
+                    crate::envelope_supply::root_key_of(federation, &host, &host_root, authority)
+                },
+            ) {
+                Ok(supply) => supply,
+                Err(refusal) => return refused(&refusal.to_string()),
+            };
+            // The evidence a composed run cites. Recorded whether or not any
+            // stakeholder supplied policy: an empty record beside a populated
+            // roster is the durable statement that every party was ungoverned,
+            // which is exactly what must not be indistinguishable from a set
+            // that was never assembled. Fail-closed, unlike the admission
+            // queue's best-effort append beside it — a run admitted without this
+            // is a run whose governance cannot be audited afterwards, and that
+            // is the question the record exists to answer.
+            if crate::envelope_supply::record_supply(guard.store_mut(), &wire.correlation, &supply)
+                .is_err()
+            {
+                return refused("the run's envelope set could not be recorded");
+            }
         } else {
             // Fail-closed: queue the run for the host's decision (the admission queue).
             record_pending_run(guard.store_mut(), wire);

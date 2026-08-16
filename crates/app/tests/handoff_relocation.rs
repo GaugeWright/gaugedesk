@@ -1315,3 +1315,199 @@ async fn relocating_to_an_unpaired_peer_is_refused() {
         "a relocation to an unpaired peer is refused before any transport"
     );
 }
+
+// --- Envelope supply at admission (ADR 0139 §5 layer 3, SUPPLY-1..3) --------
+
+/// Grant alice a standing allow on `project` at bob, and place a run. Returns
+/// the placement's `(status, body)`.
+async fn allow_and_place(alice: &Router, bob: &Router, project: &str) -> (StatusCode, Value) {
+    let (allow, _) = post(
+        bob,
+        "/federation/run/allow",
+        json!({ "project": project, "operator": "alice" }),
+    )
+    .await;
+    assert_eq!(allow, StatusCode::OK);
+    post(
+        alice,
+        "/federation/run/place",
+        json!({ "peer": "bob", "project": project, "archetype": "analyst",
+                "data_handle": "folder://acme", "prompt": "go" }),
+    )
+    .await
+}
+
+/// Bob's governance root public key — the one an envelope of bob's must be
+/// signed by (ADR 0139 §3).
+fn root_pubkey(root: &tempfile::TempDir, authority: &str) -> gaugedesk_core::ids::PublicKey {
+    use gaugedesk_app::key_store::{FileKeyStore, KeyStore};
+    FileKeyStore::new(root.path().join("keys"))
+        .signing_key(&AuthorityId::new(authority))
+        .public_key()
+}
+
+fn envelope(
+    authority: &str,
+    signer: gaugedesk_core::ids::PublicKey,
+) -> gaugedesk_app::envelope_supply::EnvelopeRecord {
+    gaugedesk_app::envelope_supply::EnvelopeRecord {
+        authority: AuthorityId::new(authority),
+        envelope_hash: format!("hash-{authority}"),
+        envelope_version: 1,
+        epoch: 3,
+        signer,
+    }
+}
+
+#[tokio::test]
+async fn an_admitted_run_records_the_envelope_set_it_was_checked_under() {
+    // ADR 0139's evidence consequence: "which policies was this checked under"
+    // is answerable after the fact rather than reconstructed. With nobody
+    // supplying policy the record is empty and the roster is not — and an empty
+    // record beside a populated roster is exactly the statement that must not be
+    // indistinguishable from a set that was never assembled (§2).
+    std::env::set_var("GAUGEDESK_FAKE_AGENT", "1");
+    let (broker, _relay) = start_broker().await;
+    let (alice, _wa, _ra) = instance("alice", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let (status, body) = allow_and_place(&alice, &bob, "supply-evidence").await;
+    assert_eq!(status, StatusCode::OK, "allowed run executes: {body}");
+    let correlation = body["correlation"]
+        .as_str()
+        .expect("correlation")
+        .to_string();
+
+    let guard = bob_wb.lock().unwrap();
+    let supply = gaugedesk_app::envelope_supply::supply_for(guard.store_ref(), &correlation)
+        .expect("an admitted run records its supply");
+    assert_eq!(
+        supply.roster.len(),
+        1,
+        "the host is a stakeholder in every run it admits: {supply:?}"
+    );
+    assert_eq!(supply.roster[0].authority.as_str(), "bob");
+    assert!(!supply.roster[0].governed, "bob supplied no envelope");
+    assert!(supply.record.is_empty(), "nothing was checked under policy");
+    assert_eq!(supply.ungoverned().len(), 1);
+}
+
+#[tokio::test]
+async fn a_root_signed_envelope_enters_the_composition_record() {
+    // The positive path for SUPPLY-2/3: an envelope signed by the authority's
+    // governance root is carried in the record, and its stakeholder flips to
+    // governed in the roster. The two lists agree, which is what makes either
+    // one readable.
+    std::env::set_var("GAUGEDESK_FAKE_AGENT", "1");
+    let (broker, _relay) = start_broker().await;
+    let (alice, _wa, _ra) = instance("alice", &broker);
+    let (bob, bob_wb, rb) = instance("bob", &broker);
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    {
+        let mut guard = bob_wb.lock().unwrap();
+        gaugedesk_app::envelope_supply::register_envelope(
+            guard.store_mut(),
+            "supply-governed",
+            &envelope("bob", root_pubkey(&rb, "bob")),
+        )
+        .unwrap();
+    }
+
+    let (status, body) = allow_and_place(&alice, &bob, "supply-governed").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a root-signed envelope admits: {body}"
+    );
+    let correlation = body["correlation"]
+        .as_str()
+        .expect("correlation")
+        .to_string();
+
+    let guard = bob_wb.lock().unwrap();
+    let supply = gaugedesk_app::envelope_supply::supply_for(guard.store_ref(), &correlation)
+        .expect("supply recorded");
+    assert_eq!(supply.record.len(), 1, "{supply:?}");
+    assert_eq!(supply.record[0].authority.as_str(), "bob");
+    assert_eq!(supply.record[0].envelope_hash, "hash-bob");
+    assert_eq!(supply.record[0].epoch, 3);
+    assert!(
+        supply.roster[0].governed,
+        "the roster agrees with the record"
+    );
+    assert!(supply.ungoverned().is_empty());
+}
+
+#[tokio::test]
+async fn a_subkey_signed_envelope_refuses_the_run() {
+    // ADR 0139 §3: a policy revision is not a crossing. A device subkey chains to
+    // the root and signs every crossing, and must still not be able to author
+    // policy — otherwise a stolen laptop is a policy author for its authority.
+    std::env::set_var("GAUGEDESK_FAKE_AGENT", "1");
+    let (broker, _relay) = start_broker().await;
+    let (alice, _wa, _ra) = instance("alice", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    {
+        let mut guard = bob_wb.lock().unwrap();
+        // Any key that is not bob's governance root — a device subkey is one.
+        let not_the_root = gaugedesk_core::ids::PublicKey::new("04deadbeef");
+        gaugedesk_app::envelope_supply::register_envelope(
+            guard.store_mut(),
+            "supply-subkey",
+            &envelope("bob", not_the_root),
+        )
+        .unwrap();
+    }
+
+    let (status, body) = allow_and_place(&alice, &bob, "supply-subkey").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["status"], "refused");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("governance root"),
+        "the refusal names the tripped constraint: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_envelope_for_a_non_stakeholder_refuses_the_run() {
+    // The direction ADR 0139 §2 fails closed on: an authority in the record but
+    // not the roster means this side's derivation and its supply disagree about
+    // who has a stake, and the one that can be influenced from outside is the
+    // supply.
+    std::env::set_var("GAUGEDESK_FAKE_AGENT", "1");
+    let (broker, _relay) = start_broker().await;
+    let (alice, _wa, _ra) = instance("alice", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    {
+        let mut guard = bob_wb.lock().unwrap();
+        gaugedesk_app::envelope_supply::register_envelope(
+            guard.store_mut(),
+            "supply-stranger",
+            &envelope("carol", gaugedesk_core::ids::PublicKey::new("04c0ffee")),
+        )
+        .unwrap();
+    }
+
+    let (status, body) = allow_and_place(&alice, &bob, "supply-stranger").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not a derived stakeholder"),
+        "the refusal names the tripped constraint: {body}"
+    );
+}
