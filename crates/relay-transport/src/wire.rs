@@ -29,6 +29,20 @@ pub const WSS_PROTOCOL_VERSION: u16 = 1;
 pub const WSS_MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const WSS_STREAM_BUFFER_BYTES: usize = 256 * 1024;
 pub const WSS_HANDSHAKE_LEN: usize = 84;
+/// Handshake flag bit 1: this leg sends relay keepalives and may therefore be
+/// judged on its silence. The relay accepts the bit but requires *both* legs to
+/// set it before it holds either to that standard, so setting it is safe and
+/// not setting it costs only the bound.
+///
+/// The relay rejected this bit outright until it shipped support, so a client
+/// that sets it can never reach an older relay. That ordering is why the edge
+/// half landed first.
+pub const WSS_KEEPALIVE_FLAG: u8 = 2;
+/// The liveness exchange. Text, because the relay serves it from its Durable
+/// Object auto-response: the ping never reaches the object's message handler,
+/// never wakes it, and is never forwarded to the peer.
+pub const WSS_KEEPALIVE_REQUEST: &str = "GWRPING";
+pub const WSS_KEEPALIVE_RESPONSE: &str = "GWRPONG";
 pub(crate) const WSS_HANDSHAKE_MAGIC: [u8; 8] = *b"GWRWSS1\n";
 pub(crate) const WSS_READY: [u8; 8] = *b"GWRREADY";
 pub(crate) const WSS_DATA: u8 = 0;
@@ -61,6 +75,14 @@ pub enum OneShotLeg {
 impl WebSocketRelayRole {
     pub fn is_initializer(self) -> bool {
         matches!(self, Self::Home | Self::Source)
+    }
+
+    /// Durable legs only. A Home/client route is legitimately idle for hours,
+    /// so without keepalives nothing can tell a quiet session from a dead one,
+    /// and the relay bounds neither. A one-shot crossing is bounded work and
+    /// already has a crossing expiry, so pinging it would buy nothing.
+    pub fn sends_keepalives(self) -> bool {
+        matches!(self, Self::Home | Self::Client)
     }
 }
 
@@ -166,7 +188,12 @@ pub fn websocket_handshake(
     frame[..8].copy_from_slice(&WSS_HANDSHAKE_MAGIC);
     frame[8..10].copy_from_slice(&WSS_PROTOCOL_VERSION.to_be_bytes());
     frame[10] = role as u8;
-    frame[11] = u8::from(route.previous_proof.is_some());
+    frame[11] = u8::from(route.previous_proof.is_some())
+        | if role.sends_keepalives() {
+            WSS_KEEPALIVE_FLAG
+        } else {
+            0
+        };
     frame[12..20].copy_from_slice(&route.epoch.to_be_bytes());
     frame[20..52].copy_from_slice(route.proof.as_bytes());
     if let Some(previous) = route.previous_proof {
@@ -377,7 +404,10 @@ mod tests {
         assert_eq!(&frame[..8], &WSS_HANDSHAKE_MAGIC);
         assert_eq!(&frame[8..10], &WSS_PROTOCOL_VERSION.to_be_bytes());
         assert_eq!(frame[10], WebSocketRelayRole::Client as u8);
-        assert_eq!(frame[11], 0);
+        // A client is a durable leg, so it promises keepalives. The relay
+        // rejected this bit until it shipped support, which is why the edge half
+        // deployed before this one.
+        assert_eq!(frame[11], WSS_KEEPALIVE_FLAG);
         assert_eq!(&frame[12..20], &3u64.to_be_bytes());
         assert_eq!(&frame[20..52], &[9u8; 32]);
     }
@@ -390,7 +420,8 @@ mod tests {
         assert!(websocket_handshake(&rotating, WebSocketRelayRole::Target).is_err());
         let frame =
             websocket_handshake(&rotating, WebSocketRelayRole::Home).expect("initializer rotates");
-        assert_eq!(frame[11], 1);
+        // Rotating and promising keepalives are independent bits, both set here.
+        assert_eq!(frame[11], 1 | WSS_KEEPALIVE_FLAG);
         assert_eq!(&frame[52..84], &[1u8; 32]);
     }
 
@@ -480,5 +511,38 @@ mod tests {
     #[test]
     fn a_data_frame_carries_its_kind_byte() {
         assert_eq!(data_frame(&[7, 8]), vec![WSS_DATA, 7, 8]);
+    }
+
+    /// Only a durable leg promises keepalives, and the promise is what the relay
+    /// judges silence against. A one-shot crossing is bounded work with its own
+    /// expiry, so pinging it would buy nothing.
+    #[test]
+    fn only_durable_legs_promise_keepalives() {
+        assert!(WebSocketRelayRole::Home.sends_keepalives());
+        assert!(WebSocketRelayRole::Client.sends_keepalives());
+        assert!(!WebSocketRelayRole::Source.sends_keepalives());
+        assert!(!WebSocketRelayRole::Target.sends_keepalives());
+    }
+
+    /// The flags byte carries rotation in bit 0 and the keepalive promise in
+    /// bit 1. The relay rejected bit 1 outright until it shipped support, so
+    /// setting it here can never reach an older relay — the edge half deployed
+    /// first, and this test is the record of why that order was required.
+    #[test]
+    fn the_keepalive_promise_rides_beside_rotation_without_disturbing_it() {
+        let route = route();
+        let durable = websocket_handshake(&route, WebSocketRelayRole::Home).expect("handshake");
+        assert_eq!(durable[11], WSS_KEEPALIVE_FLAG, "a durable leg promises");
+        let crossing = websocket_handshake(&route, WebSocketRelayRole::Source).expect("handshake");
+        assert_eq!(crossing[11], 0, "a crossing promises nothing");
+
+        // Rotating and promising at once must set both bits, not one.
+        let mut rotating = route;
+        rotating.previous_proof = Some(RouteProof::new([9u8; 32]));
+        let both = websocket_handshake(&rotating, WebSocketRelayRole::Home).expect("handshake");
+        assert_eq!(both[11], 1 | WSS_KEEPALIVE_FLAG);
+        // And the relay refuses anything outside those two bits, so no third
+        // meaning can be smuggled into this byte.
+        assert_eq!(both[11] & !(1 | WSS_KEEPALIVE_FLAG), 0);
     }
 }

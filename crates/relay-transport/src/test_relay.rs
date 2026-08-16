@@ -265,7 +265,11 @@ fn parse_handshake(bytes: &[u8]) -> std::io::Result<Handshake> {
         _ => return Err(invalid("unknown relay role")),
     };
     let flags = bytes[11];
-    if flags & !1 != 0 {
+    // Bit 1 is the keepalive promise. This relay serves no auto-response and
+    // holds nobody to their silence, so it accepts the bit and ignores it —
+    // but it must accept it, or every durable leg fails its handshake here
+    // while succeeding against the edge.
+    if flags & !(1 | crate::wire::WSS_KEEPALIVE_FLAG) != 0 {
         return Err(invalid("relay handshake flags are invalid"));
     }
     let epoch = u64::from_be_bytes(bytes[12..20].try_into().expect("fixed epoch"));

@@ -24,8 +24,8 @@ use crate::wire;
 use crate::wire::{
     invalid_data, one_shot_websocket_route, other, websocket_handshake, CertFingerprint,
     OneShotLeg, RouteProof, WebSocketRelayRole, WebSocketRelayRoute, PIN_SNI, TOKEN_LEN, WSS_DATA,
-    WSS_FIN, WSS_FIN_ACK, WSS_HANDSHAKE_LEN, WSS_MAX_FRAME_BYTES, WSS_READY,
-    WSS_STREAM_BUFFER_BYTES,
+    WSS_FIN, WSS_FIN_ACK, WSS_HANDSHAKE_LEN, WSS_KEEPALIVE_REQUEST, WSS_KEEPALIVE_RESPONSE,
+    WSS_MAX_FRAME_BYTES, WSS_READY, WSS_STREAM_BUFFER_BYTES,
 };
 
 /// Type-erased ordered byte stream used by the enrollment/federation shells.
@@ -38,6 +38,14 @@ pub type BoxedRelayByteStream = Box<dyn RelayByteStream>;
 /// died mid-crossing: without it, a crash on one side would hang the survivor's
 /// teardown, and that teardown now runs inside a request handler.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a durable leg tells the relay it is alive.
+///
+/// The relay closes a pair that has promised keepalives and then gone silent
+/// for `IDLE_MILLIS` — 150s at the edge — so this must stay comfortably under a
+/// fifth of it. The ping is served by the relay's auto-response: it never wakes
+/// the Durable Object and is never forwarded to the peer.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Ordered byte stream backed by bounded binary WebSocket frames. Closing or
 /// dropping it terminates the pump; no reconnect can silently join two TLS
@@ -123,7 +131,7 @@ pub async fn connect_websocket_stream(
     let (socket, _) = tokio_tungstenite::connect_async(route.url()?)
         .await
         .map_err(|error| other(format!("connect relay WebSocket: {error}")))?;
-    websocket_stream_from_socket(socket, handshake).await
+    websocket_stream_from_socket(socket, handshake, role.sends_keepalives()).await
 }
 
 /// Connect a bounded enrollment/federation leg through the canonical WSS
@@ -152,6 +160,7 @@ pub async fn connect_one_shot(
 async fn websocket_stream_from_socket<S>(
     mut socket: tokio_tungstenite::WebSocketStream<S>,
     handshake: [u8; WSS_HANDSHAKE_LEN],
+    keepalive: bool,
 ) -> std::io::Result<WebSocketByteStream>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -184,6 +193,8 @@ where
         // waiter open: after the grace the socket closes regardless, which is
         // what tells the relay the leg is free.
         let mut teardown_deadline = None;
+        // `None` for a one-shot crossing, which is bounded by its own expiry.
+        let mut keepalive_at = keepalive.then(|| tokio::time::Instant::now() + KEEPALIVE_INTERVAL);
         loop {
             if sent_fin && received_fin && fin_acknowledged {
                 let _ = socket.close(None).await;
@@ -198,6 +209,25 @@ where
                 } => {
                     let _ = socket.close(None).await;
                     break;
+                }
+                // Only a leg that set the handshake flag speaks here, because
+                // only such a leg is judged on its silence. Stops once this side
+                // has sent its `FIN`: the leg is closing, and a ping after that
+                // says nothing useful.
+                () = async {
+                    match keepalive_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                }, if !sent_fin => {
+                    keepalive_at = Some(tokio::time::Instant::now() + KEEPALIVE_INTERVAL);
+                    if socket
+                        .send(Message::Text(WSS_KEEPALIVE_REQUEST.into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 read = pump_side.read(&mut outgoing), if !sent_fin => {
                     match read {
@@ -243,6 +273,14 @@ where
                         }
                         Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                         Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                        // The relay's auto-response to a keepalive, or — from a
+                        // relay that does not serve one — a peer's ping
+                        // forwarded verbatim. Text used to fall through to the
+                        // catch-all below and tear the leg down, so both had to
+                        // become expected before any ping could be sent.
+                        Some(Ok(Message::Text(text)))
+                            if text.as_str() == WSS_KEEPALIVE_RESPONSE
+                                || text.as_str() == WSS_KEEPALIVE_REQUEST => {}
                         _ => break,
                     }
                 }
@@ -741,7 +779,9 @@ mod tests {
         assert_eq!(&frame[..8], b"GWRWSS1\n");
         assert_eq!(u16::from_be_bytes(frame[8..10].try_into().unwrap()), 1);
         assert_eq!(frame[10], WebSocketRelayRole::Home as u8);
-        assert_eq!(frame[11], 0);
+        // A Home is durable, so it promises keepalives; the edge accepts the bit
+        // and holds a pair to it only when both legs set it.
+        assert_eq!(frame[11], crate::wire::WSS_KEEPALIVE_FLAG);
         assert_eq!(u64::from_be_bytes(frame[12..20].try_into().unwrap()), 9);
         assert_eq!(&frame[20..52], &[7; 32]);
         assert_eq!(&frame[52..84], &[0; 32]);
@@ -753,7 +793,8 @@ mod tests {
             ..route
         };
         let frame = websocket_handshake(&rotated, WebSocketRelayRole::Home).unwrap();
-        assert_eq!(frame[11], 1);
+        // Rotation and the keepalive promise are independent bits.
+        assert_eq!(frame[11], 1 | crate::wire::WSS_KEEPALIVE_FLAG);
         assert_eq!(&frame[20..52], &[8; 32]);
         assert_eq!(&frame[52..84], &[7; 32]);
         assert!(websocket_handshake(&rotated, WebSocketRelayRole::Client).is_err());
@@ -881,16 +922,24 @@ mod tests {
         let websocket_url = format!("ws://{address}/v1/relay/{}", route.handle);
         let home_connect = async {
             let (socket, _) = connect_async(&websocket_url).await.unwrap();
-            let stream = websocket_stream_from_socket(socket, home_handshake)
-                .await
-                .unwrap();
+            let stream = websocket_stream_from_socket(
+                socket,
+                home_handshake,
+                WebSocketRelayRole::Home.sends_keepalives(),
+            )
+            .await
+            .unwrap();
             stream
         };
         let client_connect = async {
             let (socket, _) = connect_async(&websocket_url).await.unwrap();
-            let stream = websocket_stream_from_socket(socket, client_handshake)
-                .await
-                .unwrap();
+            let stream = websocket_stream_from_socket(
+                socket,
+                client_handshake,
+                WebSocketRelayRole::Client.sends_keepalives(),
+            )
+            .await
+            .unwrap();
             stream
         };
         let (home_stream, client_stream) = tokio::join!(home_connect, client_connect);
@@ -1220,5 +1269,97 @@ mod tests {
             "teardown waited {waited:?}, which is not the bounded grace",
         );
         relay.abort();
+    }
+
+    /// The relay's answer to a keepalive must not tear the leg down.
+    ///
+    /// Text used to fall through the pump's catch-all and break the loop, so
+    /// shipping the ping without teaching the pump to expect a reply would have
+    /// killed every durable route on its first keepalive — the client half
+    /// cannot be split any finer than this.
+    ///
+    /// The interval itself is not exercised here: driving it needs a paused
+    /// clock the pump's timer does not observe, and `KEEPALIVE_INTERVAL` is
+    /// instead pinned against the edge's idle bound below.
+    #[tokio::test]
+    async fn a_keepalive_answer_does_not_tear_the_leg_down() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(tcp).await.unwrap();
+            let handshake = socket.next().await.unwrap().unwrap().into_data();
+            assert_eq!(
+                handshake[11] & crate::wire::WSS_KEEPALIVE_FLAG,
+                crate::wire::WSS_KEEPALIVE_FLAG,
+                "a durable leg must advertise the promise it is about to keep",
+            );
+            socket
+                .send(Message::Binary(WSS_READY.to_vec().into()))
+                .await
+                .unwrap();
+            // Exactly what the edge's auto-response sends back, unprompted so
+            // the test does not depend on the ping timer.
+            socket
+                .send(Message::Text(WSS_KEEPALIVE_RESPONSE.into()))
+                .await
+                .unwrap();
+            // A relay that serves no auto-response forwards a peer's ping
+            // verbatim instead; that must be survivable too.
+            socket
+                .send(Message::Text(WSS_KEEPALIVE_REQUEST.into()))
+                .await
+                .unwrap();
+            // Then behave normally: echo one application frame back.
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Binary(bytes) if bytes.first() == Some(&WSS_DATA) => {
+                        socket.send(Message::Binary(bytes)).await.unwrap();
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let route = WebSocketRelayRoute {
+            endpoint: format!("ws://{address}"),
+            handle: "A".repeat(43),
+            epoch: 1,
+            proof: RouteProof::new([5u8; 32]),
+            previous_proof: None,
+        };
+        let mut leg = connect_websocket_stream(&route, WebSocketRelayRole::Home)
+            .await
+            .unwrap();
+
+        // The leg still carries bytes after both text frames, which it could not
+        // do if either had ended the pump.
+        leg.write_all(b"still here").await.unwrap();
+        leg.flush().await.unwrap();
+        let mut echoed = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(5), leg.read_exact(&mut echoed))
+            .await
+            .expect("the leg died on a keepalive frame")
+            .unwrap();
+        assert_eq!(&echoed, b"still here");
+
+        leg.shutdown().await.unwrap();
+        relay.abort();
+    }
+
+    /// The client speaks often enough for the edge to believe it.
+    ///
+    /// `IDLE_MILLIS` at the edge is 150s. These two numbers live in different
+    /// repositories, so nothing but this stops one from drifting into the
+    /// other: an interval above a fifth of the bound would let two ordinary
+    /// scheduling delays close a live Home.
+    #[test]
+    fn the_keepalive_interval_leaves_room_for_missed_pings() {
+        const EDGE_IDLE_MILLIS: u128 = 150_000;
+        assert!(
+            KEEPALIVE_INTERVAL.as_millis() * 5 <= EDGE_IDLE_MILLIS,
+            "five keepalives must fit inside the edge's idle bound",
+        );
     }
 }
