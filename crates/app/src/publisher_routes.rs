@@ -173,11 +173,23 @@ pub async fn collect_into_project(
     .await;
     match result {
         Ok(Ok(outcome)) => (StatusCode::OK, Json(json!({ "collected": outcome }))).into_response(),
-        Ok(Err(error)) => (
-            collection_status(&error),
-            Json(json!({ "error": error.to_string() })),
-        )
-            .into_response(),
+        Ok(Err(error)) => {
+            let status = collection_status(&error);
+            // `collection_status` sends every unclassified kind to `502`, so the
+            // status alone cannot say whether an upstream really failed or the
+            // catch-all fired. The canary retries `502` as transient and the
+            // Home logged 66 of these over three days without once saying why.
+            //
+            // The kind, not the message: an `ErrorKind` is a closed enum that
+            // carries no path, identifier, or customer payload, and it is the
+            // one fact that distinguishes the buckets.
+            tracing::warn!(
+                status = status.as_u16(),
+                kind = ?error.kind(),
+                "collection into project failed"
+            );
+            (status, Json(json!({ "error": error.to_string() }))).into_response()
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "publisher task failed" })),
