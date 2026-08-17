@@ -59,7 +59,6 @@ const LAYOUT = [
     heading: "Panel frame",
     tokens: [
       ["--gw-panel-width"],
-      ["--gw-panel-height"],
       ["--gw-panel-padding"],
       ["--gw-panel-border"],
       ["--gw-panel-radius"],
@@ -163,9 +162,9 @@ export function readBridge(source, defaults) {
   for (const [, value] of template.matchAll(
     /^\s*[\w-]+:\s*(var\(--gw-[^;]+?)(?:\s*!important)?;$/gmu,
   )) {
-    // The min-height default is per element, not one value, so it is rendered
-    // into the per-element blocks below instead.
-    if (value.includes("${defaultMinHeight}")) continue;
+    // The height and min-height defaults are per element, not one value, so
+    // they are rendered into the per-element blocks below instead.
+    if (value.includes("${defaultMinHeight}") || value.includes("${defaultHeight}")) continue;
 
     const { names, literal } = parseChain(value);
     const publicName = names[0];
@@ -206,24 +205,41 @@ export function readBridge(source, defaults) {
   return exposed;
 }
 
-/// The per-element minimum heights, read from the element classes so the
-/// published file cannot claim a height the code does not use.
-export function readMinHeights(source) {
+/// The per-element frame defaults (height and minimum height), read from the
+/// element classes so the published file cannot claim a value the code does
+/// not use. Every panel class declares both explicitly.
+export function readFrames(source) {
   const tags = new Map(
     [...source.matchAll(/customElements\.define\("(gw-[\w-]+)",\s*(\w+)\)/gu)].map((m) => [m[2], m[1]]),
   );
-  const heights = new Map();
-  for (const [, className, height] of source.matchAll(
-    /export class (\w+) extends GwPanelElement \{[\s\S]*?defaultMinHeight\s*=\s*"([^"]+)"/gu,
-  )) {
-    const tag = tags.get(className);
-    if (tag) heights.set(tag, height);
+  const read = (property) => {
+    const values = new Map();
+    const pattern = new RegExp(
+      `export class (\\w+) extends GwPanelElement \\{[\\s\\S]*?${property}\\s*=\\s*"([^"]+)"`,
+      "gu",
+    );
+    for (const [, className, value] of source.matchAll(pattern)) {
+      const tag = tags.get(className);
+      if (tag) values.set(tag, value);
+    }
+    return values;
+  };
+  const minHeights = read("defaultMinHeight");
+  const heights = read("defaultHeight");
+  if (minHeights.size === 0) throw new Error("no panel element min-heights found");
+  for (const tag of minHeights.keys()) {
+    if (!heights.has(tag)) {
+      throw new Error(`${tag} declares no defaultHeight — every panel class must state both frame defaults`);
+    }
   }
-  if (heights.size === 0) throw new Error("no panel element min-heights found");
-  return heights;
+  const frames = new Map();
+  for (const [tag, minHeight] of minHeights) {
+    frames.set(tag, { height: heights.get(tag), minHeight });
+  }
+  return frames;
 }
 
-function render(exposed, minHeights) {
+function render(exposed, frames) {
   const covered = new Set(LAYOUT.flatMap((group) => group.tokens.map(([name]) => name)));
   for (const name of exposed.keys()) {
     if (!covered.has(name)) {
@@ -258,14 +274,17 @@ function render(exposed, minHeights) {
     .filter(([, spec]) => spec.legacy.length > 0)
     .flatMap(([name, spec]) => spec.legacy.map((old) => `${old} is now ${name}`));
 
-  const minHeightBlocks = [...minHeights]
-    .reduce((blocks, [tag, height]) => {
-      const existing = blocks.find((block) => block.height === height);
+  const frameBlocks = [...frames]
+    .reduce((blocks, [tag, frame]) => {
+      const existing = blocks.find(
+        (block) => block.frame.height === frame.height && block.frame.minHeight === frame.minHeight,
+      );
       if (existing) existing.tags.push(tag);
-      else blocks.push({ height, tags: [tag] });
+      else blocks.push({ frame, tags: [tag] });
       return blocks;
     }, [])
-    .map(({ tags, height }) => `${tags.join(",\n")} {\n  --gw-panel-min-height: ${height};\n}`)
+    .map(({ tags, frame }) =>
+      `${tags.join(",\n")} {\n  --gw-panel-height: ${frame.height};\n  --gw-panel-min-height: ${frame.minHeight};\n}`)
     .join("\n\n");
 
   return `/**
@@ -294,8 +313,10 @@ gw-session {
 ${groups}
 }
 
-/* Each panel has a useful minimum height out of the box. Edit these independently. */
-${minHeightBlocks}
+/* Each panel's frame out of the box. The chat has a definite height because its
+   scroll behavior (send anchoring, jump-to-latest) lives in its own internal
+   scroller; \`auto\` sizes a panel to its content. Edit these independently. */
+${frameBlocks}
 
 /**
  * Need one special exception?
@@ -321,7 +342,7 @@ ${minHeightBlocks}
 /// assert on it without shelling out.
 export function renderEmbedTheme() {
   const source = fs.readFileSync(bridgeFile, "utf8");
-  return render(readBridge(source, readDefaults()), readMinHeights(source));
+  return render(readBridge(source, readDefaults()), readFrames(source));
 }
 
 const invokedDirectly =

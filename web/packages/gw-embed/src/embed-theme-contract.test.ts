@@ -63,9 +63,15 @@ describe("editable embed theme", () => {
     it("keeps the prose a person wrote", async () => {
         const published = await readFile(editableThemeUrl, "utf8");
         expect(published).toContain("GaugeDesk Embeddable Panels — optional editable theme");
-        expect(published).toContain("gw-chat {\n  --gw-panel-min-height: 520px;");
-        expect(published).toContain("gw-viewer {\n  --gw-panel-min-height: 320px;");
-        expect(published).toContain("gw-files,\ngw-chats {\n  --gw-panel-min-height: 280px;");
+        expect(published).toContain(
+            "gw-chat {\n  --gw-panel-height: min(640px, 85vh);\n  --gw-panel-min-height: 520px;",
+        );
+        expect(published).toContain(
+            "gw-viewer {\n  --gw-panel-height: auto;\n  --gw-panel-min-height: 320px;",
+        );
+        expect(published).toContain(
+            "gw-files,\ngw-chats {\n  --gw-panel-height: auto;\n  --gw-panel-min-height: 280px;",
+        );
     });
 });
 

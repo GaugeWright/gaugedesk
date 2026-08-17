@@ -100,6 +100,16 @@ gw-chat::part(panel) {
 }
 ```
 
+### The chat panel's height
+
+`<gw-chat>` has a definite height by default (`min(640px, 85vh)`), so the
+conversation scrolls inside the panel: sending a message anchors it to the top
+of the panel, and a jump-to-latest button appears whenever the reply grows past
+the fold. Set `--gw-panel-height` to any length to change it, or to `auto` to
+let the panel grow with its content instead — the page then scrolls rather than
+the panel, sent messages are still brought into view, and the jump button
+simply never appears.
+
 The public settings are grouped plainly in `embed.css`: colors, actions and
 status, panel frame, typography, and the default height of each panel. That file
 is generated from the panels' own defaults, so it always states what a panel

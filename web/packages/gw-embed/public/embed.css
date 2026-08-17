@@ -45,7 +45,6 @@ gw-session {
 
   /* Panel frame */
   --gw-panel-width: 100%;
-  --gw-panel-height: auto;
   --gw-panel-padding: 12px;
   --gw-panel-border: 1px solid var(--gw-edge);
   --gw-panel-radius: 12px;
@@ -68,17 +67,22 @@ gw-session {
   --gw-color-scheme: dark;
 }
 
-/* Each panel has a useful minimum height out of the box. Edit these independently. */
+/* Each panel's frame out of the box. The chat has a definite height because its
+   scroll behavior (send anchoring, jump-to-latest) lives in its own internal
+   scroller; `auto` sizes a panel to its content. Edit these independently. */
 gw-chat {
+  --gw-panel-height: min(640px, 85vh);
   --gw-panel-min-height: 520px;
 }
 
 gw-viewer {
+  --gw-panel-height: auto;
   --gw-panel-min-height: 320px;
 }
 
 gw-files,
 gw-chats {
+  --gw-panel-height: auto;
   --gw-panel-min-height: 280px;
 }
 

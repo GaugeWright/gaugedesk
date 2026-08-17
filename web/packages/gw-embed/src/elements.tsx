@@ -67,7 +67,7 @@ import brandTokensCss from "@gaugewright/workbench-ui/brand-tokens.css?inline";
  * with the type families. The former names still work: a customer who vendored
  * an older `embed.css` and set `--gw-bad` keeps the colour they chose.
  */
-const embedThemeCss = (defaultMinHeight: string) => `
+const embedThemeCss = (defaultMinHeight: string, defaultHeight: string) => `
 :host {
   /* Public theme tokens. Internal aliases are declared here so unrelated host
      variables with generic names such as --panel or --muted cannot leak in.
@@ -109,7 +109,7 @@ const embedThemeCss = (defaultMinHeight: string) => `
   box-sizing: border-box !important;
   width: var(--gw-panel-width, 100%) !important;
   max-width: 100% !important;
-  height: var(--gw-panel-height, auto) !important;
+  height: var(--gw-panel-height, ${defaultHeight}) !important;
   min-width: 0 !important;
   min-height: var(--gw-panel-min-height, ${defaultMinHeight}) !important;
   margin: 0 !important;
@@ -681,6 +681,11 @@ abstract class GwPanelElement extends HTMLElement {
     private _disposeRender?: () => void;
     protected abstract readonly panelId: PanelId;
     protected readonly defaultMinHeight: string = "320px";
+    /** The height a panel has when the host page sets nothing. `auto` sizes to
+     *  content; a definite default gives the panel a real internal scroller.
+     *  Overridden per element and published into `embed.css`; a host changes it
+     *  with `--gw-panel-height`. */
+    protected readonly defaultHeight: string = "auto";
 
     /** The Solid view this element renders against the resolved Session. */
     protected abstract view(session: Session): JSX.Element;
@@ -706,7 +711,7 @@ abstract class GwPanelElement extends HTMLElement {
         // Theme bridge first (defines the palette on :host), then the workbench
         // stylesheet (consumes it via var(--bg)… — its own :root block is inert here).
         const theme = document.createElement("style");
-        theme.textContent = embedThemeCss(this.defaultMinHeight);
+        theme.textContent = embedThemeCss(this.defaultMinHeight, this.defaultHeight);
         root.appendChild(theme);
         const style = document.createElement("style");
         style.textContent = appCss;
@@ -746,6 +751,12 @@ abstract class GwPanelElement extends HTMLElement {
 export class GwChatElement extends GwPanelElement {
     protected readonly panelId = "chat" as const;
     protected override readonly defaultMinHeight = "520px";
+    /** A definite height by default: the chat panel's scroll behavior (send
+     *  anchoring, the jump-to-latest latch) lives in its internal scroller,
+     *  which only exists when the panel's height does not track its content.
+     *  `--gw-panel-height: auto` restores content sizing, where the panel
+     *  degrades to best-effort anchoring in the host page's own scroller. */
+    protected override readonly defaultHeight = "min(640px, 85vh)";
 
     protected view(session: Session): JSX.Element {
         return (
@@ -762,6 +773,7 @@ export class GwChatElement extends GwPanelElement {
 export class GwViewerElement extends GwPanelElement {
     protected readonly panelId = "viewer" as const;
     protected override readonly defaultMinHeight = "320px";
+    protected override readonly defaultHeight = "auto";
 
     protected view(): JSX.Element {
         return <ContentViewer />;
@@ -771,6 +783,7 @@ export class GwViewerElement extends GwPanelElement {
 export class GwFilesElement extends GwPanelElement {
     protected readonly panelId = "files" as const;
     protected override readonly defaultMinHeight = "280px";
+    protected override readonly defaultHeight = "auto";
 
     protected view(): JSX.Element {
         return <Workspace />;
@@ -780,6 +793,7 @@ export class GwFilesElement extends GwPanelElement {
 export class GwChatsElement extends GwPanelElement {
     protected readonly panelId = "chats" as const;
     protected override readonly defaultMinHeight = "280px";
+    protected override readonly defaultHeight = "auto";
 
     protected view(session: Session): JSX.Element {
         return <AudienceChats session={session} standalone />;

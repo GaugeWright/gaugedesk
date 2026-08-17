@@ -384,6 +384,21 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .embed-chat { display: flex; flex-direction: column; height: 100%; min-height: 0;
     min-width: 0; overflow: hidden; }
 .embed-chat > .transcript { flex: 1 1 auto; overflow: auto; min-height: 0; }
+/* Transcript scroll behavior (transcript-scroll.ts): the spacer under the last
+   turn reserves exactly the room a just-sent message needs to anchor at the top
+   of the viewport; the pill floats over the seam between transcript and
+   composer and offers the way back to the live end. The zero-height wrap keeps
+   the pill positioned against that seam in every mount without requiring the
+   host's panel to be a containing block. */
+.transcript { overscroll-behavior: contain; }
+.jump-latest-wrap { position: relative; height: 0; overflow: visible; z-index: 3; }
+.jump-latest { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; padding: 0; border-radius: 50%;
+    background: var(--panel); color: var(--muted);
+    box-shadow: 0 2px 10px rgb(0 0 0 / 25%); }
+.jump-latest:hover { color: var(--accent); }
+.jump-latest .icon { width: 16px; height: 16px; }
 .turn-activity { display: flex; align-items: center; gap: 7px; padding: 7px 10px;
     color: var(--muted); font-size: var(--fs-ui); }
 .turn-activity-dots { display: inline-flex; align-items: center; gap: 3px; }

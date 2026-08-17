@@ -6,8 +6,10 @@
  * attachment controls). Remote/audience environments use the panel's default
  * Session-backed composer. The panel shell and transcript are shared either way.
  */
-import {createSignal, Show, type JSX} from "solid-js";
+import {createEffect, createSignal, on, onCleanup, Show, type JSX} from "solid-js";
 import { ChatComposer, type ComposerMode } from "./ChatComposer";
+import { createTranscriptScroll } from "./transcript-scroll";
+import { Icon } from "./icons";
 import { type ContextUsage } from "./ContextMeter";
 import { AudienceChats } from "./AudienceChats";
 import {
@@ -245,6 +247,14 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
             ...transcript,
         ];
     };
+    // The reader's position is theirs (transcript-scroll.ts): a send anchors
+    // the sent message to the top of the viewport, the pill (or reaching the
+    // bottom by hand) latches the viewport to the live end, and any manual
+    // scroll releases it. One instance here covers every mount of the panel.
+    const scroll = createTranscriptScroll();
+    onCleanup(scroll.dispose);
+    createEffect(on(() => session().engagementId(), scroll.reset));
+    createEffect(() => scroll.observeLines(lines()));
     const body = () => (
         <>
             <Show when={props.audience === true}>
@@ -255,20 +265,38 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
             </Show>
             <div
                 class="transcript"
+                ref={scroll.transcriptRef}
                 data-embed-transcript={props.audience ? "" : undefined}
                 data-pending-send={props.pendingSend}
             >
-                <TranscriptView
-                    lines={lines()}
-                    agentName={props.agentName}
-                    onOpen={session().selectFile}
-                    prefs={props.prefs}
-                    onResolveCredential={props.onResolveCredential}
-                    onFork={session().forkAt}
-                />
-                <TurnActivity session={session()} agentName={props.agentName} />
-                {props.transcriptTail}
+                <div class="transcript-body" ref={scroll.bodyRef}>
+                    <TranscriptView
+                        lines={lines()}
+                        agentName={props.agentName}
+                        onOpen={session().selectFile}
+                        prefs={props.prefs}
+                        onResolveCredential={props.onResolveCredential}
+                        onFork={session().forkAt}
+                    />
+                    <TurnActivity session={session()} agentName={props.agentName} />
+                    {props.transcriptTail}
+                </div>
+                <div class="transcript-spacer" ref={scroll.spacerRef} aria-hidden="true" />
             </div>
+            <Show when={scroll.pillVisible()}>
+                <div class="jump-latest-wrap">
+                    <button
+                        type="button"
+                        class="jump-latest"
+                        data-jump-latest
+                        aria-label="Jump to the latest"
+                        title="Jump to the latest"
+                        onClick={scroll.jumpToLatest}
+                    >
+                        <Icon name="chevron" />
+                    </button>
+                </div>
+            </Show>
             <SessionComposer
                 session={session()}
                 audience={props.audience === true}
