@@ -1626,10 +1626,10 @@ pub fn send_publisher_request_with(
         // Status and method only: a path here carries a deployment id, and this
         // is a diagnostic rather than an audit trail.
         tracing::warn!(status, method, "edge publisher rejected a command");
-        Err(io::Error::other(format!(
-            "edge publisher rejected command ({status}): {}",
-            bounded_upstream(&response)
-        )))
+        Err(io::Error::other(EdgeRejection {
+            status,
+            detail: bounded_upstream(&response),
+        }))
     }
 }
 
@@ -1707,6 +1707,46 @@ fn bounded_upstream(response: &str) -> String {
     match flattened.char_indices().nth(LIMIT) {
         Some((cut, _)) => format!("{}… (truncated)", &flattened[..cut]),
         None => flattened,
+    }
+}
+
+/// A refusal from the publisher edge, carrying the status the edge gave.
+///
+/// The status used to survive only inside a formatted message, so every caller
+/// downstream saw `ErrorKind::Other` and could not tell a request the edge
+/// declined from an edge that was down. `/public-deployments/collect` therefore
+/// answered `502` to a `422`, the canary retried it as a transient gateway
+/// failure, and Cloudflare's substituted page called it an overloaded origin —
+/// three layers describing an outage that never happened.
+#[derive(Debug)]
+pub struct EdgeRejection {
+    pub status: u16,
+    pub detail: String,
+}
+
+impl std::fmt::Display for EdgeRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "edge publisher rejected command ({}): {}",
+            self.status, self.detail
+        )
+    }
+}
+
+impl std::error::Error for EdgeRejection {}
+
+/// The status an edge refusal should be reported as.
+///
+/// A client error upstream is this request's fault and stays a client error: a
+/// caller that retries `502` must not be told to retry something the edge will
+/// decline identically every time. Anything else the edge says is a genuine
+/// gateway condition.
+pub fn edge_rejection_status(status: u16) -> u16 {
+    if (400..500).contains(&status) {
+        status
+    } else {
+        502
     }
 }
 
@@ -1946,5 +1986,54 @@ mod publisher_tests {
         // Multibyte text must not be cut mid-character.
         let wide = bounded_upstream(&"é".repeat(5_000));
         assert!(wide.ends_with("… (truncated)"));
+    }
+
+    /// A client error upstream stays a client error.
+    ///
+    /// The edge answered `422` to a drain issued before its artifact was ready.
+    /// Reported as `502`, that told the canary a gateway had failed, so it
+    /// retried — and the shape of the reply then let Cloudflare replace it with
+    /// "the origin is overloaded or misconfigured". Three layers describing an
+    /// outage that never happened, from one wrong mapping.
+    #[test]
+    fn an_edge_client_error_is_not_reported_as_a_gateway_failure() {
+        assert_eq!(
+            edge_rejection_status(422),
+            422,
+            "the exact refusal survives"
+        );
+        assert_eq!(edge_rejection_status(400), 400);
+        assert_eq!(edge_rejection_status(404), 404);
+        assert_eq!(edge_rejection_status(409), 409);
+        assert_eq!(edge_rejection_status(499), 499);
+
+        // Anything the edge says that is not a client error is a genuine
+        // gateway condition, including its own 5xx.
+        assert_eq!(edge_rejection_status(500), 502);
+        assert_eq!(edge_rejection_status(502), 502);
+        assert_eq!(edge_rejection_status(503), 502);
+        assert_eq!(edge_rejection_status(302), 502);
+        assert_eq!(edge_rejection_status(200), 502);
+    }
+
+    /// The status has to travel on the error, not inside its message. Every
+    /// caller downstream sees `ErrorKind::Other`, so a formatted string was
+    /// indistinguishable from an edge that was simply down.
+    #[test]
+    fn an_edge_rejection_carries_its_status_to_the_caller() {
+        let error = std::io::Error::other(EdgeRejection {
+            status: 422,
+            detail: "collection not ready".to_owned(),
+        });
+        let carried = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<EdgeRejection>())
+            .expect("the rejection must survive as itself, not as prose");
+        assert_eq!(carried.status, 422);
+        // And still reads as the sentence operators had before.
+        assert!(error
+            .to_string()
+            .contains("edge publisher rejected command (422)"));
+        assert!(error.to_string().contains("collection not ready"));
     }
 }

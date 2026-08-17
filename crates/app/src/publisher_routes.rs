@@ -387,6 +387,18 @@ pub async fn review_quarantined_item(
 }
 
 fn collection_status(error: &std::io::Error) -> StatusCode {
+    // An edge refusal knows the status the edge gave. Reporting a `422` as
+    // `502` told every caller the upstream had failed when it had in fact
+    // declined the request, and a `502` is what `drainUntilLanded` retries — so
+    // a client error was retried a hundred and twenty times as though a service
+    // were down, then reported as an overloaded origin.
+    if let Some(rejection) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<crate::agent_release::EdgeRejection>())
+    {
+        let mapped = crate::agent_release::edge_rejection_status(rejection.status);
+        return StatusCode::from_u16(mapped).unwrap_or(StatusCode::BAD_GATEWAY);
+    }
     match error.kind() {
         std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
             StatusCode::BAD_REQUEST
