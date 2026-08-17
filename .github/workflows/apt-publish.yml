@@ -26,7 +26,7 @@ jobs:
     # here anyway. Stating it means the Debian promotion cannot be resurrected
     # on the private trunk by someone tagging there.
     if: github.repository == 'GaugeWright/gaugedesk'
-    runs-on: ${{ github.repository == 'GaugeWright/gaugedesk' && 'ubuntu-22.04' || 'blacksmith-4vcpu-ubuntu-2204' }}
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     environment: production
     env:

@@ -41,11 +41,11 @@
 # something real to carry back to trunk. A private pass cannot stand in for it:
 # it proves the private tree builds, not that the projection is self-contained.
 #
-# The mirror stays on GitHub-hosted runners, because Actions is free for a
-# public repository and paying Blacksmith for that work buys nothing. The
-# repository check is spelled out in each job rather than hoisted into a
-# variable, because `env` is not available to `runs-on`. This is the shape
-# whipplescript already uses, for the same reasons.
+# Both repositories run on GitHub-hosted runners: the mirror because Actions
+# is free for a public repository, `-src` because the Enterprise plan's
+# included allowance covers the private gate, so `runs-on` no longer needs to
+# resolve per repository. This is the shape whipplescript already uses, for
+# the same reasons.
 name: ci (public mirror)
 
 on:
@@ -72,7 +72,7 @@ concurrency:
 jobs:
   rust:
     name: rust (fmt · clippy · test)
-    runs-on: ${{ github.repository == 'GaugeWright/gaugedesk' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -103,7 +103,7 @@ jobs:
 
   web:
     name: web (typecheck · vitest)
-    runs-on: ${{ github.repository == 'GaugeWright/gaugedesk' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ubuntu-latest
     # The wasm toolchain below installs from apt, a binaryen release, crates.io,
     # and npm, and any of them can hang rather than fail — the browser-tunnel
     # job in ci.yml lost a runner to a fifty-minute `apt-get install` once. This
