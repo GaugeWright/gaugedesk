@@ -17,8 +17,8 @@ description = "Per-boundary WhippleScript tracker runtime (ADR 0075): a RuntimeK
 # forks, command admission, and native workspace substrate required by SUB-1
 # through SUB-6. Provider adapters stay disabled: the tracker needs only the
 # native rusqlite store and sans-IO kernel, never an agent turn.
-whipplescript-kernel = { version = "0.4.1", default-features = false, features = ["native"] }
-whipplescript-store = { version = "0.4.2", default-features = false, features = ["native"] }
+whipplescript-kernel = { version = "0.5.1", default-features = false, features = ["native"] }
+whipplescript-store = { version = "0.5.1", default-features = false, features = ["native"] }
 serde_json = "1"
 
 [dev-dependencies]

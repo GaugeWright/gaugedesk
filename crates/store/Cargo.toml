@@ -8,7 +8,7 @@ description = "gaugewright local store: SQLite event log + records + the admissi
 [dependencies]
 gaugedesk-env = { path = "../env" }
 gaugedesk-core = { path = "../core" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = "1"
 serde_json = "1"
 

@@ -14,17 +14,17 @@ sha2 = "0.11"
 serde = "1"
 serde_json = "1"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
-whipplescript = { version = "0.4.2", default-features = false }
+whipplescript = { version = "0.5.1", default-features = false }
 # Compiling a governed program is part of admitting it. The CLI enforces
 # information flow at run time as well as check time (DR-0027 I-IFC6/E3), and a
 # host embedding WhippleScript needs the same before it executes anything.
-whipplescript-parser = { version = "0.4.1" }
+whipplescript-parser = { version = "0.5.1" }
 # The host-integration surface. `whipplescript-host-do` — WhippleScript's own
 # second host — drives workflows through exactly these APIs, so GaugeDesk
 # running a project's gate is a third host on the same path rather than a bypass
 # of the CLI crate's narrower re-export list.
-whipplescript-kernel = { version = "0.4.1" }
-whipplescript-store = { version = "0.4.2" }
+whipplescript-kernel = { version = "0.5.1" }
+whipplescript-store = { version = "0.5.1" }
 
 [dev-dependencies]
 tempfile = "3"
