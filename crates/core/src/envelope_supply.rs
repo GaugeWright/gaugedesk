@@ -41,9 +41,12 @@ pub struct CompositionEntry {
     pub authority: Authority,
     /// The hash of the canonical envelope document the signature covers.
     pub envelope_hash: String,
-    /// The envelope's declared policy version.
-    pub envelope_version: u32,
     /// The policy epoch the `:v2` preimage binds.
+    ///
+    /// There is deliberately no separate version: DR-0063 §4's record *replaces*
+    /// the single per-run policy binding rather than carrying it. The hash pins
+    /// which document, the epoch pins which revision, and a third number would
+    /// restate the epoch while being covered by no signature.
     pub epoch: u64,
 }
 
@@ -69,7 +72,6 @@ pub struct RosterEntry {
 pub struct SuppliedEnvelope {
     pub authority: Authority,
     pub envelope_hash: String,
-    pub envelope_version: u32,
     pub epoch: u64,
     /// The key that signed the `:v2` preimage. Checked against the authority's
     /// governance root, never against a device subkey (ADR 0139 §3).
@@ -182,7 +184,6 @@ pub fn assemble(
         let entry = CompositionEntry {
             authority: envelope.authority.clone(),
             envelope_hash: envelope.envelope_hash.clone(),
-            envelope_version: envelope.envelope_version,
             epoch: envelope.epoch,
         };
         if by_authority
@@ -224,7 +225,6 @@ mod tests {
         let authority = authority(name);
         SuppliedEnvelope {
             envelope_hash: format!("hash-{name}"),
-            envelope_version: 1,
             epoch: 7,
             signer: root_of(&authority),
             authority,

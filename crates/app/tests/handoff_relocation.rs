@@ -1353,7 +1353,6 @@ fn envelope(
     gaugedesk_app::envelope_supply::EnvelopeRecord {
         authority: AuthorityId::new(authority),
         envelope_hash: format!("hash-{authority}"),
-        envelope_version: 1,
         epoch: 3,
         signer,
     }

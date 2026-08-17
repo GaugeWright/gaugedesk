@@ -196,7 +196,6 @@ fn project_envelope_scope(project: &str) -> String {
 pub struct EnvelopeRecord {
     pub authority: Authority,
     pub envelope_hash: String,
-    pub envelope_version: u32,
     pub epoch: u64,
     /// The key that signed the `:v2` preimage.
     pub signer: PublicKey,
@@ -230,7 +229,6 @@ pub fn registered_envelopes(store: &Store, project: &str) -> Vec<SuppliedEnvelop
             SuppliedEnvelope {
                 authority: record.authority,
                 envelope_hash: record.envelope_hash,
-                envelope_version: record.envelope_version,
                 epoch: record.epoch,
                 signer: record.signer,
             },
