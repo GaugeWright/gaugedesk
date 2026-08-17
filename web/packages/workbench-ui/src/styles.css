@@ -991,8 +991,13 @@ input {
    two `<select>` outlines, and the filled Send. What's left is a single edge that
    lights on focus, with a chrome-free control rail sitting inside it. Controls
    are separated by spacing, not by boxes. */
+/* The field is a recessed --bg well on every surface. The app's chat panes sit
+   on a --panel ground, so the well reads darker there; in the embed the ground
+   is already --bg and the field's edge alone delimits it. One colour for the
+   input everywhere is the point — the dock below matches its local ground
+   instead. */
 .composer-field { display: flex; flex-direction: column; min-width: 0;
-    border: 1px solid var(--edge); border-radius: 10px; background: var(--panel);
+    border: 1px solid var(--edge); border-radius: 10px; background: var(--bg);
     box-shadow: 0 1px 0 rgba(255,255,255,0.025) inset;
     transition: border-color 120ms ease, box-shadow 120ms ease; }
 .composer-field:focus-within { border-color: var(--accent);
@@ -1687,15 +1692,16 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 /* The dock carries no rule of its own: the field's single edge already separates
    the composer from the transcript, and a border on top of a border is exactly
    the stacking this pass removes. */
-/* The dock is the panel ground, not a surface of its own. It still needs to be
-   opaque — the transcript scrolls behind it — but painting it --panel drew a
-   hard-edged lighter rectangle around the composer, square where the field is
-   rounded, while the field itself sat at --bg and vanished into the transcript.
-   The two were the wrong way round: --gw-panel is published to customers as
-   "Raised controls and composer", so the raised colour belongs to the field. */
+/* The dock is the local ground, not a surface of its own. It still needs to be
+   opaque — the transcript scrolls behind it — but it must paint whatever colour
+   it sits on, or it draws a hard-edged rectangle around the rounded field. The
+   embed's panel interior is --bg; the app's chat panes (.panel on the desktop
+   grid, .carousel-pane on mobile) are --panel, so those two contexts override.
+   The field itself is the one fixed colour (--bg) across all of them. */
 .composer-dock { flex: 0 0 auto; margin-top: 8px;
     display: flex; flex-direction: column; gap: 8px;
     background: var(--bg); padding: 6px 0 4px; }
+.panel .composer-dock, .carousel-pane .composer-dock { background: var(--panel); }
 
 
 

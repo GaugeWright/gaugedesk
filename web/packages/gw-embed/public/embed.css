@@ -28,8 +28,8 @@
 
 gw-session {
   /* Main colors */
-  --gw-bg: #142238;                /* Panel background */
-  --gw-panel: #1b2c46;             /* Raised controls and composer */
+  --gw-bg: #142238;                /* Panel background and composer input */
+  --gw-panel: #1b2c46;             /* Raised controls and menus */
   --gw-edge: #2f4059;              /* Borders and dividers */
   --gw-ink: #d3dbe6;               /* Primary text */
   --gw-muted: #93a1b5;             /* Secondary text */

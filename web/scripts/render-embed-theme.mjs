@@ -36,8 +36,8 @@ const LAYOUT = [
   {
     heading: "Main colors",
     tokens: [
-      ["--gw-bg", "Panel background"],
-      ["--gw-panel", "Raised controls and composer"],
+      ["--gw-bg", "Panel background and composer input"],
+      ["--gw-panel", "Raised controls and menus"],
       ["--gw-edge", "Borders and dividers"],
       ["--gw-ink", "Primary text"],
       ["--gw-muted", "Secondary text"],
