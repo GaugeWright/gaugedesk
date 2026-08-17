@@ -373,6 +373,13 @@ pub struct CollectIntoProjectOutcome {
     pub refused: Vec<CollectionRefusal>,
     /// How many sealed payloads the deposit store dropped at our word.
     pub acknowledged: u64,
+    /// How many it kept despite the acknowledgement. The collections bucket
+    /// carries a seven-day minimum-age deletion lock (DR-0054 Phase D), so a
+    /// drain acknowledged minutes after the deposit cannot release the hosted
+    /// copy — the acknowledgement still stands and the entry is still drained.
+    /// Reported rather than dropped: a caller that only saw `acknowledged`
+    /// could not tell custody transferred from nothing having happened.
+    pub retained: u64,
     /// The attention count after this drain: items awaiting the gate.
     pub pending_attention: usize,
 }
@@ -1544,8 +1551,8 @@ pub fn collect_into_project(
     }
 
     // Only what is durably held here. A refusal keeps its hosted copy.
-    let acknowledged = if acknowledge.is_empty() {
-        0
+    let released = if acknowledge.is_empty() {
+        serde_json::json!({ "acknowledged": 0, "retained": 0 })
     } else {
         acknowledge_collections_with(
             &credential,
@@ -1555,10 +1562,15 @@ pub fn collect_into_project(
                 acknowledge,
             },
         )?
+    };
+    let acknowledged = released
         .get("acknowledged")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default()
-    };
+        .unwrap_or_default();
+    let retained = released
+        .get("retained")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
 
     let pending_attention = crate::quarantine::pending_count(&store, &request.project_id)
         .map_err(|error| io::Error::other(format!("{error:?}")))?;
@@ -1577,6 +1589,7 @@ pub fn collect_into_project(
         already_held,
         refused,
         acknowledged,
+        retained,
         pending_attention,
     })
 }
@@ -2035,5 +2048,40 @@ mod publisher_tests {
             .to_string()
             .contains("edge publisher rejected command (422)"));
         assert!(error.to_string().contains("collection not ready"));
+    }
+
+    /// A refused release is still an acknowledgement, and the caller has to be
+    /// able to tell it from nothing happening.
+    ///
+    /// The collections bucket carries a seven-day minimum-age deletion lock, so
+    /// a drain acknowledged seconds after the deposit always leaves the hosted
+    /// copy in place. Reporting only `acknowledged` made that indistinguishable
+    /// from an acknowledge that never ran — which is exactly what a canary saw:
+    /// `acknowledged 0`, with nothing to say the custody transfer had happened.
+    #[test]
+    fn a_retained_payload_is_reported_beside_the_released_count() {
+        let released = serde_json::json!({ "acknowledged": 0, "retained": 2 });
+        assert_eq!(
+            released.get("retained").and_then(serde_json::Value::as_u64),
+            Some(2),
+        );
+        // The shape the edge answers when nothing is locked.
+        let clean = serde_json::json!({ "acknowledged": 3, "retained": 0 });
+        assert_eq!(
+            clean
+                .get("acknowledged")
+                .and_then(serde_json::Value::as_u64),
+            Some(3),
+        );
+        // And an older edge that predates the field reads as zero rather than
+        // failing the drain.
+        let legacy = serde_json::json!({ "acknowledged": 1 });
+        assert_eq!(
+            legacy
+                .get("retained")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            0,
+        );
     }
 }
