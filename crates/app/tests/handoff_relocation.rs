@@ -1339,14 +1339,56 @@ async fn allow_and_place(alice: &Router, bob: &Router, project: &str) -> (Status
 
 /// Bob's governance root public key — the one an envelope of bob's must be
 /// signed by (ADR 0139 §3).
-fn root_pubkey(root: &tempfile::TempDir, authority: &str) -> gaugedesk_core::ids::PublicKey {
+fn root_signing_key(
+    root: &tempfile::TempDir,
+    authority: &str,
+) -> gaugedesk_core::signature::SigningKey {
     use gaugedesk_app::key_store::{FileKeyStore, KeyStore};
-    FileKeyStore::new(root.path().join("keys"))
-        .signing_key(&AuthorityId::new(authority))
-        .public_key()
+    FileKeyStore::new(root.path().join("keys")).signing_key(&AuthorityId::new(authority))
 }
 
-fn envelope(
+/// Mint a genuinely signed `:v2` envelope for `authority`, signed by `root`.
+///
+/// The document has to be real: SUPPLY-4 verifies it against the authority's
+/// governance root before composing, so a placeholder cannot reach the meet.
+fn signed_envelope(
+    authority: &str,
+    root: &gaugedesk_core::signature::SigningKey,
+) -> gaugedesk_app::envelope_supply::EnvelopeRecord {
+    use whipplescript_kernel::gov::{external_signing_bytes_v2, SignedEnvelope};
+
+    // A JSON body: `to_json` rebuilds the document from the canonical form, and a
+    // DSL body does not survive that round trip.
+    let config = r#"{"readers":{},"governed":[]}"#;
+    let key_id = "gov-root";
+    let epoch = 3u64;
+    let preimage =
+        external_signing_bytes_v2(config, authority, "p256-sha256", key_id, epoch, authority)
+            .expect("preimage");
+    let signature = hex::encode(root.sign(&preimage).as_bytes());
+    let signed = SignedEnvelope::from_external_signature_v2(
+        config,
+        authority,
+        "p256-sha256",
+        key_id,
+        &signature,
+        epoch,
+        authority,
+    )
+    .expect("signed envelope");
+
+    gaugedesk_app::envelope_supply::EnvelopeRecord {
+        authority: AuthorityId::new(authority),
+        envelope_hash: signed.envelope_hash.clone(),
+        epoch,
+        signer: root.public_key(),
+        signed_document: signed.to_json(),
+    }
+}
+
+/// An envelope whose document is a placeholder — registered, identified, and
+/// unverifiable. Used to show the meet refuses what supply alone would admit.
+fn unsigned_envelope(
     authority: &str,
     signer: gaugedesk_core::ids::PublicKey,
 ) -> gaugedesk_app::envelope_supply::EnvelopeRecord {
@@ -1355,6 +1397,7 @@ fn envelope(
         envelope_hash: format!("hash-{authority}"),
         epoch: 3,
         signer,
+        signed_document: String::new(),
     }
 }
 
@@ -1411,7 +1454,7 @@ async fn a_root_signed_envelope_enters_the_composition_record() {
         gaugedesk_app::envelope_supply::register_envelope(
             guard.store_mut(),
             "supply-governed",
-            &envelope("bob", root_pubkey(&rb, "bob")),
+            &signed_envelope("bob", &root_signing_key(&rb, "bob")),
         )
         .unwrap();
     }
@@ -1432,7 +1475,15 @@ async fn a_root_signed_envelope_enters_the_composition_record() {
         .expect("supply recorded");
     assert_eq!(supply.record.len(), 1, "{supply:?}");
     assert_eq!(supply.record[0].authority.as_str(), "bob");
-    assert_eq!(supply.record[0].envelope_hash, "hash-bob");
+    // The hash is the real digest of the canonical envelope, not a fixture
+    // string: SUPPLY-4 verifies the document, and `Composition::compose` refuses
+    // a record citing a different envelope than the signature covers, so these
+    // agreeing is the end-to-end property.
+    assert_eq!(supply.record[0].envelope_hash.len(), 64);
+    assert!(supply.record[0]
+        .envelope_hash
+        .chars()
+        .all(|c| c.is_ascii_hexdigit()));
     assert_eq!(supply.record[0].epoch, 3);
     assert!(
         supply.roster[0].governed,
@@ -1456,11 +1507,12 @@ async fn a_subkey_signed_envelope_refuses_the_run() {
     {
         let mut guard = bob_wb.lock().unwrap();
         // Any key that is not bob's governance root — a device subkey is one.
-        let not_the_root = gaugedesk_core::ids::PublicKey::new("04deadbeef");
+        let not_the_root = gaugedesk_core::signature::SigningKey::from_seed(&[7u8; 32])
+            .expect("a valid P-256 scalar");
         gaugedesk_app::envelope_supply::register_envelope(
             guard.store_mut(),
             "supply-subkey",
-            &envelope("bob", not_the_root),
+            &signed_envelope("bob", &not_the_root),
         )
         .unwrap();
     }
@@ -1495,7 +1547,7 @@ async fn an_envelope_for_a_non_stakeholder_refuses_the_run() {
         gaugedesk_app::envelope_supply::register_envelope(
             guard.store_mut(),
             "supply-stranger",
-            &envelope("carol", gaugedesk_core::ids::PublicKey::new("04c0ffee")),
+            &unsigned_envelope("carol", gaugedesk_core::ids::PublicKey::new("04c0ffee")),
         )
         .unwrap();
     }
@@ -1508,5 +1560,66 @@ async fn an_envelope_for_a_non_stakeholder_refuses_the_run() {
             .unwrap_or_default()
             .contains("not a derived stakeholder"),
         "the refusal names the tripped constraint: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_v1_signed_envelope_passes_supply_and_is_refused_by_the_meet() {
+    // The layer-3 tooth. Supply checks that the SIGNER is the authority's
+    // governance root (SUPPLY-3) and nothing more, so a `:v1` envelope signed by
+    // the root passes it: the signer is right. Composition is what refuses it,
+    // because `:v1` does not cover the epoch or the authority, and a set whose
+    // constituents are not bound to a policy revision cannot carry the
+    // non-retroactivity claim the composition record exists to make (DR-0063 §5).
+    //
+    // Without this the meet could stop refusing and every other test would still
+    // pass — the subkey case never reaches it, being caught in `assemble` first.
+    std::env::set_var("GAUGEDESK_FAKE_AGENT", "1");
+    let (broker, _relay) = start_broker().await;
+    let (alice, _wa, _ra) = instance("alice", &broker);
+    let (bob, bob_wb, rb) = instance("bob", &broker);
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    {
+        use whipplescript_kernel::gov::{external_signing_bytes, SignedEnvelope};
+        let root = root_signing_key(&rb, "bob");
+        let config = r#"{"readers":{},"governed":[]}"#;
+        // `:v1` — the preimage covers neither the epoch nor the authority.
+        let preimage =
+            external_signing_bytes(config, "bob", "p256-sha256", "gov-root").expect("v1 preimage");
+        let signature = hex::encode(root.sign(&preimage).as_bytes());
+        let signed = SignedEnvelope::from_external_signature(
+            config,
+            "bob",
+            "p256-sha256",
+            "gov-root",
+            &signature,
+        )
+        .expect("v1 signed envelope");
+
+        let mut guard = bob_wb.lock().unwrap();
+        gaugedesk_app::envelope_supply::register_envelope(
+            guard.store_mut(),
+            "supply-v1",
+            &gaugedesk_app::envelope_supply::EnvelopeRecord {
+                authority: AuthorityId::new("bob"),
+                envelope_hash: signed.envelope_hash.clone(),
+                epoch: 3,
+                // The genuine root key, so supply's own check is satisfied.
+                signer: root.public_key(),
+                signed_document: signed.to_json(),
+            },
+        )
+        .unwrap();
+    }
+
+    let (status, body) = allow_and_place(&alice, &bob, "supply-v1").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["status"], "refused");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("did not verify") || reason.contains("not composable"),
+        "the refusal comes from the meet, not from supply: {body}"
     );
 }

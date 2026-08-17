@@ -189,9 +189,10 @@ fn project_envelope_scope(project: &str) -> String {
 
 /// A policy envelope registered on this home, for one authority.
 ///
-/// The envelope *document* is not stored here and is never parsed on this side —
-/// supply carries what identifies and authenticates it, and composition is the
-/// checker's (ADR 0139 §6).
+/// Supply still does not *parse* policy — composition is the checker's (ADR 0139
+/// §6). But `Composition::compose` takes verified envelopes, and a hash cannot be
+/// verified into one, so the signed document is stored beside the identifying
+/// fields and read only by [`crate::envelope_composition`].
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EnvelopeRecord {
     pub authority: Authority,
@@ -199,6 +200,12 @@ pub struct EnvelopeRecord {
     pub epoch: u64,
     /// The key that signed the `:v2` preimage.
     pub signer: PublicKey,
+    /// The signed envelope document, verbatim. `#[serde(default)]` so records
+    /// written before SUPPLY-4 round-trip as an empty document rather than
+    /// failing to deserialize — and an empty document cannot verify, so such a
+    /// record refuses the run instead of silently governing nothing.
+    #[serde(default)]
+    pub signed_document: String,
 }
 
 /// Register (or revise) an authority's policy envelope for a project.
@@ -215,8 +222,8 @@ pub fn register_envelope(
 /// The envelopes registered for a project, folded latest-wins per authority — a
 /// revision supersedes rather than accumulating, so this side never offers two
 /// envelopes for one authority and never has to choose between them.
-pub fn registered_envelopes(store: &Store, project: &str) -> Vec<SuppliedEnvelope> {
-    let mut by_authority: BTreeMap<Authority, SuppliedEnvelope> = BTreeMap::new();
+pub fn registered_records(store: &Store, project: &str) -> Vec<EnvelopeRecord> {
+    let mut by_authority: BTreeMap<Authority, EnvelopeRecord> = BTreeMap::new();
     for payload in store
         .records(&project_envelope_scope(project), ENVELOPE_KIND)
         .unwrap_or_default()
@@ -224,17 +231,22 @@ pub fn registered_envelopes(store: &Store, project: &str) -> Vec<SuppliedEnvelop
         let Ok(record) = serde_json::from_str::<EnvelopeRecord>(&payload) else {
             continue;
         };
-        by_authority.insert(
-            record.authority.clone(),
-            SuppliedEnvelope {
-                authority: record.authority,
-                envelope_hash: record.envelope_hash,
-                epoch: record.epoch,
-                signer: record.signer,
-            },
-        );
+        by_authority.insert(record.authority.clone(), record);
     }
     by_authority.into_values().collect()
+}
+
+/// The identifying half of [`registered_records`], for the supply cross-check.
+pub fn registered_envelopes(store: &Store, project: &str) -> Vec<SuppliedEnvelope> {
+    registered_records(store, project)
+        .into_iter()
+        .map(|record| SuppliedEnvelope {
+            authority: record.authority,
+            envelope_hash: record.envelope_hash,
+            epoch: record.epoch,
+            signer: record.signer,
+        })
+        .collect()
 }
 
 // --- Evidence: what the run was checked under -------------------------------

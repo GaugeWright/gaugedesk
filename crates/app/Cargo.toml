@@ -80,6 +80,11 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 listenfd = "1"
 tempfile = "3"
 whipplescript-store = { version = "0.5.1" }
+# SUPPLY-4 verifies each supplied envelope against its authority's governance
+# root and composes the set at admission, so the kernel is a runtime dependency
+# now, not only a test one. The comment below in [dev-dependencies] described the
+# parser's dev-only use and no longer covers the kernel.
+whipplescript-kernel = { version = "0.5.1" }
 
 [dev-dependencies]
 gaugedesk-pi-bridge = { path = "../pi-bridge" }
@@ -87,7 +92,6 @@ gaugedesk-relay-transport = { path = "../relay-transport", features = ["test-rel
 # Compiles the shipped gate program in tests. A gate we ship but never parse is
 # the same class of bug as a sealing construction nobody cross-checked: it looks
 # fine until it runs. Dev-only — nothing at runtime depends on the parser.
-whipplescript-kernel = { version = "0.5.1" }
 whipplescript-parser = { version = "0.5.1" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

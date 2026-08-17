@@ -4110,6 +4110,47 @@ fn admit_run_place(
             // queue's best-effort append beside it — a run admitted without this
             // is a run whose governance cannot be audited afterwards, and that
             // is the question the record exists to answer.
+            // SUPPLY-4: evaluate the meet. Everything above assembles and
+            // authenticates the set; this is the layer that lets it decide.
+            // Composition itself is `whip`'s — this side supplies the documents
+            // and the authority-to-root-key bindings, and refuses on its verdict
+            // without reinterpreting it (ADR 0139 §6).
+            let constituents: Vec<crate::envelope_composition::SignedConstituent> =
+                crate::envelope_supply::registered_records(guard.store_ref(), &wire.project)
+                    .into_iter()
+                    .filter(|record| {
+                        // Only the constituents the record was actually checked
+                        // under. An envelope registered for a non-stakeholder has
+                        // already refused the run above; this keeps the composed
+                        // set and the evidence the same set.
+                        supply
+                            .record
+                            .iter()
+                            .any(|entry| entry.authority == record.authority)
+                    })
+                    .map(|record| crate::envelope_composition::SignedConstituent {
+                        authority: record.authority,
+                        signed_document: record.signed_document,
+                    })
+                    .collect();
+            let composition_record: Vec<whipplescript_kernel::ifc::CompositionEntry> = supply
+                .record
+                .iter()
+                .map(|entry| whipplescript_kernel::ifc::CompositionEntry {
+                    authority: entry.authority.as_str().to_string(),
+                    envelope_hash: entry.envelope_hash.clone(),
+                    epoch: entry.epoch,
+                })
+                .collect();
+            if let Err(refusal) = crate::envelope_composition::compose(
+                &constituents,
+                composition_record,
+                |authority| {
+                    crate::envelope_supply::root_key_of(federation, &host, &host_root, authority)
+                },
+            ) {
+                return refused(&refusal.to_string());
+            }
             if crate::envelope_supply::record_supply(guard.store_mut(), &wire.correlation, &supply)
                 .is_err()
             {

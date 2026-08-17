@@ -38,6 +38,7 @@ pub mod directory_sync;
 pub mod discipline;
 pub mod engagement_routes;
 pub mod engine;
+pub mod envelope_composition;
 pub mod envelope_supply;
 pub mod environment_agent;
 pub mod environment_contract;
