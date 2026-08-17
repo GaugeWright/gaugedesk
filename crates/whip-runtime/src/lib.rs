@@ -739,6 +739,8 @@ impl Harness for WhipHarness {
             workspace: &self.workspace,
             images,
             asked: std::cell::RefCell::new(Vec::new()),
+            live: std::cell::RefCell::new(sink),
+            streamed: std::cell::Cell::new(false),
         };
         // ADR 0111: a question settles the turn. There is no suspended epoch to
         // resume into, because WhippleScript 0.2.2 removed the host-facing
@@ -755,7 +757,10 @@ impl Harness for WhipHarness {
         self.clear_cancellation();
         let execution = execution?;
         let evidence_pointers = execution.evidence_pointers();
-        let mut outcome = project_turn_execution(execution, evidence_pointers, &command, sink)?;
+        let streamed = resources.streamed.get();
+        let sink = resources.live.into_inner();
+        let mut outcome =
+            project_turn_execution(execution, evidence_pointers, &command, sink, !streamed)?;
         outcome.asked_questions = resources.asked.into_inner();
         outcome.runtime_start_position = Some(RuntimePosition {
             instance_ref: runtime_start_position.instance_ref,
@@ -975,6 +980,7 @@ fn project_turn_execution(
     evidence_pointers: Vec<RuntimeEvidencePointer>,
     command: &StartTurnCommand,
     sink: &mut dyn FnMut(&Observation),
+    sink_final_text: bool,
 ) -> io::Result<TurnOutcome> {
     let mut outcome = TurnOutcome {
         runtime_evidence_pointers: evidence_pointers
@@ -1025,7 +1031,10 @@ fn project_turn_execution(
             outcome.mediated_tool_calls.push(call.name);
             outcome.observations.push(observation);
         }
-        if !outcome.assistant_text.is_empty() {
+        // When deltas already streamed through `observe_text_delta`, the live
+        // tier has this text; sinking it again would double it on the open
+        // line. The durable record still carries it either way.
+        if sink_final_text && !outcome.assistant_text.is_empty() {
             sink(&Observation {
                 kind: "text",
                 detail: outcome.assistant_text.clone(),
@@ -1537,6 +1546,15 @@ struct TurnResources<'a> {
     /// `execute_tool` takes `&self`; the engine drains these once the turn
     /// settles, since it holds the store across the run (ADR 0113).
     asked: std::cell::RefCell<Vec<gaugedesk_harness::AskedQuestion>>,
+    /// The engine's observation sink, held for the duration of the blocking
+    /// `run_turn` call so WhippleScript's `observe_text_delta` can project
+    /// answer text live — the native counterpart of the DO harness's stream
+    /// relay. Interior mutability for the same reason as `asked`; the sink is
+    /// taken back out once the runtime returns.
+    live: std::cell::RefCell<&'a mut dyn FnMut(&Observation)>,
+    /// Whether any answer delta streamed, so the settled projection does not
+    /// sink the full text a second time (mirrors the hosted `streamed_text`).
+    streamed: std::cell::Cell<bool>,
 }
 
 impl ResourceResolver for TurnResources<'_> {
@@ -1622,6 +1640,23 @@ impl ResourceResolver for TurnResources<'_> {
             .to_string());
         }
         self.workspace.execute_tool(admitted_resources, call)
+    }
+
+    /// WhippleScript projects each answer-text delta here while the turn
+    /// streams (its "Live Turn Observation" contract). Relay it to the
+    /// engine's observation sink as the same operational `text` event the
+    /// hosted harness emits — never durable, replaced by the settled record.
+    fn observe_text_delta(&self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.streamed.set(true);
+        let observation = Observation {
+            kind: "text",
+            detail: delta.to_owned(),
+            tool: None,
+        };
+        (self.live.borrow_mut())(&observation);
     }
 }
 
@@ -1880,6 +1915,45 @@ impl std::error::Error for PolicyAdmissionError {}
 
 #[cfg(test)]
 mod tests {
+    /// The native answer-delta relay: WhippleScript's `observe_text_delta`
+    /// lands in the engine's observation sink as the same operational `text`
+    /// event the hosted harness emits, and marks the turn streamed so the
+    /// settled projection does not sink the full text a second time.
+    #[test]
+    fn answer_deltas_relay_to_the_observation_sink_as_text_events() {
+        use whipplescript::host_runtime::{NativeWorkspaceResolver, ResourceResolver};
+        let root = std::env::temp_dir().join(format!("whip-delta-relay-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("workspace root");
+        let workspace = NativeWorkspaceResolver::new(&root).expect("workspace resolver");
+        let mut seen: Vec<gaugedesk_harness::Observation> = Vec::new();
+        {
+            let mut sink = |observation: &gaugedesk_harness::Observation| {
+                seen.push(observation.clone());
+            };
+            let resources = super::TurnResources {
+                workspace: &workspace,
+                images: &[],
+                asked: std::cell::RefCell::new(Vec::new()),
+                live: std::cell::RefCell::new(&mut sink),
+                streamed: std::cell::Cell::new(false),
+            };
+            resources.observe_text_delta("Gauge");
+            resources.observe_text_delta("");
+            resources.observe_text_delta("Wright");
+            assert!(
+                resources.streamed.get(),
+                "a non-empty delta marks the turn streamed"
+            );
+        }
+        assert_eq!(seen.len(), 2, "empty deltas are not relayed");
+        assert!(seen.iter().all(|o| o.kind == "text"));
+        assert_eq!(
+            seen.iter().map(|o| o.detail.as_str()).collect::<String>(),
+            "GaugeWright"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `GATE-3f`: the roster reaches the agent on the tool, not by trial and error.
     ///
     /// Before this, an agent's only way to learn who exists was to name someone,
