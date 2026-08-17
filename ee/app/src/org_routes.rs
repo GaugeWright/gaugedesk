@@ -197,6 +197,12 @@ pub use gaugedesk_app::workbench_auth::{deny, req_scope};
 /// its own audience auth.
 fn entsec_exempt(path: &str) -> bool {
     path == "/health"
+        // What revision this Hub is serving. The four static surfaces publish the
+        // same document at the same path with no credential, and a monitor
+        // compares them; gating this one would mean the surface thirteen canary
+        // suites address is the only one that cannot be asked. It carries a build
+        // revision and nothing else -- no account, tenant or member state.
+        || path == "/gaugewright-release.json"
         // Stripe authenticates delivery with its signed webhook header. The route must
         // reach that verifier without a browser/member bearer; it grants no account access.
         || path == "/stripe/webhook"
@@ -1599,6 +1605,13 @@ mod authenticated_actor_tests {
         assert!(entsec_exempt(
             "/account/invitations/organization%3Aacme/accept"
         ));
+        // A public operational probe, like `/health`: the identity of the running
+        // build, carrying no account state. Deployed gated, it answered
+        // "authenticate to access your account" and could not do the one job it
+        // has.
+        assert!(entsec_exempt("/gaugewright-release.json"));
+        // Exempting the exact path must not exempt anything near it.
+        assert!(!entsec_exempt("/gaugewright-release.json.map"));
         assert!(!entsec_exempt("/account/tenants"));
         assert!(!entsec_exempt("/account/invitations-extra"));
     }
