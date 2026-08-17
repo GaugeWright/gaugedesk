@@ -223,6 +223,16 @@ export function createTranscriptScroll(): TranscriptScroll {
             following = false;
         }
     };
+    /** Hand the viewport to the reader mid-glide. Clearing our window is not
+     *  enough: the browser does not abandon an in-flight programmatic smooth
+     *  scroll on user input, so the animation keeps dragging the viewport to
+     *  its old target and the gesture feels ignored. An instant same-position
+     *  write is the documented way to cancel the animation. */
+    const haltGlide = () => {
+        if (glideUntil === 0) return;
+        glideUntil = 0;
+        transcriptEl?.scrollTo({ top: transcriptEl.scrollTop, behavior: "auto" });
+    };
     // Wheel-up and touch drags release the latch directly: during streaming the
     // latch rewrites scrollTop every frame, so waiting for the scroll event to
     // land off-bottom would fight the reader's gesture.
@@ -230,7 +240,7 @@ export function createTranscriptScroll(): TranscriptScroll {
         intentUntil = now() + INTENT_WINDOW_MS;
         if (event.deltaY !== 0) {
             anchored = false;
-            glideUntil = 0;
+            haltGlide();
         }
         if (event.deltaY < 0) following = false;
     };
@@ -238,11 +248,13 @@ export function createTranscriptScroll(): TranscriptScroll {
         intentUntil = now() + INTENT_WINDOW_MS;
         following = false;
         anchored = false;
-        glideUntil = 0;
+        haltGlide();
     };
-    // A scrollbar grab: the drag's scroll events do the judging.
+    // A scrollbar grab: halt any glide so the thumb is not fought over, and let
+    // the drag's scroll events do the judging.
     const onMouseDown = () => {
         intentUntil = now() + INTENT_WINDOW_MS;
+        haltGlide();
     };
 
     const placeAtBottom = () => {
