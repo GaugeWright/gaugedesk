@@ -572,7 +572,12 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
    stays reachable no matter how long a room gets. That is the failure the single
    882-line panel had: the way out scrolled off the top. */
 .settings-modal { width: 860px; max-width: 94vw; }
-.settings-body { display: flex; gap: 0; margin-top: 12px; min-height: 380px; max-height: 68vh; }
+/* The body is a fixed frame, not content-sized: between the 380px floor and the
+   68vh cap the old min/max pair let every room pick its own height, so the modal
+   grew and shrank on each switch in the room rail. One height for every room —
+   a short room keeps quiet space below, a long one scrolls inside — so the rail,
+   the head, and the close stay exactly where the last click left them. */
+.settings-body { display: flex; gap: 0; margin-top: 12px; height: min(600px, 68vh); min-height: 380px; }
 .settings-rooms { flex: 0 0 176px; border-right: 1px solid var(--edge); padding-right: 8px;
     display: flex; flex-direction: column; gap: 2px; }
 .settings-room { text-align: left; background: transparent; border: none; border-radius: 5px;
