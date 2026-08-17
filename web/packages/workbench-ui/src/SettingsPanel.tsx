@@ -506,6 +506,12 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
             setStatus("could not start sign-in");
             return;
         }
+        if (started.webReturn) {
+            // ADR 0140: the Hub returns the code to this browser origin — the
+            // round trip must happen in this tab for the fragment to land here.
+            window.location.assign(started.url);
+            return;
+        }
         window.open(started.url, "_blank", "noopener,noreferrer");
         setStatus("finish signing in in your browser — this panel updates by itself");
         // The deep-linked return lands in the control plane; poll until the session

@@ -1540,7 +1540,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         return this.runtimeAccountJson().then((json) => accountClient.hubSessionStatus(json));
     }
 
-    hubSessionStart(): Promise<{ url: string }> {
+    hubSessionStart(): Promise<{ url: string; webReturn: boolean }> {
         return this.runtimeAccountJson().then((json) => accountClient.hubSessionStart(json));
     }
 

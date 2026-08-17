@@ -88,13 +88,51 @@ fn challenge_for(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-/// The Hub login URL that begins a native handoff bound to `challenge`.
-fn login_url(hub: &str, challenge: &str) -> String {
+/// The Hub login URL that begins a native handoff bound to `challenge`. The
+/// return is the `gaugewright://` scheme unless a dev web return (ADR 0140)
+/// asks the Hub to hand the code back to a loopback browser origin instead.
+fn login_url(hub: &str, challenge: &str, web_return: Option<&str>) -> String {
     // The challenge alphabet is base64url (alphanumeric, `-`, `_`) — URL-safe by
     // construction; only the return URI needs encoding.
-    format!(
-        "{hub}/auth/login?return_to=gaugewright%3A%2F%2Fauth%2Fcallback&handoff_challenge={challenge}"
-    )
+    let return_to = match web_return {
+        Some(uri) => encode_return(uri),
+        None => encode_return(NATIVE_RETURN),
+    };
+    format!("{hub}/auth/login?return_to={return_to}&handoff_challenge={challenge}")
+}
+
+/// Percent-encode a return URI for a query value. The admitted return alphabets
+/// (the fixed native scheme and the loopback web grammar) leave only `:` and `/`
+/// as reserved characters.
+fn encode_return(uri: &str) -> String {
+    uri.replace(':', "%3A").replace('/', "%2F")
+}
+
+/// The dev web return (ADR 0140), validated: `GAUGEDESK_ACCOUNT_HUB_WEB_RETURN`
+/// names the loopback browser URL the Hub should hand the one-time code back to,
+/// for a browser dev client that cannot receive a `gaugewright://` deep link.
+/// The Hub admits it only when its own `GAUGEDESK_DEV_WEB_RETURN` gate is set.
+fn web_return_from_env() -> Result<Option<String>, &'static str> {
+    validate_web_return(gaugedesk_env::var("ACCOUNT_HUB_WEB_RETURN"))
+}
+
+/// Pure half of [`web_return_from_env`]. A set-but-invalid value is an error —
+/// fail closed rather than silently reverting to the native deep link the
+/// operator just asked to avoid.
+fn validate_web_return(raw: Option<String>) -> Result<Option<String>, &'static str> {
+    let Some(raw) = raw else { return Ok(None) };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if crate::auth_oidc::loopback_web_return(trimmed) {
+        Ok(Some(trimmed.to_string()))
+    } else {
+        Err(
+            "GAUGEDESK_ACCOUNT_HUB_WEB_RETURN must be a plain-http loopback URL \
+             (http://localhost[:port][/path] or http://127.0.0.1[:port][/path])",
+        )
+    }
 }
 
 /// Decode a claims field from an (already server-verified) JWT for projection —
@@ -323,6 +361,10 @@ pub async fn post_signin_start() -> impl IntoResponse {
         )
             .into_response();
     };
+    let web_return = match web_return_from_env() {
+        Ok(value) => value,
+        Err(message) => return (StatusCode::CONFLICT, message).into_response(),
+    };
     let verifier = new_verifier();
     let challenge = challenge_for(&verifier);
     *pending() = Some(PendingSignin {
@@ -330,8 +372,8 @@ pub async fn post_signin_start() -> impl IntoResponse {
         started: Instant::now(),
     });
     Json(json!({
-        "url": login_url(&hub, &challenge),
-        "return": NATIVE_RETURN,
+        "url": login_url(&hub, &challenge, web_return.as_deref()),
+        "return": web_return.as_deref().unwrap_or(NATIVE_RETURN),
     }))
     .into_response()
 }
@@ -519,11 +561,39 @@ mod tests {
 
     #[test]
     fn login_url_pins_the_native_return_and_carries_the_challenge() {
-        let url = login_url("https://auth.example.test", "abc-_123");
+        let url = login_url("https://auth.example.test", "abc-_123", None);
         assert_eq!(
             url,
             "https://auth.example.test/auth/login?return_to=gaugewright%3A%2F%2Fauth%2Fcallback&handoff_challenge=abc-_123"
         );
+    }
+
+    #[test]
+    fn login_url_carries_the_dev_web_return_when_asked() {
+        let url = login_url(
+            "https://auth.example.test",
+            "abc-_123",
+            Some("http://localhost:5176/auth/native-return"),
+        );
+        assert_eq!(
+            url,
+            "https://auth.example.test/auth/login?return_to=http%3A%2F%2Flocalhost%3A5176%2Fauth%2Fnative-return&handoff_challenge=abc-_123"
+        );
+    }
+
+    #[test]
+    fn web_return_validation_is_fail_closed() {
+        // Unset / blank: the native deep link stays the return.
+        assert_eq!(validate_web_return(None), Ok(None));
+        assert_eq!(validate_web_return(Some("  ".to_string())), Ok(None));
+        // A loopback URL is admitted (trimmed).
+        assert_eq!(
+            validate_web_return(Some(" http://127.0.0.1:5176/return ".to_string())),
+            Ok(Some("http://127.0.0.1:5176/return".to_string()))
+        );
+        // Anything else errors rather than silently reverting to the deep link.
+        assert!(validate_web_return(Some("https://evil.example/".to_string())).is_err());
+        assert!(validate_web_return(Some("gaugewright://auth/callback".to_string())).is_err());
     }
 
     fn test_jwt(claims: serde_json::Value) -> String {

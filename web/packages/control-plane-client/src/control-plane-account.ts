@@ -595,13 +595,21 @@ export async function hubSessionStatus(json: RouteJson): Promise<HubSessionStatu
 /** Begin the native handoff: the control plane mints and holds the verifier and
  *  returns the Hub login URL to open in the system browser. The flow completes
  *  when the OS deep-links `gaugewright://auth/callback#code=…` back and the code
- *  is posted via {@link hubSessionCallback}. */
-export async function hubSessionStart(json: RouteJson): Promise<{ url: string }> {
-    const o = (await json("POST", "/account/hub-session/start", {})) as { url?: string };
+ *  is posted via {@link hubSessionCallback}. `webReturn` is true when the
+ *  control plane asked for a dev web return (ADR 0140) — the Hub will 302 back
+ *  to this browser origin with `#code=…`, so the caller should navigate the
+ *  current tab rather than open a new one. */
+export async function hubSessionStart(
+    json: RouteJson,
+): Promise<{ url: string; webReturn: boolean }> {
+    const o = (await json("POST", "/account/hub-session/start", {})) as {
+        url?: string;
+        return?: string;
+    };
     if (typeof o.url !== "string" || !o.url) {
         throw new Error("account sign-in returned no login URL");
     }
-    return { url: o.url };
+    return { url: o.url, webReturn: typeof o.return === "string" && o.return.startsWith("http://") };
 }
 
 /** Deliver the deep-linked one-time code; the control plane redeems it with its
@@ -667,6 +675,26 @@ export function parseNativeHandoffCode(url: string): string | null {
     const hash = url.indexOf("#");
     if (hash < 0) return null;
     const params = new URLSearchParams(url.slice(hash + 1));
+    const code = params.get("code");
+    return code && code.trim() ? code.trim() : null;
+}
+
+/** Parse the one-time code out of a dev web-return fragment (ADR 0140): the Hub
+ *  redirected a *browser* dev client back to its own loopback origin with
+ *  `#code=…` instead of the `gaugewright://` scheme. `null` when the fragment is
+ *  anything else — in particular the local-OIDC callback fragment
+ *  (`#id_token=…`), which belongs to {@link parseCallbackFragment}'s flow.
+ *  Pure, for tests. */
+export function parseWebReturnHandoffCode(hash: string): string | null {
+    const h = hash.startsWith("#") ? hash.slice(1) : hash;
+    if (!h) return null;
+    let params: URLSearchParams;
+    try {
+        params = new URLSearchParams(h);
+    } catch {
+        return null;
+    }
+    if (params.get("id_token")) return null;
     const code = params.get("code");
     return code && code.trim() ? code.trim() : null;
 }

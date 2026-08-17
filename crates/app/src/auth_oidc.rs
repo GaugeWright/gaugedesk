@@ -983,6 +983,7 @@ pub async fn get_login(
     let native_return = match native_return_uri(
         query.return_to.as_deref(),
         query.handoff_challenge.as_deref(),
+        dev_web_return_enabled(),
     ) {
         Ok(value) => value,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
@@ -1042,22 +1043,77 @@ pub struct LoginQuery {
 fn native_return_uri(
     raw: Option<&str>,
     challenge: Option<&str>,
+    dev_web_return: bool,
 ) -> Result<Option<String>, &'static str> {
+    let challenge_ok = |challenge: &str| {
+        challenge.len() == 43
+            && challenge
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    };
     match (raw, challenge) {
         (None | Some(""), None) => Ok(None),
-        (Some("gaugewright://auth/callback"), Some(challenge))
-            if challenge.len() == 43
-                && challenge
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') =>
-        {
+        (Some("gaugewright://auth/callback"), Some(challenge)) if challenge_ok(challenge) => {
             Ok(Some("gaugewright://auth/callback".to_string()))
         }
         (Some("gaugewright://auth/callback"), _) => {
             Err("native login requires a valid handoff challenge")
         }
+        (Some(raw), Some(challenge)) if dev_web_return && loopback_web_return(raw) => {
+            if challenge_ok(challenge) {
+                Ok(Some(raw.to_string()))
+            } else {
+                Err("native login requires a valid handoff challenge")
+            }
+        }
+        (Some(raw), None) if dev_web_return && loopback_web_return(raw) => {
+            Err("native login requires a valid handoff challenge")
+        }
         _ => Err("unsupported login return URI"),
     }
+}
+
+/// Whether this deployment admits dev loopback web returns on the login handoff
+/// (ADR 0140): `GAUGEDESK_DEV_WEB_RETURN=1`. Off is the production posture — the
+/// hosted Hub never sets it, so the `gaugewright://` scheme stays the only
+/// admitted return there.
+fn dev_web_return_enabled() -> bool {
+    gaugedesk_env::enabled("DEV_WEB_RETURN")
+}
+
+/// A dev web return target (ADR 0140): plain-http **loopback** only —
+/// `http://localhost[:port][/path]` or `http://127.0.0.1[:port][/path]` — with a
+/// conservative path charset and no query, fragment, or userinfo, so the
+/// admitted value can only ever reach a browser on the developer's own machine.
+/// Pure; the env gate is [`dev_web_return_enabled`].
+pub(crate) fn loopback_web_return(raw: &str) -> bool {
+    let rest = match raw
+        .strip_prefix("http://localhost")
+        .or_else(|| raw.strip_prefix("http://127.0.0.1"))
+    {
+        Some(rest) => rest,
+        None => return false,
+    };
+    // The host must end exactly there — `http://localhost.evil.example` strips to
+    // `.evil.example`, which the port/path grammar below rejects.
+    let rest = match rest.strip_prefix(':') {
+        Some(after_colon) => {
+            let digits = after_colon
+                .bytes()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if digits == 0 {
+                return false;
+            }
+            &after_colon[digits..]
+        }
+        None => rest,
+    };
+    rest.is_empty()
+        || (rest.starts_with('/')
+            && rest.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_' | b'~')
+            }))
 }
 
 /// The OP's redirect-back query: a success carries `code` + `state`; a denial carries
@@ -1782,18 +1838,81 @@ iqlTEKVISscuchxZtKQJ4k8=
     fn native_login_return_is_exactly_allowlisted() {
         let challenge =
             crate::identity_oidc::s256_challenge("0123456789012345678901234567890123456789012");
-        assert_eq!(native_return_uri(None, None), Ok(None));
+        assert_eq!(native_return_uri(None, None, false), Ok(None));
         assert_eq!(
-            native_return_uri(Some("gaugewright://auth/callback"), Some(&challenge)),
+            native_return_uri(Some("gaugewright://auth/callback"), Some(&challenge), false),
             Ok(Some("gaugewright://auth/callback".to_string()))
         );
-        assert!(native_return_uri(Some("gaugewright://auth/callback"), None).is_err());
-        assert!(
-            native_return_uri(Some("https://attacker.example/callback"), Some(&challenge)).is_err()
+        assert!(native_return_uri(Some("gaugewright://auth/callback"), None, false).is_err());
+        assert!(native_return_uri(
+            Some("https://attacker.example/callback"),
+            Some(&challenge),
+            false
+        )
+        .is_err());
+        assert!(native_return_uri(
+            Some("gaugewright://auth/callback/extra"),
+            Some(&challenge),
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn dev_web_return_admits_loopback_only_behind_the_gate() {
+        let challenge =
+            crate::identity_oidc::s256_challenge("0123456789012345678901234567890123456789012");
+        let loopback = "http://localhost:5176/auth/native-return";
+        // Gate off (the production posture): a loopback return is refused outright.
+        assert!(native_return_uri(Some(loopback), Some(&challenge), false).is_err());
+        // Gate on: admitted, but only with the same valid PKCE challenge the
+        // native scheme requires.
+        assert_eq!(
+            native_return_uri(Some(loopback), Some(&challenge), true),
+            Ok(Some(loopback.to_string()))
         );
-        assert!(
-            native_return_uri(Some("gaugewright://auth/callback/extra"), Some(&challenge)).is_err()
+        assert!(native_return_uri(Some(loopback), None, true).is_err());
+        assert!(native_return_uri(Some(loopback), Some("short"), true).is_err());
+        // The native scheme is unchanged by the gate.
+        assert_eq!(
+            native_return_uri(Some("gaugewright://auth/callback"), Some(&challenge), true),
+            Ok(Some("gaugewright://auth/callback".to_string()))
         );
+        // Non-loopback web returns stay refused even with the gate on.
+        assert!(native_return_uri(
+            Some("https://attacker.example/callback"),
+            Some(&challenge),
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn loopback_web_return_grammar_is_strict() {
+        for admitted in [
+            "http://localhost",
+            "http://localhost:5176",
+            "http://localhost:5176/",
+            "http://localhost:5176/auth/native-return",
+            "http://127.0.0.1:7878/return_here-1.x~ok",
+        ] {
+            assert!(loopback_web_return(admitted), "should admit {admitted}");
+        }
+        for refused in [
+            "https://localhost:5176/",        // https loopback is not the dev shape
+            "http://localhost.evil.example/", // host must end at the loopback name
+            "http://localhost:5176evil/",     // port must be digits to the path
+            "http://localhost:/",             // empty port
+            "http://127.0.0.2:5176/",         // only the canonical loopback literal
+            "http://evil.example/",           // not loopback at all
+            "http://localhost:5176/?next=x",  // no query
+            "http://localhost:5176/#frag",    // no fragment
+            "http://user@localhost:5176/",    // no userinfo
+            "http://localhost:5176/sp ace",   // conservative charset only
+            "gaugewright://auth/callback",    // the native scheme is not a web return
+        ] {
+            assert!(!loopback_web_return(refused), "should refuse {refused}");
+        }
     }
 
     #[test]

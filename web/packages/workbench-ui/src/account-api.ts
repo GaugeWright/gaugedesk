@@ -55,6 +55,9 @@ export interface AccountPanelApi {
      * co-resident desktop control plane custodies a Hub session; compositions
      * without these methods simply do not render the account-session section. */
     hubSessionStatus?(): Promise<HubSessionStatus>;
-    hubSessionStart?(): Promise<{ url: string }>;
+    /** `webReturn` (ADR 0140): the Hub will 302 back to this browser origin with
+     * `#code=…`, so the caller navigates the current tab instead of opening a
+     * new one. Absent/false on the desktop deep-link path. */
+    hubSessionStart?(): Promise<{ url: string; webReturn?: boolean }>;
     hubSessionSignOut?(): Promise<void>;
 }

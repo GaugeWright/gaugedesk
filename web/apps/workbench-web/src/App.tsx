@@ -40,6 +40,7 @@ import {
     type ClientRequestId,
     parseHomeInvitation,
     parseNativeHandoffCode,
+    parseWebReturnHandoffCode,
     type HomeInvitationPreview,
     type PlacementPolicy,
 } from "@gaugewright/control-plane-client";
@@ -375,6 +376,28 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         };
         window.addEventListener("gw-deep-link", onDeepLink);
         onCleanup(() => window.removeEventListener("gw-deep-link", onDeepLink));
+        // ADR 0140: a dev web return — the Hub handed the one-time handoff code
+        // back to this browser origin (`#code=…`) instead of the `gaugewright://`
+        // scheme, because the initiating client is a browser dev session that no
+        // deep link can reach. Same redemption as the deep-linked return; the
+        // fragment is stripped first so a reload or copied URL cannot replay it
+        // (the code is single-use at the control plane regardless).
+        const webReturnCode = parseWebReturnHandoffCode(window.location.hash);
+        if (webReturnCode) {
+            try {
+                history.replaceState(
+                    null,
+                    "",
+                    window.location.pathname + window.location.search,
+                );
+            } catch {
+                /* ignore — the code is redeemed regardless */
+            }
+            void api
+                .hubSessionCallback(webReturnCode)
+                .then(() => refetchHubSession())
+                .catch(() => {});
+        }
     }
     const [agentSettings, setAgentSettings] = createSignal<{ id: ArchetypeId; name: string } | null>(null);
     // The per-project Engagement pane (FED-7), opened from a project node.
@@ -2251,10 +2274,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             }
                             // Desktop: the control plane mints and holds the verifier and
                             // returns the Hub login URL for the system browser; the
-                            // gaugewright:// return completes the handoff.
+                            // gaugewright:// return completes the handoff. A dev web
+                            // return (ADR 0140) instead lands back on this origin, so
+                            // the round trip must stay in this tab.
                             void api
                                 .hubSessionStart()
-                                .then(({ url }) => {
+                                .then(({ url, webReturn }) => {
+                                    if (webReturn) {
+                                        window.location.assign(url);
+                                        return;
+                                    }
                                     window.open(url, "_blank", "noopener,noreferrer");
                                 })
                                 .catch(() => {});

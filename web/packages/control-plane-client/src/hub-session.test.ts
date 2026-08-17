@@ -8,6 +8,7 @@ import {
     hubSessionStart,
     hubSessionStatus,
     parseNativeHandoffCode,
+    parseWebReturnHandoffCode,
     type RouteJson,
 } from "./index";
 
@@ -25,6 +26,25 @@ describe("parseNativeHandoffCode", () => {
         expect(parseNativeHandoffCode("gaugewright://auth/callback#code=")).toBeNull();
         expect(parseNativeHandoffCode("https://auth.example.test/callback#code=x")).toBeNull();
         expect(parseNativeHandoffCode("")).toBeNull();
+    });
+});
+
+describe("parseWebReturnHandoffCode", () => {
+    it("reads the code off the dev web-return fragment", () => {
+        expect(parseWebReturnHandoffCode("#code=abc123")).toBe("abc123");
+        expect(parseWebReturnHandoffCode("code=abc123")).toBe("abc123");
+        expect(parseWebReturnHandoffCode("#code=a-b_c&extra=1")).toBe("a-b_c");
+    });
+
+    it("ignores empty, foreign, and local-OIDC fragments", () => {
+        expect(parseWebReturnHandoffCode("")).toBeNull();
+        expect(parseWebReturnHandoffCode("#")).toBeNull();
+        expect(parseWebReturnHandoffCode("#code=")).toBeNull();
+        expect(parseWebReturnHandoffCode("#section-3")).toBeNull();
+        // The local-OIDC callback fragment belongs to the bearer flow, even if a
+        // stray `code` rides along.
+        expect(parseWebReturnHandoffCode("#id_token=jwt&token_type=Bearer")).toBeNull();
+        expect(parseWebReturnHandoffCode("#id_token=jwt&code=x")).toBeNull();
     });
 });
 
@@ -66,6 +86,21 @@ describe("hub session wrappers", () => {
         await expect(hubSessionStart(jsonReturning({}, []))).rejects.toThrow(/no login URL/);
         const started = await hubSessionStart(jsonReturning({ url: "https://hub/auth/login" }, []));
         expect(started.url).toBe("https://hub/auth/login");
+        expect(started.webReturn).toBe(false);
+    });
+
+    it("start reports a dev web return so the caller keeps the tab", async () => {
+        const native = await hubSessionStart(
+            jsonReturning({ url: "https://hub/auth/login", return: "gaugewright://auth/callback" }, []),
+        );
+        expect(native.webReturn).toBe(false);
+        const web = await hubSessionStart(
+            jsonReturning(
+                { url: "https://hub/auth/login", return: "http://localhost:5176/" },
+                [],
+            ),
+        );
+        expect(web.webReturn).toBe(true);
     });
 
     it("callback posts exactly the one-time code", async () => {
