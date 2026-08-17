@@ -128,10 +128,9 @@ fn validate_web_return(raw: Option<String>) -> Result<Option<String>, &'static s
     if crate::auth_oidc::loopback_web_return(trimmed) {
         Ok(Some(trimmed.to_string()))
     } else {
-        Err(
-            "GAUGEDESK_ACCOUNT_HUB_WEB_RETURN must be a plain-http loopback URL \
-             (http://localhost[:port][/path] or http://127.0.0.1[:port][/path])",
-        )
+        Err("GAUGEDESK_ACCOUNT_HUB_WEB_RETURN must be a loopback URL: \
+             http://localhost[:port][/path], http://127.0.0.1[:port][/path], \
+             or the fabric's https://<name>.localhost[:port][/path]")
     }
 }
 
@@ -594,6 +593,11 @@ mod tests {
         // Anything else errors rather than silently reverting to the deep link.
         assert!(validate_web_return(Some("https://evil.example/".to_string())).is_err());
         assert!(validate_web_return(Some("gaugewright://auth/callback".to_string())).is_err());
+        // The fabric's named loopback origin is admitted (ADR 0140 amendment).
+        assert_eq!(
+            validate_web_return(Some("https://desk.gw.localhost:7443/".to_string())),
+            Ok(Some("https://desk.gw.localhost:7443/".to_string()))
+        );
     }
 
     fn test_jwt(claims: serde_json::Value) -> String {

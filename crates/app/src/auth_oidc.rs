@@ -1081,15 +1081,20 @@ fn dev_web_return_enabled() -> bool {
     gaugedesk_env::enabled("DEV_WEB_RETURN")
 }
 
-/// A dev web return target (ADR 0140): plain-http **loopback** only —
-/// `http://localhost[:port][/path]` or `http://127.0.0.1[:port][/path]` — with a
-/// conservative path charset and no query, fragment, or userinfo, so the
+/// A dev web return target (ADR 0140, amended): **loopback** only, in two
+/// forms — the raw dev loop's plain-http loopback literal
+/// (`http://localhost[:port][/path]`, `http://127.0.0.1[:port][/path]`), and
+/// the development fabric's named origin (`https://<labels>.localhost[:port]
+/// [/path]`, e.g. `https://desk.gw.localhost:7443/`), whose `.localhost` suffix
+/// resolves to loopback by RFC 6761 and by every browser that would open the
+/// return. Conservative path charset, no query, fragment, or userinfo, so the
 /// admitted value can only ever reach a browser on the developer's own machine.
 /// Pure; the env gate is [`dev_web_return_enabled`].
 pub(crate) fn loopback_web_return(raw: &str) -> bool {
     let rest = match raw
         .strip_prefix("http://localhost")
         .or_else(|| raw.strip_prefix("http://127.0.0.1"))
+        .or_else(|| fabric_host_rest(raw))
     {
         Some(rest) => rest,
         None => return false,
@@ -1114,6 +1119,39 @@ pub(crate) fn loopback_web_return(raw: &str) -> bool {
             && rest.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_' | b'~')
             }))
+}
+
+/// The named-origin form: `https://<label>(.<label>)+` where the final label is
+/// exactly `localhost` and every label is lowercase alphanumeric-or-hyphen.
+/// Returns the remainder after the host (the `[:port][/path]` tail) when the
+/// host matches, `None` otherwise. A bare `https://localhost` is deliberately
+/// not admitted — the raw loop is plain http; https is the fabric's named
+/// origin model.
+fn fabric_host_rest(raw: &str) -> Option<&str> {
+    let after_scheme = raw.strip_prefix("https://")?;
+    let host_len = after_scheme
+        .bytes()
+        .take_while(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'.'
+        })
+        .count();
+    let host = &after_scheme[..host_len];
+    let rest = &after_scheme[host_len..];
+    let mut labels = host.split('.');
+    let Some("localhost") = labels.next_back() else {
+        return None;
+    };
+    let mut named = 0;
+    for label in labels {
+        if label.is_empty() || label.starts_with('-') || label.ends_with('-') {
+            return None;
+        }
+        named += 1;
+    }
+    if named == 0 {
+        return None;
+    }
+    Some(rest)
 }
 
 /// The OP's redirect-back query: a success carries `code` + `state`; a denial carries
@@ -1895,11 +1933,15 @@ iqlTEKVISscuchxZtKQJ4k8=
             "http://localhost:5176/",
             "http://localhost:5176/auth/native-return",
             "http://127.0.0.1:7878/return_here-1.x~ok",
+            // The fabric's named loopback origins (ADR 0140 amendment).
+            "https://desk.gw.localhost:7443/",
+            "https://desk.gw.localhost:7463",
+            "https://a.localhost/return",
         ] {
             assert!(loopback_web_return(admitted), "should admit {admitted}");
         }
         for refused in [
-            "https://localhost:5176/",        // https loopback is not the dev shape
+            "https://localhost:5176/",        // bare https loopback is not a dev shape
             "http://localhost.evil.example/", // host must end at the loopback name
             "http://localhost:5176evil/",     // port must be digits to the path
             "http://localhost:/",             // empty port
@@ -1910,6 +1952,17 @@ iqlTEKVISscuchxZtKQJ4k8=
             "http://user@localhost:5176/",    // no userinfo
             "http://localhost:5176/sp ace",   // conservative charset only
             "gaugewright://auth/callback",    // the native scheme is not a web return
+            // Named-origin form: `.localhost` must be the final label of a real
+            // named host, http named hosts stay refused, and the tail grammar
+            // still holds.
+            "https://desk.gw.localhost.evil.example/", // suffix must end the host
+            "https://desk.gw.localhostx:7443/",        // exact final label
+            "http://desk.gw.localhost:7443/",          // named origins are https-only
+            "https://gw..localhost/",                  // no empty labels
+            "https://-a.localhost/",                   // no hyphen-edged labels
+            "https://DESK.gw.localhost:7443/",         // lowercase hosts only
+            "https://desk.gw.localhost@evil.example/", // no userinfo
+            "https://desk.gw.localhost:7443/?next=x",  // no query
         ] {
             assert!(!loopback_web_return(refused), "should refuse {refused}");
         }
