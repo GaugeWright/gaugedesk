@@ -62,6 +62,13 @@ export function reduce(t: Transcript, ev: StreamEvent): Transcript {
             return { lines: [...t.lines, line], openText: null };
         }
         case "assistant": {
+            // A turn can end with no user-visible prose (the durable Assistant
+            // record exists regardless — it anchors the turn boundary). Admit
+            // nothing rather than a blank bubble, but still close the open
+            // operational line: the turn is over.
+            if (ev.text.trim() === "") {
+                return { lines: t.lines, openText: null };
+            }
             const line: TranscriptLine = {
                 seq, tier: "admitted", kind: "assistant", text: ev.text,
                 entryId: ev.entry_id, forkable: ev.forkable,

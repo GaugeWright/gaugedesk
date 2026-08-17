@@ -79,6 +79,18 @@ describe("transcript reduction", () => {
         expect(assistant.lines[1]).toMatchObject({ entryId: 52, forkable: true });
     });
 
+    it("admits no line for an assistant record with no prose, but closes the open text", () => {
+        let t = empty;
+        t = reduce(t, { type: "text", delta: "partial" });
+        expect(t.openText).not.toBeNull();
+        t = reduce(t, { type: "assistant", text: "", entry_id: 7, forkable: true });
+        expect(t.openText).toBeNull();
+        expect(t.lines.filter((l) => l.kind === "assistant")).toHaveLength(0);
+        // whitespace-only prose is the same absence
+        const ws = reduce(empty, { type: "assistant", text: "  \n" });
+        expect(ws.lines).toHaveLength(0);
+    });
+
     it("is repairable: replaying a snapshot from empty yields the same transcript", () => {
         const events: StreamEvent[] = [
             { type: "text", delta: "a" },
