@@ -156,7 +156,7 @@ async fn multi_tenant_admin_surfaces_are_scope_isolated() {
             "acme",
             "administration.organization",
             "organization.update",
-            json!({"display_name":"Acme", "verified_domains":[], "kind":"client"})
+            json!({"display_name":"Acme", "verified_domains":[], "default_region":null, "kind":"client"})
         )
         .await
         .0,
@@ -168,7 +168,7 @@ async fn multi_tenant_admin_surfaces_are_scope_isolated() {
             "globex",
             "administration.organization",
             "organization.update",
-            json!({"display_name":"Globex", "verified_domains":[], "kind":"client"})
+            json!({"display_name":"Globex", "verified_domains":[], "default_region":null, "kind":"client"})
         )
         .await
         .0,
@@ -255,6 +255,87 @@ async fn org_settings_round_trip() {
     assert_eq!(body["display_name"], "Acme");
     assert!(body["verified_domains"].as_array().unwrap().is_empty());
     assert_eq!(body["default_region"], "eu");
+}
+
+#[tokio::test]
+async fn an_incomplete_organization_edit_is_refused_and_changes_nothing() {
+    // `organization.update` replaces the whole `administration.organization`
+    // document, so a payload missing a field is a client defect and is refused.
+    // It used to parse — every field was `#[serde(default)]` — and the omitted
+    // ones were written back as `Default`, blanking the display name and
+    // resetting the tenant's recorded party to `client`. The org fold is
+    // latest-wins, so that loss was permanent.
+    let (_dir, app) = workbench();
+    let (status, _) = command(
+        &app,
+        "administration.organization",
+        "organization.update",
+        json!({"display_name":"Expert LLC","verified_domains":[],"default_region":"eu","kind":"consultant"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for partial in [
+        json!({"default_region":"us"}),
+        json!({"display_name":"Expert LLC","verified_domains":[],"kind":"consultant"}),
+        json!({"verified_domains":[],"default_region":"eu","kind":"consultant"}),
+        json!({"display_name":"Expert LLC","default_region":"eu","kind":"consultant"}),
+        json!({"display_name":"Expert LLC","verified_domains":[],"default_region":"eu"}),
+        json!({}),
+    ] {
+        let (status, body) = command(
+            &app,
+            "administration.organization",
+            "organization.update",
+            partial.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "incomplete organization payload {partial} was accepted: {body}"
+        );
+    }
+
+    // Every field the refused payloads omitted still holds its configured value.
+    let (status, body) = document(&app, None, "administration.organization").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["display_name"], "Expert LLC");
+    assert_eq!(body["kind"], "consultant");
+    assert_eq!(body["default_region"], "eu");
+}
+
+#[tokio::test]
+async fn a_complete_organization_edit_replaces_every_field() {
+    // The other half of the replace contract: a field the caller does send is
+    // written verbatim, including a cleared `default_region`.
+    let (_dir, app) = workbench();
+    let (status, _) = command(
+        &app,
+        "administration.organization",
+        "organization.update",
+        json!({"display_name":"Acme","verified_domains":[],"default_region":"eu","kind":"consultant"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = command(
+        &app,
+        "administration.organization",
+        "organization.update",
+        json!({"display_name":"Acme Holdings","verified_domains":[],"default_region":null,"kind":"client"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = document(&app, None, "administration.organization").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["display_name"], "Acme Holdings");
+    assert_eq!(body["kind"], "client");
+    assert!(
+        body["default_region"].is_null(),
+        "an explicit null clears the region: {body}"
+    );
 }
 
 #[tokio::test]
@@ -445,7 +526,7 @@ async fn org_kind_defaults_to_client_and_accepts_consultant() {
         &app,
         "administration.organization",
         "organization.update",
-        json!({"display_name":"Acme","verified_domains":[],"kind":"client"}),
+        json!({"display_name":"Acme","verified_domains":[],"default_region":null,"kind":"client"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -457,7 +538,7 @@ async fn org_kind_defaults_to_client_and_accepts_consultant() {
         &app,
         "administration.organization",
         "organization.update",
-        json!({"display_name":"Expert LLC","verified_domains":[],"kind":"consultant"}),
+        json!({"display_name":"Expert LLC","verified_domains":[],"default_region":null,"kind":"consultant"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -512,7 +593,7 @@ async fn domain_capture_has_no_unauthenticated_public_mutation_route() {
         &app,
         "administration.organization",
         "organization.update",
-        json!({"display_name":"Acme","verified_domains":["acme.com"],"kind":"client"}),
+        json!({"display_name":"Acme","verified_domains":["acme.com"],"default_region":null,"kind":"client"}),
     )
     .await;
     assert_eq!(

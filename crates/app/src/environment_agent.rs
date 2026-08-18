@@ -553,7 +553,7 @@ fn provider_tools() -> Value {
         // schemas forbid an open nested object, so only this proposal tool is
         // non-strict; the outer arguments remain closed and every read tool
         // remains strict.
-        { "type": "function", "name": "environment_changes_propose", "description": "Prepare, but never apply or review, one declared Environment command proposal.", "parameters": { "type": "object", "properties": { "document_id": { "type": "string" }, "command_id": { "type": "string" }, "payload": { "type": "object", "additionalProperties": true } }, "required": ["document_id", "command_id", "payload"], "additionalProperties": false }, "strict": false }
+        { "type": "function", "name": "environment_changes_propose", "description": "Prepare, but never apply or review, one declared Environment command proposal. A command that edits a whole document replaces it: read the document first and send every field, carrying unchanged ones through verbatim. An omitted field is a rejected payload, not a preserved value.", "parameters": { "type": "object", "properties": { "document_id": { "type": "string" }, "command_id": { "type": "string" }, "payload": { "type": "object", "additionalProperties": true } }, "required": ["document_id", "command_id", "payload"], "additionalProperties": false }, "strict": false }
     ])
 }
 

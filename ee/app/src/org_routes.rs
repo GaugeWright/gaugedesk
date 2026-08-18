@@ -361,38 +361,11 @@ pub async fn get_org(State(wb): State<SharedWorkbench>, headers: HeaderMap) -> i
     }
 }
 
-#[derive(Deserialize)]
-pub struct OrgSettingsBody {
-    #[serde(default)]
-    display_name: String,
-    #[serde(default)]
-    verified_domains: Vec<String>,
-    #[serde(default)]
-    default_region: Option<String>,
-    #[serde(default)]
-    kind: gaugedesk_app::org::OrgKind,
-}
-
-pub async fn post_org(
-    State(wb): State<SharedWorkbench>,
-    headers: HeaderMap,
-    Json(body): Json<OrgSettingsBody>,
-) -> impl IntoResponse {
-    let mut wb = wb.lock_unpoisoned();
-    if let Some(resp) = deny(&wb, &headers, Some(Capability::EditOrgSettings)) {
-        return resp;
-    }
-    let record = OrgRecord {
-        id: ORG_ID.to_string(),
-        op: RecordOp::Upsert,
-        display_name: body.display_name,
-        verified_domains: body.verified_domains,
-        default_region: body.default_region,
-        kind: body.kind,
-    };
-    write_org(&mut wb, &req_scope(&headers), &record);
-    (StatusCode::OK, Json(json!({ "org": record }))).into_response()
-}
+// `post_org` stood here as the `/admin/org` façade. The route is retired — see
+// `retired_legacy_management_facades_are_unreachable` — and the handler was left
+// behind unmounted, carrying the same all-optional body that let an incomplete
+// payload blank the org. `organization.update` is the one way to write these
+// settings, and it now requires the whole document.
 
 // ---- members (B11) -------------------------------------------------------
 

@@ -988,16 +988,44 @@ fn fact(
     })
 }
 
+/// The whole `administration.organization` document, field for field.
+///
+/// Environment commands replace the document they name rather than merging into
+/// it: a literal Edit submits the content the caller edited, and a form control
+/// submits the same payload it would have produced. So every field is required.
+/// These four were once `#[serde(default)]`, which made an incomplete payload
+/// parse into a *complete* record built from `Default` — a caller sending only
+/// `default_region` blanked the tenant's display name and reset its recorded
+/// party to `Client`, and the latest-wins org fold made the loss permanent.
+/// Nothing in the payload said which fields the caller meant to leave alone, so
+/// there was no honest merge to perform; refusing the payload is the answer that
+/// keeps Edit literal. The record type keeps its own `#[serde(default)]` for a
+/// different reason — old log records must stay parseable (`INV-6`) — and that
+/// is why the wire type is separate from it.
 #[derive(Deserialize)]
 struct OrganizationPayload {
-    #[serde(default)]
     display_name: String,
-    #[serde(default)]
     verified_domains: Vec<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "present_option")]
     default_region: Option<String>,
-    #[serde(default)]
     kind: OrgKind,
+}
+
+/// Deserialize an optional field that must still be **present**.
+///
+/// `#[serde(default)]` is not the only thing that makes a field skippable: the
+/// derive routes a missing `Option` through serde's `missing_field`, which
+/// answers `None` rather than erroring, so dropping the attribute alone left
+/// `default_region` omissible — and an omission read as "clear the region",
+/// which is the same silent overwrite in a quieter form. Naming a
+/// `deserialize_with` makes the derive emit a hard `missing_field` error
+/// instead. The field must appear; an explicit `null` is how a caller clears it.
+fn present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 #[derive(Deserialize)]
 struct DomainPayload {
@@ -2496,6 +2524,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_literal_edit_that_drops_a_field_is_refused_rather_than_merged() {
+        // Edit is literal: `submit_change` forwards the edited document as the
+        // command payload, so `organization.update` receives the document itself
+        // and replaces it. A caller who deletes a key has not asked to keep the
+        // old value — nothing in the payload could say so — and merging one back
+        // in would make the editor lie about what it wrote. Refuse instead, the
+        // way `policy.update` already refuses a document missing `security`.
+        let (_dir, shared, app) = test_app();
+        let session = open(&app).await;
+        let organization = session["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|document| document["id"] == "administration.organization")
+            .unwrap();
+        let change = |content: Value| {
+            json!({
+                "session_id": session["id"], "environment": "administration", "scope": session["scope"],
+                "document_id": "administration.organization",
+                "base_revision": organization["revision"], "content": content, "client": "edit",
+            })
+        };
+        let (status, accepted) = request(
+            &app,
+            Method::POST,
+            "/environments/administration/changes",
+            change(json!({
+                "display_name": "Expert LLC", "verified_domains": [],
+                "default_region": "eu", "kind": "consultant",
+            })),
+            Some("edit-complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+
+        let (status, refused) = request(
+            &app,
+            Method::POST,
+            "/environments/administration/changes",
+            change(json!({ "display_name": "Expert LLC", "verified_domains": [] })),
+            Some("edit-incomplete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("kind") || error.contains("default_region"),
+            "the refusal names the field the document is missing: {refused}"
+        );
+        // The refused edit left no change behind — only the complete one exists.
+        let changes = fold_environment_changes(shared.lock().unwrap().store_ref(), "org").unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+    }
+
+    #[tokio::test]
     async fn browser_edit_agent_and_cli_share_the_route_decision_and_receipt_contract() {
         let (_dir, shared, app) = test_app();
         let session = open(&app).await;
@@ -2728,7 +2811,7 @@ mod tests {
             .find(|document| document["id"] == "administration.organization")
             .unwrap()["revision"]
             .clone();
-        let make = |name: &str| json!({ "session_id": session["id"], "environment": "administration", "scope": session["scope"], "document_id": "administration.organization", "command_id": "organization.update", "base_revision": base, "payload": { "display_name": name, "verified_domains": [], "kind": "client" }, "client": "cli" });
+        let make = |name: &str| json!({ "session_id": session["id"], "environment": "administration", "scope": session["scope"], "document_id": "administration.organization", "command_id": "organization.update", "base_revision": base, "payload": { "display_name": name, "verified_domains": [], "default_region": null, "kind": "client" }, "client": "cli" });
         let (_, first) = request(
             &app,
             Method::POST,
