@@ -23,8 +23,8 @@ use gaugedesk_core::abac::Policy;
 use gaugedesk_core::rbac::Capability;
 
 use gaugedesk_app::org::{
-    is_valid_role, ArchetypeApprovalPolicyRecord, BillingRecord, GroupMappingRecord,
-    MemberGrantRecord, MembershipRecord, MembershipStatus, Org, OrgRecord, PolicyRecord, RecordOp,
+    is_valid_role, ArchetypeApprovalPolicyRecord, GroupMappingRecord, MemberGrantRecord,
+    MembershipRecord, MembershipStatus, Org, OrgRecord, PolicyRecord, RecordOp,
     SecurityPolicyRecord, SoftwarePolicyRecord, SsoConnectionRecord, ORG_ID,
 };
 use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
@@ -960,14 +960,6 @@ pub async fn post_software_policy(
 
 // ---- billing & seats (B16 / BILL-1, BILL-3) ------------------------------
 
-fn write_billing(wb: &mut Workbench, scope: &str, r: &BillingRecord) {
-    let op = op_str(r.op);
-    let _ = wb
-        .store_mut()
-        .append_record(scope, "billing", &serde_json::to_string(r).unwrap());
-    wb.notify_library_changed("billing", &r.id, op);
-}
-
 pub async fn get_billing(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
@@ -1001,22 +993,13 @@ pub async fn get_billing(
     }
 }
 
-pub async fn post_billing(
-    State(wb): State<SharedWorkbench>,
-    headers: HeaderMap,
-    Json(mut record): Json<BillingRecord>,
-) -> impl IntoResponse {
-    let mut wb = wb.lock_unpoisoned();
-    if let Some(resp) = deny(&wb, &headers, Some(Capability::ManageBilling)) {
-        return resp;
-    }
-    record.id = ORG_ID.to_string();
-    record.op = RecordOp::Upsert;
-    write_billing(&mut wb, &req_scope(&headers), &record);
-    let actor = wb.actor(bearer(&headers));
-    gaugedesk_app::audit::record(&mut wb, &actor, "billing.update", "billing");
-    (StatusCode::OK, Json(json!({ "billing": record }))).into_response()
-}
+// `post_billing` stood here as the `/admin/billing` façade. The route is retired
+// — see `retired_legacy_management_facades_are_unreachable` — and the handler was
+// left behind unmounted, deserializing the request body straight into
+// `BillingRecord`, whose `#[serde(default)]` fields exist for the log rather than
+// for a wire body. Any body it did not recognise wrote an all-default record.
+// `billing.update` is the one way to write billing state, and it now requires the
+// whole document.
 
 // ---- security policy (B15 / SEC-1/2/3) -----------------------------------
 

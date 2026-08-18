@@ -109,11 +109,13 @@ export interface SoftwarePolicy {
     readonly allowed_channels: ReadonlyArray<"stable" | "beta" | "dev">;
     readonly grace_until_unix_ms?: number | null;
 }
-/** Billing/seat state (B16). */
+/** Billing/seat state (B16). `billing.update` replaces the whole record, so every
+ *  field is required on the wire — an omitted `managed_inference` would drop the
+ *  org-funded subscription rather than preserve it. `null` is how it is cleared. */
 export interface Billing {
     readonly plan: string;
     readonly seats: number;
-    readonly managed_inference?: {
+    readonly managed_inference: {
         readonly plan: string;
         readonly status: "active" | "suspended" | "lapsed";
         readonly included_tokens: number;

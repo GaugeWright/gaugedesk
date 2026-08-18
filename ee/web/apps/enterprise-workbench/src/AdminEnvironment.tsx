@@ -298,7 +298,12 @@ export function AdminEnvironment(props: { api: EnterpriseControlPlane; onReturnT
         setPlacement: (value) => proposeCommand("policy.json", "policy.update", policyPayload({ placement: value })),
         setApproval: (value) => proposeCommand("policy.json", "policy.update", policyPayload({ archetype_approval: value })),
         setSoftware: (value) => proposeCommand("software-policy.json", "software-policy.update", value),
-        setBilling: (value) => proposeCommand("billing.json", "billing.update", value),
+        // `billing.update` replaces the whole `billing.json` document, and that
+        // document nests the writable record under `billing` beside its derived
+        // `seats_used`/`managed_usage`. The form composes the same payload a
+        // literal Edit of the document would send; the derived keys are the
+        // command's to ignore, not this control's to invent.
+        setBilling: (value) => proposeCommand("billing.json", "billing.update", { billing: value }),
     };
 
     const reviewChange = async (change: ManagementEnvironmentChange, decision: "accept" | "reject") => {

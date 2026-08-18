@@ -4,6 +4,8 @@ This guide explains the derived View for `billing.json`. The JSON document remai
 
 Plan and seat state are operational. Payment or a seat does not create an access grant and cannot rewrite prior authority or history.
 
+Only the `billing` object in this document is writable, and a change replaces it whole: send every field, carrying unchanged ones through verbatim, and clear the managed-inference subscription with an explicit `null` rather than by dropping it. `seats_used` and `managed_usage` are derived from membership and recorded usage; editing them changes nothing.
+
 ## Using the agent
 
 Ask the Admin agent to explain this file or prepare a reviewed patch. The agent cannot use a shell or the web, cannot reveal credentials, and cannot admit its own proposal.

@@ -1064,6 +1064,57 @@ struct PolicyPayload {
     archetype_approval: ArchetypeApprovalPolicyRecord,
 }
 
+/// The `administration.billing` document as `billing.update` receives it.
+///
+/// `billing.update` replaces its document the way `organization.update` does,
+/// but this document is not its payload field for field: the projection nests
+/// the record under `billing` beside the derived `seats_used` and
+/// `managed_usage`, and the hosted extension replaces the projection with a
+/// superset carrying `cloud` as well. A literal Edit forwards the whole edited
+/// document, so the payload the command must accept *is* that document. It used
+/// to parse the payload straight into `BillingRecord`, and none of the
+/// document's keys are record fields — so every field fell to the
+/// `#[serde(default)]` the record carries for `INV-6`, the parse succeeded into
+/// an all-default record, and the upsert blanked the plan, zeroed the seats, and
+/// dropped the org-funded managed-inference subscription. The org fold is
+/// latest-wins, so the loss was permanent.
+///
+/// The derived siblings are read, never written, so they are absent here and
+/// whatever the caller sends for them is ignored. Nor could they be checked
+/// against the projection: these commands are proposed and applied after human
+/// review, and `seats_used` and `managed_usage` legitimately move in between, so
+/// refusing a stale echo would refuse honest edits. Everything the command does
+/// write is required — a form control composes exactly this shape.
+#[derive(Deserialize)]
+struct BillingPayload {
+    billing: BillingSettings,
+}
+
+/// The writable billing record, field for field, separate from `BillingRecord`
+/// for the reason `OrganizationPayload` is separate from `OrgRecord`: the record
+/// defaults every field so old log records stay parseable (`INV-6`), and a wire
+/// type inheriting that would write a dropped field back as `Default` rather
+/// than refuse the payload. `id` and `op` are the command's to set, so an edited
+/// one is ignored rather than honoured.
+#[derive(Deserialize)]
+struct BillingSettings {
+    plan: String,
+    seats: u64,
+    #[serde(deserialize_with = "present_option")]
+    managed_inference: Option<ManagedInferenceSettings>,
+}
+
+/// The org-funded managed-inference subscription, field for field. The same rule
+/// one level down, because the same `INV-6` defaults are one level down:
+/// a nested object that dropped `status` would quietly suspend the subscription,
+/// and one that dropped `included_tokens` would zero the token grant.
+#[derive(Deserialize)]
+struct ManagedInferenceSettings {
+    plan: String,
+    status: gaugedesk_app::managed_inference::ManagedPlanStatus,
+    included_tokens: u64,
+}
+
 fn parse<T: serde::de::DeserializeOwned>(payload: &Value) -> Result<T, Response> {
     serde_json::from_value(payload.clone()).map_err(|error| {
         (
@@ -1444,9 +1495,20 @@ fn plan_command(
             }
         }
         "billing.update" => {
-            let mut record: BillingRecord = parse(&command.payload)?;
-            record.id = ORG_ID.into();
-            record.op = RecordOp::Upsert;
+            let value: BillingPayload = parse(&command.payload)?;
+            let record = BillingRecord {
+                id: ORG_ID.into(),
+                op: RecordOp::Upsert,
+                plan: value.billing.plan,
+                seats: value.billing.seats,
+                managed_inference: value.billing.managed_inference.map(|plan| {
+                    gaugedesk_app::managed_inference::ManagedInferencePlan {
+                        plan: plan.plan,
+                        status: plan.status,
+                        included_tokens: plan.included_tokens,
+                    }
+                }),
+            };
             MutationPlan {
                 facts: vec![fact(&scope, "billing", &record)?],
                 notices: vec![("billing", record.id.clone(), "upsert")],
@@ -2576,6 +2638,202 @@ mod tests {
         // The refused edit left no change behind — only the complete one exists.
         let changes = fold_environment_changes(shared.lock().unwrap().store_ref(), "org").unwrap();
         assert_eq!(changes.len(), 1, "{changes:?}");
+    }
+
+    #[tokio::test]
+    async fn a_literal_edit_of_billing_replaces_the_record_and_never_blanks_it() {
+        // `administration.billing` is the one editable document that is not its
+        // payload field for field: the record is nested under `billing` beside
+        // the derived `seats_used` and `managed_usage`, and the projected record
+        // carries `id`/`op` besides. Edit is literal, so that whole document
+        // lands as the `billing.update` payload. It used to be parsed straight
+        // into `BillingRecord` — not one of those keys is a record field, and
+        // every field of the record defaults for `INV-6`, so the parse
+        // "succeeded" into an all-default record and the upsert blanked the
+        // plan, zeroed the seats, and dropped the org-funded managed-inference
+        // subscription. The org fold is latest-wins, so the loss was permanent.
+        let (_dir, shared, app) = test_app();
+        let billing = |shared: &SharedWorkbench| {
+            Org::rebuild(shared.lock().unwrap().store_ref())
+                .unwrap()
+                .billing
+        };
+        let configured = json!({
+            "plan": "business", "seats": 10,
+            "managed_inference": { "plan": "org-managed", "status": "active", "included_tokens": 1_000_000 },
+        });
+        apply_billing(&app, json!({ "billing": configured }), "seed").await;
+        assert_eq!(billing(&shared).unwrap().seats, 10);
+
+        // Round-trip the projected document verbatim, `seats_used`,
+        // `managed_usage`, `id` and `op` included. The command owns the derived
+        // and identity keys, so it ignores them; the record it writes is the one
+        // the document showed.
+        let document = billing_document(&app).await;
+        assert_eq!(document["content"]["seats_used"], 1);
+        assert_eq!(document["content"]["billing"]["plan"], "business");
+        apply_billing_change(&app, document["content"].clone(), "literal").await;
+        let record = billing(&shared).unwrap();
+        assert_eq!(record.plan, "business");
+        assert_eq!(record.seats, 10);
+        assert_eq!(
+            record.managed_inference.as_ref().unwrap().included_tokens,
+            1_000_000
+        );
+        assert!(record
+            .managed_inference
+            .as_ref()
+            .unwrap()
+            .admits_future_run());
+
+        // A caller who deletes a key has not asked to keep the old value —
+        // nothing in the payload could say so — so each of these is refused
+        // rather than written back as `Default`. The nested subscription is held
+        // to the same rule, because its fields default for the same reason.
+        let session = open(&app).await;
+        let base = billing_document(&app).await["revision"].clone();
+        for (label, content) in [
+            ("no-billing", json!({ "seats_used": 1 })),
+            ("null-billing", json!({ "billing": Value::Null })),
+            (
+                "no-seats",
+                json!({ "billing": { "plan": "business", "managed_inference": Value::Null } }),
+            ),
+            (
+                "no-plan",
+                json!({ "billing": { "seats": 10, "managed_inference": Value::Null } }),
+            ),
+            (
+                "no-managed-inference",
+                json!({ "billing": { "plan": "business", "seats": 10 } }),
+            ),
+            (
+                "no-managed-status",
+                json!({ "billing": { "plan": "business", "seats": 10, "managed_inference": { "plan": "org-managed", "included_tokens": 1_000_000 } } }),
+            ),
+            (
+                "no-included-tokens",
+                json!({ "billing": { "plan": "business", "seats": 10, "managed_inference": { "plan": "org-managed", "status": "active" } } }),
+            ),
+        ] {
+            let (status, refused) = request(
+                &app,
+                Method::POST,
+                "/environments/administration/changes",
+                json!({
+                    "session_id": session["id"], "environment": "administration", "scope": session["scope"],
+                    "document_id": "administration.billing",
+                    "base_revision": base, "content": content, "client": "edit",
+                }),
+                Some(label),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "incomplete billing document {label} was accepted: {refused}"
+            );
+        }
+
+        // Nothing the refusals dropped was written, and no refused edit is
+        // waiting in the change list — only the seed and the literal round trip.
+        let record = billing(&shared).unwrap();
+        assert_eq!(record.plan, "business");
+        assert_eq!(record.seats, 10);
+        assert!(record.managed_inference.is_some());
+        let changes = fold_environment_changes(shared.lock().unwrap().store_ref(), "org").unwrap();
+        assert_eq!(changes.len(), 2, "{changes:?}");
+
+        // The other half of the replace contract: what the caller does send is
+        // written verbatim, a cleared subscription included.
+        apply_billing(
+            &app,
+            json!({ "billing": { "plan": "free", "seats": 0, "managed_inference": Value::Null } }),
+            "lapse",
+        )
+        .await;
+        let record = billing(&shared).unwrap();
+        assert_eq!(record.plan, "free");
+        assert_eq!(record.seats, 0);
+        assert!(record.managed_inference.is_none());
+    }
+
+    async fn billing_document(app: &Router) -> Value {
+        let session = open(app).await;
+        let (status, response) = request(
+            app,
+            Method::GET,
+            &format!(
+                "/environments/administration/documents/administration.billing?session={}&scope={}",
+                session["id"].as_str().unwrap(),
+                session["scope"]["id"].as_str().unwrap(),
+            ),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        response["document"].clone()
+    }
+
+    /// Propose one `billing.update` through the literal-Edit route and accept it.
+    async fn apply_billing_change(app: &Router, content: Value, key: &str) {
+        let session = open(app).await;
+        let base = billing_document(app).await["revision"].clone();
+        let (status, proposed) = request(
+            app,
+            Method::POST,
+            "/environments/administration/changes",
+            json!({
+                "session_id": session["id"], "environment": "administration", "scope": session["scope"],
+                "document_id": "administration.billing",
+                "base_revision": base, "content": content, "client": "edit",
+            }),
+            Some(key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proposed}");
+        accept(app, &session, &proposed, key).await;
+    }
+
+    /// The same payload through the command route, the way a form control sends it.
+    async fn apply_billing(app: &Router, payload: Value, key: &str) {
+        let session = open(app).await;
+        let base = billing_document(app).await["revision"].clone();
+        let (status, proposed) = request(
+            app,
+            Method::POST,
+            "/environments/administration/commands",
+            json!({
+                "session_id": session["id"], "environment": "administration", "scope": session["scope"],
+                "document_id": "administration.billing", "command_id": "billing.update",
+                "base_revision": base, "payload": payload, "client": "browser",
+            }),
+            Some(key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proposed}");
+        accept(app, &session, &proposed, key).await;
+    }
+
+    async fn accept(app: &Router, session: &Value, proposed: &Value, key: &str) {
+        assert_eq!(proposed["receipt"]["status"], "proposed");
+        let (status, applied) = request(
+            app,
+            Method::POST,
+            &format!(
+                "/environments/administration/changes/{}/review",
+                proposed["change"]["id"].as_str().unwrap()
+            ),
+            json!({
+                "session_id": session["id"], "environment": "administration",
+                "scope": session["scope"], "decision": "accept", "client": "browser",
+            }),
+            Some(&format!("{key}-review")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(applied["receipt"]["status"], "applied");
     }
 
     #[tokio::test]

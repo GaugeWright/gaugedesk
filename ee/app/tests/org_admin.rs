@@ -452,7 +452,7 @@ async fn billing_round_trips_and_is_not_authority() {
         &app,
         "administration.billing",
         "billing.update",
-        json!({"plan":"business","seats":10,"managed_inference":{"plan":"org-managed","status":"active","included_tokens":1000000}}),
+        json!({"billing":{"plan":"business","seats":10,"managed_inference":{"plan":"org-managed","status":"active","included_tokens":1000000}}}),
     ).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -464,13 +464,17 @@ async fn billing_round_trips_and_is_not_authority() {
     assert_eq!(body["managed_usage"]["included_tokens"], 1_000_000);
 
     // BILL-3: lapse the plan to zero seats — it confers/revokes no authority.
-    command(
+    // The payload is the whole document: `billing.update` replaces the record,
+    // so clearing the managed-inference subscription is said explicitly rather
+    // than by omission.
+    let (status, body) = command(
         &app,
         "administration.billing",
         "billing.update",
-        json!({"plan":"free","seats":0}),
+        json!({"billing":{"plan":"free","seats":0,"managed_inference":null}}),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     // The active owner's role/status is untouched by billing.
     let (_s, body) = document(&app, None, "administration.access").await;
     let owner = body["members"]
