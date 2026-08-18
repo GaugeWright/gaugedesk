@@ -236,8 +236,16 @@ fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<(String, Strin
         "device_label": device_label(),
     })
     .to_string();
+    // The exchange is a POST, and a hub composition may require the
+    // idempotency-key spine on every mutation (the open composition does).
+    // Key it by the single-use code: a retry of the same redemption is the
+    // same command, and a different code is a different one.
+    let idempotency = [(
+        "idempotency-key".to_string(),
+        format!("hub-exchange:{code}"),
+    )];
     let (status, response) = http
-        .post_json_headers(&format!("{hub}/auth/mobile/exchange"), &[], &body)
+        .post_json_headers(&format!("{hub}/auth/mobile/exchange"), &idempotency, &body)
         .map_err(|error| format!("the Hub was unreachable: {error}"))?;
     if status != 200 {
         return Err(format!("the Hub refused the handoff ({status})"));
@@ -403,6 +411,7 @@ pub async fn post_signin_callback(
     // replay) finds nothing.
     let taken = pending().take();
     let Some(taken) = taken else {
+        tracing::warn!("hub-session callback refused: no sign-in was started on this device");
         return (
             StatusCode::BAD_REQUEST,
             "no sign-in was started on this device",
@@ -410,6 +419,7 @@ pub async fn post_signin_callback(
             .into_response();
     };
     if taken.started.elapsed() > PENDING_TTL {
+        tracing::warn!("hub-session callback refused: the sign-in attempt expired");
         return (
             StatusCode::BAD_REQUEST,
             "the sign-in attempt expired; start again",
@@ -421,14 +431,21 @@ pub async fn post_signin_callback(
         tokio::task::spawn_blocking(move || redeem_at_hub(&hub, &code, &taken.verifier)).await;
     let (id_token, device) = match redeemed {
         Ok(Ok(token)) => token,
-        Ok(Err(message)) => return (StatusCode::BAD_GATEWAY, message).into_response(),
+        Ok(Err(message)) => {
+            tracing::warn!("hub-session exchange failed: {message}");
+            return (StatusCode::BAD_GATEWAY, message).into_response();
+        }
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "sign-in task panicked").into_response()
+            tracing::warn!("hub-session exchange task panicked");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "sign-in task panicked").into_response();
         }
     };
     match seal_session(&wb, &id_token, &device) {
         Ok(record) => Json(status_json(Some(&record), true)).into_response(),
-        Err(message) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
+        Err(message) => {
+            tracing::warn!("hub-session seal failed: {message}");
+            (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+        }
     }
 }
 

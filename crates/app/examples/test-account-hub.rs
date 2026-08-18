@@ -55,7 +55,21 @@ fn mint(exp: i64) -> String {
     )
 }
 
-async fn exchange(State(hub): State<Arc<Hub>>, Json(body): Json<Value>) -> impl IntoResponse {
+async fn exchange(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    // Real hub compositions carry the idempotency-key spine on every POST; the
+    // stand-in enforces it too, so the e2e lane proves the client sends it
+    // (the open-composition hub 400s without it — found live 2026-08-18).
+    if !headers.contains_key("idempotency-key") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing Idempotency-Key header" })),
+        )
+            .into_response();
+    }
     let code = body.get("code").and_then(Value::as_str).unwrap_or_default();
     let verifier = body
         .get("verifier")
