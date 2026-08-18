@@ -3879,9 +3879,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb3571fcb2fd70170422ecf482b8a116a9186d1dd1a9e6679633015bd0ae8ac6"
+checksum = "86f1306286bb709ec9322b826647398174ccc8714bef424a534945a480c5962b"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3903,9 +3903,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-core"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "240a5a0976038f4f60b20e68a7444e8a8eb09ad51490b792b5256ded3710a178"
+checksum = "ae7668d1f7ae7936d402ab952c7819d2856bbbacbe1c3d1b7d95585d9a21a9cd"
 dependencies = [
  "serde",
  "serde_json",
@@ -3913,9 +3913,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-custody"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bfd0215aa3f23337e588db5d567e67597333e8f729d689769ba42e027e9f060"
+checksum = "915af5e44ed145a33fbbe3edce578e0148ef1eb2621b4d515d0168bfba6850f7"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -3925,9 +3925,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-kernel"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38fc893e662fe2f89b9c96d8dd38fdb65699063fc6ebd5d8971057ed24e8b57b"
+checksum = "3143c543ace9a9c83c4e82eba760717fafd6913968a08a4a6215de993eebc0c8"
 dependencies = [
  "bashkit",
  "chrono",
@@ -3945,9 +3945,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-parser"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2602822709c04f47cded4ef76ea581ffc8a750f0b4baee7554e8e9679ee96c8"
+checksum = "8e23bd277fdda799998468a26aa3aaead30459175ea3778c106e50b4c6b4e0c7"
 dependencies = [
  "serde_json",
  "sha2 0.11.0",
@@ -3957,9 +3957,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-store"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43368af6de6f25f7258becfdc98c8cc9a725a9680d53b43dd974184108fbd5e1"
+checksum = "1c5e9abdf80c61c796f3d95bbd22369c17e5cce2cf8aaea94ce7875b6321d01f"
 dependencies = [
  "rusqlite",
  "serde",
