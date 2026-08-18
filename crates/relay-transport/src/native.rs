@@ -123,15 +123,105 @@ impl AsyncWrite for WebSocketByteStream {
     }
 }
 
+/// A dial that failed, and whether waiting could change the answer.
+struct DialRefusal {
+    error: std::io::Error,
+    transient: bool,
+}
+
+/// Does this upgrade status mean "not yet" rather than "no"?
+///
+/// `409` is the relay refusing a third leg. It is inherently a *momentary*
+/// answer: the relay decides from socket state that lags the peer's close, so a
+/// route holding two live legs now may hold none a few hundred milliseconds
+/// later. `routeAdmitsLeg` on the relay narrowed that window by discounting
+/// sockets already closing, but no admission check can close it — there is
+/// always an interval between a peer hanging up and the runtime saying so.
+///
+/// Retrying is safe as well as correct. A refused dial creates no route state,
+/// and a genuine mismatch answers differently: a durable pair on this handle is
+/// refused as a family mismatch, not a conflict.
+fn upgrade_is_transient(status: tokio_tungstenite::tungstenite::http::StatusCode) -> bool {
+    // Through tungstenite's re-export, so the type is by construction the one
+    // its error carries rather than a second `http` version that merely looks
+    // the same.
+    status == tokio_tungstenite::tungstenite::http::StatusCode::CONFLICT
+}
+
 pub async fn connect_websocket_stream(
     route: &WebSocketRelayRoute,
     role: WebSocketRelayRole,
 ) -> std::io::Result<WebSocketByteStream> {
-    let handshake = websocket_handshake(route, role)?;
-    let (socket, _) = tokio_tungstenite::connect_async(route.url()?)
+    dial_leg(route, role).await.map_err(|refusal| refusal.error)
+}
+
+async fn dial_leg(
+    route: &WebSocketRelayRoute,
+    role: WebSocketRelayRole,
+) -> Result<WebSocketByteStream, DialRefusal> {
+    let handshake = websocket_handshake(route, role).map_err(|error| DialRefusal {
+        error,
+        transient: false,
+    })?;
+    let url = route.url().map_err(|error| DialRefusal {
+        error,
+        transient: false,
+    })?;
+    let (socket, _) = match tokio_tungstenite::connect_async(url).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            // Read the status from the typed response rather than the rendered
+            // message. Matching "409" in the text would also match a route
+            // handle or a port that happened to contain those digits, and the
+            // rendering is tungstenite's to change.
+            let transient = match &error {
+                tokio_tungstenite::tungstenite::Error::Http(response) => {
+                    upgrade_is_transient(response.status())
+                }
+                _ => false,
+            };
+            return Err(DialRefusal {
+                error: other(format!("connect relay WebSocket: {error}")),
+                transient,
+            });
+        }
+    };
+    websocket_stream_from_socket(socket, handshake, role.sends_keepalives())
         .await
-        .map_err(|error| other(format!("connect relay WebSocket: {error}")))?;
-    websocket_stream_from_socket(socket, handshake, role.sends_keepalives()).await
+        .map_err(|error| {
+            // Pairing refusals arrive as close frames once the socket is up.
+            // Two are ordering races the joiner has always retried: it reached
+            // the route before the initializer created or advanced it.
+            let text = error.to_string();
+            let transient = text.contains("only an initializer may create a route")
+                || text.contains("only an initializer may advance a route");
+            DialRefusal { error, transient }
+        })
+}
+
+/// Dial a relay leg, waiting out a refusal that only means "not yet".
+///
+/// Both roles, deliberately. The joiner retried the two ordering races and the
+/// initializer retried nothing at all, so a `409` — the one refusal that clears
+/// on its own — was fatal for the role that meets it most. `/federation/run/place`
+/// is the initializer, and it failed the whole federated run on a condition that
+/// would have gone away in a few hundred milliseconds.
+async fn connect_relay_leg(
+    route: &WebSocketRelayRoute,
+    role: WebSocketRelayRole,
+) -> std::io::Result<WebSocketByteStream> {
+    let mut delay = Duration::from_millis(25);
+    for attempt in 0..8 {
+        match dial_leg(route, role).await {
+            Ok(stream) => return Ok(stream),
+            Err(refusal) if attempt < 7 && refusal.transient => {
+                sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_millis(400));
+            }
+            Err(refusal) => return Err(refusal.error),
+        }
+    }
+    unreachable!("bounded relay dial loop always returns")
 }
 
 /// Connect a bounded enrollment/federation leg through the canonical WSS
@@ -147,12 +237,7 @@ pub async fn connect_one_shot(
         OneShotLeg::Initializer => WebSocketRelayRole::Source,
         OneShotLeg::Joiner => WebSocketRelayRole::Target,
     };
-    if leg == OneShotLeg::Initializer {
-        return connect_websocket_stream(&route, role)
-            .await
-            .map(|stream| Box::new(stream) as BoxedRelayByteStream);
-    }
-    connect_websocket_joiner(&route, role)
+    connect_relay_leg(&route, role)
         .await
         .map(|stream| Box::new(stream) as BoxedRelayByteStream)
 }
@@ -297,31 +382,6 @@ where
 /// A complementary leg may win the network race before its initializer has
 /// created the route object. Retry only that explicit refusal, and only before
 /// a paired byte stream (and therefore before inner TLS) exists.
-async fn connect_websocket_joiner(
-    route: &WebSocketRelayRoute,
-    role: WebSocketRelayRole,
-) -> std::io::Result<WebSocketByteStream> {
-    let mut delay = Duration::from_millis(25);
-    for attempt in 0..8 {
-        match connect_websocket_stream(route, role).await {
-            Ok(stream) => return Ok(stream),
-            Err(error)
-                if attempt < 7
-                    && (error
-                        .to_string()
-                        .contains("only an initializer may create a route")
-                        || error
-                            .to_string()
-                            .contains("only an initializer may advance a route")) =>
-            {
-                sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(400));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("bounded joiner loop always returns")
-}
 
 #[derive(Clone, Debug)]
 pub struct TlsIdentity {
@@ -657,8 +717,7 @@ async fn connect_client(
     route: &RelayRoute,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<WebSocketByteStream>> {
     let broker =
-        connect_websocket_joiner(&websocket_route(route, false), WebSocketRelayRole::Client)
-            .await?;
+        connect_relay_leg(&websocket_route(route, false), WebSocketRelayRole::Client).await?;
     // The pin and the configuration are the portable half; only the provider is
     // this carrier's choice (ADR 0130 §4 — `ring` here, pure-Rust on wasm32).
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
@@ -1070,8 +1129,7 @@ mod tests {
         };
         let first_home = connect_home_stream(&first);
         let first_client_route = websocket_route(&first, false);
-        let first_client =
-            connect_websocket_joiner(&first_client_route, WebSocketRelayRole::Client);
+        let first_client = connect_relay_leg(&first_client_route, WebSocketRelayRole::Client);
         let (first_home, first_client) = tokio::join!(first_home, first_client);
         let mut first_home = first_home.unwrap();
         let mut first_client = first_client.unwrap();
@@ -1093,8 +1151,7 @@ mod tests {
         };
         let rotated_home = connect_home_stream(&rotated);
         let rotated_client_route = websocket_route(&rotated, false);
-        let rotated_client =
-            connect_websocket_joiner(&rotated_client_route, WebSocketRelayRole::Client);
+        let rotated_client = connect_relay_leg(&rotated_client_route, WebSocketRelayRole::Client);
         let (rotated_home, rotated_client) = tokio::join!(rotated_home, rotated_client);
         let mut rotated_home = rotated_home.unwrap();
         let mut rotated_client = rotated_client.unwrap();
@@ -1109,8 +1166,7 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
 
         let stale =
-            connect_websocket_joiner(&websocket_route(&first, false), WebSocketRelayRole::Client)
-                .await;
+            connect_relay_leg(&websocket_route(&first, false), WebSocketRelayRole::Client).await;
         assert!(
             stale.is_err(),
             "the epoch-one locator paired after rotation"
@@ -1147,6 +1203,62 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         HomeRelayConfig::load_or_mint(directory.path(), "wss://relay.example").unwrap();
         assert!(HomeRelayConfig::load_or_mint(directory.path(), "wss://other.example").is_err());
+    }
+
+    /// A `409` means "not yet", so a crossing must wait it out rather than fail.
+    ///
+    /// A rendezvous handle is derived from the authority pair alone, so
+    /// consecutive `/federation/run/place` calls in one suite cross the *same*
+    /// route object. The relay refuses a third leg from socket state that lags
+    /// the peer's close, so the next place can arrive while the previous
+    /// crossing's legs are still being reaped — and the answer changes on its
+    /// own within a few hundred milliseconds.
+    ///
+    /// The initializer used to retry nothing at all and the joiner retried only
+    /// the two ordering races, so this refusal failed the whole federated run.
+    /// `desktop-federation` failed exactly this way in production.
+    #[tokio::test]
+    async fn a_conflicted_route_is_waited_out_rather_than_failing_the_crossing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            // Two refusals at the upgrade, then the previous crossing's legs are
+            // gone and the route admits this one.
+            for _ in 0..2 {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let _ = tcp.read(&mut request).await.unwrap();
+                tcp.write_all(
+                    b"HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                let _ = tcp.shutdown().await;
+            }
+            let (accepted_tcp, _) = listener.accept().await.unwrap();
+            let mut accepted = accept_async(accepted_tcp).await.unwrap();
+            let _handshake = accepted.next().await.unwrap().unwrap();
+            accepted
+                .send(Message::Binary(WSS_READY.to_vec().into()))
+                .await
+                .unwrap();
+            // Hold the leg until the test drops its end.
+            while let Some(Ok(message)) = accepted.next().await {
+                if message.is_close() {
+                    break;
+                }
+            }
+        });
+
+        let endpoint = format!("ws://{address}");
+        let crossing = connect_one_shot(&endpoint, [9u8; TOKEN_LEN], OneShotLeg::Initializer).await;
+        assert!(
+            crossing.is_ok(),
+            "a transient 409 failed the crossing: {:?}",
+            crossing.err()
+        );
+        drop(crossing);
+        let _ = timeout(Duration::from_secs(5), relay).await;
     }
 
     /// A clean teardown completes through the `FIN` exchange, not by waiting out
