@@ -570,6 +570,10 @@ export interface HubSessionStatus {
     available: boolean;
     linked: boolean;
     person: string | null;
+    /** The subject as a person would recognize it (the id-token's email, else
+     *  name) — what surfaces display. `person` stays the IdP's opaque `sub`.
+     *  Falls back to `person` against a control plane that predates it. */
+    label: string | null;
     expires: number | null;
     expired: boolean;
     /** The Hub-minted trusted-device id this session is bound to (LOGIN-3). */
@@ -578,10 +582,12 @@ export interface HubSessionStatus {
 
 function hubSessionStatusFrom(value: unknown): HubSessionStatus {
     const o = value as Record<string, unknown> | null;
+    const person = typeof o?.person === "string" && o.person ? o.person : null;
     return {
         available: Boolean(o?.available),
         linked: Boolean(o?.linked),
-        person: typeof o?.person === "string" && o.person ? o.person : null,
+        person,
+        label: typeof o?.label === "string" && o.label ? o.label : person,
         expires: typeof o?.expires === "number" ? o.expires : null,
         expired: Boolean(o?.expired),
         device: typeof o?.device === "string" && o.device ? o.device : null,

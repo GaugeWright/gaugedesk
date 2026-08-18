@@ -320,7 +320,7 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
             hub: {
                 available: Boolean(hubSession()?.available),
                 linked: Boolean(hubSession()?.linked),
-                person: hubSession()?.person ?? undefined,
+                person: hubSession()?.label ?? hubSession()?.person ?? undefined,
                 expired: Boolean(hubSession()?.expired),
             },
             invitations: (invitations() ?? []).map((i) => ({

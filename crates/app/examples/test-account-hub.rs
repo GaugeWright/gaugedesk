@@ -25,6 +25,8 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 const PERSON: &str = "e2e-person@example.test";
+/// The IdP subject, Google-shaped: opaque digits, never shown to a person.
+const SUBJECT: &str = "100000000000000000001";
 const CODE: &str = "e2e-handoff-code";
 const DEVICE: &str = "native-e2e-device";
 /// Short enough that every status read on the desktop control plane falls
@@ -48,10 +50,13 @@ fn now_secs() -> i64 {
 /// from an already-server-verified token; it never verifies signatures).
 fn mint(exp: i64) -> String {
     let b64 = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+    // Google's shape: `sub` is an opaque number, the email rides its own
+    // claim. The e2e's "signed in as <email>" assertion therefore proves the
+    // display-label projection, not an accident of an email-shaped subject.
     format!(
         "{}.{}.sig",
         b64(&json!({ "alg": "none" })),
-        b64(&json!({ "sub": PERSON, "exp": exp }))
+        b64(&json!({ "sub": SUBJECT, "email": PERSON, "exp": exp }))
     )
 }
 

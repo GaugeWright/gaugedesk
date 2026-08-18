@@ -340,7 +340,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // address is split so the trigger carries a name and the menu head the proof of
     // which account it is, rather than printing the same string twice.
     const menuIdentity = createMemo(() => {
-        const person = authority() ?? hubSession()?.person ?? null;
+        // The label (email, else name) is the display; the opaque IdP subject
+        // is a last resort for sessions sealed before the label existed.
+        const person = authority() ?? hubSession()?.label ?? hubSession()?.person ?? null;
         if (!person) return null;
         const at = person.indexOf("@");
         return at > 0
@@ -2266,7 +2268,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             bearer() !== null ||
                             import.meta.env.VITE_HOME_SPLIT === "true" ||
                             (hubSession()?.linked === true && !hubSession()?.expired),
-                        subject: () => authority() ?? hubSession()?.person ?? null,
+                        subject: () => authority() ?? hubSession()?.label ?? hubSession()?.person ?? null,
                         begin: () => {
                             if (accountLoginAvailable) {
                                 beginLogin(controlPlaneBase());

@@ -172,6 +172,13 @@ struct SessionRecord {
     /// presented on refresh so revocation from the account surface bites.
     #[serde(default)]
     device: String,
+    /// The human display of the signed-in subject — the id-token's `email`
+    /// (else `name`) claim. The IdP's `sub` stays the identity (`person`); a
+    /// Google `sub` is an opaque number no surface should show. Defaulted so
+    /// records sealed before this field read back; the projection falls back
+    /// to `person`.
+    #[serde(default)]
+    label: String,
 }
 
 fn write_session(wb: &SharedWorkbench, record: &SessionRecord) -> Result<(), String> {
@@ -208,6 +215,7 @@ fn seal_session(
     device: &str,
 ) -> Result<SessionRecord, String> {
     let person = jwt_subject(id_token).unwrap_or_default();
+    let label = jwt_display_label(id_token).unwrap_or_else(|| person.clone());
     let expires = jwt_expiry_ms(id_token).unwrap_or(0);
     let sealed = {
         let workbench = wb.lock_unpoisoned();
@@ -221,9 +229,22 @@ fn seal_session(
         person,
         expires,
         device: device.to_string(),
+        label,
     };
     write_session(wb, &record)?;
     Ok(record)
+}
+
+/// The subject as a person would recognize it: the `email` claim, else `name`.
+/// `None` when the token carries neither (the caller falls back to `sub`).
+fn jwt_display_label(token: &str) -> Option<String> {
+    ["email", "name"].iter().find_map(|claim| {
+        jwt_claim(token, claim)?
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// Redeem the deep-linked single-use code at the Hub. Blocking (ureq) — run off
@@ -350,6 +371,9 @@ fn status_json(record: Option<&SessionRecord>, available: bool) -> Value {
             "available": available,
             "linked": true,
             "person": record.person,
+            // Records sealed before the label existed project the subject, so
+            // the surfaces always have something to show.
+            "label": if record.label.is_empty() { &record.person } else { &record.label },
             "expires": record.expires,
             "expired": record.expires <= now_ms(),
             "device": record.device,
@@ -537,6 +561,7 @@ pub async fn post_signin_logout(State(wb): State<SharedWorkbench>) -> impl IntoR
         person: String::new(),
         expires: 0,
         device: String::new(),
+        label: String::new(),
     };
     match write_session(&wb, &cleared) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -633,6 +658,28 @@ mod tests {
     }
 
     #[test]
+    fn display_label_prefers_email_then_name_never_the_opaque_sub() {
+        // A Google id-token: `sub` is an opaque number; email is the display.
+        let google = test_jwt(json!({
+            "sub": "109305974930518687474",
+            "email": "alice@example.test",
+            "name": "Alice Example",
+        }));
+        assert_eq!(
+            jwt_display_label(&google).as_deref(),
+            Some("alice@example.test")
+        );
+        let name_only = test_jwt(json!({ "sub": "1093", "name": "Alice Example" }));
+        assert_eq!(
+            jwt_display_label(&name_only).as_deref(),
+            Some("Alice Example")
+        );
+        let bare = test_jwt(json!({ "sub": "1093" }));
+        assert_eq!(jwt_display_label(&bare), None);
+        assert_eq!(jwt_display_label(&test_jwt(json!({ "email": " " }))), None);
+    }
+
+    #[test]
     fn session_seals_projects_and_clears_without_leaking_the_token() {
         let root = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(root.path()).unwrap();
@@ -665,6 +712,7 @@ mod tests {
             person: String::new(),
             expires: 0,
             device: String::new(),
+            label: String::new(),
         };
         write_session(&wb, &cleared).unwrap();
         assert!(latest_session(&wb).is_none());
@@ -683,6 +731,7 @@ mod tests {
             person: "alice".to_string(),
             expires: 1,
             device: String::new(),
+            label: "alice@example.test".to_string(),
         };
         let projection = status_json(Some(&record), true);
         assert_eq!(projection["linked"], true);

@@ -65,6 +65,8 @@ describe("hub session wrappers", () => {
             available: true,
             linked: true,
             person: "alice",
+            // No label from an older control plane: the subject stands in.
+            label: "alice",
             expires: 5,
             expired: false,
             device: null,
@@ -76,6 +78,7 @@ describe("hub session wrappers", () => {
             available: false,
             linked: false,
             person: null,
+            label: null,
             expires: null,
             expired: false,
             device: null,
@@ -101,6 +104,22 @@ describe("hub session wrappers", () => {
             ),
         );
         expect(web.webReturn).toBe(true);
+    });
+
+    it("prefers the label over the opaque subject when the server sends one", async () => {
+        const status = await hubSessionStatus(
+            jsonReturning(
+                {
+                    available: true,
+                    linked: true,
+                    person: "100000000000000000001",
+                    label: "alice@example.test",
+                },
+                [],
+            ),
+        );
+        expect(status.person).toBe("100000000000000000001");
+        expect(status.label).toBe("alice@example.test");
     });
 
     it("callback posts exactly the one-time code", async () => {
