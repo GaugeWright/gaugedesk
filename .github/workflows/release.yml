@@ -240,6 +240,33 @@ jobs:
           $overlay | ConvertTo-Json -Depth 8 | Set-Content src-tauri/tauri.windows-signing.conf.json
           Get-Content src-tauri/tauri.windows-signing.conf.json
 
+      - name: probe Azure Artifact Signing end to end
+        # Signs a scratch copy of a real PE through the exact hook Tauri will
+        # invoke. A credential, dependency, or service failure surfaces here in
+        # about a minute with the module's full output, instead of after the
+        # release build as Tauri's opaque `failed to run pwsh`.
+        if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
+        shell: pwsh
+        env:
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $probe = Join-Path $env:RUNNER_TEMP 'signing-probe.exe'
+          Copy-Item "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" $probe
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/sign-windows-artifact.ps1 $probe
+          if ($LASTEXITCODE -ne 0) { throw "signing hook failed with exit code $LASTEXITCODE" }
+          $signature = Get-AuthenticodeSignature $probe
+          if ($signature.Status -ne 'Valid') {
+            throw "probe signature is $($signature.Status), expected Valid"
+          }
+          if ($signature.SignerCertificate.Subject -notlike '*GaugeWright LLC*') {
+            throw "probe signed by unexpected subject: $($signature.SignerCertificate.Subject)"
+          }
+          Write-Output "probe signed by $($signature.SignerCertificate.Subject)"
+          Remove-Item $probe
+
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -430,6 +457,15 @@ jobs:
           releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('GaugeDesk {0}', github.ref_name) || '' }}
           releaseDraft: true
           args: --bundles ${{ env.BUNDLES }} --config tauri.bundle.conf.json${{ (matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true') && ' --config tauri.windows-signing.conf.json' || '' }}
+
+      - name: report signing hook transcript
+        # Tauri reports a failing signCommand only as `failed to run pwsh`;
+        # the hook's transcript carries the actual error.
+        if: failure() && matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'sign-windows-artifact.log'
+          if (Test-Path $log) { Get-Content $log } else { Write-Output "no signing transcript at $log" }
 
       - name: verify signed Windows package boundary
         # The mirror-image of the unsigned check below: every released Windows
