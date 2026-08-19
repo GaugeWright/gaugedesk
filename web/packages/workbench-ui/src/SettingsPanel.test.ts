@@ -29,8 +29,9 @@ describe("trusted-device enrollment copy", () => {
 });
 
 describe("credential expiry warning", () => {
-    const now = Date.UTC(2026, 0, 15) ;
-    const inDays = (days: number) => Math.floor((now + days * 86_400_000) / 1000);
+    const now = Date.UTC(2026, 0, 15);
+    // Expiries are epoch milliseconds, the unit the account routes report.
+    const inDays = (days: number) => now + days * 86_400_000;
 
     it("warns only inside the renewal window", () => {
         expect(expiresSoon(inDays(3), now)).toBe(true);

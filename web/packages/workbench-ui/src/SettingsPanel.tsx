@@ -77,9 +77,10 @@ export function managedInferenceWriteAvailable(editable: boolean | undefined): b
 const EXPIRES_SOON_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function expiresSoon(expires: number | null | undefined, now = Date.now()): boolean {
+    // `expires` is epoch milliseconds — the unit the account routes report
+    // (`jwt_expiry_ms`), the same one `Date.now()` uses.
     if (!expires) return false;
-    const at = expires * 1000;
-    return Number.isFinite(at) && at > now && at - now <= EXPIRES_SOON_MS;
+    return Number.isFinite(expires) && expires > now && expires - now <= EXPIRES_SOON_MS;
 }
 
 /** What can be added, and how each one is authorized. A provider is a *kind* of
@@ -250,7 +251,7 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
     const codexCredential = (): SettingsModel["models"]["credentials"][number] | null => {
         const cx = codex();
         if (!cx?.linked) return null;
-        const on = cx.expires ? new Date(cx.expires * 1000).toLocaleDateString() : null;
+        const on = cx.expires ? new Date(cx.expires).toLocaleDateString() : null;
         return {
             id: "openai-codex",
             pin: "openai-codex",

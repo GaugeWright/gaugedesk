@@ -1,8 +1,9 @@
 # Packaging lane (D-RELEASE-LANES item 2, Tier 4). On tag push the per-OS Tauri
 # build matrix produces .deb + .AppImage on Linux, .dmg on macOS, and .msi on
 # Windows. macOS signing/notarization is mandatory and verified in the production
-# lane; Windows Artifact Signing remains blocked
-# on Azure organization validation and a Public Trust certificate profile.
+# lane; Windows is signed through Azure Artifact Signing (account
+# gaugewright-signing, Public Trust profile gaugewright-public-trust) when
+# AZURE_ARTIFACT_SIGNING_ENABLED is true, and the signed boundary is verified.
 # See DEFERRED.md (D-RELEASE-LANES) and specs/implementation/test-and-release-infra.md.
 #
 # VALIDATED-BY-SYNTAX-HERE, RUNS-ON-CI: this environment has no webkit/Tauri
@@ -76,7 +77,9 @@ jobs:
       # ring compiles C for wasm32 and needs both the compiler and an LLVM
       # archiver; only one of them fails legibly (ADR 0130 §4).
       - name: Install clang for the wasm32 target
-        run: sudo apt-get update && sudo apt-get install -y clang llvm
+        uses: ./.github/actions/apt-install
+        with:
+          packages: clang llvm
       # Pinned rather than taken from the distribution: binaryen 108 emits a
       # module whose function table cannot grow, which fails at load rather than
       # at build. build-wasm.sh rejects anything below 120.
@@ -123,8 +126,8 @@ jobs:
       matrix:
         os-label: ${{ fromJSON((inputs.platform == '' || inputs.platform == 'all') && '["linux","macos","windows"]' || format('["{0}"]', inputs.platform)) }}
     # Linux builds on the oldest supported base so a moving runner does not
-    # silently raise glibc. macOS is Apple Silicon; Windows remains unsigned
-    # until Microsoft approves the Public Trust profile.
+    # silently raise glibc. macOS is Apple Silicon; Windows signs through Azure
+    # Artifact Signing when AZURE_ARTIFACT_SIGNING_ENABLED is true.
     runs-on: ${{ matrix.os-label == 'linux' && 'ubuntu-22.04' || matrix.os-label == 'macos' && 'macos-latest' || 'windows-latest' }}
     timeout-minutes: 90
     env:
@@ -135,16 +138,13 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: verify Azure Artifact Signing inputs
-        # The pre-approval lane intentionally emits unsigned packages. Enable
-        # Azure only after the Public Trust profile and pre-bundle signing hook
-        # both exist; merely provisioning an account must not block rehearsals.
-        #
-        # Two inputs are still missing, and this preflight exists to name them
-        # rather than let `azure/login` fail obscurely. AZURE_ARTIFACT_SIGNING_
-        # TENANT_ID is not provisioned on any repository or environment, and
-        # the federated credential must assert the subject GitHub actually
-        # mints for this job — the identifier form under DR-0079,
-        # repo:GaugeWright@301893664/gaugedesk@1291563372:environment:production
+        # The pre-approval lane intentionally emitted unsigned packages; this
+        # preflight names a missing input rather than let `azure/login` fail
+        # obscurely. The federated credential must assert the subject GitHub
+        # actually mints for this job — the identifier form under DR-0079,
+        # repo:GaugeWright@301893664/gaugedesk-src@1288693434:environment:production
+        # per this repository's OIDC sub_claim_prefix (an earlier note here
+        # cited the public mirror's repository id, which this repo never mints)
         # — because this job carries `environment: production` exactly as the
         # apt lane does, and a name-bound subject there cost five runs.
         if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
@@ -156,6 +156,7 @@ jobs:
           SIGNING_RESOURCE_GROUP: ${{ vars.AZURE_ARTIFACT_SIGNING_RESOURCE_GROUP }}
           SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
           SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
         run: |
           set -euo pipefail
           test -n "$AZURE_CLIENT_ID"
@@ -164,6 +165,7 @@ jobs:
           test -n "$SIGNING_RESOURCE_GROUP"
           test -n "$SIGNING_ACCOUNT"
           test -n "$SIGNING_ENDPOINT"
+          test -n "$SIGNING_CERTIFICATE_PROFILE"
 
       - name: authenticate Windows release identity
         if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
@@ -179,6 +181,8 @@ jobs:
         env:
           SIGNING_RESOURCE_GROUP: ${{ vars.AZURE_ARTIFACT_SIGNING_RESOURCE_GROUP }}
           SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          SIGNING_SUBSCRIPTION_ID: ${{ vars.AZURE_ARTIFACT_SIGNING_SUBSCRIPTION_ID }}
+          SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
         run: |
           set -euo pipefail
           state="$(az resource show \
@@ -189,6 +193,42 @@ jobs:
             --query properties.provisioningState \
             --output tsv)"
           test "$state" = "Succeeded"
+          # The Public Trust profile must be Active, not merely provisioned:
+          # an expired or suspended identity validation flips this status and
+          # would otherwise surface as an opaque mid-bundle signing failure.
+          profile_status="$(az resource show \
+            --ids "/subscriptions/$SIGNING_SUBSCRIPTION_ID/resourceGroups/$SIGNING_RESOURCE_GROUP/providers/Microsoft.CodeSigning/codeSigningAccounts/$SIGNING_ACCOUNT/certificateProfiles/$SIGNING_CERTIFICATE_PROFILE" \
+            --api-version 2025-10-13 \
+            --query properties.status \
+            --output tsv)"
+          test "$profile_status" = "Active"
+
+      - name: install Azure Artifact Signing hook
+        # The TrustedSigning module wraps signtool with the Azure dlib; the
+        # pre-bundle hook (scripts/sign-windows-artifact.ps1) calls it once per
+        # artifact. Version-pinned because PSGallery has no digest pinning.
+        # The overlay is generated here rather than committed because the
+        # signCommand must carry the runner-absolute script path, and because
+        # its presence alone would break the unsigned rehearsal lane.
+        if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Install-Module -Name TrustedSigning -RequiredVersion 0.5.8 -Force -Scope CurrentUser -Repository PSGallery
+          $hook = Join-Path $env:GITHUB_WORKSPACE 'scripts/sign-windows-artifact.ps1'
+          if (-not (Test-Path $hook)) { throw "signing hook missing: $hook" }
+          $overlay = @{
+            bundle = @{
+              windows = @{
+                signCommand = @{
+                  cmd  = 'pwsh'
+                  args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $hook, '%1')
+                }
+              }
+            }
+          }
+          $overlay | ConvertTo-Json -Depth 8 | Set-Content src-tauri/tauri.windows-signing.conf.json
+          Get-Content src-tauri/tauri.windows-signing.conf.json
 
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
@@ -204,10 +244,10 @@ jobs:
       - name: linux bundle deps
         # NEEDS-INFRA: Tauri's Linux bundling needs gtk/webkit2gtk + appindicator.
         if: matrix.os-label == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
             librsvg2-dev patchelf lintian
 
       # Restores what the wasm job produced. Without it the bundle cannot resolve
@@ -274,10 +314,11 @@ jobs:
       #   * macOS uses a Developer ID Application certificate and App Store Connect
       #     notarization key from the protected production environment. The lane
       #     fails closed when any signing input is absent.
-      #   * Windows will use Azure Artifact Signing with the production OIDC identity.
-      #     The account exists, but Microsoft identity validation and a Public Trust
-      #     certificate profile must exist before adding a Tauri pre-bundle sign
-      #     command; signing after Tauri creates updater payloads would invalidate
+      #   * Windows signs with Azure Artifact Signing through the production OIDC
+      #     identity when AZURE_ARTIFACT_SIGNING_ENABLED is true: the generated
+      #     tauri.windows-signing.conf.json overlay points signCommand at
+      #     scripts/sign-windows-artifact.ps1, which runs per artifact BEFORE
+      #     Tauri creates updater payloads — signing afterwards would invalidate
       #     their Tauri signatures.
       # -----------------------------------------------------------------------
 
@@ -366,6 +407,11 @@ jobs:
           APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+          # Windows Azure Artifact Signing: read by scripts/sign-windows-artifact.ps1
+          # each time the signCommand overlay invokes it. Empty on other OSes.
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
         with:
           projectPath: src-tauri
           # Tag pushes draft a release. Manual runs are artifact-only signing
@@ -373,7 +419,45 @@ jobs:
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('GaugeDesk {0}', github.ref_name) || '' }}
           releaseDraft: true
-          args: --bundles ${{ env.BUNDLES }} --config tauri.bundle.conf.json
+          args: --bundles ${{ env.BUNDLES }} --config tauri.bundle.conf.json${{ (matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true') && ' --config tauri.windows-signing.conf.json' || '' }}
+
+      - name: verify signed Windows package boundary
+        # The mirror-image of the unsigned check below: every released Windows
+        # artifact must carry a valid Authenticode signature chaining to the
+        # GaugeWright LLC Public Trust certificate, with an RFC 3161 timestamp
+        # so the signature outlives the three-day signing certificate.
+        if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $executables = @(Get-ChildItem `
+            'src-tauri/target/release/gaugedesk.exe')
+          $installers = @(Get-ChildItem `
+            'src-tauri/target/release/bundle/msi/*.msi')
+          if ($executables.Count -ne 1) {
+            throw "expected exactly one Windows executable"
+          }
+          if ($installers.Count -ne 1) {
+            throw "expected exactly one Windows MSI"
+          }
+
+          foreach ($artifact in @($executables[0], $installers[0])) {
+            if ($artifact.Length -eq 0) {
+              throw "empty Windows artifact: $($artifact.FullName)"
+            }
+            $signature = Get-AuthenticodeSignature $artifact.FullName
+            if ($signature.Status -ne 'Valid') {
+              throw "expected a valid Authenticode signature, got $($signature.Status): $($artifact.FullName)"
+            }
+            if ($signature.SignerCertificate.Subject -notlike '*GaugeWright LLC*') {
+              throw "unexpected signer $($signature.SignerCertificate.Subject): $($artifact.FullName)"
+            }
+            if (-not $signature.TimeStamperCertificate) {
+              throw "signature carries no RFC 3161 timestamp: $($artifact.FullName)"
+            }
+            $digest = Get-FileHash -Algorithm SHA256 $artifact.FullName
+            Write-Output "$($artifact.Name) signed by $($signature.SignerCertificate.Subject) SHA256 $($digest.Hash)"
+          }
 
       - name: verify unsigned Windows package boundary
         if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED != 'true'

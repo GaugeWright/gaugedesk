@@ -918,12 +918,18 @@ impl Workbench {
         self.account_credential_providers_in(ACCOUNT_SCOPE)
     }
 
-    /// Provider ids linked in `scope` (the caller's account).
+    /// Provider ids linked in `scope` (the caller's account). OAuth-linked
+    /// providers are excluded: each one is projected by its own status route
+    /// (e.g. `/account/oauth/openai-codex`) and unlinks through its own flow,
+    /// so listing it here would present the same credential twice.
     pub fn account_credential_providers_in(&self, scope: &str) -> Result<Vec<String>, AdmitError> {
         Ok(Account::rebuild_in(self.store_ref(), scope)?
             .credentials
             .into_iter()
-            .filter(|(_, record)| record.status == CredentialStatus::Active)
+            .filter(|(_, record)| {
+                record.status == CredentialStatus::Active
+                    && record.authentication != CredentialAuthentication::OAuth
+            })
             .map(|(provider, _)| provider)
             .collect())
     }

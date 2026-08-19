@@ -106,8 +106,9 @@ jobs:
     runs-on: ubuntu-latest
     # The wasm toolchain below installs from apt, a binaryen release, crates.io,
     # and npm, and any of them can hang rather than fail — the browser-tunnel
-    # job in ci.yml lost a runner to a fifty-minute `apt-get install` once. This
-    # is slack, not a deadline.
+    # job in ci.yml lost a runner to a fifty-minute `apt-get install` once. The
+    # apt one is now bounded and retried by `apt-install`; binaryen, crates.io
+    # and npm are not, so this is still slack rather than a deadline.
     timeout-minutes: 30
     defaults:
       run:
@@ -133,8 +134,9 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup target add wasm32-unknown-unknown
       - name: Install clang for the wasm32 target
-        working-directory: .
-        run: sudo apt-get update && sudo apt-get install -y clang llvm
+        uses: ./.github/actions/apt-install
+        with:
+          packages: clang llvm
       # Binaryen comes from its own releases at a pinned version, not from the
       # distribution, exactly as ci.yml's browser-tunnel job takes it. apt ships
       # 108 on both runners, and `build-wasm.sh` refuses anything below 120

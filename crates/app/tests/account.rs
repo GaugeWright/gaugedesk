@@ -137,6 +137,42 @@ async fn linked_credential_is_sealed_and_token_never_leaves() {
 }
 
 #[tokio::test]
+async fn oauth_credential_stays_out_of_the_generic_credential_list() {
+    let (_dir, app) = workbench();
+
+    // An OAuth-linked provider (openai-codex) is projected by its own status
+    // route and unlinked through its own flow. Listing it in the generic
+    // key-credential list would show the same credential twice in every
+    // surface that also renders the OAuth row.
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(r#"{"provider":"openai-codex","token":"oauth-bundle"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(r#"{"provider":"anthropic","token":"sk-ant-test"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, body) = send(&app, "GET", "/account/credentials", None).await;
+    assert_eq!(s, StatusCode::OK);
+    let providers: Vec<&str> = body["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["provider"].as_str())
+        .collect();
+    assert_eq!(providers, ["anthropic"], "got {body}");
+}
+
+#[tokio::test]
 async fn managed_plan_and_usage_projection_round_trip() {
     let (_dir, app) = workbench();
     let (status, body) = send(

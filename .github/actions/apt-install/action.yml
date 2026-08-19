@@ -1,0 +1,74 @@
+name: Install apt packages, bounded
+description: >-
+  Install Debian packages with a per-attempt time bound and retries, so a mirror
+  that stalls costs a retry rather than the whole job.
+
+inputs:
+  packages:
+    description: Space-separated package names.
+    required: true
+  attempt-timeout:
+    description: >-
+      Seconds one update+install attempt may take before it is killed and
+      retried. The default clears the slowest healthy run observed on these
+      runners with margin to spare.
+    required: false
+    default: "480"
+  attempts:
+    description: How many bounded attempts before giving up.
+    required: false
+    default: "3"
+
+runs:
+  using: composite
+  steps:
+    # Why this exists rather than two plain `apt-get` lines:
+    #
+    # On 2026-08-18 `apt-get update` on a GitHub-hosted runner went **silent for
+    # 1765 seconds** — no output, no error, no progress — immediately after
+    # fetching the `InRelease` files, and did it on three separate runs. The
+    # `native shells` job died at its 30-minute wall each time and reported as a
+    # failing required check on healthy changes. That step normally takes
+    # 22-106s.
+    #
+    # apt's own `Acquire::Retries` and `Acquire::*::Timeout` did not bound it, so
+    # the bound has to come from outside the process. `timeout` runs under
+    # `sudo` rather than the other way around: `timeout sudo …` signals `sudo`,
+    # which need not forward anything to `apt-get`, whereas `sudo timeout …`
+    # runs as root and can kill `apt-get` directly.
+    #
+    # The stall correlated with `azure.archive.ubuntu.com` being ignored and the
+    # mirrorlist falling back to `archive.ubuntu.com`, but the silence outlasted
+    # every timeout apt was willing to apply, so this treats the cause as
+    # unknown and only bounds the symptom.
+    - name: Install ${{ inputs.packages }}
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+        APT_ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
+        APT_ATTEMPTS: ${{ inputs.attempts }}
+      run: |
+        set -uo pipefail
+        # Fail an individual mirror fast so a retry can pick a different one,
+        # instead of one attempt absorbing the whole budget on a dead host.
+        options="-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+        attempt=1
+        while [ "$attempt" -le "$APT_ATTEMPTS" ]; do
+          if sudo timeout "$APT_ATTEMPT_TIMEOUT" apt-get $options update \
+            && sudo timeout "$APT_ATTEMPT_TIMEOUT" apt-get $options install -y $APT_PACKAGES; then
+            echo "apt install succeeded on attempt ${attempt}"
+            exit 0
+          fi
+          echo "::warning::apt attempt ${attempt} did not finish inside ${APT_ATTEMPT_TIMEOUT}s" >&2
+          # A killed apt leaves its lock held and can leave dpkg half-configured;
+          # both make the next attempt fail for a reason that has nothing to do
+          # with the mirror.
+          sudo pkill -9 -x apt-get || true
+          sudo pkill -9 -x dpkg || true
+          sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend || true
+          sudo dpkg --configure -a || true
+          attempt=$((attempt + 1))
+          sleep 5
+        done
+        echo "apt never completed in ${APT_ATTEMPTS} bounded attempts" >&2
+        exit 1

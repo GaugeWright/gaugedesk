@@ -38,9 +38,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: install archive tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y awscli dpkg-dev gnupg lintian
+        uses: ./.github/actions/apt-install
+        with:
+          packages: awscli dpkg-dev gnupg lintian
 
       - name: fetch production publication secrets through OIDC
         uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
