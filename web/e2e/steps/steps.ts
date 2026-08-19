@@ -772,18 +772,24 @@ Then("the forked chat shows it is a copy of its source", async ({ page }) => {
     await expect(sub).toContainText("copy of");
 });
 
-// Round-8 #3: opening the fork shows a first-view note explaining the
-// copy-semantics — files came along, the conversation starts fresh.
+// Round-8 #3, revised by ADR 0141: a fork inherits its parent's transcript, so
+// the first-view note appears only when there was no history to inherit (the
+// parent had run no turns) — and says what did carry over: the files.
 Then(
-    "the chat shows it started as a copy with files but a fresh conversation",
+    "the chat shows it started as a copy with its files",
     async ({ page }) => {
         await page.locator(".chat-item", { hasText: "(fork)" }).first().click();
         const note = page.locator("[data-fork-note]");
         await expect(note).toBeVisible();
         await expect(note).toContainText("files came along");
-        await expect(note).toContainText("conversation starts fresh");
     },
 );
+
+// ADR 0141: the seam in a fork's transcript where inherited lineage history
+// ends and the chat's own lines begin.
+Then("the fork point marker is visible", async ({ page }) => {
+    await expect(page.locator("[data-fork-boundary]").first()).toBeVisible();
+});
 
 // ---- edit vs work chats (chat rooting, ADR 0035) ----
 

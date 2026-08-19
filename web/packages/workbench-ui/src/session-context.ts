@@ -265,7 +265,7 @@ export interface Session {
     readonly stop?: () => Promise<void>;
     /** Fork at an exact durable user/assistant boundary. Owner environments
      *  supply this; audience sessions intentionally omit it. */
-    readonly forkAt?: (entryId: number) => void;
+    readonly forkAt?: (entryId: number, origin?: string) => void;
 }
 
 const SessionContext = createContext<Session>();

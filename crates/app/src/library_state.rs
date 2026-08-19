@@ -177,6 +177,10 @@ pub(crate) enum ForkChatError {
 
 struct ResolvedForkPoint {
     entry_id: i64,
+    /// Inclusive bound on the source-scope records the fork inherits
+    /// (ADR 0141): strictly before the user entry on a pre-user cut, through
+    /// the assistant entry on a post-assistant cut.
+    inherited_cut: i64,
     workspace_cut: String,
     runtime_position: gaugedesk_harness::RuntimePosition,
     reads: Vec<String>,
@@ -2015,6 +2019,7 @@ impl Workbench {
             created_position: 0,
             forked_from: None,
             forked_from_entry: None,
+            forked_from_cut: None,
         };
         let pos = self
             .store_mut()
@@ -3037,6 +3042,7 @@ impl Workbench {
             if boundary.user_entry_id == entry_id {
                 return Ok(ResolvedForkPoint {
                     entry_id,
+                    inherited_cut: entry_id - 1,
                     workspace_cut: boundary.before_workspace_cut,
                     runtime_position: boundary.runtime_before,
                     reads: boundary.reads_before,
@@ -3045,6 +3051,7 @@ impl Workbench {
             if boundary.assistant_entry_id == entry_id {
                 return Ok(ResolvedForkPoint {
                     entry_id,
+                    inherited_cut: entry_id,
                     workspace_cut: boundary.after_workspace_cut,
                     runtime_position: boundary.runtime_after,
                     reads: boundary.reads_after,
@@ -3214,6 +3221,16 @@ impl Workbench {
         }
         self.register_engagement(new_id.clone(), storage_target_id, new_eng);
         let title = format!("{} (fork)", src_chat.title);
+        // ADR 0141: the durable log forks by lineage, not by copy. The cut is
+        // the inclusive bound on the parent-scope records this child inherits —
+        // the resolved point's bound, or the parent's whole log for a tip fork.
+        let inherited_cut = point.as_ref().map(|point| point.inherited_cut).unwrap_or(
+            source_events
+                .iter()
+                .map(|(position, _, _)| *position)
+                .max()
+                .unwrap_or(0),
+        );
         let rec = ChatRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
@@ -3224,6 +3241,7 @@ impl Workbench {
             created_position: 0,
             forked_from: Some(id.to_string()),
             forked_from_entry: point.as_ref().map(|point| point.entry_id),
+            forked_from_cut: Some(inherited_cut),
         };
         let pos = self
             .store
@@ -3254,6 +3272,32 @@ impl Workbench {
         })
     }
 
+    /// The chat's **effective-log lineage** (ADR 0141): the (authoring chat,
+    /// inclusive position bound) pairs whose records compose this chat's
+    /// durable log, root first, ending with the chat itself (unbounded). Walks
+    /// [`Library::chat_lineage`], so deleted ancestors still resolve; an edge
+    /// without a recorded cut (a pre-ADR-0141 fork) inherits nothing and ends
+    /// the walk.
+    pub(crate) fn effective_log_lineage(&self, id: &str) -> Vec<(String, Option<i64>)> {
+        let mut chain = vec![(id.to_owned(), None)];
+        let mut current = id.to_owned();
+        while let Some(lineage) = self.library.chat_lineage.get(&current) {
+            let (Some(parent), Some(cut)) = (lineage.forked_from.clone(), lineage.forked_from_cut)
+            else {
+                break;
+            };
+            // Fork can never record a cycle (a child is always a new id), but a
+            // corrupt log must not hang the reader.
+            if chain.iter().any(|(scope, _)| scope == &parent) {
+                break;
+            }
+            chain.push((parent.clone(), Some(cut)));
+            current = parent;
+        }
+        chain.reverse();
+        chain
+    }
+
     pub(crate) fn delete_chat_cascade(&mut self, id: &str) -> bool {
         if !self.engagement_index.contains_key(id) && !self.library.chats.contains_key(id) {
             return false;
@@ -3262,14 +3306,44 @@ impl Workbench {
         // purge its now-unreachable workspace blobs after the engagement line is gone (SECAUD-6).
         let inst_id = self.engagement_index.get(id).cloned();
         self.destroy_chat(id);
-        self.crypto_erase_content(id);
+        // ADR 0141: this chat's records may still compose a live descendant's
+        // effective log, so crypto-erasure is deferred to the reachability
+        // sweep — which erases this scope immediately when nothing inherits
+        // from it, and an ancestor's the moment its last descendant goes.
+        self.sweep_deferred_crypto_erasure();
         // SECAUD-6: erase the workspace payload too — `destroy_chat` removed
         // the engagement branch, so its unique objects are now unreachable; prune them so the
         // deleted chat's workspace content is unrecoverable, matching the store crypto-erasure.
+        // (`purge_unreachable_objects` is itself reachability-based: objects a
+        // fork's branch still reaches survive, the workspace half of ADR 0141.)
         if let Some(inst) = inst_id.and_then(|iid| self.targets.get(&iid)) {
             let _ = inst.purge_unreachable_objects();
         }
         true
+    }
+
+    /// Destroy the DEK of every deleted chat scope no live chat's effective log
+    /// reaches (ADR 0141 refcounted DEK lifetime). Reachability is the
+    /// effective-log walk, so an inheritance edge without a recorded cut does
+    /// not hold its ancestors' keys. Idempotent — long-erased scopes simply
+    /// have no key left to destroy.
+    fn sweep_deferred_crypto_erasure(&mut self) {
+        let mut reached: std::collections::BTreeSet<String> = Default::default();
+        for live in self.library.chats.keys() {
+            for (scope, _) in self.effective_log_lineage(live) {
+                reached.insert(scope);
+            }
+        }
+        let erasable: Vec<String> = self
+            .library
+            .chat_lineage
+            .keys()
+            .filter(|id| !self.library.chats.contains_key(*id) && !reached.contains(*id))
+            .cloned()
+            .collect();
+        for scope in erasable {
+            self.crypto_erase_content(&scope);
+        }
     }
 
     pub(crate) fn rename_chat_record(&mut self, id: &str, title: String) -> Option<ChatRecord> {
@@ -3608,22 +3682,30 @@ impl Workbench {
         let mut chats: Vec<&ChatRecord> = self.library.chats.values().collect();
         chats.sort_by_key(|chat| std::cmp::Reverse(chat.created_position));
 
-        // Tier 2 — chat log: fold each chat's transcript records and substring-match.
+        // Tier 2 — chat log: fold each chat's *effective* transcript (its own
+        // records plus the inherited lineage prefix, ADR 0141) and
+        // substring-match — a fork is findable by the history it carries.
         let mut hits = Vec::new();
         let mut logged: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for chat in &chats {
-            let Ok(rows) = self.store_ref().records(&chat.id, "transcript") else {
-                continue;
-            };
             let mut hay = String::new();
-            for row in &rows {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(row) else {
+            for (scope, bound) in self.effective_log_lineage(&chat.id) {
+                let Ok(events) = self.store_ref().events(&scope) else {
                     continue;
                 };
-                for key in ["text", "delta"] {
-                    if let Some(text) = value.get(key).and_then(|item| item.as_str()) {
-                        hay.push_str(text);
-                        hay.push('\n');
+                let bound = bound.unwrap_or(i64::MAX);
+                for (_, _, row) in events
+                    .iter()
+                    .filter(|(position, kind, _)| *position <= bound && kind == "transcript")
+                {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(row) else {
+                        continue;
+                    };
+                    for key in ["text", "delta"] {
+                        if let Some(text) = value.get(key).and_then(|item| item.as_str()) {
+                            hay.push_str(text);
+                            hay.push('\n');
+                        }
                     }
                 }
             }

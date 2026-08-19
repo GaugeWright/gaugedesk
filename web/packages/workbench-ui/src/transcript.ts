@@ -27,6 +27,11 @@ export interface TranscriptLine {
     /** Stable durable-store entry backing a reproducible user/assistant fork. */
     readonly entryId?: number;
     readonly forkable?: boolean;
+    /** The authoring chat of an inherited line (ADR 0141): a fork's transcript
+     *  carries its lineage prefix by reference, and entry ids are scoped to
+     *  their authoring chat — so a fork at this line targets `origin`. Absent
+     *  on the chat's own lines. */
+    readonly origin?: string;
     /** Tool-line metadata (B4): target opens the content viewer; args/result expand. */
     readonly tool?: ToolLine;
 }
@@ -57,7 +62,7 @@ export function reduce(t: Transcript, ev: StreamEvent): Transcript {
         case "user": {
             const line: TranscriptLine = {
                 seq, tier: "admitted", kind: "user", text: ev.text,
-                entryId: ev.entry_id, forkable: ev.forkable,
+                entryId: ev.entry_id, forkable: ev.forkable, origin: ev.origin,
             };
             return { lines: [...t.lines, line], openText: null };
         }
@@ -71,7 +76,7 @@ export function reduce(t: Transcript, ev: StreamEvent): Transcript {
             }
             const line: TranscriptLine = {
                 seq, tier: "admitted", kind: "assistant", text: ev.text,
-                entryId: ev.entry_id, forkable: ev.forkable,
+                entryId: ev.entry_id, forkable: ev.forkable, origin: ev.origin,
             };
             return { lines: [...t.lines, line], openText: null };
         }

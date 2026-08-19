@@ -2003,6 +2003,7 @@ mod search_tests {
             created_position: pos,
             forked_from: None,
             forked_from_entry: None,
+            forked_from_cut: None,
         }
     }
 

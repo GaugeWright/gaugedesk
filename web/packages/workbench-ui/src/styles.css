@@ -1671,6 +1671,12 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     line-height: 1.4; }
 /* No bold chrome face is shipped (DR-0072); colour carries this instead. */
 .fork-note strong { color: var(--ink); font-weight: 400; }
+/* The fork point inside a fork's transcript (ADR 0141): the quiet seam where
+   inherited lineage history ends and the chat's own lines begin. */
+.fork-boundary { display: flex; align-items: center; gap: 8px; margin: 6px 0;
+    color: var(--muted); font-size: var(--fs-label); }
+.fork-boundary::before, .fork-boundary::after { content: ""; flex: 1;
+    border-top: 1px solid var(--edge); }
 .inline-edit { font: inherit; font-size: var(--fs-ui); padding: 1px 4px; background: var(--bg);
     color: var(--ink); border: 1px solid var(--accent); border-radius: 3px; }
 /* Placement lineage + pinned method version (ADR 0035 C1 pivot). */

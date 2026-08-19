@@ -102,6 +102,7 @@ impl Workbench {
             created_position: 0,
             forked_from: None,
             forked_from_entry: None,
+            forked_from_cut: None,
         });
         self.write_chat_target_record(ChatTargetBindingRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
@@ -200,28 +201,44 @@ impl Workbench {
         &self,
         id: &str,
     ) -> Result<String, gaugedesk_store::AdmitError> {
-        let events = self.store_ref().events(id)?;
-        let forkable: std::collections::BTreeSet<i64> = events
-            .iter()
-            .filter(|(_, kind, _)| kind == crate::engine::TURN_BOUNDARY_KIND)
-            .filter_map(|(_, _, payload)| {
-                serde_json::from_str::<crate::engine::TurnBoundaryRecord>(payload).ok()
-            })
-            .flat_map(|boundary| [boundary.user_entry_id, boundary.assistant_entry_id])
-            .collect();
-        let rows = events
-            .into_iter()
-            .filter(|(_, kind, _)| kind == "transcript")
-            .filter_map(|(position, _, payload)| {
-                let mut event = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
-                let object = event.as_object_mut()?;
+        // ADR 0141: the durable log is a rooted tree — fold the whole lineage,
+        // root first. Inherited entries keep their authoring scope's identity
+        // (`origin` + that scope's entry ids), so "Fork here" on an inherited
+        // line forks the *origin* chat at its own entry; the vault decrypts
+        // each scope's rows with that scope's own key.
+        let mut rows = Vec::new();
+        for (scope, bound) in self.effective_log_lineage(id) {
+            let events = self.store_ref().events(&scope)?;
+            let bound = bound.unwrap_or(i64::MAX);
+            let forkable: std::collections::BTreeSet<i64> = events
+                .iter()
+                .filter(|(_, kind, _)| kind == crate::engine::TURN_BOUNDARY_KIND)
+                .filter_map(|(_, _, payload)| {
+                    serde_json::from_str::<crate::engine::TurnBoundaryRecord>(payload).ok()
+                })
+                .flat_map(|boundary| [boundary.user_entry_id, boundary.assistant_entry_id])
+                .filter(|entry| *entry <= bound)
+                .collect();
+            for (position, _, payload) in events
+                .into_iter()
+                .filter(|(position, kind, _)| *position <= bound && kind == "transcript")
+            {
+                let Ok(mut event) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                    continue;
+                };
+                let Some(object) = event.as_object_mut() else {
+                    continue;
+                };
                 object.insert("entry_id".into(), position.into());
                 if forkable.contains(&position) {
                     object.insert("forkable".into(), true.into());
                 }
-                Some(event)
-            })
-            .collect::<Vec<_>>();
+                if scope != id {
+                    object.insert("origin".into(), scope.clone().into());
+                }
+                rows.push(event);
+            }
+        }
         serde_json::to_string(&rows).map_err(Into::into)
     }
 

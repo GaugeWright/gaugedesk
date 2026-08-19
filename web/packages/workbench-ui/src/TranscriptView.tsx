@@ -11,7 +11,7 @@
  */
 
 import { createSignal, For, lazy, Show, Suspense, type JSX } from "solid-js";
-import { groupTurns, type TranscriptLine } from "./transcript";
+import { groupTurns, type TranscriptLine, type TranscriptSegment } from "./transcript";
 import {
     defaultPrefs,
     lineToolGroup,
@@ -177,7 +177,7 @@ function LineView(props: {
     prefs: FilterPrefs;
     /** Fired by the action on a `code: "no_credential"` error line — opens settings. */
     onResolveCredential?: () => void;
-    onFork?: (entryId: number) => void;
+    onFork?: (entryId: number, origin?: string) => void;
 }): JSX.Element {
     // A model-credential refusal (LLM-1) carries a machine-readable code: render the
     // reason *with* an action into settings, so the user can act from the chat log
@@ -213,7 +213,7 @@ function LineView(props: {
                                     class="line-action fork-action"
                                     data-fork-entry={props.line.entryId}
                                     title={props.line.kind === "user" ? "Fork before this message" : "Fork after this message"}
-                                    onClick={() => props.onFork?.(props.line.entryId!)}
+                                    onClick={() => props.onFork?.(props.line.entryId!, props.line.origin)}
                                 >
                                     Fork here
                                 </button>
@@ -262,7 +262,7 @@ function TurnView(props: {
     prefs: FilterPrefs;
     onOpen: (path: string) => void;
     onResolveCredential?: () => void;
-    onFork?: (entryId: number) => void;
+    onFork?: (entryId: number, origin?: string) => void;
 }): JSX.Element {
     const [collapsed, setCollapsed] = createSignal(false);
     return (
@@ -313,34 +313,69 @@ export function TranscriptView(props: {
     /** Fired by the in-log action on a model-credential refusal (LLM-1) — opens settings. */
     onResolveCredential?: () => void;
     /** Owner-only exact point fork. Omit in audience environments. */
-    onFork?: (entryId: number) => void;
+    onFork?: (entryId: number, origin?: string) => void;
 }): JSX.Element {
     const prefs = () => props.prefs ?? defaultPrefs;
     const agentName = () => displayAgentName(props.agentName);
     const segments = () => groupTurns(props.lines.filter((l) => lineVisible(l, prefs())));
+    // The authoring chat of a segment's first line (ADR 0141): inherited lines
+    // carry their origin, the chat's own lines none. A change of origin between
+    // consecutive segments is a fork point — mark it, so where inherited
+    // history ends is legible in the flow of the transcript. A transcript that
+    // *ends* inherited (a fresh fork that has run nothing yet) gets a trailing
+    // marker instead: new messages continue from there.
+    const segmentOrigin = (seg: TranscriptSegment): string | undefined =>
+        seg.type === "turn" ? seg.lines[0]?.origin : seg.line.origin;
+    // A factory, not a shared element: each seam needs its own node.
+    const forkPointMarker = (): JSX.Element => (
+        <div
+            class="fork-boundary"
+            data-fork-boundary
+            title="The history above is inherited from the chat this one was forked from."
+        >
+            ⑂ fork point
+        </div>
+    );
     return (
+        <>
         <For each={segments()} fallback={props.fallback ?? <div class="status">no activity yet</div>}>
-            {(seg) =>
-                seg.type === "turn" ? (
-                    <TurnView
-                        lines={seg.lines}
-                        agentName={agentName()}
-                        prefs={prefs()}
-                        onOpen={props.onOpen}
-                        onResolveCredential={props.onResolveCredential}
-                        onFork={props.onFork}
-                    />
-                ) : (
-                    <LineView
-                        line={seg.line}
-                        agentName={agentName()}
-                        onOpen={props.onOpen}
-                        prefs={prefs()}
-                        onResolveCredential={props.onResolveCredential}
-                        onFork={props.onFork}
-                    />
-                )
-            }
+            {(seg, index) => (
+                <>
+                    <Show
+                        when={index() > 0 && segmentOrigin(segments()[index() - 1]) !== segmentOrigin(seg)}
+                    >
+                        {forkPointMarker()}
+                    </Show>
+                    {seg.type === "turn" ? (
+                        <TurnView
+                            lines={seg.lines}
+                            agentName={agentName()}
+                            prefs={prefs()}
+                            onOpen={props.onOpen}
+                            onResolveCredential={props.onResolveCredential}
+                            onFork={props.onFork}
+                        />
+                    ) : (
+                        <LineView
+                            line={seg.line}
+                            agentName={agentName()}
+                            onOpen={props.onOpen}
+                            prefs={prefs()}
+                            onResolveCredential={props.onResolveCredential}
+                            onFork={props.onFork}
+                        />
+                    )}
+                </>
+            )}
         </For>
+        <Show
+            when={
+                segments().length > 0 &&
+                segmentOrigin(segments()[segments().length - 1]) !== undefined
+            }
+        >
+            {forkPointMarker()}
+        </Show>
+        </>
     );
 }

@@ -1152,7 +1152,7 @@ export function FacetBrowser(props: {
                                 <span
                                     class="leaf-sub"
                                     data-fork-source={src()}
-                                    title={`Started as a copy of "${src()}" — its files came along, the conversation started fresh`}
+                                    title={`Forked from "${src()}" — its files and conversation history came along`}
                                 >
                                     copy of {src()}
                                 </span>

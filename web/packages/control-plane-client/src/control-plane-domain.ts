@@ -349,8 +349,8 @@ export interface WorkspaceChange {
 
 /** An event from the control-plane stream that clients reduce into a transcript. */
 export type StreamEvent =
-    | { type: "user"; text: string; entry_id?: number; forkable?: boolean }
-    | { type: "assistant"; text: string; entry_id?: number; forkable?: boolean }
+    | { type: "user"; text: string; entry_id?: number; forkable?: boolean; origin?: string }
+    | { type: "assistant"; text: string; entry_id?: number; forkable?: boolean; origin?: string }
     | { type: "text"; delta: string }
     | { type: "tool"; tool: string; mediated: boolean; call_id?: string; target?: string; args?: string }
     | { type: "toolresult"; call_id: string; ok: boolean; result?: string }

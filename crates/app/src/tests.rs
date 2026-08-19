@@ -1309,6 +1309,7 @@ async fn project_home_rolls_up_runs_outputs_and_audit() {
             created_position: 1,
             forked_from: None,
             forked_from_entry: None,
+            forked_from_cut: None,
         });
     }
     let app = open_control_plane(wb);
@@ -3376,7 +3377,7 @@ async fn archetype_abilities_update_only_the_draft_manifest() {
 #[tokio::test]
 async fn forking_a_chat_links_it_and_inherits_the_parent_worktree() {
     let (_d, wb) = seeded_workbench();
-    let app = open_control_plane(wb);
+    let app = open_control_plane(wb.clone());
     // a work chat (back-compat path roots it on the default placement)
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"fork-src"}"#)).await;
     assert_eq!(s, StatusCode::CREATED);
@@ -3413,6 +3414,220 @@ async fn forking_a_chat_links_it_and_inherits_the_parent_worktree() {
     assert!(
         ws.contains("\"forked_from\":\"fork-src\""),
         "projection shows forked_from: {ws}"
+    );
+    // ADR 0141: the fork records the inclusive parent-scope cut its effective
+    // log inherits — the durable half of forking by lineage instead of by copy.
+    let guard = wb.lock_unpoisoned();
+    assert!(
+        guard.library.chats[&fork_id].forked_from_cut.is_some(),
+        "a new fork stamps its inherited cut"
+    );
+}
+
+/// ADR 0141 helpers: a minimal chat record with fork lineage, and one durable
+/// turn (user + assistant transcript rows and their boundary) written straight
+/// into a chat's scope — the shapes the engine writes, without running a turn.
+fn lineage_chat(
+    id: &str,
+    forked_from: Option<&str>,
+    cut: Option<i64>,
+) -> crate::library::ChatRecord {
+    crate::library::ChatRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        id: id.into(),
+        op: crate::org::RecordOp::Upsert,
+        instance_id: "inst-lineage".into(),
+        title: id.into(),
+        created_position: 0,
+        forked_from: forked_from.map(str::to_string),
+        forked_from_entry: None,
+        forked_from_cut: cut,
+    }
+}
+
+fn append_turn(wb: &mut Workbench, chat: &str, user: &str, assistant: &str) -> (i64, i64) {
+    let user_entry = wb
+        .store_mut()
+        .append_record(
+            chat,
+            "transcript",
+            &serde_json::json!({"type":"user","text":user}).to_string(),
+        )
+        .unwrap();
+    let assistant_entry = wb
+        .store_mut()
+        .append_record(
+            chat,
+            "transcript",
+            &serde_json::json!({"type":"assistant","text":assistant}).to_string(),
+        )
+        .unwrap();
+    let boundary = crate::engine::TurnBoundaryRecord {
+        user_entry_id: user_entry,
+        assistant_entry_id: assistant_entry,
+        before_workspace_cut: "cut-before".into(),
+        after_workspace_cut: "cut-after".into(),
+        runtime_before: gaugedesk_harness::RuntimePosition {
+            instance_ref: "ri".into(),
+            sequence: 0,
+        },
+        runtime_after: gaugedesk_harness::RuntimePosition {
+            instance_ref: "ri".into(),
+            sequence: 1,
+        },
+        reads_before: vec![],
+        reads_after: vec![],
+    };
+    wb.store_mut()
+        .append_record(
+            chat,
+            crate::engine::TURN_BOUNDARY_KIND,
+            &serde_json::to_string(&boundary).unwrap(),
+        )
+        .unwrap();
+    (user_entry, assistant_entry)
+}
+
+/// ADR 0141: a fork's transcript is its parent's records up to the recorded cut
+/// — resolved by lineage, tagged with their authoring scope — followed by its
+/// own. Records past the cut, and the whole prefix of a pre-ADR-0141 fork
+/// (no recorded cut), stay out.
+#[test]
+fn a_forks_transcript_folds_its_inherited_lineage() {
+    let mut wb = Workbench::new(Store::open_in_memory().unwrap());
+    wb.write_chat_record(lineage_chat("lin-p", None, None));
+    let (_, assistant_entry) = append_turn(&mut wb, "lin-p", "parent hello", "parent reply");
+    wb.write_chat_record(lineage_chat("lin-c", Some("lin-p"), Some(assistant_entry)));
+    // A parent turn after the fork point must not leak into the child.
+    append_turn(&mut wb, "lin-p", "parent later", "parent later reply");
+    append_turn(&mut wb, "lin-c", "child question", "child reply");
+
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&wb.engagement_transcript_json("lin-c").unwrap()).unwrap();
+    let texts: Vec<&str> = rows.iter().map(|r| r["text"].as_str().unwrap()).collect();
+    assert_eq!(
+        texts,
+        vec![
+            "parent hello",
+            "parent reply",
+            "child question",
+            "child reply"
+        ],
+        "inherited prefix up to the cut, then the child's own lines"
+    );
+    // Inherited lines carry their authoring scope + that scope's entry ids and
+    // stay forkable (the fork point machinery is the origin's); own lines are
+    // unmarked.
+    assert_eq!(rows[0]["origin"], "lin-p");
+    assert_eq!(rows[1]["origin"], "lin-p");
+    assert_eq!(rows[1]["entry_id"], assistant_entry);
+    assert_eq!(rows[1]["forkable"], true);
+    assert!(rows[2]["origin"].is_null(), "own lines carry no origin");
+    // A legacy fork (lineage without a recorded cut) inherits nothing.
+    wb.write_chat_record(lineage_chat("lin-legacy", Some("lin-p"), None));
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&wb.engagement_transcript_json("lin-legacy").unwrap()).unwrap();
+    assert!(rows.is_empty(), "pre-ADR-0141 forks began empty: {rows:?}");
+    // The parent's own view is untouched by being inherited from.
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&wb.engagement_transcript_json("lin-p").unwrap()).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|r| r["origin"].is_null()));
+}
+
+/// ADR 0141 refcounted DEK lifetime: deleting a forked ancestor hides it but
+/// keeps its records decodable to the descendants that inherit them; the key is
+/// destroyed the moment the last inheriting descendant goes.
+#[test]
+fn deleting_a_forked_ancestor_defers_crypto_erasure_until_the_last_descendant() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Arc::new(content_vault::ContentVault::new(
+        dir.path().join("ckeys"),
+        Box::new(at_rest::LoopbackKeyWrap::new([3u8; 32])),
+    ));
+    let store = Store::open_in_memory().unwrap().with_codec(vault.clone());
+    let mut wb = Workbench::new(store).with_content_vault(vault);
+
+    wb.write_chat_record(lineage_chat("era-p", None, None));
+    let (_, cut) = append_turn(&mut wb, "era-p", "the secret number is 8351", "noted");
+    wb.write_chat_record(lineage_chat("era-c", Some("era-p"), Some(cut)));
+    append_turn(&mut wb, "era-c", "child turn", "child reply");
+
+    assert!(wb.delete_chat_cascade("era-p"));
+    // The parent is gone from the listing, but the child still renders the
+    // inherited history — the parent scope's key survived the delete.
+    assert!(!wb.library.chats.contains_key("era-p"));
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&wb.engagement_transcript_json("era-c").unwrap()).unwrap();
+    assert_eq!(
+        rows[0]["text"], "the secret number is 8351",
+        "inherited history survives the ancestor's deletion: {rows:?}"
+    );
+
+    assert!(wb.delete_chat_cascade("era-c"));
+    // Nothing reaches either scope now: both keys are destroyed and the
+    // retained ciphertext is unrecoverable (SECAUD-6, deferred half).
+    assert!(
+        wb.store_ref()
+            .records("era-p", "transcript")
+            .unwrap()
+            .is_empty(),
+        "the ancestor's content is crypto-erased once its last descendant goes"
+    );
+    assert!(wb
+        .store_ref()
+        .records("era-c", "transcript")
+        .unwrap()
+        .is_empty());
+}
+
+/// The deferral is scoped to real inheritance: a pre-ADR-0141 fork edge (no
+/// recorded cut) reads nothing from its ancestor, so it holds no key alive.
+#[test]
+fn a_legacy_fork_edge_does_not_defer_its_ancestors_erasure() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Arc::new(content_vault::ContentVault::new(
+        dir.path().join("ckeys"),
+        Box::new(at_rest::LoopbackKeyWrap::new([3u8; 32])),
+    ));
+    let store = Store::open_in_memory().unwrap().with_codec(vault.clone());
+    let mut wb = Workbench::new(store).with_content_vault(vault);
+
+    wb.write_chat_record(lineage_chat("leg-p", None, None));
+    append_turn(&mut wb, "leg-p", "private", "ack");
+    wb.write_chat_record(lineage_chat("leg-c", Some("leg-p"), None));
+
+    assert!(wb.delete_chat_cascade("leg-p"));
+    assert!(
+        wb.store_ref()
+            .records("leg-p", "transcript")
+            .unwrap()
+            .is_empty(),
+        "no inheriting descendant ⇒ erased immediately"
+    );
+}
+
+/// ADR 0141: search folds each chat's *effective* log, so a fork is findable by
+/// the history it inherited, not only by what it appended itself.
+#[test]
+fn search_finds_a_fork_by_its_inherited_history() {
+    let mut wb = Workbench::new(Store::open_in_memory().unwrap());
+    wb.write_chat_record(lineage_chat("srch-p", None, None));
+    let (_, cut) = append_turn(&mut wb, "srch-p", "the xylophone is broken", "understood");
+    wb.write_chat_record(lineage_chat("srch-c", Some("srch-p"), Some(cut)));
+
+    let hits = wb.search_value("xylophone");
+    let ids: Vec<&str> = hits["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"srch-p"), "the author matches: {ids:?}");
+    assert!(
+        ids.contains(&"srch-c"),
+        "the fork matches via its inherited prefix: {ids:?}"
     );
 }
 

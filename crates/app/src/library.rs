@@ -281,6 +281,13 @@ pub struct ChatRecord {
     /// for original chats and legacy whole-thread forks.
     #[serde(default)]
     pub forked_from_entry: Option<i64>,
+    /// Inclusive upper bound on the parent-scope records this fork inherits
+    /// (ADR 0141): the child's effective log is the parent's records with
+    /// `position <= forked_from_cut` followed by its own — resolved by
+    /// lineage, never copied. Absent for original chats and for forks created
+    /// before ADR 0141, which inherit nothing (their durable log began empty).
+    #[serde(default)]
+    pub forked_from_cut: Option<i64>,
     /// The record-shape schema version that wrote this record (DR-0054 Phase
     /// B). Absent on records predating the stamp = version 1, the implicit
     /// original shape. Readers fail closed on a version newer than
@@ -492,6 +499,16 @@ pub struct WorkstreamRecord {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// The immutable lineage half of a [`ChatRecord`], retained across deletion
+/// (ADR 0141): a deleted ancestor's records are still part of its descendants'
+/// effective logs, so effective-log resolution and deferred crypto-erasure
+/// must be able to walk the fork tree after the listing tombstone.
+#[derive(Clone, Debug, Default)]
+pub struct ChatLineage {
+    pub forked_from: Option<String>,
+    pub forked_from_cut: Option<i64>,
+}
+
 /// The current value of every library record id, folded latest-wins. Held in
 /// the `Workbench` and mutated in place on each write (never re-folded on the
 /// hot path); rebuilt from the log on startup.
@@ -501,6 +518,8 @@ pub struct Library {
     pub projects: BTreeMap<String, ProjectRecord>,
     pub instances: BTreeMap<String, InstanceRecord>,
     pub chats: BTreeMap<String, ChatRecord>,
+    /// Fork lineage of every chat ever recorded, tombstones included (ADR 0141).
+    pub chat_lineage: BTreeMap<String, ChatLineage>,
     pub workstreams: BTreeMap<String, WorkstreamRecord>,
     pub work_targets: BTreeMap<String, WorkTargetRecord>,
     pub placement_targets: BTreeMap<String, PlacementTargetsRecord>,
@@ -542,7 +561,7 @@ impl Library {
         for row in store.records(LIBRARY_SCOPE, "chat")? {
             let r: ChatRecord = serde_json::from_str(&row)?;
             guard_record_schema("chat", &r.id, r.schema)?;
-            fold_one(&mut lib.chats, &r.id.clone(), r.op, r);
+            lib.apply_chat(r);
         }
         for row in store.records(LIBRARY_SCOPE, "workstream")? {
             let r: WorkstreamRecord = serde_json::from_str(&row)?;
@@ -595,6 +614,15 @@ impl Library {
         fold_one(&mut self.instances, &r.id.clone(), r.op, r);
     }
     pub fn apply_chat(&mut self, r: ChatRecord) {
+        // Lineage survives the tombstone (ADR 0141): op-independent, and a
+        // rename's read-modify-write carries the same immutable fields.
+        self.chat_lineage.insert(
+            r.id.clone(),
+            ChatLineage {
+                forked_from: r.forked_from.clone(),
+                forked_from_cut: r.forked_from_cut,
+            },
+        );
         fold_one(&mut self.chats, &r.id.clone(), r.op, r);
     }
     pub fn apply_workstream(&mut self, r: WorkstreamRecord) {
@@ -1082,6 +1110,7 @@ mod tests {
                 created_position: 0,
                 forked_from: None,
                 forked_from_entry: None,
+                forked_from_cut: None,
             });
         };
         bind(&mut lib, "i-iso", Some("p-iso"));
@@ -1149,6 +1178,7 @@ mod tests {
                 created_position: 0,
                 forked_from: None,
                 forked_from_entry: None,
+                forked_from_cut: None,
             });
         };
         chat(&mut lib, "c-work", "i-using");
@@ -1175,6 +1205,7 @@ mod tests {
             created_position: pos,
             forked_from: from.map(str::to_string),
             forked_from_entry: None,
+            forked_from_cut: None,
         };
         // c1 (root) → c2 → c3 ; c4 (root) ; c5 forked from a missing parent ⇒ surfaces as root.
         lib.apply_chat(chat("c1", 1, None));
@@ -1266,6 +1297,7 @@ mod tests {
                 created_position: pos,
                 forked_from: None,
                 forked_from_entry: None,
+                forked_from_cut: None,
             };
             store
                 .append_record(LIBRARY_SCOPE, "chat", &serde_json::to_string(&c).unwrap())
@@ -1336,6 +1368,7 @@ mod tests {
                 created_position: pos,
                 forked_from: None,
                 forked_from_entry: None,
+                forked_from_cut: None,
             });
         }
         let ids: Vec<&str> = lib

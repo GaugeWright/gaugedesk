@@ -22,8 +22,8 @@ Feature: Round 8 — plain-language tool detail and legible fork lineage
     Then I see a forked chat
     And the forked chat shows it is a copy of its source
 
-  Scenario: opening a fork explains the copy semantics on its empty transcript
+  Scenario: opening a fork of a chat with no history explains what carried over
     Given a new engagement
     When I switch to the "Projects" facet
     And I fork the first chat
-    Then the chat shows it started as a copy with files but a fresh conversation
+    Then the chat shows it started as a copy with its files

@@ -1799,12 +1799,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 <Show when={streamReady()}>
                     <span data-testid="stream-ready" style={{ display: "none" }} />
                 </Show>
-                {/* Fork first-view note (#3): on the fork's empty transcript, explain
-                    the copy-semantics established round 1 #2 — files came along, the
-                    conversation started fresh — so the lineage is legible at a glance. */}
+                {/* Fork first-view note: since ADR 0141 a fork carries its inherited
+                    history, so a *populated* fork needs no explanation — the lineage is
+                    in the transcript. An empty fork transcript means a pre-ADR-0141
+                    fork (created before logs forked by lineage); say what carried over. */}
                 <Show when={forkOf() && transcript().lines.length === 0}>
                     <div class="fork-note" data-fork-note>
-                        Started as a copy of <strong>{forkOf()}</strong> — its files came along, the conversation starts fresh here.
+                        Started as a copy of <strong>{forkOf()}</strong> — its files came along.
                     </div>
                 </Show>
                 <ChatPanel
@@ -1976,9 +1977,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             if (selected() !== id) throw new Error("This chat is no longer selected.");
             await stopTurn();
         },
-        forkAt: (entryId) => {
+        forkAt: (entryId, origin) => {
             if (selected() !== id) return;
-            void api.forkChatAt(id, entryId).then(openChat);
+            // ADR 0141: an inherited line's entry id is scoped to its authoring
+            // chat, and forking there IS forking that ancestor at its own entry
+            // — the new branch becomes the ancestor's child in the fork tree.
+            void api.forkChatAt((origin as EngagementId | undefined) ?? id, entryId).then(openChat);
         },
     });
     const desktopEnvironment = new Environment({

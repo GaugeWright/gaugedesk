@@ -377,6 +377,7 @@ mod tests {
                 created_position: 0,
                 forked_from: None,
                 forked_from_entry: None,
+                forked_from_cut: None,
             });
         }
         let wrong_admission = "0".repeat(64);
