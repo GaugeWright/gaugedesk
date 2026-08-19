@@ -748,6 +748,14 @@ pub fn web_account_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `/auth/login` may skip the IdP ceremony for this request: only the hosted web
+/// flow — never a native/dev handoff, which exists to mint a fresh single-use code — and only
+/// when the carried session already authenticates to a real person. Pure; the handler wires in
+/// the deployment mode, the handoff intent, and the resolved actor.
+pub fn login_ceremony_skippable(web_account: bool, native_login: bool, actor: &str) -> bool {
+    web_account && !native_login && actor != "anonymous"
+}
+
 /// Post-login account reconciliation for the hosted web account (`ADR 0077` §9): provision the
 /// authenticated person's **personal tenant-of-one** (idempotent), so a Google login lands them in
 /// the Console with their own space. The authenticated `authority` (the OIDC subject) *is* the
@@ -903,6 +911,40 @@ pub fn expired_session_cookie_value(domain: Option<&str>, secure: bool) -> Strin
     c
 }
 
+/// The JS-readable companion to the session cookie. [`session_cookie_value`] is `HttpOnly`, so
+/// the static public site cannot tell a signed-in browser from an anonymous one; this hint —
+/// deliberately not `HttpOnly`, carrying the constant `1` and never the credential — is what lets
+/// `gaugewright.com` relabel its nav ("Sign in" → "Go to hub"). It grants nothing: a forged or
+/// stale hint only changes a label, and the real session cookie still decides every request.
+pub const SESSION_HINT_COOKIE: &str = "gw_session_hint";
+
+/// The hint's `Set-Cookie` value, same path/domain/security attributes as the session cookie so
+/// the pair always travels — and expires — together.
+pub fn session_hint_cookie_value(domain: Option<&str>, secure: bool) -> String {
+    let mut c = format!("{SESSION_HINT_COOKIE}=1; Path=/; SameSite=Lax");
+    if secure {
+        c.push_str("; Secure");
+    }
+    if let Some(d) = domain.map(str::trim).filter(|d| !d.is_empty()) {
+        c.push_str("; Domain=");
+        c.push_str(d);
+    }
+    c
+}
+
+/// Expire the hint with the attributes it was issued under (see
+/// [`expired_session_cookie_value`] for why the attributes must match).
+pub fn expired_session_hint_cookie_value(domain: Option<&str>, secure: bool) -> String {
+    let mut c = session_hint_cookie_value(domain, secure);
+    c = c.replacen(
+        &format!("{SESSION_HINT_COOKIE}=1"),
+        &format!("{SESSION_HINT_COOKIE}="),
+        1,
+    );
+    c.push_str("; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+    c
+}
+
 /// The OAuth **client secret** for a confidential OP (Google), from `GAUGEDESK_GOOGLE_CLIENT_SECRET`.
 /// `None` when unset — a public PKCE client (Okta/Entra) needs no secret at exchange.
 fn google_client_secret_from_env() -> Option<crate::secret::Secret> {
@@ -928,6 +970,36 @@ fn expired_session_cookie_header() -> String {
         .map(|v| v == "1")
         .unwrap_or(false);
     expired_session_cookie_value(domain.as_deref(), !insecure)
+}
+
+fn session_hint_cookie_header() -> String {
+    let domain = gaugedesk_env::var("SESSION_COOKIE_DOMAIN");
+    let insecure = gaugedesk_env::var("SESSION_COOKIE_INSECURE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    session_hint_cookie_value(domain.as_deref(), !insecure)
+}
+
+fn expired_session_hint_cookie_header() -> String {
+    let domain = gaugedesk_env::var("SESSION_COOKIE_DOMAIN");
+    let insecure = gaugedesk_env::var("SESSION_COOKIE_INSECURE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    expired_session_hint_cookie_value(domain.as_deref(), !insecure)
+}
+
+/// Append both session `Set-Cookie` headers — the `HttpOnly` credential and its JS-readable
+/// hint — so the pair can never drift apart at an issue site.
+fn append_session_cookies(resp: &mut axum::response::Response, id_token: &str) {
+    for value in [
+        session_cookie_header(id_token),
+        session_hint_cookie_header(),
+    ] {
+        if let Ok(cookie) = axum::http::HeaderValue::from_str(&value) {
+            resp.headers_mut()
+                .append(axum::http::header::SET_COOKIE, cookie);
+        }
+    }
 }
 
 // ---- axum handlers -------------------------------------------------------
@@ -988,6 +1060,21 @@ pub async fn get_login(
         Ok(value) => value,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    // Hosted web account: a browser that already carries a still-valid session (the shared
+    // `.gaugewright.com` cookie) needs no new ceremony — bounce it straight to the post-login
+    // surface. The public site's "Sign in" entry lands here, so without this every visit
+    // re-ran the full IdP consent even for a signed-in person. An expired/absent cookie
+    // authenticates to nobody and falls through to the normal flow.
+    {
+        let bearer = crate::net_http::bearer(&headers).map(str::to_string);
+        let actor = wb.lock_unpoisoned().actor(bearer.as_deref());
+        if login_ceremony_skippable(web_account_mode(), native_return.is_some(), &actor) {
+            let post_login = gaugedesk_env::var("OIDC_POST_LOGIN_URL")
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| "/".to_string());
+            return Redirect::to(&post_login).into_response();
+        }
+    }
     let sso = {
         let wb = wb.lock_unpoisoned();
         match Org::rebuild_in(wb.store_ref(), &crate::workbench_auth::req_scope(&headers)) {
@@ -1310,10 +1397,7 @@ pub async fn get_callback(
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| "/".to_string());
         let mut resp = Redirect::to(&post_login).into_response();
-        if let Ok(cookie) = axum::http::HeaderValue::from_str(&session_cookie_header(&id_token)) {
-            resp.headers_mut()
-                .append(axum::http::header::SET_COOKIE, cookie);
-        }
+        append_session_cookies(&mut resp, &id_token);
         return resp;
     }
 
@@ -1405,10 +1489,7 @@ pub async fn get_refresh(
         Json(json!({ "refreshed": true, "person": person })),
     )
         .into_response();
-    if let Ok(cookie) = axum::http::HeaderValue::from_str(&session_cookie_header(&new_id)) {
-        resp.headers_mut()
-            .append(axum::http::header::SET_COOKIE, cookie);
-    }
+    append_session_cookies(&mut resp, &new_id);
     resp
 }
 
@@ -1605,9 +1686,14 @@ pub async fn post_native_exchange(
 /// expired user can always return to a clean signed-out state.
 pub async fn post_logout() -> impl IntoResponse {
     let mut resp = StatusCode::NO_CONTENT.into_response();
-    if let Ok(cookie) = axum::http::HeaderValue::from_str(&expired_session_cookie_header()) {
-        resp.headers_mut()
-            .append(axum::http::header::SET_COOKIE, cookie);
+    for value in [
+        expired_session_cookie_header(),
+        expired_session_hint_cookie_header(),
+    ] {
+        if let Ok(cookie) = axum::http::HeaderValue::from_str(&value) {
+            resp.headers_mut()
+                .append(axum::http::header::SET_COOKIE, cookie);
+        }
     }
     resp
 }
@@ -2082,6 +2168,64 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(c.contains("Path=/") && c.contains("HttpOnly") && c.contains("Secure"));
         assert!(c.contains("Max-Age=0"));
         assert!(c.contains("Expires=Thu, 01 Jan 1970 00:00:00 GMT"));
+    }
+
+    #[test]
+    fn a_signed_in_browser_skips_the_login_ceremony_but_native_never_does() {
+        // The one skippable case: hosted web flow, no handoff, authenticated actor.
+        assert!(login_ceremony_skippable(true, false, "google-sub-123"));
+        // An absent/expired/forged cookie authenticates to nobody — full ceremony.
+        assert!(!login_ceremony_skippable(true, false, "anonymous"));
+        // A native/dev handoff needs its fresh single-use code even when signed in.
+        assert!(!login_ceremony_skippable(true, true, "google-sub-123"));
+        // Enterprise/desktop deployments are untouched.
+        assert!(!login_ceremony_skippable(false, false, "google-sub-123"));
+    }
+
+    #[test]
+    fn session_hint_cookie_is_js_readable_and_carries_no_credential() {
+        let c = session_hint_cookie_value(Some(".gaugewright.com"), true);
+        assert!(c.starts_with("gw_session_hint=1;"));
+        assert!(
+            !c.contains("HttpOnly"),
+            "the public site's nav script must be able to read it"
+        );
+        assert!(c.contains("Domain=.gaugewright.com"));
+        assert!(c.contains("Path=/") && c.contains("SameSite=Lax") && c.contains("Secure"));
+        // Loopback dev mirrors the session cookie: no Domain, Secure droppable.
+        let dev = session_hint_cookie_value(None, false);
+        assert!(!dev.contains("Domain=") && !dev.contains("Secure"));
+    }
+
+    #[test]
+    fn expired_session_hint_clears_with_the_issued_attributes() {
+        let c = expired_session_hint_cookie_value(Some(".gaugewright.com"), true);
+        assert!(c.starts_with("gw_session_hint=;"));
+        assert!(c.contains("Domain=.gaugewright.com"));
+        assert!(c.contains("Path=/") && c.contains("Secure"));
+        assert!(c.contains("Max-Age=0"));
+        assert!(c.contains("Expires=Thu, 01 Jan 1970 00:00:00 GMT"));
+    }
+
+    #[test]
+    fn session_cookies_are_issued_as_a_pair() {
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        append_session_cookies(&mut resp, "id-tok-123");
+        let cookies: Vec<String> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            cookies.len(),
+            2,
+            "credential + hint, never one without the other"
+        );
+        assert!(cookies[0].starts_with("gw_session=id-tok-123;"));
+        assert!(cookies[0].contains("HttpOnly"));
+        assert!(cookies[1].starts_with("gw_session_hint=1;"));
+        assert!(!cookies[1].contains("HttpOnly"));
     }
 
     #[test]
