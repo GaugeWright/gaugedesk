@@ -141,12 +141,15 @@ jobs:
         # The pre-approval lane intentionally emitted unsigned packages; this
         # preflight names a missing input rather than let `azure/login` fail
         # obscurely. The federated credential must assert the subject GitHub
-        # actually mints for this job — the identifier form under DR-0079,
-        # repo:GaugeWright@301893664/gaugedesk-src@1288693434:environment:production
-        # per this repository's OIDC sub_claim_prefix (an earlier note here
-        # cited the public mirror's repository id, which this repo never mints)
-        # — because this job carries `environment: production` exactly as the
-        # apt lane does, and a name-bound subject there cost five runs.
+        # actually mints for this job — and this job only runs in the public
+        # mirror (the `if:` above), so that is the mirror's identifier form
+        # under DR-0079,
+        # repo:GaugeWright@301893664/gaugedesk@1291563372:environment:production
+        # per the mirror's OIDC sub_claim_prefix. A note here briefly claimed
+        # the `-src` form instead; `-src` never runs this job. The subject is
+        # environment-bound because this job carries `environment: production`
+        # exactly as the apt lane does, and a name-bound subject there cost
+        # five runs.
         if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
         shell: bash
         env:
