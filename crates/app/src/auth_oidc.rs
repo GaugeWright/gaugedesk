@@ -60,6 +60,11 @@ pub struct PendingAuth {
     /// Held [`Secret`](crate::secret::Secret) so this `Debug`-deriving
     /// struct never leaks it to a log (`SECAUD-10`).
     pub verifier: crate::secret::Secret,
+    /// The OIDC `nonce` minted on the authorize leg and echoed in the id-token's
+    /// `nonce` claim. The callback requires the returned id-token to carry exactly
+    /// this value, binding the token to *this* browser login (replay/injection
+    /// defense, `INV-20`).
+    pub nonce: String,
     /// The OP token endpoint the code is redeemed at.
     pub token_endpoint: String,
     /// The OP JWKS endpoint the returned id-token is verified against.
@@ -330,6 +335,11 @@ pub fn start_login(
     // 16 CSPRNG bytes hex-encoded — unguessable, so a forged `state` cannot collide
     // with a live login (the CSRF binding the OP echoes back).
     let state = hex::encode(crate::session::random_bytes::<16>());
+    // 16 CSPRNG bytes hex-encoded — the OIDC `nonce`. It rides the authorize request and
+    // must come back inside the signed id-token's `nonce` claim (checked in
+    // `finish_callback`), binding the token to this browser login (replay/injection
+    // defense, `INV-20`).
+    let nonce = hex::encode(crate::session::random_bytes::<16>());
     // Request **offline access** (ADR 0077 session refresh): Google returns a refresh token on the
     // consent grant only with `access_type=offline`. `prompt=consent` (opt-in via env) forces the
     // consent screen so a refresh token is re-issued even for an already-granted account — the hub
@@ -344,11 +354,13 @@ pub fn start_login(
         redirect_uri,
         scope,
         &state,
+        &nonce,
         &pkce.challenge,
         &extra,
     );
     let pending = PendingAuth {
         verifier: pkce.verifier.into(),
+        nonce,
         token_endpoint: endpoints.token_endpoint,
         jwks_uri: endpoints.jwks_uri,
         issuer: sso.issuer.clone(),
@@ -411,9 +423,32 @@ pub fn finish_callback(
     let authority = idp
         .authenticate(&id_token)
         .ok_or(CallbackError::NotVerified)?;
+    // Bind the id-token to *this* browser login: its `nonce` claim must equal the one
+    // minted on the authorize leg and stashed in `pending`. `authenticate` already
+    // verified the signature, so the payload is authentic — reading `nonce` off it is
+    // safe. A missing or mismatched nonce is fail-closed (replay/injection, `INV-20`).
+    if id_token_nonce(&id_token).as_deref() != Some(pending.nonce.as_str()) {
+        return Err(CallbackError::NotVerified);
+    }
     // The refresh token (present only on an offline-access consent grant) rides back so the
     // callback can seal it for the session-refresh leg (ADR 0077).
     Ok((authority, id_token, refresh_token))
+}
+
+/// The `nonce` claim of an **already-verified** id-token (its signature and registered
+/// claims were checked via [`OidcIdentityProvider::authenticate`]), read straight off the
+/// payload segment for the login-session binding check in [`finish_callback`]. `None` if
+/// the token carries no readable `nonce`.
+fn id_token_nonce(id_token: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 // ---- enterprise-mode activation (wb.idp from the SSO connection) ---------
@@ -1768,6 +1803,24 @@ iqlTEKVISscuchxZtKQJ4k8=
         encode(&header, &claims, &key).expect("encode id-token")
     }
 
+    /// Mint an otherwise-valid id-token carrying a specific `nonce` claim — the callback
+    /// binds the token to its login by requiring this to match the stored pending nonce.
+    fn mint_id_token_with_nonce(nonce: &str) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_string());
+        let claims = json!({
+            "iss": ISSUER,
+            "aud": CLIENT_ID,
+            "sub": "alice@example.test",
+            "exp": now() + 3600,
+            "iat": now(),
+            "roles": ["admin"],
+            "nonce": nonce,
+        });
+        let key = EncodingKey::from_rsa_pem(RSA_PRIVATE_PEM).expect("test signing key");
+        encode(&header, &claims, &key).expect("encode id-token")
+    }
+
     fn jwks() -> String {
         format!(
             r#"{{"keys":[{{"kty":"RSA","use":"sig","kid":"{KID}","n":"{n}","e":"AQAB"}}]}}"#,
@@ -1836,6 +1889,7 @@ iqlTEKVISscuchxZtKQJ4k8=
     fn pending_auth() -> PendingAuth {
         PendingAuth {
             verifier: "v".into(),
+            nonce: "n".into(),
             token_endpoint: TOKEN_ENDPOINT.into(),
             jwks_uri: JWKS_URI.into(),
             issuer: ISSUER.into(),
@@ -2268,6 +2322,10 @@ iqlTEKVISscuchxZtKQJ4k8=
             url.contains(&format!("state={state}")),
             "the CSRF state is on the URL"
         );
+        assert!(
+            url.contains(&format!("nonce={}", pending.nonce)),
+            "the OIDC nonce is on the URL and stashed for the callback check"
+        );
         assert!(url.contains("scope=openid%20profile%20email"));
         // The verifier is kept server-side, never on the authorize URL.
         assert!(!url.contains(pending.verifier.expose()));
@@ -2315,10 +2373,9 @@ iqlTEKVISscuchxZtKQJ4k8=
 
     #[test]
     fn finish_callback_exchanges_then_verifies_the_id_token() {
-        let id_token = mint_id_token();
-        let op = mock_op(json!({ "id_token": id_token, "token_type": "Bearer" }).to_string());
-
-        // The pending state a prior login leg would have stashed.
+        // The pending state a prior login leg would have stashed — including the nonce it
+        // minted, which the returned id-token must echo.
+        let login_op = mock_op(String::new());
         let (_url, _state, pending) = start_login(
             &oidc_sso(),
             "http://localhost:1421/auth/callback",
@@ -2327,9 +2384,12 @@ iqlTEKVISscuchxZtKQJ4k8=
                 roles_claim: Some("roles".into()),
                 ..ClaimMapping::default()
             },
-            &op,
+            &login_op,
         )
         .unwrap();
+
+        let id_token = mint_id_token_with_nonce(&pending.nonce);
+        let op = mock_op(json!({ "id_token": id_token, "token_type": "Bearer" }).to_string());
 
         let (authority, returned, _refresh) =
             finish_callback(&pending, "auth-code-xyz", &op).expect("callback verifies");
@@ -2350,6 +2410,47 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(seen
             .iter()
             .any(|(k, v)| k == "code" && v == "auth-code-xyz"));
+    }
+
+    #[test]
+    fn callback_accepts_matching_nonce() {
+        // Happy path: the id-token's nonce equals the login's stored nonce → authenticates.
+        let login_op = mock_op(String::new());
+        let (_u, _s, pending) = start_login(
+            &oidc_sso(),
+            "http://x/cb",
+            "openid",
+            ClaimMapping::default(),
+            &login_op,
+        )
+        .unwrap();
+        let id_token = mint_id_token_with_nonce(&pending.nonce);
+        let op = mock_op(json!({ "id_token": id_token }).to_string());
+        let (authority, _returned, _refresh) =
+            finish_callback(&pending, "code", &op).expect("matching nonce authenticates");
+        assert_eq!(authority, AuthorityId::new("alice@example.test"));
+    }
+
+    #[test]
+    fn callback_rejects_mismatched_nonce() {
+        // A token whose nonce differs from the one bound to this login is rejected
+        // (replay/injection defense, `INV-20`), even though it is otherwise fully valid.
+        let login_op = mock_op(String::new());
+        let (_u, _s, pending) = start_login(
+            &oidc_sso(),
+            "http://x/cb",
+            "openid",
+            ClaimMapping::default(),
+            &login_op,
+        )
+        .unwrap();
+        let wrong = format!("not-{}", pending.nonce);
+        let id_token = mint_id_token_with_nonce(&wrong);
+        let op = mock_op(json!({ "id_token": id_token }).to_string());
+        assert!(matches!(
+            finish_callback(&pending, "code", &op),
+            Err(CallbackError::NotVerified)
+        ));
     }
 
     #[test]

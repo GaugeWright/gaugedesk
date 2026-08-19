@@ -494,21 +494,24 @@ pub fn s256_challenge(verifier: &str) -> String {
 /// Build the authorize-endpoint redirect URL for the auth-code + PKCE flow. The
 /// browser shell sends the user here; the OP redirects back to `redirect_uri` with a
 /// `code` the token exchange then redeems with the PKCE verifier.
+#[allow(clippy::too_many_arguments)] // one authorize-request builder; every OIDC param is load-bearing
 pub fn authorize_url(
     authorization_endpoint: &str,
     client_id: &str,
     redirect_uri: &str,
     scope: &str,
     state: &str,
+    nonce: &str,
     challenge: &str,
     extra_params: &str,
 ) -> String {
     format!(
-        "{authorization_endpoint}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256{extra_params}",
+        "{authorization_endpoint}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256{extra_params}",
         pct(client_id),
         pct(redirect_uri),
         pct(scope),
         pct(state),
+        pct(nonce),
         pct(challenge),
     )
 }
@@ -916,6 +919,7 @@ JHmZgYDG5oeiHH3XvE7+GU3ekV0tajXPJ4/hHX7Y3fHB/fLZDDBkB+2hdg==
             "https://app.example.com/cb",
             "openid email",
             "xyz",
+            "NONCE",
             "CHAL",
             "&access_type=offline",
         );
@@ -925,6 +929,23 @@ JHmZgYDG5oeiHH3XvE7+GU3ekV0tajXPJ4/hHX7Y3fHB/fLZDDBkB+2hdg==
         assert!(url.contains("scope=openid%20email")); // space encoded
         assert!(url.contains("redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb"));
         assert!(url.ends_with("&access_type=offline")); // extra params appended
+    }
+
+    #[test]
+    fn authorize_url_carries_nonce() {
+        // The nonce goes on the authorize request so the id-token can be bound back to
+        // this browser login (OIDC replay/injection defense).
+        let url = authorize_url(
+            "https://idp.example.com/authorize",
+            "client-1",
+            "https://app.example.com/cb",
+            "openid email",
+            "state-xyz",
+            "nonce-abc",
+            "CHAL",
+            "",
+        );
+        assert!(url.contains("nonce=nonce-abc"));
     }
 
     #[test]

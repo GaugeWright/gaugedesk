@@ -88,21 +88,44 @@ pub async fn security_headers(
     resp
 }
 
-/// The default CORS origin allowlist (FED-2): the Vite dev server, the built preview, and the
-/// Tauri webview — instead of permissive `*`. Extended by `GAUGEDESK_ALLOWED_ORIGINS`
-/// (comma-separated). Public Embeddable Panels enforce their deployment origin
-/// policy at the edge and do not use this private control-plane CORS layer.
+/// Whether this build seeds the localhost dev-server origins into the credentialed CORS
+/// allowlist: a `debug` build always, or a release build with an explicit
+/// `GAUGEDESK_DEV_ORIGINS` opt-in (local QA against a release binary). A production
+/// release carries neither, so `localhost:5173/4173` never ship in a credentialed
+/// allowlist. Pure so it is unit-testable; the caller passes `cfg!(debug_assertions)`
+/// and the env var.
+fn dev_origins_enabled(debug: bool, env: Option<String>) -> bool {
+    debug || env.is_some()
+}
+
+/// The default CORS origin allowlist (FED-2): the Tauri desktop webview always, plus the
+/// Vite dev server + built preview only in a dev build (or a release opting in via
+/// `GAUGEDESK_DEV_ORIGINS`) — instead of permissive `*`. Extended by
+/// `GAUGEDESK_ALLOWED_ORIGINS` (comma-separated), the path production hosted origins
+/// arrive on. Public Embeddable Panels enforce their deployment origin policy at the
+/// edge and do not use this private control-plane CORS layer.
 pub fn default_allowed_origins() -> Vec<String> {
+    // The real desktop production webview origins — always trusted (not dev convenience).
     const DEFAULT_ORIGINS: &[&str] = &[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
         // Tauri v2 webview origins (platform-dependent).
         "tauri://localhost",
         "http://tauri.localhost",
     ];
     let mut v: Vec<String> = DEFAULT_ORIGINS.iter().map(|s| s.to_string()).collect();
+    // The localhost dev-server origins are pure dev convenience; gate them out of a
+    // production release so it never carries localhost in a credentialed allowlist.
+    if dev_origins_enabled(cfg!(debug_assertions), gaugedesk_env::var("DEV_ORIGINS")) {
+        v.extend(
+            [
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+                "http://localhost:4173",
+                "http://127.0.0.1:4173",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+    }
     if let Some(extra) = gaugedesk_env::var("ALLOWED_ORIGINS") {
         for o in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             v.push(o.to_string());
@@ -370,6 +393,27 @@ mod tests {
 
     #[test]
     fn native_webview_origins_are_in_the_private_api_allowlist() {
+        let origins = default_allowed_origins();
+        assert!(origins.iter().any(|origin| origin == "tauri://localhost"));
+        assert!(origins
+            .iter()
+            .any(|origin| origin == "http://tauri.localhost"));
+    }
+
+    #[test]
+    fn dev_origins_gated_off_in_release_without_env() {
+        use super::dev_origins_enabled;
+        // A production release (no debug, no opt-in env) does not seed localhost.
+        assert!(!dev_origins_enabled(false, None));
+        // A debug build always does; a release build with the opt-in env does too.
+        assert!(dev_origins_enabled(true, None));
+        assert!(dev_origins_enabled(false, Some("1".to_string())));
+        assert!(dev_origins_enabled(true, Some("1".to_string())));
+    }
+
+    #[test]
+    fn default_origins_always_include_tauri() {
+        // The desktop webview origins are unconditional, regardless of the dev gate.
         let origins = default_allowed_origins();
         assert!(origins.iter().any(|origin| origin == "tauri://localhost"));
         assert!(origins

@@ -24,7 +24,10 @@ pub fn hub_login_fold() -> LoginFold {
 /// Extract the `email` claim from an **already-verified** id-token (the caller verified
 /// signature + claims via the shell's callback) — used only for JIT domain matching, so
 /// decoding the payload without re-checking the signature is safe here. `None` if the
-/// token has no readable `email`.
+/// token has no readable `email`, **or** if the IdP did not assert `email_verified:true`:
+/// JIT auto-join into a verified org domain must never trust an unverified address (a
+/// federated IdP could otherwise assert any in-domain email). Such users are instead
+/// invited or SCIM-provisioned (fail-closed, `INV-20`).
 fn email_claim(id_token: &str) -> Option<String> {
     use base64::Engine as _;
     let payload = id_token.split('.').nth(1)?;
@@ -32,6 +35,9 @@ fn email_claim(id_token: &str) -> Option<String> {
         .decode(payload)
         .ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if claims.get("email_verified").and_then(|v| v.as_bool()) != Some(true) {
+        return None; // unverified (or absent) ⇒ no JIT domain trust (fail-closed)
+    }
     claims
         .get("email")
         .and_then(|e| e.as_str())
@@ -106,8 +112,10 @@ mod tests {
             .append_record(ORG_SCOPE, "org", &serde_json::to_string(&org_rec).unwrap())
             .unwrap();
 
-        // Verified-domain subject → provisioned as an active member.
-        let tok = token_with_claims(&json!({ "sub": "sub-alice", "email": "alice@acme.com" }));
+        // Verified-domain subject with a verified email → provisioned as an active member.
+        let tok = token_with_claims(
+            &json!({ "sub": "sub-alice", "email": "alice@acme.com", "email_verified": true }),
+        );
         assert!(
             jit_provision(&mut wb, ORG_SCOPE, "sub-alice", &tok),
             "verified domain provisions"
@@ -130,5 +138,43 @@ mod tests {
         // No email claim → cannot match a verified domain → no provision.
         let anon = token_with_claims(&json!({ "sub": "sub-anon" }));
         assert!(!jit_provision(&mut wb, ORG_SCOPE, "sub-anon", &anon));
+    }
+
+    #[test]
+    fn jit_skips_unverified_email_claim() {
+        // A federated IdP that asserts an *unverified* email inside a verified org domain
+        // must not get the subject auto-joined — even though acme.com is a verified domain.
+        use gaugedesk_app::org::{OrgRecord, ORG_ID, ORG_SCOPE};
+        let store = gaugedesk_store::Store::open_in_memory().unwrap();
+        let mut wb = Workbench::new(store);
+        let org_rec = OrgRecord {
+            id: ORG_ID.to_string(),
+            op: RecordOp::Upsert,
+            display_name: "Acme".into(),
+            verified_domains: vec!["acme.com".into()],
+            default_region: None,
+            kind: Default::default(),
+        };
+        wb.store_mut()
+            .append_record(ORG_SCOPE, "org", &serde_json::to_string(&org_rec).unwrap())
+            .unwrap();
+
+        // email_verified:false ⇒ fail-closed, no provision, no role.
+        let unverified = token_with_claims(
+            &json!({ "sub": "sub-alice", "email": "alice@acme.com", "email_verified": false }),
+        );
+        assert!(!jit_provision(&mut wb, ORG_SCOPE, "sub-alice", &unverified));
+        assert!(Org::rebuild(wb.store_ref())
+            .unwrap()
+            .role_of("sub-alice")
+            .is_none());
+
+        // The claim absent entirely is treated the same (an IdP that omits it).
+        let absent = token_with_claims(&json!({ "sub": "sub-bob", "email": "bob@acme.com" }));
+        assert!(!jit_provision(&mut wb, ORG_SCOPE, "sub-bob", &absent));
+        assert!(Org::rebuild(wb.store_ref())
+            .unwrap()
+            .role_of("sub-bob")
+            .is_none());
     }
 }
