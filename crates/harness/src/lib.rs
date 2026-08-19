@@ -105,6 +105,13 @@ pub struct TurnOutcome {
     /// A narrow product-metering projection published by the governed runtime.
     /// `usage_ref` points back to the runtime-owned evidence body.
     pub managed_usage: Option<ModelUsage>,
+    /// The runtime's settled context-window reading: the final main model
+    /// call's prompt size, the same number its own compaction trigger reads.
+    /// A gauge, never a meter — `managed_usage` sums a turn's calls for
+    /// billing; this says how full the window was when the turn settled.
+    /// Present on any runtime that reports it, managed or BYOK; `None` where
+    /// the runtime published none.
+    pub context_reading: Option<ContextWindowReading>,
     pub error: Option<String>,
 }
 
@@ -115,6 +122,16 @@ pub struct ModelUsage {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+/// One settled context-window reading, carrying the model that read it so the
+/// window it is measured against is the window of the model that actually ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextWindowReading {
+    pub provider: String,
+    pub model: String,
+    /// The final main call's prompt tokens, as the provider counted them.
+    pub last_input_tokens: u64,
 }
 
 /// Adapter-neutral representation of a governed runtime event coordinate.

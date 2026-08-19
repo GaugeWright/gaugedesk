@@ -7618,6 +7618,13 @@
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"
+    },
+    {
+      "method": "GET",
+      "path": "/chats/{id}/context-usage",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
     }
   ],
   "nonProduct": [

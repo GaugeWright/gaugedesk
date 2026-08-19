@@ -520,6 +520,23 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         void Promise.allSettled([refetchRun(), refetchDiff(), refetchMerge(), refetchChatInfo()]);
     }
 
+    // The composer's context meter (the ring beside the mode selector): the
+    // chat's latest settled context-window reading, straight from the runtime's
+    // own compaction trigger. Keyed on the per-turn `status` signal so each
+    // settling turn refreshes it; `null` — no reporting turn yet — leaves the
+    // meter honestly absent rather than estimated. Not freshness-fed: a stale
+    // gauge for one turn is a glance-level surface, not run truth.
+    const [contextUsage] = createResource(
+        () => (selected() ? { id: selected()!, rev: status() } : undefined),
+        async ({ id }) => {
+            try {
+                return await api.getContextUsage(id);
+            } catch {
+                return null;
+            }
+        },
+    );
+
     // The selected chat's raw `.agent-config.json` — read so the composer model picker
     // (LLM-1, ADR 0062) can show the per-chat model and write a new one back without
     // clobbering the rest of the config. Not a freshness-fed projection (it is config,
@@ -1834,6 +1851,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     onForkWithDraft={selected() ? () => void forkWithDraft() : undefined}
                     defaultMode={defaultComposerMode()}
                     onSetDefaultMode={makeModeDefault}
+                    context={(() => {
+                        const usage = contextUsage();
+                        return usage && usage.window_tokens > 0
+                            ? { used: usage.used_tokens, limit: usage.window_tokens }
+                            : undefined;
+                    })()}
                 />
             </Show>
         </>

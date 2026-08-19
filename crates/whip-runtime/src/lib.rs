@@ -18,9 +18,9 @@ use gaugedesk_core::ids::{AuthorityId, PublicKey};
 use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
 use gaugedesk_harness::sandbox::Network;
 use gaugedesk_harness::{
-    CredentialCapability, CredentialProbe, EgressGate, Harness, HarnessContinuitySpec,
-    HarnessFactory, HarnessSpec, ImageContent, Observation, OutputFieldFlow, RuntimePosition,
-    ToolInfo, TurnOutcome,
+    ContextWindowReading, CredentialCapability, CredentialProbe, EgressGate, Harness,
+    HarnessContinuitySpec, HarnessFactory, HarnessSpec, ImageContent, Observation, OutputFieldFlow,
+    RuntimePosition, ToolInfo, TurnOutcome,
 };
 pub use whipplescript::gov::{
     external_signing_bytes, ExternalAttestation, GovernanceAttestationVerifier, SignedEnvelope,
@@ -757,10 +757,24 @@ impl Harness for WhipHarness {
         self.clear_cancellation();
         let execution = execution?;
         let evidence_pointers = execution.evidence_pointers();
+        // The runtime's settled context reading (its own compaction-trigger
+        // number), taken before the execution moves into the projection. The
+        // provider/model ride along so the reading is measured against the
+        // window of the model that actually produced it.
+        let context_tokens = execution
+            .usage
+            .as_ref()
+            .map(|usage| usage.last_input_tokens)
+            .filter(|tokens| *tokens > 0);
         let streamed = resources.streamed.get();
         let sink = resources.live.into_inner();
         let mut outcome =
             project_turn_execution(execution, evidence_pointers, &command, sink, !streamed)?;
+        outcome.context_reading = context_tokens.map(|last_input_tokens| ContextWindowReading {
+            provider: provider_wire_name(self.provider.provider).to_owned(),
+            model: self.provider.model.clone(),
+            last_input_tokens,
+        });
         outcome.asked_questions = resources.asked.into_inner();
         outcome.runtime_start_position = Some(RuntimePosition {
             instance_ref: runtime_start_position.instance_ref,
@@ -1277,6 +1291,21 @@ impl PackageResolver for StaticPackages {
         } else {
             Err("package version ref is outside the GaugeDesk migration set".to_owned())
         }
+    }
+}
+
+/// The provider's config-vocabulary name, the inverse of the `ProviderConfig`
+/// parse below — the same strings `.agent-config.json` carries, so a persisted
+/// reading names its provider in the one vocabulary the product speaks.
+fn provider_wire_name(provider: ModelProvider) -> &'static str {
+    match provider {
+        ModelProvider::OpenAi => "openai",
+        ModelProvider::OpenAiCompat => "openai-generic",
+        ModelProvider::Anthropic => "anthropic",
+        ModelProvider::Codex => "openai-codex",
+        // Not yet reachable from `.agent-config.json` (the xai rollout has not
+        // landed here); named ahead so the reading is right when it does.
+        ModelProvider::Xai => "xai",
     }
 }
 

@@ -25,8 +25,8 @@ pub mod protocol;
 /// The seam types live in `gaugedesk-harness` (SUB-0); re-exported here at
 /// their pre-extraction paths so existing callers keep compiling unchanged.
 pub use gaugedesk_harness::{
-    sandbox, AllowAllGate, EgressGate, GateDecision, Harness, ModelUsage, Observation,
-    RemoteHarness, ToolInfo, TurnOutcome,
+    sandbox, AllowAllGate, ContextWindowReading, EgressGate, GateDecision, Harness, ModelUsage,
+    Observation, RemoteHarness, ToolInfo, TurnOutcome,
 };
 use gaugedesk_harness::{
     ChatMode, CredentialProbe, HarnessContinuitySpec, HarnessFactory, HarnessSpec,

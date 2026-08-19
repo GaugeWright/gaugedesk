@@ -192,6 +192,14 @@ impl HarnessFactory for ScriptedFakeFactory {
 /// and a `bash` request for the membrane to allow/block/stage from real policy.
 fn fake_turn() -> ScriptedTurn {
     ScriptedTurn {
+        // A plausible mid-range reading so fixture desks render the composer's
+        // context meter the way a reporting runtime would.
+        context_reading: Some(gaugedesk_harness::ContextWindowReading {
+            provider: "anthropic".into(),
+            // A 200k-window model, so 96k reads as a visibly half-full ring.
+            model: "claude-haiku-4-5".into(),
+            last_input_tokens: 96_000,
+        }),
         assistant_text: "Wrote agent-note.txt.".into(),
         observations: vec![Observation {
             kind: "text",

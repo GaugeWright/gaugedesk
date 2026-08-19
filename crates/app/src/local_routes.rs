@@ -169,6 +169,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route("/chats/{id}/file", get(er::get_file).put(er::put_file))
         .route("/chats/{id}/merge-preview", post(er::post_merge_preview))
         .route("/chats/{id}/transcript", get(er::get_transcript))
+        .route("/chats/{id}/context-usage", get(er::get_context_usage))
         .route("/chats/{id}/audit", get(er::get_audit))
         .route("/chats/{id}/events", get(er::engagement_events))
         .route("/chats/{id}/task", post(er::post_task))

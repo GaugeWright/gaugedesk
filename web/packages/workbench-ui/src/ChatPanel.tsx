@@ -95,6 +95,9 @@ export interface ChatPanelProps {
      *  it. Omitted by hosts that do not persist a preference. */
     readonly defaultMode?: ComposerMode;
     readonly onSetDefaultMode?: (mode: ComposerMode) => void;
+    /** Context-window usage for the composer's meter. Hosts that cannot
+     *  measure it leave it undefined and the meter is honestly absent. */
+    readonly context?: ContextUsage;
 }
 
 export function SessionComposer(props: {
@@ -307,6 +310,7 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                 onFork={props.onForkWithDraft}
                 defaultMode={props.defaultMode}
                 onSetDefaultMode={props.onSetDefaultMode}
+                context={props.context}
             />
         </>
     );

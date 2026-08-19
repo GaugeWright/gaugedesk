@@ -34,6 +34,9 @@ pub struct ScriptedTurn {
     pub tool_calls: Vec<ScriptedToolCall>,
     pub runtime_start_position: Option<RuntimePosition>,
     pub runtime_terminal_position: Option<RuntimePosition>,
+    /// Scripted context-window reading, so fixture environments exercise the
+    /// composer's meter the way a reporting runtime would.
+    pub context_reading: Option<crate::ContextWindowReading>,
 }
 
 enum TurnScript {
@@ -101,6 +104,7 @@ fn project_neutral_turn(turn: ScriptedTurn, gate: &dyn EgressGate) -> TurnOutcom
         observations: turn.observations,
         runtime_start_position: turn.runtime_start_position,
         runtime_terminal_position: turn.runtime_terminal_position,
+        context_reading: turn.context_reading,
         ..TurnOutcome::default()
     };
     for call in turn.tool_calls {

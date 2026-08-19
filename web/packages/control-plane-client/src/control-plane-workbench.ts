@@ -1082,6 +1082,24 @@ export async function getTranscript(
     return (await transport.json("GET", `/chats/${id}/transcript`)) as StreamEvent[];
 }
 
+/** The chat's latest settled context-window reading (the composer's meter):
+ *  the runtime's own compaction-trigger number against the window of the model
+ *  that read it. `null` until a turn on a reporting runtime settles — the
+ *  meter is honestly absent rather than estimated. */
+export interface ChatContextUsage {
+    readonly used_tokens: number;
+    readonly window_tokens: number;
+    readonly provider: string;
+    readonly model: string;
+}
+
+export async function getContextUsage(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+): Promise<ChatContextUsage | null> {
+    return (await transport.json("GET", `/chats/${id}/context-usage`)) as ChatContextUsage | null;
+}
+
 export async function getTree(transport: WorkbenchTransport, id: EngagementId): Promise<FileEntry[]> {
     const o = (await transport.json("GET", `/chats/${id}/tree`)) as {
         files: { path: string; is_dir: boolean }[];

@@ -26,6 +26,7 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use whipplescript_kernel::coerce_native::CoerceProvider;
 
 #[cfg(debug_assertions)]
 use crate::build_workbench;
@@ -240,6 +241,42 @@ impl Workbench {
             }
         }
         serde_json::to_string(&rows).map_err(Into::into)
+    }
+
+    /// The chat's latest settled context-window reading (the composer's context
+    /// meter), paired with the window of the model that read it — the runtime's
+    /// own capability table, the same number its compaction trigger measures
+    /// against. `null` when no turn has reported one: an Environment that
+    /// cannot measure the window says so by showing nothing (ADR 0135's
+    /// honesty rule), never by estimating.
+    pub(crate) fn engagement_context_json(
+        &self,
+        id: &str,
+    ) -> Result<String, gaugedesk_store::AdmitError> {
+        let readings = self
+            .store_ref()
+            .records(id, crate::engine::CONTEXT_READING_KIND)?;
+        let Some(latest) = readings.last() else {
+            return Ok("null".to_owned());
+        };
+        let reading: gaugedesk_harness::ContextWindowReading = serde_json::from_str(latest)?;
+        let window = whipplescript_kernel::harness_model::model_context_window(
+            match reading.provider.as_str() {
+                "anthropic" => CoerceProvider::Anthropic,
+                "openai" | "openai-codex" => CoerceProvider::OpenAi,
+                // The conservative family default; the function keys Claude
+                // models off the model id regardless of this wire.
+                _ => CoerceProvider::OpenAiCompat,
+            },
+            &reading.model,
+        );
+        Ok(serde_json::json!({
+            "used_tokens": reading.last_input_tokens,
+            "window_tokens": window,
+            "provider": reading.provider,
+            "model": reading.model,
+        })
+        .to_string())
     }
 
     /// The engagement's governance audit records (ADR 0082 §4: every
@@ -826,6 +863,23 @@ pub(crate) async fn get_transcript(
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
     match wb.engagement_transcript_json(&id) {
+        Ok(body) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+/// The chat's context-window reading for the composer's meter. `null` until a
+/// turn on a reporting runtime settles.
+pub(crate) async fn get_context_usage(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    match wb.engagement_context_json(&id) {
         Ok(body) => (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             body,

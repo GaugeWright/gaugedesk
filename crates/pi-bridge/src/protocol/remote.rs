@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ModelUsage, Observation, ToolInfo, TurnOutcome};
+use crate::{ContextWindowReading, ModelUsage, Observation, ToolInfo, TurnOutcome};
 
 /// One turn handed to a remote harness — the request line the orchestrator sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +59,10 @@ pub struct WireTurnOutcome {
     pub runtime_evidence_pointers: Vec<String>,
     #[serde(default)]
     pub managed_usage: Option<ModelUsage>,
+    /// The settled context-window reading. Defaulted so a peer that predates
+    /// the gauge simply reports none.
+    #[serde(default)]
+    pub context_reading: Option<ContextWindowReading>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -103,6 +107,7 @@ impl From<&TurnOutcome> for WireTurnOutcome {
             pending_approvals: o.pending_approvals.clone(),
             runtime_evidence_pointers: o.runtime_evidence_pointers.clone(),
             managed_usage: o.managed_usage.clone(),
+            context_reading: o.context_reading.clone(),
             error: o.error.clone(),
         }
     }
@@ -126,6 +131,7 @@ impl From<&WireTurnOutcome> for TurnOutcome {
             runtime_start_position: None,
             runtime_terminal_position: None,
             managed_usage: w.managed_usage.clone(),
+            context_reading: w.context_reading.clone(),
             error: w.error.clone(),
         }
     }
@@ -230,6 +236,7 @@ mod tests {
             runtime_start_position: None,
             runtime_terminal_position: None,
             managed_usage: None,
+            context_reading: None,
             error: None,
         }
     }

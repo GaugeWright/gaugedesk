@@ -373,6 +373,12 @@ fn admit_turn_summary(
 
 pub(crate) const TURN_BOUNDARY_KIND: &str = "turn_boundary";
 
+/// One settled context-window reading per turn (the composer's context meter).
+/// Engagement-scoped only — this is a gauge of the chat's own window, never
+/// billing evidence, so it deliberately does not join the managed-usage
+/// dual-write to billing scopes. The latest record is the reading.
+pub(crate) const CONTEXT_READING_KIND: &str = "context_window_reading";
+
 /// Exact coordinates needed to fork either side of one completed turn.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TurnBoundaryRecord {
@@ -935,6 +941,10 @@ fn run_task_streaming_billed<G: EgressGate>(
             managed_billing_scope.unwrap_or(scope),
             usage,
         )?;
+    }
+    if let Some(reading) = &outcome.context_reading {
+        let payload = serde_json::to_string(reading).map_err(gaugedesk_store::AdmitError::Json)?;
+        store.append_record(scope, CONTEXT_READING_KIND, &payload)?;
     }
     if let (Some(reservation_id), Some(billing_scope)) =
         (&managed_reservation_id, managed_billing_scope)
@@ -3295,6 +3305,49 @@ mod tests {
         // the text delta and the mediated tool both reached the sink live
         assert!(streamed.contains(&"text".to_string()));
         assert!(streamed.contains(&"egress".to_string()));
+    }
+
+    #[test]
+    fn context_reading_is_recorded_in_the_engagement_scope_only() {
+        use gaugedesk_harness::testing::ScriptedHarness;
+
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("e1").unwrap();
+        let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
+        let mut harness = ScriptedHarness::new(vec![TurnOutcome {
+            assistant_text: "done".into(),
+            context_reading: Some(gaugedesk_harness::ContextWindowReading {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-5".into(),
+                last_input_tokens: 34_000,
+            }),
+            ..TurnOutcome::default()
+        }]);
+        let mut store = Store::open_in_memory().unwrap();
+        run_task_streaming(
+            &mut store,
+            "e1",
+            &eng,
+            &mut harness,
+            &gate,
+            "go",
+            &[],
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let readings = store.records("e1", CONTEXT_READING_KIND).unwrap();
+        assert_eq!(readings.len(), 1);
+        let reading: gaugedesk_harness::ContextWindowReading =
+            serde_json::from_str(&readings[0]).unwrap();
+        assert_eq!(reading.last_input_tokens, 34_000);
+        // A gauge of this chat's window, never billing evidence: nothing landed
+        // in the account scope.
+        assert!(store
+            .events(crate::account::ACCOUNT_SCOPE)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

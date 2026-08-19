@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gaugedesk_harness::{
-    EgressGate, Harness, HarnessContinuitySpec, HarnessSpec, ImageContent, InterruptHandle,
-    ModelUsage, Observation, OutputFieldFlow, RuntimePosition, ToolInfo, TurnOutcome,
+    ContextWindowReading, EgressGate, Harness, HarnessContinuitySpec, HarnessSpec, ImageContent,
+    InterruptHandle, ModelUsage, Observation, OutputFieldFlow, RuntimePosition, ToolInfo,
+    TurnOutcome,
 };
 use serde_json::{json, Value};
 
@@ -994,6 +995,18 @@ fn project_result_inner(
                 .and_then(Value::as_u64)
                 .ok_or_else(|| invalid_data("hosted usage observation omitted output_tokens"))?,
         });
+        // The settled context reading rides the same observation. Tolerant
+        // where the billing counts are strict: a runtime deployed before the
+        // gauge existed simply reports none.
+        outcome.context_reading = usage
+            .get("last_input_tokens")
+            .and_then(Value::as_u64)
+            .filter(|tokens| *tokens > 0)
+            .map(|last_input_tokens| ContextWindowReading {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+                last_input_tokens,
+            });
     }
     let status = result
         .get("run_status")

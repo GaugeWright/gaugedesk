@@ -228,21 +228,24 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bashkit"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9519f28a01c71fc6791a6a9d01b406b1e1c5854ca314cd3730ee5f1a4126d5e1"
+checksum = "ace171a860c49083fbb7dd7fe6ebda7c6535aa24cdcf396b9edd9c71c4dd1d37"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.23.1",
  "bigdecimal",
  "bitflags 2.13.1",
+ "bzip2",
  "chrono",
+ "chrono-tz",
  "clap",
  "fancy-regex",
  "flate2",
  "futures-util",
  "getrandom 0.4.3",
+ "gloo-timers",
  "hmac 0.13.0",
  "jaq-core",
  "jaq-json",
@@ -251,9 +254,11 @@ dependencies = [
  "num-traits",
  "os_display",
  "regex",
+ "send_wrapper",
  "serde",
  "serde_json",
- "sha1 0.11.0",
+ "serde_yaml_ng",
+ "sha1",
  "sha2 0.11.0",
  "thiserror",
  "tokio",
@@ -351,6 +356,15 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "bzip2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
+dependencies = [
+ "libbz2-rs-sys",
+]
 
 [[package]]
 name = "cast"
@@ -913,9 +927,9 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fancy-regex"
-version = "0.18.0"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
+checksum = "476de73bddf2ef8490aa4ee8f1cf40b430bf1d56c48c22080e5186952cd580e6"
 dependencies = [
  "bit-set",
  "regex-automata",
@@ -1347,6 +1361,18 @@ dependencies = [
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
  "wasm-bindgen",
 ]
 
@@ -1868,6 +1894,12 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
  "spin",
 ]
+
+[[package]]
+name = "libbz2-rs-sys"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
 
 [[package]]
 name = "libc"
@@ -2969,6 +3001,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
+name = "send_wrapper"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
+dependencies = [
+ "futures-core",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3035,6 +3076,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "serdect"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3042,17 +3096,6 @@ checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
 dependencies = [
  "base16ct 1.0.0",
  "serde",
-]
-
-[[package]]
-name = "sha1"
-version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
 ]
 
 [[package]]
@@ -3576,7 +3619,7 @@ dependencies = [
  "rand 0.10.2",
  "rustls",
  "rustls-pki-types",
- "sha1 0.11.0",
+ "sha1",
  "thiserror",
 ]
 
@@ -3615,6 +3658,12 @@ name = "unit-prefix"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
@@ -3879,9 +3928,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86f1306286bb709ec9322b826647398174ccc8714bef424a534945a480c5962b"
+checksum = "7d37ce46bf782e0b1051b56d46ffb420c831db253d61b0804db24ca2a2e0f59d"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3890,7 +3939,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "sha1 0.10.7",
+ "sha1",
  "sha2 0.11.0",
  "ureq",
  "url",
@@ -3903,9 +3952,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-core"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae7668d1f7ae7936d402ab952c7819d2856bbbacbe1c3d1b7d95585d9a21a9cd"
+checksum = "013b53eb3ad35eaf888ca37008bd4d80016ccce91c93b8899865023df01e7578"
 dependencies = [
  "serde",
  "serde_json",
@@ -3913,11 +3962,11 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-custody"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "915af5e44ed145a33fbbe3edce578e0148ef1eb2621b4d515d0168bfba6850f7"
+checksum = "5bb1b4ae3c849037c5a6eb9d57b3d397725eb7f5261e71e999daeb78e345d92e"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3925,9 +3974,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-kernel"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3143c543ace9a9c83c4e82eba760717fafd6913968a08a4a6215de993eebc0c8"
+checksum = "77817b57e07b1418fd682969a6113bbeefdf7d92bfc81b1e0cf24dbb81271af9"
 dependencies = [
  "bashkit",
  "chrono",
@@ -3945,9 +3994,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-parser"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e23bd277fdda799998468a26aa3aaead30459175ea3778c106e50b4c6b4e0c7"
+checksum = "f30d5da4a4da8935007e8cb1ee390cd556688c7d466a665e0ea0f1ba4512c005"
 dependencies = [
  "serde_json",
  "sha2 0.11.0",
@@ -3957,9 +4006,9 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-store"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c5e9abdf80c61c796f3d95bbd22369c17e5cce2cf8aaea94ce7875b6321d01f"
+checksum = "12f33ad640f3614ae9c1c176ca745a1846c158608365a142446b15a287138a8c"
 dependencies = [
  "rusqlite",
  "serde",
