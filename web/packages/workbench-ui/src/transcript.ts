@@ -100,7 +100,9 @@ export function reduce(t: Transcript, ev: StreamEvent): Transcript {
                 args: ev.args,
             };
             const text = `▸ ${ev.tool}${ev.target ? ` ${ev.target}` : ""}`;
-            const line: TranscriptLine = { seq, tier: "operational", kind: "tool", text, tool };
+            const line: TranscriptLine = {
+                seq, tier: "operational", kind: "tool", text, tool, origin: ev.origin,
+            };
             return { lines: [...t.lines, line], openText: null };
         }
         case "toolresult": {
@@ -125,17 +127,22 @@ export function reduce(t: Transcript, ev: StreamEvent): Transcript {
                 tier: "operational",
                 kind: "blocked",
                 text: `⨯ ${ev.tool}${ev.reason ? `: ${ev.reason}` : ""}`,
+                origin: ev.origin,
             };
             return { lines: [...t.lines, line], openText: null };
         }
         case "error": {
             // A failed turn's reason, shown as an admitted-tier line so it survives a
             // reload and reads as durable truth (run-chat.md "Message attachments").
-            const line: TranscriptLine = { seq, tier: "admitted", kind: "error", text: ev.reason, code: ev.code };
+            const line: TranscriptLine = {
+                seq, tier: "admitted", kind: "error", text: ev.reason, code: ev.code, origin: ev.origin,
+            };
             return { lines: [...t.lines, line], openText: null };
         }
         case "admitted": {
-            const line: TranscriptLine = { seq, tier: "admitted", kind: ev.kind, text: ev.text };
+            const line: TranscriptLine = {
+                seq, tier: "admitted", kind: ev.kind, text: ev.text, origin: ev.origin,
+            };
             return { lines: [...t.lines, line], openText: null };
         }
     }

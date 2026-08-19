@@ -347,16 +347,20 @@ export interface WorkspaceChange {
     readonly op: "upsert" | "tombstone";
 }
 
-/** An event from the control-plane stream that clients reduce into a transcript. */
+/** An event from the control-plane stream that clients reduce into a transcript.
+ *  `origin` (ADR 0141) marks a line inherited from a fork ancestor — the
+ *  transcript projection stamps it on every inherited durable record, whatever
+ *  its kind, so the client can place the fork-point seam correctly. Only `text`
+ *  lacks it: streamed deltas are operational-only and never inherited. */
 export type StreamEvent =
     | { type: "user"; text: string; entry_id?: number; forkable?: boolean; origin?: string }
     | { type: "assistant"; text: string; entry_id?: number; forkable?: boolean; origin?: string }
     | { type: "text"; delta: string }
-    | { type: "tool"; tool: string; mediated: boolean; call_id?: string; target?: string; args?: string }
-    | { type: "toolresult"; call_id: string; ok: boolean; result?: string }
-    | { type: "blocked"; tool: string; reason: string }
-    | { type: "error"; reason: string; code?: string }
-    | { type: "admitted"; kind: string; text: string };
+    | { type: "tool"; tool: string; mediated: boolean; call_id?: string; target?: string; args?: string; origin?: string }
+    | { type: "toolresult"; call_id: string; ok: boolean; result?: string; origin?: string }
+    | { type: "blocked"; tool: string; reason: string; origin?: string }
+    | { type: "error"; reason: string; code?: string; origin?: string }
+    | { type: "admitted"; kind: string; text: string; origin?: string };
 
 const WORKSPACE_RECORDS: readonly WorkspaceChange["record"][] = ["archetype", "project", "placement", "chat", "workstream", "work_target"];
 /** Narrow a raw event `record` to the closed {@link WorkspaceChange} set. */

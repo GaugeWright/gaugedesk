@@ -103,6 +103,26 @@ describe("transcript reduction", () => {
         expect(repaired).toEqual(live);
     });
 
+    it("carries an inherited line's origin on every durable kind, not only messages (ADR 0141)", () => {
+        // A fork's inherited prefix includes tool and lifecycle lines. If any of
+        // them drops `origin`, the fork-point seam renders at every kind change
+        // inside the inherited history instead of once at the real seam.
+        const parent = "chat-parent";
+        const events: StreamEvent[] = [
+            { type: "user", text: "do it", origin: parent },
+            { type: "tool", tool: "write", mediated: true, call_id: "c1", origin: parent },
+            { type: "toolresult", call_id: "c1", ok: true, origin: parent },
+            { type: "blocked", tool: "curl", reason: "no egress", origin: parent },
+            { type: "error", reason: "transport died", origin: parent },
+            { type: "assistant", text: "done", origin: parent },
+            { type: "admitted", kind: "run", text: "run → Completed", origin: parent },
+            { type: "user", text: "my own line" },
+        ];
+        const lines = fromSnapshot(events).lines;
+        expect(lines.slice(0, -1).every((line) => line.origin === parent)).toBe(true);
+        expect(lines[lines.length - 1].origin).toBeUndefined();
+    });
+
     it("keeps a pending user line across a lagging snapshot repair without duplicating admission", () => {
         const before = fromSnapshot([{ type: "user", text: "same words" }]);
 
