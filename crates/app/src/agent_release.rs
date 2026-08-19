@@ -1306,7 +1306,7 @@ impl Workbench {
         request: ProvisionPublicCredentialRequest,
     ) -> io::Result<serde_json::Value> {
         let edge = normalized_edge(&request.edge_origin)?;
-        if !matches!(request.provider.as_str(), "openai" | "anthropic")
+        if !matches!(request.provider.as_str(), "openai" | "anthropic" | "xai")
             || request.credential_class.is_empty()
             || request.api_key.trim().len() < 8
             || request.label.len() > 128

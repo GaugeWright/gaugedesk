@@ -692,10 +692,15 @@ pub fn metered_route(model: &str) -> MeteredRoute {
     MeteredRoute {
         base_url: format!("{base}/compat"),
         // A bare name is not addressable through unified billing. One that
-        // already carries a provider is left alone; a bare one is qualified with
-        // `openai`, the only other provider a public release admits today.
+        // already carries a provider is left alone; a bare one is qualified
+        // with the provider the model belongs to — `grok/` for a Grok model,
+        // else `openai/`. Unified billing routes the compat surface by this
+        // prefix, so `openai/grok-4.6` would ask for a model that does not
+        // exist (DR-0085).
         model: if model.contains('/') {
             model.to_owned()
+        } else if is_grok_model(model) {
+            format!("grok/{model}")
         } else {
             format!("openai/{model}")
         },
@@ -709,6 +714,13 @@ pub fn metered_route(model: &str) -> MeteredRoute {
 /// may declare its model either way.
 fn is_anthropic_model(model: &str) -> bool {
     model.starts_with("claude-")
+}
+
+/// Whether a bare model id names an xAI Grok model, so the compat surface
+/// qualifies it with `grok/` rather than `openai/` (DR-0085). The gateway
+/// addresses xAI as `grok/<model>` on its unified-billing compat surface.
+fn is_grok_model(model: &str) -> bool {
+    model.starts_with("grok-")
 }
 
 #[cfg(test)]
@@ -778,5 +790,20 @@ mod metered_rail {
         assert!(super::metered_route("gpt-4.1-mini")
             .base_url
             .ends_with("/compat"));
+    }
+
+    /// A bare Grok model is qualified with `grok/`, not `openai/` — the compat
+    /// surface routes by the prefix, so `openai/grok-4.6` would ask the gateway
+    /// for a model that does not exist (DR-0085).
+    #[test]
+    fn a_bare_grok_model_is_qualified_with_the_grok_prefix() {
+        let route = super::metered_route("grok-4.6");
+        assert_eq!(route.model, "grok/grok-4.6");
+        // Grok speaks the OpenAI-compatible wire, so it stays on the compat shim.
+        assert!(route.base_url.ends_with("/compat"), "{}", route.base_url);
+        // An explicitly qualified name is left alone (no double-qualifying).
+        assert_eq!(super::metered_route("grok/grok-4.6").model, "grok/grok-4.6");
+        // A Grok id is not mistaken for an Anthropic native-surface model.
+        assert!(!super::is_anthropic_model("grok-4.6"));
     }
 }
