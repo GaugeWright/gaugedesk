@@ -1610,7 +1610,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
 
     const contentPane = () => (
         <>
-            <h2>Content</h2>
             <Show when={selected()} keyed fallback={<div class="status">Open a chat, then pick a file to read it — and review changes — here.</div>}>
                 {(id) => (
                     <SessionProvider value={desktopEnvironment.openSession(id).session}>
@@ -2301,6 +2300,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             <Show when={!homeState.loading && !homeFailure() && homeState()?.kind !== "none"}>
                 <WorkbenchShell
                     state={workbenchShell}
+                    // The facet tabs and the chat's own header row are the panels'
+                    // top rows; a NAVIGATE/CHAT caption above them restated what the
+                    // row beneath already said. Admin keeps its titles — its nav has
+                    // no tabs, so "Administration" is the only thing naming the pane.
+                    headings={{ nav: false, chat: false }}
                     taskBar={() => (
                         <TaskBar
                             api={api}

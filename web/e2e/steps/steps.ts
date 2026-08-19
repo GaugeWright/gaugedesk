@@ -1284,9 +1284,15 @@ Then("the composer mode menu is closed", async ({ page }) => {
 Then("the composer is ready to send again", async ({ page }) => {
     await expect(page.getByTestId("send-msg")).toBeVisible();
 });
-// Panel header labels.
-Then("the run pane is labelled {string}", async ({ page }, label) => {
-    await expect(page.locator(".panel.run > .panel-heading")).toContainText(label);
+// Panel header rows (header consolidation): the browse and chat panes open
+// straight onto their working top rows — the facet tabs and the chat's own
+// header — with no caption row above them; only Files keeps a caption.
+Then("the browse pane opens with the facet tabs and no caption", async ({ page }) => {
+    await expect(page.locator(".panel.nav .panel-heading")).toHaveCount(0);
+    await expect(page.locator(".panel.nav .facets")).toBeVisible();
+});
+Then("the run pane has no caption row", async ({ page }) => {
+    await expect(page.locator(".panel.run > .panel-heading")).toHaveCount(0);
 });
 Then("the workspace pane is labelled {string}", async ({ page }, label) => {
     await expect(page.locator(".panel.workspace .panel-body > h2")).toContainText(label);

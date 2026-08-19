@@ -754,6 +754,12 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .panel.content .panel-body > h2,
 .panel.workspace .panel-body > h2 { padding-left: 22px; }
+/* The ordinary workbench's content pane opens with no caption row: its first row
+   is the viewer's tab strip (or the empty-state hint), so that row clears the
+   left-edge fold control instead. `:first-child` leaves environments that still
+   open the pane with an h2 (Admin) on the caption rule above. */
+.panel.content .panel-body > .viewer:first-child > .tabs { padding-left: 22px; }
+.panel.content .panel-body > .status:first-child { padding-left: 22px; }
 .panel-collapse:hover { color: var(--accent); background: var(--edge); }
 /* The chat lane folds like the others; its collapse chevron lives in its own header
    (.run is position:relative) and reuses .panel-collapse so it sits at the same top
