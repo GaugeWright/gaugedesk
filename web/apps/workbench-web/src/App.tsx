@@ -1610,8 +1610,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
 
     const contentPane = () => (
         <>
-            <h2>Content</h2>
-            <Show when={selected()} keyed fallback={<div class="status">Open a chat, then pick a file to read it — and review changes — here.</div>}>
+            {/* The CONTENT caption is the pane's empty-state placeholder: with a chat
+                open the viewer's own tab strip is the top row and restating "Content"
+                above it says nothing the tabs don't. Same doctrine as the chat pane's
+                caption below (headings on the shell). */}
+            <Show when={selected()} keyed fallback={<>
+                <h2>Content</h2>
+                <div class="status">Open a chat, then pick a file to read it — and review changes — here.</div>
+            </>}>
                 {(id) => (
                     <SessionProvider value={desktopEnvironment.openSession(id).session}>
                         {/* The review surface takes the pane rather than a fourth tab
@@ -2305,6 +2311,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             <Show when={!homeState.loading && !homeFailure() && homeState()?.kind !== "none"}>
                 <WorkbenchShell
                     state={workbenchShell}
+                    // Captions are empty-state placeholders, replaced by the working
+                    // rows once there is content: the chat's own header supplants CHAT
+                    // when a chat is open, and the facet tabs are always the nav's top
+                    // row so NAVIGATE never shows. The Admin Environment keeps shell
+                    // defaults — its navigator has no tabs, so its title carries.
+                    headings={{ nav: false, chat: !selected() }}
                     taskBar={() => (
                         <TaskBar
                             api={api}

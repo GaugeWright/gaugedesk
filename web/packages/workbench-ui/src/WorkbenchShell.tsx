@@ -267,7 +267,7 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
             >
                 <div class="nav-stack">
                     <div class="nav-scroll">
-                        <h2 class="panel-heading">{title("nav")}</h2>
+                        <Show when={showsHeading("nav")}><h2 class="panel-heading">{title("nav")}</h2></Show>
                         {props.nav()}
                     </div>
                     {props.navFooter?.()}

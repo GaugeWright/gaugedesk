@@ -1290,9 +1290,26 @@ Then("the composer mode menu is closed", async ({ page }) => {
 Then("the composer is ready to send again", async ({ page }) => {
     await expect(page.getByTestId("send-msg")).toBeVisible();
 });
-// Panel header labels.
+// Panel captions are empty-state placeholders: with no chat open the chat and
+// content panes carry their captions; opening a chat replaces them with the
+// working rows (the chat's own header, the viewer's tab strip). The nav never
+// captions — the facet tabs are always its top row. Files always captions.
+Then("the browse pane opens with the facet tabs and no caption", async ({ page }) => {
+    await expect(page.locator(".panel.nav .panel-heading")).toHaveCount(0);
+    await expect(page.locator(".panel.nav .facets")).toBeVisible();
+});
 Then("the run pane is labelled {string}", async ({ page }, label) => {
     await expect(page.locator(".panel.run > .panel-heading")).toContainText(label);
+});
+Then("the content pane is labelled {string}", async ({ page }, label) => {
+    await expect(page.locator(".panel.content .panel-body > h2")).toContainText(label);
+});
+Then("the run pane has no caption row", async ({ page }) => {
+    await expect(page.locator(".panel.run > .panel-heading")).toHaveCount(0);
+});
+Then("the content pane shows the viewer tabs in place of its caption", async ({ page }) => {
+    await expect(page.locator(".panel.content .panel-body > h2")).toHaveCount(0);
+    await expect(page.locator(".panel.content .tabs .tab").first()).toBeVisible();
 });
 Then("the workspace pane is labelled {string}", async ({ page }, label) => {
     await expect(page.locator(".panel.workspace .panel-body > h2")).toContainText(label);

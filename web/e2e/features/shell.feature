@@ -34,9 +34,15 @@ Feature: The workbench shell
     When I clear the facet search
     Then I see the archetype "Default"
 
-  Scenario: the panels are labelled Chat and Files
+  Scenario: captions are empty-state placeholders, replaced by the working rows
     Given the workbench is open
-    Then the run pane is labelled "Chat"
+    Then the browse pane opens with the facet tabs and no caption
+    And the run pane is labelled "Chat"
+    And the content pane is labelled "Content"
+    And the workspace pane is labelled "Files"
+    When I start a new chat in Personal
+    Then the run pane has no caption row
+    And the content pane shows the viewer tabs in place of its caption
     And the workspace pane is labelled "Files"
 
   Scenario: only Content and Files fold from their left edge

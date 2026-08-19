@@ -754,6 +754,10 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .panel.content .panel-body > h2,
 .panel.workspace .panel-body > h2 { padding-left: 22px; }
+/* With a chat open the content pane's caption yields to the viewer, so the tab
+   strip is the top row and clears the left-edge fold control itself. Scoped to
+   `:first-child` so a captioned pane (the empty state, Admin) keeps the rule above. */
+.panel.content .panel-body > .viewer:first-child > .tabs { padding-left: 22px; }
 .panel-collapse:hover { color: var(--accent); background: var(--edge); }
 /* The chat lane folds like the others; its collapse chevron lives in its own header
    (.run is position:relative) and reuses .panel-collapse so it sits at the same top
