@@ -483,22 +483,18 @@ jobs:
         # artifact must carry a valid Authenticode signature chaining to the
         # GaugeWright LLC Public Trust certificate, with an RFC 3161 timestamp
         # so the signature outlives the three-day signing certificate.
+        #
+        # Verified on what ships, not the build tree: Tauri patches the
+        # executable with bundle-type information, signs the patched copy it
+        # embeds in the MSI, and restores the original bytes afterwards — so
+        # target/release/gaugedesk.exe legitimately ends the build unsigned.
+        # The executable is therefore extracted from the MSI and verified
+        # there, beside the MSI's own signature.
         if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $executables = @(Get-ChildItem `
-            'src-tauri/target/release/gaugedesk.exe')
-          $installers = @(Get-ChildItem `
-            'src-tauri/target/release/bundle/msi/*.msi')
-          if ($executables.Count -ne 1) {
-            throw "expected exactly one Windows executable"
-          }
-          if ($installers.Count -ne 1) {
-            throw "expected exactly one Windows MSI"
-          }
-
-          foreach ($artifact in @($executables[0], $installers[0])) {
+          function Assert-GaugeWrightSignature([System.IO.FileInfo]$artifact) {
             if ($artifact.Length -eq 0) {
               throw "empty Windows artifact: $($artifact.FullName)"
             }
@@ -515,6 +511,26 @@ jobs:
             $digest = Get-FileHash -Algorithm SHA256 $artifact.FullName
             Write-Output "$($artifact.Name) signed by $($signature.SignerCertificate.Subject) SHA256 $($digest.Hash)"
           }
+
+          $installers = @(Get-ChildItem `
+            'src-tauri/target/release/bundle/msi/*.msi')
+          if ($installers.Count -ne 1) {
+            throw "expected exactly one Windows MSI"
+          }
+          Assert-GaugeWrightSignature $installers[0]
+
+          $image = Join-Path $env:RUNNER_TEMP 'msi-admin-image'
+          $extract = Start-Process msiexec -Wait -PassThru -ArgumentList `
+            '/a', "`"$($installers[0].FullName)`"", '/qn', "TARGETDIR=`"$image`""
+          if ($extract.ExitCode -ne 0) {
+            throw "msiexec administrative extraction failed with exit code $($extract.ExitCode)"
+          }
+          $executables = @(Get-ChildItem -Recurse $image -Filter 'gaugedesk.exe')
+          if ($executables.Count -ne 1) {
+            throw "expected exactly one gaugedesk.exe inside the MSI, found $($executables.Count)"
+          }
+          Assert-GaugeWrightSignature $executables[0]
+          Remove-Item -Recurse -Force $image
 
       - name: verify unsigned Windows package boundary
         if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED != 'true'
