@@ -253,8 +253,19 @@ jobs:
           AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # A freshly compiled PE, not a copy of a system binary: a Microsoft
+          # binary is already signed (and catalog-known), so the post-sign
+          # check would report Microsoft as signer no matter what this account
+          # signed. The Framework csc is present on every Windows runner.
+          $source = Join-Path $env:RUNNER_TEMP 'signing-probe.cs'
           $probe = Join-Path $env:RUNNER_TEMP 'signing-probe.exe'
-          Copy-Item "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" $probe
+          Set-Content $source 'class Probe { static void Main() {} }'
+          & "$env:SystemRoot/Microsoft.NET/Framework64/v4.0.30319/csc.exe" /nologo /out:$probe $source
+          if ($LASTEXITCODE -ne 0) { throw "csc failed with exit code $LASTEXITCODE" }
+          $unsigned = Get-AuthenticodeSignature $probe
+          if ($unsigned.Status -ne 'NotSigned') {
+            throw "probe should start unsigned, got $($unsigned.Status)"
+          }
           pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/sign-windows-artifact.ps1 $probe
           if ($LASTEXITCODE -ne 0) { throw "signing hook failed with exit code $LASTEXITCODE" }
           $signature = Get-AuthenticodeSignature $probe
@@ -265,7 +276,7 @@ jobs:
             throw "probe signed by unexpected subject: $($signature.SignerCertificate.Subject)"
           }
           Write-Output "probe signed by $($signature.SignerCertificate.Subject)"
-          Remove-Item $probe
+          Remove-Item $probe, $source
 
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
