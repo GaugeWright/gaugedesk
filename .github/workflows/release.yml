@@ -214,7 +214,7 @@ jobs:
           test "$profile_status" = "Active"
 
       - name: install Azure Artifact Signing hook
-        # The TrustedSigning module wraps signtool with the Azure dlib; the
+        # The ArtifactSigning module wraps signtool with the Azure dlib; the
         # pre-bundle hook (scripts/sign-windows-artifact.ps1) calls it once per
         # artifact. Version-pinned because PSGallery has no digest pinning.
         # The overlay is generated here rather than committed because the
@@ -224,7 +224,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Install-Module -Name TrustedSigning -RequiredVersion 0.5.8 -Force -Scope CurrentUser -Repository PSGallery
+          Install-Module -Name ArtifactSigning -RequiredVersion 0.1.17 -Force -Scope CurrentUser -Repository PSGallery
           $hook = Join-Path $env:GITHUB_WORKSPACE 'scripts/sign-windows-artifact.ps1'
           if (-not (Test-Path $hook)) { throw "signing hook missing: $hook" }
           $overlay = @{
