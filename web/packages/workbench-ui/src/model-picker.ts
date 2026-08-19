@@ -40,6 +40,10 @@ const ACCOUNT_SOURCES: Record<string, AccountSource> = {
     // the catalog under this same provider key; with none declared it contributes
     // nothing, and a model id may still be typed per chat (`providerTakesCustomModel`).
     "openai-generic": { pin: "openai-generic", primary: ["openai-generic"], secondary: [] },
+    // xAI is a fixed-host key provider with a shipped Grok catalog; its models
+    // carry no controllable reasoning effort on the Chat Completions wire, so
+    // their catalog rows declare `thinking: ["off"]`.
+    xai: { pin: "xai", primary: ["xai"], secondary: [] },
 };
 
 /** A friendly provider name for the `(provider)` disambiguator suffix. */
@@ -48,6 +52,7 @@ const PROVIDER_LABEL: Record<string, string> = {
     openai: "OpenAI",
     anthropic: "Anthropic",
     "openai-generic": "OpenAI-compatible",
+    xai: "xAI",
 };
 
 /** Providers whose model id is entered free-text rather than picked from the catalog

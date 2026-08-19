@@ -97,6 +97,7 @@ const PROVIDERS: SettingsModel["models"]["providers"] = [
     },
     { pin: "openai", label: "OpenAI", auth: "key" },
     { pin: "anthropic", label: "Anthropic", auth: "key" },
+    { pin: "xai", label: "xAI (Grok)", auth: "key" },
     { pin: "openai-generic", label: "OpenAI-compatible endpoint", auth: "endpoint" },
 ];
 

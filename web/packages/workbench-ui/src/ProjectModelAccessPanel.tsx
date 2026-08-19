@@ -14,7 +14,7 @@ import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import type { LinkedProvider } from "@gaugewright/control-plane-client";
 import { providerTakesCustomModel } from "./model-picker";
 
-const PROVIDERS = ["openai", "anthropic", "openai-generic"];
+const PROVIDERS = ["openai", "anthropic", "xai", "openai-generic"];
 
 export interface ProjectModelAccessApi {
     projectCredentials(project: string): Promise<LinkedProvider[]>;

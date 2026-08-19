@@ -639,5 +639,83 @@ export const MODEL_CATALOG: readonly CatalogModel[] = [
             "text",
             "image"
         ]
+    },
+    {
+        "provider": "xai",
+        "id": "grok-4.6",
+        "name": "Grok 4.6",
+        "reasoning": true,
+        "thinking": [
+            "off"
+        ],
+        "input": [
+            "text",
+            "image"
+        ]
+    },
+    {
+        "provider": "xai",
+        "id": "grok-4.5",
+        "name": "Grok 4.5",
+        "reasoning": true,
+        "thinking": [
+            "off"
+        ],
+        "input": [
+            "text",
+            "image"
+        ]
+    },
+    {
+        "provider": "xai",
+        "id": "grok-4.3",
+        "name": "Grok 4.3",
+        "reasoning": true,
+        "thinking": [
+            "off"
+        ],
+        "input": [
+            "text",
+            "image"
+        ]
+    },
+    {
+        "provider": "xai",
+        "id": "grok-4.20",
+        "name": "Grok 4.20",
+        "reasoning": true,
+        "thinking": [
+            "off"
+        ],
+        "input": [
+            "text",
+            "image"
+        ]
+    },
+    {
+        "provider": "xai",
+        "id": "grok-4.20-non-reasoning",
+        "name": "Grok 4.20 Non-reasoning",
+        "reasoning": false,
+        "thinking": [
+            "off"
+        ],
+        "input": [
+            "text",
+            "image"
+        ]
+    },
+    {
+        "provider": "xai",
+        "id": "grok-build-0.1",
+        "name": "Grok Build 0.1",
+        "reasoning": true,
+        "thinking": [
+            "off"
+        ],
+        "input": [
+            "text",
+            "image"
+        ]
     }
 ];

@@ -46,6 +46,7 @@ const INITIAL: SettingsModel = {
             { pin: "openai-codex", label: "OpenAI (Codex)", auth: "account", note: "also serves the OpenAI catalog" },
             { pin: "anthropic", label: "Anthropic", auth: "key" },
             { pin: "openai", label: "OpenAI", auth: "key" },
+            { pin: "xai", label: "xAI (Grok)", auth: "key" },
             { pin: "openai-generic", label: "OpenAI-compatible", auth: "endpoint" },
         ],
         // One per provider, because that is how the store keys them. The bench holds the

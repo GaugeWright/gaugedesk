@@ -1432,6 +1432,11 @@ pub fn native_provider_descriptor(
             "GAUGEDESK_CODEX_ACCESS_TOKEN",
             Some("gpt-5.5"),
         ),
+        // xAI's Grok API: a fixed-host OpenAI-compatible endpoint. The wire is
+        // the Chat Completions client (ADR 0083 §4), whose builder appends only
+        // `/chat/completions`, so the base URL must carry the `/v1` segment —
+        // unlike the rows above, whose clients append the full `/v1/...` path.
+        "xai" => ("https://api.x.ai/v1", "api.x.ai", "XAI_API_KEY", None),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1473,6 +1478,8 @@ impl ProviderConfig {
             // the Chat Completions API (ADR 0083), a distinct wire client from the
             // Responses-API `OpenAi` provider.
             "openai-generic" => ModelProvider::OpenAiCompat,
+            // xai is a fixed-host endpoint on the same Chat Completions wire.
+            "xai" => ModelProvider::OpenAiCompat,
             "anthropic" => ModelProvider::Anthropic,
             "openai-codex" => ModelProvider::Codex,
             _ => unreachable!("validated by native_provider_descriptor"),
@@ -2214,6 +2221,25 @@ mod tests {
             Some("http://api.together.xyz")
         )
         .is_err());
+    }
+
+    #[test]
+    fn xai_descriptor_carries_the_v1_base_and_requires_an_explicit_model() {
+        // Fixed host, but on the Chat Completions wire: the client appends only
+        // `/chat/completions`, so the base URL MUST already carry `/v1` or every
+        // turn 404s (the openai-generic lesson, live-confirmed 2026-07-19).
+        let desc =
+            native_provider_descriptor("xai", Some("grok-4.6"), None).expect("xai descriptor");
+        assert_eq!(desc.base_url, "https://api.x.ai/v1");
+        assert_eq!(desc.endpoint_host, "api.x.ai");
+        assert_eq!(desc.model, "grok-4.6");
+        // Like the other fixed-host API-key providers, the model is not defaulted.
+        assert!(native_provider_descriptor("xai", None, None).is_err());
+        // base_url is ignored for fixed-host providers rather than honored.
+        let pinned =
+            native_provider_descriptor("xai", Some("grok-4.6"), Some("https://evil.example"))
+                .expect("xai descriptor ignores base_url");
+        assert_eq!(pinned.base_url, "https://api.x.ai/v1");
     }
 
     #[test]

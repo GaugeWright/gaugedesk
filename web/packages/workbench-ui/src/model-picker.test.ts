@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CatalogModel } from "./model-catalog.generated";
+import { MODEL_CATALOG, type CatalogModel } from "./model-catalog.generated";
 import {
     defaultOption,
     defaultVisibleKeys,
@@ -150,6 +150,22 @@ describe("openai-generic custom model (ADR 0083)", () => {
         expect(opts.map((o) => o.label)).toEqual(["Default", "llama-3.3-70b"]);
         const pinned = opts.find((o) => o.provider === "openai-generic");
         expect(pinned).toMatchObject({ id: "llama-3.3-70b", provider: "openai-generic" });
+    });
+});
+
+describe("xai fixed-host provider", () => {
+    it("contributes its shipped Grok catalog when the account is linked", () => {
+        // ACCOUNT_SOURCES membership is what makes a linked account contribute
+        // models; a provider missing there fails QUIET (zero models, no error),
+        // so this is the drift guard.
+        const opts = modelOptions(["xai"], null, undefined, MODEL_CATALOG);
+        const grok = opts.filter((o) => o.provider === "xai");
+        expect(grok.map((o) => o.id)).toContain("grok-4.6");
+        expect(grok.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("is a catalog provider, not a free-text-model one", () => {
+        expect(providerTakesCustomModel("xai")).toBe(false);
     });
 });
 

@@ -548,6 +548,7 @@ fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
             &["api.openai.com", "chatgpt.com", "auth.openai.com"]
         }
         p if p.contains("anthropic") => &["api.anthropic.com"],
+        "xai" => &["api.x.ai"],
         p if p.contains("azure") => &["openai.azure.com"],
         // Unknown provider: default to the codex/OpenAI endpoints rather than
         // opening the network wide — a misconfigured provider fails closed-ish.
@@ -1473,6 +1474,11 @@ pub fn isolated_turn_descriptor(
             provider_descriptor.base_url.trim_end_matches('/')
         ),
         "openai-generic" => format!(
+            "{}/chat/completions",
+            provider_descriptor.base_url.trim_end_matches('/')
+        ),
+        // Same Chat Completions shape; the descriptor base already ends in /v1.
+        "xai" => format!(
             "{}/chat/completions",
             provider_descriptor.base_url.trim_end_matches('/')
         ),
