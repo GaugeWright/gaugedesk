@@ -184,7 +184,6 @@ jobs:
         env:
           SIGNING_RESOURCE_GROUP: ${{ vars.AZURE_ARTIFACT_SIGNING_RESOURCE_GROUP }}
           SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
-          SIGNING_SUBSCRIPTION_ID: ${{ vars.AZURE_ARTIFACT_SIGNING_SUBSCRIPTION_ID }}
           SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
         run: |
           set -euo pipefail
@@ -199,8 +198,16 @@ jobs:
           # The Public Trust profile must be Active, not merely provisioned:
           # an expired or suspended identity validation flips this status and
           # would otherwise surface as an opaque mid-bundle signing failure.
+          # Addressed as a child of the account rather than by a full resource
+          # id: this step runs under Git Bash on the Windows runner, whose MSYS
+          # path conversion rewrites a leading-slash id into a C:/Program
+          # Files/Git/... path before az ever sees it.
           profile_status="$(az resource show \
-            --ids "/subscriptions/$SIGNING_SUBSCRIPTION_ID/resourceGroups/$SIGNING_RESOURCE_GROUP/providers/Microsoft.CodeSigning/codeSigningAccounts/$SIGNING_ACCOUNT/certificateProfiles/$SIGNING_CERTIFICATE_PROFILE" \
+            --resource-group "$SIGNING_RESOURCE_GROUP" \
+            --namespace Microsoft.CodeSigning \
+            --parent "codeSigningAccounts/$SIGNING_ACCOUNT" \
+            --resource-type certificateProfiles \
+            --name "$SIGNING_CERTIFICATE_PROFILE" \
             --api-version 2025-10-13 \
             --query properties.status \
             --output tsv)"
