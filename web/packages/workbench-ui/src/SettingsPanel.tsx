@@ -16,11 +16,12 @@
  */
 
 import { createMemo, createResource, createSignal, onCleanup, type JSX } from "solid-js";
-import type {
-    AccountDevice,
-    AccountSignInMethod,
-    FederationPeer,
-    ManagedInferencePlan,
+import {
+    handoffCodeFromPaste,
+    type AccountDevice,
+    type AccountSignInMethod,
+    type FederationPeer,
+    type ManagedInferencePlan,
 } from "@gaugewright/control-plane-client";
 import {
     ADVANCEMENT_RULES_SETTING,
@@ -131,6 +132,12 @@ export interface SettingsPanelProps {
     /** Which room to land in. Whoever opened Settings usually knows what for — an
      *  in-chat "no model attached" refusal means Model access, not the first tab. */
     readonly initialRoom?: SettingsRoom;
+    /** How this runtime opens a URL in the person's browser, where `window.open`
+     *  cannot (the Tauri webview silently drops it — the desktop sign-in that
+     *  "did nothing", 2026-08-19). Resolves to whether a browser actually
+     *  opened, so the surface can lead with the link when none did. Absent →
+     *  `window.open`, which is right for every browser build. */
+    readonly openExternal?: (url: string) => Promise<boolean>;
 }
 
 export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
@@ -170,6 +177,15 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
     onCleanup(() => {
         disposed = true;
     });
+
+    /** Open a URL in the person's browser and say whether one actually opened.
+     *  Every external open goes through here so the desktop seam covers them
+     *  all — a `window.open` call left behind is exactly the silent no-op this
+     *  seam exists to end. */
+    const openExternally = async (url: string): Promise<boolean> => {
+        if (props.openExternal) return await props.openExternal(url).catch(() => false);
+        return window.open(url, "_blank", "noopener,noreferrer") !== null;
+    };
 
     /** Run a write, report it, and re-read. One wrapper so no action can quietly
      *  swallow its own failure — the pre-split panel repeated this at every call and
@@ -227,7 +243,7 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                 code: login.mode === "device" ? login.login.userCode : undefined,
                 url,
             });
-            window.open(url, "_blank", "noopener,noreferrer");
+            void openExternally(url);
         } catch (e) {
             setStatus(`could not start sign-in — ${e instanceof Error ? e.message : String(e)}`);
             return;
@@ -314,6 +330,13 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
     const librarySyncFacility = () =>
         (facilities() ?? []).find((f) => f.kind === "library_sync" && f.status === "active");
 
+    // A Hub sign-in that left for the browser and has not come back (LOGIN-7).
+    // Held here rather than inferred from the poll so the surface can keep
+    // offering the link and the manual return for as long as the person needs.
+    const [pendingHubSignIn, setPendingHubSignIn] = createSignal<
+        SettingsModel["account"]["hub"]["pending"]
+    >(null);
+
     const model = createMemo<SettingsModel>(() => ({
         status: status(),
         account: {
@@ -323,6 +346,7 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                 linked: Boolean(hubSession()?.linked),
                 person: hubSession()?.label ?? hubSession()?.person ?? undefined,
                 expired: Boolean(hubSession()?.expired),
+                pending: pendingHubSignIn(),
             },
             invitations: (invitations() ?? []).map((i) => ({
                 tenantId: i.tenantId,
@@ -386,6 +410,13 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
             accountAvailable={props.accountAvailable ?? true}
             actions={{
                 hubSignIn: () => void startHubSignIn(),
+                hubFinishSignIn: (pasted) => void finishHubSignIn(pasted),
+                hubDismissSignIn: () => {
+                    // Nothing to cancel server-side: the Hub-held verifier just
+                    // expires. Only the surface's own waiting state goes away.
+                    setPendingHubSignIn(null);
+                    setStatus("");
+                },
                 hubSignOut: () => void act("sign out", async () => {
                     await props.api.hubSessionSignOut?.();
                     return "signed out";
@@ -395,7 +426,7 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                     return `joined ${tenant.displayName} ✓`;
                 }),
                 openHub: props.hubUrl
-                    ? () => window.open(props.hubUrl!, "_blank", "noopener,noreferrer")
+                    ? () => void openExternally(props.hubUrl!)
                     : undefined,
 
                 signInToProvider: () => void startCodexSignIn(),
@@ -513,18 +544,45 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
             window.location.assign(started.url);
             return;
         }
-        window.open(started.url, "_blank", "noopener,noreferrer");
-        setStatus("finish signing in in your browser — this panel updates by itself");
+        // Whether a browser actually opened decides what the surface says: the
+        // desktop shell reports it honestly, where the old `window.open` claimed
+        // a browser the Tauri webview had silently dropped (2026-08-19).
+        const opened = await openExternally(started.url);
+        setPendingHubSignIn({ url: started.url, opened });
+        setStatus(opened
+            ? "finish signing in in your browser — this panel updates by itself"
+            : "no browser opened — copy the sign-in link below");
         // The deep-linked return lands in the control plane; poll until the session
-        // appears (bounded — the person may abandon the tab).
+        // appears (bounded — the person may abandon the tab). The pending block
+        // stays after the poll gives up: the link and the manual return are still
+        // the way through, on whatever clock the person is on.
         for (let attempt = 0; attempt < 60 && !disposed; attempt += 1) {
             await new Promise((resolve) => setTimeout(resolve, 2000));
             const current = await props.api.hubSessionStatus?.().catch(() => null);
             if (current?.linked) {
+                setPendingHubSignIn(null);
                 setStatus("signed in ✓");
                 refresh();
                 return;
             }
         }
+    }
+
+    /** The manual return (LOGIN-7): redeem a pasted `gaugewright://auth/callback…`
+     *  link — or its bare code — for machines whose OS never routes the scheme
+     *  back to the app (an unregistered handler, a dev build, another browser
+     *  profile). Same one-time code, same control-plane-held verifier. */
+    async function finishHubSignIn(pasted: string): Promise<void> {
+        const code = handoffCodeFromPaste(pasted);
+        if (!code) {
+            setStatus("that isn't the return link — it looks like gaugewright://auth/callback#code=…");
+            return;
+        }
+        await act("finish the sign-in", async () => {
+            const linked = await props.api.hubSessionCallback?.(code);
+            if (!linked?.linked) throw new Error("the code was not accepted — start the sign-in again");
+            setPendingHubSignIn(null);
+            return "signed in ✓";
+        });
     }
 }

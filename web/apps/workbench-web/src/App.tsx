@@ -47,6 +47,7 @@ import {
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
 import { desktopUpdateAllowed } from "./desktop-update";
+import { openExternal } from "./open-external";
 import "@gaugewright/gw-embed";
 import {
     AgentSettings,
@@ -1520,6 +1521,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 openInvite={inviteDeepLink}
                 onSignOut={signOutAccount}
                 environmentAction={props.environmentAction}
+                openExternal={openExternal}
             />
         </div>
         </div>
@@ -2319,7 +2321,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                         window.location.assign(url);
                                         return;
                                     }
-                                    window.open(url, "_blank", "noopener,noreferrer");
+                                    // Through the shell seam, not `window.open` — the
+                                    // Tauri webview drops the latter silently. Settings
+                                    // carries the copy-link/paste-return fallback.
+                                    void openExternal(url);
                                 })
                                 .catch(() => {});
                         },

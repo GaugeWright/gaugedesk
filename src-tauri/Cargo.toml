@@ -35,6 +35,10 @@ tauri-plugin-updater = "2"
 # Linux/Windows (must be registered first); macOS delivers to the running app natively.
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+# LOGIN-7: open http(s) URLs in the person's default browser. The webview drops
+# `window.open` silently, and ADR 0123 requires sign-in in the *system* browser
+# (an embedded webview is rejected there), so the shell owns the open.
+tauri-plugin-opener = "2"
 gaugedesk-app = { path = "../crates/app", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # `tauri::generate_context!()` expands to code that parses the bundled config via

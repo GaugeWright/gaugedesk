@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+    handoffCodeFromPaste,
     hubSessionCallback,
     hubSessionStart,
     hubSessionStatus,
@@ -26,6 +27,29 @@ describe("parseNativeHandoffCode", () => {
         expect(parseNativeHandoffCode("gaugewright://auth/callback#code=")).toBeNull();
         expect(parseNativeHandoffCode("https://auth.example.test/callback#code=x")).toBeNull();
         expect(parseNativeHandoffCode("")).toBeNull();
+    });
+});
+
+describe("handoffCodeFromPaste", () => {
+    it("reads the code out of a pasted return link", () => {
+        expect(handoffCodeFromPaste("gaugewright://auth/callback#code=abc123")).toBe("abc123");
+        expect(handoffCodeFromPaste("  gaugewright://auth/callback#code=abc123  ")).toBe("abc123");
+    });
+
+    it("accepts the bare code copied off the return page", () => {
+        expect(handoffCodeFromPaste("abc123")).toBe("abc123");
+        expect(handoffCodeFromPaste("  a-b_c.d~e  ")).toBe("a-b_c.d~e");
+    });
+
+    it("refuses pastes that are neither", () => {
+        expect(handoffCodeFromPaste("")).toBeNull();
+        expect(handoffCodeFromPaste("   ")).toBeNull();
+        // A gaugewright:// link that is not the sign-in return.
+        expect(handoffCodeFromPaste("gaugewright://invite#blob")).toBeNull();
+        // A link to anywhere else is a wrong paste, not a code.
+        expect(handoffCodeFromPaste("https://hub.example.test/auth/login")).toBeNull();
+        // Prose is not a code.
+        expect(handoffCodeFromPaste("the browser said it could not open it")).toBeNull();
     });
 });
 

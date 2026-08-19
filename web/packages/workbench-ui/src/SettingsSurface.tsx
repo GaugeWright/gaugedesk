@@ -45,6 +45,14 @@ export interface SettingsModel {
             readonly linked: boolean;
             readonly person?: string;
             readonly expired?: boolean;
+            /** A sign-in started and not yet returned (LOGIN-7). `url` is the Hub
+             *  login page; `opened` is whether the runtime managed to open a
+             *  browser at it — when it could not, the row leads with the link
+             *  instead of claiming a browser that never appeared. */
+            readonly pending?: {
+                readonly url: string;
+                readonly opened: boolean;
+            } | null;
         };
         readonly invitations: readonly {
             readonly tenantId: string;
@@ -159,6 +167,13 @@ export interface SettingsModel {
 
 export interface SettingsActions {
     readonly hubSignIn?: () => void;
+    /** The manual return (LOGIN-7): the pasted `gaugewright://auth/callback…`
+     *  link — or its bare code — from a browser whose OS never routed the
+     *  scheme back to the app. */
+    readonly hubFinishSignIn?: (pasted: string) => void;
+    /** Put the pending sign-in away without finishing it. The Hub-held
+     *  verifier simply expires; nothing needs cancelling server-side. */
+    readonly hubDismissSignIn?: () => void;
     readonly hubSignOut?: () => void;
     readonly acceptInvitation?: (tenantId: string) => void;
     readonly linkKey?: (input: { pin: string; token: string; endpoint?: string }) => void;
@@ -231,6 +246,10 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
         const flow = props.model.models.signIn;
         return flow?.mode === "device" && flow.code ? flow : null;
     };
+    // The manual sign-in return (LOGIN-7): what the person pasted back from the
+    // browser. Cleared when it is handed off, not when it fails to parse — a
+    // near-miss paste should stay visible to be corrected.
+    const [returnPaste, setReturnPaste] = createSignal("");
     const [autoKeep, setAutoKeep] = createSignal<string | null>(null);
     // `serializeAdvancementScopes` strips `**` — accepting it here would show a chip the
     // stored document never contains.
@@ -340,7 +359,7 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
                                 >
                                 <Show
                                     when={props.model.account.hub.linked}
-                                    fallback={
+                                    fallback={<>
                                         <div class="settings-row">
                                             <span class="settings-row-main">
                                                 <span class="settings-row-name">Not signed in</span>
@@ -354,7 +373,69 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
                                                 </button>
                                             </span>
                                         </div>
-                                    }
+                                        {/* A sign-in that left for the browser and has not come back
+                                            (LOGIN-7). Two ways it goes wrong, two visible ways out:
+                                            no browser opened → the link itself, to carry anywhere;
+                                            the return never arrived → paste it back by hand. */}
+                                        <Show when={props.model.account.hub.pending}>
+                                            {(pending) => (
+                                                <div class="settings-row-detail" data-hub-session-pending>
+                                                    <p class="muted">
+                                                        {pending().opened
+                                                            ? "Finish signing in in your browser — this panel updates by itself. If no browser opened, use this link:"
+                                                            : "A browser could not be opened. Copy this link into any browser to sign in:"}
+                                                    </p>
+                                                    <div class="admin-invite">
+                                                        <input
+                                                            data-hub-session-url
+                                                            readonly
+                                                            value={pending().url}
+                                                            onFocus={(e) => e.currentTarget.select()}
+                                                        />
+                                                        <button
+                                                            type="button"
+                                                            class="tree-action"
+                                                            data-hub-session-copy
+                                                            onClick={() => void navigator.clipboard?.writeText(pending().url).catch(() => {})}
+                                                        >copy</button>
+                                                    </div>
+                                                    <p class="muted">
+                                                        If the browser ends on a <code>gaugewright://…</code> link
+                                                        instead of returning here, paste that link (or its code):
+                                                    </p>
+                                                    <div class="admin-invite">
+                                                        <input
+                                                            data-hub-session-paste
+                                                            value={returnPaste()}
+                                                            onInput={(e) => setReturnPaste(e.currentTarget.value)}
+                                                            onKeyDown={(e) => {
+                                                                if (e.key !== "Enter" || !returnPaste().trim()) return;
+                                                                props.actions?.hubFinishSignIn?.(returnPaste());
+                                                                setReturnPaste("");
+                                                            }}
+                                                            placeholder="gaugewright://auth/callback#code=…"
+                                                        />
+                                                        <button
+                                                            type="button"
+                                                            class="tree-action"
+                                                            data-hub-session-finish
+                                                            disabled={!returnPaste().trim()}
+                                                            onClick={() => {
+                                                                props.actions?.hubFinishSignIn?.(returnPaste());
+                                                                setReturnPaste("");
+                                                            }}
+                                                        >finish sign-in</button>
+                                                        <button
+                                                            type="button"
+                                                            class="tree-action"
+                                                            data-hub-session-dismiss
+                                                            onClick={() => props.actions?.hubDismissSignIn?.()}
+                                                        >dismiss</button>
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </Show>
+                                    </>}
                                 >
                                     <div
                                         class="settings-row"

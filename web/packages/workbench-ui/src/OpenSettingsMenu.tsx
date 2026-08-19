@@ -89,6 +89,10 @@ export function SettingsMenu(props: {
     environmentAction?: SettingsEnvironmentAction;
     /** Authenticated org floor supplied only by an enrolled composition. */
     placementPolicy?: Accessor<PlacementPolicy | undefined>;
+    /** How this runtime opens a URL in the person's browser — the desktop shell's
+     *  seam, since its webview silently drops `window.open`. Passed through to
+     *  Settings; absent means `window.open` (right for browser builds). */
+    openExternal?: (url: string) => Promise<boolean>;
 }): JSX.Element {
     const [menuOpen, setMenuOpen] = createSignal(false);
     const [devicesOpen, setDevicesOpen] = createSignal(false);
@@ -258,6 +262,7 @@ export function SettingsMenu(props: {
                         accountAvailable={accountAvailable()}
                         initialRoom={settingsRoom()}
                         hubUrl={props.hubUrl}
+                        openExternal={props.openExternal}
                         // Enrolling a phone and pairing a separate party are multi-step
                         // handshakes the Devices modal owns; Settings lists their standing
                         // result and hands off rather than growing a second copy of them.

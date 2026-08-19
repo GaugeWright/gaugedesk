@@ -59,5 +59,10 @@ export interface AccountPanelApi {
      * `#code=…`, so the caller navigates the current tab instead of opening a
      * new one. Absent/false on the desktop deep-link path. */
     hubSessionStart?(): Promise<{ url: string; webReturn?: boolean }>;
+    /** Deliver the one-time return code by hand (LOGIN-7): the fallback for a
+     * machine whose OS never routes `gaugewright://` back — the person pastes
+     * the return link (or its code) into the panel instead. Same redemption as
+     * the deep-linked path; the control plane holds the verifier either way. */
+    hubSessionCallback?(code: string): Promise<HubSessionStatus>;
     hubSessionSignOut?(): Promise<void>;
 }

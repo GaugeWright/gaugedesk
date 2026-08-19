@@ -685,6 +685,22 @@ export function parseNativeHandoffCode(url: string): string | null {
     return code && code.trim() ? code.trim() : null;
 }
 
+/** Parse the one-time code out of whatever the person pasted back from their
+ *  browser (the manual return, LOGIN-7): the full
+ *  `gaugewright://auth/callback#code=…` link a browser without the scheme
+ *  handler showed instead of returning here, or the bare code copied off it.
+ *  `null` when the paste is neither — a link to some other place, prose, or
+ *  nothing. Pure, for tests. */
+export function handoffCodeFromPaste(pasted: string): string | null {
+    const text = pasted.trim();
+    if (!text) return null;
+    if (text.startsWith("gaugewright://")) return parseNativeHandoffCode(text);
+    // A bare code is one opaque token: no whitespace inside, and not a URL —
+    // a link to anywhere else is a wrong paste, not a code.
+    if (/\s/.test(text) || text.includes("://")) return null;
+    return text;
+}
+
 /** Parse the one-time code out of a dev web-return fragment (ADR 0140): the Hub
  *  redirected a *browser* dev client back to its own loopback origin with
  *  `#code=…` instead of the `gaugewright://` scheme. `null` when the fragment is

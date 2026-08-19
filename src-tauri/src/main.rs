@@ -18,9 +18,39 @@ fn restart_app(app: tauri::AppHandle) {
     app.restart();
 }
 
+/// Open a URL in the person's **default browser** (LOGIN-7). The webview drops
+/// `window.open` silently, and account sign-in must happen in the system
+/// browser — never an embedded webview (ADR 0123, rejected there because it is
+/// phishable and IdPs block it). Only web schemes: the webview must not be able
+/// to launch arbitrary local handlers through this seam.
+#[tauri::command]
+fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    external_open_allowed(&url)?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// Whether the shell will hand `url` to the OS default browser: exactly the web
+/// schemes, decided on a *parsed* URL rather than a string prefix, so anything
+/// that does not parse to an http(s) place is refused rather than guessed at.
+/// Pure in its input → unit-testable without a window.
+fn external_open_allowed(url: &str) -> Result<(), String> {
+    let parsed = tauri::Url::parse(url).map_err(|e| format!("not a URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(()),
+        other => Err(format!("refusing to open a {other}: URL in the browser")),
+    }
+}
+
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![restart_app])
+        .invoke_handler(tauri::generate_handler![restart_app, open_external])
+        // LOGIN-7: the system-browser opener behind `open_external`. Sign-in and
+        // "manage in the Hub" leave through it; the webview itself cannot open
+        // anything (its `window.open` is a silent no-op).
+        .plugin(tauri_plugin_opener::init())
         // FED-7: a `gaugewright://` invite link should reach the RUNNING app, not spawn a
         // duplicate. single-instance MUST be registered first; on Linux/Windows a deep link
         // launches a second instance whose argv carries the URL — focus the existing window and
@@ -218,9 +248,29 @@ fn deep_link_dispatch_script(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cp_launch_decision, deep_link_dispatch_script, deep_link_from_argv, local_cp_bind,
-        webview_org_cp_script,
+        cp_launch_decision, deep_link_dispatch_script, deep_link_from_argv,
+        external_open_allowed, local_cp_bind, webview_org_cp_script,
     };
+
+    #[test]
+    fn external_open_allows_exactly_the_web_schemes() {
+        // LOGIN-7: the sign-in URL and the Hub are web places; both forms pass.
+        assert!(external_open_allowed("https://hub.gaugewright.com/auth/login?k=v").is_ok());
+        assert!(external_open_allowed("http://localhost:7443/").is_ok());
+    }
+
+    #[test]
+    fn external_open_refuses_everything_that_is_not_a_web_url() {
+        // A local handler launch (file:, mailto:, a custom scheme) must not be
+        // reachable from the webview through this seam.
+        assert!(external_open_allowed("file:///etc/passwd").is_err());
+        assert!(external_open_allowed("mailto:a@b.c").is_err());
+        assert!(external_open_allowed("gaugewright://invite?d=ab").is_err());
+        // Not a URL at all — parsed, not prefix-matched.
+        assert!(external_open_allowed("//scheme-relative.example").is_err());
+        assert!(external_open_allowed("not a url").is_err());
+        assert!(external_open_allowed("").is_err());
+    }
 
     #[test]
     fn solo_spawns_the_co_resident_control_plane() {
