@@ -23,7 +23,8 @@ use gaugedesk_harness::{
     RuntimePosition, ToolInfo, TurnOutcome,
 };
 pub use whipplescript::gov::{
-    external_signing_bytes, ExternalAttestation, GovernanceAttestationVerifier, SignedEnvelope,
+    external_signing_bytes, external_signing_bytes_v2, ExternalAttestation,
+    GovernanceAttestationVerifier, SignedEnvelope,
 };
 pub use whipplescript::host_policy::{
     HostGovernancePolicy, PlacementPolicy as WhipplePlacementPolicy, ProviderBindingPolicy,
@@ -166,6 +167,41 @@ pub fn sign_policy_envelope(
         GAUGEDESK_ATTESTATION_ALGORITHM,
         public_key.as_str(),
         &hex::encode(signature.as_bytes()),
+    )
+    .map(|envelope| envelope.to_json())
+}
+
+/// Compile and sign a hosted WhippleScript governance envelope whose signature
+/// also binds the immutable policy epoch and the authority it speaks for.
+/// Hosted placements require this `:v2` form; the single-envelope local path
+/// continues to use [`sign_policy_envelope`].
+pub fn sign_hosted_policy_envelope(
+    config_text: &str,
+    signer: &AuthorityId,
+    key: &SigningKey,
+    epoch: u64,
+) -> Result<String, String> {
+    if epoch == 0 {
+        return Err("hosted governance policy epoch must be non-zero".to_owned());
+    }
+    let public_key = key.public_key();
+    let signing_bytes = external_signing_bytes_v2(
+        config_text,
+        signer.as_str(),
+        GAUGEDESK_ATTESTATION_ALGORITHM,
+        public_key.as_str(),
+        epoch,
+        signer.as_str(),
+    )?;
+    let signature = key.sign(&signing_bytes);
+    SignedEnvelope::from_external_signature_v2(
+        config_text,
+        signer.as_str(),
+        GAUGEDESK_ATTESTATION_ALGORITHM,
+        public_key.as_str(),
+        &hex::encode(signature.as_bytes()),
+        epoch,
+        signer.as_str(),
     )
     .map(|envelope| envelope.to_json())
 }

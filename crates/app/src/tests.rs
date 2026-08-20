@@ -1809,6 +1809,18 @@ fn published_agent_release_contains_the_runtime_closure_and_verifies_offline() {
         admitted.signer(),
         signed.payload.host_policy.expected_signer
     );
+    let envelope: serde_json::Value =
+        serde_json::from_str(&signed.payload.host_policy.signed_envelope).unwrap();
+    assert_eq!(
+        envelope["attestation"]["epoch"].as_u64(),
+        Some(signed.payload.host_policy.epoch),
+        "the hosted governance signature must bind the release policy epoch"
+    );
+    assert_eq!(
+        envelope["attestation"]["authority"].as_str(),
+        Some(signed.payload.host_policy.expected_signer.as_str()),
+        "the hosted governance signature must bind the authority it speaks for"
+    );
 }
 
 /// Seed the org's archetype-approval policy (`APPROVE-1`, ADR 0064) — the record the

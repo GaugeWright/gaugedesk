@@ -689,10 +689,12 @@ impl Workbench {
             )]),
             ..gaugedesk_whip_runtime::HostGovernancePolicy::default()
         };
-        let signed_host_policy = gaugedesk_whip_runtime::sign_policy_envelope(
+        const HOST_POLICY_EPOCH: u64 = 1;
+        let signed_host_policy = gaugedesk_whip_runtime::sign_hosted_policy_envelope(
             &host_policy.to_json().map_err(invalid)?,
             self.authority(),
             &signing_key,
+            HOST_POLICY_EPOCH,
         )
         .map_err(invalid)?;
         // Discipline assets under `workspace/` fork into each session's private
@@ -718,7 +720,7 @@ impl Workbench {
                 ]),
             },
             host_policy: HostPolicyClosure {
-                epoch: 1,
+                epoch: HOST_POLICY_EPOCH,
                 signed_envelope: signed_host_policy,
                 expected_signer: self.authority().as_str().to_owned(),
                 signer_public_key_hex: signing_key.public_key().as_str().to_owned(),
