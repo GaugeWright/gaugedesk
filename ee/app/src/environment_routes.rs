@@ -1268,7 +1268,7 @@ fn plan_command(
                 )
                     .into_response());
             };
-            if !wb.team_scope_ok(bearer(headers), existing.team.as_deref()) {
+            if !wb.team_scope_ok_in(bearer(headers), existing.team.as_deref(), &scope) {
                 return Err((
                     StatusCode::FORBIDDEN,
                     Json(json!({ "error": "outside your team scope" })),
@@ -1306,7 +1306,7 @@ fn plan_command(
                 )
                     .into_response());
             };
-            if !wb.team_scope_ok(bearer(headers), existing.team.as_deref()) {
+            if !wb.team_scope_ok_in(bearer(headers), existing.team.as_deref(), &scope) {
                 return Err((
                     StatusCode::FORBIDDEN,
                     Json(json!({ "error": "outside your team scope" })),

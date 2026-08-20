@@ -480,7 +480,11 @@ pub async fn post_member_role(
     let Some(existing) = org.members.get(&id) else {
         return (StatusCode::NOT_FOUND, "no such member").into_response();
     };
-    if !wb.team_scope_ok(bearer(&headers), existing.team.as_deref()) {
+    if !wb.team_scope_ok_in(
+        bearer(&headers),
+        existing.team.as_deref(),
+        &req_scope(&headers),
+    ) {
         return (StatusCode::FORBIDDEN, "outside your team scope").into_response();
     }
     // An org must always retain a break-glass owner: refuse demoting the last active
@@ -517,7 +521,11 @@ pub async fn post_member_deactivate(
     let Some(existing) = org.members.get(&id) else {
         return (StatusCode::NOT_FOUND, "no such member").into_response();
     };
-    if !wb.team_scope_ok(bearer(&headers), existing.team.as_deref()) {
+    if !wb.team_scope_ok_in(
+        bearer(&headers),
+        existing.team.as_deref(),
+        &req_scope(&headers),
+    ) {
         return (StatusCode::FORBIDDEN, "outside your team scope").into_response();
     }
     if existing.role == "owner"

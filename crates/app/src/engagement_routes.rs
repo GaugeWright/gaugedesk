@@ -781,7 +781,10 @@ pub(crate) async fn list_engagements(
     let wb = wb.lock_unpoisoned();
     // ENTSEC-2: a scoped member sees only chats in their granted projects (a no-op for
     // solo/owner); a chat outside a visible project is dropped, not just access-denied.
-    let vis = wb.project_visibility(crate::net_http::bearer(&headers));
+    let vis = wb.project_visibility_in(
+        crate::net_http::bearer(&headers),
+        &crate::workbench_auth::req_scope(&headers),
+    );
     let ids: Vec<_> = wb
         .engagement_ids()
         .into_iter()

@@ -55,7 +55,8 @@ pub fn deny(
     headers: &HeaderMap,
     cap: Option<gaugedesk_core::rbac::Capability>,
 ) -> Option<axum::response::Response> {
-    wb.authorize(net_http::bearer(headers), cap)
+    let scope = req_scope(headers);
+    wb.authorize_in(net_http::bearer(headers), cap, &scope)
         .err()
         .map(|(code, msg)| (code, msg).into_response())
 }
@@ -188,6 +189,23 @@ impl Workbench {
         bearer: Option<&str>,
         cap: Option<gaugedesk_core::rbac::Capability>,
     ) -> Result<(), (StatusCode, &'static str)> {
+        self.authorize_in(bearer, cap, org::ORG_SCOPE)
+    }
+
+    /// **RBAC-5 / DEPLOY-6**: [`authorize`](Self::authorize) against a specific tenant
+    /// scope. The admin gate must fold the *same* tenant directory the handler reads and
+    /// writes (resolved from `X-Gaugewright-Tenant` via [`req_scope`]); otherwise a
+    /// default-scope owner — or, under bootstrap-passthrough, an unseeded default scope —
+    /// would authorize actions against another tenant's data the gate never inspects
+    /// (cross-tenant authz bypass). [`authorize`] delegates here with the default
+    /// [`ORG_SCOPE`](org::ORG_SCOPE), so header-absent (desktop / single-tenant) callers
+    /// are byte-for-byte unchanged (`tenant_scope("") == ORG_SCOPE`).
+    pub fn authorize_in(
+        &self,
+        bearer: Option<&str>,
+        cap: Option<gaugedesk_core::rbac::Capability>,
+        org_scope: &str,
+    ) -> Result<(), (StatusCode, &'static str)> {
         let Some(idp) = &self.idp else {
             if self.hosted_home_mode() {
                 return Err((
@@ -197,7 +215,7 @@ impl Workbench {
             }
             return Ok(()); // single-user local: ungated
         };
-        let org = org::Org::rebuild(self.store_ref())
+        let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let provisioned = org
             .members
@@ -420,13 +438,25 @@ impl Workbench {
     /// would already have refused with `401`/`403`) resolves fail-closed to an empty set, so a
     /// projection can never leak project existence to someone the gate would reject.
     pub fn project_visibility(&self, bearer: Option<&str>) -> ProjectVisibility {
+        self.project_visibility_in(bearer, org::ORG_SCOPE)
+    }
+
+    /// [`project_visibility`](Self::project_visibility) against a specific tenant scope
+    /// (`DEPLOY-6`): the visibility set must be read from the same tenant directory the
+    /// projection lists. Delegated to by [`project_visibility`] with the default
+    /// [`ORG_SCOPE`](org::ORG_SCOPE).
+    pub fn project_visibility_in(
+        &self,
+        bearer: Option<&str>,
+        org_scope: &str,
+    ) -> ProjectVisibility {
         let Some(idp) = &self.idp else {
             if self.hosted_home_mode() {
                 return ProjectVisibility::Only(BTreeSet::new());
             }
             return ProjectVisibility::All; // solo / loopback: the operator's own channel
         };
-        let Ok(org) = org::Org::rebuild(self.store_ref()) else {
+        let Ok(org) = org::Org::rebuild_in(self.store_ref(), org_scope) else {
             return ProjectVisibility::Only(BTreeSet::new()); // directory unreadable: leak nothing
         };
         let provisioned = org
@@ -508,13 +538,25 @@ impl Workbench {
     /// Called *after* the capability gate, which already established the actor is an
     /// owner/admin.
     pub fn team_scope_ok(&self, bearer: Option<&str>, target_team: Option<&str>) -> bool {
+        self.team_scope_ok_in(bearer, target_team, org::ORG_SCOPE)
+    }
+
+    /// [`team_scope_ok`](Self::team_scope_ok) against a specific tenant scope (`DEPLOY-6`):
+    /// the team check must fold the same tenant directory the handler acts on. Delegated to
+    /// by [`team_scope_ok`] with the default [`ORG_SCOPE`](org::ORG_SCOPE).
+    pub fn team_scope_ok_in(
+        &self,
+        bearer: Option<&str>,
+        target_team: Option<&str>,
+        org_scope: &str,
+    ) -> bool {
         let Some(idp) = &self.idp else {
             return true; // single-user local: ungated
         };
         let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
             return false;
         };
-        let Ok(org) = org::Org::rebuild(self.store_ref()) else {
+        let Ok(org) = org::Org::rebuild_in(self.store_ref(), org_scope) else {
             return false;
         };
         match org.role_of(authority.as_str()) {
@@ -578,10 +620,22 @@ impl Workbench {
     /// rules (pii/region) are enforced by the resource-export protection path; this
     /// is the role-level gate the org policy adds on top.
     pub fn authorize_export(&self, bearer: Option<&str>) -> Result<(), (StatusCode, &'static str)> {
+        self.authorize_export_in(bearer, org::ORG_SCOPE)
+    }
+
+    /// [`authorize_export`](Self::authorize_export) against a specific tenant scope
+    /// (`DEPLOY-6`): the role gate must fold the same tenant directory the export runs
+    /// against. Delegated to by [`authorize_export`] with the default
+    /// [`ORG_SCOPE`](org::ORG_SCOPE).
+    pub fn authorize_export_in(
+        &self,
+        bearer: Option<&str>,
+        org_scope: &str,
+    ) -> Result<(), (StatusCode, &'static str)> {
         let Some(idp) = &self.idp else {
             return Ok(()); // single-user local: ungated
         };
-        let org = org::Org::rebuild(self.store_ref())
+        let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let provisioned = org
             .members
@@ -629,10 +683,24 @@ impl Workbench {
         engagement: &str,
         res_id: &gaugedesk_core::resource::ResourceId,
     ) -> Result<(), (StatusCode, &'static str)> {
+        self.authorize_resource_export_in(bearer, engagement, res_id, org::ORG_SCOPE)
+    }
+
+    /// [`authorize_resource_export`](Self::authorize_resource_export) against a specific
+    /// tenant scope (`DEPLOY-6`): the directory role composed with the resource attributes
+    /// must be read from the same tenant directory the export runs against. Delegated to by
+    /// [`authorize_resource_export`] with the default [`ORG_SCOPE`](org::ORG_SCOPE).
+    pub fn authorize_resource_export_in(
+        &self,
+        bearer: Option<&str>,
+        engagement: &str,
+        res_id: &gaugedesk_core::resource::ResourceId,
+        org_scope: &str,
+    ) -> Result<(), (StatusCode, &'static str)> {
         let Some(idp) = &self.idp else {
             return Ok(()); // single-user local / loopback: ungated
         };
-        let org = org::Org::rebuild(self.store_ref())
+        let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let provisioned = org
             .members
@@ -686,10 +754,24 @@ impl Workbench {
         engagement: &str,
         res_id: &gaugedesk_core::resource::ResourceId,
     ) -> Result<(), (StatusCode, &'static str)> {
+        self.authorize_resource_access_in(bearer, engagement, res_id, org::ORG_SCOPE)
+    }
+
+    /// [`authorize_resource_access`](Self::authorize_resource_access) against a specific
+    /// tenant scope (`DEPLOY-6`): the directory role composed with the resource attributes
+    /// must be read from the same tenant directory the grant runs against. Delegated to by
+    /// [`authorize_resource_access`] with the default [`ORG_SCOPE`](org::ORG_SCOPE).
+    pub fn authorize_resource_access_in(
+        &self,
+        bearer: Option<&str>,
+        engagement: &str,
+        res_id: &gaugedesk_core::resource::ResourceId,
+        org_scope: &str,
+    ) -> Result<(), (StatusCode, &'static str)> {
         let Some(idp) = &self.idp else {
             return Ok(()); // single-user local / loopback: ungated
         };
-        let org = org::Org::rebuild(self.store_ref())
+        let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let provisioned = org
             .members

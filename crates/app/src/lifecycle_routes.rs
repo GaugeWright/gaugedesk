@@ -304,7 +304,10 @@ pub(crate) async fn get_workspace_delta(
         }
     };
     let wb = wb.lock_unpoisoned();
-    let vis = wb.project_visibility(crate::net_http::bearer(&headers));
+    let vis = wb.project_visibility_in(
+        crate::net_http::bearer(&headers),
+        &crate::workbench_auth::req_scope(&headers),
+    );
     let workspace =
         library_routes::scope_workspace_value(&wb, library_routes::workspace_value(&wb), &vis);
     let Some(value) = library_routes::workspace_delta_value(&workspace, &record, &id) else {
@@ -366,7 +369,10 @@ pub(crate) async fn get_projection(
         if scope == library::LIBRARY_SCOPE && kind == "workspace" {
             // ENTSEC-2: the carriage serves the same nav projection as GET /workspace, so it is
             // scoped to the caller's visible projects too (a no-op for solo/owner).
-            let vis = wb.project_visibility(crate::net_http::bearer(&headers));
+            let vis = wb.project_visibility_in(
+                crate::net_http::bearer(&headers),
+                &crate::workbench_auth::req_scope(&headers),
+            );
             library_routes::scope_workspace_value(&wb, library_routes::workspace_value(&wb), &vis)
         } else {
             match wb.lifecycle_projection_value(&scope, &kind) {

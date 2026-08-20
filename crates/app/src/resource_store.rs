@@ -956,7 +956,12 @@ pub(crate) async fn post_resource_access_approve(
     // an unattested ceiling is refused access even where the consent reducer would allow it
     // (restrict-only, fail-closed). No-op in solo / no-policy.
     let bearer = net_http::bearer(&headers);
-    if let Err((code, msg)) = wb.authorize_resource_access(bearer, &id, &res_id) {
+    if let Err((code, msg)) = wb.authorize_resource_access_in(
+        bearer,
+        &id,
+        &res_id,
+        &crate::workbench_auth::req_scope(&headers),
+    ) {
         return (code, msg).into_response();
     }
     let approver = Authority::from(wb.actor(bearer));
@@ -991,8 +996,12 @@ pub(crate) async fn post_resource_export(
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
     let res_id = ResourceId::new(rid);
-    if let Err((code, msg)) = wb.authorize_resource_export(net_http::bearer(&headers), &id, &res_id)
-    {
+    if let Err((code, msg)) = wb.authorize_resource_export_in(
+        net_http::bearer(&headers),
+        &id,
+        &res_id,
+        &crate::workbench_auth::req_scope(&headers),
+    ) {
         return (code, msg).into_response();
     }
     match wb.admit_resource_export(&id, &res_id) {
@@ -1060,7 +1069,12 @@ pub(crate) async fn post_resource_export_command(
         Ok(None) => return (StatusCode::NOT_FOUND, "no such resource").into_response(),
         Err(error) => return err_response(error),
     };
-    if let Err((code, message)) = wb.authorize_resource_export(bearer, &id, &res_id) {
+    if let Err((code, message)) = wb.authorize_resource_export_in(
+        bearer,
+        &id,
+        &res_id,
+        &crate::workbench_auth::req_scope(&headers),
+    ) {
         return (code, message).into_response();
     }
     let actor = match wb.authenticate_identity(bearer) {
@@ -1258,9 +1272,12 @@ pub(crate) async fn post_resource_review(
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
     let res_id = ResourceId::new(rid);
-    if let Err((code, message)) =
-        wb.authorize_resource_export(net_http::bearer(&headers), &id, &res_id)
-    {
+    if let Err((code, message)) = wb.authorize_resource_export_in(
+        net_http::bearer(&headers),
+        &id,
+        &res_id,
+        &crate::workbench_auth::req_scope(&headers),
+    ) {
         return (code, message).into_response();
     }
     match wb.admit_resource_review(&id, &res_id) {
@@ -1326,7 +1343,12 @@ pub(crate) async fn post_resource_review_command(
         Ok(None) => return (StatusCode::NOT_FOUND, "no such resource").into_response(),
         Err(error) => return err_response(error),
     };
-    if let Err((code, message)) = wb.authorize_resource_export(bearer, &id, &res_id) {
+    if let Err((code, message)) = wb.authorize_resource_export_in(
+        bearer,
+        &id,
+        &res_id,
+        &crate::workbench_auth::req_scope(&headers),
+    ) {
         return (code, message).into_response();
     }
     let actor = match wb.authenticate_identity(bearer) {

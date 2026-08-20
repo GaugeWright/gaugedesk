@@ -60,7 +60,10 @@ pub async fn get_workspace(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    let vis = wb.project_visibility(crate::net_http::bearer(&headers));
+    let vis = wb.project_visibility_in(
+        crate::net_http::bearer(&headers),
+        &crate::workbench_auth::req_scope(&headers),
+    );
     Json(scope_workspace_value(&wb, workspace_value(&wb), &vis)).into_response()
 }
 

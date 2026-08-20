@@ -20,7 +20,7 @@ use gaugedesk_app::library::{
     PlacementTargetsRecord, ProjectRecord, RecordOp, TargetCapabilities, LIBRARY_SCOPE,
 };
 use gaugedesk_app::org::{
-    MembershipRecord, MembershipStatus, RecordOp as OrgRecordOp, ORG_ID, ORG_SCOPE,
+    tenant_scope, MembershipRecord, MembershipStatus, RecordOp as OrgRecordOp, ORG_ID, ORG_SCOPE,
 };
 use gaugedesk_app::{resource_store, Workbench};
 use gaugedesk_core::abac::AuthorityAttributes;
@@ -1241,4 +1241,146 @@ async fn itgov4_home_enforces_software_policy_and_preserves_recovery() {
         .as_str()
         .unwrap()
         .contains("2.0.0"));
+}
+
+/// Seed active members into an explicit tenant scope (F-2.3 multi-tenant harness).
+fn seed_members_in(store: &mut Store, scope: &str, members: &[(&str, &str, Option<&str>)]) {
+    for (authority, role, team) in members {
+        store
+            .append_record(
+                scope,
+                "membership",
+                &serde_json::to_string(&active_member(authority, role, *team)).unwrap(),
+            )
+            .unwrap();
+    }
+}
+
+/// An enterprise workbench whose default `org` scope and the named tenant `acme`
+/// hold independent directories — the fixture the F-2.3 tenant-scoped admin-gate
+/// test drives. Enrolls the default owner (`owner-token`) and acme's owner
+/// (`acme-owner-token`) in the IdP.
+fn tenant_workbench(
+    default_members: &[(&str, &str, Option<&str>)],
+    acme_members: &[(&str, &str, Option<&str>)],
+) -> (tempfile::TempDir, Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    seed_members_in(&mut store, ORG_SCOPE, default_members);
+    seed_members_in(&mut store, &tenant_scope("acme"), acme_members);
+    let idp = LoopbackIdentityProvider::new()
+        .enroll(
+            "owner-token",
+            AuthorityId::new("owner-auth"),
+            AuthorityAttributes::default(),
+        )
+        .enroll(
+            "acme-owner-token",
+            AuthorityId::new("acme-owner"),
+            AuthorityAttributes::default(),
+        );
+    let wb =
+        Workbench::with_target("inst-test", instance, store).with_identity_provider(Arc::new(idp));
+    (dir, enterprise_control_plane(Arc::new(Mutex::new(wb))))
+}
+
+async fn send_tenant(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    tenant: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut b = Request::builder().method(method).uri(uri);
+    if let Some(t) = token {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    if let Some(tenant) = tenant {
+        b = b.header("x-gaugewright-tenant", tenant);
+    }
+    let resp = app
+        .clone()
+        .oneshot(b.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// F-2.3 (SOC 2 CC6.1): the `/admin/*` capability gate must authorize against the
+/// **same** tenant directory the handler reads/writes (resolved from
+/// `X-Gaugewright-Tenant`), not the fixed default `org` scope. Before the fix,
+/// `deny` folded the default scope while `get_audit_log` served the header's
+/// tenant — so a default-scope owner (or, under bootstrap, an unseeded default
+/// scope) could reach another tenant's audit/member data.
+#[tokio::test]
+async fn admin_gate_is_tenant_scoped() {
+    // Case 1 — cross-tenant owner. The default scope and acme are both provisioned,
+    // with *different* owners. The default-scope owner is not an acme member.
+    let (_dir, app) = tenant_workbench(
+        &[("owner-auth", "owner", None)],
+        &[("acme-owner", "owner", None)],
+    );
+
+    // The default-scope owner, carrying acme's header, is refused — the gate now folds
+    // acme's directory, where they are not a member (was 200 reading acme's audit log).
+    let (s, body) = send_tenant(
+        &app,
+        "GET",
+        "/admin/audit",
+        Some("owner-token"),
+        Some("acme"),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "a default-scope owner must not administer tenant acme: {body}"
+    );
+
+    // Acme's own owner is admitted for acme (the gate and the handler agree on scope).
+    let (s, _) = send_tenant(
+        &app,
+        "GET",
+        "/admin/audit",
+        Some("acme-owner-token"),
+        Some("acme"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "acme's own owner administers acme");
+
+    // Back-compat: header-absent, the default-scope owner still administers the default
+    // tenant (tenant_scope("") == ORG_SCOPE), byte-for-byte unchanged.
+    let (s, _) = send_tenant(&app, "GET", "/admin/audit", Some("owner-token"), None).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the default-scope owner still administers the default tenant"
+    );
+
+    // Case 2 — bootstrap passthrough must not cross scopes. The default scope is
+    // UNPROVISIONED but acme IS provisioned. A request carrying acme's header must fold
+    // acme (provisioned ⇒ require authentication), not be waved through by the empty
+    // default scope's bootstrap passthrough.
+    let (_dir2, app2) = tenant_workbench(&[], &[("acme-owner", "owner", None)]);
+    let (s, body) = send_tenant(&app2, "GET", "/admin/audit", None, Some("acme")).await;
+    assert_eq!(
+        s,
+        StatusCode::UNAUTHORIZED,
+        "acme is provisioned: no bootstrap passthrough of the empty default scope: {body}"
+    );
+
+    // Sanity: the unprovisioned default tenant itself is still in bootstrap and open —
+    // the fix narrows the passthrough to the requested scope, it does not remove it.
+    let (s, _) = send_tenant(&app2, "GET", "/admin/audit", None, None).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the unprovisioned default tenant remains bootstrap-open"
+    );
 }
