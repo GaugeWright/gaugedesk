@@ -59,6 +59,16 @@ run_contracts() {
     echo "== updater endpoint =="
     node scripts/check-updater-endpoint.mjs
 
+    # The other bundle fact nothing else looks at. `generate_context!` requires
+    # only that an icon be RGBA, which a flattened matte satisfies, so an icon
+    # whose transparency has been baked out builds and ships clean and then
+    # draws a white box around the mark on every dark shell. It shipped that way
+    # twice, the second time in a commit whose entire subject was these files.
+    # It runs here rather than in `desktop` because reading a PNG needs none of
+    # what linking a Tauri shell needs.
+    echo "== app icons =="
+    node scripts/check-app-icons.mjs
+
     # The artifact side of the same manifest: what a built bundle says about the
     # contract it holds, and the canonical digest both this section and the
     # hosted surfaces compare (DR-0051). A test no section names is a test
