@@ -660,7 +660,24 @@ pub struct MeteredRoute {
     /// origin and path.
     pub base_url: String,
     pub model: String,
+    /// The request dialect this surface speaks, named as WhippleScript's
+    /// `ModelWire` names it.
+    ///
+    /// Travels with the surface because it is a fact about the surface, and
+    /// because the runtime had been left to recover it by inspecting the URL.
+    /// That reading had no arm for the provider-native OpenAI surface, so every
+    /// OpenAI model took the compat wire whether or not its family could carry
+    /// tools there — which is the failure this field exists to make impossible
+    /// to reintroduce silently.
+    pub wire: &'static str,
 }
+
+/// The wire names, as WhippleScript spells them (DR-0064). Kept as literals
+/// rather than imported because the pinned runtime crate need not yet know the
+/// concept for a publisher to declare it; the edge and the DO read the string.
+pub const WIRE_ANTHROPIC_MESSAGES: &str = "anthropic-messages";
+pub const WIRE_OPENAI_RESPONSES: &str = "openai-responses";
+pub const WIRE_OPENAI_CHAT_COMPAT: &str = "openai-chat-compat";
 
 /// Route a managed model through the gateway surface that fits it.
 ///
@@ -687,6 +704,21 @@ pub fn metered_route(model: &str) -> MeteredRoute {
             // takes carries no prefix. Sending `anthropic/claude-opus-5` there
             // asks for a model that does not exist.
             model: native.to_owned(),
+            wire: WIRE_ANTHROPIC_MESSAGES,
+        };
+    }
+    let openai_native = model.strip_prefix("openai/").unwrap_or(model);
+    if openai_requires_responses(openai_native) {
+        return MeteredRoute {
+            // Same reasoning as the Anthropic arm above: the provider-native
+            // surface, selected by path, taking an unprefixed name. Verified
+            // 2026-08-19 against `gaugewright-panels` — `…/openai/v1/responses`
+            // reaches OpenAI (it answers with its own authentication error),
+            // while an unknown path under `/openai` is refused by the gateway
+            // itself. The runtime appends `/v1/responses` to this base.
+            base_url: format!("{base}/openai"),
+            model: openai_native.to_owned(),
+            wire: WIRE_OPENAI_RESPONSES,
         };
     }
     MeteredRoute {
@@ -704,7 +736,59 @@ pub fn metered_route(model: &str) -> MeteredRoute {
         } else {
             format!("openai/{model}")
         },
+        wire: WIRE_OPENAI_CHAT_COMPAT,
     }
+}
+
+/// Whether an OpenAI model must be reached on the Responses API rather than the
+/// chat-completions shim.
+///
+/// The GPT-5.6 families answer a tool-carrying chat-completions request with a
+/// refusal — *"function tools with reasoning_effort are not supported … use
+/// /v1/responses"* — because a reasoning model applies an effort by default and
+/// that combination is Responses-only. There is no request this publisher can
+/// build that avoids it while keeping the agent's tools, so the surface is the
+/// thing that has to change.
+///
+/// Deliberately a family test rather than a catalogue lookup: the catalogue
+/// lives in the workbench UI and this decision is made where the release is
+/// built. It is also deliberately narrow — models that work on the shim today
+/// keep it, so this fix moves exactly the deployments that are broken.
+fn openai_requires_responses(model: &str) -> bool {
+    // `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.6-luna`, and whatever the next
+    // point release of that family is called.
+    model.starts_with("gpt-5.6")
+}
+
+/// Why this model cannot be served from this surface, if it cannot.
+///
+/// A publisher chooses a model and a surface at the same moment, and until now
+/// nothing compared them. The pairing that started this — a GPT-5.6 model on
+/// the compat shim — published without complaint and failed at a visitor's
+/// first message, as a 502 with the reason two systems away in a provider log.
+///
+/// The check is deliberately about the *pairing*, not about a list of blessed
+/// models: a model this publisher has never heard of routes to the shim and is
+/// allowed, because being unknown is not the same as being wrong.
+pub fn metered_pairing_error(base_url: &str, model: &str) -> Option<String> {
+    let surface = base_url.trim_end_matches('/');
+    let bare = model.trim();
+    let openai_native = bare.strip_prefix("openai/").unwrap_or(bare);
+    if openai_requires_responses(openai_native) && !surface.ends_with("/openai") {
+        return Some(format!(
+            "{openai_native} carries tools only on the OpenAI Responses API, and \
+             this deployment is admitted against {surface}. Publish it against \
+             the provider-native `/openai` surface instead."
+        ));
+    }
+    if is_anthropic_model(openai_native) && surface.ends_with("/compat") {
+        return Some(format!(
+            "{openai_native} is an Anthropic model admitted against the compat \
+             shim, which drops `cache_control`: every re-sent prefix would pay \
+             full price. Publish it against the `/anthropic` surface."
+        ));
+    }
+    None
 }
 
 /// Whether a bare model id names an Anthropic model.
@@ -755,6 +839,107 @@ mod metered_rail {
         let qualified = super::metered_route("anthropic/claude-opus-5");
         assert_eq!(qualified, route);
         assert_eq!(super::metered_route("  claude-opus-5 "), route);
+    }
+
+    /// The live failure of 2026-08-19, as a route.
+    ///
+    /// `gw-guide` was published on `gpt-5.6-terra` and every turn 502'd: the
+    /// release was admitted against `/compat`, the runtime sent the agent's five
+    /// file tools on chat completions, and OpenAI refused — that family carries
+    /// tools only on the Responses API. The surface is the thing that had to
+    /// change, because no request carrying the agent's tools would have been
+    /// accepted at the other one.
+    #[test]
+    fn a_gpt_5_6_model_routes_to_the_openai_native_surface_with_a_bare_name() {
+        let route = super::metered_route("gpt-5.6-terra");
+        // The runtime appends `/v1/responses` to this base. Verified live
+        // against the panels gateway: that path reaches OpenAI, and an unknown
+        // one under `/openai` is refused by the gateway itself.
+        assert!(route.base_url.ends_with("/openai"), "{}", route.base_url);
+        assert!(route.base_url.contains(super::METERED_GATEWAY_PANELS));
+        assert_eq!(route.model, "gpt-5.6-terra");
+        assert_eq!(route.wire, super::WIRE_OPENAI_RESPONSES);
+        // Declared either way, it reaches the same place: the path already
+        // selects the provider, so the native surface takes a bare name.
+        assert_eq!(super::metered_route("openai/gpt-5.6-terra"), route);
+
+        // The fix is narrow on purpose. A model that works on the shim today
+        // keeps it, so this moves only the deployments that are broken.
+        let compat = super::metered_route("gpt-5.5");
+        assert!(compat.base_url.ends_with("/compat"), "{}", compat.base_url);
+        assert_eq!(compat.model, "openai/gpt-5.5");
+        assert_eq!(compat.wire, super::WIRE_OPENAI_CHAT_COMPAT);
+    }
+
+    /// Every surface names the wire it speaks, so nothing downstream has to
+    /// recover it from the URL — which is how the wrong one was chosen.
+    #[test]
+    fn each_route_declares_the_wire_of_its_surface() {
+        assert_eq!(
+            super::metered_route("claude-opus-5").wire,
+            super::WIRE_ANTHROPIC_MESSAGES
+        );
+        assert_eq!(
+            super::metered_route("gpt-5.6-sol").wire,
+            super::WIRE_OPENAI_RESPONSES
+        );
+        assert_eq!(
+            super::metered_route("grok-4").wire,
+            super::WIRE_OPENAI_CHAT_COMPAT
+        );
+    }
+
+    /// The guard that should have caught this at the command line. Every arm
+    /// describes a pairing the runtime cannot serve well; an unrecognized model
+    /// is not one of them, because unknown is not the same as wrong.
+    #[test]
+    fn an_impossible_pairing_is_refused_and_an_unknown_model_is_not() {
+        let gateway = "https://gateway.ai.cloudflare.com/v1/acct/gaugewright-panels";
+        let compat = format!("{gateway}/compat");
+        // The exact pairing that reached a visitor.
+        let refusal = super::metered_pairing_error(&compat, "openai/gpt-5.6-terra")
+            .expect("a GPT-5.6 model on the shim must be refused");
+        assert!(refusal.contains("Responses"), "{refusal}");
+        assert!(refusal.contains("gpt-5.6-terra"), "{refusal}");
+        // And the same model on the surface it belongs to is fine.
+        assert_eq!(
+            super::metered_pairing_error(&format!("{gateway}/openai"), "gpt-5.6-terra"),
+            None
+        );
+        // An Anthropic model on the shim is a silent cost defect rather than a
+        // refusal from the provider, and is caught here for the same reason.
+        assert!(super::metered_pairing_error(&compat, "claude-opus-5").is_some());
+        // Models this publisher has never heard of keep the shim.
+        assert_eq!(
+            super::metered_pairing_error(&compat, "openai/gpt-5.5"),
+            None
+        );
+        assert_eq!(
+            super::metered_pairing_error(&compat, "openai/some-future-model"),
+            None
+        );
+    }
+
+    /// The routes this publisher builds must satisfy the guard it publishes
+    /// behind. If these ever disagree, one of them has drifted.
+    #[test]
+    fn every_route_this_publisher_builds_passes_its_own_guard() {
+        for model in [
+            "gpt-5.5",
+            "gpt-5.6-terra",
+            "openai/gpt-5.6-luna",
+            "claude-opus-5",
+            "anthropic/claude-sonnet-5",
+            "grok-4",
+            "some-future-model",
+        ] {
+            let route = super::metered_route(model);
+            assert_eq!(
+                super::metered_pairing_error(&route.base_url, &route.model),
+                None,
+                "{model} routed to a surface its own guard refuses"
+            );
+        }
     }
 
     #[test]

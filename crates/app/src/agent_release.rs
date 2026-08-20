@@ -851,6 +851,18 @@ impl Workbench {
                 "BYOK funding requires the owner credential reference",
             ));
         }
+        // A model and the surface it is admitted against are chosen together
+        // here, so this is where they are compared. Publishing an impossible
+        // pairing used to succeed and fail later, in front of a visitor, with
+        // the reason recorded two systems away.
+        if managed {
+            let route = crate::managed_inference::metered_route(&request.model);
+            if let Some(reason) =
+                crate::managed_inference::metered_pairing_error(&route.base_url, &route.model)
+            {
+                return Err(invalid(reason));
+            }
+        }
 
         let published_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
