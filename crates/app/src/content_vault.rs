@@ -34,14 +34,49 @@ use crate::workbench_state::Workbench;
 /// legacy/plaintext row (mixed logs and the pre-encryption history stay readable).
 const MARKER: &str = "gwenc:1:";
 
-/// The default content kind to encrypt: the durable conversation transcript.
-pub const DEFAULT_CONTENT_KINDS: &[&str] = &["transcript"];
+/// The content record kinds sealed at rest by default.
+///
+/// The set covers the durable conversation transcript plus every record kind that
+/// carries personal data an erasure request must be able to destroy (SOC 2 finding
+/// 2.6, authorized by DR-0086). `audit` is deliberately **excluded**: it lives on a
+/// separate store, is hash-chained for keyless external verification, and holds
+/// pseudonymous references rather than the PII erasure targets. Library/lifecycle
+/// metadata kinds (`chat`, `project`, `target`, `engagement`, …) are also left
+/// cleartext for a follow-on, so their titles are the remaining residual.
+pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
+    // The durable conversation transcript (the client's own words).
+    "transcript",
+    // Org-scope personal-data records (SOC 2 finding 2.6 / DR-0086).
+    "membership",
+    "org",
+    "billing",
+    "sso",
+    "scim_token",
+    "member_grant",
+    "group_mapping",
+    "policy",
+    "placement_policy",
+    "security",
+    "software_policy",
+    "archetype_approval",
+    // Account-scope personal-data records.
+    "setting",
+    "device",
+    "home",
+    "home_route",
+    "credential",
+];
 
 pub(crate) fn configured_content_vault(
     root: &Path,
     content_keywrap: impl Fn(&Path) -> std::io::Result<Box<dyn KeyWrap>>,
 ) -> std::io::Result<Option<Arc<ContentVault>>> {
-    if gaugedesk_env::var("ENCRYPT_CONTENT").as_deref() != Some("1") {
+    // Fail-closed posture (SOC 2 finding 2.6 / DR-0086): content encryption is ON by
+    // default so a deployment that forgets a flag still seals personal data at rest.
+    // It is disabled only by an explicit opt-out. The local KEK works with no config,
+    // so defaulting on is safe on the desktop path; the hosted path supplies its own
+    // keywrap closure and is likewise unaffected by the default.
+    if content_encryption_opted_out() {
         return Ok(None);
     }
     // KEK selection is creds-only: a hosted deployment sets GAUGEDESK_CONTENT_KEK_ID
@@ -50,6 +85,17 @@ pub(crate) fn configured_content_vault(
         root.join("content-keys"),
         content_keywrap(root)?,
     ))))
+}
+
+/// Whether an operator has explicitly opted out of at-rest content encryption.
+/// Any other value (including the flag being unset) keeps encryption on.
+fn content_encryption_opted_out() -> bool {
+    matches!(
+        gaugedesk_env::var("ENCRYPT_CONTENT")
+            .as_deref()
+            .map(str::trim),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
 }
 
 pub(crate) fn open_startup_store(
@@ -217,15 +263,101 @@ mod tests {
 
     #[test]
     fn non_content_kinds_pass_through() {
+        // `audit` is deliberately excluded from the sealed set (it verifies without
+        // keys), so it must round-trip untouched — cleartext in, cleartext out.
         let dir = tempfile::tempdir().unwrap();
         let v = vault(dir.path());
         assert_eq!(
-            v.encode("eng-1", "membership", "role=admin").unwrap(),
-            "role=admin"
+            v.encode("eng-1", "audit", "advanced by rule R7").unwrap(),
+            "advanced by rule R7"
         );
         assert_eq!(
-            v.decode("eng-1", "membership", "role=admin").as_deref(),
-            Some("role=admin")
+            v.decode("eng-1", "audit", "advanced by rule R7").as_deref(),
+            Some("advanced by rule R7")
+        );
+    }
+
+    #[test]
+    fn every_pii_kind_is_treated_as_content() {
+        // Guards SOC 2 finding 2.6 (DR-0086): the whole personal-data set is sealed.
+        let dir = tempfile::tempdir().unwrap();
+        let v = vault(dir.path());
+        for kind in [
+            "transcript",
+            "membership",
+            "org",
+            "billing",
+            "sso",
+            "scim_token",
+            "member_grant",
+            "group_mapping",
+            "policy",
+            "placement_policy",
+            "security",
+            "software_policy",
+            "archetype_approval",
+            "setting",
+            "device",
+            "home",
+            "home_route",
+            "credential",
+        ] {
+            assert!(v.is_content(kind), "{kind} must be sealed at rest");
+        }
+        // Excluded kinds stay cleartext.
+        for kind in ["audit", "chat", "project", "target", "engagement"] {
+            assert!(!v.is_content(kind), "{kind} must remain cleartext");
+        }
+    }
+
+    #[test]
+    fn membership_is_sealed_through_the_store_and_erasable_audit_stays_cleartext() {
+        // The full seam as the app runs it: a Store with the vault as its codec.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.db");
+        let db_path = db.to_str().unwrap();
+        let vault = Arc::new(vault(&dir.path().join("content-keys")));
+        let mut store = Store::open(db_path).unwrap().with_codec(vault.clone());
+
+        store
+            .append_record("org", "membership", "role=admin;email=alice@example.com")
+            .unwrap();
+        // (d) an excluded `audit` record is written cleartext.
+        store
+            .append_record("eng-1", "audit", "advanced by rule R7")
+            .unwrap();
+
+        // (a) the raw stored membership payload is ciphertext (MARKER-prefixed), not
+        //     the plaintext — read it back through a codec-less store to see the row.
+        let raw = Store::open(db_path).unwrap();
+        let stored_membership = raw.records("org", "membership").unwrap();
+        assert!(
+            stored_membership[0].starts_with(MARKER),
+            "membership is sealed at rest: {}",
+            stored_membership[0]
+        );
+        assert!(!stored_membership[0].contains("alice@example.com"));
+        // (d, cont.) the audit row is stored verbatim, no marker.
+        let stored_audit = raw.records("eng-1", "audit").unwrap();
+        assert_eq!(stored_audit, vec!["advanced by rule R7".to_string()]);
+
+        // (b) it round-trips: reading through the vault's decode seam yields plaintext.
+        assert_eq!(
+            store.records("org", "membership").unwrap(),
+            vec!["role=admin;email=alice@example.com".to_string()]
+        );
+
+        // (c) after crypto-erasing the scope, the record is unreadable — the decode
+        //     seam drops the now-unrecoverable row.
+        assert!(vault.crypto_erase("org"), "the scope key existed");
+        assert!(
+            store.records("org", "membership").unwrap().is_empty(),
+            "crypto-erased membership is gone from every reader"
+        );
+        // The audit row, on a different scope with no key, is untouched by erasure.
+        assert_eq!(
+            store.records("eng-1", "audit").unwrap(),
+            vec!["advanced by rule R7".to_string()]
         );
     }
 
