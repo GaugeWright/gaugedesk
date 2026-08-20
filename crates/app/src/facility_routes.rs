@@ -244,7 +244,11 @@ pub async fn delete_tenant(
         )
             .into_response();
     }
-    match crate::tenancy::delete_organization_in(wb.store_mut(), &actor, &account_scope, &id) {
+    // Deleting also crypto-erases the tenant scope's content (SOC 2 finding 4.5 /
+    // DR-0086): the command tombstones the org/membership/switcher records, then the
+    // tenant scope's per-scope content DEK is destroyed so those now-encrypted-at-rest
+    // records become permanently unrecoverable rather than merely tombstoned.
+    match wb.delete_organization_in(&actor, &account_scope, &id) {
         Ok(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(Refusal::NoSuchOrganization)) => {
             (StatusCode::NOT_FOUND, "no such organization").into_response()

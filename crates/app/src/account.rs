@@ -1174,6 +1174,52 @@ impl Workbench {
     pub fn account_tenancy(&self) -> Result<crate::tenancy::Tenancy, AdmitError> {
         self.account_tenancy_in(ACCOUNT_SCOPE)
     }
+
+    /// Delete one organization the caller owns and is alone in, then **crypto-erase**
+    /// its content (SOC 2 finding 4.5 / DR-0086).
+    ///
+    /// [`crate::tenancy::delete_organization_in`] tombstones the org, membership, and
+    /// switcher records but destroys no key, so every encrypted record under the
+    /// tenant scope (org/membership/billing/policy, sealed under the scope's per-scope
+    /// DEK since finding 2.6) stayed recoverable after a "delete". This tears that key
+    /// down so the tombstoned ciphertext becomes permanently unrecoverable.
+    ///
+    /// Org scopes are never forked, so erasure is immediate — there is no descendant
+    /// that could still reach the content, and no deferred sweep is involved. The
+    /// account-scope `tenant_ref` tombstone is written under a *different* scope and is
+    /// untouched, so the tenant still leaves the person's switcher.
+    ///
+    /// Erasure is idempotent and retryable: a second call finds no key left to destroy.
+    /// A `false` from the erase while content encryption is configured leaves the tenant
+    /// tombstoned but not yet erased, and is surfaced rather than swallowed.
+    pub fn delete_organization_in(
+        &mut self,
+        authority: &str,
+        account_scope: &str,
+        tenant_id: &str,
+    ) -> Result<
+        Result<crate::tenancy::TenantRef, crate::tenancy::DeleteOrganizationRefusal>,
+        AdmitError,
+    > {
+        let outcome = crate::tenancy::delete_organization_in(
+            self.store_mut(),
+            authority,
+            account_scope,
+            tenant_id,
+        )?;
+        if outcome.is_ok() {
+            let scope = crate::org::tenant_scope(tenant_id);
+            if !self.crypto_erase_content(&scope) && self.content_encryption_enabled() {
+                tracing::warn!(
+                    tenant = %tenant_id,
+                    scope = %scope,
+                    "tenant deleted but content crypto-erase destroyed no key; its \
+                     tombstoned records are not yet erased (erasure is idempotent/retryable)"
+                );
+            }
+        }
+        Ok(outcome)
+    }
 }
 
 #[derive(Clone)]

@@ -3691,6 +3691,83 @@ fn deleting_a_project_crypto_erases_its_chats_content() {
     );
 }
 
+/// SECAUD-6 (SOC 2 finding 4.5 / DR-0086): deleting an *organization/tenant* must
+/// crypto-erase the tenant scope's content, not merely tombstone it. Before the fix
+/// `delete_organization_in` tombstoned the org/membership/switcher records but
+/// destroyed no key, so the tenant scope's now-orphaned encrypted records (org,
+/// membership, billing, … — sealed under its per-scope DEK since finding 2.6) stayed
+/// recoverable after the "delete". Exercised through the same `Workbench` entry point
+/// the delete-tenant route calls, with content encryption enabled.
+#[test]
+fn deleting_an_organization_crypto_erases_its_tenant_scope_content() {
+    const ROOT: &str = "pubkey-owner";
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Arc::new(content_vault::ContentVault::new(
+        dir.path().join("ckeys"),
+        Box::new(at_rest::LoopbackKeyWrap::new([5u8; 32])),
+    ));
+    let store = Store::open_in_memory().unwrap().with_codec(vault.clone());
+    let mut wb = Workbench::new(store).with_content_vault(vault);
+
+    // A non-personal tenant the caller solely owns. `provision_organization` writes an
+    // encrypted `membership` (and `org`) record under the tenant scope and a plaintext
+    // `tenant_ref` switcher entry under the account scope.
+    let account_scope = crate::account::account_scope(ROOT);
+    let tenant = crate::tenancy::provision_organization(
+        wb.store_mut(),
+        ROOT,
+        &account_scope,
+        "Acme Studio",
+        None,
+    )
+    .unwrap();
+    let scope = crate::org::tenant_scope(&tenant.id);
+
+    assert!(
+        wb.content_encryption_enabled(),
+        "content encryption is configured for this test"
+    );
+    // The membership record is encrypted at rest and readable before the delete.
+    assert!(
+        !wb.store_ref()
+            .records(&scope, "membership")
+            .unwrap()
+            .is_empty(),
+        "an encrypted membership record exists under the tenant scope"
+    );
+
+    // Delete via the exact Workbench entry point the delete-tenant route calls.
+    let deleted = wb
+        .delete_organization_in(ROOT, &account_scope, &tenant.id)
+        .unwrap();
+    assert_eq!(deleted.unwrap().id, tenant.id);
+
+    // The tenant scope's content DEK is gone: a fresh erase finds no key left to
+    // destroy, proving the delete crypto-erased it.
+    assert!(
+        !wb.crypto_erase_content(&scope),
+        "the delete already crypto-erased the tenant scope's content"
+    );
+    // ...and the retained ciphertext is now unrecoverable — the encrypted membership
+    // record no longer decodes, so its reader drops it.
+    assert!(
+        wb.store_ref()
+            .records(&scope, "membership")
+            .unwrap()
+            .is_empty(),
+        "the deleted tenant's encrypted content is crypto-erased"
+    );
+
+    // The account-scope `tenant_ref` tombstone survived (a different scope, never
+    // erased), so the tenant has correctly left the person's switcher.
+    assert!(
+        !crate::tenancy::Tenancy::rebuild_in(wb.store_ref(), &account_scope)
+            .unwrap()
+            .contains(&tenant.id),
+        "the deleted tenant no longer appears in the account switcher"
+    );
+}
+
 /// ADR 0141: search folds each chat's *effective* log, so a fork is findable by
 /// the history it inherited, not only by what it appended itself.
 #[test]

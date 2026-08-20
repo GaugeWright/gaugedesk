@@ -365,6 +365,14 @@ impl Workbench {
             .unwrap_or(false)
     }
 
+    /// Whether content encryption is configured (a vault is present). Lets an
+    /// erasure caller tell a [`crypto_erase_content`](Self::crypto_erase_content)
+    /// that returned `false` because encryption is off (expected) from one that
+    /// found no key while encryption is on (worth surfacing).
+    pub fn content_encryption_enabled(&self) -> bool {
+        self.content_vault.is_some()
+    }
+
     /// Enable sensitive-read auditing (`SECAUD-4`): also record GET reads of
     /// project-scoped data to the org audit trail. Builder; off by default.
     pub fn with_audit_reads(mut self, on: bool) -> Self {
