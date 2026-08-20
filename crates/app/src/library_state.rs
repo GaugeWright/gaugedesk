@@ -2410,9 +2410,14 @@ impl Workbench {
             .iter()
             .map(|instance| instance.id.clone())
             .collect();
-        for instance_id in instance_ids {
-            self.destroy_instance(&instance_id);
+        for instance_id in &instance_ids {
+            self.destroy_instance(instance_id);
         }
+        // The hosting instances whose workspace blobs must be purged once the
+        // project's chats are gone. Placement handles survive `destroy_instance`
+        // (it removes only authoring targets), so they stay resolvable in
+        // `self.targets` for the purge below.
+        let mut affected: Vec<String> = instance_ids.clone();
         let target_ids = self
             .library
             .targets_for_project(id)
@@ -2428,6 +2433,11 @@ impl Workbench {
                 .map(|binding| binding.chat_id.clone())
                 .collect::<Vec<_>>();
             for chat_id in chats {
+                // Capture the host before teardown drops the index entry, so the
+                // per-instance workspace purge below can reach its blobs.
+                if let Some(inst) = self.engagement_index.get(&chat_id).cloned() {
+                    affected.push(inst);
+                }
                 self.destroy_chat(&chat_id);
             }
             self.targets.remove(&target_id);
@@ -2444,6 +2454,16 @@ impl Workbench {
             op: RecordOp::Tombstone,
             ..project
         });
+        // Match delete_chat_cascade (ADR 0141 / SECAUD-6): destroy the DEKs of
+        // now-unreachable deleted scopes and purge their workspace blobs, so a
+        // project delete erases its chats' content instead of leaving tombstones
+        // with the keys and ciphertext intact.
+        self.sweep_deferred_crypto_erasure();
+        for inst_id in affected {
+            if let Some(inst) = self.targets.get(&inst_id) {
+                let _ = inst.purge_unreachable_objects();
+            }
+        }
         true
     }
 

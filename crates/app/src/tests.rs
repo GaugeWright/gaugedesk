@@ -3608,6 +3608,89 @@ fn a_legacy_fork_edge_does_not_defer_its_ancestors_erasure() {
     );
 }
 
+/// SECAUD-6 / ADR 0141 regression (finding 4.6): deleting a *project* must
+/// crypto-erase the content of every chat it contained, exactly as deleting a
+/// single chat does. Before the fix `delete_project_cascade` only tombstoned
+/// records and never ran the deferred-erasure sweep, so each chat's DEK — and
+/// therefore its encrypted transcript — stayed recoverable after the project
+/// was "deleted".
+#[test]
+fn deleting_a_project_crypto_erases_its_chats_content() {
+    use crate::library::{
+        Admission, ChatRecord, InstanceKind, InstanceRecord, ProjectRecord, RecordOp,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Arc::new(content_vault::ContentVault::new(
+        dir.path().join("ckeys"),
+        Box::new(at_rest::LoopbackKeyWrap::new([3u8; 32])),
+    ));
+    let store = Store::open_in_memory().unwrap().with_codec(vault.clone());
+    let mut wb = Workbench::new(store).with_content_vault(vault);
+
+    // A project with a using-placement that hosts one work chat.
+    wb.write_project_record(ProjectRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        id: "proj-erase".into(),
+        op: RecordOp::Upsert,
+        name: "Acme".into(),
+        is_default: false,
+        home_id: gaugedesk_core::ids::HomeId::new("home:local-user"),
+        network_isolated: false,
+        run_purpose: None,
+        deployment_mode: None,
+    });
+    wb.write_instance_record(InstanceRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        id: "inst-erase".into(),
+        op: RecordOp::Upsert,
+        kind: InstanceKind::Using,
+        agent_id: "a1".into(),
+        project_id: Some("proj-erase".into()),
+        version: 1,
+        admission: Admission::Active,
+    });
+    wb.write_chat_record(ChatRecord {
+        schema: crate::library::LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        id: "chat-erase".into(),
+        op: RecordOp::Upsert,
+        instance_id: "inst-erase".into(),
+        title: "secret work".into(),
+        created_position: 1,
+        forked_from: None,
+        forked_from_entry: None,
+        forked_from_cut: None,
+    });
+    // Transcript content, encrypted at rest by the vault codec.
+    wb.store_mut()
+        .append_record("chat-erase", "transcript", r#"{"line":"private"}"#)
+        .unwrap();
+    assert_eq!(
+        wb.store_ref().records("chat-erase", "transcript").unwrap(),
+        vec![r#"{"line":"private"}"#],
+        "transcript is readable before the project delete"
+    );
+
+    assert!(wb.delete_project_cascade("proj-erase"));
+
+    // The cascade already destroyed the chat's DEK: a fresh erase finds no key
+    // left to destroy, proving the project delete crypto-erased it.
+    assert!(
+        !wb.crypto_erase_content("chat-erase"),
+        "delete_project_cascade already crypto-erased the chat's content"
+    );
+    // And the retained ciphertext is now unrecoverable.
+    assert!(
+        wb.store_ref()
+            .records("chat-erase", "transcript")
+            .unwrap()
+            .is_empty(),
+        "the deleted project's chat content is crypto-erased"
+    );
+}
+
 /// ADR 0141: search folds each chat's *effective* log, so a fork is findable by
 /// the history it inherited, not only by what it appended itself.
 #[test]
