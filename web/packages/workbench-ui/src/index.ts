@@ -187,6 +187,14 @@ export type {
     DeploymentPanelApi,
     DeploymentSelection,
 } from "./DeploymentPanel";
+export { DeploymentStudio } from "./DeploymentStudio";
+export type {
+    DeploymentAudience,
+    DeploymentFunding,
+    DeploymentPanelKind,
+    DeploymentStudioProps,
+    DeploymentStudioSelection,
+} from "./DeploymentStudio";
 export { SessionProvider, useSession, localTurnActivity, TURN_ACTIVITIES } from "./session-context";
 export type { Session, SessionApi, TurnActivity } from "./session-context";
 export { Shelf } from "./Shelf";

@@ -61,6 +61,7 @@
     "packages/workbench-ui/src/QueueSheet.tsx",
     "packages/workbench-ui/src/resource-catalog.ts",
     "packages/workbench-ui/src/DevicesModal.tsx",
+    "packages/workbench-ui/src/DeploymentStudio.tsx",
     "packages/workbench-ui/src/session-context.ts",
     "packages/workbench-ui/src/SettingsPanel.tsx",
     "packages/workbench-ui/src/SettingsSurface.tsx",
