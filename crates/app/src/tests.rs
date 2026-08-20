@@ -3768,6 +3768,207 @@ fn deleting_an_organization_crypto_erases_its_tenant_scope_content() {
     );
 }
 
+/// SOC 2 finding 4.4a / DR-0086: the Hub-side account self-erase refuses while the
+/// person still solely owns a non-personal organization. Erasing the account must
+/// not cascade-delete an organization out from under its billing or other members;
+/// the person winds it down through the tenant-delete path first. Nothing is erased
+/// on a refusal.
+#[test]
+fn erasing_an_account_is_refused_while_it_solely_owns_an_organization() {
+    use crate::account::AccountEraseRefusal;
+    const ROOT: &str = "pubkey-erase-owner";
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Arc::new(content_vault::ContentVault::new(
+        dir.path().join("ckeys"),
+        Box::new(at_rest::LoopbackKeyWrap::new([6u8; 32])),
+    ));
+    let store = Store::open_in_memory().unwrap().with_codec(vault.clone());
+    let mut wb = Workbench::new(store).with_content_vault(vault);
+
+    let account_scope = crate::account::account_scope(ROOT);
+    // A non-personal organization the caller solely, actively owns.
+    let tenant = crate::tenancy::provision_organization(
+        wb.store_mut(),
+        ROOT,
+        &account_scope,
+        "Acme Studio",
+        None,
+    )
+    .unwrap();
+    let scope = crate::org::tenant_scope(&tenant.id);
+
+    let refusal = wb
+        .erase_account_in(ROOT, &account_scope)
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        refusal,
+        AccountEraseRefusal::OwnsOrganizations(vec![tenant.id.clone()]),
+    );
+
+    // Nothing was erased: the organization's encrypted content still decodes and the
+    // owner is still an active owner. Its content DEK is intact, so a fresh erase of
+    // that scope would still find a key.
+    assert!(
+        !wb.store_ref()
+            .records(&scope, "membership")
+            .unwrap()
+            .is_empty(),
+        "the refused erase left the organization's membership content in place"
+    );
+    assert_eq!(
+        crate::org::Org::rebuild_in(wb.store_ref(), &scope)
+            .unwrap()
+            .member_by_authority(ROOT)
+            .unwrap()
+            .status,
+        crate::org::MembershipStatus::Active,
+    );
+    // The switcher still lists it, and the account scope's content key still exists.
+    assert!(
+        crate::tenancy::Tenancy::rebuild_in(wb.store_ref(), &account_scope)
+            .unwrap()
+            .contains(&tenant.id)
+    );
+}
+
+/// SOC 2 finding 4.4a / DR-0086: on success the self-erase crypto-erases the
+/// person's own account scope and their personal tenant scope, and deprovisions
+/// their membership in an organization they merely belong to — without erasing that
+/// organization's own scope, which belongs to the tenant and its other members.
+#[test]
+fn erasing_an_account_crypto_erases_own_scopes_and_deprovisions_memberships() {
+    use crate::org::{MembershipRecord, MembershipStatus, RecordOp};
+    const ROOT: &str = "pubkey-erase-self";
+    const OTHER_OWNER: &str = "pubkey-erase-colleague";
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Arc::new(content_vault::ContentVault::new(
+        dir.path().join("ckeys"),
+        Box::new(at_rest::LoopbackKeyWrap::new([7u8; 32])),
+    ));
+    let store = Store::open_in_memory().unwrap().with_codec(vault.clone());
+    let mut wb = Workbench::new(store).with_content_vault(vault);
+
+    let account_scope = crate::account::account_scope(ROOT);
+
+    // An encrypted account-scope setting proves the account scope is crypto-erased.
+    wb.store_mut()
+        .append_record(
+            &account_scope,
+            "setting",
+            &serde_json::to_string(&crate::account::SettingRecord {
+                id: "theme".into(),
+                op: RecordOp::Upsert,
+                value: "dark".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+    // The person's own personal tenant-of-one (its org + owner membership are
+    // encrypted under its scope).
+    let personal_id =
+        crate::tenancy::provision_personal_tenant(wb.store_mut(), ROOT, "Personal").unwrap();
+    let personal_scope = crate::org::tenant_scope(&personal_id);
+
+    // An organization owned by someone else, that the person merely belongs to as a
+    // non-owner member.
+    let other_account_scope = crate::account::account_scope(OTHER_OWNER);
+    let other = crate::tenancy::provision_organization(
+        wb.store_mut(),
+        OTHER_OWNER,
+        &other_account_scope,
+        "Colleague Org",
+        None,
+    )
+    .unwrap();
+    let other_scope = crate::org::tenant_scope(&other.id);
+    wb.store_mut()
+        .append_record(
+            &other_scope,
+            "membership",
+            &serde_json::to_string(&MembershipRecord {
+                id: ROOT.into(),
+                op: RecordOp::Upsert,
+                org_id: other.id.clone(),
+                authority: ROOT.into(),
+                email: String::new(),
+                role: "member".into(),
+                status: MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    // Index that organization in the person's switcher.
+    wb.store_mut()
+        .append_record(
+            &account_scope,
+            crate::tenancy::TENANT_REF_KIND,
+            &serde_json::to_string(&crate::tenancy::TenantRef {
+                id: other.id.clone(),
+                op: RecordOp::Upsert,
+                display_name: "Colleague Org".into(),
+                role: "member".into(),
+                personal: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+    // Erase succeeds.
+    wb.erase_account_in(ROOT, &account_scope).unwrap().unwrap();
+
+    // (i) The account scope's content is crypto-erased: a fresh erase finds no key,
+    // and the encrypted setting no longer decodes.
+    assert!(
+        !wb.crypto_erase_content(&account_scope),
+        "the erase already destroyed the account scope's content key"
+    );
+    assert!(
+        wb.store_ref()
+            .records(&account_scope, "setting")
+            .unwrap()
+            .is_empty(),
+        "the account scope's encrypted setting is crypto-erased"
+    );
+
+    // (ii) The personal tenant scope is crypto-erased.
+    assert!(
+        !wb.crypto_erase_content(&personal_scope),
+        "the erase already destroyed the personal tenant scope's content key"
+    );
+    assert!(
+        wb.store_ref()
+            .records(&personal_scope, "membership")
+            .unwrap()
+            .is_empty(),
+        "the personal tenant's encrypted content is crypto-erased"
+    );
+
+    // (iii) The other organization's membership for this person is deprovisioned, but
+    // that organization's scope is NOT erased — its owner's content survives.
+    let other_org = crate::org::Org::rebuild_in(wb.store_ref(), &other_scope).unwrap();
+    assert_eq!(
+        other_org.member_by_authority(ROOT).unwrap().status,
+        MembershipStatus::Deprovisioned,
+        "the person's membership in the colleague org is deprovisioned"
+    );
+    assert_eq!(
+        other_org.member_by_authority(OTHER_OWNER).unwrap().status,
+        MembershipStatus::Active,
+        "the colleague org's own owner is untouched"
+    );
+    assert!(
+        !wb.store_ref()
+            .records(&other_scope, "membership")
+            .unwrap()
+            .is_empty(),
+        "the colleague org's scope was not crypto-erased"
+    );
+}
+
 /// ADR 0141: search folds each chat's *effective* log, so a fork is findable by
 /// the history it inherited, not only by what it appended itself.
 #[test]

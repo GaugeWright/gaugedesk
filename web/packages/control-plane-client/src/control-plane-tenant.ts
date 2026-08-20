@@ -196,6 +196,19 @@ export async function deleteOrganization(
     await json("DELETE", `/account/tenants/${encodeURIComponent(tenantId)}`);
 }
 
+/** Erase the signed-in person's own account (`DELETE /account/erase`, SOC 2
+ * finding 4.4a / DR-0086).
+ *
+ * Irreversible: the Hub crypto-erases the account scope and the person's personal
+ * tenant, so `confirm` must be sent explicitly (`422` without it). Refused with
+ * `409` while the person still solely owns an organization (or one still has an
+ * active billable facility) — those are removed through {@link deleteOrganization}
+ * first. Erasing a remote Home's workbench content (4.4b) is not part of this and
+ * is blocked on DR-0061. */
+export async function eraseAccount(json: RouteJson): Promise<void> {
+    await json("DELETE", "/account/erase", { confirm: true });
+}
+
 /** Create an organization tenant with the caller as its only active owner. */
 export async function createOrganization(
     json: RouteJson,

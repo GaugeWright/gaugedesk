@@ -1220,6 +1220,181 @@ impl Workbench {
         }
         Ok(outcome)
     }
+
+    /// **Erase this person's own account** (SOC 2 finding 4.4a / DR-0086): the
+    /// Hub-side, customer-facing self-erase. The authenticated person erases their
+    /// own account scope — devices, settings, credentials, homes, home-routes, and
+    /// the tenant switcher, all sealed under the account scope's per-scope content
+    /// DEK since finding 2.6 — by destroying that key, so the retained ciphertext
+    /// becomes permanently unrecoverable rather than merely tombstoned.
+    ///
+    /// It is deliberately narrow, mirroring [`Self::delete_organization_in`]:
+    ///
+    /// - It **refuses** ([`AccountEraseRefusal::OwnsOrganizations`]) while the
+    ///   person is still the sole active owner of any non-personal organization, or
+    ///   any such organization still has an active tenant-billable facility. Those
+    ///   are the person's to wind down through the tenant-delete path first (which
+    ///   detaches the facilities and requires the other members to have left);
+    ///   account erase never cascade-deletes an organization out from under its
+    ///   other members or its billing. This is the agreed refuse-and-require-cleanup
+    ///   default.
+    /// - It **deprovisions** (future-only, `INV-18`) the person's membership in
+    ///   every non-personal organization they merely belong to (a non-owner
+    ///   member), so their access is revoked without erasing a scope that belongs
+    ///   to the tenant and its other members.
+    /// - It **crypto-erases** the person's own **personal** tenant scope — the
+    ///   tenant-of-one [`Self::delete_organization_in`] refuses to touch — after
+    ///   tombstoning its org/membership, and then the **account scope** itself.
+    ///
+    /// 4.4b — erasing a *remote* Home's workbench content the person provisioned —
+    /// is out of scope here and blocked on DR-0061 (the Hub has no signed
+    /// provisioning channel to the Home plane). Content co-located under this one
+    /// account scope is covered; a separate Home plane is not reached.
+    ///
+    /// Erasure is idempotent and retryable: a second call finds no key left to
+    /// destroy. A `false` from an erase while content encryption is configured
+    /// leaves the scope tombstoned-or-emptied but not yet erased, and is surfaced
+    /// via `tracing::warn!` rather than swallowed, exactly as finding 4.5 does.
+    pub fn erase_account_in(
+        &mut self,
+        actor: &str,
+        account_scope: &str,
+    ) -> Result<Result<(), AccountEraseRefusal>, AdmitError> {
+        use crate::org::{MembershipStatus, Org, OrgRecord, ORG_ID};
+        use crate::tenancy::Tenancy;
+
+        let tenancy = Tenancy::rebuild_in(self.store_ref(), account_scope)?;
+
+        // Partition the person's tenants. `personal` is their own tenant-of-one;
+        // every other entry is an organization they belong to.
+        let mut personal: Vec<crate::tenancy::TenantRef> = Vec::new();
+        let mut blocking: Vec<String> = Vec::new();
+        let mut deprovision: Vec<String> = Vec::new();
+        for tenant in tenancy.list().cloned().collect::<Vec<_>>() {
+            if tenant.personal {
+                personal.push(tenant);
+                continue;
+            }
+            let scope = crate::org::tenant_scope(&tenant.id);
+            // The singleton local directory is not a hosted organization.
+            if scope == crate::org::ORG_SCOPE {
+                continue;
+            }
+            let org = Org::rebuild_in(self.store_ref(), &scope)?;
+            let Some(member) = org.member_by_authority(actor).cloned() else {
+                // A stale switcher entry for a tenant this person no longer has a
+                // membership in — nothing there to revoke.
+                continue;
+            };
+            // Reuse delete_organization_in's ownership test: a sole active owner is
+            // an active owner with no other active member.
+            let is_active_owner =
+                member.status == MembershipStatus::Active && member.role == "owner";
+            let others = org
+                .members
+                .values()
+                .filter(|m| m.status == MembershipStatus::Active && m.authority != actor)
+                .count();
+            let sole_active_owner = is_active_owner && others == 0;
+            let active_facilities =
+                crate::facility::Facilities::rebuild_in(self.store_ref(), &scope)?
+                    .active()
+                    .count();
+            if sole_active_owner || active_facilities > 0 {
+                blocking.push(tenant.id.clone());
+            } else if member.status == MembershipStatus::Active && member.role != "owner" {
+                deprovision.push(tenant.id.clone());
+            }
+        }
+
+        if !blocking.is_empty() {
+            blocking.sort();
+            return Ok(Err(AccountEraseRefusal::OwnsOrganizations(blocking)));
+        }
+
+        // Not refused: deprovision the person's non-owner memberships (future-only,
+        // INV-18) under each organization's *own* scope — never erased here, it
+        // belongs to the tenant and its other members.
+        for tenant_id in &deprovision {
+            let scope = crate::org::tenant_scope(tenant_id);
+            if let Some(member) = Org::rebuild_in(self.store_ref(), &scope)?
+                .member_by_authority(actor)
+                .cloned()
+            {
+                let mut retired = member;
+                retired.status = MembershipStatus::Deprovisioned;
+                self.store_mut().append_record(
+                    &scope,
+                    "membership",
+                    &serde_json::to_string(&retired)?,
+                )?;
+            }
+        }
+
+        // Crypto-erase the personal tenant-of-one: tombstone its org + owner
+        // membership as delete_organization_in does, then destroy its content key so
+        // the retained ciphertext is unrecoverable.
+        for tenant in &personal {
+            let scope = crate::org::tenant_scope(&tenant.id);
+            let directory = OrgRecord {
+                id: ORG_ID.into(),
+                op: RecordOp::Tombstone,
+                ..Default::default()
+            };
+            let mut records: Vec<(&str, &str, String)> =
+                vec![(scope.as_str(), "org", serde_json::to_string(&directory)?)];
+            if let Some(member) = Org::rebuild_in(self.store_ref(), &scope)?
+                .member_by_authority(actor)
+                .cloned()
+            {
+                let mut retired = member;
+                retired.status = MembershipStatus::Deprovisioned;
+                records.push((
+                    scope.as_str(),
+                    "membership",
+                    serde_json::to_string(&retired)?,
+                ));
+            }
+            let refs: Vec<(&str, &str, &str)> = records
+                .iter()
+                .map(|(s, k, v)| (*s, *k, v.as_str()))
+                .collect();
+            self.store_mut().append_records_atomically(&refs)?;
+            if !self.crypto_erase_content(&scope) && self.content_encryption_enabled() {
+                tracing::warn!(
+                    tenant = %tenant.id,
+                    scope = %scope,
+                    "account erase tombstoned the personal tenant but its content \
+                     crypto-erase destroyed no key; not yet erased (idempotent/retryable)"
+                );
+            }
+        }
+
+        // Finally, crypto-erase the account scope itself: devices, settings,
+        // credentials, homes, home-routes, and the tenant_ref switcher entries all
+        // become permanently unrecoverable — the intended "account gone" state.
+        if !self.crypto_erase_content(account_scope) && self.content_encryption_enabled() {
+            tracing::warn!(
+                scope = %account_scope,
+                "account erase destroyed no account-scope content key; the account's \
+                 records are not yet erased (idempotent/retryable)"
+            );
+        }
+
+        Ok(Ok(()))
+    }
+}
+
+/// Why an [`Workbench::erase_account_in`] was refused. Mirrors
+/// [`crate::tenancy::DeleteOrganizationRefusal`]'s "each arm is a distinct thing to
+/// do next" shape — here there is one, and it names the cleanup the person owns.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AccountEraseRefusal {
+    /// The person still solely owns — or has an active tenant-billable facility in
+    /// — one or more organizations (their ids). Account erase does not cascade-
+    /// delete them out from under their other members or their billing: remove each
+    /// through the tenant-delete path first, then erase the account.
+    OwnsOrganizations(Vec<String>),
 }
 
 #[derive(Clone)]

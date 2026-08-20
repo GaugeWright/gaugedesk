@@ -62,6 +62,10 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
             "/account/devices/enroll/join/{session}",
             get(get_enroll_join),
         )
+        // Self-erase (SOC 2 finding 4.4a / DR-0086): the authenticated person
+        // crypto-erases their own account. Refuse-and-require-cleanup — see
+        // `erase_account`.
+        .route("/account/erase", delete(erase_account))
         .route("/account/settings", get(get_settings))
         .route("/account/settings/{key}", put(put_setting))
         .route("/account/homes", get(get_homes).post(post_home))
@@ -1325,6 +1329,64 @@ pub async fn post_credential(
         })),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct EraseAccountBody {
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// Erase the authenticated person's own account (SOC 2 finding 4.4a / DR-0086).
+///
+/// The customer-facing self-erase entry point. It requires an explicit
+/// `{ "confirm": true }`: a destructive, irreversible crypto-erase must never fire
+/// on an empty or accidental request (`422` without it). The authenticated actor
+/// is the account owner, so no capability beyond being that person is needed; the
+/// scope erased is exactly that person's own `account_scope_for(actor)`.
+///
+/// Refuse-and-require-cleanup: `409` while the person still solely owns an
+/// organization (or one still has an active billable facility) — those are wound
+/// down through the tenant-delete path first. On success the account scope and the
+/// person's personal tenant scope are crypto-erased and their non-owner
+/// memberships deprovisioned (see [`crate::Workbench::erase_account_in`]).
+///
+/// 4.4b — erasing a remote Home's workbench content the person provisioned — is out
+/// of scope and blocked on DR-0061 (the Hub has no signed Hub→Home provisioning
+/// channel).
+pub async fn erase_account(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Json(body): Json<EraseAccountBody>,
+) -> impl IntoResponse {
+    use crate::account::AccountEraseRefusal as Refusal;
+    let mut wb = wb.lock_unpoisoned();
+    let actor = wb.actor(net_http::bearer(&headers));
+    if actor == "anonymous" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "authenticate to erase your account",
+        )
+            .into_response();
+    }
+    if !body.confirm {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "confirm is required to erase your account",
+        )
+            .into_response();
+    }
+    let account_scope = wb.account_scope_for(net_http::bearer(&headers));
+    match wb.erase_account_in(&actor, &account_scope) {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(Refusal::OwnsOrganizations(_))) => (
+            StatusCode::CONFLICT,
+            "delete the organizations you own through the tenant-delete path before \
+             erasing your account",
+        )
+            .into_response(),
+        Err(e) => err_response(e),
+    }
 }
 
 pub async fn delete_credential(
