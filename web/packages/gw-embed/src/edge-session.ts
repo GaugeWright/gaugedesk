@@ -99,6 +99,11 @@ export class EdgeSessionApi implements EmbedSessionApi {
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private reconnectAttempts = 0;
     private terminalRecoveryStarted = false;
+    /** Whether a refused probe has already been answered with a capability
+     *  refresh. A second refusal after a refresh that reported success means the
+     *  routes disagree about this session, and one more attempt would only
+     *  resume the loop this flag exists to end. */
+    private refusalRecoveryAttempted = false;
 
     constructor(
         private readonly deploymentBase: string,
@@ -261,16 +266,48 @@ export class EdgeSessionApi implements EmbedSessionApi {
      * refused session as transient and reconnected against it forever. */
     private async recoverOrReconnect(): Promise<void> {
         let unavailable = false;
+        let refused = false;
         try {
             const response = await fetch(this.projection("state"), {
                 credentials: "omit",
                 cache: "no-store",
             });
             unavailable = response.status === 404 || response.status === 410;
+            refused = response.status === 401 || response.status === 403;
         } catch {
             // A failed probe is transport uncertainty, not terminal authority.
         }
         if (this.disposed) return;
+        // A refusal says the capability this client holds is not one the
+        // deployment will honour, and that has two causes which look identical
+        // here. The capability may simply have expired while the tab slept,
+        // which a refresh repairs. Or the session behind it is gone — a
+        // deployment cutover ends live sessions — and no capability for it will
+        // ever be honoured again.
+        //
+        // Refreshing distinguishes them, because the refresh insists on being
+        // handed back this same session. When it cannot be, the session is the
+        // thing that ended rather than the credential, and this client must
+        // start another instead of asking a second time.
+        //
+        // Treating a refusal as transient is what produced the failure this
+        // handles: a panel whose session had been ended by a cutover reconnected
+        // against it every few seconds for as long as the tab stayed open,
+        // showing a visitor a permanent outage where a new session was
+        // available for the asking.
+        if (refused && !unavailable) {
+            if (this.refusalRecoveryAttempted) {
+                unavailable = true;
+            } else {
+                this.refusalRecoveryAttempted = true;
+                try {
+                    await this.refreshConnectionCapability();
+                } catch {
+                    unavailable = true;
+                }
+                if (this.disposed) return;
+            }
+        }
         if (unavailable) {
             this.terminalRecoveryStarted = true;
             const error = new Error("public session is no longer available");

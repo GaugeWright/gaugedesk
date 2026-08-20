@@ -586,6 +586,129 @@ describe("EdgeSessionApi", () => {
         vi.useRealTimers();
     });
 
+    /** The live failure of 2026-08-20. A deployment cutover ends live sessions,
+     *  and a tab open across one held a capability for a session that no longer
+     *  existed. The state probe answered 401, which this client read as
+     *  transient, so it reconnected against a dead session every few seconds
+     *  for as long as the tab stayed open — a permanent outage, in a panel
+     *  where a new session was one bootstrap away. */
+    it("starts a new session when a refusal outlives a capability refresh", async () => {
+        vi.useFakeTimers();
+        const sockets: FakeWebSocket[] = [];
+        const create = vi.fn(async () => undefined);
+        // The probe refuses; the refresh cannot return this same session,
+        // because the session is what ended.
+        const fetchMock = vi.fn(async (input: unknown) =>
+            String(input).includes("/state?")
+                ? new Response(null, { status: 401 })
+                : new Response(null, { status: 410 }),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+        vi.stubGlobal(
+            "WebSocket",
+            class extends FakeWebSocket {
+                constructor(url: string) {
+                    super(url);
+                    sockets.push(this);
+                }
+            },
+        );
+        const api = new EdgeSessionApi(
+            "https://panels.gaugewright.com/d/theory-a",
+            "sess_0123456789abcdef0123456789abcdef" as EngagementId,
+            "resume-capability",
+            "connection-capability",
+            Date.now() + 15 * 60 * 1000,
+            null,
+            false,
+            undefined,
+            { create },
+        );
+        const ready = api.ready();
+        sockets[0]!.emit("open");
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "session_ready",
+                snapshot: { cursor: 0, transcript: [], files: [] },
+            }),
+        });
+        await ready;
+        api.subscribe("ignored" as EngagementId, () => undefined);
+
+        sockets[0]!.close();
+        await vi.advanceTimersByTimeAsync(100);
+        await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+        // And it stays ended: no further sockets, no second replacement.
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(create).toHaveBeenCalledOnce();
+        expect(sockets).toHaveLength(1);
+        api.dispose();
+        vi.useRealTimers();
+    });
+
+    /** The other half of the same status. A capability that merely expired is
+     *  repaired by a refresh, and the session it belongs to must survive:
+     *  replacing it would throw away a visitor's conversation over a credential
+     *  that had simply gone stale. */
+    it("refreshes and reconnects when a refusal is only an expired capability", async () => {
+        vi.useFakeTimers();
+        const sockets: FakeWebSocket[] = [];
+        const create = vi.fn(async () => undefined);
+        const fetchMock = vi.fn(async (input: unknown) =>
+            String(input).includes("/state?")
+                ? new Response(null, { status: 401 })
+                : new Response(
+                      JSON.stringify({
+                          session_id: "sess_0123456789abcdef0123456789abcdef",
+                          connection_capability: "refreshed-capability",
+                          connection_expires_at_unix_ms: Date.now() + 15 * 60 * 1000,
+                      }),
+                      { status: 200, headers: { "content-type": "application/json" } },
+                  ),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+        vi.stubGlobal(
+            "WebSocket",
+            class extends FakeWebSocket {
+                constructor(url: string) {
+                    super(url);
+                    sockets.push(this);
+                }
+            },
+        );
+        const api = new EdgeSessionApi(
+            "https://panels.gaugewright.com/d/theory-a",
+            "sess_0123456789abcdef0123456789abcdef" as EngagementId,
+            "resume-capability",
+            "connection-capability",
+            Date.now() + 15 * 60 * 1000,
+            null,
+            false,
+            undefined,
+            { create },
+        );
+        const ready = api.ready();
+        sockets[0]!.emit("open");
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "session_ready",
+                snapshot: { cursor: 0, transcript: [], files: [] },
+            }),
+        });
+        await ready;
+        api.subscribe("ignored" as EngagementId, () => undefined);
+
+        sockets[0]!.close();
+        await vi.advanceTimersByTimeAsync(100);
+        // The session is kept and reconnected, carrying the refreshed
+        // capability rather than the one that was refused.
+        await vi.waitFor(() => expect(sockets).toHaveLength(2));
+        expect(create).not.toHaveBeenCalled();
+        expect(sockets[1]!.url).toContain("refreshed-capability");
+        api.dispose();
+        vi.useRealTimers();
+    });
+
     it.each([404, 410])(
         "replaces a terminally unavailable %i session instead of retrying its socket",
         async (status) => {
