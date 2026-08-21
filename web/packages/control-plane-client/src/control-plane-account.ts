@@ -558,6 +558,40 @@ export async function codexLoginCancel(json: RouteJson): Promise<void> {
     await json("POST", "/account/oauth/openai-codex/cancel", {});
 }
 
+/** xAI Grok subscription OAuth uses the same non-secret device projection as
+ * Codex, but remains a distinct provider/account record and endpoint. */
+export type XaiGrokStatus = CodexStatus;
+export type XaiGrokLoginStart = CodexLoginStart;
+
+export async function xaiGrokStatus(json: RouteJson): Promise<XaiGrokStatus> {
+    const o = (await json("GET", "/account/oauth/xai-grok")) as {
+        linked?: boolean;
+        expires?: number | null;
+        expired?: boolean;
+        login?: unknown;
+    };
+    return {
+        linked: Boolean(o.linked),
+        expires: o.expires ?? null,
+        expired: Boolean(o.expired),
+        login: deviceLogin(o.login),
+    };
+}
+
+export async function xaiGrokLoginStart(json: RouteJson): Promise<XaiGrokLoginStart> {
+    const o = (await json("POST", "/account/oauth/xai-grok/start", {})) as {
+        mode?: string;
+        login?: unknown;
+    };
+    const login = deviceLogin(o.login);
+    if (o.mode === "device" && login) return { mode: "device", login };
+    throw new Error("xAI sign-in returned an unsupported login response");
+}
+
+export async function xaiGrokLoginCancel(json: RouteJson): Promise<void> {
+    await json("POST", "/account/oauth/xai-grok/cancel", {});
+}
+
 // ---------------------------------------------------------------------------
 // Desktop → Hub account sign-in: the native device handoff's client half
 // (ADR 0123, LOGIN-2). The local control plane custodies the session; these

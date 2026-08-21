@@ -7656,6 +7656,27 @@
       "expires": "2026-10-31"
     },
     {
+      "method": "GET",
+      "path": "/account/oauth/xai-grok",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/account/oauth/xai-grok/cancel",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/account/oauth/xai-grok/start",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
       "method": "POST",
       "path": "/archetypes/{id}/copy-as-panel",
       "owner": "gaugedesk",

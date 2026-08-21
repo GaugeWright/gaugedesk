@@ -98,6 +98,7 @@ pub mod turn_summary;
 pub mod workbench_auth;
 pub mod workbench_state;
 pub mod workstream_routes;
+pub mod xai_oauth;
 pub(crate) use app_support::io;
 pub use app_support::LockUnpoisoned;
 pub use app_support::{

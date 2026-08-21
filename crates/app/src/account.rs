@@ -399,7 +399,7 @@ pub(crate) fn provider_env_var(provider: &str) -> Option<&'static str> {
 pub fn authentication_for_provider(provider: &str) -> CredentialAuthentication {
     match provider {
         "anthropic" => CredentialAuthentication::ApiKey,
-        "openai-codex" => CredentialAuthentication::OAuth,
+        "openai-codex" | "xai-grok" => CredentialAuthentication::OAuth,
         _ => CredentialAuthentication::Bearer,
     }
 }

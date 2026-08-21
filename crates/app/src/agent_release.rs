@@ -677,6 +677,10 @@ impl Workbench {
                     model: spec.provider.model.clone(),
                     base_url: spec.provider.base_url.clone(),
                     credential_ref: spec.provider.credential_class.clone(),
+                    wire: Some(
+                        gaugedesk_whip_runtime::provider_model_wire_name(&spec.provider.provider)?
+                            .to_owned(),
+                    ),
                 },
             )]),
             placements: BTreeMap::from([(

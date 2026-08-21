@@ -549,6 +549,7 @@ fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
         }
         p if p.contains("anthropic") => &["api.anthropic.com"],
         "xai" => &["api.x.ai"],
+        "xai-grok" => &["cli-chat-proxy.grok.com", "auth.x.ai"],
         p if p.contains("azure") => &["openai.azure.com"],
         // Unknown provider: default to the codex/OpenAI endpoints rather than
         // opening the network wide — a misconfigured provider fails closed-ish.
@@ -1732,6 +1733,33 @@ fn run_claimed_engagement_turn(
                     );
                 }
             }
+        } else if provider == "xai-grok" {
+            match crate::xai_oauth::resolve_turn_credential(
+                wb,
+                actor.as_str(),
+                effective_execution_class,
+            ) {
+                Ok(Some(credential)) => Some(crate::account::resolved_credential_capability(
+                    credential_ref.clone(),
+                    credential.access,
+                    None,
+                )),
+                Ok(None) => None,
+                Err(reason) => {
+                    let _ = sender.send(ServerEvent::Error {
+                        reason: reason.clone(),
+                        code: Some("credential_refresh_failed".into()),
+                    });
+                    let mut workbench = wb.lock_unpoisoned();
+                    return record_precheck_failure(
+                        &mut workbench.store,
+                        id,
+                        task,
+                        reason,
+                        "credential_refresh_failed",
+                    );
+                }
+            }
         } else {
             let g = wb.lock_unpoisoned();
             g.credential_capability_for_chat_in_class(
@@ -1978,6 +2006,7 @@ fn run_claimed_engagement_turn(
                 model: provider_descriptor.model.clone(),
                 base_url: provider_descriptor.base_url.clone(),
                 credential_ref,
+                wire: provider_descriptor.wire.to_owned(),
                 placement_kind: if factory.kind() == "whip-do" {
                     "do".to_owned()
                 } else {

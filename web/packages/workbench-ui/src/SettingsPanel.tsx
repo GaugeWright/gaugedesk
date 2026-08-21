@@ -98,6 +98,12 @@ const PROVIDERS: SettingsModel["models"]["providers"] = [
     { pin: "openai", label: "OpenAI", auth: "key" },
     { pin: "anthropic", label: "Anthropic", auth: "key" },
     { pin: "xai", label: "xAI (Grok)", auth: "key" },
+    {
+        pin: "xai-grok",
+        label: "xAI Grok subscription",
+        auth: "account",
+        note: "uses your Grok or X Premium plan",
+    },
     { pin: "openai-generic", label: "OpenAI-compatible endpoint", auth: "endpoint" },
 ];
 
@@ -165,6 +171,7 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
     const [facilities] = createResource(tick, soft(() => props.api.accountFacilities()));
     const [peers] = createResource(tick, soft(() => props.api.listPeers()));
     const [codex] = createResource(tick, soft(() => props.api.codexStatus()));
+    const [xaiGrok] = createResource(tick, soft(() => props.api.xaiGrokStatus()));
     const [settings, { refetch: refetchSettings }] = createResource(
         tick,
         soft(() => props.api.accountSettings()),
@@ -222,6 +229,7 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
     const linkedAccounts = createMemo(() => {
         const pins = (credentials() ?? []).filter((c) => c.linked).map((c) => c.provider);
         if (codex()?.linked) pins.push("openai-codex");
+        if (xaiGrok()?.linked) pins.push("xai-grok");
         return pins;
     });
 
@@ -229,17 +237,20 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
     // rather than to a credential — the credential does not exist until it completes.
     const [pendingSignIn, setPendingSignIn] = createSignal<SettingsModel["models"]["signIn"]>();
     let watchingLink = false;
-    const startCodexSignIn = async () => {
+    const startProviderSignIn = async (pin: string) => {
         setStatus("");
         // A re-sign-in starts with the old credential still linked, so completion is
         // "the expiry changed", not "a credential exists" — baseline it here.
-        const baselineExpires = codex()?.expires ?? null;
+        const isXai = pin === "xai-grok";
+        const baselineExpires = isXai ? (xaiGrok()?.expires ?? null) : (codex()?.expires ?? null);
         try {
-            const login = await props.api.codexLoginStart();
+            const login = isXai
+                ? await props.api.xaiGrokLoginStart()
+                : await props.api.codexLoginStart();
             const url = login.mode === "browser" ? login.url : login.login.verificationUrl;
             setPendingSignIn({
-                pin: "openai-codex",
-                label: PROVIDER_LABEL.get("openai-codex") ?? "OpenAI (Codex)",
+                pin,
+                label: PROVIDER_LABEL.get(pin) ?? pin,
                 mode: login.mode,
                 code: login.mode === "device" ? login.login.userCode : undefined,
                 url,
@@ -252,10 +263,13 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
         if (watchingLink) return; // a prior click's watcher is already at it
         watchingLink = true;
         try {
-            const linked = await waitForCodexLink(() => props.api.codexStatus(), {
-                baselineExpires,
-                cancelled: () => disposed,
-            });
+            const linked = await waitForCodexLink(
+                () => (isXai ? props.api.xaiGrokStatus() : props.api.codexStatus()),
+                {
+                    baselineExpires,
+                    cancelled: () => disposed,
+                },
+            );
             if (disposed) return;
             setPendingSignIn(undefined);
             setStatus(linked ? "signed in ✓" : "couldn't confirm the sign-in — finish it in the browser");
@@ -263,6 +277,22 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
         } finally {
             watchingLink = false;
         }
+    };
+
+    const oauthCredential = (
+        pin: string,
+        state: { linked: boolean; expires: number | null; expired: boolean } | undefined,
+    ): SettingsModel["models"]["credentials"][number] | null => {
+        if (!state?.linked) return null;
+        const on = state.expires ? new Date(state.expires).toLocaleDateString() : null;
+        return {
+            id: pin,
+            pin,
+            status: state.expired ? "expired" : "connected",
+            expiresSoon: !state.expired && expiresSoon(state.expires),
+            detail: on ? (state.expired ? `expired ${on}` : `valid to ${on}`) : undefined,
+            removable: false,
+        };
     };
 
     const codexCredential = (): SettingsModel["models"]["credentials"][number] | null => {
@@ -285,6 +315,8 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
         const rows: SettingsModel["models"]["credentials"][number][] = [];
         const cx = codexCredential();
         if (cx) rows.push(cx);
+        const gx = oauthCredential("xai-grok", xaiGrok());
+        if (gx) rows.push(gx);
         for (const c of credentials() ?? []) {
             if (!c.linked) continue;
             rows.push({
@@ -430,15 +462,20 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                     ? () => void openExternally(props.hubUrl!)
                     : undefined,
 
-                signInToProvider: () => void startCodexSignIn(),
+                signInToProvider: (pin) => void startProviderSignIn(pin),
                 cancelSignIn: () => {
                     // Both modes leave the server holding something: a device login it is
                     // polling for, or a browser helper sitting on the fixed loopback
                     // callback port. Dropping only our own waiting state left that port
                     // held, and the next sign-in failed on it.
+                    const pin = pendingSignIn()?.pin;
                     setPendingSignIn(undefined);
                     void act("cancel the sign-in", async () => {
-                        await props.api.codexLoginCancel();
+                        if (pin === "xai-grok") {
+                            await props.api.xaiGrokLoginCancel();
+                        } else {
+                            await props.api.codexLoginCancel();
+                        }
                         return "sign-in cancelled";
                     });
                 },

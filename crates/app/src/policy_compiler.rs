@@ -38,6 +38,7 @@ pub(crate) struct PolicyCompilationInput {
     pub model: String,
     pub base_url: String,
     pub credential_ref: String,
+    pub wire: String,
     pub placement_kind: String,
     pub command_network: bool,
     pub resources: Vec<ResourceRecord>,
@@ -285,6 +286,7 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
                 model: input.model.clone(),
                 base_url: input.base_url.clone(),
                 credential_ref: input.credential_ref.clone(),
+                wire: Some(input.wire.clone()),
             },
         )]),
         placements: BTreeMap::from([(
@@ -445,6 +447,7 @@ mod tests {
             model: "gpt-5".to_owned(),
             base_url: "https://api.openai.com".to_owned(),
             credential_ref: "gaugedesk:credential:account:openai".to_owned(),
+            wire: "openai-responses".to_owned(),
             placement_kind: "local".to_owned(),
             command_network: false,
             resources: Vec::new(),
@@ -535,6 +538,13 @@ mod tests {
                 .get(PROVIDER_BINDING_HANDLE)
                 .map(|binding| binding.credential_ref.as_str()),
             Some("gaugedesk:credential:account:openai")
+        );
+        assert_eq!(
+            policy
+                .provider_bindings
+                .get(PROVIDER_BINDING_HANDLE)
+                .and_then(|binding| binding.wire.as_deref()),
+            Some("openai-responses")
         );
         assert!(policy
             .placements

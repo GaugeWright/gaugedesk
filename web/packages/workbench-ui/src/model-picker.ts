@@ -44,6 +44,7 @@ const ACCOUNT_SOURCES: Record<string, AccountSource> = {
     // carry no controllable reasoning effort on the Chat Completions wire, so
     // their catalog rows declare `thinking: ["off"]`.
     xai: { pin: "xai", primary: ["xai"], secondary: [] },
+    "xai-grok": { pin: "xai-grok", primary: ["xai"], secondary: [] },
 };
 
 /** A friendly provider name for the `(provider)` disambiguator suffix. */
@@ -53,6 +54,7 @@ const PROVIDER_LABEL: Record<string, string> = {
     anthropic: "Anthropic",
     "openai-generic": "OpenAI-compatible",
     xai: "xAI",
+    "xai-grok": "Grok subscription",
 };
 
 /** Providers whose model id is entered free-text rather than picked from the catalog

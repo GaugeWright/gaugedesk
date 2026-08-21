@@ -26,7 +26,7 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
-use whipplescript_kernel::coerce_native::CoerceProvider;
+use whipplescript_kernel::harness_model::ModelWire;
 
 #[cfg(debug_assertions)]
 use crate::build_workbench;
@@ -262,11 +262,11 @@ impl Workbench {
         let reading: gaugedesk_harness::ContextWindowReading = serde_json::from_str(latest)?;
         let window = whipplescript_kernel::harness_model::model_context_window(
             match reading.provider.as_str() {
-                "anthropic" => CoerceProvider::Anthropic,
-                "openai" | "openai-codex" => CoerceProvider::OpenAi,
+                "anthropic" => ModelWire::AnthropicMessages,
+                "openai" | "openai-codex" | "xai-grok" => ModelWire::OpenAiResponses,
                 // The conservative family default; the function keys Claude
                 // models off the model id regardless of this wire.
-                _ => CoerceProvider::OpenAiCompat,
+                _ => ModelWire::OpenAiChatCompat,
             },
             &reading.model,
         );

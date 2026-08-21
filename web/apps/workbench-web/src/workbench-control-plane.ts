@@ -1552,6 +1552,18 @@ export class WorkbenchControlPlane implements ControlPlane {
         return this.runtimeAccountJson().then((json) => accountClient.codexLoginCancel(json));
     }
 
+    xaiGrokStatus(): Promise<accountClient.XaiGrokStatus> {
+        return this.runtimeAccountJson().then((json) => accountClient.xaiGrokStatus(json));
+    }
+
+    xaiGrokLoginStart(): Promise<accountClient.XaiGrokLoginStart> {
+        return this.runtimeAccountJson().then((json) => accountClient.xaiGrokLoginStart(json));
+    }
+
+    xaiGrokLoginCancel(): Promise<void> {
+        return this.runtimeAccountJson().then((json) => accountClient.xaiGrokLoginCancel(json));
+    }
+
     // Desktop → Hub account sign-in (ADR 0123, LOGIN-2): the local control
     // plane custodies the session; the client sees only the login URL, the
     // one-time code, and non-secret status.

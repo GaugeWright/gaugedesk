@@ -709,6 +709,10 @@ impl HarnessFactory for WhipHarnessFactory {
                 "No GaugeDesk-owned Codex OAuth credential is linked. Open Account settings and connect ChatGPT."
                     .to_owned(),
             ),
+            _ if provider == "xai-grok" => CredentialProbe::Missing(
+                "No GaugeDesk-owned Grok subscription is linked. Open Model access and connect xAI Grok."
+                    .to_owned(),
+            ),
             _ => CredentialProbe::Missing(format!(
                 "WhippleScript has no admitted credential capability for provider `{provider}`"
             )),
@@ -1342,6 +1346,7 @@ fn provider_wire_name(provider: ModelProvider) -> &'static str {
         // Not yet reachable from `.agent-config.json` (the xai rollout has not
         // landed here); named ahead so the reading is right when it does.
         ModelProvider::Xai => "xai",
+        ModelProvider::XaiSubscription => "xai-grok",
     }
 }
 
@@ -1361,6 +1366,22 @@ pub struct NativeProviderDescriptor {
     pub base_url: String,
     pub endpoint_host: String,
     pub credential_env: &'static str,
+    pub wire: &'static str,
+}
+
+/// The model request dialect GaugeDesk admits for a provider identity.
+/// Provider identity and wire are separate policy facts: xAI's API key uses
+/// Chat Completions, while a Grok subscription uses Responses.
+pub fn provider_model_wire_name(provider_name: &str) -> io::Result<&'static str> {
+    match provider_name {
+        "anthropic" => Ok("anthropic-messages"),
+        "openai" | "openai-codex" | "xai-grok" => Ok("openai-responses"),
+        "openai-generic" | "xai" => Ok("openai-chat-compat"),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("WhippleScript native provider `{provider_name}` has no declared wire"),
+        )),
+    }
 }
 
 /// Whether `host` is a loopback address the TLS policy admits over plain `http`
@@ -1447,6 +1468,7 @@ pub fn native_provider_descriptor(
             endpoint_host,
             // The key rides the CredentialCapability path, not the env resolver.
             credential_env: "OPENAI_API_KEY",
+            wire: provider_model_wire_name(provider_name)?,
         });
     }
     let (base_url, endpoint_host, credential_env, default_model) = match provider_name {
@@ -1473,6 +1495,12 @@ pub fn native_provider_descriptor(
         // `/chat/completions`, so the base URL must carry the `/v1` segment —
         // unlike the rows above, whose clients append the full `/v1/...` path.
         "xai" => ("https://api.x.ai/v1", "api.x.ai", "XAI_API_KEY", None),
+        "xai-grok" => (
+            "https://cli-chat-proxy.grok.com",
+            "cli-chat-proxy.grok.com",
+            "GAUGEDESK_XAI_ACCESS_TOKEN",
+            None,
+        ),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1492,6 +1520,7 @@ pub fn native_provider_descriptor(
         base_url: base_url.to_owned(),
         endpoint_host: endpoint_host.to_owned(),
         credential_env,
+        wire: provider_model_wire_name(provider_name)?,
     })
 }
 
@@ -1516,6 +1545,7 @@ impl ProviderConfig {
             "openai-generic" => ModelProvider::OpenAiCompat,
             // xai is a fixed-host endpoint on the same Chat Completions wire.
             "xai" => ModelProvider::OpenAiCompat,
+            "xai-grok" => ModelProvider::XaiSubscription,
             "anthropic" => ModelProvider::Anthropic,
             "openai-codex" => ModelProvider::Codex,
             _ => unreachable!("validated by native_provider_descriptor"),
@@ -2168,6 +2198,7 @@ mod tests {
                     model: "gpt-test".to_owned(),
                     base_url: "https://api.openai.com".to_owned(),
                     credential_ref: "gaugedesk:credential:account:openai".to_owned(),
+                    wire: Some("openai-responses".to_owned()),
                 },
             )]),
             placements: std::collections::BTreeMap::from([(
@@ -2276,6 +2307,16 @@ mod tests {
             native_provider_descriptor("xai", Some("grok-4.6"), Some("https://evil.example"))
                 .expect("xai descriptor ignores base_url");
         assert_eq!(pinned.base_url, "https://api.x.ai/v1");
+    }
+
+    #[test]
+    fn xai_subscription_descriptor_is_fixed_host_responses() {
+        let descriptor = native_provider_descriptor("xai-grok", Some("grok-code-fast-1"), None)
+            .expect("xAI Grok subscription descriptor");
+        assert_eq!(descriptor.base_url, "https://cli-chat-proxy.grok.com");
+        assert_eq!(descriptor.endpoint_host, "cli-chat-proxy.grok.com");
+        assert_eq!(descriptor.credential_env, "GAUGEDESK_XAI_ACCESS_TOKEN");
+        assert_eq!(descriptor.wire, "openai-responses");
     }
 
     #[test]

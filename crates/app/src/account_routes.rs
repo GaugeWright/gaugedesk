@@ -22,6 +22,7 @@ use crate::account::{seal_token, HomeRouteRecord, RecordOp, RegisteredHomeRecord
 #[cfg(debug_assertions)]
 use crate::account::{DeviceRecord, DeviceStatus};
 use crate::codex_oauth;
+use crate::xai_oauth;
 use crate::{err_response, net_http, LockUnpoisoned, SharedWorkbench};
 use gaugedesk_core::ids::HomeId;
 
@@ -123,6 +124,12 @@ pub fn runtime_credential_routes() -> Router<SharedWorkbench> {
             "/account/oauth/openai-codex/cancel",
             post(codex_oauth::post_codex_login_cancel),
         )
+        .route("/account/oauth/xai-grok", get(xai_oauth::get_status))
+        .route("/account/oauth/xai-grok/start", post(xai_oauth::post_start))
+        .route(
+            "/account/oauth/xai-grok/cancel",
+            post(xai_oauth::post_cancel),
+        )
         // Desktop → Hub account sign-in: the native device handoff's local half
         // (ADR 0123, LOGIN-2). Account identity, not a model credential — the
         // sealed session stays in this control plane; routes carry no token.
@@ -161,6 +168,15 @@ pub fn home_runtime_credential_routes() -> Router<SharedWorkbench> {
         .route(
             "/account/oauth/openai-codex/cancel",
             post(codex_oauth::post_home_codex_login_cancel),
+        )
+        .route("/account/oauth/xai-grok", get(xai_oauth::get_home_status))
+        .route(
+            "/account/oauth/xai-grok/start",
+            post(xai_oauth::post_home_start),
+        )
+        .route(
+            "/account/oauth/xai-grok/cancel",
+            post(xai_oauth::post_cancel),
         )
 }
 

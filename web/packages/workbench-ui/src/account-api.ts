@@ -18,6 +18,8 @@ import type {
     AccountTenant,
     CodexLoginStart,
     CodexStatus,
+    XaiGrokLoginStart,
+    XaiGrokStatus,
     HubSessionStatus,
     LinkedProvider,
     ManagedInferenceBilling,
@@ -35,6 +37,9 @@ export interface AccountPanelApi {
     codexStatus(): Promise<CodexStatus>;
     codexLoginStart(): Promise<CodexLoginStart>;
     codexLoginCancel(): Promise<void>;
+    xaiGrokStatus(): Promise<XaiGrokStatus>;
+    xaiGrokLoginStart(): Promise<XaiGrokLoginStart>;
+    xaiGrokLoginCancel(): Promise<void>;
     accountLinkCredential(provider: string, token: string, baseUrl?: string): Promise<void>;
     accountUnlinkCredential(provider: string): Promise<void>;
     accountManagedInference(): Promise<ManagedInferenceBilling>;
