@@ -131,11 +131,13 @@ export class EdgeSessionApi implements EmbedSessionApi {
     }
 
     private projection(path: "state" | "files"): string {
-        const url = new URL(
+        return new URL(
             `${this.deploymentBase}/sessions/${encodeURIComponent(this.sessionId)}/${path}`,
-        );
-        url.searchParams.set("cap", this.connectionCapability);
-        return url.toString();
+        ).toString();
+    }
+
+    private projectionHeaders(): HeadersInit {
+        return { "x-gw-connection-capability": this.connectionCapability };
     }
 
     private socketUrl(): string {
@@ -150,6 +152,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
 
     private async refreshState(): Promise<void> {
         const response = await fetch(this.projection("state"), {
+            headers: this.projectionHeaders(),
             credentials: "omit",
             cache: "no-store",
         });
@@ -269,6 +272,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
         let refused = false;
         try {
             const response = await fetch(this.projection("state"), {
+                headers: this.projectionHeaders(),
                 credentials: "omit",
                 cache: "no-store",
             });
@@ -878,7 +882,11 @@ export class EdgeSessionApi implements EmbedSessionApi {
                 url.searchParams.set("path", path);
                 return url.toString();
             })(),
-            { credentials: "omit", cache: "no-store" },
+            {
+                headers: this.projectionHeaders(),
+                credentials: "omit",
+                cache: "no-store",
+            },
         );
         if (!response.ok) throw new Error(`read ${path}: ${response.status}`);
         return response.text();

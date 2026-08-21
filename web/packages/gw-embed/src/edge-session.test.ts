@@ -142,6 +142,38 @@ describe("EdgeSessionApi", () => {
         anonymous.dispose();
     });
 
+    it("carries projection capabilities in headers without leaking them into URLs", async () => {
+        const fetchMock = vi.fn(
+            async (_input: RequestInfo | URL, _init?: RequestInit) =>
+                new Response("contents"),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+        const api = new EdgeSessionApi(
+            "https://panels.gaugewright.com/d/theory-a",
+            "sess_0123456789abcdef0123456789abcdef" as EngagementId,
+            "resume-capability",
+            "connection-capability",
+            Date.now() + 15 * 60 * 1000,
+            null,
+            false,
+        );
+
+        await expect(api.getFile("ignored" as EngagementId, "answer.md")).resolves.toBe(
+            "contents",
+        );
+        const [input, init] = fetchMock.mock.calls[0]!;
+        const url = new URL(String(input));
+        expect(url.pathname).toBe(
+            "/d/theory-a/sessions/sess_0123456789abcdef0123456789abcdef/files",
+        );
+        expect(url.searchParams.get("path")).toBe("answer.md");
+        expect(url.searchParams.has("cap")).toBe(false);
+        expect(new Headers(init?.headers).get("x-gw-connection-capability")).toBe(
+            "connection-capability",
+        );
+        api.dispose();
+    });
+
     it("hydrates and sends turns over one cursor-resumable WebSocket", async () => {
         const fetchMock = vi.fn();
         const sockets: FakeWebSocket[] = [];
@@ -473,6 +505,15 @@ describe("EdgeSessionApi", () => {
             "/d/theory-a/sessions/sess_0123456789abcdef0123456789abcdef/state",
             "/d/theory-a/sessions/sess_0123456789abcdef0123456789abcdef/state",
         ]);
+        for (const [url, init] of fetchMock.mock.calls) {
+            expect(new URL(String(url)).searchParams.has("cap")).toBe(false);
+            expect(new Headers(init?.headers).get("x-gw-connection-capability")).toBe(
+                "connection-capability",
+            );
+        }
+        expect(new URL(sockets[0]!.url).searchParams.get("cap")).toBe(
+            "connection-capability",
+        );
         api.dispose();
     });
 
@@ -637,7 +678,7 @@ describe("EdgeSessionApi", () => {
         // The probe refuses; the refresh cannot return this same session,
         // because the session is what ended.
         const fetchMock = vi.fn(async (input: unknown) =>
-            String(input).includes("/state?")
+            new URL(String(input)).pathname.endsWith("/state")
                 ? new Response(null, { status: 401 })
                 : new Response(null, { status: 410 }),
         );
@@ -693,7 +734,7 @@ describe("EdgeSessionApi", () => {
         const sockets: FakeWebSocket[] = [];
         const create = vi.fn(async () => undefined);
         const fetchMock = vi.fn(async (input: unknown) =>
-            String(input).includes("/state?")
+            new URL(String(input)).pathname.endsWith("/state")
                 ? new Response(null, { status: 401 })
                 : new Response(
                       JSON.stringify({
