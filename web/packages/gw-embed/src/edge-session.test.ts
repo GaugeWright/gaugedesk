@@ -44,6 +44,44 @@ afterEach(() => {
 });
 
 describe("EdgeSessionApi", () => {
+    it("disposes a bootstrapped client that fails before host adoption", async () => {
+        vi.useFakeTimers();
+        const sockets: FakeWebSocket[] = [];
+        const create = vi.fn(async () => undefined);
+        const fetchMock = vi.fn(async () => new Response(null, { status: 401 }));
+        vi.stubGlobal("fetch", fetchMock);
+        vi.stubGlobal(
+            "WebSocket",
+            class extends FakeWebSocket {
+                constructor(url: string) {
+                    super(url);
+                    sockets.push(this);
+                }
+            },
+        );
+        const api = new EdgeSessionApi(
+            "https://panels.gaugewright.com/d/theory-a",
+            "sess_0123456789abcdef0123456789abcdef" as EngagementId,
+            "resume-capability",
+            "connection-capability",
+            Date.now() + 15 * 60 * 1000,
+            null,
+            false,
+            undefined,
+            { create },
+        );
+
+        const ready = api.readyForAdoption();
+        sockets[0]!.close();
+        await expect(ready).rejects.toThrow("closed before ready");
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(sockets).toHaveLength(1);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+        vi.useRealTimers();
+    });
+
     it("starts fresh sessions anonymously while keeping history commands authenticated", async () => {
         vi.stubGlobal("fetch", vi.fn());
         const controls = {

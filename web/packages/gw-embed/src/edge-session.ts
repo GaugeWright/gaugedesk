@@ -697,6 +697,20 @@ export class EdgeSessionApi implements EmbedSessionApi {
         await this.connect();
     }
 
+    /** Wait until a freshly bootstrapped session can be adopted by its host.
+     * A client which fails before that point was never bound into the element's
+     * teardown chain, so leaving it alive creates an orphan reconnect loop.
+     * Dispose that unowned client while preserving `ready()` for callers which
+     * deliberately want to ride out an initial transport failure. */
+    async readyForAdoption(): Promise<void> {
+        try {
+            await this.ready();
+        } catch (error) {
+            this.dispose();
+            throw error;
+        }
+    }
+
     async getTranscript(_id: EngagementId): Promise<StreamEvent[]> {
         await this.refreshState();
         await this.connect();

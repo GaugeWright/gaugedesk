@@ -533,7 +533,7 @@ export class GwSessionElement extends HTMLElement {
                     : {}),
             },
         );
-        await api.ready();
+        await api.readyForAdoption();
         if (!this.isConnected) {
             api.dispose();
             return;
