@@ -3,6 +3,7 @@ import * as federationClient from "@gaugewright/control-plane-client";
 import * as workbenchClient from "@gaugewright/control-plane-client";
 import type {
     AccessPhase,
+    AgentKind,
     ArchetypeId,
     AuditEvent,
     Engagement,
@@ -13,6 +14,8 @@ import type {
     MergeAction,
     MergeState,
     PlacementId,
+    PanelPublicProfile,
+    CollectionRecipient,
     PublicDeploymentInput,
     PublicDeploymentInspection,
     PublicDeploymentOutcome,
@@ -730,8 +733,20 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.search(this.workbenchTransport(), query);
     }
 
-    createArchetype(name: string): Promise<ArchetypeId> {
-        return workbenchClient.createArchetype(this.workbenchTransport(), name);
+    createArchetype(name: string, kind: AgentKind = "work"): Promise<ArchetypeId> {
+        return workbenchClient.createArchetype(this.workbenchTransport(), name, kind);
+    }
+
+    copyAgentAsPanel(id: ArchetypeId, name?: string): Promise<ArchetypeId> {
+        return workbenchClient.copyAgentAsPanel(this.workbenchTransport(), id, name);
+    }
+
+    getPanelProfile(id: ArchetypeId): Promise<PanelPublicProfile> {
+        return workbenchClient.getPanelProfile(this.workbenchTransport(), id);
+    }
+
+    setPanelProfile(id: ArchetypeId, profile: PanelPublicProfile): Promise<PanelPublicProfile> {
+        return workbenchClient.setPanelProfile(this.workbenchTransport(), id, profile);
     }
 
     renameArchetype(id: ArchetypeId, name: string): Promise<void> {
@@ -842,12 +857,20 @@ export class WorkbenchControlPlane implements ControlPlane {
         return accountClient.forkTree(this.routeJson());
     }
 
-    placeArchetype(pid: ProjectId, archetypeId: ArchetypeId): Promise<PlacementId> {
-        return workbenchClient.placeArchetype(this.workbenchTransport(), pid, archetypeId);
+    placeArchetype(
+        pid: ProjectId,
+        archetypeId: ArchetypeId,
+        recipient?: CollectionRecipient,
+    ): Promise<PlacementId> {
+        return workbenchClient.placeArchetype(this.workbenchTransport(), pid, archetypeId, recipient);
     }
 
     publishDeployment(input: PublicDeploymentInput): Promise<PublicDeploymentOutcome> {
         return workbenchClient.publishDeployment(this.workbenchTransport(), input);
+    }
+
+    importLegacyDeployment(input: PublicDeploymentInput) {
+        return workbenchClient.importLegacyDeployment(this.workbenchTransport(), input);
     }
 
     // The collection surfaces (ADR 0109 §5–§7, GATE-8): which keyrings exist, how
@@ -862,12 +885,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     drainCollections(input: {
-        deployment_id: string;
-        edge_origin: string;
-        project_id: string;
-        recipient_id: string;
-        schema_ref: string;
-        admission_scope: string;
+        binding_id: string;
     }) {
         return workbenchClient.drainCollections(this.workbenchTransport(), input);
     }
@@ -1153,26 +1171,23 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.readQuarantinedItem(this.workbenchTransport(), project, item);
     }
 
-    screenQuarantinedItem(project: string, item: string, chat: EngagementId) {
+    screenQuarantinedItem(project: string, item: string) {
         return workbenchClient.screenQuarantinedItem(
             this.workbenchTransport(),
             project,
             item,
-            chat,
         );
     }
 
     reviewQuarantinedItem(
         project: string,
         item: string,
-        chat: EngagementId,
         verdict: "keep" | "flag",
     ): Promise<{ workspacePath: string | null }> {
         return workbenchClient.reviewQuarantinedItem(
             this.workbenchTransport(),
             project,
             item,
-            chat,
             verdict,
         );
     }

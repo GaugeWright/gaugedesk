@@ -163,10 +163,12 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
         id: "i-acme".into(),
         op: RecordOp::Upsert,
         kind: InstanceKind::Using,
+        placement_kind: gaugedesk_app::library::PlacementKind::Work,
         agent_id: "a1".into(),
         project_id: Some("proj-acme".into()),
         version: 1,
         admission: Admission::Active,
+        collection_recipient: None,
     };
     let chat = ChatRecord {
         schema: gaugedesk_app::library::LIBRARY_RECORD_SCHEMA,

@@ -28,10 +28,13 @@ import {
     startSessionRefresh,
     reportedClientBuild,
     type ArchetypeId,
+    type ArchetypeNode,
+    type AgentKind,
     describeFailure,
     turnStopped,
     type EngagementId,
     type ProjectId,
+    type ProjectNode,
     Rejected,
     scopeId,
     type MergeAction,
@@ -60,6 +63,7 @@ import {
     QuarantineIndex,
     ContextPanel,
     DeploymentPanel,
+    type DeploymentSelection,
     createSessionComposerController,
     deriveFreshness,
     gemState,
@@ -75,6 +79,8 @@ import {
     fileFromSearch,
     freshnessEventForMarker,
     FacetBrowser,
+    PanelAgentPreview,
+    ProjectInbox,
     forkSource,
     FreshnessBanner,
     fromSnapshot,
@@ -402,7 +408,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 .catch(() => {});
         }
     }
-    const [agentSettings, setAgentSettings] = createSignal<{ id: ArchetypeId; name: string } | null>(null);
+    const [agentSettings, setAgentSettings] = createSignal<{ id: ArchetypeId; name: string; kind: AgentKind } | null>(null);
     // The per-project Engagement pane (FED-7), opened from a project node.
     const [engagement, setEngagement] = createSignal<{ id: ProjectId; name: string } | null>(null);
     // LLM-2: the per-project model-access panel (pin a BYOK key at project scope).
@@ -411,15 +417,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [projectHome, setProjectHome] = createSignal<{ id: ProjectId; name: string } | null>(null);
     // UX-8: the fork-tree panel (chat fork lineage); holds the chat that opened it.
     const [forkTreeFor, setForkTreeFor] = createSignal<EngagementId | null>(null);
-    const [deployment, setDeployment] = createSignal<{
-        // Carried so a drain knows which project's quarantine it lands in. The
-        // facet browser already produced it; the signal used to drop it.
-        projectId: string;
-        projectName: string;
-        placementId: import("@gaugewright/control-plane-client").PlacementId;
-        archetypeName: string;
-        reviewChatId?: EngagementId;
-    } | null>(null);
+    const [deployment, setDeployment] = createSignal<DeploymentSelection | null>(null);
+    const [panelPreview, setPanelPreview] = createSignal<{ agent: ArchetypeNode; project?: ProjectNode } | null>(null);
+    const [projectInbox, setProjectInbox] = createSignal<{ id: ProjectId; name: string } | null>(null);
 
     // Mirror the workspace *live* across clients over the workspace event stream
     // (the sibling of the per-chat SSE): the server pushes a "changed" ping whenever
@@ -1436,11 +1436,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             api={api}
             selected={selected()}
             onSelect={openChat}
-            onOpenArchetypeSettings={(id, name) => setAgentSettings({ id, name })}
+            onOpenArchetypeSettings={(id, name, kind) => setAgentSettings({ id, name, kind })}
             onOpenEngagement={(id, name) => setEngagement({ id, name })}
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}
             onOpenProjectHome={(id, name) => setProjectHome({ id, name })}
             onDeployPlacement={setDeployment}
+            onPreviewPanel={(agent, project) => setPanelPreview({ agent, project })}
+            onOpenInbox={(id, name) => setProjectInbox({ id, name })}
             onAttachTarget={(id, name, kind) => void attachTarget(id, name, kind)}
             onOpenForkTree={(chat) => setForkTreeFor(chat)}
             onChatDeleted={(id) => selected() === id && setSelected(null)}
@@ -1618,7 +1620,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onSetDefaultMode={makeModeDefault}
             quickStart={!selected()}
             placeholder={selected() && chatKind() === "edit"
-                ? `Describe what to change about ${methodName() || "this archetype"}…`
+                ? `Describe what to change about ${methodName() || "this Agent"}…`
                 : "task the agent…"}
             inputRef={(element) => {
                 composerEl = element;
@@ -1759,7 +1761,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             class="icon-btn"
                             data-open-sources
                             aria-label="Sources"
-                            title="See the context this chat is working with — attached files and its archetype"
+                            title="See the context this chat is working with — attached files and its Agent"
                             onClick={() => setShowSources(true)}
                         >
                             <Icon name="sources" />
@@ -1876,6 +1878,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 api={api}
                                 id={a().id}
                                 name={a().name}
+                                kind={a().kind}
                                 onClose={() => setAgentSettings(null)}
                             />
                         </div>
@@ -1944,9 +1947,26 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         || ""}
                     defaultCredentialRef={import.meta.env.VITE_PUBLIC_CREDENTIAL_REF
                         || "credential:production:openai:v1"}
+                    onOpenInbox={() => {
+                        setProjectInbox({ id: selectedDeployment().projectId as ProjectId, name: selectedDeployment().projectName });
+                        setDeployment(null);
+                    }}
                     onClose={() => setDeployment(null)}
                 />
             )}</Show>
+
+            <Show when={panelPreview()}>{(preview) => <PanelAgentPreview
+                agent={preview().agent}
+                project={preview().project}
+                onClose={() => setPanelPreview(null)}
+            />}</Show>
+
+            <Show when={projectInbox()}>{(inbox) => <ProjectInbox
+                api={api}
+                project={inbox().id}
+                projectName={inbox().name}
+                onClose={() => setProjectInbox(null)}
+            />}</Show>
 
             <Show when={selected() && showShelf()}>
                 <Shelf

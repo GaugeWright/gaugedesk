@@ -3,7 +3,6 @@
   "include": [],
   "files": [
     "apps/workbench-web/src/main.tsx",
-    "apps/workbench-web/src/deployment-lab.tsx",
     "apps/workbench-web/src/App.tsx",
     "apps/workbench-web/src/workbench-control-plane.ts",
     "apps/workbench-web/src/generated-tunnel.d.ts"

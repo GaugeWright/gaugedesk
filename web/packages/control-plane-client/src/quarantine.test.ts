@@ -76,12 +76,11 @@ describe("quarantine transport boundary", () => {
             transport,
             "project/a",
             "session:1",
-            "chat-review",
         )).resolves.toEqual({ workspacePath: null, parked: true });
         expect(json).toHaveBeenCalledWith(
             "POST",
             "/projects/project%2Fa/quarantine/session%3A1/screen",
-            { chat_id: "chat-review" },
+            {},
         );
     });
 });

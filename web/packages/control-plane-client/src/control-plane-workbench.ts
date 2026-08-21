@@ -18,6 +18,8 @@ import {
 } from "./control-plane-domain";
 import type {
     AccessPhase,
+    AgentAbility,
+    AgentKind,
     ArchetypeId,
     AuditEvent,
     Engagement,
@@ -25,8 +27,10 @@ import type {
     ExportState,
     FileEntry,
     HumanTask,
+    LegacyDeploymentImportOutcome,
     MergeAction,
     MergeState,
+    PanelPublicProfile,
     PlacementId,
     ProjectId,
     CollectionRecipient,
@@ -210,9 +214,34 @@ export async function search(transport: WorkbenchTransport, query: string): Prom
 export async function createArchetype(
     transport: WorkbenchTransport,
     name: string,
+    kind: AgentKind = "work",
 ): Promise<ArchetypeId> {
-    const o = (await transport.json("POST", "/archetypes", { name })) as { id: string };
+    const o = (await transport.json("POST", "/archetypes", { name, kind })) as { id: string };
     return o.id as ArchetypeId;
+}
+
+export async function copyAgentAsPanel(
+    transport: WorkbenchTransport,
+    id: ArchetypeId,
+    name?: string,
+): Promise<ArchetypeId> {
+    const o = (await transport.json("POST", `/archetypes/${id}/copy-as-panel`, { name })) as { id: string };
+    return o.id as ArchetypeId;
+}
+
+export async function getPanelProfile(
+    transport: WorkbenchTransport,
+    id: ArchetypeId,
+): Promise<PanelPublicProfile> {
+    return await transport.json("GET", `/archetypes/${id}/panel-profile`) as PanelPublicProfile;
+}
+
+export async function setPanelProfile(
+    transport: WorkbenchTransport,
+    id: ArchetypeId,
+    profile: PanelPublicProfile,
+): Promise<PanelPublicProfile> {
+    return await transport.json("PUT", `/archetypes/${id}/panel-profile`, profile) as PanelPublicProfile;
 }
 
 export async function renameArchetype(
@@ -245,11 +274,6 @@ export async function setArchetypeConfig(
     if (res.status === 400) throw new Error(`invalid config: ${await res.text()}`);
     if (!res.ok) throw new Error(`PUT archetype: ${res.status}`);
 }
-
-export type AgentAbility =
-    | "workspace.read"
-    | "workspace.write"
-    | "command.run";
 
 export async function getArchetypeAbilities(
     transport: WorkbenchTransport,
@@ -428,8 +452,15 @@ export async function placeArchetype(
     transport: WorkbenchTransport,
     pid: ProjectId,
     archetypeId: ArchetypeId,
+    recipient?: CollectionRecipient,
 ): Promise<PlacementId> {
-    const o = (await transport.json("POST", `/projects/${pid}/placements`, { agent_id: archetypeId })) as {
+    const o = (await transport.json("POST", `/projects/${pid}/placements`, {
+        agent_id: archetypeId,
+        collection_recipient: recipient ? {
+            recipient_ref: recipient.recipient_id,
+            recipient_public_keys: [recipient.public_key_hex],
+        } : undefined,
+    })) as {
         instance_id: string;
     };
     return o.instance_id as PlacementId;
@@ -446,14 +477,36 @@ export async function publishDeployment(
     )) as { deployment?: PublicDeploymentOutcome };
     if (
         !response.deployment
+        || typeof response.deployment.binding_id !== "string"
+        || typeof response.deployment.project_id !== "string"
+        || typeof response.deployment.placement_id !== "string"
         || typeof response.deployment.deployment_id !== "string"
         || typeof response.deployment.release_id !== "string"
+        || typeof response.deployment.edge_origin !== "string"
         || typeof response.deployment.deployment_url !== "string"
         || typeof response.deployment.embed_html !== "string"
     ) {
         throw new Error("deployment publisher response is malformed");
     }
     return response.deployment;
+}
+
+export async function importLegacyDeployment(
+    transport: WorkbenchTransport,
+    input: PublicDeploymentInput,
+): Promise<LegacyDeploymentImportOutcome> {
+    const response = await transport.json("POST", "/public-deployments/import", {
+        placement_id: input.placement_id,
+        deployment_id: input.deployment_id,
+        edge_origin: input.edge_origin,
+    }) as LegacyDeploymentImportOutcome;
+    if (
+        typeof response.binding_id !== "string"
+        || typeof response.project_id !== "string"
+        || typeof response.deployment_id !== "string"
+        || typeof response.active_release_id !== "string"
+    ) throw new Error("legacy deployment import response is malformed");
+    return response;
 }
 
 export async function inspectDeployment(
@@ -1500,12 +1553,11 @@ export async function screenQuarantinedItem(
     transport: WorkbenchTransport,
     project: string,
     item: string,
-    chat: string,
 ): Promise<{ workspacePath: string | null; parked: boolean }> {
     const o = (await transport.json(
         "POST",
         `/projects/${encodeURIComponent(project)}/quarantine/${encodeURIComponent(item)}/screen`,
-        { chat_id: chat },
+        {},
     )) as { workspace_path?: unknown; parked?: unknown };
     if (typeof o.parked !== "boolean") {
         throw new Error("quarantine screening result was malformed");
@@ -1523,7 +1575,6 @@ export async function reviewQuarantinedItem(
     transport: WorkbenchTransport,
     project: string,
     item: string,
-    chat: string,
     verdict: "keep" | "flag",
 ): Promise<{ workspacePath: string | null }> {
     // The gate may rule or may park, and the caller has to be able to tell.
@@ -1532,7 +1583,7 @@ export async function reviewQuarantinedItem(
     const o = (await transport.json(
         "POST",
         `/projects/${encodeURIComponent(project)}/quarantine/${encodeURIComponent(item)}/review`,
-        { chat_id: chat, verdict },
+        { verdict },
     )) as { workspace_path?: unknown };
     return {
         workspacePath: typeof o.workspace_path === "string" ? o.workspace_path : null,
@@ -1570,15 +1621,7 @@ export async function ensureCollectionRecipient(
 export async function drainCollections(
     transport: WorkbenchTransport,
     input: {
-        readonly deployment_id: string;
-        readonly edge_origin: string;
-        readonly project_id: string;
-        readonly recipient_id: string;
-        readonly schema_ref: string;
-        /** The scope the sessions sealed their wraps under. Required — omitting
-         *  it made every drain from this client a 422 before the request was
-         *  even read. */
-        readonly admission_scope: string;
+        readonly binding_id: string;
     },
 ): Promise<{ landed: readonly string[]; refused: readonly unknown[] }> {
     const o = (await transport.json("POST", "/public-deployments/collect", input)) as {

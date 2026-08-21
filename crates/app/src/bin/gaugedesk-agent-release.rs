@@ -392,6 +392,7 @@ fn build_release(
         placement,
         ReleasePublishSpec {
             published_at_unix_ms,
+            public_abilities: BTreeSet::new(),
             panels: PanelManifest {
                 components: BTreeSet::from([
                     "gw-chat".to_owned(),
@@ -402,6 +403,7 @@ fn build_release(
                 default_component: "gw-chat".to_owned(),
                 attribution: AttributionPolicy::GaugeWright,
             },
+            audience_inputs: BTreeSet::from(["text".to_owned()]),
             provider: ProviderPolicy {
                 provider: "openai".to_owned(),
                 model,

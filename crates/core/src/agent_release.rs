@@ -34,6 +34,14 @@ pub struct AgentRelease {
     pub initial_workspace: Vec<ReleaseFile>,
     pub capabilities: CapabilityManifest,
     pub panels: PanelManifest,
+    /// Audience-supplied input classes admitted by this immutable public
+    /// contract. The Session host rejects an input whose class is absent here;
+    /// deployments may not widen the set.
+    #[serde(
+        default = "default_audience_inputs",
+        skip_serializing_if = "is_default_audience_inputs"
+    )]
+    pub audience_inputs: BTreeSet<String>,
     pub provider: ProviderPolicy,
     pub retention: RetentionPolicy,
     /// What, if anything, a session may return to the deployment owner. Absent
@@ -42,6 +50,14 @@ pub struct AgentRelease {
     /// an induced agent can neither widen nor suppress it (ADR 0109 §5).
     #[serde(default)]
     pub collection: Option<CollectionPolicy>,
+}
+
+fn default_audience_inputs() -> BTreeSet<String> {
+    BTreeSet::from(["text".to_owned()])
+}
+
+fn is_default_audience_inputs(inputs: &BTreeSet<String>) -> bool {
+    inputs == &default_audience_inputs()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +401,18 @@ impl AgentRelease {
         for panel in &self.panels.components {
             required_text(panel, "panel component is empty")?;
         }
+        if self.audience_inputs.is_empty() {
+            return Err(AgentReleaseError::Invalid(
+                "at least one audience input class is required",
+            ));
+        }
+        for input in &self.audience_inputs {
+            if input != "text" {
+                return Err(AgentReleaseError::Invalid(
+                    "audience input class is unsupported by the public host",
+                ));
+            }
+        }
         required_text(&self.provider.provider, "provider is required")?;
         required_text(&self.provider.model, "provider model is required")?;
         required_text(&self.provider.base_url, "provider base URL is required")?;
@@ -594,6 +622,7 @@ mod tests {
                 default_component: "gw-chat-panel".to_owned(),
                 attribution: AttributionPolicy::GaugeWright,
             },
+            audience_inputs: BTreeSet::from(["text".to_owned()]),
             provider: ProviderPolicy {
                 provider: "openai".to_owned(),
                 model: "gpt-5.1".to_owned(),
@@ -644,6 +673,34 @@ mod tests {
             second.content_hash().unwrap()
         );
         assert!(first.content_hash().unwrap().starts_with("sha256:"));
+    }
+
+    #[test]
+    fn releases_from_before_audience_inputs_default_to_text() {
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&release(), &mut encoded).unwrap();
+        let mut legacy: ciborium::Value = ciborium::from_reader(encoded.as_slice()).unwrap();
+        let ciborium::Value::Map(fields) = &mut legacy else {
+            panic!("AgentRelease must encode as a CBOR map");
+        };
+        fields.retain(|(key, _)| key.as_text() != Some("audience_inputs"));
+        encoded.clear();
+        ciborium::into_writer(&legacy, &mut encoded).unwrap();
+        let decoded: AgentRelease = ciborium::from_reader(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.audience_inputs, BTreeSet::from(["text".to_owned()]));
+    }
+
+    #[test]
+    fn the_v1_text_default_stays_wire_compatible_with_existing_hosts() {
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&release(), &mut encoded).unwrap();
+        let value: ciborium::Value = ciborium::from_reader(encoded.as_slice()).unwrap();
+        let ciborium::Value::Map(fields) = value else {
+            panic!("AgentRelease must encode as a CBOR map");
+        };
+        assert!(!fields
+            .iter()
+            .any(|(key, _)| key.as_text() == Some("audience_inputs")));
     }
 
     #[test]
@@ -705,6 +762,19 @@ mod tests {
                 "gw-viewer-panel".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn a_release_cannot_advertise_an_input_the_public_host_does_not_accept() {
+        let key = SigningKey::from_seed(&[21; 32]).unwrap();
+        let mut unsupported = release();
+        unsupported.audience_inputs.insert("image".to_owned());
+        assert!(matches!(
+            unsupported.sign("publisher:test", &key),
+            Err(AgentReleaseError::Invalid(
+                "audience input class is unsupported by the public host"
+            ))
+        ));
     }
 
     #[test]

@@ -5,7 +5,7 @@
  * never owns truth (`INV-5`).
  *
  * The model (ADR 0035): an **archetype** is the reusable, named behaviour shown
- * in the Library (the UI calls it an "archetype" throughout); a
+ * in the Library (the UI calls it an "Agent" throughout); a
  * **placement** is an archetype installed on a **project** (Projects) — what you
  * chat with to do work. A chat's **kind** is its ROOT, fixed at creation: rooted
  * on an archetype ⇒ an **edit** chat; rooted on a placement ⇒ a **work** chat.
@@ -20,6 +20,7 @@ import { createEffect, createMemo, createResource, createSignal, For, onCleanup,
 import { createStore, reconcile } from "solid-js/store";
 import {
     Rejected,
+    type AgentKind,
     type ArchetypeId,
     type Engagement,
     type EngagementId,
@@ -93,7 +94,7 @@ function projectBlastRadius(p: { placements: { chats: unknown[] }[] }): string |
     const chats = p.placements.reduce((n, pl) => n + pl.chats.length, 0);
     if (methods === 0 && chats === 0) return undefined; // empty project — no warning needed
     const parts: string[] = [];
-    if (methods > 0) parts.push(`${methods} archetype${methods === 1 ? "" : "s"}`);
+    if (methods > 0) parts.push(`${methods} Agent placement${methods === 1 ? "" : "s"}`);
     if (chats > 0) parts.push(`${chats} chat${chats === 1 ? "" : "s"}`);
     return `also removes ${parts.join(" and ")} — this can't be undone`;
 }
@@ -113,7 +114,8 @@ export interface FacetBrowserApi {
     search(query: string): Promise<SearchHit[]>;
     getPlacementConfig(placementId: PlacementId): Promise<{ config: string; notes: string }>;
     setPlacementConfig(placementId: PlacementId, config: string, notes: string): Promise<void>;
-    createArchetype(name: string): Promise<ArchetypeId>;
+    createArchetype(name: string, kind?: AgentKind): Promise<ArchetypeId>;
+    copyAgentAsPanel(id: ArchetypeId, name?: string): Promise<ArchetypeId>;
     createProject(name: string): Promise<ProjectId>;
     renameArchetype(id: ArchetypeId, name: string): Promise<void>;
     renameProject(id: ProjectId, name: string): Promise<void>;
@@ -137,14 +139,15 @@ export interface FacetBrowserApi {
     forkArchetype(id: ArchetypeId, name?: string): Promise<ArchetypeId>;
     pullFromSource(id: ArchetypeId): Promise<void>;
     deleteArchetype(id: ArchetypeId): Promise<void>;
-    placeArchetype(pid: ProjectId, archetypeId: ArchetypeId): Promise<PlacementId>;
+    placeArchetype(pid: ProjectId, archetypeId: ArchetypeId, recipient?: import("@gaugewright/control-plane-client").CollectionRecipient): Promise<PlacementId>;
+    ensureCollectionRecipient?(recipientId: string): Promise<import("@gaugewright/control-plane-client").CollectionRecipient>;
 }
 
 export function FacetBrowser(props: {
     api: FacetBrowserApi;
     selected: EngagementId | null;
     onSelect: (id: EngagementId) => void;
-    onOpenArchetypeSettings: (id: ArchetypeId, name: string) => void;
+    onOpenArchetypeSettings: (id: ArchetypeId, name: string, kind: AgentKind) => void;
     /** Open the per-project Engagement pane (hand off / share a project, FED-7). */
     onOpenEngagement: (id: ProjectId, name: string) => void;
     onOpenModelAccess: (id: ProjectId, name: string) => void;
@@ -155,8 +158,12 @@ export function FacetBrowser(props: {
         projectName: string;
         placementId: PlacementId;
         archetypeName: string;
-        reviewChatId?: EngagementId;
+        version: number;
+        profile: import("@gaugewright/control-plane-client").PanelPublicProfile;
+        deployments: Workspace["projects"][number]["placements"][number]["deployments"];
     }) => void;
+    onPreviewPanel?: (agent: Workspace["archetypes"][number], project?: Workspace["projects"][number]) => void;
+    onOpenInbox?: (project: ProjectId, name: string) => void;
     onAttachTarget?: (id: ProjectId, name: string, kind: "external-vcs" | "external-folder") => void;
     onOpenForkTree: (chat: EngagementId) => void;
     onChatDeleted: (id: EngagementId) => void;
@@ -393,6 +400,7 @@ export function FacetBrowser(props: {
         document.removeEventListener("pointerup", finishPointerDrag);
     });
     const [editText, setEditText] = createSignal("");
+    const [newAgentKind, setNewAgentKind] = createSignal<AgentKind>("work");
 
     // The "add a method" picker (#1): from a project, choose *which* archetype to
     // install on it, rather than the app silently placing an arbitrary one. (The
@@ -508,10 +516,10 @@ export function FacetBrowser(props: {
         if (!e || !text) return;
         switch (e.kind) {
             case "new-archetype":
-                // "method" everywhere in the user-facing string (round-6 #3): the
-                // create flow says "+ archetype" / "place this method" — the success
-                // toast must not leak the implementation word "archetype".
-                return withRefresh(() => props.api.createArchetype(text), `archetype "${text}" created`);
+                return withRefresh(
+                    () => props.api.createArchetype(text, newAgentKind()),
+                    `${newAgentKind() === "panel" ? "Panel agent" : "Agent"} "${text}" created`,
+                );
             case "new-project":
                 return withRefresh(() => props.api.createProject(text), `project "${text}" created`);
             case "rename-archetype":
@@ -623,7 +631,7 @@ export function FacetBrowser(props: {
         await withRefresh(async () => {
             const id = await props.api.createChatUnderArchetype(archetypeId, "edit chat");
             props.onSelect(id);
-        }, "editing this archetype");
+        }, "editing this Agent");
     }
     // A WORK chat is rooted on a placement (do the job).
     function targetsForPlacement(placementId: PlacementId): WorkTargetNode[] {
@@ -743,7 +751,14 @@ export function FacetBrowser(props: {
             placeholder={placeholder}
             value={editText()}
             onInput={(ev) => setEditText(ev.currentTarget.value)}
-            onBlur={commitEdit}
+            onBlur={() => {
+                // Creating an Agent includes a kind selector beside this input.
+                // Moving focus to that selector is still part of the same form,
+                // not an implicit submit/cancel. Agent creation is therefore
+                // confirmed explicitly with Enter; ordinary renames and the
+                // single-field create rows keep the familiar blur-to-commit.
+                if (editing()?.kind !== "new-archetype") void commitEdit();
+            }}
             onClick={(ev) => ev.stopPropagation()}
             onKeyDown={(ev) => {
                 if (ev.key === "Enter") commitEdit();
@@ -858,21 +873,21 @@ export function FacetBrowser(props: {
             ] : []),
             ...(lens === "chats"
                 ? p.placements
-                    .filter((pl) => !pl.isDefault)
+                    .filter((pl) => !pl.isDefault && pl.kind === "work")
                     .map((pl) => ({
                         label: `new chat with ${pl.archetypeName}`,
-                        hint: "Start a chat rooted on this archetype's placement in this project",
+                        hint: "Start a chat rooted on this Agent's placement in this project",
                         run: () => void newWorkChat(p.id, pl.placementId),
                     }))
                 : []),
             {
-                label: lens === "chats" ? "group by archetype" : "flat chats",
+                label: lens === "chats" ? "group by Agent" : "flat chats",
                 hint: lens === "chats"
                     ? "Show this project's placements as structure (workstreams, drag, merge live there)"
                     : "Show this project's chats as one flat, current-first list",
                 run: () => setLens(p.id, lens === "chats" ? "archetype" : "chats"),
             },
-            { label: "add an archetype", run: () => openAddMethod(p.id, p.name) },
+            { label: "add an agent", run: () => openAddMethod(p.id, p.name) },
             ...(props.onAttachTarget ? [
                 { label: "attach Git repository…", hint: "Use its native Git history and explicit apply lifecycle", run: () => props.onAttachTarget?.(p.id, p.name, "external-vcs" as const) },
                 { label: "attach folder…", hint: "Fingerprint the folder and compare before every write", run: () => props.onAttachTarget?.(p.id, p.name, "external-folder" as const) },
@@ -888,49 +903,114 @@ export function FacetBrowser(props: {
     };
 
     // A placement row's menu (shared by right-click and the row's ⋯ button).
-    const placementMenuItems = (p: ProjectNode, pl: ProjectNode["placements"][number]): MenuState["items"] => [
+    const placementMenuItems = (p: ProjectNode, pl: ProjectNode["placements"][number]): MenuState["items"] => pl.kind === "panel" ? [
+        ...(props.onPreviewPanel ? [{ label: "preview", hint: "Run the pinned public contract without writing production Inbox data", run: () => {
+            const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
+            if (agent) props.onPreviewPanel?.(agent, p);
+        } }] : []),
+        ...(props.onDeployPlacement && pl.panelProfile ? [{
+            label: pl.deployments.length ? "manage deployments…" : "deploy…",
+            hint: "Publish this pinned Panel-agent version for this project",
+            run: () => props.onDeployPlacement?.({
+                projectId: p.id,
+                projectName: p.name,
+                placementId: pl.placementId,
+                archetypeName: pl.archetypeName,
+                version: pl.version,
+                profile: pl.panelProfile!,
+                deployments: pl.deployments,
+            }),
+        }] : []),
+        ...(props.onOpenInbox ? [{ label: "inbox", hint: "Review public output held by this project's gate", run: () => props.onOpenInbox?.(p.id, p.name) }] : []),
+        ...(pl.upgradeAvailable ? [{ label: "upgrade to latest", run: () => void withRefresh(() => props.api.upgradePlacement(pl.placementId), "upgraded to the latest version") }] : []),
+        { label: "remove from project", danger: true, run: () => void withRefresh(() => props.api.removePlacement(p.id, pl.placementId), "removed") },
+    ] : [
         { label: "new chat", hint: "Start a new chat on this placement", run: () => newWorkChat(p.id, pl.placementId) },
         { label: "new workstream", hint: "Create a shared auto-sync line for chats here to collaborate on", run: () => startEdit({ kind: "new-workstream", placementId: pl.placementId }) },
         { label: "edit", run: () => newEditChat(pl.archetypeId) },
         { label: "customize…", hint: "Tweak this method for this project — config + notes, no fork (placement.md)", run: () => void openConfig(pl.placementId, `${pl.archetypeName} · ${p.name}`) },
-        ...(props.onDeployPlacement
-            ? [{
-                label: "deploy to website…",
-                hint: "Publish this tested agent as an embeddable panel",
-                run: () => props.onDeployPlacement?.({
-                    projectId: p.id,
-                    projectName: p.name,
-                    placementId: pl.placementId,
-                    archetypeName: pl.archetypeName,
-                    reviewChatId: pl.chats[0]?.id,
-                }),
-            }]
-            : []),
         ...(pl.pending
-            ? [{ label: "accept", hint: "Approve this archetype so it can host work chats (APPROVE-1)", run: () => void withRefresh(() => props.api.acceptPlacement(pl.placementId), "placement accepted") }]
+            ? [{ label: "accept", hint: "Approve this Agent so it can host work chats (APPROVE-1)", run: () => void withRefresh(() => props.api.acceptPlacement(pl.placementId), "placement accepted") }]
             : []),
         ...(pl.upgradeAvailable
-            ? [{ label: "upgrade to latest", hint: `Take the newer published version (v${pl.currentVersion}) of this archetype`, run: () => void withRefresh(() => props.api.upgradePlacement(pl.placementId), "upgraded to the latest version") }]
+            ? [{ label: "upgrade to latest", hint: `Take the newer published version (v${pl.currentVersion}) of this Agent`, run: () => void withRefresh(() => props.api.upgradePlacement(pl.placementId), "upgraded to the latest version") }]
             : []),
         { label: "remove from project", danger: true, run: () => void withRefresh(() => props.api.removePlacement(p.id, pl.placementId), "removed") },
     ];
 
+    const panelPlacementRow = (p: ProjectNode, pl: ProjectNode["placements"][number]) => (
+        <div class="tree-subgroup" data-placement={pl.placementId}>
+            <div
+                class="tree-node placement"
+                classList={{ "row-hot": hotRow() === pl.placementId }}
+                onPointerEnter={() => setHotRow(pl.placementId)}
+                onPointerLeave={() => setHotRow((value) => value === pl.placementId ? null : value)}
+                role="treeitem"
+                tabindex="0"
+                aria-label={`Panel agent ${pl.archetypeName} on ${p.name}`}
+                title="Preview, deploy, manage, or open Inbox"
+                onClick={() => {
+                    const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
+                    if (agent) props.onPreviewPanel?.(agent, p);
+                }}
+                onKeyDown={(event) => {
+                    if (event.key !== "Enter" && event.key !== " ") return;
+                    event.preventDefault();
+                    const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
+                    if (agent) props.onPreviewPanel?.(agent, p);
+                }}
+                onContextMenu={(event) => openMenu(event, placementMenuItems(p, pl))}
+            >
+                <span class="node-label" data-lineage-archetype={pl.archetypeId}>{mark(pl.archetypeName)}</span>
+                <span class="cfg-badge">Panel agent</span>
+                <Show when={pl.upgradeAvailable}><button
+                    class="upgrade-badge"
+                    data-upgrade-available={pl.placementId}
+                    title={`v${pl.version} → v${pl.currentVersion} available — click to upgrade`}
+                    onClick={(event) => {
+                        event.stopPropagation();
+                        void withRefresh(() => props.api.upgradePlacement(pl.placementId), "upgraded to the latest version");
+                    }}
+                >update available</button></Show>
+                {rowActions({
+                    primary: props.onPreviewPanel ? {
+                        icon: "robot",
+                        title: "Preview this Panel agent",
+                        aria: `preview ${pl.archetypeName}`,
+                        data: "preview-panel-agent",
+                        run: () => {
+                            const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
+                            if (agent) props.onPreviewPanel?.(agent, p);
+                        },
+                    } : undefined,
+                    menuAria: `actions for ${pl.archetypeName} on ${p.name}`,
+                    menuItems: () => placementMenuItems(p, pl),
+                })}
+            </div>
+        </div>
+    );
+
     // A Library archetype row's menu (shared by right-click and the ⋯ button).
     type ArchetypeNode = Workspace["archetypes"][number];
     const archetypeMenuItems = (a: ArchetypeNode): MenuState["items"] => [
-        { label: "test", hint: "Try this method out — opens a chat that runs it (in your Personal space)", run: () => void useArchetype(a.id) },
-        { label: "edit", hint: "Open a chat to edit what this archetype does — you review every change before it's kept", run: () => newEditChat(a.id) },
+        ...(a.kind === "work"
+            ? [{ label: "test", hint: "Try this Agent in a Personal work chat", run: () => void useArchetype(a.id) }]
+            : props.onPreviewPanel
+                ? [{ label: "preview", hint: "Run the disposable public contract without creating a project or production Inbox data", run: () => props.onPreviewPanel?.(a) }]
+                : []),
+        { label: "edit", hint: "Open a chat to edit what this Agent does — you review every change before it's kept", run: () => newEditChat(a.id) },
         { label: "new workstream", hint: "Create a shared auto-sync line over this method's edit chats", run: () => startEdit({ kind: "new-workstream", placementId: a.instanceId }) },
-        { label: "settings", run: () => props.onOpenArchetypeSettings(a.id, a.name) },
+        { label: "settings", run: () => props.onOpenArchetypeSettings(a.id, a.name, a.kind) },
         { label: "publish a new version", hint: "Make this the current version — placements of it get an upgrade-available notice (UX-9)", run: () => void withRefresh(() => props.api.publishArchetype(a.id), "published a new version") },
-        { label: "fork", run: () => void withRefresh(() => props.api.forkArchetype(a.id), "archetype forked") },
+        ...(a.kind === "work" ? [{ label: "copy as Panel agent", run: () => void withRefresh(() => props.api.copyAgentAsPanel(a.id), "Panel agent created") }] : []),
+        { label: "fork", run: () => void withRefresh(() => props.api.forkArchetype(a.id), "Agent forked") },
         ...(a.forkedFrom
             ? [{ label: "pull updates from source", hint: `Merge improvements from “${a.forkedFromName ?? "the source"}” into this fork (ADR 0038)`, run: () => void withRefresh(() => props.api.pullFromSource(a.id), "pulled updates from the source") }]
             : []),
         { label: "rename", run: () => startEdit({ kind: "rename-archetype", id: a.id }, a.name) },
         ...(a.isDefault
             ? []
-            : [{ label: "delete", danger: true, run: () => void withRefresh(() => props.api.deleteArchetype(a.id), "archetype deleted") }]),
+            : [{ label: "delete", danger: true, run: () => void withRefresh(() => props.api.deleteArchetype(a.id), "Agent deleted") }]),
     ];
 
     // The flat `chats` lens body (ADR 0112, NAVLENS-1): every work chat in the
@@ -1164,7 +1244,7 @@ export function FacetBrowser(props: {
                 {renameInput()}
             </Show>
             <Show when={meta}>
-                <span class="leaf-meta" title={`runs the ${meta} archetype`}>{meta}</span>
+                <span class="leaf-meta" title={`runs the ${meta} Agent`}>{meta}</span>
             </Show>
         </div>
         {/* Create-a-workstream-from-this-chat (WS-H): the cross-cutting way to start a
@@ -1403,7 +1483,7 @@ export function FacetBrowser(props: {
                 <input
                     class="facet-search"
                     data-testid="facet-search"
-                    aria-label="Search projects, archetypes, and chats"
+                    aria-label="Search projects, Agents, and chats"
                     placeholder="search…"
                     value={query()}
                     onInput={(e) => setQuery(e.currentTarget.value)}
@@ -1501,12 +1581,12 @@ export function FacetBrowser(props: {
                                                         data-lens-toggle={p.id}
                                                         data-lens={lensOf(p.id)}
                                                         title={lensOf(p.id) === "chats"
-                                                            ? "Flat chats — click to group by archetype"
-                                                            : "Grouped by archetype — click for flat chats"}
+                                                            ? "Flat chats — click to group by Agent"
+                                                            : "Grouped by Agent — click for flat chats"}
                                                         aria-label={`change how ${p.name} is grouped`}
                                                         onClick={(e) => { e.stopPropagation(); setLens(p.id, lensOf(p.id) === "chats" ? "archetype" : "chats"); }}
                                                     >
-                                                        {lensOf(p.id) === "chats" ? "chats" : "by archetype"}
+                                                        {lensOf(p.id) === "chats" ? "chats" : "by Agent"}
                                                     </button>
                                                 ),
                                                 primary: canStartProjectChat(p)
@@ -1535,6 +1615,14 @@ export function FacetBrowser(props: {
                                             <div class="project-home" data-project-home={p.id} data-project-lens="chats">
                                                 {flatProjectChats(p)}
                                             </div>
+                                            <Show when={p.placements.some((placement) => placement.kind === "panel")}>
+                                                <div class="status panel-agents-heading">Panel agents</div>
+                                                <For each={p.placements.filter((placement) =>
+                                                    placement.kind === "panel"
+                                                    && placementVisible(p.name, placement, query(), contentHits()))}>
+                                                    {(placement) => panelPlacementRow(p, placement)}
+                                                </For>
+                                            </Show>
                                         </Show>
                                         <Show when={lensOf(p.id) === "archetype"}>
                                         {/* The structural `by archetype` lens: the project's general
@@ -1568,36 +1656,47 @@ export function FacetBrowser(props: {
                                                         onPointerLeave={() => setHotRow((v) => (v === pl.placementId ? null : v))}
                                                         role="treeitem"
                                                         tabindex="0"
-                                                        aria-expanded={pl.chats.length > 0 ? !isCollapsed(pl.placementId) : undefined}
+                                                        aria-expanded={pl.kind === "work" && pl.chats.length > 0 ? !isCollapsed(pl.placementId) : undefined}
                                                         aria-label={
-                                                            pl.chats.length > 0
-                                                                ? `archetype ${pl.archetypeName} on ${p.name} — open its chats`
-                                                                : `archetype ${pl.archetypeName} on ${p.name} — start a chat`
+                                                            pl.kind === "panel"
+                                                                ? `Panel agent ${pl.archetypeName} on ${p.name}`
+                                                                : pl.chats.length > 0
+                                                                ? `Agent ${pl.archetypeName} on ${p.name} — open its chats`
+                                                                : `Agent ${pl.archetypeName} on ${p.name} — start a chat`
                                                         }
-                                                        title={pl.chats.length > 0 ? "open this archetype's chats" : "start a chat with this archetype"}
+                                                        title={pl.kind === "panel" ? "Preview, deploy, manage, or open Inbox" : pl.chats.length > 0 ? "open this Agent's chats" : "start a chat with this Agent"}
                                                         // Clicking the row is the obvious "start working" path: with no
                                                         // chats yet it opens a new work chat; otherwise it reveals the
                                                         // existing ones (the `+ chat` button always adds another).
                                                         onClick={() =>
-                                                            pl.chats.length > 0
+                                                            pl.kind === "panel"
+                                                                ? (() => {
+                                                                    const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
+                                                                    if (agent) props.onPreviewPanel?.(agent, p);
+                                                                })()
+                                                                : pl.chats.length > 0
                                                                 ? toggleCollapse(pl.placementId)
                                                                 : void newWorkChat(p.id, pl.placementId)
                                                         }
                                                         onKeyDown={(e) => {
                                                             if (e.key === "Enter" || e.key === " ") {
                                                                 e.preventDefault();
-                                                                if (pl.chats.length > 0) toggleCollapse(pl.placementId);
+                                                                if (pl.kind === "panel") {
+                                                                    const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
+                                                                    if (agent) props.onPreviewPanel?.(agent, p);
+                                                                } else if (pl.chats.length > 0) toggleCollapse(pl.placementId);
                                                                 else void newWorkChat(p.id, pl.placementId);
                                                             }
                                                         }}
                                                         onContextMenu={(e) => openMenu(e, placementMenuItems(p, pl))}
                                                     >
-                                                        {caret(pl.placementId, pl.chats.length > 0)}
+                                                        {caret(pl.placementId, pl.kind === "work" && pl.chats.length > 0)}
                                                         {/* Just the method name here (round-6 #6): this row is
                                                             already nested under its project, so the "· project"
                                                             half of the old lineage was redundant noise. Keep a
                                                             stable hook for the pivot via the data attribute. */}
-                                                        <span class="node-label" data-lineage-archetype={pl.archetypeId} title="the archetype this placement runs">{mark(pl.archetypeName)}</span>
+                                                        <span class="node-label" data-lineage-archetype={pl.archetypeId} title="the Agent this placement runs">{mark(pl.archetypeName)}</span>
+                                                        <Show when={pl.kind === "panel"}><span class="cfg-badge">Panel agent</span></Show>
                                                         {/* This placement carries client-specific config/notes
                                                             (config-only customization, no fork). */}
                                                         <Show when={pl.hasConfig}>
@@ -1609,7 +1708,7 @@ export function FacetBrowser(props: {
                                                             <button
                                                                 class="pending-badge"
                                                                 data-placement-pending={pl.placementId}
-                                                                title="Pending approval — click to accept so this archetype can host work chats"
+                                                                title="Pending approval — click to accept so this Agent can host work chats"
                                                                 onClick={(e) => { e.stopPropagation(); void withRefresh(() => props.api.acceptPlacement(pl.placementId), "placement accepted"); }}
                                                             >
                                                                 pending — accept
@@ -1629,18 +1728,27 @@ export function FacetBrowser(props: {
                                                             </button>
                                                         </Show>
                                                         {rowActions({
-                                                            primary: {
+                                                            primary: pl.kind === "work" ? {
                                                                 icon: "robot",
-                                                                title: "Start a new chat with this archetype",
+                                                                title: "Start a new chat with this Agent",
                                                                 aria: `new chat with ${pl.archetypeName}`,
                                                                 data: "new-placement-chat",
                                                                 run: () => void newWorkChat(p.id, pl.placementId),
-                                                            },
+                                                            } : props.onPreviewPanel ? {
+                                                                icon: "robot",
+                                                                title: "Preview this Panel agent",
+                                                                aria: `preview ${pl.archetypeName}`,
+                                                                data: "preview-panel-agent",
+                                                                run: () => {
+                                                                    const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
+                                                                    if (agent) props.onPreviewPanel?.(agent, p);
+                                                                },
+                                                            } : undefined,
                                                             menuAria: `actions for ${pl.archetypeName} on ${p.name}`,
                                                             menuItems: () => placementMenuItems(p, pl),
                                                         })}
                                                     </div>
-                                                    <Show when={!isCollapsed(pl.placementId)}>
+                                                    <Show when={pl.kind === "work" && !isCollapsed(pl.placementId)}>
                                                         {wsEditorFor(pl.placementId)}
                                                         {/* Chats grouped by workstream (WS-F). */}
                                                         {chatGroups(
@@ -1665,15 +1773,21 @@ export function FacetBrowser(props: {
                                 over one archetype's edit chats, so it lives per-archetype (below),
                                 not at the Library root where there's no single target. */}
                             <div class="action-row" data-actions="library">
-                                {createBtn("+ archetype", () => startEdit({ kind: "new-archetype" }), { title: "Create a new archetype" })}
+                                {createBtn("+ agent", () => { setNewAgentKind("work"); startEdit({ kind: "new-archetype" }); }, { title: "Create an Agent or Panel agent" })}
                             </div>
                             </Show>
                             <Show when={editing()?.kind === "new-archetype"}>
-                                <div class="tree-leaf">{renameInput("name this archetype, then Enter")}</div>
+                                <div class="tree-leaf">
+                                    <div class="deployment-actions">
+                                        <button type="button" classList={{ active: newAgentKind() === "work" }} onMouseDown={(event) => event.preventDefault()} onClick={() => setNewAgentKind("work")}>Agent</button>
+                                        <button type="button" classList={{ active: newAgentKind() === "panel" }} onMouseDown={(event) => event.preventDefault()} onClick={() => setNewAgentKind("panel")}>Panel agent</button>
+                                    </div>
+                                    {renameInput(`name this ${newAgentKind() === "panel" ? "Panel agent" : "Agent"}, then Enter`)}
+                                </div>
                             </Show>
                             <For
                                 each={t().archetypes.filter((a) => archetypeVisible(a, query(), contentHits()))}
-                                fallback={<div class="status">no archetypes yet</div>}
+                                fallback={<div class="status">no Agents yet</div>}
                             >
                                 {(a) => (
                                     <div class="tree-group" data-archetype={a.id}>
@@ -1685,7 +1799,7 @@ export function FacetBrowser(props: {
                                             role="treeitem"
                                             tabindex="0"
                                             aria-expanded={archetypeHasChildren(a) ? !isCollapsed(a.id) : undefined}
-                                            aria-label={`archetype ${a.name}`}
+                                            aria-label={`${a.kind === "panel" ? "Panel agent" : "Agent"} ${a.name}`}
                                             onKeyDown={(e) => {
                                                 if ((e.key === "Enter" || e.key === " ") && archetypeHasChildren(a)) { e.preventDefault(); toggleCollapse(a.id); }
                                             }}
@@ -1698,6 +1812,7 @@ export function FacetBrowser(props: {
                                             >
                                                 {renameInput()}
                                             </Show>
+                                            <Show when={a.kind === "panel"}><span class="cfg-badge">Panel agent</span></Show>
                                             {rowActions({
                                                 primary: {
                                                     icon: "pencil",
@@ -1706,7 +1821,7 @@ export function FacetBrowser(props: {
                                                     data: "edit-archetype",
                                                     run: () => newEditChat(a.id),
                                                 },
-                                                menuAria: `actions for archetype ${a.name}`,
+                                                menuAria: `actions for Agent ${a.name}`,
                                                 menuItems: () => archetypeMenuItems(a),
                                             })}
                                         </div>
@@ -1863,15 +1978,15 @@ export function FacetBrowser(props: {
                             </div>
                             <p class="status" style={{ margin: "0 0 8px" }}>
                                 {pk().dir === "to-project"
-                                    ? "Choose which archetype this project should work with."
-                                    : "Choose which project to install this archetype on."}
+                                    ? "Choose an Agent to install on this project."
+                                    : "Choose a project for this Agent."}
                             </p>
                             <input
                                 class="picker-search"
                                 autofocus
                                 data-picker-search
-                                aria-label={pk().dir === "to-project" ? "Find an archetype to add" : "Find a project to place this archetype on"}
-                                placeholder={pk().dir === "to-project" ? "find an archetype…" : "find a project…"}
+                                aria-label={pk().dir === "to-project" ? "Find an Agent to add" : "Find a project for this Agent"}
+                                placeholder={pk().dir === "to-project" ? "find an Agent…" : "find a project…"}
                                 value={pickerQuery()}
                                 onInput={(e) => setPickerQuery(e.currentTarget.value)}
                             />
@@ -1884,28 +1999,28 @@ export function FacetBrowser(props: {
                                                 each={(tree()?.archetypes ?? []).filter((a) =>
                                                     a.name.toLowerCase().includes(pickerQuery().trim().toLowerCase()),
                                                 )}
-                                                fallback={<div class="status">No archetypes yet — create one in the Library first.</div>}
+                                                fallback={<div class="status">No Agents yet — create one in the Library first.</div>}
                                             >
                                                 {(a) => (
                                                     <button
                                                         type="button"
                                                         class="picker-row"
                                                         data-picker-archetype={a.id}
-                                                        onClick={() => placeChosen(p.pid, a.id, a.name)}
+                                                        onClick={() => placeChosen(p.pid, a)}
                                                     >
-                                                        {a.name}
+                                                        {a.name} <span class="muted">· {a.kind === "panel" ? "Panel agent" : "Agent"}</span>
                                                     </button>
                                                 )}
                                             </For>
                                             {/* Empty-library escape hatch: jump to the Library to
-                                                define a new method, so the picker is never a dead end. */}
+                                                define a new Agent, so the picker is never a dead end. */}
                                             <button
                                                 type="button"
                                                 class="picker-row picker-create"
                                                 data-picker-create
                                                 onClick={() => { setPicker(null); setFacet("library"); startEdit({ kind: "new-archetype" }); }}
                                             >
-                                                + create a new archetype
+                                                + create a new Agent
                                             </button>
                                         </>
                                     )}
@@ -1919,7 +2034,7 @@ export function FacetBrowser(props: {
     );
 
     function pickerTitle(p: NonNullable<ReturnType<typeof picker>>): string {
-        return `Add an archetype to ${p.projectName}`;
+        return `Add an Agent to ${p.projectName}`;
     }
 
     // Open the picker to add a method to a project (#1) — the user chooses *which*
@@ -1932,8 +2047,13 @@ export function FacetBrowser(props: {
         setPicker({ dir: "to-project", pid, projectName });
     }
     // Commit a placement once a method is chosen, then close the picker.
-    async function placeChosen(pid: ProjectId, archetypeId: ArchetypeId, label: string) {
+    async function placeChosen(pid: ProjectId, agent: Workspace["archetypes"][number]) {
         setPicker(null);
-        await withRefresh(() => props.api.placeArchetype(pid, archetypeId), `placed ${label}`);
+        await withRefresh(async () => {
+            const recipient = agent.kind === "panel" && agent.panelProfile?.collection
+                ? await props.api.ensureCollectionRecipient?.(`${pid}-${agent.id}`)
+                : undefined;
+            await props.api.placeArchetype(pid, agent.id, recipient);
+        }, `placed ${agent.name}`);
     }
 }

@@ -29,8 +29,8 @@ export function keptLabel(chatKind: ChatKind | undefined, methodName: string | u
     if (chatKind !== "edit") return "Kept into the shared copy";
     const method = (methodName ?? "").trim();
     return method
-        ? `Saved to the ${method} archetype — this now applies everywhere it's used`
-        : "Saved to the archetype — this now applies everywhere it's used";
+        ? `Saved to the ${method} Agent — this now applies everywhere it's used`
+        : "Saved to the Agent — this now applies everywhere it's used";
 }
 
 /** The merge phase in words the user can read. Falls back to the raw token for

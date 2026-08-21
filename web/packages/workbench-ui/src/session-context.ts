@@ -41,12 +41,11 @@ export interface SessionApi {
     listQuarantine?(project: string): Promise<QuarantineIndex>;
     /** One quarantined item's bytes, for a person to read. */
     readQuarantinedItem?(project: string, item: string): Promise<string>;
-    /** Carry a reviewer's verdict to the project's gate, which is what rules
-     *  (ADR 0117 §1). `chat` is the chat the review is acted from. */
+    /** Carry a reviewer's verdict to the project gate. Inbox custody and review
+     *  are project acts and do not require a work chat. */
     reviewQuarantinedItem?(
         project: string,
         item: string,
-        chat: EngagementId,
         verdict: "keep" | "flag",
     ): Promise<{ workspacePath: string | null }>;
     /** `getFile` plus the cut the read serves (SUB-6 §12) — the base a

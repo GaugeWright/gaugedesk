@@ -35,6 +35,7 @@ export const MOBILE_CONTROL_PLANE_INVENTORY = {
     getPlacementConfig: "projection",
     setPlacementConfig: "command",
     createArchetype: "command",
+    copyAgentAsPanel: "command",
     renameArchetype: "command",
     deleteArchetype: "command",
     forkArchetype: "command",
@@ -160,8 +161,12 @@ export class MobileControlPlane implements FacetBrowserApi {
         return workbenchClient.setPlacementConfig(this.workbenchTransport(), placementId, config, notes);
     }
 
-    createArchetype(name: string): Promise<ArchetypeId> {
-        return workbenchClient.createArchetype(this.workbenchTransport(), name);
+    createArchetype(name: string, kind?: import("@gaugewright/control-plane-client").AgentKind): Promise<ArchetypeId> {
+        return workbenchClient.createArchetype(this.workbenchTransport(), name, kind);
+    }
+
+    copyAgentAsPanel(id: ArchetypeId, name?: string): Promise<ArchetypeId> {
+        return workbenchClient.copyAgentAsPanel(this.workbenchTransport(), id, name);
     }
 
     renameArchetype(id: ArchetypeId, name: string): Promise<void> {
@@ -207,8 +212,8 @@ export class MobileControlPlane implements FacetBrowserApi {
         return workbenchClient.deleteProject(this.workbenchTransport(), id);
     }
 
-    placeArchetype(pid: ProjectId, archetypeId: ArchetypeId): Promise<PlacementId> {
-        return workbenchClient.placeArchetype(this.workbenchTransport(), pid, archetypeId);
+    placeArchetype(pid: ProjectId, archetypeId: ArchetypeId, recipient?: import("@gaugewright/control-plane-client").CollectionRecipient): Promise<PlacementId> {
+        return workbenchClient.placeArchetype(this.workbenchTransport(), pid, archetypeId, recipient);
     }
 
     removePlacement(pid: ProjectId, placementId: PlacementId): Promise<void> {

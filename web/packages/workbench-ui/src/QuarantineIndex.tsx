@@ -66,11 +66,6 @@ export function QuarantineIndex(props: { readonly project: string }) {
     );
 
     async function rule(item: string, verdict: "keep" | "flag") {
-        const chat = session.engagementId();
-        if (!chat) {
-            setMsg("open a chat first — a review is acted from one");
-            return;
-        }
         if (!session.api.reviewQuarantinedItem) {
             setMsg("this session cannot review inbound material");
             return;
@@ -80,7 +75,6 @@ export function QuarantineIndex(props: { readonly project: string }) {
             const ruled = await session.api.reviewQuarantinedItem(
                 props.project,
                 item,
-                chat,
                 verdict,
             );
             setOpen(null);

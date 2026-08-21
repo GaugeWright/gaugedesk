@@ -20,6 +20,10 @@ use whipplescript_store::skill_frontmatter::parse_skill_frontmatter;
 
 use crate::app_support::LockUnpoisoned;
 use crate::key_store::FileKeyStore;
+use crate::library::{
+    DeploymentAudience, DeploymentAudienceOidc, DeploymentBindingStatus,
+    DeploymentOperationalConfig, PlacementKind, PublicDeploymentBindingRecord, RecordOp,
+};
 use crate::library_state::{published_discipline_root, published_package_root};
 use crate::Workbench;
 
@@ -130,7 +134,9 @@ impl PublisherAuthorization {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleasePublishSpec {
     pub published_at_unix_ms: u64,
+    pub public_abilities: BTreeSet<String>,
     pub panels: PanelManifest,
+    pub audience_inputs: BTreeSet<String>,
     pub provider: ProviderPolicy,
     pub retention: RetentionPolicy,
     /// Exact selected initial session content. Paths are release-relative and
@@ -140,54 +146,8 @@ pub struct ReleasePublishSpec {
     pub collection: Option<CollectionPolicy>,
 }
 
-/// Owner input for a collecting deployment. The class is frozen into the
-/// release; the exact recipient reference belongs to the deployment record and
-/// must prove against that class before a session is admitted.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PublishCollection {
-    #[serde(default)]
-    pub exportable_paths: Vec<String>,
-    #[serde(default)]
-    pub transcript_eligible: bool,
-    pub schema_ref: String,
-    pub recipient_class: String,
-    pub max_artifact_bytes: u64,
-    /// Exact recipient reference this deployment seals to. Not release content.
-    pub recipient_ref: String,
-    /// Public halves of the tenant-held recipient keyring, hex SEC1 P-256.
-    /// Public by design; the private halves never leave the tenant.
-    pub recipient_public_keys: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PublishAudienceOidc {
-    pub issuer: String,
-    pub audience: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PublishAudience {
-    #[serde(default = "default_anonymous_audience")]
-    pub anonymous_allowed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oidc: Option<PublishAudienceOidc>,
-}
-
-fn default_anonymous_audience() -> bool {
-    true
-}
-
-impl Default for PublishAudience {
-    fn default() -> Self {
-        Self {
-            anonymous_allowed: true,
-            oidc: None,
-        }
-    }
-}
+pub type PublishAudience = DeploymentAudience;
+pub type PublishAudienceOidc = DeploymentAudienceOidc;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,7 +156,6 @@ pub struct PublishDeploymentRequest {
     pub deployment_id: String,
     pub edge_origin: String,
     pub allowed_origins: Vec<String>,
-    pub panel_ceiling: BTreeSet<String>,
     /// Optional aggregate, per-session, and per-turn monetary guards. The
     /// legacy reservation field is accepted as a per-turn guard so an older
     /// publisher keeps its exact behavior across ADR 0121.
@@ -206,14 +165,10 @@ pub struct PublishDeploymentRequest {
     pub max_session_spend_cents: Option<u64>,
     #[serde(default)]
     pub max_turn_spend_cents: Option<u64>,
-    #[serde(default)]
-    pub reserve_cents_per_turn: Option<u64>,
     pub per_visitor_turn_limit: u64,
     pub max_concurrent_sessions: u64,
     pub funding_ref: String,
-    pub credential_class: String,
     pub credential_ref: String,
-    pub model: String,
     /// Audience admission for the public deployment. Anonymous remains the
     /// compatibility default, while an explicit OIDC tuple is carried into the
     /// signed publisher request consumed by the edge.
@@ -221,25 +176,11 @@ pub struct PublishDeploymentRequest {
     pub audience: PublishAudience,
     #[serde(default)]
     pub white_label: bool,
-    /// Author ceiling frozen into the immutable release. A deployment may set a
-    /// shorter lease but never a longer one; the edge re-checks on admission.
-    #[serde(default = "default_idle_ttl_seconds")]
-    pub retention_idle_ttl_ceiling_seconds: u64,
-    #[serde(default = "default_absolute_ttl_seconds")]
-    pub retention_absolute_ttl_ceiling_seconds: u64,
-    /// Operative lease for this deployment, within the ceiling above.
+    /// Operative lease for this deployment, within the frozen version ceiling.
     #[serde(default = "default_idle_ttl_seconds")]
     pub retention_idle_ttl_seconds: u64,
     #[serde(default = "default_absolute_ttl_seconds")]
     pub retention_absolute_ttl_seconds: u64,
-    /// Release-declared permission for what the session may retain at all.
-    #[serde(default = "default_retained")]
-    pub transcript_retained: bool,
-    #[serde(default = "default_retained")]
-    pub workspace_retained: bool,
-    /// Absent means this deployment collects nothing.
-    #[serde(default)]
-    pub collection: Option<PublishCollection>,
 }
 
 fn default_idle_ttl_seconds() -> u64 {
@@ -250,12 +191,11 @@ fn default_absolute_ttl_seconds() -> u64 {
     2_592_000
 }
 
-fn default_retained() -> bool {
-    true
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct PublishDeploymentOutcome {
+    pub binding_id: String,
+    pub project_id: String,
+    pub placement_id: String,
     pub deployment_id: String,
     pub release_id: String,
     pub edge_origin: String,
@@ -298,6 +238,71 @@ pub struct InspectDeploymentRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ImportLegacyDeploymentRequest {
+    pub placement_id: String,
+    pub deployment_id: String,
+    pub edge_origin: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostedOperationalConfig {
+    #[serde(default)]
+    allowed_origins: Vec<String>,
+    #[serde(default)]
+    audience: DeploymentAudience,
+    funding_ref: String,
+    credential_class: String,
+    #[serde(default)]
+    credential_ref: String,
+    #[serde(default)]
+    max_spend_cents: Option<u64>,
+    #[serde(default)]
+    max_session_spend_cents: Option<u64>,
+    #[serde(default)]
+    max_turn_spend_cents: Option<u64>,
+    per_visitor_turn_limit: u64,
+    max_concurrent_sessions: u64,
+    #[serde(default)]
+    white_label: bool,
+    retention: HostedRetentionConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostedRetentionConfig {
+    idle_ttl_seconds: u64,
+    absolute_ttl_seconds: u64,
+}
+
+fn operational_from_hosted_config(
+    hosted_config: serde_json::Value,
+    expected_credential_class: &str,
+) -> io::Result<DeploymentOperationalConfig> {
+    let hosted: HostedOperationalConfig = serde_json::from_value(hosted_config)
+        .map_err(|error| invalid(format!("hosted operational config is incomplete: {error}")))?;
+    if hosted.credential_class != expected_credential_class {
+        return Err(invalid(
+            "hosted provider posture does not match the selected Panel-agent version",
+        ));
+    }
+    Ok(DeploymentOperationalConfig {
+        allowed_origins: hosted.allowed_origins,
+        audience: hosted.audience,
+        funding_ref: hosted.funding_ref,
+        credential_class: hosted.credential_class,
+        credential_ref: hosted.credential_ref,
+        max_spend_cents: hosted.max_spend_cents,
+        max_session_spend_cents: hosted.max_session_spend_cents,
+        max_turn_spend_cents: hosted.max_turn_spend_cents,
+        per_visitor_turn_limit: hosted.per_visitor_turn_limit,
+        max_concurrent_sessions: hosted.max_concurrent_sessions,
+        white_label: hosted.white_label,
+        retention_idle_ttl_seconds: hosted.retention.idle_ttl_seconds,
+        retention_absolute_ttl_seconds: hosted.retention.absolute_ttl_seconds,
+    })
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlDeploymentRequest {
     pub deployment_id: String,
     pub edge_origin: String,
@@ -333,19 +338,9 @@ pub struct DrainCollectionsRequest {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectIntoProjectRequest {
-    pub deployment_id: String,
-    pub edge_origin: String,
-    /// The project whose quarantine receives these artifacts. They arrive
-    /// awaiting the gate, reachable by no agent.
-    pub project_id: String,
-    /// The recipient whose privately held half opens them.
-    pub recipient_id: String,
-    /// The opaque admission scope the sessions sealed under. A wrap is bound to
-    /// it, so the wrong scope fails to open rather than opening something else.
-    pub admission_scope: String,
-    /// This Home's own copy of the release's schema identity. The hosted side
-    /// already checked; its verdict is not what we act on.
-    pub schema_ref: String,
+    /// Local project-owned deployment authority. Project, edge, hosted id,
+    /// recipient, schema and admission scope are resolved from this record.
+    pub binding_id: String,
     #[serde(default)]
     pub after_unix_ms: Option<u64>,
 }
@@ -617,7 +612,12 @@ impl Workbench {
                 package.system_prompt_document().as_bytes().to_vec(),
             ),
         ];
-        let required = package_abilities;
+        if !spec.public_abilities.is_subset(&package_capabilities) {
+            return Err(invalid(
+                "public ability ceiling exceeds the package capability registry",
+            ));
+        }
+        let required = spec.public_abilities.clone();
         let signing_key = self.public_publisher_signing_key()?;
         let policy_principal = gaugedesk_whip_runtime::ResourcePolicy {
             reader: BTreeSet::from(["audience".to_owned()]),
@@ -743,6 +743,7 @@ impl Workbench {
                 ceiling: required,
             },
             panels: spec.panels,
+            audience_inputs: spec.audience_inputs,
             provider: spec.provider,
             retention: spec.retention,
             collection: spec.collection,
@@ -761,11 +762,42 @@ impl Workbench {
     /// The account root key never leaves the Workbench key store. Every edge
     /// mutation receives a fresh detached signature over its exact request.
     pub fn publish_agent_deployment(
-        &self,
+        &mut self,
         request: PublishDeploymentRequest,
     ) -> io::Result<PublishDeploymentOutcome> {
         validate_deployment_id(&request.deployment_id)?;
         let edge = normalized_edge(&request.edge_origin)?;
+        let placement = self
+            .library
+            .instances
+            .get(&request.placement_id)
+            .filter(|instance| {
+                instance.kind == crate::library::InstanceKind::Using
+                    && instance.placement_kind == PlacementKind::Panel
+            })
+            .cloned()
+            .ok_or_else(|| invalid("deployment requires a Panel-agent project placement"))?;
+        let project_id = placement
+            .project_id
+            .clone()
+            .filter(|project| !project.is_empty())
+            .ok_or_else(|| invalid("panel placement has no owning project"))?;
+        let agent = self
+            .library
+            .agents
+            .get(&placement.agent_id)
+            .ok_or_else(|| not_found("panel agent does not exist"))?;
+        let profile = agent
+            .versions
+            .get(&placement.version)
+            .and_then(|version| version.panel_profile.clone())
+            .ok_or_else(|| invalid("panel placement has no frozen public profile"))?;
+        let recipient = placement.collection_recipient.clone();
+        if profile.collection.is_some() && recipient.is_none() {
+            return Err(invalid(
+                "collecting panel placement has no exact project recipient",
+            ));
+        }
         if request.allowed_origins.is_empty()
             || request.allowed_origins.iter().any(|origin| {
                 !origin.starts_with("https://")
@@ -778,44 +810,30 @@ impl Workbench {
                 "allowed origins must be exact HTTPS origins without paths or trailing slashes",
             ));
         }
-        let supported_panels = BTreeSet::from([
-            "gw-chat".to_owned(),
-            "gw-viewer".to_owned(),
-            "gw-files".to_owned(),
-            "gw-chats".to_owned(),
-        ]);
-        if request.panel_ceiling.is_empty() || !request.panel_ceiling.is_subset(&supported_panels) {
-            return Err(invalid("panel ceiling contains an unsupported component"));
-        }
-        if let Some(collection) = &request.collection {
-            if collection.recipient_ref.trim().is_empty()
-                || collection.recipient_public_keys.is_empty()
-                || collection.recipient_public_keys.iter().any(|key| {
+        if let Some(recipient) = &recipient {
+            if recipient.recipient_ref.trim().is_empty()
+                || recipient.recipient_public_keys.is_empty()
+                || recipient.recipient_public_keys.iter().any(|key| {
                     key.len() < 2
                         || key.len() % 2 != 0
                         || !key.chars().all(|c| c.is_ascii_hexdigit())
                 })
             {
                 return Err(invalid(
-                    "collection requires an exact recipient reference and hex public recipient keys",
+                    "collection requires an exact project recipient and hex public keys",
                 ));
             }
         }
         if request.retention_idle_ttl_seconds == 0
             || request.retention_absolute_ttl_seconds < request.retention_idle_ttl_seconds
-            || request.retention_absolute_ttl_ceiling_seconds
-                < request.retention_idle_ttl_ceiling_seconds
-            || request.retention_idle_ttl_seconds > request.retention_idle_ttl_ceiling_seconds
-            || request.retention_absolute_ttl_seconds
-                > request.retention_absolute_ttl_ceiling_seconds
+            || request.retention_idle_ttl_seconds > profile.retention.idle_ttl_seconds
+            || request.retention_absolute_ttl_seconds > profile.retention.absolute_ttl_seconds
         {
             return Err(invalid(
                 "deployment retention must be positive, ordered, and within the release ceiling",
             ));
         }
-        let max_turn_spend_cents = request
-            .max_turn_spend_cents
-            .or(request.reserve_cents_per_turn);
+        let max_turn_spend_cents = request.max_turn_spend_cents;
         if [
             request.max_spend_cents,
             request.max_session_spend_cents,
@@ -827,11 +845,9 @@ impl Workbench {
             || request.per_visitor_turn_limit == 0
             || request.max_concurrent_sessions == 0
             || request.funding_ref.trim().is_empty()
-            || request.credential_class.trim().is_empty()
-            || request.model.trim().is_empty()
         {
             return Err(invalid(
-                "deployment funding, credential, quota, or model is invalid",
+                "deployment funding, credential, or quota is invalid",
             ));
         }
         // A managed plan funds the turn from GaugeWright's metered rail and the
@@ -858,12 +874,48 @@ impl Workbench {
         // pairing used to succeed and fail later, in front of a visitor, with
         // the reason recorded two systems away.
         if managed {
-            let route = crate::managed_inference::metered_route(&request.model);
-            if let Some(reason) =
-                crate::managed_inference::metered_pairing_error(&route.base_url, &route.model)
-            {
+            if profile.provider.provider != crate::managed_inference::METERED_GATEWAY_PROVIDER {
+                return Err(invalid(
+                    "managed funding requires a Panel-agent version authored for the metered gateway",
+                ));
+            }
+            if let Some(reason) = crate::managed_inference::metered_pairing_error(
+                &profile.provider.base_url,
+                &profile.provider.model,
+            ) {
                 return Err(invalid(reason));
             }
+        }
+
+        let path = format!("/v1/deployments/{}", request.deployment_id);
+        let inspected =
+            send_publisher_response(self, &edge, "GET", &path, &[], "application/json")?;
+        let existing = self
+            .library
+            .public_deployments
+            .values()
+            .find(|binding| {
+                binding.hosted_deployment_id == request.deployment_id && binding.edge_origin == edge
+            })
+            .cloned();
+        if existing
+            .as_ref()
+            .is_some_and(|binding| binding.placement_id != placement.id)
+        {
+            return Err(invalid(
+                "hosted deployment is already bound to a different Panel placement",
+            ));
+        }
+        if existing.is_none() && inspected.0 == 200 {
+            return Err(invalid(
+                "legacy hosted deployment requires import and project confirmation before update",
+            ));
+        }
+        if !matches!(inspected.0, 200 | 404) {
+            return Err(io::Error::other(format!(
+                "edge publisher rejected deployment inspection ({}): {}",
+                inspected.0, inspected.1
+            )));
         }
 
         let published_at_unix_ms = SystemTime::now()
@@ -872,70 +924,54 @@ impl Workbench {
             .as_millis()
             .try_into()
             .map_err(io::Error::other)?;
-        let default_panel = ["gw-chat", "gw-viewer", "gw-files", "gw-chats"]
-            .into_iter()
-            .find(|panel| request.panel_ceiling.contains(*panel))
-            .expect("non-empty panel ceiling was validated")
-            .to_owned();
         let release = self.build_agent_release(
             &request.placement_id,
             ReleasePublishSpec {
                 published_at_unix_ms,
-                panels: PanelManifest {
-                    components: request.panel_ceiling.clone(),
-                    default_component: default_panel,
-                    attribution: gaugedesk_core::agent_release::AttributionPolicy::GaugeWright,
-                },
-                // A managed-funded release is built for the metered gateway, and
-                // that is what makes it eligible to be paid from GaugeWright's
-                // credits: the edge refuses managed funding against any other
-                // provider, precisely so a plan cannot be declared over a release
-                // that egresses somewhere else (ADR 0085 §6, `FUND-1`).
-                provider: if managed {
-                    // The endpoint and the model name are chosen together: the
-                    // gateway's two surfaces spell models differently, and an
-                    // Anthropic model must reach the native one or it can never
-                    // use the prompt cache.
-                    let route = crate::managed_inference::metered_route(&request.model);
-                    ProviderPolicy {
-                        provider: crate::managed_inference::METERED_GATEWAY_PROVIDER.to_owned(),
-                        model: route.model,
-                        base_url: route.base_url,
-                        credential_class: request.credential_class.clone(),
-                        max_input_tokens: None,
-                        max_output_tokens: None,
-                    }
-                } else {
-                    ProviderPolicy {
-                        provider: "openai".to_owned(),
-                        model: request.model,
-                        base_url: "https://api.openai.com".to_owned(),
-                        credential_class: request.credential_class.clone(),
-                        max_input_tokens: None,
-                        max_output_tokens: None,
-                    }
-                },
-                retention: RetentionPolicy {
-                    idle_ttl_seconds: request.retention_idle_ttl_ceiling_seconds,
-                    absolute_ttl_seconds: request.retention_absolute_ttl_ceiling_seconds,
-                    transcript_retained: request.transcript_retained,
-                    workspace_retained: request.workspace_retained,
-                },
-                // Discipline assets under `workspace/` supply the fork; this
-                // spec field stays for explicitly selected extra content.
-                initial_workspace: Vec::new(),
-                collection: request
-                    .collection
-                    .as_ref()
-                    .map(|collection| CollectionPolicy {
-                        exportable_paths: collection.exportable_paths.clone(),
-                        transcript_eligible: collection.transcript_eligible,
-                        schema_ref: collection.schema_ref.clone(),
-                        recipient_class: collection.recipient_class.clone(),
-                        max_artifact_bytes: collection.max_artifact_bytes,
-                    }),
+                public_abilities: profile.public_abilities.clone(),
+                panels: profile.panels.clone(),
+                audience_inputs: profile.audience_inputs.clone(),
+                provider: profile.provider.clone(),
+                retention: profile.retention.clone(),
+                initial_workspace: profile.initial_workspace.clone(),
+                collection: profile.collection.clone(),
             },
         )?;
+
+        let operational = DeploymentOperationalConfig {
+            allowed_origins: request.allowed_origins.clone(),
+            audience: request.audience.clone(),
+            funding_ref: request.funding_ref.clone(),
+            credential_class: profile.provider.credential_class.clone(),
+            credential_ref: request.credential_ref.clone(),
+            max_spend_cents: request.max_spend_cents,
+            max_session_spend_cents: request.max_session_spend_cents,
+            max_turn_spend_cents,
+            per_visitor_turn_limit: request.per_visitor_turn_limit,
+            max_concurrent_sessions: request.max_concurrent_sessions,
+            white_label: request.white_label,
+            retention_idle_ttl_seconds: request.retention_idle_ttl_seconds,
+            retention_absolute_ttl_seconds: request.retention_absolute_ttl_seconds,
+        };
+        let binding_id = existing
+            .as_ref()
+            .map(|binding| binding.id.clone())
+            .unwrap_or_else(|| crate::library::gen_id("public-deployment"));
+        self.write_public_deployment_record(PublicDeploymentBindingRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            id: binding_id.clone(),
+            op: RecordOp::Upsert,
+            project_id: project_id.clone(),
+            placement_id: placement.id.clone(),
+            hosted_deployment_id: request.deployment_id.clone(),
+            edge_origin: edge.clone(),
+            active_release_id: existing
+                .as_ref()
+                .and_then(|binding| binding.active_release_id.clone()),
+            operational: operational.clone(),
+            status: DeploymentBindingStatus::PendingPublish,
+        })?;
         let release_bytes = release.canonical_bytes().map_err(io::Error::other)?;
         send_publisher_request(
             self,
@@ -958,7 +994,7 @@ impl Workbench {
             "deployment_id": request.deployment_id.clone(),
             "enabled": true,
             "allowed_origins": request.allowed_origins.clone(),
-            "panel_ceiling": request.panel_ceiling.clone(),
+            "panel_ceiling": profile.panels.components.clone(),
             "max_spend_cents": request.max_spend_cents,
             "max_session_spend_cents": request.max_session_spend_cents,
             "max_turn_spend_cents": max_turn_spend_cents,
@@ -966,7 +1002,7 @@ impl Workbench {
             "per_visitor_turn_limit": request.per_visitor_turn_limit,
             "max_concurrent_sessions": request.max_concurrent_sessions,
             "funding_ref": request.funding_ref.clone(),
-            "credential_class": request.credential_class.clone(),
+            "credential_class": profile.provider.credential_class.clone(),
             "credential_ref": request.credential_ref.clone(),
             "audience": request.audience.clone(),
             // Upstream cost plus GaugeWright's margin for fronting the metered
@@ -977,26 +1013,23 @@ impl Workbench {
             "retention": {
                 "idle_ttl_seconds": request.retention_idle_ttl_seconds,
                 "absolute_ttl_seconds": request.retention_absolute_ttl_seconds,
-                "transcript_retained": request.transcript_retained,
-                "workspace_retained": request.workspace_retained
+                "transcript_retained": profile.retention.transcript_retained,
+                "workspace_retained": profile.retention.workspace_retained
             },
             "white_label": request.white_label
         });
-        if let Some(collection) = &request.collection {
+        if let (Some(collection), Some(recipient)) = (&profile.collection, &recipient) {
             // The release carries the class; the deployment names the exact
             // recipient reference and the edge proves the class before a
             // session is admitted (ADR 0109 §7/§8).
             config["collection"] = serde_json::json!({
                 "schema_ref": collection.schema_ref.clone(),
                 "recipient_class": collection.recipient_class.clone(),
-                "recipient_ref": collection.recipient_ref.clone(),
-                "recipient_public_keys": collection.recipient_public_keys.clone(),
+                "recipient_ref": recipient.recipient_ref.clone(),
+                "recipient_public_keys": recipient.recipient_public_keys.clone(),
                 "max_artifact_bytes": collection.max_artifact_bytes,
             });
         }
-        let path = format!("/v1/deployments/{}", request.deployment_id);
-        let inspected =
-            send_publisher_response(self, &edge, "GET", &path, &[], "application/json")?;
         let response = match inspected {
             (404, _) => {
                 let body = serde_json::to_vec(&serde_json::json!({
@@ -1053,8 +1086,22 @@ impl Workbench {
         };
         let deployment: serde_json::Value = serde_json::from_str(&response).map_err(invalid)?;
         let deployment_url = format!("{edge}/d/{}", request.deployment_id);
-        let embed_html = customer_embed_html(&edge, &request.deployment_id, &request.panel_ceiling);
+        let embed_html =
+            customer_embed_html(&edge, &request.deployment_id, &profile.panels.components);
+        self.write_public_deployment_record(PublicDeploymentBindingRecord {
+            active_release_id: Some(release.release_id().to_owned()),
+            status: DeploymentBindingStatus::Active,
+            ..self
+                .library
+                .public_deployments
+                .get(&binding_id)
+                .cloned()
+                .ok_or_else(|| invalid("local deployment binding disappeared"))?
+        })?;
         Ok(PublishDeploymentOutcome {
+            binding_id,
+            project_id,
+            placement_id: placement.id,
             deployment_id: request.deployment_id.clone(),
             release_id: release.release_id().to_owned(),
             edge_origin: edge,
@@ -1079,6 +1126,115 @@ impl Workbench {
             "application/json",
         )?;
         serde_json::from_str(&response).map_err(invalid)
+    }
+
+    /// Confirm the owner-selected project and Panel placement for a hosted
+    /// deployment created before local bindings existed. Hosted identity and
+    /// active release remain unchanged; this only records the missing local
+    /// ownership after verifying the hosted functional surface against the
+    /// placement's pinned version.
+    pub fn import_legacy_public_deployment(
+        &mut self,
+        request: ImportLegacyDeploymentRequest,
+    ) -> io::Result<serde_json::Value> {
+        validate_deployment_id(&request.deployment_id)?;
+        let edge = normalized_edge(&request.edge_origin)?;
+        let placement = self
+            .library
+            .instances
+            .get(&request.placement_id)
+            .filter(|placement| {
+                placement.kind == crate::library::InstanceKind::Using
+                    && placement.placement_kind == PlacementKind::Panel
+            })
+            .cloned()
+            .ok_or_else(|| invalid("legacy import requires a Panel-agent placement"))?;
+        let project_id = placement
+            .project_id
+            .clone()
+            .ok_or_else(|| invalid("panel placement has no owning project"))?;
+        let profile = self
+            .library
+            .agents
+            .get(&placement.agent_id)
+            .and_then(|agent| agent.versions.get(&placement.version))
+            .and_then(|version| version.panel_profile.clone())
+            .ok_or_else(|| invalid("panel placement has no frozen public profile"))?;
+        if self.library.public_deployments.values().any(|binding| {
+            binding.hosted_deployment_id == request.deployment_id && binding.edge_origin == edge
+        }) {
+            return Err(invalid("hosted deployment already has a local binding"));
+        }
+        let path = format!("/v1/deployments/{}", request.deployment_id);
+        let response = send_publisher_request(self, &edge, "GET", &path, &[], "application/json")?;
+        let hosted: serde_json::Value = serde_json::from_str(&response).map_err(invalid)?;
+        let active_release_id = hosted
+            .pointer("/deployment/active_release_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|release| !release.is_empty())
+            .ok_or_else(|| invalid("hosted deployment inspection omitted its active release"))?
+            .to_owned();
+        let hosted_release = send_publisher_request(
+            self,
+            &edge,
+            "GET",
+            &format!("/v1/releases/{active_release_id}"),
+            &[],
+            "application/json",
+        )?;
+        let hosted_release: serde_json::Value =
+            serde_json::from_str(&hosted_release).map_err(invalid)?;
+        if hosted_release
+            .get("release_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(active_release_id.as_str())
+        {
+            return Err(invalid(
+                "hosted active release could not be verified for legacy import",
+            ));
+        }
+        let hosted_config = hosted
+            .pointer("/deployment/config")
+            .cloned()
+            .ok_or_else(|| invalid("hosted deployment inspection omitted its config"))?;
+        let hosted_panels = hosted_config
+            .get("panel_ceiling")
+            .and_then(serde_json::Value::as_array)
+            .map(|panels| {
+                panels
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+            })
+            .ok_or_else(|| invalid("hosted deployment inspection omitted its panel contract"))?;
+        if hosted_panels != profile.panels.components {
+            return Err(invalid(
+                "hosted deployment panels do not match the selected Panel-agent version",
+            ));
+        }
+        let binding_id = crate::library::gen_id("public-deployment");
+        let operational =
+            operational_from_hosted_config(hosted_config, &profile.provider.credential_class)?;
+        self.write_public_deployment_record(PublicDeploymentBindingRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            id: binding_id.clone(),
+            op: RecordOp::Upsert,
+            project_id: project_id.clone(),
+            placement_id: placement.id,
+            hosted_deployment_id: request.deployment_id.clone(),
+            edge_origin: edge,
+            active_release_id: Some(active_release_id.clone()),
+            operational,
+            status: DeploymentBindingStatus::Active,
+        })?;
+        Ok(serde_json::json!({
+            "binding_id": binding_id,
+            "project_id": project_id,
+            "deployment_id": request.deployment_id,
+            "active_release_id": active_release_id,
+        }))
     }
 
     /// Local custody for this account's collection recipient keys.
@@ -1178,10 +1334,10 @@ impl Workbench {
         &mut self,
         project_id: &str,
         item_id: &str,
-        chat_id: &str,
+        _chat_id: &str,
         verdict: crate::gate::Verdict,
     ) -> io::Result<Option<String>> {
-        self.apply_gate_verdict(project_id, item_id, chat_id, verdict)
+        self.apply_project_gate_verdict(project_id, item_id, verdict)
     }
 
     /// Move one item according to a verdict, and settle its quarantine record.
@@ -1195,17 +1351,34 @@ impl Workbench {
         &mut self,
         project_id: &str,
         item_id: &str,
-        chat_id: &str,
+        _chat_id: &str,
         verdict: crate::gate::Verdict,
     ) -> io::Result<Option<String>> {
-        if self.library_project_of_chat(chat_id).as_deref() != Some(project_id) {
-            return Err(invalid("that chat does not belong to this project"));
+        self.apply_project_gate_verdict(project_id, item_id, verdict)
+    }
+
+    /// Apply a project gate's verdict to the project-owned inbound area. A
+    /// work chat may be created later to act on approved material, but it is
+    /// neither the owner nor a prerequisite of this custody transition.
+    pub fn apply_project_gate_verdict(
+        &mut self,
+        project_id: &str,
+        item_id: &str,
+        verdict: crate::gate::Verdict,
+    ) -> io::Result<Option<String>> {
+        if !self.library.projects.contains_key(project_id) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such project"));
         }
         let worktree = self
-            .engagements
-            .get(chat_id)
-            .map(|engagement| engagement.path().to_path_buf())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such chat"))?;
+            .targets_dir()
+            .join(crate::library_state::managed_project_target_id(project_id))
+            .join("repo");
+        if !worktree.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "project inbound target is unavailable",
+            ));
+        }
         let payloads = self.quarantine_payloads();
         let landed = crate::gate::apply_verdict(
             &mut self.store,
@@ -1439,19 +1612,54 @@ pub fn collect_into_project(
 ) -> io::Result<CollectIntoProjectOutcome> {
     // Phase one: check out. Every value here is owned, so nothing below borrows
     // the workbench.
-    let (credential, seed, mut store, payloads) = {
+    let (credential, seed, mut store, payloads, binding, schema_ref) = {
         let guard = workbench.lock_unpoisoned();
+        let binding = guard
+            .library
+            .public_deployments
+            .get(&request.binding_id)
+            .filter(|binding| binding.status == DeploymentBindingStatus::Active)
+            .cloned()
+            .ok_or_else(|| not_found("no active public deployment binding"))?;
+        let placement = guard
+            .library
+            .instances
+            .get(&binding.placement_id)
+            .filter(|placement| {
+                placement.placement_kind == PlacementKind::Panel
+                    && placement.project_id.as_deref() == Some(binding.project_id.as_str())
+            })
+            .ok_or_else(|| {
+                invalid("deployment binding no longer resolves to its Panel placement")
+            })?;
+        let agent = guard
+            .library
+            .agents
+            .get(&placement.agent_id)
+            .ok_or_else(|| invalid("deployment binding's Panel agent is unavailable"))?;
+        let schema_ref = agent
+            .versions
+            .get(&placement.version)
+            .and_then(|version| version.panel_profile.as_ref())
+            .and_then(|profile| profile.collection.as_ref())
+            .map(|collection| collection.schema_ref.clone())
+            .ok_or_else(|| invalid("deployment's frozen version does not permit collection"))?;
+        let recipient_id = placement
+            .collection_recipient
+            .as_ref()
+            .map(|recipient| recipient.recipient_ref.clone())
+            .ok_or_else(|| invalid("deployment's Panel placement has no collection recipient"))?;
         let store = guard
             .store_ref()
             .sibling()
             .map_err(|error| io::Error::other(format!("open a drain store connection: {error}")))?;
         (
             guard.publisher_credential()?,
-            guard
-                .collection_recipients()
-                .open_seed(&request.recipient_id)?,
+            guard.collection_recipients().open_seed(&recipient_id)?,
             store,
             guard.quarantine_payloads(),
+            binding,
+            schema_ref,
         )
     };
 
@@ -1459,8 +1667,8 @@ pub fn collect_into_project(
     let drained = drain_collections_with(
         &credential,
         &DrainCollectionsRequest {
-            deployment_id: request.deployment_id.clone(),
-            edge_origin: request.edge_origin.clone(),
+            deployment_id: binding.hosted_deployment_id.clone(),
+            edge_origin: binding.edge_origin.clone(),
             after_unix_ms: request.after_unix_ms,
         },
     )?;
@@ -1519,8 +1727,8 @@ pub fn collect_into_project(
         let ingested = match crate::collection_recipient::ingest_sealed_collection(
             &sealed,
             &seed,
-            &request.admission_scope,
-            &request.schema_ref,
+            &binding.hosted_deployment_id,
+            &schema_ref,
         ) {
             Ok(ingested) => ingested,
             Err(error) => {
@@ -1532,13 +1740,16 @@ pub fn collect_into_project(
         let artifact_id = crate::quarantine::item_id(&ingested.session_id, ingested.revision);
         // Custody before disposition: an index entry pointing at bytes we do
         // not hold is worse than no entry at all.
-        if let Err(error) = payloads.put(&request.project_id, &artifact_id, &ingested.plaintext) {
+        if let Err(error) = payloads.put(&binding.project_id, &artifact_id, &ingested.plaintext) {
             refuse(format!("collected plaintext could not be held: {error}"));
             continue;
         }
         let item = crate::quarantine::QuarantinedItem {
             item_id: artifact_id.clone(),
-            source: format!("collection:{}", request.deployment_id),
+            source: format!("collection:{}", binding.hosted_deployment_id),
+            deployment_binding_id: Some(binding.id.clone()),
+            deployment_id: Some(binding.hosted_deployment_id.clone()),
+            public_session_id: Some(ingested.session_id.clone()),
             source_id: ingested.session_id.clone(),
             release_id: ingested.release_id.clone(),
             revision: ingested.revision,
@@ -1551,7 +1762,7 @@ pub fn collect_into_project(
             arrived_at_unix_ms: now,
             status: crate::quarantine::ItemStatus::Pending,
         };
-        match crate::quarantine::record(&mut store, &request.project_id, &item) {
+        match crate::quarantine::record(&mut store, &binding.project_id, &item) {
             Ok(true) => landed.push(artifact_id),
             Ok(false) => already_held.push(artifact_id),
             Err(error) => {
@@ -1571,8 +1782,8 @@ pub fn collect_into_project(
         acknowledge_collections_with(
             &credential,
             &AcknowledgeCollectionsRequest {
-                deployment_id: request.deployment_id.clone(),
-                edge_origin: request.edge_origin.clone(),
+                deployment_id: binding.hosted_deployment_id.clone(),
+                edge_origin: binding.edge_origin.clone(),
                 acknowledge,
             },
         )?
@@ -1586,18 +1797,18 @@ pub fn collect_into_project(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or_default();
 
-    let pending_attention = crate::quarantine::pending_count(&store, &request.project_id)
+    let pending_attention = crate::quarantine::pending_count(&store, &binding.project_id)
         .map_err(|error| io::Error::other(format!("{error:?}")))?;
 
     // Phase three: publish the change. The projection is stale until this runs,
     // which INV-5 permits — a projection is never authority.
     workbench
         .lock_unpoisoned()
-        .notify_library_changed("quarantine", &request.project_id, "upsert");
+        .notify_library_changed("quarantine", &binding.project_id, "upsert");
 
     Ok(CollectIntoProjectOutcome {
-        deployment_id: request.deployment_id,
-        project_id: request.project_id,
+        deployment_id: binding.hosted_deployment_id,
+        project_id: binding.project_id,
         waiting,
         landed,
         already_held,
@@ -1921,6 +2132,50 @@ mod publisher_tests {
                 }
             }),
         );
+    }
+
+    #[test]
+    fn legacy_import_copies_the_hosted_operational_record_instead_of_form_defaults() {
+        let operational = operational_from_hosted_config(
+            serde_json::json!({
+                "deployment_id": "existing",
+                "enabled": true,
+                "allowed_origins": ["https://customer.example"],
+                "panel_ceiling": ["gw-chat"],
+                "max_spend_cents": 900,
+                "max_session_spend_cents": 90,
+                "max_turn_spend_cents": 9,
+                "reserve_cents_per_turn": 5,
+                "per_visitor_turn_limit": 12,
+                "max_concurrent_sessions": 3,
+                "funding_ref": "funding:existing",
+                "credential_class": "openai-api-key",
+                "credential_ref": "credential:existing",
+                "audience": { "anonymous_allowed": false, "oidc": {
+                    "issuer": "https://identity.example", "audience": "customers"
+                }},
+                "pricing": {},
+                "retention": {
+                    "idle_ttl_seconds": 3_600,
+                    "absolute_ttl_seconds": 86_400,
+                    "transcript_retained": true,
+                    "workspace_retained": false
+                },
+                "white_label": true
+            }),
+            "openai-api-key",
+        )
+        .unwrap();
+
+        assert_eq!(operational.allowed_origins, ["https://customer.example"]);
+        assert_eq!(operational.funding_ref, "funding:existing");
+        assert_eq!(operational.credential_ref, "credential:existing");
+        assert_eq!(operational.max_turn_spend_cents, Some(9));
+        assert_eq!(operational.per_visitor_turn_limit, 12);
+        assert_eq!(operational.max_concurrent_sessions, 3);
+        assert!(operational.white_label);
+        assert_eq!(operational.retention_idle_ttl_seconds, 3_600);
+        assert_eq!(operational.retention_absolute_ttl_seconds, 86_400);
     }
 
     #[test]

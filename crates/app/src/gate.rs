@@ -514,6 +514,9 @@ mod tests {
         QuarantinedItem {
             item_id: id.to_owned(),
             source: "collection:dep-1".into(),
+            deployment_binding_id: None,
+            deployment_id: None,
+            public_session_id: None,
             source_id: "s1".into(),
             release_id: "rel-1".into(),
             revision: 1,

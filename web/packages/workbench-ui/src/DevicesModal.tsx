@@ -709,7 +709,7 @@ export function DevicesModal(props: {
                                 anything off this machine unasked.
                             </p>
                             <Show when={(d().manifest ?? []).length > 0}>
-                                <p class="status">Archetypes: {(d().manifest ?? []).join(", ")}</p>
+                                <p class="status">Agents: {(d().manifest ?? []).join(", ")}</p>
                             </Show>
                             <p class="status">
                                 Confirm code: <strong>{d().confirm_code}</strong> — check it matches what they

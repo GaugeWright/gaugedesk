@@ -87,7 +87,7 @@ export function outputs(resources: readonly ResourceView[]): ResourceView[] {
 export function kindLabel(kind: ResourceKind): string {
     switch (kind) {
         case "method":
-            return "archetype";
+            return "Agent";
         case "context":
             return "context";
         case "output":

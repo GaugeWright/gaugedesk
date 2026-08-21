@@ -403,12 +403,94 @@ Then("I see the project {string}", async ({ page }, name: string) => {
 
 When("I create an archetype named {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Library" }).click();
-    await page.getByText("+ archetype", { exact: true }).click();
+    await page.getByText("+ agent", { exact: true }).click();
     await page.locator(".inline-edit").fill(name);
     await page.locator(".inline-edit").press("Enter");
     await expect(
         page.locator("[data-archetype] .node-label", { hasText: new RegExp(`^${name}$`) }),
     ).toBeVisible();
+});
+
+When("I create a Panel agent named {string}", async ({ page }, name: string) => {
+    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.getByText("+ agent", { exact: true }).click();
+    await page.getByRole("button", { name: "Panel agent", exact: true }).click();
+    await page.locator(".inline-edit").fill(name);
+    await page.locator(".inline-edit").press("Enter");
+});
+
+Then("the Panel agent {string} is in the Library", async ({ page }, name: string) => {
+    const row = page.locator("[data-archetype]", { hasText: name });
+    await expect(row.locator(".node-label", { hasText: new RegExp(`^${name}$`) })).toBeVisible();
+    await expect(row.locator(".cfg-badge", { hasText: "Panel agent" })).toBeVisible();
+});
+
+When("I preview the Panel agent {string}", async ({ page }, name: string) => {
+    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator("[data-archetype]", { hasText: name }).locator(".tree-node.archetype").click({ button: "right" });
+    await page.locator(".menu-item-label", { hasText: /^preview$/ }).click();
+});
+
+Then("its disposable public preview is open", async ({ page }) => {
+    await expect(page.getByRole("dialog", { name: /Preview/ })).toBeVisible();
+    await expect(page.getByText(/Disposable public session/)).toBeVisible();
+});
+
+Then("the preview says it writes no production Inbox data", async ({ page }) => {
+    await expect(page.getByText(/does not enter a project Inbox/)).toBeVisible();
+});
+
+When("I close the Panel agent preview", async ({ page }) => {
+    await page.getByRole("dialog", { name: /Preview/ }).getByRole("button", { name: "Close" }).click();
+});
+
+When("I open settings for the Panel agent {string}", async ({ page }, name: string) => {
+    await page.locator("[data-archetype]", { hasText: name }).locator(".tree-node.archetype").click({ button: "right" });
+    await page.locator(".menu-item-label", { hasText: /^settings$/ }).click();
+});
+
+Then("its Panel contract editor is open", async ({ page }) => {
+    await expect(page.locator("[data-panel-public-profile]")).toBeVisible();
+    await expect(page.getByText("Published panels", { exact: true })).toBeVisible();
+    await expect(page.getByText("Project Inbox collection", { exact: true })).toBeVisible();
+});
+
+When("I close the Agent settings", async ({ page }) => {
+    await page.locator("[data-config-editor]").getByRole("button", { name: "close" }).click();
+});
+
+When("I place the Panel agent {string} on project {string}", async ({ page }, agent: string, project: string) => {
+    await page.locator(".facet", { hasText: "Projects" }).click();
+    await page.locator("[data-project]", { hasText: project }).locator(".tree-node.project").click({ button: "right" });
+    await page.locator(".menu-item-label", { hasText: /^add an agent$/ }).click();
+    await page.locator("[data-picker-archetype]", { hasText: agent }).click();
+});
+
+Then("project {string} has a Panel-agent placement without a new-chat action", async ({ page }, project: string) => {
+    const placement = page.locator("[data-project]", { hasText: project }).locator(".tree-subgroup[data-placement]", { hasText: "Panel agent" });
+    await expect(placement).toBeVisible();
+    await expect(placement.locator("[data-create='new-placement-chat']")).toHaveCount(0);
+    await expect(placement.locator("[data-create='preview-panel-agent']")).toBeVisible();
+});
+
+When("I open deployment for the Panel agent in project {string}", async ({ page }, project: string) => {
+    await page.locator("[data-project]", { hasText: project }).locator(".tree-subgroup[data-placement]", { hasText: "Panel agent" }).locator(".tree-node.placement").click({ button: "right" });
+    await page.locator(".menu-item-label", { hasText: /^deploy…$/ }).click();
+});
+
+Then("deployment shows the frozen public contract", async ({ page }) => {
+    await expect(page.getByRole("dialog", { name: "Deploy Panel agent" })).toBeVisible();
+    await expect(page.getByText("Frozen public contract", { exact: true })).toBeVisible();
+    await expect(page.getByText(/Deployment operates it; it does not redefine it/)).toBeVisible();
+});
+
+When("I open the deployment Inbox", async ({ page }) => {
+    await page.getByRole("dialog", { name: "Deploy Panel agent" }).getByRole("button", { name: "Open Inbox" }).click();
+});
+
+Then("the project Inbox for {string} is open", async ({ page }, project: string) => {
+    await expect(page.getByRole("dialog", { name: `${project} Inbox` })).toBeVisible();
+    await expect(page.getByText(/stays isolated until this project’s gate admits it/)).toBeVisible();
 });
 
 When("I create a project named {string}", async ({ page }, name: string) => {
@@ -439,7 +521,7 @@ When("I place an archetype on the project {string}", async ({ page }, name: stri
         .locator("[data-project]", { hasText: name })
         .locator(".tree-node.project")
         .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "add an archetype" }).click();
+    await page.locator(".menu-item", { hasText: "add an agent" }).click();
     await pickFirstMethod(page);
     await ensureArchetypeLens(page, name);
     await expect(
@@ -1469,7 +1551,7 @@ When("I open the add-method picker for project {string}", async ({ page }, name:
         .locator("[data-project]", { hasText: name })
         .locator(".tree-node.project")
         .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "add an archetype" }).click();
+    await page.locator(".menu-item", { hasText: "add an agent" }).click();
 });
 
 Then("the place picker is open", async ({ page }) => {

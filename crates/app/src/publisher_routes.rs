@@ -5,9 +5,9 @@ use axum::Json;
 use serde_json::json;
 
 use crate::agent_release::{
-    ControlDeploymentRequest, ErasePublicSessionRequest, InspectDeploymentRequest,
-    ListPublicCredentialsRequest, ProvisionPublicCredentialRequest, PublishDeploymentRequest,
-    RevokePublicCredentialRequest,
+    ControlDeploymentRequest, ErasePublicSessionRequest, ImportLegacyDeploymentRequest,
+    InspectDeploymentRequest, ListPublicCredentialsRequest, ProvisionPublicCredentialRequest,
+    PublishDeploymentRequest, RevokePublicCredentialRequest,
 };
 use crate::{LockUnpoisoned, SharedWorkbench};
 
@@ -33,6 +33,31 @@ pub async fn publish_deployment(
             };
             (status, Json(json!({ "error": error.to_string() }))).into_response()
         }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "publisher task failed" })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn import_legacy_deployment(
+    State(workbench): State<SharedWorkbench>,
+    Json(request): Json<ImportLegacyDeploymentRequest>,
+) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        workbench
+            .lock_unpoisoned()
+            .import_legacy_public_deployment(request)
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => (StatusCode::CREATED, Json(value)).into_response(),
+        Ok(Err(error)) => (
+            collection_status(&error),
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response(),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "publisher task failed" })),
@@ -261,15 +286,12 @@ pub async fn get_quarantined_item(
 
 #[derive(serde::Deserialize)]
 pub struct ReviewQuarantinedItem {
-    pub chat_id: String,
     /// `keep` or `flag`.
     pub verdict: String,
 }
 
 #[derive(serde::Deserialize)]
-pub struct ScreenQuarantinedItem {
-    pub chat_id: String,
-}
+pub struct ScreenQuarantinedItem {}
 
 /// Run this project's gate over one quarantined item (ADR 0117 §1).
 ///
@@ -285,7 +307,7 @@ pub struct ScreenQuarantinedItem {
 pub async fn screen_quarantined_item(
     State(workbench): State<SharedWorkbench>,
     axum::extract::Path((project_id, item_id)): axum::extract::Path<(String, String)>,
-    Json(request): Json<ScreenQuarantinedItem>,
+    Json(_request): Json<ScreenQuarantinedItem>,
 ) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         // Whether this pass needs a model is the *gate program's* business, not
@@ -297,12 +319,12 @@ pub async fn screen_quarantined_item(
         // obvious refusal from an unreachable host rather than a silent call
         // somewhere real.
         let coerce =
-            crate::gate_service::gate_coercion_config(&workbench, &request.chat_id, "gpt-4.1-mini")
+            crate::gate_service::gate_coercion_config(&workbench, &project_id, "gpt-4.1-mini")
                 .unwrap_or_else(|_| crate::gate_service::unusable_coercion_config());
         workbench.lock_unpoisoned().run_project_gate(
             &project_id,
             &item_id,
-            &request.chat_id,
+            "",
             &coerce,
             &crate::gate_service::HttpGateTransport,
         )
@@ -357,12 +379,12 @@ pub async fn review_quarantined_item(
         // so an absent one degrades to a config the human path never reaches
         // rather than refusing the request.
         let coerce =
-            crate::gate_service::gate_coercion_config(&workbench, &request.chat_id, "gpt-4.1-mini")
+            crate::gate_service::gate_coercion_config(&workbench, &project_id, "gpt-4.1-mini")
                 .unwrap_or_else(|_| crate::gate_service::unusable_coercion_config());
         workbench.lock_unpoisoned().review_through_gate(
             &project_id,
             &item_id,
-            &request.chat_id,
+            "",
             verdict,
             &coerce,
             &crate::gate_service::HttpGateTransport,

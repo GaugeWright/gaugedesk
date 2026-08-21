@@ -18,8 +18,9 @@ use gaugedesk_workspace::{ChatWorkspace, Instance, MergeOutcome, Workspace, Work
 use crate::attestation_verifier::{LoopbackVerifier, QuoteVerifier, RealQuoteVerifierError};
 use crate::boundary_keeper::{accept_boundary_attested, AcceptError};
 use crate::library::{
-    Admission, AgentRecord, ArchetypeVersionRecord, ChatRecord, ChatTargetBindingRecord,
-    InstanceKind, InstanceRecord, PlacementTargetsRecord, ProjectRecord, RecordOp,
+    Admission, AgentKind, AgentRecord, ArchetypeVersionRecord, ChatRecord, ChatTargetBindingRecord,
+    InstanceKind, InstanceRecord, PanelCollectionRecipient, PanelPublicProfile, PlacementKind,
+    PlacementTargetsRecord, ProjectRecord, PublicDeploymentBindingRecord, RecordOp,
     TargetCapabilities, TargetVcsPosture, WorkTargetKind, WorkTargetOwner, WorkTargetRecord,
     WorkTargetStatus, WorkstreamRecord, WorkstreamRootRecord, LIBRARY_SCOPE,
 };
@@ -70,7 +71,86 @@ fn published_archetype_version(
     Ok(ArchetypeVersionRecord {
         package_ref: package.version_ref().to_owned(),
         discipline_ref: discipline.reference,
+        panel_profile: None,
     })
+}
+
+fn validate_panel_profile(
+    profile: &PanelPublicProfile,
+    package_capabilities: &[String],
+) -> Result<(), String> {
+    let supported_panels = ["gw-chat", "gw-viewer", "gw-files", "gw-chats"];
+    if profile.panels.components.is_empty()
+        || !profile
+            .panels
+            .components
+            .contains(&profile.panels.default_component)
+    {
+        return Err("the default panel must be in the non-empty panel set".to_owned());
+    }
+    if let Some(panel) = profile
+        .panels
+        .components
+        .iter()
+        .find(|panel| !supported_panels.contains(&panel.as_str()))
+    {
+        return Err(format!("unsupported public panel `{panel}`"));
+    }
+    let supported_abilities = ["workspace.read", "workspace.write", "command.run"];
+    for ability in &profile.public_abilities {
+        if !supported_abilities.contains(&ability.as_str()) {
+            return Err(format!("unsupported public ability `{ability}`"));
+        }
+        if !package_capabilities.contains(ability) {
+            return Err(format!(
+                "public ability `{ability}` is absent from the package capability registry"
+            ));
+        }
+    }
+    if profile.provider.provider.trim().is_empty()
+        || profile.provider.model.trim().is_empty()
+        || profile.provider.base_url.trim().is_empty()
+        || profile.provider.credential_class.trim().is_empty()
+    {
+        return Err("provider, model, base URL, and credential class are required".to_owned());
+    }
+    if profile.audience_inputs != ["text".to_owned()].into_iter().collect() {
+        return Err("the current public host admits exactly the text input class".to_owned());
+    }
+    if profile.retention.idle_ttl_seconds == 0
+        || profile.retention.absolute_ttl_seconds < profile.retention.idle_ttl_seconds
+    {
+        return Err("retention TTLs are inconsistent".to_owned());
+    }
+    if let Some(collection) = &profile.collection {
+        if collection.exportable_paths.is_empty() && !collection.transcript_eligible {
+            return Err("collection declares no eligible output".to_owned());
+        }
+        if collection.schema_ref.trim().is_empty()
+            || collection.recipient_class.trim().is_empty()
+            || collection.max_artifact_bytes == 0
+            || collection.max_artifact_bytes
+                > gaugedesk_core::agent_release::MAX_COLLECTION_ARTIFACT_BYTES
+        {
+            return Err("collection closure is incomplete or exceeds the size bound".to_owned());
+        }
+        for path in &collection.exportable_paths {
+            let selector = path.strip_suffix("/*").unwrap_or(path);
+            if selector.is_empty()
+                || selector.starts_with('/')
+                || selector.contains('\\')
+                || selector.contains("**")
+                || selector
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err(format!(
+                    "collection path `{path}` is not a bounded selector"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn archetype_files(
@@ -644,6 +724,19 @@ fn validate_target_cutover(library: &crate::library::Library) -> std::io::Result
             .project_id
             .as_deref()
             .ok_or_else(|| invalid(format!("placement {} has no project", placement.id)))?;
+        if placement.placement_kind == PlacementKind::Panel {
+            if library
+                .chats
+                .values()
+                .any(|chat| chat.instance_id == placement.id)
+            {
+                return Err(invalid(format!(
+                    "panel placement {} must not host work chats",
+                    placement.id
+                )));
+            }
+            continue;
+        }
         let targets = library
             .placement_targets
             .get(&placement.id)
@@ -915,10 +1008,12 @@ fn seed_builtin_archetype(
         id: instance_id.clone(),
         op: RecordOp::Upsert,
         kind: InstanceKind::Authoring,
+        placement_kind: crate::library::PlacementKind::Work,
         agent_id: archetype.id.to_owned(),
         project_id: None,
         version: 1,
         admission: Admission::Active,
+        collection_recipient: None,
     };
     append_library_record(store, "instance", &instance)?;
     library.apply_instance(instance);
@@ -929,6 +1024,8 @@ fn seed_builtin_archetype(
         id: archetype.id.to_owned(),
         op: RecordOp::Upsert,
         name: archetype.name.to_owned(),
+        agent_kind: crate::library::AgentKind::Work,
+        panel_profile: None,
         instance_id,
         config: "{}".into(),
         current_version: 1,
@@ -975,10 +1072,12 @@ fn ensure_builtin_placement(
         id: placement_id.clone(),
         op: RecordOp::Upsert,
         kind: InstanceKind::Using,
+        placement_kind: crate::library::PlacementKind::Work,
         agent_id: archetype.id.to_owned(),
         project_id: Some(DEFAULT_PROJECT.into()),
         version: 1,
         admission: Admission::Active,
+        collection_recipient: None,
     };
     append_library_record(store, "instance", &placement)?;
     library.apply_instance(placement);
@@ -1076,10 +1175,12 @@ pub(crate) fn seed_default_agent(
         id: DEFAULT_PLACEMENT.into(),
         op: RecordOp::Upsert,
         kind: InstanceKind::Using,
+        placement_kind: crate::library::PlacementKind::Work,
         agent_id: DEFAULT_AGENT.into(),
         project_id: Some(DEFAULT_PROJECT.into()),
         version: 1,
         admission: Admission::Active,
+        collection_recipient: None,
     };
     store
         .append_record(
@@ -1144,10 +1245,12 @@ impl Workbench {
             id: target_id.clone(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Using,
+            placement_kind: crate::library::PlacementKind::Work,
             agent_id: DEFAULT_AGENT.to_owned(),
             project_id: Some("test-project".to_owned()),
             version: 1,
             admission: Admission::Active,
+            collection_recipient: None,
         });
         wb.default_instance = target_id;
         wb
@@ -1381,6 +1484,21 @@ impl Workbench {
         );
         self.library.apply_instance(record);
         self.notify_library_changed("placement", &id, op);
+    }
+
+    pub(crate) fn write_public_deployment_record(
+        &mut self,
+        record: PublicDeploymentBindingRecord,
+    ) -> std::io::Result<()> {
+        let id = record.id.clone();
+        let op = Self::library_op_str(record.op);
+        let payload = serde_json::to_string(&record).map_err(std::io::Error::other)?;
+        self.store_mut()
+            .append_record(LIBRARY_SCOPE, "public_deployment_binding", &payload)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        self.library.apply_public_deployment(record);
+        self.notify_library_changed("public_deployment", &id, op);
+        Ok(())
     }
 
     pub(crate) fn write_chat_record(&mut self, record: ChatRecord) {
@@ -1821,6 +1939,21 @@ impl Workbench {
                 });
             }
         }
+        let deployment_ids = self
+            .library
+            .public_deployments
+            .values()
+            .filter(|binding| binding.placement_id == inst_id)
+            .map(|binding| binding.id.clone())
+            .collect::<Vec<_>>();
+        for deployment_id in deployment_ids {
+            if let Some(existing) = self.library.public_deployments.get(&deployment_id).cloned() {
+                let _ = self.write_public_deployment_record(PublicDeploymentBindingRecord {
+                    op: RecordOp::Tombstone,
+                    ..existing
+                });
+            }
+        }
         if let Some(existing) = self.library.instances.get(inst_id).cloned() {
             self.write_instance_record(InstanceRecord {
                 op: RecordOp::Tombstone,
@@ -1966,6 +2099,9 @@ impl Workbench {
         let Some(inst_rec) = self.library.instances.get(inst_id).cloned() else {
             return Err("no such instance".into());
         };
+        if inst_rec.kind == InstanceKind::Using && inst_rec.placement_kind == PlacementKind::Panel {
+            return Err("panel placements do not host work chats".into());
+        }
         // APPROVE-1 (ADR 0064): a placement hosts work chats only while active. A pending
         // placement (approved-but-not-yet-accepted under an approval-required policy) is
         // refused up front — fail closed until the project owner accepts it.
@@ -2067,6 +2203,53 @@ impl Workbench {
 
     pub(crate) fn agent_record(&self, id: &str) -> Option<AgentRecord> {
         self.library.agents.get(id).cloned()
+    }
+
+    pub(crate) fn panel_profile(&self, id: &str) -> Result<PanelPublicProfile, String> {
+        let agent = self
+            .library
+            .agents
+            .get(id)
+            .ok_or_else(|| "no such agent".to_owned())?;
+        if agent.agent_kind != AgentKind::Panel {
+            return Err("agent is not a panel agent".to_owned());
+        }
+        agent
+            .panel_profile
+            .clone()
+            .ok_or_else(|| "panel agent has no public profile".to_owned())
+    }
+
+    pub(crate) fn set_panel_profile(
+        &mut self,
+        id: &str,
+        profile: PanelPublicProfile,
+    ) -> Result<PanelPublicProfile, String> {
+        let mut agent = self
+            .library
+            .agents
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "no such agent".to_owned())?;
+        if agent.agent_kind != AgentKind::Panel {
+            return Err("agent is not a panel agent".to_owned());
+        }
+        let target = self
+            .library
+            .authoring_target_for(id)
+            .ok_or_else(|| "agent authoring target is unavailable".to_owned())?;
+        let package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(
+            self.targets_dir()
+                .join(&target.id)
+                .join("repo")
+                .join(gaugedesk_boundary::definition::DRAFT_ROOT),
+        )
+        .map_err(|error| error.to_string())?;
+        validate_panel_profile(&profile, package.capabilities())?;
+        agent.op = RecordOp::Upsert;
+        agent.panel_profile = Some(profile.clone());
+        self.write_agent_record(agent);
+        Ok(profile)
     }
 
     pub(crate) fn archetype_abilities(&self, id: &str) -> Result<Vec<String>, String> {
@@ -2470,6 +2653,7 @@ impl Workbench {
     pub(crate) fn create_archetype(
         &mut self,
         name: String,
+        agent_kind: AgentKind,
     ) -> Result<CreatedArchetype, CreateArchetypeError> {
         let agent_id = library::gen_id("agent");
         let inst_id = library::gen_id("inst");
@@ -2499,8 +2683,10 @@ impl Workbench {
         workspace
             .remove_engagement(&basis_probe)
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
-        let version = published_archetype_version(&self.targets_dir(), &target_id, 1)
+        let mut version = published_archetype_version(&self.targets_dir(), &target_id, 1)
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
+        let panel_profile = (agent_kind == AgentKind::Panel).then(PanelPublicProfile::default);
+        version.panel_profile = panel_profile.clone();
         self.targets.insert(target_id.clone(), workspace);
         self.write_instance_record(InstanceRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
@@ -2508,10 +2694,12 @@ impl Workbench {
             id: inst_id.clone(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Authoring,
+            placement_kind: agent_kind.into(),
             agent_id: agent_id.clone(),
             project_id: None,
             version: 1,
             admission: Admission::Active,
+            collection_recipient: None,
         });
         activate_instance(self.store_mut(), &inst_id);
         self.write_agent_record(AgentRecord {
@@ -2520,6 +2708,8 @@ impl Workbench {
             id: agent_id.clone(),
             op: RecordOp::Upsert,
             name: name.clone(),
+            agent_kind,
+            panel_profile,
             instance_id: inst_id.clone(),
             config: "{}".into(),
             current_version: 1,
@@ -2537,11 +2727,13 @@ impl Workbench {
             &home_id,
             basis,
         ));
-        let _ = self.place_archetype_on_project(
-            DEFAULT_PROJECT,
-            &agent_id,
-            crate::library::Admission::Active,
-        );
+        if agent_kind == AgentKind::Work {
+            let _ = self.place_archetype_on_project(
+                DEFAULT_PROJECT,
+                &agent_id,
+                crate::library::Admission::Active,
+            );
+        }
         Ok(CreatedArchetype { id: agent_id, name })
     }
 
@@ -2592,10 +2784,12 @@ impl Workbench {
             id: new_inst.clone(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Authoring,
+            placement_kind: src.agent_kind.into(),
             agent_id: new_agent.clone(),
             project_id: None,
             version: 1,
             admission: Admission::Active,
+            collection_recipient: None,
         });
         activate_instance(self.store_mut(), &new_inst);
         let name = name.unwrap_or_else(|| format!("{} (fork)", src.name));
@@ -2605,6 +2799,8 @@ impl Workbench {
             id: new_agent.clone(),
             op: RecordOp::Upsert,
             name: name.clone(),
+            agent_kind: src.agent_kind,
+            panel_profile: src.panel_profile.clone(),
             instance_id: new_inst.clone(),
             config: src.config.clone(),
             current_version: src.current_version,
@@ -2622,15 +2818,70 @@ impl Workbench {
             &home_id,
             basis,
         ));
-        let _ = self.place_archetype_on_project(
-            DEFAULT_PROJECT,
-            &new_agent,
-            crate::library::Admission::Active,
-        );
+        if src.agent_kind == AgentKind::Work {
+            let _ = self.place_archetype_on_project(
+                DEFAULT_PROJECT,
+                &new_agent,
+                crate::library::Admission::Active,
+            );
+        }
         Ok(CreatedArchetype {
             id: new_agent,
             name,
         })
+    }
+
+    /// Explicitly copy any Agent into a new Panel-agent lineage. Kind is never
+    /// mutated in place; the new lineage receives a complete default public
+    /// profile on every inherited version and no Personal work placement.
+    pub(crate) fn copy_agent_as_panel(
+        &mut self,
+        id: &str,
+        name: Option<String>,
+    ) -> Result<CreatedArchetype, ForkArchetypeError> {
+        let source_name = self
+            .library
+            .agents
+            .get(id)
+            .map(|agent| agent.name.clone())
+            .ok_or(ForkArchetypeError::NotFound)?;
+        let created = self.fork_archetype(
+            id,
+            Some(name.unwrap_or_else(|| format!("{source_name} Panel"))),
+        )?;
+        let personal_placements = self
+            .library
+            .instances
+            .values()
+            .filter(|instance| {
+                instance.kind == InstanceKind::Using
+                    && instance.agent_id == created.id
+                    && instance.project_id.as_deref() == Some(DEFAULT_PROJECT)
+            })
+            .map(|instance| instance.id.clone())
+            .collect::<Vec<_>>();
+        for placement in personal_placements {
+            self.destroy_instance(&placement);
+        }
+        let profile = PanelPublicProfile::default();
+        let mut agent = self
+            .library
+            .agents
+            .get(&created.id)
+            .cloned()
+            .ok_or(ForkArchetypeError::NotFound)?;
+        agent.agent_kind = AgentKind::Panel;
+        agent.panel_profile = Some(profile.clone());
+        for version in agent.versions.values_mut() {
+            version.panel_profile = Some(profile.clone());
+        }
+        let authoring_instance_id = agent.instance_id.clone();
+        self.write_agent_record(agent);
+        if let Some(mut instance) = self.library.instances.get(&authoring_instance_id).cloned() {
+            instance.placement_kind = PlacementKind::Panel;
+            self.write_instance_record(instance);
+        }
+        Ok(created)
     }
 
     pub(crate) fn place_archetype_on_project(
@@ -2654,8 +2905,14 @@ impl Workbench {
         if !self.library.projects.contains_key(project_id) {
             return Err("no such project".to_owned());
         }
-        if !self.library.agents.contains_key(agent_id) {
-            return Err("no such archetype".to_owned());
+        let agent = self
+            .library
+            .agents
+            .get(agent_id)
+            .cloned()
+            .ok_or_else(|| "no such archetype".to_owned())?;
+        if agent.agent_kind == AgentKind::Panel {
+            return Err("panel agents require an explicit project binding".to_owned());
         }
         let target_ids = self
             .library
@@ -2667,22 +2924,19 @@ impl Workbench {
         if target_ids.is_empty() {
             return Err("project has no work target".to_owned());
         }
-        let version = self
-            .library
-            .agents
-            .get(agent_id)
-            .map(|agent| agent.current_version)
-            .unwrap_or(1);
+        let version = agent.current_version;
         self.write_instance_record(InstanceRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: inst_id.clone(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Using,
+            placement_kind: PlacementKind::Work,
             agent_id: agent_id.to_string(),
             project_id: Some(project_id.to_string()),
             version,
             admission,
+            collection_recipient: None,
         });
         self.write_placement_targets_record(PlacementTargetsRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
@@ -2690,6 +2944,56 @@ impl Workbench {
             placement_id: inst_id.clone(),
             op: RecordOp::Upsert,
             target_ids,
+        });
+        let _ = self
+            .store_mut()
+            .admit::<InstanceState>(&inst_id, InstanceCommand::PinVersion("v0".into()));
+        Ok(inst_id)
+    }
+
+    fn place_panel_agent_on_project(
+        &mut self,
+        project_id: &str,
+        agent_id: &str,
+        admission: Admission,
+        collection_recipient: Option<PanelCollectionRecipient>,
+    ) -> Result<String, String> {
+        if !self.library.projects.contains_key(project_id) {
+            return Err("no such project".to_owned());
+        }
+        let agent = self
+            .library
+            .agents
+            .get(agent_id)
+            .cloned()
+            .ok_or_else(|| "no such archetype".to_owned())?;
+        if agent.agent_kind != AgentKind::Panel {
+            return Err("agent is not a panel agent".to_owned());
+        }
+        let profile = agent
+            .versions
+            .get(&agent.current_version)
+            .and_then(|version| version.panel_profile.as_ref())
+            .ok_or_else(|| "panel agent version has no frozen public profile".to_owned())?;
+        if profile.collection.is_some() && collection_recipient.is_none() {
+            return Err("a collecting panel agent requires a project recipient".to_owned());
+        }
+        if profile.collection.is_none() && collection_recipient.is_some() {
+            return Err("this panel agent version does not collect output".to_owned());
+        }
+        let inst_id = library::gen_id("inst");
+        self.write_instance_record(InstanceRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            id: inst_id.clone(),
+            op: RecordOp::Upsert,
+            kind: InstanceKind::Using,
+            placement_kind: PlacementKind::Panel,
+            agent_id: agent_id.to_owned(),
+            project_id: Some(project_id.to_owned()),
+            version: agent.current_version,
+            admission,
+            collection_recipient,
         });
         let _ = self
             .store_mut()
@@ -2705,20 +3009,39 @@ impl Workbench {
         &mut self,
         project_id: &str,
         agent_id: &str,
+        collection_recipient: Option<PanelCollectionRecipient>,
     ) -> Result<String, BindPlacementError> {
         if !self.library.projects.contains_key(project_id) {
             return Err(BindPlacementError::ProjectNotFound);
         }
-        if !self.library.agents.contains_key(agent_id) {
-            return Err(BindPlacementError::AgentNotFound);
-        }
+        let agent_kind = self
+            .library
+            .agents
+            .get(agent_id)
+            .map(|agent| agent.agent_kind)
+            .ok_or(BindPlacementError::AgentNotFound)?;
         let admission = if self.require_archetype_approval() {
             Admission::Pending
         } else {
             Admission::Active
         };
-        self.place_archetype_on_project(project_id, agent_id, admission)
-            .map_err(BindPlacementError::Create)
+        let result = match agent_kind {
+            AgentKind::Work => {
+                if collection_recipient.is_some() {
+                    return Err(BindPlacementError::Create(
+                        "work placements cannot bind collection recipients".to_owned(),
+                    ));
+                }
+                self.place_archetype_on_project(project_id, agent_id, admission)
+            }
+            AgentKind::Panel => self.place_panel_agent_on_project(
+                project_id,
+                agent_id,
+                admission,
+                collection_recipient,
+            ),
+        };
+        result.map_err(BindPlacementError::Create)
     }
 
     /// The effective per-org archetype-approval policy (`APPROVE-1`, ADR 0064): when set,
@@ -2746,6 +3069,7 @@ impl Workbench {
         &mut self,
         target_id: &str,
         version: u64,
+        panel_profile: Option<PanelPublicProfile>,
     ) -> Result<ArchetypeVersionRecord, PublishArchetypeError> {
         let snapshot_chat = library::gen_id("package-freeze");
         let instance = self
@@ -2783,6 +3107,10 @@ impl Workbench {
             let package =
                 gaugedesk_whip_runtime::AuthoredAgentPackage::load(engagement.path().join(&target))
                     .map_err(PublishArchetypeError::InvalidPackage)?;
+            if let Some(profile) = &panel_profile {
+                validate_panel_profile(profile, package.capabilities())
+                    .map_err(PublishArchetypeError::InvalidPackage)?;
+            }
             let discipline = crate::discipline::load(
                 &engagement
                     .path()
@@ -2804,6 +3132,7 @@ impl Workbench {
             let version_record = ArchetypeVersionRecord {
                 package_ref: package.version_ref().to_owned(),
                 discipline_ref: frozen_discipline.reference,
+                panel_profile: panel_profile.clone(),
             };
             engagement
                 .commit_turn(&format!("freeze archetype version {version}"))
@@ -2839,7 +3168,13 @@ impl Workbench {
             .authoring_target_for(id)
             .map(|target| target.id.clone())
             .ok_or(PublishArchetypeError::NotFound)?;
-        let version_record = self.freeze_archetype_draft(&target_id, new_version)?;
+        if agent.agent_kind == AgentKind::Panel && agent.panel_profile.is_none() {
+            return Err(PublishArchetypeError::InvalidPackage(
+                "panel agent has no public profile".to_owned(),
+            ));
+        }
+        let version_record =
+            self.freeze_archetype_draft(&target_id, new_version, agent.panel_profile.clone())?;
         if let Some(auto_upgrade) = auto_upgrade {
             agent.auto_upgrade = auto_upgrade;
         }
@@ -3011,8 +3346,16 @@ impl Workbench {
         agent_id: &str,
         title: &str,
     ) -> Result<serde_json::Value, CreateArchetypeChatError> {
-        if !self.library.agents.contains_key(agent_id) {
-            return Err(CreateArchetypeChatError::ArchetypeNotFound);
+        let agent = self
+            .library
+            .agents
+            .get(agent_id)
+            .ok_or(CreateArchetypeChatError::ArchetypeNotFound)?;
+        if agent.agent_kind == AgentKind::Panel {
+            return Err(CreateArchetypeChatError::Create(
+                "panel agents are previewed with their public contract and are not used in Personal"
+                    .to_owned(),
+            ));
         }
         let existing = self
             .library
@@ -3520,6 +3863,11 @@ impl Workbench {
                 serde_json::json!({
                     "id": agent.id,
                     "name": agent.name,
+                    "kind": agent.agent_kind,
+                    // Library Preview exercises the mutable draft contract. A
+                    // project placement below projects its pinned version
+                    // instead, so deployment never follows draft edits.
+                    "panel_profile": agent.panel_profile,
                     "instance_id": agent.instance_id,
                     "authoring_target_id": lib.authoring_target_for(&agent.id).expect("validated archetype has an authoring target").id,
                     "is_default": agent.id == DEFAULT_AGENT,
@@ -3571,6 +3919,7 @@ impl Workbench {
                             .unwrap_or(instance.version);
                         serde_json::json!({
                             "placement_id": instance.id,
+                            "kind": instance.placement_kind,
                             "archetype_id": instance.agent_id,
                             "archetype_name": archetype_name,
                             "is_default": instance.id == library_routes::general_placement_id(&project.id),
@@ -3578,11 +3927,19 @@ impl Workbench {
                             "pinned_version": pinned_version,
                             "version": instance.version,
                             "current_version": current_version,
+                            "panel_profile": lib.agents.get(&instance.agent_id).and_then(|agent| agent.versions.get(&instance.version)).and_then(|version| version.panel_profile.clone()),
                             "upgrade_available": lib.upgrade_available(&instance.id),
                             // APPROVE-1 (ADR 0064): a pending placement is approved-but-not-yet-accepted
                             // under an approval-required policy — the nav flags it so the owner can accept.
                             "pending": instance.admission == Admission::Pending,
-                            "target_ids": lib.placement_targets.get(&instance.id).expect("validated placement has target eligibility").target_ids,
+                            "deployments": lib.public_deployments.values().filter(|binding| binding.placement_id == instance.id).map(|binding| serde_json::json!({
+                                "id": binding.id,
+                                "deployment_id": binding.hosted_deployment_id,
+                                "edge_origin": binding.edge_origin,
+                                "active_release_id": binding.active_release_id,
+                                "status": binding.status,
+                            })).collect::<Vec<_>>(),
+                            "target_ids": lib.placement_targets.get(&instance.id).map(|targets| targets.target_ids.clone()).unwrap_or_default(),
                             "chats": lib.chats_in(&instance.id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules)).collect::<Vec<_>>(),
                             "workstreams": lib.workstreams_in(&instance.id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
                         })

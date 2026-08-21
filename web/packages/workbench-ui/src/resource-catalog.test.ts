@@ -78,7 +78,7 @@ describe("partitioning", () => {
 
 describe("labels", () => {
     it("kindLabel names the known kinds and passes others through", () => {
-        expect(kindLabel("method")).toBe("archetype");
+        expect(kindLabel("method")).toBe("Agent");
         expect(kindLabel("context")).toBe("context");
         expect(kindLabel("output")).toBe("output");
         expect(kindLabel("custom")).toBe("custom");

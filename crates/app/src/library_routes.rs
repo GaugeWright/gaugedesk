@@ -16,7 +16,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::library::{gen_id, ProjectRecord, RecordOp};
+use crate::library::{
+    gen_id, AgentKind, PanelCollectionRecipient, PanelPublicProfile, ProjectRecord, RecordOp,
+};
 use crate::library_state::{
     AgentDeleteError, BindPlacementError, BoundaryAcceptError, BoundaryAttestationInput,
     CreateArchetypeChatError, CreateArchetypeError, ForkArchetypeError, ForkChatError,
@@ -343,6 +345,8 @@ pub async fn assign_work_item(
 #[derive(Deserialize)]
 pub struct CreateAgent {
     pub name: String,
+    #[serde(default)]
+    pub kind: AgentKind,
 }
 
 /// Create an agent + its authoring instance (a fresh repo).
@@ -351,10 +355,10 @@ pub async fn create_agent(
     Json(body): Json<CreateAgent>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    match wb.create_archetype(body.name) {
+    match wb.create_archetype(body.name, body.kind) {
         Ok(archetype) => (
             StatusCode::CREATED,
-            Json(json!({ "id": archetype.id, "name": archetype.name })),
+            Json(json!({ "id": archetype.id, "name": archetype.name, "kind": body.kind })),
         )
             .into_response(),
         Err(CreateArchetypeError::Create(error)) => (
@@ -368,6 +372,38 @@ pub async fn create_agent(
 #[derive(Deserialize)]
 pub struct ForkArchetype {
     pub name: Option<String>,
+}
+
+/// Create a new Panel-agent lineage from an existing Agent. This is the only
+/// work-to-Panel transition; the source Agent remains unchanged.
+pub async fn copy_agent_as_panel(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<ForkArchetype>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.copy_agent_as_panel(&id, body.name) {
+        Ok(agent) => (
+            StatusCode::CREATED,
+            Json(json!({ "id": agent.id, "name": agent.name, "kind": "panel" })),
+        )
+            .into_response(),
+        Err(ForkArchetypeError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such agent" })),
+        )
+            .into_response(),
+        Err(ForkArchetypeError::SourceNotOpen) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "source agent is not open" })),
+        )
+            .into_response(),
+        Err(ForkArchetypeError::Create(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+            .into_response(),
+    }
 }
 
 /// Fork an archetype (ADR 0035/0038): copy its authored WhippleScript package
@@ -463,10 +499,50 @@ pub async fn get_agent(
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
     match wb.agent_record(&id) {
-        Some(a) => Json(json!({ "id": a.id, "name": a.name, "config": a.config })).into_response(),
+        Some(a) => Json(json!({
+            "id": a.id,
+            "name": a.name,
+            "kind": a.agent_kind,
+            "config": a.config,
+            "panel_profile": a.panel_profile,
+        }))
+        .into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such agent" })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_panel_profile(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    match wb.panel_profile(&id) {
+        Ok(profile) => Json(profile).into_response(),
+        Err(error) if error == "no such agent" => {
+            (StatusCode::NOT_FOUND, Json(json!({ "error": error }))).into_response()
+        }
+        Err(error) => (StatusCode::CONFLICT, Json(json!({ "error": error }))).into_response(),
+    }
+}
+
+pub async fn put_panel_profile(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(profile): Json<PanelPublicProfile>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.set_panel_profile(&id, profile) {
+        Ok(profile) => Json(profile).into_response(),
+        Err(error) if error == "no such agent" => {
+            (StatusCode::NOT_FOUND, Json(json!({ "error": error }))).into_response()
+        }
+        Err(error) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": error })),
         )
             .into_response(),
     }
@@ -775,6 +851,8 @@ pub async fn delete_project(
 #[derive(Deserialize)]
 pub struct BindAgent {
     pub agent_id: String,
+    #[serde(default)]
+    pub collection_recipient: Option<PanelCollectionRecipient>,
 }
 
 /// Create a **placement** (a Using instance) of `agent_id` on `project_id`, returning
@@ -814,7 +892,7 @@ pub async fn bind_agent(
     Json(body): Json<BindAgent>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    match wb.bind_agent_to_project(&pid, &body.agent_id) {
+    match wb.bind_agent_to_project(&pid, &body.agent_id, body.collection_recipient) {
         Ok(inst_id) => {
             (StatusCode::CREATED, Json(json!({ "instance_id": inst_id }))).into_response()
         }
@@ -981,11 +1059,14 @@ pub async fn create_chat_under_agent(
             Json(json!({ "error": "no such agent" })),
         )
             .into_response(),
-        Err(CreateArchetypeChatError::Create(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
+        Err(CreateArchetypeChatError::Create(e)) => {
+            let status = if e.contains("panel agent") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(json!({ "error": e }))).into_response()
+        }
     }
 }
 
@@ -1042,11 +1123,14 @@ pub async fn use_archetype(
             Json(json!({ "error": "no such archetype" })),
         )
             .into_response(),
-        Err(CreateArchetypeChatError::Create(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
+        Err(CreateArchetypeChatError::Create(e)) => {
+            let status = if e.contains("panel agent") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(json!({ "error": e }))).into_response()
+        }
     }
 }
 

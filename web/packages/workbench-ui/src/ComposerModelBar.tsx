@@ -68,7 +68,7 @@ export function ComposerModelBar(props: ComposerModelBarProps): JSX.Element {
         <div class="composer-models" classList={{ stacked: props.stacked }}>
             <ComposerMenuButton
                 label={selected()?.label ?? "Default model"}
-                title="Model for this chat — overrides the archetype's default for this conversation only"
+                title="Model for this chat — overrides the Agent's default for this conversation only"
                 testAttr="model"
                 stacked={props.stacked}
                 rowLabel="Model"

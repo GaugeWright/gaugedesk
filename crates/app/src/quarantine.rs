@@ -79,6 +79,12 @@ pub struct QuarantinedItem {
     pub item_id: String,
     /// What produced this. `collection:{deployment}` for a drained artifact.
     pub source: String,
+    #[serde(default)]
+    pub deployment_binding_id: Option<String>,
+    #[serde(default)]
+    pub deployment_id: Option<String>,
+    #[serde(default)]
+    pub public_session_id: Option<String>,
     pub source_id: String,
     pub release_id: String,
     pub revision: u64,
@@ -312,6 +318,9 @@ mod tests {
         QuarantinedItem {
             item_id: item_id(source, revision),
             source: "collection:dep-1".into(),
+            deployment_binding_id: None,
+            deployment_id: None,
+            public_session_id: None,
             source_id: source.into(),
             release_id: "rel-1".into(),
             revision,

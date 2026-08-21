@@ -113,7 +113,7 @@ fn collection_and_gate_surface() -> Vec<RouteCheck> {
         RouteCheck {
             method: "POST",
             uri: format!("/projects/{PROJECT}/quarantine/{ABSENT_ITEM}/review"),
-            body: Some(json!({ "chat_id": "chat-absent", "verdict": "keep" }).to_string()),
+            body: Some(json!({ "verdict": "keep" }).to_string()),
             because: "a reviewer's verdict, carried to the gate that rules on it",
         },
         RouteCheck {
@@ -131,20 +131,10 @@ fn collection_and_gate_surface() -> Vec<RouteCheck> {
         RouteCheck {
             method: "POST",
             uri: "/public-deployments/collect".into(),
-            // Exactly the field set the web client sends. It sent five of these
-            // six for its whole life, so every Drain click died in serde before
-            // the request was read.
-            body: Some(
-                json!({
-                    "deployment_id": "route-surface",
-                    "edge_origin": "https://edge.invalid",
-                    "project_id": PROJECT,
-                    "recipient_id": "route-surface",
-                    "schema_ref": "survey.v1",
-                    "admission_scope": "route-surface",
-                })
-                .to_string(),
-            ),
+            // The durable local binding resolves edge, deployment, project,
+            // recipient, schema, and admission scope. The caller cannot redirect
+            // inbound custody by resupplying any of those fields at drain time.
+            body: Some(json!({ "binding_id": "route-surface" }).to_string()),
             because: "the drain the owner clicks to receive their collected material",
         },
         RouteCheck {

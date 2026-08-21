@@ -1294,10 +1294,12 @@ async fn project_home_rolls_up_runs_outputs_and_audit() {
             id: "inst-1".into(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Using,
+            placement_kind: crate::library::PlacementKind::Work,
             agent_id: "a1".into(),
             project_id: Some("proj-1".into()),
             version: 1,
             admission: Admission::Active,
+            collection_recipient: None,
         });
         g.write_chat_record(ChatRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
@@ -1729,11 +1731,13 @@ fn published_agent_release_contains_the_runtime_closure_and_verifies_offline() {
             DEFAULT_PLACEMENT,
             crate::agent_release::ReleasePublishSpec {
                 published_at_unix_ms: 1_800_000_000_000,
+                public_abilities: BTreeSet::new(),
                 panels: PanelManifest {
                     components: BTreeSet::from(["gw-chat".to_owned(), "gw-viewer".to_owned()]),
                     default_component: "gw-chat".to_owned(),
                     attribution: AttributionPolicy::GaugeWright,
                 },
+                audience_inputs: BTreeSet::from(["text".to_owned()]),
                 provider: ProviderPolicy {
                     provider: "openai".to_owned(),
                     model: "gpt-5.1".to_owned(),
@@ -2442,6 +2446,174 @@ async fn placements_share_project_targets_and_cross_project_targets_are_rejected
 }
 
 #[tokio::test]
+async fn panel_agents_preview_and_place_without_becoming_work_chat_hosts() {
+    let (_dir, wb) = seeded_workbench();
+    let app = open_control_plane(wb.clone());
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/archetypes",
+        Some(r#"{"name":"Public intake","kind":"panel"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let agent_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (_, workspace_body) = send(&app, "GET", "/workspace", None).await;
+    let workspace: serde_json::Value = serde_json::from_str(&workspace_body).unwrap();
+    let agent = workspace["archetypes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["id"] == agent_id)
+        .expect("Panel agent projects into Library");
+    assert_eq!(agent["kind"], "panel");
+    assert!(agent["panel_profile"].is_object());
+    assert!(workspace["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|project| project["placements"].as_array().unwrap())
+        .all(|placement| placement["archetype_id"] != agent_id));
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{agent_id}/use"),
+        Some(r#"{"title":"must not become Personal work"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, project_body) = send(
+        &app,
+        "POST",
+        "/projects",
+        Some(r#"{"name":"Customer site"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{project_body}");
+    let project: serde_json::Value = serde_json::from_str(&project_body).unwrap();
+    let project_id = project["id"].as_str().unwrap();
+    let target_id = project["target_id"].as_str().unwrap();
+    let (status, placement_body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{project_id}/placements"),
+        Some(&serde_json::json!({ "agent_id": agent_id }).to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{placement_body}");
+    let placement: serde_json::Value = serde_json::from_str(&placement_body).unwrap();
+    let placement_id = placement["instance_id"].as_str().unwrap();
+
+    let (_, workspace_body) = send(&app, "GET", "/workspace", None).await;
+    let workspace: serde_json::Value = serde_json::from_str(&workspace_body).unwrap();
+    let projected = workspace["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["id"] == project_id)
+        .unwrap()["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|placement| placement["placement_id"] == placement_id)
+        .unwrap();
+    assert_eq!(projected["kind"], "panel");
+    assert_eq!(projected["target_ids"], serde_json::json!([]));
+    assert_eq!(projected["chats"], serde_json::json!([]));
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{project_id}/placements/{placement_id}/chats"),
+        Some(
+            &serde_json::json!({ "title": "not a work host", "target_id": target_id }).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn publishing_a_panel_agent_freezes_the_complete_profile() {
+    let (_dir, wb) = seeded_workbench();
+    let app = open_control_plane(wb.clone());
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/archetypes",
+        Some(r#"{"name":"Frozen public agent","kind":"panel"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let agent_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (_, profile_body) = send(
+        &app,
+        "GET",
+        &format!("/archetypes/{agent_id}/panel-profile"),
+        None,
+    )
+    .await;
+    let mut profile: serde_json::Value = serde_json::from_str(&profile_body).unwrap();
+    profile["provider"]["model"] = serde_json::json!("previewed-model");
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &format!("/archetypes/{agent_id}/panel-profile"),
+        Some(&profile.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{agent_id}/publish"),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let version = serde_json::from_str::<serde_json::Value>(&body).unwrap()["version"]
+        .as_u64()
+        .unwrap();
+
+    profile["provider"]["model"] = serde_json::json!("later-draft-model");
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &format!("/archetypes/{agent_id}/panel-profile"),
+        Some(&profile.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let guard = wb.lock_unpoisoned();
+    let agent = &guard.library.agents[&agent_id];
+    assert_eq!(
+        agent.panel_profile.as_ref().unwrap().provider.model,
+        "later-draft-model"
+    );
+    assert_eq!(
+        agent.versions[&version]
+            .panel_profile
+            .as_ref()
+            .unwrap()
+            .provider
+            .model,
+        "previewed-model",
+    );
+}
+
+#[tokio::test]
 async fn target_binding_basis_and_candidate_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
     let (chat_id, target_id, basis) = {
@@ -3066,6 +3238,8 @@ async fn exact_pre_target_defaults_migrate_additively() {
             id: DEFAULT_AGENT.into(),
             op: RecordOp::Upsert,
             name: "assistant".into(),
+            agent_kind: crate::library::AgentKind::Work,
+            panel_profile: None,
             instance_id: DEFAULT_INSTANCE.into(),
             config: "{}".into(),
             current_version: 1,
@@ -3091,10 +3265,12 @@ async fn exact_pre_target_defaults_migrate_additively() {
             id: DEFAULT_INSTANCE.into(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Authoring,
+            placement_kind: crate::library::PlacementKind::Work,
             agent_id: DEFAULT_AGENT.into(),
             project_id: None,
             version: 1,
             admission: Admission::Active,
+            collection_recipient: None,
         };
         let placement = InstanceRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
@@ -3102,10 +3278,12 @@ async fn exact_pre_target_defaults_migrate_additively() {
             id: DEFAULT_PLACEMENT.into(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Using,
+            placement_kind: crate::library::PlacementKind::Work,
             agent_id: DEFAULT_AGENT.into(),
             project_id: Some(DEFAULT_PROJECT.into()),
             version: 1,
             admission: Admission::Active,
+            collection_recipient: None,
         };
         for (kind, payload) in [
             ("agent", serde_json::to_string(&agent).unwrap()),
@@ -3187,10 +3365,12 @@ async fn pre_target_store_is_rejected_instead_of_self_healed() {
             id: DEFAULT_INSTANCE.into(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Authoring,
+            placement_kind: crate::library::PlacementKind::Work,
             agent_id: DEFAULT_AGENT.into(),
             project_id: None,
             version: 1,
             admission: Admission::Active,
+            collection_recipient: None,
         };
         store
             .append_record(
@@ -3205,6 +3385,8 @@ async fn pre_target_store_is_rejected_instead_of_self_healed() {
             id: DEFAULT_AGENT.into(),
             op: RecordOp::Upsert,
             name: "assistant".into(),
+            agent_kind: crate::library::AgentKind::Work,
+            panel_profile: None,
             instance_id: DEFAULT_INSTANCE.into(),
             config: "{}".into(),
             current_version: 1,
@@ -3658,10 +3840,12 @@ fn deleting_a_project_crypto_erases_its_chats_content() {
         id: "inst-erase".into(),
         op: RecordOp::Upsert,
         kind: InstanceKind::Using,
+        placement_kind: crate::library::PlacementKind::Work,
         agent_id: "a1".into(),
         project_id: Some("proj-erase".into()),
         version: 1,
         admission: Admission::Active,
+        collection_recipient: None,
     });
     wb.write_chat_record(ChatRecord {
         schema: crate::library::LIBRARY_RECORD_SCHEMA,

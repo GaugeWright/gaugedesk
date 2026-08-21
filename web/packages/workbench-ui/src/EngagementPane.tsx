@@ -273,7 +273,7 @@ export function EngagementPane(props: {
             const r = await props.api.placeRun(
                 target,
                 props.project,
-                runArchetype().trim() || "archetype",
+                runArchetype().trim() || "Agent",
                 connected()?.[0]?.handle ?? "data",
                 runPrompt().trim() || "go",
                 targetChat,
@@ -636,7 +636,7 @@ export function EngagementPane(props: {
                             class="fed-paste"
                             data-engagement-run-archetype
                             value={runArchetype()}
-                            placeholder="archetype"
+                            placeholder="Agent"
                             onInput={(e) => setRunArchetype(e.currentTarget.value)}
                         />
                         <input

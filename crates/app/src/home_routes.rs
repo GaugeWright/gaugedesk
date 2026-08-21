@@ -353,10 +353,12 @@ mod tests {
                 id: "foreign-placement".into(),
                 op: RecordOp::Upsert,
                 kind: InstanceKind::Using,
+                placement_kind: crate::library::PlacementKind::Work,
                 agent_id: crate::DEFAULT_AGENT.into(),
                 project_id: Some("foreign".into()),
                 version: 1,
                 admission: Admission::Active,
+                collection_recipient: None,
             });
             guard.write_workstream_record(WorkstreamRecord {
                 schema: crate::library::LIBRARY_RECORD_SCHEMA,

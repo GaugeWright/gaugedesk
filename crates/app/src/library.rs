@@ -15,8 +15,12 @@
 //! - **project** = a grouping of placements and ordinary work targets.
 //! - **chat** = an engagement binding a placement/archetype to a target and exact basis.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use gaugedesk_core::agent_release::{
+    AttributionPolicy, CollectionPolicy, PanelManifest, ProviderPolicy, ReleaseFile,
+    RetentionPolicy,
+};
 use gaugedesk_core::boundary_lifecycle::{BoundaryPhase, BoundaryState, Operator, Placement};
 use gaugedesk_core::ids::HomeId;
 use gaugedesk_store::{AdmitError, Store};
@@ -78,6 +82,90 @@ pub enum InstanceKind {
     Using,
 }
 
+/// Immutable product kind of an Agent lineage (ADR 0143). Records written
+/// before Panel agents existed deserialize as ordinary work Agents.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKind {
+    #[default]
+    Work,
+    Panel,
+}
+
+/// Runtime shape of a project installation. This is stored independently of
+/// [`InstanceKind`], which still distinguishes authoring roots from project
+/// placements. Legacy placements are work placements.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PlacementKind {
+    #[default]
+    Work,
+    Panel,
+}
+
+impl From<AgentKind> for PlacementKind {
+    fn from(value: AgentKind) -> Self {
+        match value {
+            AgentKind::Work => Self::Work,
+            AgentKind::Panel => Self::Panel,
+        }
+    }
+}
+
+/// Complete public contract authored with a Panel agent and frozen into each
+/// numeric version. None of these fields are deployment-time choices.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PanelPublicProfile {
+    pub panels: PanelManifest,
+    #[serde(default)]
+    pub public_abilities: BTreeSet<String>,
+    pub provider: ProviderPolicy,
+    #[serde(default)]
+    pub audience_inputs: BTreeSet<String>,
+    #[serde(default)]
+    pub initial_workspace: Vec<ReleaseFile>,
+    pub retention: RetentionPolicy,
+    #[serde(default)]
+    pub collection: Option<CollectionPolicy>,
+}
+
+impl Default for PanelPublicProfile {
+    fn default() -> Self {
+        Self {
+            panels: PanelManifest {
+                components: ["gw-chat".to_owned()].into_iter().collect(),
+                default_component: "gw-chat".to_owned(),
+                attribution: AttributionPolicy::GaugeWright,
+            },
+            public_abilities: BTreeSet::new(),
+            provider: ProviderPolicy {
+                provider: "openai".to_owned(),
+                model: "gpt-5-mini".to_owned(),
+                base_url: "https://api.openai.com/v1".to_owned(),
+                credential_class: "openai-api-key".to_owned(),
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+            audience_inputs: ["text".to_owned()].into_iter().collect(),
+            initial_workspace: Vec::new(),
+            retention: RetentionPolicy {
+                idle_ttl_seconds: 86_400,
+                absolute_ttl_seconds: 2_592_000,
+                transcript_retained: true,
+                workspace_retained: true,
+            },
+            collection: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PanelCollectionRecipient {
+    pub recipient_ref: String,
+    #[serde(default)]
+    pub recipient_public_keys: Vec<String>,
+}
+
 /// A placement's **admission state** (`APPROVE-1`, [ADR 0064](../decisions/0064-archetype-approval-two-acts.md)):
 /// whether it is admitted for use. A placement hosts work chats and is offered in the
 /// project's chat picker **only while `Active`**. Under an approval-required project
@@ -121,6 +209,10 @@ impl InstanceKind {
 pub struct ArchetypeVersionRecord {
     pub package_ref: String,
     pub discipline_ref: String,
+    /// Frozen only for Panel-agent versions. Legacy versions are ordinary work
+    /// versions and therefore have no public profile.
+    #[serde(default)]
+    pub panel_profile: Option<PanelPublicProfile>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -129,6 +221,13 @@ pub struct AgentRecord {
     #[serde(default)]
     pub op: RecordOp,
     pub name: String,
+    /// Immutable for this lineage. A work Agent becomes public-capable only by
+    /// an explicit copy into a new Panel-agent lineage.
+    #[serde(default)]
+    pub agent_kind: AgentKind,
+    /// Mutable Panel-agent draft. Publish copies it into the numeric version.
+    #[serde(default)]
+    pub panel_profile: Option<PanelPublicProfile>,
     /// The logical authoring root. Its files live in the archetype-owned target.
     pub instance_id: String,
     /// The raw `.agent-config.json` seeded into each chat's worktree. Stored
@@ -234,6 +333,10 @@ pub struct InstanceRecord {
     #[serde(default)]
     pub op: RecordOp,
     pub kind: InstanceKind,
+    /// Work versus Panel installation. Authoring instances mirror their
+    /// Agent's kind; persisted placements without the field remain work.
+    #[serde(default)]
+    pub placement_kind: PlacementKind,
     pub agent_id: String,
     /// `Some` for a using-instance (which project it's bound into); `None` for
     /// an authoring instance.
@@ -251,6 +354,10 @@ pub struct InstanceRecord {
     /// records and the frictionless default read as `Active`.
     #[serde(default)]
     pub admission: Admission,
+    /// Exact project-owned collection recipient admitted by a Panel
+    /// placement. It is absent when the frozen profile collects nothing.
+    #[serde(default)]
+    pub collection_recipient: Option<PanelCollectionRecipient>,
     /// The record-shape schema version that wrote this record (DR-0054 Phase
     /// B). Absent on records predating the stamp = version 1, the implicit
     /// original shape. Readers fail closed on a version newer than
@@ -259,6 +366,90 @@ pub struct InstanceRecord {
     pub schema: u32,
     /// Fields written by a build newer than this one, preserved verbatim so a
     /// read-modify-write here never drops them (DR-0054 Phase B).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct DeploymentAudienceOidc {
+    pub issuer: String,
+    pub audience: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DeploymentAudience {
+    #[serde(default = "default_true")]
+    pub anonymous_allowed: bool,
+    #[serde(default)]
+    pub oidc: Option<DeploymentAudienceOidc>,
+}
+
+impl Default for DeploymentAudience {
+    fn default() -> Self {
+        Self {
+            anonymous_allowed: true,
+            oidc: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Operational deployment choices. Functional contract fields deliberately do
+/// not appear here; they come only from the pinned Panel-agent version.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DeploymentOperationalConfig {
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub audience: DeploymentAudience,
+    pub funding_ref: String,
+    pub credential_class: String,
+    pub credential_ref: String,
+    #[serde(default)]
+    pub max_spend_cents: Option<u64>,
+    #[serde(default)]
+    pub max_session_spend_cents: Option<u64>,
+    #[serde(default)]
+    pub max_turn_spend_cents: Option<u64>,
+    pub per_visitor_turn_limit: u64,
+    pub max_concurrent_sessions: u64,
+    #[serde(default)]
+    pub white_label: bool,
+    pub retention_idle_ttl_seconds: u64,
+    pub retention_absolute_ttl_seconds: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentBindingStatus {
+    #[default]
+    PendingPublish,
+    Active,
+    LegacyConfirmationRequired,
+}
+
+/// Local authority connecting one hosted public deployment to exactly one
+/// project-owned Panel placement (ADR 0143). This record is written before the
+/// hosted publish call and updated with its active immutable release afterward.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PublicDeploymentBindingRecord {
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    pub project_id: String,
+    pub placement_id: String,
+    pub hosted_deployment_id: String,
+    pub edge_origin: String,
+    #[serde(default)]
+    pub active_release_id: Option<String>,
+    pub operational: DeploymentOperationalConfig,
+    #[serde(default)]
+    pub status: DeploymentBindingStatus,
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -517,6 +708,7 @@ pub struct Library {
     pub agents: BTreeMap<String, AgentRecord>,
     pub projects: BTreeMap<String, ProjectRecord>,
     pub instances: BTreeMap<String, InstanceRecord>,
+    pub public_deployments: BTreeMap<String, PublicDeploymentBindingRecord>,
     pub chats: BTreeMap<String, ChatRecord>,
     /// Fork lineage of every chat ever recorded, tombstones included (ADR 0141).
     pub chat_lineage: BTreeMap<String, ChatLineage>,
@@ -557,6 +749,11 @@ impl Library {
             let r: InstanceRecord = serde_json::from_str(&row)?;
             guard_record_schema("instance", &r.id, r.schema)?;
             fold_one(&mut lib.instances, &r.id.clone(), r.op, r);
+        }
+        for row in store.records(LIBRARY_SCOPE, "public_deployment_binding")? {
+            let r: PublicDeploymentBindingRecord = serde_json::from_str(&row)?;
+            guard_record_schema("public_deployment_binding", &r.id, r.schema)?;
+            fold_one(&mut lib.public_deployments, &r.id.clone(), r.op, r);
         }
         for row in store.records(LIBRARY_SCOPE, "chat")? {
             let r: ChatRecord = serde_json::from_str(&row)?;
@@ -612,6 +809,9 @@ impl Library {
     }
     pub fn apply_instance(&mut self, r: InstanceRecord) {
         fold_one(&mut self.instances, &r.id.clone(), r.op, r);
+    }
+    pub fn apply_public_deployment(&mut self, r: PublicDeploymentBindingRecord) {
+        fold_one(&mut self.public_deployments, &r.id.clone(), r.op, r);
     }
     pub fn apply_chat(&mut self, r: ChatRecord) {
         // Lineage survives the tombstone (ADR 0141): op-independent, and a
@@ -959,6 +1159,16 @@ mod tests {
         assert!(record.versions.is_empty());
         assert_eq!(record.schema, 1, "a pre-stamp record reads as version 1");
         assert!(record.extra.is_empty());
+        assert_eq!(record.agent_kind, AgentKind::Work);
+        assert!(record.panel_profile.is_none());
+    }
+
+    #[test]
+    fn placement_reads_records_written_before_panel_kinds_as_work() {
+        let record: InstanceRecord =
+            serde_json::from_str(r#"{"id":"i1","kind":"using","agent_id":"a1"}"#).unwrap();
+        assert_eq!(record.placement_kind, PlacementKind::Work);
+        assert!(record.collection_recipient.is_none());
     }
 
     /// DR-0054 Phase B: a record stamped by a newer build (schema ahead of this
@@ -1045,6 +1255,8 @@ mod tests {
             id: id.into(),
             op,
             name: name.into(),
+            agent_kind: AgentKind::Work,
+            panel_profile: None,
             instance_id: format!("inst-{id}"),
             config: "{}".into(),
             current_version: 1,
@@ -1093,10 +1305,12 @@ mod tests {
                 id: inst.into(),
                 op: RecordOp::Upsert,
                 kind: InstanceKind::Using,
+                placement_kind: PlacementKind::Work,
                 agent_id: "a1".into(),
                 project_id: project.map(str::to_string),
                 version: 1,
                 admission: Admission::Active,
+                collection_recipient: None,
             });
         };
         let chat = |lib: &mut Library, id: &str, inst: &str| {
@@ -1151,10 +1365,12 @@ mod tests {
             id: "i-using".into(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Using,
+            placement_kind: PlacementKind::Work,
             agent_id: "a1".into(),
             project_id: Some("proj-acme".into()),
             version: 1,
             admission: Admission::Active,
+            collection_recipient: None,
         });
         lib.apply_instance(InstanceRecord {
             schema: LIBRARY_RECORD_SCHEMA,
@@ -1162,10 +1378,12 @@ mod tests {
             id: "i-authoring".into(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Authoring,
+            placement_kind: PlacementKind::Work,
             agent_id: "a1".into(),
             project_id: None,
             version: 1,
             admission: Admission::Active,
+            collection_recipient: None,
         });
         let chat = |lib: &mut Library, id: &str, inst: &str| {
             lib.apply_chat(ChatRecord {
@@ -1321,10 +1539,12 @@ mod tests {
             id: "inst-u".into(),
             op: RecordOp::Upsert,
             kind: InstanceKind::Using,
+            placement_kind: PlacementKind::Work,
             agent_id: "a1".into(),
             project_id: Some("proj-1".into()),
             version: 1,
             admission: Admission::Active,
+            collection_recipient: None,
         });
         assert_eq!(lib.using_instances_of("proj-1").len(), 1);
         assert_eq!(lib.using_instances_of("proj-other").len(), 0);
@@ -1346,10 +1566,12 @@ mod tests {
                 id: iid.into(),
                 op: RecordOp::Upsert,
                 kind: InstanceKind::Using,
+                placement_kind: PlacementKind::Work,
                 agent_id: "a1".into(),
                 project_id: Some(pid.into()),
                 version: 1,
                 admission: Admission::Active,
+                collection_recipient: None,
             });
         }
         for (id, iid, pos) in [

@@ -588,7 +588,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                                     data-merge-admit
                                     title={
                                         isImprove()
-                                            ? `Save this change to the ${method() || "archetype"} — it will apply everywhere the archetype is used`
+                                            ? `Save this change to the ${method() || "Agent"} — it will apply everywhere the Agent is used`
                                             : "Keep these changes into the shared copy"
                                     }
                                     onClick={() => session.merge("admit")}
@@ -596,7 +596,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                                     {loosening()
                                         ? "Yes, keep this permission change"
                                         : isImprove()
-                                            ? "save to the archetype"
+                                            ? "save to the Agent"
                                             : "keep this work"}
                                 </button>
                             }

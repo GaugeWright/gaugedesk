@@ -23,12 +23,12 @@ describe("keptLabel (scope-specific vocabulary)", () => {
     });
     it("an improve chat names the method and states the broader scope", () => {
         expect(keptLabel("edit", "Reviewer")).toBe(
-            "Saved to the Reviewer archetype — this now applies everywhere it's used",
+            "Saved to the Reviewer Agent — this now applies everywhere it's used",
         );
     });
     it("an improve chat with no method name falls back to a generic method phrasing", () => {
-        expect(keptLabel("edit", undefined)).toBe("Saved to the archetype — this now applies everywhere it's used");
-        expect(keptLabel("edit", "   ")).toBe("Saved to the archetype — this now applies everywhere it's used");
+        expect(keptLabel("edit", undefined)).toBe("Saved to the Agent — this now applies everywhere it's used");
+        expect(keptLabel("edit", "   ")).toBe("Saved to the Agent — this now applies everywhere it's used");
     });
 });
 
@@ -42,7 +42,7 @@ describe("phaseLabel", () => {
     it("Advanced/Integrated reuse the scope-specific kept label", () => {
         expect(phaseLabel("Advanced", "work", undefined)).toBe("Kept into the shared copy");
         expect(phaseLabel("Integrated", "edit", "Reviewer")).toBe(
-            "Saved to the Reviewer archetype — this now applies everywhere it's used",
+            "Saved to the Reviewer Agent — this now applies everywhere it's used",
         );
     });
     it("falls back to the raw token for an unlabeled phase (Clean)", () => {

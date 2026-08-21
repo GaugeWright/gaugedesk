@@ -126,6 +126,8 @@ export interface WorkstreamNode {
 export interface ArchetypeNode {
     readonly id: ArchetypeId;
     readonly name: string;
+    readonly kind: AgentKind;
+    readonly panelProfile: PanelPublicProfile | null;
     /** The archetype's authoring instance — the root a workstream over its edit chats is
      *  created on (WS-F). */
     readonly instanceId: PlacementId;
@@ -138,10 +140,21 @@ export interface ArchetypeNode {
     readonly chats: ChatNode[];
     readonly workstreams: WorkstreamNode[];
 }
+export type AgentKind = "work" | "panel";
+export type AgentAbility = "workspace.read" | "workspace.write" | "command.run";
+
+export interface PublicDeploymentBindingSummary {
+    readonly id: string;
+    readonly deploymentId: string;
+    readonly edgeOrigin: string;
+    readonly activeReleaseId: string | null;
+    readonly status: "pending_publish" | "active" | "legacy_confirmation_required";
+}
 /** A **placement**: an archetype installed on a project, with its work chats. Its
  *  lineage (`archetypeName`) is always visible — a placement is never an orphan. */
 export interface PlacementNode {
     readonly placementId: PlacementId;
+    readonly kind: AgentKind;
     readonly archetypeId: ArchetypeId;
     readonly archetypeName: string;
     /** The project's built-in **general** placement (project-tied default): the nav hides
@@ -156,12 +169,14 @@ export interface PlacementNode {
     readonly version: number;
     /** The archetype's current published version. */
     readonly currentVersion: number;
+    readonly panelProfile: PanelPublicProfile | null;
     /** Whether a newer archetype version is available to upgrade to (UX-9). */
     readonly upgradeAvailable: boolean;
     /** Whether this placement is **pending approval** (APPROVE-1, ADR 0064): approved-but-
      *  not-yet-accepted under an approval-required policy. It can't host work chats until
      *  the owner accepts it; the nav flags it. Frictionless placements are never pending. */
     readonly pending: boolean;
+    readonly deployments: readonly PublicDeploymentBindingSummary[];
     readonly targetIds: readonly WorkTargetId[];
     readonly chats: ChatNode[];
     /** The named workstreams (shared auto-sync lines) in this placement (WS-F). */
@@ -186,18 +201,17 @@ export interface PublicDeploymentInput {
     readonly deployment_id: string;
     readonly edge_origin: string;
     readonly allowed_origins: readonly string[];
-    readonly panel_ceiling: readonly ("gw-chat" | "gw-viewer" | "gw-files" | "gw-chats")[];
     readonly max_spend_cents: number | null;
     readonly max_session_spend_cents: number | null;
     readonly max_turn_spend_cents: number | null;
-    /** Legacy publisher compatibility; new callers use max_turn_spend_cents. */
-    readonly reserve_cents_per_turn?: number | null;
     readonly per_visitor_turn_limit: number;
     readonly max_concurrent_sessions: number;
     readonly funding_ref: string;
-    readonly credential_class: string;
     readonly credential_ref: string;
-    readonly model: string;
+    readonly audience?: {
+        readonly anonymous_allowed: boolean;
+        readonly oidc?: { readonly issuer: string; readonly audience: string };
+    };
     readonly white_label: boolean;
     /** How long a visitor may resume, within the ceiling the release declares
      *  (ADR 0109). A resumption window, not a collection deadline — collection
@@ -206,8 +220,6 @@ export interface PublicDeploymentInput {
      *  server's defaults. */
     readonly retention_idle_ttl_seconds?: number;
     readonly retention_absolute_ttl_seconds?: number;
-    /** Absent means this deployment collects nothing. */
-    readonly collection?: PublicDeploymentCollection;
 }
 
 /** What a collecting deployment gathers, and who it seals to (ADR 0109 §5–§7).
@@ -229,6 +241,40 @@ export interface PublicDeploymentCollection {
     readonly recipient_public_keys: readonly string[];
 }
 
+export type PublicPanelComponent = "gw-chat" | "gw-viewer" | "gw-files" | "gw-chats";
+export type AudienceInputClass = "text" | "image" | "document" | "audio";
+
+export interface PanelPublicProfile {
+    readonly panels: {
+        readonly components: readonly PublicPanelComponent[];
+        readonly default_component: PublicPanelComponent;
+        readonly attribution: "gauge_wright" | "white_label_eligible";
+    };
+    readonly public_abilities: readonly AgentAbility[];
+    readonly provider: {
+        readonly provider: string;
+        readonly model: string;
+        readonly base_url: string;
+        readonly credential_class: string;
+        readonly max_input_tokens?: number;
+        readonly max_output_tokens?: number;
+    };
+    readonly audience_inputs: readonly AudienceInputClass[];
+    readonly initial_workspace: readonly {
+        readonly path: string;
+        readonly media_type: string;
+        readonly sha256: string;
+        readonly bytes: readonly number[];
+    }[];
+    readonly retention: {
+        readonly idle_ttl_seconds: number;
+        readonly absolute_ttl_seconds: number;
+        readonly transcript_retained: boolean;
+        readonly workspace_retained: boolean;
+    };
+    readonly collection: Omit<PublicDeploymentCollection, "recipient_ref" | "recipient_public_keys"> | null;
+}
+
 /** One collection recipient keyring this Home holds. */
 export interface CollectionRecipient {
     readonly recipient_id: string;
@@ -237,12 +283,22 @@ export interface CollectionRecipient {
 }
 
 export interface PublicDeploymentOutcome {
+    readonly binding_id: string;
+    readonly project_id: string;
+    readonly placement_id: PlacementId;
     readonly deployment_id: string;
     readonly release_id: string;
     readonly edge_origin: string;
     readonly deployment_url: string;
     readonly embed_html: string;
     readonly deployment: unknown;
+}
+
+export interface LegacyDeploymentImportOutcome {
+    readonly binding_id: string;
+    readonly project_id: string;
+    readonly deployment_id: string;
+    readonly active_release_id: string;
 }
 
 export interface PublicCredentialMetadata {
@@ -552,7 +608,7 @@ export function parseWorkTarget(raw: unknown): WorkTargetNode {
  *  `/projections/library/workspace` carriage value) into the branded {@link Workspace}. */
 export function parseWorkspace(raw: unknown): Workspace {
     const o = (raw ?? {}) as {
-        archetypes?: { id: string; name: string; instance_id?: string; authoring_target_id: string; is_default: boolean; forked_from?: string | null; forked_from_name?: string | null; chats: RawChat[]; workstreams?: { id: string; name: string; placement_id: string; workspace_root: string; target_id: string; status?: string; members?: string[] }[] }[];
+        archetypes?: { id: string; name: string; kind?: AgentKind; panel_profile?: PanelPublicProfile | null; instance_id?: string; authoring_target_id: string; is_default: boolean; forked_from?: string | null; forked_from_name?: string | null; chats: RawChat[]; workstreams?: { id: string; name: string; placement_id: string; workspace_root: string; target_id: string; status?: string; members?: string[] }[] }[];
         projects?: {
             id: string;
             home_id?: string;
@@ -562,6 +618,7 @@ export function parseWorkspace(raw: unknown): Workspace {
             targets: unknown[];
             placements: {
                 placement_id: string;
+                kind?: AgentKind;
                 archetype_id: string;
                 archetype_name: string;
                 is_default?: boolean;
@@ -569,8 +626,10 @@ export function parseWorkspace(raw: unknown): Workspace {
                 pinned_version: string | null;
                 version?: number;
                 current_version?: number;
+                panel_profile?: PanelPublicProfile | null;
                 upgrade_available?: boolean;
                 pending?: boolean;
+                deployments?: { id: string; deployment_id: string; edge_origin: string; active_release_id?: string | null; status: PublicDeploymentBindingSummary["status"] }[];
                 target_ids: string[];
                 chats: RawChat[];
                 workstreams?: { id: string; name: string; placement_id: string; workspace_root: string; target_id: string; status?: string; members?: string[] }[];
@@ -585,6 +644,8 @@ export function parseWorkspace(raw: unknown): Workspace {
         archetypes: (o.archetypes ?? []).map((a) => ({
             id: a.id as ArchetypeId,
             name: a.name,
+            kind: a.kind ?? "work",
+            panelProfile: a.panel_profile ?? null,
             instanceId: (a.instance_id ?? "") as PlacementId,
             authoringTargetId: workTargetId(requiredString(a.authoring_target_id, "archetype.authoring_target_id")),
             isDefault: a.is_default,
@@ -602,6 +663,7 @@ export function parseWorkspace(raw: unknown): Workspace {
             targets: valueList(p.targets, "project.targets").map(parseWorkTarget),
             placements: p.placements.map((pl) => ({
                 placementId: pl.placement_id as PlacementId,
+                kind: pl.kind ?? "work",
                 archetypeId: pl.archetype_id as ArchetypeId,
                 archetypeName: pl.archetype_name,
                 isDefault: pl.is_default ?? false,
@@ -609,8 +671,16 @@ export function parseWorkspace(raw: unknown): Workspace {
                 pinnedVersion: pl.pinned_version ?? null,
                 version: pl.version ?? 1,
                 currentVersion: pl.current_version ?? 1,
+                panelProfile: pl.panel_profile ?? null,
                 upgradeAvailable: pl.upgrade_available ?? false,
                 pending: pl.pending ?? false,
+                deployments: (pl.deployments ?? []).map((deployment) => ({
+                    id: deployment.id,
+                    deploymentId: deployment.deployment_id,
+                    edgeOrigin: deployment.edge_origin,
+                    activeReleaseId: deployment.active_release_id ?? null,
+                    status: deployment.status,
+                })),
                 targetIds: stringList(pl.target_ids, "placement.target_ids").map(workTargetId),
                 chats: pl.chats.map(parseChat),
                 workstreams: (pl.workstreams ?? []).map(parseWorkstream),

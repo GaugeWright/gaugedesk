@@ -40,6 +40,14 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route("/archetypes/{id}/use", post(lr::use_archetype))
         .route("/archetypes/{id}/fork", post(lr::fork_archetype))
         .route(
+            "/archetypes/{id}/copy-as-panel",
+            post(lr::copy_agent_as_panel),
+        )
+        .route(
+            "/archetypes/{id}/panel-profile",
+            get(lr::get_panel_profile).put(lr::put_panel_profile),
+        )
+        .route(
             "/archetypes/{id}/pull-from-source",
             post(lr::post_pull_from_source),
         )
@@ -53,6 +61,10 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route(
             "/public-deployments",
             post(crate::publisher_routes::publish_deployment),
+        )
+        .route(
+            "/public-deployments/import",
+            post(crate::publisher_routes::import_legacy_deployment),
         )
         .route(
             "/public-deployments/inspect",

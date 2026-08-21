@@ -38,6 +38,7 @@ use gaugedesk_app::{open_control_plane, open_workbench, LockUnpoisoned, SharedWo
 const PROJECT: &str = "proj-default";
 const PLACEMENT: &str = "inst-placement-default";
 const DEPLOYMENT: &str = "dep-collect-1";
+const BINDING: &str = "public-deployment-collect-1";
 const RECIPIENT: &str = "theory-a";
 /// The vector's `admission_scope`; a wrap is bound to it.
 const ADMISSION_SCOPE: &str = "theory-a-test";
@@ -71,6 +72,112 @@ fn install_recipient(root: &std::path::Path, seed_hex: &str) {
         hex::decode(seed_hex).unwrap(),
     )
     .unwrap();
+}
+
+fn install_binding(workbench: &SharedWorkbench, edge: &str, hosted_deployment_id: &str) {
+    use gaugedesk_app::library::{
+        AgentKind, AgentRecord, DeploymentAudience, DeploymentBindingStatus,
+        DeploymentOperationalConfig, InstanceKind, InstanceRecord, PanelCollectionRecipient,
+        PanelPublicProfile, PlacementKind, PublicDeploymentBindingRecord, RecordOp,
+        LIBRARY_RECORD_SCHEMA, LIBRARY_SCOPE,
+    };
+
+    let mut guard = workbench.lock_unpoisoned();
+    let mut agent: AgentRecord = guard
+        .store_ref()
+        .records(LIBRARY_SCOPE, "agent")
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| serde_json::from_str::<AgentRecord>(&row).ok())
+        .rfind(|agent| agent.id == gaugedesk_app::DEFAULT_AGENT)
+        .unwrap();
+    let profile = PanelPublicProfile {
+        collection: Some(gaugedesk_core::agent_release::CollectionPolicy {
+            exportable_paths: vec!["responses.json".to_owned()],
+            transcript_eligible: false,
+            schema_ref: SCHEMA_REF.to_owned(),
+            recipient_class: "collection:tenant".to_owned(),
+            max_artifact_bytes: 1_000_000,
+        }),
+        ..PanelPublicProfile::default()
+    };
+    agent.agent_kind = AgentKind::Panel;
+    agent.panel_profile = Some(profile.clone());
+    agent
+        .versions
+        .get_mut(&agent.current_version)
+        .unwrap()
+        .panel_profile = Some(profile.clone());
+    let placement = InstanceRecord {
+        schema: LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        id: "inst-panel-collection".to_owned(),
+        op: RecordOp::Upsert,
+        kind: InstanceKind::Using,
+        placement_kind: PlacementKind::Panel,
+        agent_id: agent.id.clone(),
+        project_id: Some(PROJECT.to_owned()),
+        version: agent.current_version,
+        admission: gaugedesk_app::library::Admission::Active,
+        collection_recipient: Some(PanelCollectionRecipient {
+            recipient_ref: RECIPIENT.to_owned(),
+            recipient_public_keys: vec!["02aa".to_owned()],
+        }),
+    };
+    let binding = PublicDeploymentBindingRecord {
+        schema: LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+        id: BINDING.to_owned(),
+        op: RecordOp::Upsert,
+        project_id: PROJECT.to_owned(),
+        placement_id: placement.id.clone(),
+        hosted_deployment_id: hosted_deployment_id.to_owned(),
+        edge_origin: edge.to_owned(),
+        active_release_id: Some(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        ),
+        operational: DeploymentOperationalConfig {
+            allowed_origins: vec!["https://example.test".to_owned()],
+            audience: DeploymentAudience::default(),
+            funding_ref: "managed:plan".to_owned(),
+            credential_class: profile.provider.credential_class,
+            credential_ref: String::new(),
+            max_spend_cents: None,
+            max_session_spend_cents: None,
+            max_turn_spend_cents: None,
+            per_visitor_turn_limit: 10,
+            max_concurrent_sessions: 10,
+            white_label: false,
+            retention_idle_ttl_seconds: 86_400,
+            retention_absolute_ttl_seconds: 2_592_000,
+        },
+        status: DeploymentBindingStatus::Active,
+    };
+    guard
+        .store_mut()
+        .append_record(
+            LIBRARY_SCOPE,
+            "agent",
+            &serde_json::to_string(&agent).unwrap(),
+        )
+        .unwrap();
+    guard
+        .store_mut()
+        .append_record(
+            LIBRARY_SCOPE,
+            "instance",
+            &serde_json::to_string(&placement).unwrap(),
+        )
+        .unwrap();
+    guard
+        .store_mut()
+        .append_record(
+            LIBRARY_SCOPE,
+            "public_deployment_binding",
+            &serde_json::to_string(&binding).unwrap(),
+        )
+        .unwrap();
+    guard.rebuild_library();
 }
 
 /// What the stub edge was asked to do, in order.
@@ -207,16 +314,11 @@ async fn a_chat(app: &Router) -> String {
         .to_owned()
 }
 
-fn drain(workbench: &SharedWorkbench, edge: &str, project: &str) -> Value {
+fn drain(workbench: &SharedWorkbench, _edge: &str, _project: &str) -> Value {
     let outcome = gaugedesk_app::agent_release::collect_into_project(
         workbench,
         CollectIntoProjectRequest {
-            deployment_id: DEPLOYMENT.to_owned(),
-            edge_origin: edge.to_owned(),
-            project_id: project.to_owned(),
-            recipient_id: RECIPIENT.to_owned(),
-            admission_scope: ADMISSION_SCOPE.to_owned(),
-            schema_ref: SCHEMA_REF.to_owned(),
+            binding_id: BINDING.to_owned(),
             after_unix_ms: None,
         },
     )
@@ -269,8 +371,17 @@ fn setup() -> (
     let root = workbench.lock_unpoisoned().root_path();
     install_recipient(&root, &vector.recipient_private_seed_hex);
     let (edge, log) = stub_edge(vector.sealed);
+    install_binding(&workbench, &edge, ADMISSION_SCOPE);
     let app = open_control_plane(Arc::clone(&workbench));
     (dir, workbench, app, edge, log)
+}
+
+fn project_repo(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("targets")
+        .join(gaugedesk_app::library_state::managed_project_target_id(
+            PROJECT,
+        ))
+        .join("repo")
 }
 
 #[tokio::test]
@@ -339,18 +450,14 @@ async fn nothing_is_acknowledged_when_the_artifact_cannot_be_opened() {
     let root = workbench.lock_unpoisoned().root_path();
     install_recipient(&root, &vector.recipient_private_seed_hex);
     let (edge, log) = stub_edge(vector.sealed);
+    install_binding(&workbench, &edge, "some-other-deployment");
 
     // The wrong admission scope: the wrap is bound to it, so this is the shape a
     // misrouted or replayed artifact takes.
     let outcome = gaugedesk_app::agent_release::collect_into_project(
         &workbench,
         CollectIntoProjectRequest {
-            deployment_id: DEPLOYMENT.to_owned(),
-            edge_origin: edge,
-            project_id: PROJECT.to_owned(),
-            recipient_id: RECIPIENT.to_owned(),
-            admission_scope: "some-other-deployment".to_owned(),
-            schema_ref: SCHEMA_REF.to_owned(),
+            binding_id: BINDING.to_owned(),
             after_unix_ms: None,
         },
     )
@@ -433,15 +540,14 @@ async fn a_first_verdict_settles_an_item_nothing_has_screened() {
     // parked request, returns `None`, and the item stays pending with nothing
     // said. This is the reviewer's *first* action on a freshly drained item,
     // which is what actually happens.
-    let (_dir, workbench, app, edge, _log) = setup();
+    let (dir, workbench, app, edge, _log) = setup();
     drain(&workbench, &edge, PROJECT);
-    let chat = a_chat(&app).await;
 
     let (status, body) = send(
         &app,
         "POST",
         &format!("/projects/{PROJECT}/quarantine/{ARTIFACT}/review"),
-        Some(&json!({ "chat_id": chat, "verdict": "keep" }).to_string()),
+        Some(&json!({ "verdict": "keep" }).to_string()),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -450,11 +556,10 @@ async fn a_first_verdict_settles_an_item_nothing_has_screened() {
         .expect("a first verdict must settle the item, not silently park it");
 
     let guard = workbench.lock_unpoisoned();
-    guard
-        .engagement_worktrees()
-        .into_iter()
-        .find(|path| path.join(landed).exists())
-        .unwrap_or_else(|| panic!("the approved item is workspace content at {landed}"));
+    assert!(
+        project_repo(dir.path()).join(landed).is_file(),
+        "the approved item is project-owned content at {landed}",
+    );
     assert_eq!(
         quarantine::pending_count(guard.store_ref(), PROJECT).unwrap(),
         0,
@@ -464,7 +569,7 @@ async fn a_first_verdict_settles_an_item_nothing_has_screened() {
 
 #[tokio::test]
 async fn a_reviewer_can_approve_an_item_into_the_workspace() {
-    let (_dir, workbench, app, edge, _log) = setup();
+    let (dir, workbench, app, edge, _log) = setup();
     drain(&workbench, &edge, PROJECT);
     let chat = a_chat(&app).await;
 
@@ -484,7 +589,7 @@ async fn a_reviewer_can_approve_an_item_into_the_workspace() {
         &app,
         "POST",
         &format!("/projects/{PROJECT}/quarantine/{ARTIFACT}/review"),
-        Some(&json!({ "chat_id": chat, "verdict": "keep" }).to_string()),
+        Some(&json!({ "verdict": "keep" }).to_string()),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -493,19 +598,18 @@ async fn a_reviewer_can_approve_an_item_into_the_workspace() {
         .expect("it landed somewhere");
 
     let guard = workbench.lock_unpoisoned();
-    let worktree = guard
-        .engagement_worktrees()
-        .into_iter()
-        .find(|path| path.join(landed).exists())
-        .expect("the approved item is in the chat's worktree");
+    let worktree = project_repo(dir.path());
+    assert!(
+        worktree.join(landed).is_file(),
+        "the approved item is in the project's managed target"
+    );
     assert_eq!(
         std::fs::read_to_string(worktree.join(landed)).unwrap(),
         vector().expected_plaintext,
     );
 
-    // Approved output is ordinary workspace content (ADR 0110 §4): no stamp, no
-    // reduced ceiling, no special resource class. The chat that reviewed it is
-    // an ordinary chat.
+    // Approved output is ordinary project content (ADR 0110 §4): no stamp, no
+    // reduced ceiling, and no special resource class in the reviewer's chat.
     assert!(
         gaugedesk_app::resource_store::list(guard.store_ref(), &chat)
             .unwrap()
@@ -529,7 +633,7 @@ async fn a_flagged_item_never_becomes_workspace_content() {
         &app,
         "POST",
         &format!("/projects/{PROJECT}/quarantine/{ARTIFACT}/review"),
-        Some(&json!({ "chat_id": chat, "verdict": "flag" }).to_string()),
+        Some(&json!({ "verdict": "flag" }).to_string()),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -658,6 +762,7 @@ fn a_drain_in_flight_does_not_hold_the_workbench() {
     let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let edge = parked_stub_edge(vector.sealed, arrived_tx, release_rx);
+    install_binding(&workbench, &edge, ADMISSION_SCOPE);
 
     let drainer = {
         let workbench = Arc::clone(&workbench);
@@ -665,12 +770,7 @@ fn a_drain_in_flight_does_not_hold_the_workbench() {
             gaugedesk_app::agent_release::collect_into_project(
                 &workbench,
                 CollectIntoProjectRequest {
-                    deployment_id: DEPLOYMENT.to_owned(),
-                    edge_origin: edge,
-                    project_id: PROJECT.to_owned(),
-                    recipient_id: RECIPIENT.to_owned(),
-                    admission_scope: ADMISSION_SCOPE.to_owned(),
-                    schema_ref: SCHEMA_REF.to_owned(),
+                    binding_id: BINDING.to_owned(),
                     after_unix_ms: None,
                 },
             )
@@ -776,13 +876,8 @@ async fn a_projects_own_gate_screens_a_drained_item_into_the_workspace() {
         .expect("the project's gate runs")
         .expect("a kept item lands in the workspace");
 
-    // The bytes are in the chat's worktree, and the record says so.
-    let worktree = workbench
-        .lock_unpoisoned()
-        .engagement_worktrees()
-        .into_iter()
-        .find(|path| path.join(&landed).is_file())
-        .expect("the approved item is on disk at the recorded path");
+    // The bytes are in the project-owned target, and the record says so.
+    let worktree = project_repo(dir.path());
     assert!(worktree.join(&landed).is_file());
 
     let held = quarantine::list(workbench.lock_unpoisoned().store_ref(), PROJECT).unwrap();
@@ -809,7 +904,7 @@ async fn a_projects_own_gate_screens_a_drained_item_into_the_workspace() {
 /// a person and settles nothing, which is the behaviour under test.
 #[tokio::test]
 async fn a_reviewers_answer_settles_the_item_through_the_gate() {
-    let (_dir, workbench, app, edge, _log) = setup();
+    let (dir, workbench, app, edge, _log) = setup();
     drain(&workbench, &edge, PROJECT);
     let chat = a_chat(&app).await;
 
@@ -897,12 +992,7 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
         .expect("the verdict reaches the gate")
         .expect("the gate settles the item");
 
-    let worktree = workbench
-        .lock_unpoisoned()
-        .engagement_worktrees()
-        .into_iter()
-        .find(|path| path.join(&landed).is_file())
-        .expect("the approved item is on disk");
+    let worktree = project_repo(dir.path());
     assert!(worktree.join(&landed).is_file());
 
     // And the count falls back to zero. This is why the count reads the gate's
