@@ -18,6 +18,7 @@
 //! be deleted (erasure) without touching the immutable log.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,10 +82,19 @@ pub(crate) fn configured_content_vault(
     }
     // KEK selection is creds-only: a hosted deployment sets GAUGEDESK_CONTENT_KEK_ID
     // + the AZURE_* Crypto User SP creds to use the KMS; dev uses the local KEK.
-    Ok(Some(Arc::new(ContentVault::new(
-        root.join("content-keys"),
-        content_keywrap(root)?,
-    ))))
+    //
+    // The erasure ledger (SOC 2 finding 4.7 / DR-0086) is default-wired to a co-located
+    // local file. That local backend is durable only for the desktop / self-hosted
+    // path: it lives on the same data root as the wrapped-DEK files, so a whole-disk
+    // backup restore that resurrects an erased scope's DEK also rolls the ledger back.
+    // A HOSTED deployment MUST inject an OUT-OF-BAND backend (R2 object-lock) via
+    // [`ContentVault::with_ledger`] so the record of an erasure cannot be undone by a
+    // data-disk restore — that injection is the ops step, not built here.
+    Ok(Some(Arc::new(
+        ContentVault::new(root.join("content-keys"), content_keywrap(root)?).with_ledger(Box::new(
+            LocalFileErasureLedger::new(root.join("content-keys").join("erased.ledger")),
+        )),
+    )))
 }
 
 /// Whether an operator has explicitly opted out of at-rest content encryption.
@@ -106,6 +116,21 @@ pub(crate) fn open_startup_store(
         Store::open(root.join("gaugewright.db").to_str().expect("utf8 path")).map_err(crate::io)?;
     let content_vault = configured_content_vault(root, content_keywrap)?;
     if let Some(vault) = &content_vault {
+        // Re-erase-on-open sweep (SOC 2 finding 4.7 / DR-0086): this runs on every
+        // store open, which includes the open immediately after a backup restore and
+        // before anything serves. A restore can resurrect an erased scope's wrapped-DEK
+        // file (it lives on the whole-disk-backed data root) which the always-available
+        // KEK would then unwrap — silently undoing an erasure. The sweep reads the
+        // append-only ledger and re-deletes any wrapped-DEK file recorded as erased, so
+        // a restore self-heals. Best-effort: a ledger read error must never abort
+        // startup (it is logged), so the store still opens.
+        let reerased = vault.reerase_recorded();
+        if reerased > 0 {
+            tracing::warn!(
+                reerased,
+                "content-vault: re-applied crypto-erasure for {reerased} recorded scope(s) on open (finding 4.7)"
+            );
+        }
         store = store.with_codec(vault.clone());
     }
     Ok((store, content_vault))
@@ -128,6 +153,11 @@ pub struct ContentVault {
     kinds: BTreeSet<String>,
     /// In-memory DEK cache (scope → 32-byte key), so the KEK is touched once per scope.
     cache: Mutex<HashMap<String, [u8; 32]>>,
+    /// Append-only record of crypto-erased key-ids (SOC 2 finding 4.7 / DR-0086), so an
+    /// erasure survives a backup restore that resurrects the wrapped-DEK file. `None`
+    /// means the vault keeps no durable erasure record (erasure is then only as durable
+    /// as file deletion — undone by a restore); production always injects a backend.
+    ledger: Option<Box<dyn ErasureLedger>>,
 }
 
 impl ContentVault {
@@ -142,6 +172,7 @@ impl ContentVault {
                 .map(|s| s.to_string())
                 .collect(),
             cache: Mutex::new(HashMap::new()),
+            ledger: None,
         }
     }
 
@@ -152,6 +183,19 @@ impl ContentVault {
         S: Into<String>,
     {
         self.kinds = kinds.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Inject the erasure ledger backend (builder, SOC 2 finding 4.7 / DR-0086).
+    ///
+    /// The desktop / self-hosted path wires a [`LocalFileErasureLedger`] co-located with
+    /// the keyring; a HOSTED deployment must inject an OUT-OF-BAND backend (R2
+    /// object-lock) here so the record of an erasure is not rolled back by a data-disk
+    /// restore. Without a ledger, [`crypto_erase`](Self::crypto_erase) still deletes the
+    /// key but [`reerase_recorded`](Self::reerase_recorded) has nothing to replay, so
+    /// the erasure would not survive a restore.
+    pub fn with_ledger(mut self, ledger: Box<dyn ErasureLedger>) -> Self {
+        self.ledger = Some(ledger);
         self
     }
 
@@ -191,9 +235,72 @@ impl ContentVault {
     /// **Crypto-erase** a scope (`SECAUD-6`): destroy its wrapped DEK (file + cache).
     /// Its retained ciphertext can never be opened again. Idempotent; returns whether a
     /// key was present.
+    ///
+    /// Besides deleting the wrapped-DEK file, this records the scope's key-id in the
+    /// append-only erasure ledger (SOC 2 finding 4.7 / DR-0086) — even when the file was
+    /// already gone — so the erasure can be re-applied by
+    /// [`reerase_recorded`](Self::reerase_recorded) after a backup restore resurrects
+    /// the file. The recorded id is the key-file stem (`sha256_hex(scope)`). The bool
+    /// return still means only "a key file was present", unchanged by the ledger write;
+    /// a ledger failure is logged but does not change the return.
     pub fn crypto_erase(&self, scope: &str) -> bool {
         self.cache.lock().unwrap().remove(scope);
+        let key_id = crate::org::sha256_hex(scope);
+        if let Some(ledger) = &self.ledger {
+            if let Err(err) = ledger.record(&key_id) {
+                tracing::warn!(
+                    %err,
+                    "content-vault: failed to record crypto-erasure in ledger (finding 4.7); \
+                     erasure will not survive a restore for this scope"
+                );
+            }
+        }
         std::fs::remove_file(self.key_path(scope)).is_ok()
+    }
+
+    /// **Re-erase-on-open sweep** (SOC 2 finding 4.7 / DR-0086): re-apply every recorded
+    /// crypto-erasure whose wrapped-DEK file is present again — e.g. because a backup
+    /// restore resurrected it. Reads the append-only ledger, and for each recorded
+    /// key-id deletes `{dir}/{key_id}.dek` if present, also dropping any matching scope
+    /// from the in-memory cache. Returns the number of files actually re-erased.
+    ///
+    /// Best-effort by design: a missing/unreadable ledger, or an already-absent file, is
+    /// not an error — a ledger read failure yields `0` after logging, so a caller running
+    /// this at store open never aborts startup. Because the ledger records key-ids (the
+    /// file stem `sha256_hex(scope)`) rather than raw scopes, the cache is cleared by
+    /// matching each live scope's hash against the recorded set.
+    pub fn reerase_recorded(&self) -> usize {
+        let Some(ledger) = &self.ledger else {
+            return 0;
+        };
+        let recorded = match ledger.recorded() {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "content-vault: could not read erasure ledger for re-erase sweep \
+                     (finding 4.7); skipping"
+                );
+                return 0;
+            }
+        };
+        let recorded: BTreeSet<String> = recorded.into_iter().collect();
+        let mut count = 0;
+        for key_id in &recorded {
+            let path = self.dir.join(format!("{key_id}.dek"));
+            if std::fs::remove_file(&path).is_ok() {
+                count += 1;
+            }
+        }
+        // Drop any resurrected DEK from the in-memory cache so a cached key cannot keep
+        // opening content the ledger says is erased.
+        if !recorded.is_empty() {
+            self.cache
+                .lock()
+                .unwrap()
+                .retain(|scope, _| !recorded.contains(&crate::org::sha256_hex(scope)));
+        }
+        count
     }
 
     fn is_content(&self, kind: &str) -> bool {
@@ -235,6 +342,86 @@ impl ContentCodec for ContentVault {
     }
 }
 
+/// The durable record of crypto-erasures (SOC 2 finding 4.7 / DR-0086).
+///
+/// An erasure destroys a scope's wrapped-DEK file, but that file lives on the
+/// whole-disk-backed data root, so a backup restore can resurrect it — and the
+/// always-available KEK would then unwrap it, silently undoing the erasure. This seam
+/// records each erasure out of band from those key files, so a re-erase-on-open sweep
+/// ([`ContentVault::reerase_recorded`]) can replay it and make the erasure self-heal
+/// after a restore.
+///
+/// Entries are **key-ids** — the wrapped-DEK file stem `sha256_hex(scope)` — so the sweep
+/// maps a recorded id straight to `{key_id}.dek`. The store never learns the raw scope
+/// from the ledger. `Send + Sync` so the vault can ride the shared workbench.
+///
+/// The production durability of this record comes from an OUT-OF-BAND backend (R2
+/// object-lock) that a data-disk restore cannot roll back; wiring that backend is an ops
+/// step, out of scope here. This module ships the seam, a local file backend for the
+/// desktop / self-hosted path, and the re-erase-on-open logic that consumes it.
+pub trait ErasureLedger: Send + Sync {
+    /// Append `key_id` to the durable record. Idempotent at the sweep level: recording
+    /// the same id twice is harmless (the sweep dedups on read), and callers record even
+    /// when the key file was already gone.
+    fn record(&self, key_id: &str) -> std::io::Result<()>;
+
+    /// Every recorded key-id (deduplicated). Order is not significant.
+    fn recorded(&self) -> std::io::Result<Vec<String>>;
+}
+
+/// A [`ErasureLedger`] backed by an append-only file, one key-id per line.
+///
+/// **Durability boundary (SOC 2 finding 4.7 / DR-0086).** This file is CO-LOCATED with
+/// the wrapped-DEK keyring on the data root, so it is durable **only for the desktop /
+/// self-hosted path**. On a HOSTED deployment a whole-disk backup restore that
+/// resurrects an erased scope's DEK file would roll this ledger back in the same motion,
+/// leaving nothing for the sweep to replay. A hosted deployment MUST therefore inject an
+/// OUT-OF-BAND backend (R2 object-lock) via [`ContentVault::with_ledger`] so the record
+/// of an erasure cannot be undone by a data-disk restore. That injection is the ops
+/// step; it is not built here.
+pub struct LocalFileErasureLedger {
+    path: PathBuf,
+}
+
+impl LocalFileErasureLedger {
+    /// A ledger appending to `path` (created, with its parent dir, on first record).
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl ErasureLedger for LocalFileErasureLedger {
+    fn record(&self, key_id: &str) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        writeln!(f, "{key_id}")?;
+        f.flush()
+    }
+
+    fn recorded(&self) -> std::io::Result<Vec<String>> {
+        let file = match std::fs::File::open(&self.path) {
+            Ok(f) => f,
+            // No ledger yet ⇒ nothing recorded (not an error).
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let mut seen = BTreeSet::new();
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line?;
+            let id = line.trim();
+            if !id.is_empty() {
+                seen.insert(id.to_string());
+            }
+        }
+        Ok(seen.into_iter().collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +429,14 @@ mod tests {
 
     fn vault(dir: &std::path::Path) -> ContentVault {
         ContentVault::new(dir, Box::new(LoopbackKeyWrap::new([7u8; 32])))
+    }
+
+    /// A vault whose keyring is `dir` and whose erasure ledger is co-located under it,
+    /// mirroring the desktop wiring in `configured_content_vault`.
+    fn vault_with_ledger(dir: &std::path::Path) -> ContentVault {
+        ContentVault::new(dir, Box::new(LoopbackKeyWrap::new([7u8; 32]))).with_ledger(Box::new(
+            LocalFileErasureLedger::new(dir.join("erased.ledger")),
+        ))
     }
 
     #[test]
@@ -390,6 +585,101 @@ mod tests {
             v.decode("eng-1", "transcript", "old plaintext line")
                 .as_deref(),
             Some("old plaintext line")
+        );
+    }
+
+    #[test]
+    fn crypto_erase_records_key_id_in_ledger_and_deletes_the_key() {
+        // (a) SOC 2 finding 4.7: erasing a scope both destroys its wrapped-DEK file and
+        //     records the scope's key-id in the append-only ledger.
+        let dir = tempfile::tempdir().unwrap();
+        let v = vault_with_ledger(dir.path());
+        v.encode("eng-1", "transcript", "a private question")
+            .unwrap();
+
+        let key_id = crate::org::sha256_hex("eng-1");
+        assert!(v.key_path("eng-1").exists(), "the key file was minted");
+
+        assert!(v.crypto_erase("eng-1"), "the key existed and is destroyed");
+        // The wrapped-DEK file is gone...
+        assert!(!v.key_path("eng-1").exists(), "the key file is destroyed");
+        // ...and the key-id is recorded in the ledger.
+        let ledger = LocalFileErasureLedger::new(dir.path().join("erased.ledger"));
+        assert_eq!(ledger.recorded().unwrap(), vec![key_id]);
+    }
+
+    #[test]
+    fn reerase_recorded_survives_a_backup_restore() {
+        // (b) SOC 2 finding 4.7: the re-erase-on-open sweep undoes a restore that
+        //     resurrected an erased scope's wrapped-DEK file.
+        let dir = tempfile::tempdir().unwrap();
+        let v = vault_with_ledger(dir.path());
+        let ct = v
+            .encode("eng-1", "transcript", "a private question")
+            .unwrap();
+
+        // Capture the wrapped-DEK bytes as a backup would, then crypto-erase.
+        let key_bytes = std::fs::read(v.key_path("eng-1")).unwrap();
+        assert!(v.crypto_erase("eng-1"));
+        assert_eq!(v.decode("eng-1", "transcript", &ct), None);
+
+        // SIMULATE A RESTORE: a backup restore resurrects the wrapped-DEK file on the
+        // data root. A fresh vault (no cached DEK) would now unwrap it with the ever-
+        // present KEK — decode succeeds, i.e. the erasure has been silently undone.
+        std::fs::write(v.key_path("eng-1"), &key_bytes).unwrap();
+        let restored = vault_with_ledger(dir.path());
+        assert_eq!(
+            restored.decode("eng-1", "transcript", &ct).as_deref(),
+            Some("a private question"),
+            "a restore alone resurrects the key — this is exactly what the sweep must fix"
+        );
+
+        // The re-erase-on-open sweep re-applies the recorded erasure: the file is
+        // deleted again and the content is unrecoverable once more.
+        assert_eq!(
+            restored.reerase_recorded(),
+            1,
+            "one recorded scope re-erased"
+        );
+        assert!(
+            !restored.key_path("eng-1").exists(),
+            "the resurrected key file is deleted again"
+        );
+        assert_eq!(
+            restored.decode("eng-1", "transcript", &ct),
+            None,
+            "content is unrecoverable after the sweep"
+        );
+    }
+
+    #[test]
+    fn reerase_recorded_is_a_noop_for_scopes_not_in_the_ledger() {
+        // (c) SOC 2 finding 4.7: a live scope's key survives a sweep — only recorded
+        //     erasures are replayed.
+        let dir = tempfile::tempdir().unwrap();
+        let v = vault_with_ledger(dir.path());
+        let a = v.encode("eng-a", "transcript", "alice data").unwrap();
+        let b = v.encode("eng-b", "transcript", "bob data").unwrap();
+
+        // Erase only eng-a; eng-b is never recorded.
+        assert!(v.crypto_erase("eng-a"));
+
+        // A sweep re-erases eng-a (already gone ⇒ nothing to re-delete) but must leave
+        // the live eng-b key untouched.
+        assert_eq!(v.reerase_recorded(), 0, "nothing present to re-erase");
+        assert!(
+            v.key_path("eng-b").exists(),
+            "the live key survives the sweep"
+        );
+        assert_eq!(
+            v.decode("eng-b", "transcript", &b).as_deref(),
+            Some("bob data"),
+            "the live scope still decodes after a sweep"
+        );
+        assert_eq!(
+            v.decode("eng-a", "transcript", &a),
+            None,
+            "eng-a stays erased"
         );
     }
 
