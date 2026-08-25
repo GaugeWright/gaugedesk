@@ -245,6 +245,22 @@ run_dependencies() {
     cargo audit --file src-tauri/Cargo.lock
     cargo audit --file src-tauri-mobile/Cargo.lock
 
+    # cargo-deny adds the license, bans, and source policy that cargo audit does
+    # not cover (deny.toml at the repo root, SOC 2 remediation 4.1). It operates
+    # per-manifest, so it runs once per workspace, next to the matching audit
+    # above. The advisories subcommand is deliberately excluded here: cargo audit
+    # is the single enforcing advisory gate on all three lockfiles, so running a
+    # moving advisory database through this gate too would only add
+    # nondeterministic breakage. This gate is licenses, bans, and sources only —
+    # the same split the whipplescript and cloud gates use.
+    command -v cargo-deny >/dev/null || {
+        echo "cargo-deny is not installed; run: cargo install cargo-deny --locked" >&2
+        exit 1
+    }
+    for manifest in Cargo.toml src-tauri/Cargo.toml src-tauri-mobile/Cargo.toml; do
+        cargo deny --manifest-path "$manifest" check licenses bans sources
+    done
+
     # Production only. The dev trees are vite, wrangler, and playwright, none of
     # which reach a user.
     while IFS= read -r lock; do
