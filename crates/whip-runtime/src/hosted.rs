@@ -831,22 +831,46 @@ fn project_result_inner(
                 || message.get("role").and_then(Value::as_str) == Some("user")
         })
         .map_or(0, |i| i + 1);
-    let mut calls: BTreeMap<String, ToolInfo> = BTreeMap::new();
+    // Build the turn's content in the order it was produced: each assistant
+    // prose run interleaved with the tool calls it introduced. `ordered` is the
+    // durable observation sequence; `tool_index` maps a call id to its slot so a
+    // later `ToolResults` message fills its result into its own position. The
+    // previous projection kept only the last tool-call-free message's text (so a
+    // line spoken alongside a call was dropped) and emitted tools id-sorted at
+    // the very end (so a reloaded transcript showed them out of order); this
+    // keeps every prose run and every tool where the turn actually put it.
+    let mut ordered: Vec<Observation> = Vec::new();
+    let mut tool_index: BTreeMap<String, usize> = BTreeMap::new();
+    // The floor for a turn that closes on a tool-call message rather than a
+    // text-only one: keep the last text spoken alongside calls so a narrated
+    // turn never folds to an empty reply.
+    let mut text_with_calls = String::new();
     for message in &messages[start..] {
         if let Some(assistant) = message.get("Assistant").or_else(|| {
             (message.get("role").and_then(Value::as_str) == Some("assistant")).then_some(message)
         }) {
+            let text = assistant
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let tool_calls = assistant
                 .get("tool_calls")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            if tool_calls.is_empty() {
-                outcome.assistant_text = assistant
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
+            if !text.is_empty() {
+                ordered.push(Observation {
+                    kind: "assistant",
+                    detail: text.to_owned(),
+                    tool: None,
+                });
+                // A closing text-only message wins the fold; text spoken
+                // alongside calls is only the floor.
+                if tool_calls.is_empty() {
+                    outcome.assistant_text = text.to_owned();
+                } else {
+                    text_with_calls = text.to_owned();
+                }
             }
             for call in tool_calls {
                 let id = call
@@ -859,9 +883,11 @@ fn project_result_inner(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                calls.insert(
-                    id.clone(),
-                    ToolInfo {
+                tool_index.insert(id.clone(), ordered.len());
+                ordered.push(Observation {
+                    kind: "tool_result",
+                    detail: name.clone(),
+                    tool: Some(ToolInfo {
                         name,
                         call_id: id,
                         target: None,
@@ -872,8 +898,8 @@ fn project_result_inner(
                             .to_string(),
                         ok: None,
                         result: None,
-                    },
-                );
+                    }),
+                });
             }
         }
         let results = message
@@ -886,24 +912,29 @@ fn project_result_inner(
             });
         if let Some(results) = results {
             for item in results {
-                if let Some(call) = item
+                if let Some(&idx) = item
                     .get("tool_call_id")
                     .and_then(Value::as_str)
-                    .and_then(|id| calls.get_mut(id))
+                    .and_then(|id| tool_index.get(id))
                 {
-                    call.ok = Some(
-                        !item
-                            .get("is_error")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    );
-                    call.result = item
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
+                    if let Some(tool) = ordered[idx].tool.as_mut() {
+                        tool.ok = Some(
+                            !item
+                                .get("is_error")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        );
+                        tool.result = item
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                    }
                 }
             }
         }
+    }
+    if outcome.assistant_text.is_empty() {
+        outcome.assistant_text = text_with_calls;
     }
     // The hosted turn container may return only its terminal summary. That summary is the
     // provider's final assistant text; the Durable Object can therefore complete without a
@@ -919,22 +950,40 @@ fn project_result_inner(
             .unwrap_or_default()
             .to_owned();
     }
-    for call in calls.into_values() {
-        outcome.mediated_tool_calls.push(call.name.clone());
-        let observation = Observation {
-            kind: "tool_result",
-            detail: call.name.clone(),
-            tool: Some(call),
-        };
-        sink(&observation);
-        outcome.observations.push(observation);
-    }
-    if emit_final_text && !outcome.assistant_text.is_empty() {
-        sink(&Observation {
-            kind: "text",
+    // A completion carried only by the summary (no transcript messages) has no
+    // prose observation to carry the reply; give it one so the durable and live
+    // tiers treat it exactly like any other closing line.
+    if !ordered
+        .iter()
+        .any(|observation| observation.kind == "assistant")
+        && !outcome.assistant_text.is_empty()
+    {
+        ordered.push(Observation {
+            kind: "assistant",
             detail: outcome.assistant_text.clone(),
             tool: None,
         });
+    }
+    // Emit the ordered sequence. Tool observations always stream live (their ✓/✗
+    // fills the open line) and are durable; prose is durable and only streamed
+    // here in the fallback where no deltas streamed during the turn.
+    for observation in ordered {
+        if observation.kind == "assistant" {
+            if emit_final_text {
+                sink(&Observation {
+                    kind: "text",
+                    detail: observation.detail.clone(),
+                    tool: None,
+                });
+            }
+            outcome.observations.push(observation);
+        } else {
+            if let Some(tool) = observation.tool.as_ref() {
+                outcome.mediated_tool_calls.push(tool.name.clone());
+            }
+            sink(&observation);
+            outcome.observations.push(observation);
+        }
     }
     outcome.output_flow_signature = result
         .get("output_flow_signature")
@@ -1627,6 +1676,57 @@ mod tests {
             })
         );
         assert_eq!(streamed.len(), 2);
+    }
+
+    #[test]
+    fn hosted_projection_interleaves_prose_with_the_calls_it_introduced() {
+        // One message narrates *and* calls a tool; a closing message speaks the
+        // reply. The fold keeps only "Done.", but the durable observations must
+        // keep the mid-turn narration ("Reading the file.") in the position it
+        // was spoken — which the old `if tool_calls.is_empty()` drop discarded.
+        let result = json!({
+            "run_status": "completed",
+            "receipt": { "terminal_position": { "instance_ref": "instance-1", "sequence": 3 } },
+            "messages": [
+                { "role": "user", "text": "read it" },
+                { "role": "assistant", "text": "Reading the file.", "tool_calls": [{
+                    "id": "call-1", "name": "read", "arguments": { "path": "README.md" }
+                }] },
+                { "role": "tool_results", "results": [{
+                    "tool_call_id": "call-1", "tool_name": "read", "content": "body", "is_error": false
+                }] },
+                { "role": "assistant", "text": "Done.", "tool_calls": [] }
+            ]
+        });
+        let outcome =
+            project_result(&result, &[], "openai", "gpt-test", &mut |_| {}).expect("projection");
+
+        // The fold still concludes with the closing line.
+        assert_eq!(outcome.assistant_text, "Done.");
+        assert_eq!(outcome.mediated_tool_calls, vec!["read"]);
+
+        // The durable observations replay the turn in order: narration, the call
+        // it introduced (result correlated), then the closing line.
+        let shape: Vec<(&str, &str)> = outcome
+            .observations
+            .iter()
+            .map(|observation| (observation.kind, observation.detail.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("assistant", "Reading the file."),
+                ("tool_result", "read"),
+                ("assistant", "Done."),
+            ]
+        );
+        assert_eq!(
+            outcome.observations[1]
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.result.as_deref()),
+            Some("body")
+        );
     }
 
     #[test]

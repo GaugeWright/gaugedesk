@@ -3339,7 +3339,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3928,8 +3928,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript"
-version = "0.5.5"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=3be196d815a44b8f938e0320c6d8ba6cd79a17b3#3be196d815a44b8f938e0320c6d8ba6cd79a17b3"
+version = "0.5.6"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=0f744aae0e5355a787491bf3dea1b8ab459e4373#0f744aae0e5355a787491bf3dea1b8ab459e4373"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3951,8 +3951,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-core"
-version = "0.5.5"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=3be196d815a44b8f938e0320c6d8ba6cd79a17b3#3be196d815a44b8f938e0320c6d8ba6cd79a17b3"
+version = "0.5.6"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=0f744aae0e5355a787491bf3dea1b8ab459e4373#0f744aae0e5355a787491bf3dea1b8ab459e4373"
 dependencies = [
  "serde",
  "serde_json",
@@ -3960,8 +3960,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-custody"
-version = "0.5.5"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=3be196d815a44b8f938e0320c6d8ba6cd79a17b3#3be196d815a44b8f938e0320c6d8ba6cd79a17b3"
+version = "0.5.6"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=0f744aae0e5355a787491bf3dea1b8ab459e4373#0f744aae0e5355a787491bf3dea1b8ab459e4373"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -3971,8 +3971,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-kernel"
-version = "0.5.5"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=3be196d815a44b8f938e0320c6d8ba6cd79a17b3#3be196d815a44b8f938e0320c6d8ba6cd79a17b3"
+version = "0.5.6"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=0f744aae0e5355a787491bf3dea1b8ab459e4373#0f744aae0e5355a787491bf3dea1b8ab459e4373"
 dependencies = [
  "bashkit",
  "chrono",
@@ -3990,8 +3990,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-parser"
-version = "0.5.5"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=3be196d815a44b8f938e0320c6d8ba6cd79a17b3#3be196d815a44b8f938e0320c6d8ba6cd79a17b3"
+version = "0.5.6"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=0f744aae0e5355a787491bf3dea1b8ab459e4373#0f744aae0e5355a787491bf3dea1b8ab459e4373"
 dependencies = [
  "serde_json",
  "sha2 0.11.0",
@@ -4001,8 +4001,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-store"
-version = "0.5.5"
-source = "git+https://github.com/jamesjscully/whipplescript?rev=3be196d815a44b8f938e0320c6d8ba6cd79a17b3#3be196d815a44b8f938e0320c6d8ba6cd79a17b3"
+version = "0.5.6"
+source = "git+https://github.com/jamesjscully/whipplescript?rev=0f744aae0e5355a787491bf3dea1b8ab459e4373#0f744aae0e5355a787491bf3dea1b8ab459e4373"
 dependencies = [
  "rusqlite",
  "serde",

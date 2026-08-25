@@ -1010,26 +1010,47 @@ fn run_task_streaming_billed<G: EgressGate>(
         .collect();
 
     // Admit the rest of the turn as durable transcript evidence, in order: each
-    // boundary decision (tool line, its result, blocks) exactly as it streamed,
-    // then the agent's final message, then the run outcome. Replaying the same
-    // observations the live stream carried means a reloaded transcript keeps each
-    // tool line's target/args/result — click-to-open survives the turn ending
-    // (run-chat.md "live vs truth": the durable layer is the same reduction).
+    // boundary decision (tool line, its result, blocks) and each assistant prose
+    // run exactly where the turn produced it, then the run outcome. Replaying the
+    // same observations the live stream carried means a reloaded transcript keeps
+    // each tool line's target/args/result (click-to-open survives the turn
+    // ending) AND the agent's narration interleaved with the calls it introduced,
+    // rather than collapsing the turn to its closing line (run-chat.md "live vs
+    // truth": the durable layer is the same reduction).
+    //
+    // The runtime projects one `assistant` observation per prose run (ordered
+    // among the tool observations); the turn boundary anchors on the last of
+    // them. An adapter that emits none — or a turn with no prose at all — falls
+    // back to the folded `assistant_text` as a single closing line, preserving
+    // the pre-segments shape.
+    let mut last_assistant_entry_id: Option<i64> = None;
     for obs in &outcome.observations {
         match obs.kind {
             "egress" | "egress_staged" | "tool_result" | "egress_blocked" => {
                 record_transcript(store, scope, &ServerEvent::from_observation(obs));
             }
-            _ => {} // streamed text is operational-only; not durable evidence
+            "assistant" => {
+                last_assistant_entry_id = Some(append_transcript(
+                    store,
+                    scope,
+                    &ServerEvent::Assistant {
+                        text: obs.detail.clone(),
+                    },
+                )?);
+            }
+            _ => {} // streamed text deltas are operational-only; not durable evidence
         }
     }
-    let assistant_entry_id = append_transcript(
-        store,
-        scope,
-        &ServerEvent::Assistant {
-            text: outcome.assistant_text.clone(),
-        },
-    )?;
+    let assistant_entry_id = match last_assistant_entry_id {
+        Some(entry_id) => entry_id,
+        None => append_transcript(
+            store,
+            scope,
+            &ServerEvent::Assistant {
+                text: outcome.assistant_text.clone(),
+            },
+        )?,
+    };
     if let (Some(runtime_before), Some(runtime_after), Some(after_workspace_cut)) = (
         outcome.runtime_start_position.clone(),
         outcome.runtime_terminal_position.clone(),
@@ -3383,6 +3404,78 @@ mod tests {
             .events(crate::account::ACCOUNT_SCOPE)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn interleaved_assistant_observations_record_as_ordered_durable_lines() {
+        use gaugedesk_harness::testing::ScriptedHarness;
+
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("e1").unwrap();
+        let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
+        // The shape the runtime now projects for a narrated turn: an `assistant`
+        // prose observation, the tool it introduced, then a closing `assistant`
+        // observation — rather than one folded reply.
+        let mut harness = ScriptedHarness::new(vec![TurnOutcome {
+            assistant_text: "All set.".into(),
+            observations: vec![
+                gaugedesk_harness::Observation {
+                    kind: "assistant",
+                    detail: "Reading the file.".into(),
+                    tool: None,
+                },
+                gaugedesk_harness::Observation {
+                    kind: "tool_result",
+                    detail: "read".into(),
+                    tool: Some(gaugedesk_harness::ToolInfo {
+                        name: "read".into(),
+                        call_id: "c1".into(),
+                        target: Some("README.md".into()),
+                        args: "{}".into(),
+                        ok: Some(true),
+                        result: Some("body".into()),
+                    }),
+                },
+                gaugedesk_harness::Observation {
+                    kind: "assistant",
+                    detail: "All set.".into(),
+                    tool: None,
+                },
+            ],
+            ..TurnOutcome::default()
+        }]);
+        let mut store = Store::open_in_memory().unwrap();
+        run_task_streaming(
+            &mut store,
+            "e1",
+            &eng,
+            &mut harness,
+            &gate,
+            "go",
+            &[],
+            &mut |_| {},
+        )
+        .unwrap();
+
+        // Each prose run is its own durable `assistant` record, in order — the
+        // mid-turn narration is not collapsed into the closing line.
+        let assistants: Vec<String> = store
+            .records("e1", "transcript")
+            .unwrap()
+            .iter()
+            .filter_map(|row| {
+                let value: serde_json::Value = serde_json::from_str(row).ok()?;
+                (value.get("type")?.as_str()? == "assistant").then(|| {
+                    value
+                        .get("text")
+                        .and_then(|text| text.as_str())
+                        .unwrap_or("")
+                        .to_owned()
+                })
+            })
+            .collect();
+        assert_eq!(assistants, vec!["Reading the file.", "All set."]);
     }
 
     #[test]

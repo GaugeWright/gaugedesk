@@ -79,12 +79,12 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 # run (no FD passed ⇒ normal bind). Dev ergonomics only; no production behaviour.
 listenfd = "1"
 tempfile = "3"
-whipplescript-store = { git = "https://github.com/jamesjscully/whipplescript", rev = "3be196d815a44b8f938e0320c6d8ba6cd79a17b3" }
+whipplescript-store = { git = "https://github.com/jamesjscully/whipplescript", rev = "0f744aae0e5355a787491bf3dea1b8ab459e4373" }
 # SUPPLY-4 verifies each supplied envelope against its authority's governance
 # root and composes the set at admission, so the kernel is a runtime dependency
 # now, not only a test one. The comment below in [dev-dependencies] described the
 # parser's dev-only use and no longer covers the kernel.
-whipplescript-kernel = { git = "https://github.com/jamesjscully/whipplescript", rev = "3be196d815a44b8f938e0320c6d8ba6cd79a17b3" }
+whipplescript-kernel = { git = "https://github.com/jamesjscully/whipplescript", rev = "0f744aae0e5355a787491bf3dea1b8ab459e4373" }
 
 [dev-dependencies]
 gaugedesk-pi-bridge = { path = "../pi-bridge" }
@@ -92,7 +92,7 @@ gaugedesk-relay-transport = { path = "../relay-transport", features = ["test-rel
 # Compiles the shipped gate program in tests. A gate we ship but never parse is
 # the same class of bug as a sealing construction nobody cross-checked: it looks
 # fine until it runs. Dev-only — nothing at runtime depends on the parser.
-whipplescript-parser = { git = "https://github.com/jamesjscully/whipplescript", rev = "3be196d815a44b8f938e0320c6d8ba6cd79a17b3" }
+whipplescript-parser = { git = "https://github.com/jamesjscully/whipplescript", rev = "0f744aae0e5355a787491bf3dea1b8ab459e4373" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1"

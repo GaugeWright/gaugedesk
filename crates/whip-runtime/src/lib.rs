@@ -42,7 +42,7 @@ pub use whipplescript::host_runtime::{
     GovernedHostRuntime, HostCancellationHandle, HostRuntimeError, LabeledTurnOutput,
     ModelProvider, NativeWorkspaceResolver, PackageResolver, ProjectedToolCall, ResolvedImage,
     ResolvedPackage, ResolvedProviderBinding, ResourceResolver, SecretResolver, ToolCall,
-    TurnExecution,
+    TurnContentSegment, TurnExecution,
 };
 /// WhippleScript's information-flow surface, re-exported so a host can parse and
 /// check the governance envelopes it ships rather than trusting their text.
@@ -1064,36 +1064,57 @@ fn project_turn_execution(
                     .collect(),
             })
             .collect();
+        // `assistant_text` stays the folded view (the closing reply) for the
+        // TaskResult and the turn-boundary anchor. The durable transcript,
+        // though, is built from the ordered `segments`: each assistant prose run
+        // interleaved with the tool calls it introduced, so a reloaded turn
+        // replays its narration in place rather than collapsing to that closing
+        // line. (Before segments the durable record kept only the fold.)
         outcome.assistant_text = output.assistant_text;
-        for call in output.tool_calls {
-            let target = tool_target(&call);
-            let observation = Observation {
-                kind: "tool_result",
-                detail: format!("{} {}", call.name, target.as_deref().unwrap_or(""))
-                    .trim()
-                    .to_owned(),
-                tool: Some(ToolInfo {
-                    name: call.name.clone(),
-                    call_id: call.call_id,
-                    target,
-                    args: call.arguments.to_string(),
-                    ok: call.ok,
-                    result: call.result,
-                }),
-            };
-            sink(&observation);
-            outcome.mediated_tool_calls.push(call.name);
-            outcome.observations.push(observation);
-        }
-        // When deltas already streamed through `observe_text_delta`, the live
-        // tier has this text; sinking it again would double it on the open
-        // line. The durable record still carries it either way.
-        if sink_final_text && !outcome.assistant_text.is_empty() {
-            sink(&Observation {
-                kind: "text",
-                detail: outcome.assistant_text.clone(),
-                tool: None,
-            });
+        for segment in output.segments {
+            match segment {
+                TurnContentSegment::Prose(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    // The prose already streamed live via `observe_text_delta`;
+                    // re-sinking would double it on the open line. Only when
+                    // nothing streamed (the fallback) do we sink, so the live
+                    // view is not empty. Either way it is durable below.
+                    if sink_final_text {
+                        sink(&Observation {
+                            kind: "text",
+                            detail: text.clone(),
+                            tool: None,
+                        });
+                    }
+                    outcome.observations.push(Observation {
+                        kind: "assistant",
+                        detail: text,
+                        tool: None,
+                    });
+                }
+                TurnContentSegment::Tool(call) => {
+                    let target = tool_target(&call);
+                    let observation = Observation {
+                        kind: "tool_result",
+                        detail: format!("{} {}", call.name, target.as_deref().unwrap_or(""))
+                            .trim()
+                            .to_owned(),
+                        tool: Some(ToolInfo {
+                            name: call.name.clone(),
+                            call_id: call.call_id,
+                            target,
+                            args: call.arguments.to_string(),
+                            ok: call.ok,
+                            result: call.result,
+                        }),
+                    };
+                    sink(&observation);
+                    outcome.mediated_tool_calls.push(call.name);
+                    outcome.observations.push(observation);
+                }
+            }
         }
     }
     if receipt.status != TurnStatus::Completed {
