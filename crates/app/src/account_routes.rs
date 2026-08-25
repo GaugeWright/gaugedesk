@@ -525,6 +525,9 @@ pub async fn post_home_route(
         home_id: HomeId::new(body.home_id),
         endpoint: body.endpoint.trim_end_matches('/').to_owned(),
         relay: body.relay,
+        author_authority: String::new(),
+        author_root_pubkey: String::new(),
+        author_signature: None,
     };
     match wb.write_account_record_in(&scope, "home_route", &record.id, &record) {
         Ok(()) => (
@@ -575,6 +578,9 @@ pub async fn delete_home_route(
         home_id: HomeId::new("deleted"),
         endpoint: String::new(),
         relay: None,
+        author_authority: String::new(),
+        author_root_pubkey: String::new(),
+        author_signature: None,
     };
     match wb.write_account_record_in(&scope, "home_route", &record.id, &record) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

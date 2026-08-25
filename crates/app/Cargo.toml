@@ -5,15 +5,6 @@ version.workspace = true
 license.workspace = true
 description = "gaugewright local control plane: the co-resident axum HTTP/WS server over the admission shell (Phase 0)."
 
-[features]
-default = [
-  "federation-protocol",
-]
-# Transitional repo-split feature band. The enterprise band extracted to the
-# `ee/app` crate (`gaugedesk-ee`, SPLIT-1); federation is the only route
-# surface still gated by a feature in the open app crate.
-federation-protocol = []
-
 [dependencies]
 gaugedesk-env = { path = "../env" }
 gaugedesk-core = { path = "../core" }
@@ -103,9 +94,7 @@ proptest = "1"
 [[test]]
 name = "federation_crossing"
 path = "tests/federation_crossing.rs"
-required-features = ["federation-protocol"]
 
 [[test]]
 name = "handoff_relocation"
 path = "tests/handoff_relocation.rs"
-required-features = ["federation-protocol"]

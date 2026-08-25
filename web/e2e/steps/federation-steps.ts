@@ -22,6 +22,8 @@ const BOB_CP = bobCP;
 
 // The peer (bob) browser window, opened in the same context as the primary page.
 let bobPage: Page | null = null;
+let aliceAuthority = "";
+let bobAuthority = "";
 let combinedInviteLink = "";
 let manualHandoffs: Array<{ readonly id: string; readonly name: string }> = [];
 let cancellableHandoff: { readonly id: string; readonly name: string } | null = null;
@@ -162,6 +164,11 @@ When("the two authorities pair with each other", async ({ page }) => {
     const bobTicket = await bob.locator("[data-pd-ticket]").textContent();
     expect(aliceTicket, "alice minted a ticket").toBeTruthy();
     expect(bobTicket, "bob minted a ticket").toBeTruthy();
+    aliceAuthority = (JSON.parse(aliceTicket!.trim()) as { authority: string }).authority;
+    bobAuthority = (JSON.parse(bobTicket!.trim()) as { authority: string }).authority;
+    expect(aliceAuthority).toMatch(/^root-p256:/);
+    expect(bobAuthority).toMatch(/^root-p256:/);
+    expect(aliceAuthority).not.toBe(bobAuthority);
 
     // Each accepts the other's ticket (TOFU pin), so both hold the other's grant.
     await bob.locator("[data-pd-paste]").fill(aliceTicket!.trim());
@@ -169,9 +176,10 @@ When("the two authorities pair with each other", async ({ page }) => {
     await page.locator("[data-pd-paste]").fill(bobTicket!.trim());
     await page.locator("[data-pd-pair]").click();
 
-    // Both render the pairing (alice is `local-user`, bob is `bob`).
-    await expect(page.locator('[data-pd-peer="bob"]')).toBeVisible();
-    await expect(bob.locator('[data-pd-peer="local-user"]')).toBeVisible();
+    // Both render the distinct governance-root identities, never the shared
+    // Home-local aliases used by these otherwise-default test installations.
+    await expect(page.locator(`[data-pd-peer="${bobAuthority}"]`)).toBeVisible();
+    await expect(bob.locator(`[data-pd-peer="${aliceAuthority}"]`)).toBeVisible();
 
     // Give the peers' receiver tasks a moment to park on the broker.
     await page.waitForTimeout(800);
@@ -181,7 +189,7 @@ When("the owner offers projects for manual handoff consent", async ({ request })
     for (const project of manualHandoffs) {
         const response = await request.post(`${ALICE_CP}/federation/handoff/relocate`, {
             headers: mutationHeaders(),
-            data: { project: project.id, peer: "bob" },
+            data: { project: project.id, peer: bobAuthority },
         });
         expect(response.status(), `offer ${project.name}`).toBe(202);
     }
@@ -299,7 +307,7 @@ Then(
 // is covered by the two-control-plane Rust test `handoff_relocation.rs`.)
 When("the owner hands off a project's home", async ({ page }) => {
     const bob = bobPage!;
-    await bob.locator('[data-pd-preauth="local-user"]').click();
+    await bob.locator(`[data-pd-preauth="${aliceAuthority}"]`).click();
 
     // Alice opens the project's Engagement pane from its node (no typed
     // project id — the id comes from the node).
@@ -378,7 +386,7 @@ Then("the target manages the invited project's data and operator grant", async (
         "invite-data",
     );
 
-    const operator = bob.locator('[data-engagement-participant="local-user"]');
+    const operator = bob.locator(`[data-engagement-participant="${aliceAuthority}"]`);
     await expect(operator).toBeVisible();
     await operator.locator('[data-engagement-revoke="archetypes"]').click();
     await expect(operator).toContainText("revoked");
@@ -619,9 +627,9 @@ When("the owner disconnects the peer through the shipped Devices UI", async ({ p
         await account.locator(".modal-head button").click();
     }
     await openPairedDevices(page);
-    const peer = page.locator('[data-pd-peer="bob"]');
+    const peer = page.locator(`[data-pd-peer="${bobAuthority}"]`);
     await expect(peer).toContainText("paired");
-    const disconnect = peer.locator('[data-pd-revoke="bob"]');
+    const disconnect = peer.locator(`[data-pd-revoke="${bobAuthority}"]`);
     await disconnect.click();
     await expect(disconnect).toHaveText("confirm disconnect");
     await disconnect.click();
@@ -630,25 +638,25 @@ When("the owner disconnects the peer through the shipped Devices UI", async ({ p
 Then(
     "the revoked peer is retained for audit and future work is refused",
     async ({ page, request }) => {
-        const peer = page.locator('[data-pd-peer="bob"]');
-        await expect(page.locator("[data-pd-status]")).toContainText("disconnected bob");
+        const peer = page.locator(`[data-pd-peer="${bobAuthority}"]`);
+        await expect(page.locator("[data-pd-status]")).toContainText(`disconnected ${bobAuthority}`);
         await expect(peer).toContainText("revoked");
-        await expect(peer.locator('[data-pd-revoke="bob"]')).toHaveCount(0);
-        await expect(peer.locator('[data-pd-preauth="bob"]')).toHaveCount(0);
+        await expect(peer.locator(`[data-pd-revoke="${bobAuthority}"]`)).toHaveCount(0);
+        await expect(peer.locator(`[data-pd-preauth="${bobAuthority}"]`)).toHaveCount(0);
 
         expect(
             productionClientResponses.some((response) =>
                 response.authority === "alice"
                 && response.method === "DELETE"
-                && response.path === "/federation/peers/bob"
+                && response.path === `/federation/peers/${bobAuthority}`
                 && response.status === 200),
-            "alice production client did not cross DELETE /federation/peers/bob",
+            `alice production client did not cross DELETE /federation/peers/${bobAuthority}`,
         ).toBeTruthy();
 
         const refused = await request.post(`${ALICE_CP}/federation/run/place`, {
             headers: mutationHeaders(),
             data: {
-                peer: "bob",
+                peer: bobAuthority,
                 project: "revoked-peer-project",
                 archetype: "analyst",
                 data_handle: "revoked-peer-data",
@@ -656,6 +664,6 @@ Then(
             },
         });
         expect(refused.status()).toBe(400);
-        expect(await refused.text()).toContain("not paired with bob");
+        expect(await refused.text()).toContain(`not paired with ${bobAuthority}`);
     },
 );

@@ -99,8 +99,8 @@ impl Workbench {
         self.federation = Some(federation);
     }
 
-    /// This control plane's network federation state (`SERVE-1`), or `None` for an
-    /// in-memory test workbench / federation-off product default.
+    /// This control plane's network federation state (`SERVE-1`), or `None` for a
+    /// deliberately minimal in-memory test workbench.
     pub fn federation_ref(&self) -> Option<&Federation> {
         self.federation.as_ref()
     }
@@ -108,6 +108,37 @@ impl Workbench {
     /// Mutable federation state; pairing and handoff routes pin peers through this.
     pub fn federation_mut(&mut self) -> Option<&mut Federation> {
         self.federation.as_mut()
+    }
+
+    /// The governance-root identity exposed at a cross-authority edge. A Home's
+    /// local ownership alias is deliberately not a federation identity: fresh
+    /// installations may all begin as `local-user`, while their independently
+    /// generated governance roots are globally distinct.
+    pub fn federation_authority(&self) -> &AuthorityId {
+        self.federation
+            .as_ref()
+            .map(|federation| &federation.authority)
+            .unwrap_or(&self.authority)
+    }
+
+    /// Public Home identity paired with the root-derived authority. Like the
+    /// authority id, this is distinct across fresh default installations even
+    /// when both retain `home:local-user` as their internal ownership alias.
+    pub fn federation_home_id(&self) -> HomeId {
+        self.federation
+            .as_ref()
+            .map(|federation| HomeId::new(format!("home:{}", federation.authority.as_str())))
+            .unwrap_or_else(|| self.home_id.clone())
+    }
+
+    /// Key-store slot backing this Home's governance root. It remains the local
+    /// authority alias so activating federation does not rewrite existing local
+    /// ownership or mint a second root key.
+    fn federation_key_authority(&self) -> &AuthorityId {
+        self.federation
+            .as_ref()
+            .map(|federation| &federation.key_authority)
+            .unwrap_or(&self.authority)
     }
 
     pub(crate) fn create_default_target_engagement(
@@ -185,12 +216,11 @@ impl Workbench {
 }
 
 pub(crate) fn activate_configured_federation(wb: &mut Workbench) -> std::io::Result<()> {
-    if !crate::app_support::federation_enabled() {
-        return Ok(());
-    }
     let broker_addr = gaugedesk_env::var("RELAY_ENDPOINT")
         .unwrap_or_else(|| "wss://relay.gaugewright.com".to_string());
-    let mut fed = Federation::open(wb.authority().clone(), &wb.root_path(), broker_addr)?;
+    let key_authority = wb.authority().clone();
+    let authority = root_authority_id(&wb.governance_public_key());
+    let mut fed = Federation::open_bound(authority, key_authority, &wb.root_path(), broker_addr)?;
     fed.restore_bridges(&folded_bridges(wb.store_ref()));
     wb.apply_startup_federation(fed);
     Ok(())
@@ -202,26 +232,17 @@ const DEFAULT_TTL_SECS: u64 = 3600;
 
 /// The self-operated federation route surface (D-REMOTE / SERVE-1).
 ///
-/// Mounted only when the workbench has federation configured
-/// (`GAUGEDESK_FEDERATION=1`). These routes stay outside the enterprise auth
-/// layer because cross-authority auth rides signed envelopes plus broker pins.
+/// Mounted when the workbench has initialized its federation identity. These
+/// routes stay outside the enterprise auth layer because cross-authority auth
+/// rides signed envelopes plus broker pins.
 pub(crate) fn featured_routes(on: bool) -> axum::Router<SharedWorkbench> {
-    #[cfg(feature = "federation-protocol")]
-    {
-        if on {
-            routes()
-        } else {
-            axum::Router::new()
-        }
-    }
-    #[cfg(not(feature = "federation-protocol"))]
-    {
-        let _ = on;
+    if on {
+        routes()
+    } else {
         axum::Router::new()
     }
 }
 
-#[cfg(feature = "federation-protocol")]
 pub(crate) fn routes() -> axum::Router<SharedWorkbench> {
     use axum::routing::{delete, get, post};
 
@@ -314,6 +335,10 @@ pub struct PeerRecord {
 /// [`Workbench`](crate::Workbench) behind the same mutex that serializes admission.
 pub struct Federation {
     authority: AuthorityId,
+    /// Local key-store slot for `authority`. Kept separate because the public
+    /// authority is root-derived while old local state may use a human-readable
+    /// alias such as `local-user`.
+    key_authority: AuthorityId,
     identity: TlsIdentity,
     broker_addr: String,
     /// Pinned peer cert fingerprints (cloned into each TLS client handshake).
@@ -333,9 +358,19 @@ impl Federation {
     /// Build this instance's federation state: load (or generate + persist) its TLS
     /// identity under `root/tls`, recording the authority + broker it pairs through.
     pub fn open(authority: AuthorityId, root: &Path, broker_addr: String) -> std::io::Result<Self> {
+        Self::open_bound(authority.clone(), authority, root, broker_addr)
+    }
+
+    fn open_bound(
+        authority: AuthorityId,
+        key_authority: AuthorityId,
+        root: &Path,
+        broker_addr: String,
+    ) -> std::io::Result<Self> {
         let identity = TlsIdentity::load_or_generate(&root.join("tls"))?;
         Ok(Self {
             authority,
+            key_authority,
             identity,
             broker_addr,
             pins: PinnedTlsClientConfig::new(),
@@ -527,6 +562,57 @@ fn inbox_token(source: &str, target: &str) -> String {
 
 fn token_bytes(token: &str) -> [u8; TOKEN_LEN] {
     Sha256::digest(token.as_bytes()).into()
+}
+
+/// Stable, collision-resistant public authority id for a governance root. The
+/// complete public key still travels in the pairing ticket and is pinned by the
+/// bridge grant; the digest is only the compact identifier used in scopes and
+/// rendezvous tokens.
+fn root_authority_id(root: &PublicKey) -> AuthorityId {
+    AuthorityId::new(format!(
+        "root-p256:{}",
+        hex::encode(Sha256::digest(root.as_str().as_bytes()))
+    ))
+}
+
+fn federation_root_signing_key(workbench: &Workbench) -> SigningKey {
+    FileKeyStore::new(workbench.root_path().join("keys"))
+        .signing_key(workbench.federation_key_authority())
+}
+
+#[cfg(test)]
+mod public_authority_tests {
+    use super::*;
+
+    #[test]
+    fn normal_homes_expose_distinct_stable_root_authorities_without_rewriting_local_ownership() {
+        let left_dir = tempfile::tempdir().unwrap();
+        let right_dir = tempfile::tempdir().unwrap();
+
+        let mut left = Workbench::new(Store::open_in_memory().unwrap()).with_root(left_dir.path());
+        activate_configured_federation(&mut left).unwrap();
+        let first = left.federation_authority().clone();
+        let first_home = left.federation_home_id();
+        assert_eq!(left.authority().as_str(), crate::LOCAL_AUTHORITY);
+        assert_eq!(
+            left.home_id().as_str(),
+            format!("home:{}", crate::LOCAL_AUTHORITY)
+        );
+        assert!(first.as_str().starts_with("root-p256:"));
+        assert_eq!(first_home.as_str(), format!("home:{}", first.as_str()));
+
+        let mut reopened =
+            Workbench::new(Store::open_in_memory().unwrap()).with_root(left_dir.path());
+        activate_configured_federation(&mut reopened).unwrap();
+        assert_eq!(reopened.federation_authority(), &first);
+        assert_eq!(reopened.federation_home_id(), first_home);
+
+        let mut right =
+            Workbench::new(Store::open_in_memory().unwrap()).with_root(right_dir.path());
+        activate_configured_federation(&mut right).unwrap();
+        assert_ne!(right.federation_authority(), &first);
+        assert_ne!(right.federation_home_id(), first_home);
+    }
 }
 
 async fn park_relay(broker: &str, token: &str) -> std::io::Result<BoxedRelayByteStream> {
@@ -1025,8 +1111,8 @@ pub async fn run_runtime_receiver(wb: SharedWorkbench, owner: AuthorityId) {
     loop {
         let (broker, identity, me, subkey, delegation, still_paired) = {
             let guard = wb.lock_unpoisoned();
-            let me = guard.authority().clone();
-            let root = FileKeyStore::new(guard.root_path().join("keys")).signing_key(&me);
+            let me = guard.federation_authority().clone();
+            let root = federation_root_signing_key(&guard);
             let (subkey, delegation) = device_identity(&guard.root_path(), &me, &root);
             match guard.federation_ref() {
                 Some(fed) => (
@@ -1650,8 +1736,8 @@ pub async fn post_cross(
     // device subkey + its root-signed delegation (Model A) sign the crossing.
     let (broker, me, subkey, delegation, pins, paired) = {
         let guard = wb.lock_unpoisoned();
-        let me = guard.authority().clone();
-        let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
+        let me = guard.federation_authority().clone();
+        let root = federation_root_signing_key(&guard);
         let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
         match guard.federation_ref() {
             Some(fed) => (
@@ -1713,8 +1799,8 @@ pub async fn post_revoke_device(
     let peer = AuthorityId::new(&req.peer);
     let (broker, me, root, pins, paired) = {
         let guard = wb.lock_unpoisoned();
-        let me = guard.authority().clone();
-        let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
+        let me = guard.federation_authority().clone();
+        let root = federation_root_signing_key(&guard);
         match guard.federation_ref() {
             Some(fed) => (
                 fed.broker_addr.clone(),
@@ -1767,7 +1853,7 @@ pub async fn post_remote_run(
     let peer = AuthorityId::new(&req.peer);
     let (broker, me, pins, paired) = {
         let guard = wb.lock_unpoisoned();
-        let me = guard.authority().clone();
+        let me = guard.federation_authority().clone();
         match guard.federation_ref() {
             Some(fed) => (
                 fed.broker_addr.clone(),
@@ -1976,8 +2062,8 @@ pub async fn post_consent(
     let owner = AuthorityId::new(&req.owner);
     let (broker, me, subkey, delegation, pins, paired) = {
         let guard = wb.lock_unpoisoned();
-        let me = guard.authority().clone();
-        let root = FileKeyStore::new(guard.root_path().join("keys")).signing_key(&me);
+        let me = guard.federation_authority().clone();
+        let root = federation_root_signing_key(&guard);
         let (subkey, delegation) = device_identity(&guard.root_path(), &me, &root);
         match guard.federation_ref() {
             Some(fed) => (
@@ -2046,8 +2132,8 @@ pub async fn post_recovery_code(State(wb): State<SharedWorkbench>) -> impl IntoR
         return resp;
     }
     let guard = wb.lock_unpoisoned();
-    let me = guard.authority().clone();
-    let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
+    let me = guard.federation_authority().clone();
+    let root = federation_root_signing_key(&guard);
     let code = gaugedesk_core::recovery::export_recovery(&root);
     Json(serde_json::json!({ "authority": me.as_str(), "recovery_code": code })).into_response()
 }
@@ -2084,9 +2170,16 @@ pub async fn post_restore(
         }
     };
     let guard = wb.lock_unpoisoned();
-    let me = guard.authority().clone();
+    let me = guard.federation_authority().clone();
+    if root_authority_id(&key.public_key()) != me {
+        return (
+            StatusCode::CONFLICT,
+            "recovery code belongs to a different federation authority",
+        )
+            .into_response();
+    }
     let ks = FileKeyStore::new(guard_root(&guard).join("keys"));
-    if let Err(e) = ks.enroll(&me, &key) {
+    if let Err(e) = ks.enroll(guard.federation_key_authority(), &key) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("enroll failed: {e}"),
@@ -2264,8 +2357,8 @@ pub async fn post_handoff_abort(
     let peer = AuthorityId::new(peer);
     let (broker, me, source_home, subkey, delegation, pins) = {
         let guard = wb.lock_unpoisoned();
-        let me = guard.authority().clone();
-        let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
+        let me = guard.federation_authority().clone();
+        let root = federation_root_signing_key(&guard);
         let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
         let Some(fed) = guard.federation_ref() else {
             return (StatusCode::SERVICE_UNAVAILABLE, "federation not configured").into_response();
@@ -2273,7 +2366,7 @@ pub async fn post_handoff_abort(
         (
             fed.broker_addr.clone(),
             me,
-            guard.home_id().clone(),
+            guard.federation_home_id(),
             subkey,
             delegation,
             fed.pins_arc(),
@@ -2291,6 +2384,7 @@ pub async fn post_handoff_abort(
         &req.project,
         Vec::new(),
         Vec::new(),
+        None,
         None,
     )
     .await
@@ -2412,6 +2506,9 @@ enum HandoffMsgKind {
     /// origin → target: the origin cancelled an offer that is still pending target
     /// consent. The target removes the held offer without importing or committing it.
     Cancelled,
+    /// serving Home → operator: a root-signed reachability update for the
+    /// shared project. It changes no handoff state.
+    Route,
 }
 
 /// A handoff message as it travels the TLS leg: the kind, the project, the log
@@ -2436,6 +2533,8 @@ struct HandoffWire {
     /// the target re-wraps the opened key inside its Home boundary.
     #[serde(default)]
     credential_key: Option<SealedKey>,
+    #[serde(default)]
+    shared_route: Option<crate::home::OpaqueHomeRoute>,
     signed_bytes: Vec<u8>,
     signature: gaugedesk_core::signature::Signature,
     source_pubkey: String,
@@ -2701,6 +2800,7 @@ async fn send_handoff(
     log: Vec<HandoffLogRecord>,
     content: Vec<HandoffContentBundle>,
     credential_key: Option<SealedKey>,
+    shared_route: Option<crate::home::OpaqueHomeRoute>,
 ) -> std::io::Result<serde_json::Value> {
     let signed_bytes = handoff_bytes(project, source_home);
     let wire = HandoffWire {
@@ -2712,6 +2812,7 @@ async fn send_handoff(
         log,
         content,
         credential_key,
+        shared_route,
         signature: subkey.sign(&signed_bytes),
         source_pubkey: subkey.public_key().as_str().to_string(),
         signed_bytes,
@@ -2951,8 +3052,7 @@ fn commit_incoming_handoff(
         .any(|record| record.scope == format!("project::{project}") && record.kind == "credential");
     let project_credential_key = match credential_key {
         Some(sealed) => {
-            let target = guard.authority().clone();
-            let target_key = FileKeyStore::new(guard_root(guard).join("keys")).signing_key(&target);
+            let target_key = federation_root_signing_key(guard);
             let Some(bytes) = open_sealed(&target_key, sealed) else {
                 tracing::warn!("handoff commit: project credential key did not open for target");
                 return false;
@@ -3102,6 +3202,9 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
     {
         return refused_verdict("verification failed");
     }
+    if wire.kind != HandoffMsgKind::Route && wire.shared_route.is_some() {
+        return refused_verdict("unexpected shared route");
+    }
     if wire.kind == HandoffMsgKind::Offer {
         // DEPLOY-4 / ITGOV-3: every offer crosses the placement floor before
         // *any* admission branch. Standing preauthorization and a combined
@@ -3149,7 +3252,7 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                         "ok": committed,
                         "committed": committed,
                         "pending": false,
-                        "home": committed.then(|| guard.home_id().as_str()),
+                        "home": committed.then(|| guard.federation_home_id()),
                     }),
                     committed,
                 )
@@ -3238,6 +3341,42 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                 false,
             )
         }
+        HandoffMsgKind::Route => {
+            let Some(route) = wire.shared_route.as_ref() else {
+                return refused_verdict("shared route missing");
+            };
+            if route.project != wire.project
+                || route.home_id != wire.source_home
+                || route.author_authority != wire.source
+                || route.author_root_pubkey != grant.source_authority_root_pubkey.as_str()
+                || !crate::home::shared_home_route_verifies(route)
+            {
+                return refused_verdict("shared route verification failed");
+            }
+            let record = crate::account::HomeRouteRecord {
+                id: route.project.clone(),
+                op: if route.endpoint.is_empty() && route.relay.is_none() {
+                    crate::account::RecordOp::Tombstone
+                } else {
+                    crate::account::RecordOp::Upsert
+                },
+                home_id: route.home_id.clone(),
+                endpoint: route.endpoint.clone(),
+                relay: route.relay.clone(),
+                author_authority: route.author_authority.clone(),
+                author_root_pubkey: route.author_root_pubkey.clone(),
+                author_signature: route.author_signature.clone(),
+            };
+            let ok = guard
+                .write_account_record_in(
+                    crate::account::ACCOUNT_SCOPE,
+                    "home_route",
+                    &record.id,
+                    &record,
+                )
+                .is_ok();
+            (serde_json::json!({ "ok": ok }), false)
+        }
     };
     if registered {
         guard.rebuild_library();
@@ -3314,8 +3453,8 @@ async fn drive_relocate(
         content,
     ) = {
         let guard = wb.lock_unpoisoned();
-        let me = guard.authority().clone();
-        let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
+        let me = guard.federation_authority().clone();
+        let root = federation_root_signing_key(&guard);
         let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
         let log = collect_project_log(guard.store_ref(), project);
         let content = collect_project_content(&guard, project);
@@ -3327,7 +3466,7 @@ async fn drive_relocate(
                 (
                     fed.broker_addr.clone(),
                     me,
-                    guard.home_id().clone(),
+                    guard.federation_home_id(),
                     subkey,
                     delegation,
                     fed.pins_arc(),
@@ -3395,6 +3534,7 @@ async fn drive_relocate(
         log,
         content,
         credential_key,
+        None,
     )
     .await
     {
@@ -3473,17 +3613,29 @@ pub async fn post_handoff_relocate(
 
 // --- Combined engagement invite (FED-7 Slice 2, ADR 0047) -------------------------
 //
-// One invite folds pairing + the project offer into a single Accept: the origin mints an
+// One invite folds pairing + a project disposition into a single Accept: the origin mints an
 // `gaugewright://invite?d=…` (its pairing ticket + the offer — no log/content); the target's
 // Accept pins the origin, arms a one-shot pre-auth, and sends an `InviteAccept` back; the
-// origin pins the target (mutual pairing, `INV-21`) and drives the relocate, which the
-// one-shot auto-admits. Consent is front-loaded into the Accept (`INV-13`), never bypassed.
+// origin pins the target (mutual pairing, `INV-21`) and either drives the initial relocate or
+// adds the target to the already-hosted project without moving its Home. Consent is
+// front-loaded into the Accept (`INV-13`), never bypassed.
 
 /// Pending outgoing invites this authority has minted, keyed by `invite_id`, so its
 /// invite-response receiver knows what to expect and the surface can show status.
 const INVITE_OUTGOING_SCOPE: &str = "invite::outgoing";
 /// An unaccepted invite expires (`INV-23` bounded escape); the one-shot expires with it.
 const INVITE_TTL_SECS: u64 = 3600;
+
+/// What accepting an engagement invitation does to the project Home. `Relocate` is the
+/// legacy/default first-contact journey; `Join` is the N-party journey and never moves or
+/// copies the Home.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteDisposition {
+    #[default]
+    Relocate,
+    Join,
+}
 
 /// The engagement invite payload — the origin's pairing ticket (pin + reach-back) + the
 /// project offer (name + archetype manifest, never bodies, `INV-10`) + the rendezvous
@@ -3495,6 +3647,8 @@ struct EngagementInvite {
     ticket: PairingTicket,
     project: String,
     project_name: String,
+    #[serde(default)]
+    disposition: InviteDisposition,
     #[serde(default = "gaugedesk_core::boundary_lifecycle::Placement::local")]
     deployment_mode: gaugedesk_core::boundary_lifecycle::Placement,
     #[serde(default)]
@@ -3553,19 +3707,21 @@ fn record_pending_invite(
     store: &mut Store,
     invite_id: &str,
     project: &str,
+    disposition: InviteDisposition,
     confirm: &str,
     expiry: u64,
 ) {
     let rec = serde_json::json!({
-        "op": "mint", "invite_id": invite_id, "project": project, "confirm_code": confirm, "expiry": expiry,
+        "op": "mint", "invite_id": invite_id, "project": project, "disposition": disposition,
+        "confirm_code": confirm, "expiry": expiry,
     });
     let _ = store.append_record(INVITE_OUTGOING_SCOPE, "event", &rec.to_string());
 }
 
 /// The pending (minted, unresolved, unexpired) outgoing invite for `invite_id`, as
 /// `(project, expiry)`, or `None` if it was never minted / already accepted / expired.
-fn pending_invite(store: &Store, invite_id: &str) -> Option<(String, u64)> {
-    let mut open: Option<(String, u64)> = None;
+fn pending_invite(store: &Store, invite_id: &str) -> Option<(String, InviteDisposition, u64)> {
+    let mut open: Option<(String, InviteDisposition, u64)> = None;
     for payload in store
         .records(INVITE_OUTGOING_SCOPE, "event")
         .unwrap_or_default()
@@ -3581,6 +3737,10 @@ fn pending_invite(store: &Store, invite_id: &str) -> Option<(String, u64)> {
                             .and_then(|p| p.as_str())
                             .unwrap_or("")
                             .to_string(),
+                        v.get("disposition")
+                            .cloned()
+                            .and_then(|value| serde_json::from_value(value).ok())
+                            .unwrap_or_default(),
                         v.get("expiry").and_then(|e| e.as_u64()).unwrap_or(0),
                     ));
                 }
@@ -3589,7 +3749,7 @@ fn pending_invite(store: &Store, invite_id: &str) -> Option<(String, u64)> {
             }
         }
     }
-    open.filter(|(_, exp)| *exp >= now_secs())
+    open.filter(|(_, _, exp)| *exp >= now_secs())
 }
 
 /// Mark a pending invite resolved (accepted), recording which device accepted (so the
@@ -3604,6 +3764,8 @@ fn resolve_invite(store: &mut Store, invite_id: &str, accepted_by: &str) {
 #[derive(Deserialize)]
 pub struct InviteRequest {
     pub project: String,
+    #[serde(default)]
+    pub disposition: InviteDisposition,
 }
 
 /// `POST /federation/invite` — mint a combined engagement invite for a project and park
@@ -3621,6 +3783,13 @@ pub async fn post_invite(
         let pubkey = guard.governance_public_key();
         let project_name = guard.project_display_name(&req.project);
         let deployment_mode = guard.project_deployment_mode(&req.project);
+        if req.disposition == InviteDisposition::Join && !guard.owns_project(&req.project) {
+            return (
+                StatusCode::CONFLICT,
+                "a join invitation must be minted by the project Home",
+            )
+                .into_response();
+        }
         // `mint_ticket` returns an owned ticket, so the `fed` borrow ends here — before
         // `store_mut` below.
         let ticket = match guard.federation_ref() {
@@ -3636,6 +3805,7 @@ pub async fn post_invite(
             guard.store_mut(),
             &invite_id,
             &req.project,
+            req.disposition,
             &confirm,
             expiry,
         );
@@ -3644,6 +3814,7 @@ pub async fn post_invite(
             ticket,
             project: req.project.clone(),
             project_name,
+            disposition: req.disposition,
             deployment_mode,
             manifest: Vec::new(),
             confirm_code: confirm.clone(),
@@ -3657,6 +3828,7 @@ pub async fn post_invite(
             "invite_url": invite.to_url(),
             "confirm_code": confirm,
             "project": req.project,
+            "disposition": invite.disposition,
             "deployment_mode": invite.deployment_mode,
         })),
     )
@@ -3744,7 +3916,7 @@ async fn invite_receive_once(
     let verdict = admit_invite_accept(wb, &wire);
     write_frame(&mut tls, verdict.to_string().as_bytes()).await?;
     let _ = tls.shutdown().await;
-    // Drive the relocate *after* responding, now that the target is pinned, if accepted.
+    // Apply the disposition *after* responding, now that the target is pinned, if accepted.
     if verdict.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         let peer = AuthorityId::new(wire.ticket.authority.as_str());
         let project = verdict
@@ -3752,8 +3924,17 @@ async fn invite_receive_once(
             .and_then(|p| p.as_str())
             .unwrap_or("")
             .to_string();
+        let disposition: InviteDisposition = verdict
+            .get("disposition")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
         if !project.is_empty() {
-            let (_status, _body) = drive_relocate(wb, &project, &peer).await;
+            if disposition == InviteDisposition::Relocate {
+                let (_status, _body) = drive_relocate(wb, &project, &peer).await;
+            } else {
+                distribute_authored_home_routes(wb);
+            }
         }
     }
     Ok(())
@@ -3768,9 +3949,11 @@ async fn invite_receive_once(
 /// a broken origin. An unconfigured federation is the origin being wrong, not the
 /// origin deciding, and is left unstamped.
 fn admit_invite_accept(wb: &SharedWorkbench, wire: &InviteAcceptWire) -> serde_json::Value {
-    let project = {
+    let (project, disposition) = {
         let mut guard = wb.lock_unpoisoned();
-        let Some((project, _expiry)) = pending_invite(guard.store_ref(), &wire.invite_id) else {
+        let Some((project, disposition, _expiry)) =
+            pending_invite(guard.store_ref(), &wire.invite_id)
+        else {
             return refused_verdict("no pending invite");
         };
         // INV-21: the key in the returned ticket must have signed the invite id.
@@ -3784,17 +3967,22 @@ fn admit_invite_accept(wb: &SharedWorkbench, wire: &InviteAcceptWire) -> serde_j
         let grant_id = crate::library::gen_id("grant");
         match guard.federation_mut() {
             Some(fed) => {
-                fed.accept_ticket(&wire.ticket, grant_id);
+                fed.accept_ticket(&wire.ticket, grant_id.clone());
             }
             None => {
                 return serde_json::json!({ "ok": false, "reason": "federation not configured" })
             }
         }
+        persist_bridge(guard.store_mut(), &wire.ticket, &grant_id, true);
+        if disposition == InviteDisposition::Join {
+            let host = guard.federation_authority().as_str().to_owned();
+            record_operator_participant(guard.store_mut(), &project, &host, &wire.ticket.authority);
+        }
         resolve_invite(guard.store_mut(), &wire.invite_id, &wire.ticket.authority);
-        project
+        (project, disposition)
     };
     spawn_peer_receivers(wb, AuthorityId::new(wire.ticket.authority.as_str()));
-    serde_json::json!({ "ok": true, "project": project })
+    serde_json::json!({ "ok": true, "project": project, "disposition": disposition })
 }
 
 #[derive(Deserialize)]
@@ -3833,31 +4021,34 @@ pub async fn post_invite_accept(
     let origin = AuthorityId::new(invite.ticket.authority.as_str());
     let (broker, pins, accept_wire) = {
         let mut guard = wb.lock_unpoisoned();
-        let me = guard.authority().clone();
         // Pin the origin (TOFU) — the same pinning `POST /federation/pair` does. The
         // mut-`fed` borrow ends with this block, before `store_mut` below.
         {
             let grant_id = crate::library::gen_id("grant");
             match guard.federation_mut() {
                 Some(fed) => {
-                    fed.accept_ticket(&invite.ticket, grant_id);
+                    fed.accept_ticket(&invite.ticket, grant_id.clone());
                 }
                 None => {
                     return (StatusCode::SERVICE_UNAVAILABLE, "federation not configured")
                         .into_response()
                 }
             }
+            persist_bridge(guard.store_mut(), &invite.ticket, &grant_id, true);
         }
-        // Arm the one-shot admission for the offered relocation (INV-13 consent, ADR 0047).
-        handoff_oneshot_arm(
-            guard.store_mut(),
-            origin.as_str(),
-            &invite.project,
-            &invite.invite_id,
-            invite.ticket.expiry,
-        );
+        // Only relocation needs a one-shot handoff admission. Join consent is represented by
+        // the participant record the serving Home writes after verifying this acceptance.
+        if invite.disposition == InviteDisposition::Relocate {
+            handoff_oneshot_arm(
+                guard.store_mut(),
+                origin.as_str(),
+                &invite.project,
+                &invite.invite_id,
+                invite.ticket.expiry,
+            );
+        }
         // Sign the invite id with our governance key so the origin can pin us (INV-21).
-        let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
+        let root = federation_root_signing_key(&guard);
         let pubkey = guard.governance_public_key();
         let signed_bytes = invite_accept_bytes(&invite.invite_id);
         let (broker, pins, ticket) = match guard.federation_ref() {
@@ -3917,6 +4108,7 @@ pub async fn post_invite_accept(
                 "project": invite.project,
                 "project_name": invite.project_name,
                 "origin": origin.as_str(),
+                "disposition": invite.disposition,
                 "confirm_code": invite.confirm_code,
             })),
         )
@@ -3948,8 +4140,8 @@ pub async fn run_place_receiver(wb: SharedWorkbench, operator: AuthorityId) {
     loop {
         let (broker, identity, me, subkey, delegation, still_paired) = {
             let guard = wb.lock_unpoisoned();
-            let me = guard.authority().clone();
-            let root = FileKeyStore::new(guard.root_path().join("keys")).signing_key(&me);
+            let me = guard.federation_authority().clone();
+            let root = federation_root_signing_key(&guard);
             let (subkey, delegation) = device_identity(&guard.root_path(), &me, &root);
             match guard.federation_ref() {
                 Some(fed) => (
@@ -4033,6 +4225,9 @@ fn admit_run_place(
         {
             return refused("verification failed");
         }
+        if !active_operator_participant(guard.store_ref(), &wire.project, &wire.source) {
+            return refused("source is not an active operator participant in the project");
+        }
         if let Some(target_chat) = wire.target_chat.as_deref() {
             use gaugedesk_core::workstream::{WorkstreamPhase, WorkstreamState};
 
@@ -4071,10 +4266,8 @@ fn admit_run_place(
             // last only because it is the one that needs the set assembled
             // first. Derivation reads records this home holds, never the
             // submission — a set the submitter names is a set it can shorten.
-            let host = guard.authority().clone();
-            let host_root = FileKeyStore::new(guard_root(&guard).join("keys"))
-                .signing_key(&host)
-                .public_key();
+            let host = guard.federation_authority().clone();
+            let host_root = federation_root_signing_key(&guard).public_key();
             // Today the host executes its own admitted runs, so the executor
             // coincides with it and the set absorbs the duplicate. Once
             // execution is leased off-box they diverge, and the authority
@@ -4208,8 +4401,8 @@ pub async fn post_run_place(
     let correlation = crate::library::gen_id("run");
     let (broker, me, subkey, delegation, pins, paired) = {
         let guard = wb.lock_unpoisoned();
-        let me = guard.authority().clone();
-        let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
+        let me = guard.federation_authority().clone();
+        let root = federation_root_signing_key(&guard);
         let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
         match guard.federation_ref() {
             Some(fed) => (
@@ -4495,7 +4688,7 @@ pub async fn run_erasure_receiver(wb: SharedWorkbench, peer: AuthorityId) {
     loop {
         let (broker, identity, me, still_paired) = {
             let guard = wb.lock_unpoisoned();
-            let me = guard.authority().clone();
+            let me = guard.federation_authority().clone();
             match guard.federation_ref() {
                 Some(fed) => (
                     fed.broker_addr.clone(),
@@ -4656,8 +4849,8 @@ pub async fn post_run_admit_once(
         else {
             return (StatusCode::NOT_FOUND, "no such queued run").into_response();
         };
-        let me = guard.authority().clone();
-        let root = FileKeyStore::new(guard_root(&guard).join("keys")).signing_key(&me);
+        let me = guard.federation_authority().clone();
+        let root = federation_root_signing_key(&guard);
         let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
         match guard.federation_ref() {
             Some(fed) => (
@@ -4730,7 +4923,7 @@ pub async fn run_result_receiver(wb: SharedWorkbench, host: AuthorityId) {
     loop {
         let (broker, identity, me, still_paired) = {
             let guard = wb.lock_unpoisoned();
-            let me = guard.authority().clone();
+            let me = guard.federation_authority().clone();
             match guard.federation_ref() {
                 Some(fed) => (
                     fed.broker_addr.clone(),
@@ -4910,7 +5103,7 @@ pub async fn post_handoff_accept(
             serde_json::from_value(offer["credential_key"].clone())
                 .ok()
                 .flatten();
-        let me = guard.authority().as_str().to_string();
+        let me = guard.federation_authority().as_str().to_string();
         // ITGOV-3(a): a relocated project's declared deployment mode must satisfy this org's
         // placement policy before the target admits it — the handoff analog of the
         // boundary-accept gate (`accept_boundary`). No attestation quote is exchanged over the
@@ -5007,7 +5200,7 @@ pub async fn post_handoff_accept_all(
         if let Err((code, msg)) = guard.authenticate_request(crate::net_http::bearer(&headers)) {
             return (code, msg).into_response();
         }
-        let me = guard.authority().as_str().to_string();
+        let me = guard.federation_authority().as_str().to_string();
         // ITGOV-3(a): the same org placement policy `post_handoff_accept` enforces, applied per
         // offer in the batch — a non-compliant relocated project is skipped (left pending, not
         // committed), the bulk analog of the single-accept 403. Rebuilt once (org-wide).
@@ -5166,6 +5359,45 @@ fn record_participants(store: &mut Store, project: &str, host: &str, operator: &
     }
 }
 
+/// Add one operator to an already-hosted project without relocating or copying its Home.
+/// Reuses the same participant projection as relocation, so admission, revoke, route
+/// distribution, and the UI do not grow a parallel N-party state machine.
+fn record_operator_participant(store: &mut Store, project: &str, host: &str, operator: &str) {
+    let scope = project_participants_scope(project);
+    for (authority, owns) in [
+        (host, PayloadClass::Data),
+        (operator, PayloadClass::Archetypes),
+    ] {
+        let rec = ParticipantRecord {
+            authority: authority.to_string(),
+            role: owns.role().to_string(),
+            owns,
+            revoked: false,
+        };
+        let _ = store.append_record(
+            &scope,
+            "participant",
+            &serde_json::to_string(&rec).unwrap_or_default(),
+        );
+    }
+}
+
+fn active_operator_participant(store: &Store, project: &str, authority: &str) -> bool {
+    participants_of(store, project)
+        .into_iter()
+        .any(|participant| {
+            participant
+                .get("authority")
+                .and_then(|value| value.as_str())
+                == Some(authority)
+                && participant.get("role").and_then(|value| value.as_str()) == Some("operator")
+                && !participant
+                    .get("revoked")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true)
+        })
+}
+
 /// The project's participants, folded latest-wins per (authority, owns) so a later
 /// revoke supersedes the grant.
 fn participants_of(store: &Store, project: &str) -> Vec<serde_json::Value> {
@@ -5210,18 +5442,23 @@ pub async fn post_handoff_revoke(
     State(wb): State<SharedWorkbench>,
     Json(req): Json<HandoffRevokeRequest>,
 ) -> impl IntoResponse {
-    let mut guard = wb.lock_unpoisoned();
-    let rec = ParticipantRecord {
-        authority: req.authority.clone(),
-        role: req.owns.role().to_string(),
-        owns: req.owns,
-        revoked: true,
-    };
-    let _ = guard.store_mut().append_record(
-        &project_participants_scope(&req.project),
-        "participant",
-        &serde_json::to_string(&rec).unwrap_or_default(),
-    );
+    {
+        let mut guard = wb.lock_unpoisoned();
+        let rec = ParticipantRecord {
+            authority: req.authority.clone(),
+            role: req.owns.role().to_string(),
+            owns: req.owns,
+            revoked: true,
+        };
+        let _ = guard.store_mut().append_record(
+            &project_participants_scope(&req.project),
+            "participant",
+            &serde_json::to_string(&rec).unwrap_or_default(),
+        );
+    }
+    if req.owns == PayloadClass::Archetypes {
+        distribute_home_routes(&wb, true, false, Some((&req.project, &req.authority)));
+    }
     Json(
         serde_json::json!({ "project": req.project, "authority": req.authority, "owns": req.owns, "revoked": true }),
     )
@@ -5286,8 +5523,8 @@ struct HandoffNotify {
 /// Snapshot the material needed to notify `source` (the origin) of a consent outcome.
 /// `pins` is `None` when `source` is not a paired peer (no leg to send on).
 fn handoff_notify_material(guard: &crate::Workbench, source: &str) -> HandoffNotify {
-    let me = guard.authority().clone();
-    let root = FileKeyStore::new(guard_root(guard).join("keys")).signing_key(&me);
+    let me = guard.federation_authority().clone();
+    let root = federation_root_signing_key(guard);
     let (subkey, delegation) = device_identity(&guard_root(guard), &me, &root);
     let pins = guard
         .federation_ref()
@@ -5300,7 +5537,7 @@ fn handoff_notify_material(guard: &crate::Workbench, source: &str) -> HandoffNot
     HandoffNotify {
         broker,
         me,
-        home: guard.home_id().clone(),
+        home: guard.federation_home_id(),
         origin: AuthorityId::new(source),
         subkey,
         delegation,
@@ -5325,8 +5562,140 @@ async fn notify_origin(n: HandoffNotify, kind: HandoffMsgKind, project: &str) {
         vec![],
         vec![], // Committed/Declined carry no content — the origin already holds it.
         None,
+        None,
     )
     .await;
+}
+
+/// Push every currently-authored route for a hosted shared project to its
+/// active operators. The serving root signs the route; the ordinary handoff
+/// device signature and pinned TLS leg authenticate this delivery act.
+pub(crate) fn distribute_authored_home_routes(wb: &SharedWorkbench) {
+    distribute_home_routes(wb, false, false, None);
+}
+
+/// Retract routes for projects this Home no longer serves before the local
+/// account fold removes them, so operators never retain a live stale locator.
+pub(crate) fn retract_departed_home_routes(wb: &SharedWorkbench) {
+    distribute_home_routes(wb, true, false, None);
+}
+
+/// Retract every shared route before reachability publication is disabled.
+pub(crate) fn retract_all_home_routes(wb: &SharedWorkbench) {
+    distribute_home_routes(wb, true, true, None);
+}
+
+fn distribute_home_routes(
+    wb: &SharedWorkbench,
+    retract: bool,
+    retract_all: bool,
+    only: Option<(&str, &str)>,
+) {
+    let deliveries = {
+        let guard = wb.lock_unpoisoned();
+        let Some(fed) = guard.federation_ref() else {
+            return;
+        };
+        let root = federation_root_signing_key(&guard);
+        let me = fed.authority.clone();
+        let home = guard.federation_home_id();
+        let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
+        let routes = crate::account::Account::rebuild(guard.store_ref())
+            .map(|account| account.home_routes)
+            .unwrap_or_default();
+        let mut deliveries = Vec::new();
+        for record in routes.into_values().filter(|record| {
+            if record.op != crate::account::RecordOp::Upsert
+                || record.home_id != *guard.home_id()
+                || (record.endpoint.is_empty() && record.relay.is_none())
+            {
+                return false;
+            }
+            let served = guard
+                .library
+                .projects
+                .get(&record.id)
+                .is_some_and(|project| project.home_id == *guard.home_id());
+            if let Some((project, _)) = only {
+                return record.id == project && served;
+            }
+            if retract {
+                retract_all || !served
+            } else {
+                served
+            }
+        }) {
+            let project = record.id.clone();
+            let mut route: crate::home::OpaqueHomeRoute = record.into();
+            route.home_id = home.clone();
+            if retract {
+                route.endpoint.clear();
+                route.relay = None;
+            }
+            route.author_authority.clear();
+            route.author_root_pubkey.clear();
+            route.author_signature = None;
+            let Ok(route) = crate::home::sign_home_route(me.as_str(), route, &root) else {
+                continue;
+            };
+            for participant in participants_of(guard.store_ref(), &project) {
+                let Some(peer) = participant
+                    .get("authority")
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                if only.is_some_and(|(_, selected)| peer != selected) {
+                    continue;
+                }
+                if participant.get("role").and_then(|value| value.as_str()) != Some("operator")
+                    || (only.is_none()
+                        && participant
+                            .get("revoked")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(true))
+                    || fed.grant_for(peer).is_none()
+                {
+                    continue;
+                }
+                deliveries.push((
+                    fed.broker_addr.clone(),
+                    me.clone(),
+                    home.clone(),
+                    subkey.clone(),
+                    delegation.clone(),
+                    AuthorityId::new(peer),
+                    fed.pins_arc(),
+                    project.clone(),
+                    route.clone(),
+                ));
+            }
+        }
+        deliveries
+    };
+    for (broker, me, home, subkey, delegation, peer, pins, project, route) in deliveries {
+        tokio::spawn(async move {
+            if let Err(error) = send_handoff(
+                &broker,
+                &me,
+                &home,
+                &subkey,
+                &delegation,
+                &peer,
+                pins,
+                HandoffMsgKind::Route,
+                &project,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(route),
+            )
+            .await
+            {
+                tracing::debug!(%project, %peer, %error, "shared Home route delivery failed");
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -5441,11 +5810,168 @@ mod bridge_roster_tests {
 }
 
 #[cfg(test)]
+mod multiparty_join_tests {
+    use super::*;
+
+    #[test]
+    fn joins_accumulate_independently_revocable_operators() {
+        let mut store = Store::open_in_memory().unwrap();
+        record_operator_participant(&mut store, "project", "host", "operator-a");
+        record_operator_participant(&mut store, "project", "host", "operator-b");
+
+        assert!(active_operator_participant(&store, "project", "operator-a"));
+        assert!(active_operator_participant(&store, "project", "operator-b"));
+        let revoked = ParticipantRecord {
+            authority: "operator-a".into(),
+            role: "operator".into(),
+            owns: PayloadClass::Archetypes,
+            revoked: true,
+        };
+        store
+            .append_record(
+                &project_participants_scope("project"),
+                "participant",
+                &serde_json::to_string(&revoked).unwrap(),
+            )
+            .unwrap();
+
+        assert!(!active_operator_participant(
+            &store,
+            "project",
+            "operator-a"
+        ));
+        assert!(active_operator_participant(&store, "project", "operator-b"));
+        assert_eq!(participants_of(&store, "project").len(), 3);
+    }
+
+    #[test]
+    fn pending_invitation_preserves_join_disposition() {
+        let mut store = Store::open_in_memory().unwrap();
+        let expiry = now_secs() + 60;
+        record_pending_invite(
+            &mut store,
+            "invite",
+            "project",
+            InviteDisposition::Join,
+            "1-2-3",
+            expiry,
+        );
+        assert_eq!(
+            pending_invite(&store, "invite"),
+            Some(("project".into(), InviteDisposition::Join, expiry))
+        );
+    }
+}
+
+#[cfg(test)]
 mod handoff_routes_tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn mem_store() -> Store {
         Store::open_in_memory().expect("in-memory store")
+    }
+
+    #[test]
+    fn a_serving_root_signed_route_lands_in_the_operators_account_and_tampering_refuses() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let source_id = AuthorityId::new("source-root");
+        let target_id = AuthorityId::new("target-root");
+        let source_root = FileKeyStore::new(source_dir.path().join("keys")).signing_key(&source_id);
+        let source_fed = Federation::open(
+            source_id.clone(),
+            source_dir.path(),
+            "wss://relay.example".into(),
+        )
+        .unwrap();
+        let ticket =
+            source_fed.mint_ticket(source_root.public_key(), "bridge:invoke".into(), Some(3600));
+        let mut target_fed = Federation::open(
+            target_id.clone(),
+            target_dir.path(),
+            "wss://relay.example".into(),
+        )
+        .unwrap();
+        target_fed.accept_ticket(&ticket, "grant-route".into());
+        let target = Arc::new(Mutex::new(
+            Workbench::new(mem_store())
+                .with_authority(target_id.clone())
+                .with_root(target_dir.path())
+                .with_federation(target_fed),
+        ));
+
+        let home = HomeId::new("home:source-root");
+        let route = crate::home::sign_home_route(
+            source_id.as_str(),
+            crate::home::OpaqueHomeRoute {
+                project: "shared-project".into(),
+                home_id: home.clone(),
+                endpoint: "https://home.example".into(),
+                relay: None,
+                author_authority: String::new(),
+                author_root_pubkey: String::new(),
+                author_signature: None,
+            },
+            &source_root,
+        )
+        .unwrap();
+        let (subkey, delegation) = device_identity(source_dir.path(), &source_id, &source_root);
+        let signed_bytes = handoff_bytes("shared-project", &home);
+        let wire = HandoffWire {
+            kind: HandoffMsgKind::Route,
+            project: "shared-project".into(),
+            source: source_id.as_str().into(),
+            target: target_id.as_str().into(),
+            source_home: home,
+            log: Vec::new(),
+            content: Vec::new(),
+            credential_key: None,
+            shared_route: Some(route.clone()),
+            signature: subkey.sign(&signed_bytes),
+            source_pubkey: subkey.public_key().as_str().into(),
+            signed_bytes,
+            delegation: Some(delegation),
+        };
+        assert_eq!(
+            admit_handoff(&target, &wire).get("ok"),
+            Some(&serde_json::json!(true))
+        );
+        let stored = crate::account::Account::rebuild(target.lock_unpoisoned().store_ref())
+            .unwrap()
+            .home_routes
+            .remove("shared-project")
+            .unwrap();
+        assert_eq!(stored.author_authority, source_id.as_str());
+        assert_eq!(stored.endpoint, "https://home.example");
+
+        let mut tampered = wire;
+        tampered.shared_route.as_mut().unwrap().endpoint = "https://attacker.example".into();
+        assert_eq!(
+            admit_handoff(&target, &tampered).get("refused"),
+            Some(&serde_json::json!(true))
+        );
+
+        let mut withdrawn = route;
+        withdrawn.endpoint.clear();
+        withdrawn.author_authority.clear();
+        withdrawn.author_root_pubkey.clear();
+        withdrawn.author_signature = None;
+        let withdrawn =
+            crate::home::sign_home_route(source_id.as_str(), withdrawn, &source_root).unwrap();
+        let mut withdrawal = tampered;
+        withdrawal.shared_route = Some(withdrawn);
+        assert_eq!(
+            admit_handoff(&target, &withdrawal).get("ok"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(
+            !crate::account::Account::rebuild(target.lock_unpoisoned().store_ref())
+                .unwrap()
+                .home_routes
+                .contains_key("shared-project"),
+            "a serving-root-signed withdrawal tombstones the shared route"
+        );
     }
 
     #[test]
@@ -5608,6 +6134,7 @@ mod handoff_routes_tests {
             },
             project: "policy-project".into(),
             project_name: "Policy project".into(),
+            disposition: InviteDisposition::Relocate,
             deployment_mode: gaugedesk_core::boundary_lifecycle::Placement::local(),
             manifest: Vec::new(),
             confirm_code: "1-2-3".into(),

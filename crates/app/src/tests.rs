@@ -218,10 +218,9 @@ async fn responses_carry_an_hsts_header() {
     assert!(hsts.contains("includeSubDomains"));
 }
 
-/// ADR 0065 gate: the cross-authority federation surface is PARKED off by default. A workbench
-/// with no federation configured (the single-authority product shape) mounts **none** of the
-/// `/federation/*` relay routes — they 404, not 503 — so the unauthenticated relay surface is
-/// genuinely absent, not merely dormant.
+/// A deliberately minimal in-memory test workbench with no federation identity
+/// mounts none of the federation routes. Every normally-opened product
+/// workbench initializes that identity; this remains a composition invariant.
 #[tokio::test]
 async fn federation_routes_are_absent_when_federation_is_off() {
     let (_dir, wb) = workbench(); // with_target → no federation attached

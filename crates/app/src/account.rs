@@ -211,6 +211,12 @@ pub struct HomeRouteRecord {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<crate::home::OpaqueRelayLocator>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author_authority: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author_root_pubkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_signature: Option<gaugedesk_core::signature::Signature>,
 }
 
 impl From<HomeRouteRecord> for crate::home::OpaqueHomeRoute {
@@ -220,6 +226,9 @@ impl From<HomeRouteRecord> for crate::home::OpaqueHomeRoute {
             home_id: record.home_id,
             endpoint: record.endpoint,
             relay: record.relay,
+            author_authority: record.author_authority,
+            author_root_pubkey: record.author_root_pubkey,
+            author_signature: record.author_signature,
         }
     }
 }

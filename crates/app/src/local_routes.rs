@@ -10,8 +10,8 @@ use crate::{
 
 /// Open-source local workbench route surface: health, workspace/library,
 /// project/chat/resource lifecycles, package primitives, projections, test reset
-/// hooks (debug builds only), and the parked self-operated federation route
-/// surface when its open operator gate is enabled.
+/// hooks (debug builds only), and the self-operated federation route surface
+/// whenever the workbench carries its normally initialized federation identity.
 pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
     let routes = Router::new()
         .route("/health", get(net_http::health))

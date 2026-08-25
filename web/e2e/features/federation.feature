@@ -4,8 +4,9 @@ Feature: Cross-machine federation
 
   Two authorities on two control planes pair over the network and collaborate
   through the cert-pinned relay legs, driven from the workbench UI. Alice is the
-  primary instance (port 7878, authority local-user); Bob is the peer (port 7879)
-  reached by pointing a second browser window at it with ?cp=.
+  primary instance (port 7878); Bob is the peer (port 7879), each exposing the
+  distinct authority derived from its governance root, reached by pointing a
+  second browser window at it with ?cp=.
 
   # One scenario, one pairing: the rendezvous broker is shared and long-lived, so
   # a single pairing keeps its parked receiver legs unambiguous (re-pairing across

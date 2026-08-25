@@ -74,6 +74,7 @@ export interface EngagementInvite {
     readonly invite_url: string;
     readonly confirm_code: string;
     readonly project: ProjectId;
+    readonly disposition: "relocate" | "join";
     readonly deployment: DeploymentPlacement;
 }
 /** The origin's pending-invite status (poll while waiting for the client to accept). */
@@ -240,6 +241,7 @@ function parseEngagementInvite(raw: unknown): EngagementInvite {
         invite_url: fStr(o, "invite_url"),
         confirm_code: fStr(o, "confirm_code"),
         project: fStr(o, "project") as ProjectId,
+        disposition: o.disposition === "join" ? "join" : "relocate",
         deployment: o.deployment_mode == null
             ? localDeploymentPlacement
             : parseDeploymentPlacement(o.deployment_mode),
@@ -382,8 +384,12 @@ export async function runResult(json: RouteJson, correlation: string): Promise<R
 }
 
 /** Mint a combined engagement invite for a project. */
-export async function invite(json: RouteJson, project: ProjectId): Promise<EngagementInvite> {
-    return parseEngagementInvite(await json("POST", "/federation/invite", { project }));
+export async function invite(
+    json: RouteJson,
+    project: ProjectId,
+    disposition: "relocate" | "join" = "relocate",
+): Promise<EngagementInvite> {
+    return parseEngagementInvite(await json("POST", "/federation/invite", { project, disposition }));
 }
 
 /** Accept a combined invite (target side). */

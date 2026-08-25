@@ -172,6 +172,9 @@ impl crate::Workbench {
                 home_id: route.home_id.clone(),
                 endpoint: route.endpoint.clone(),
                 relay: route.relay.clone(),
+                author_authority: route.author_authority.clone(),
+                author_root_pubkey: route.author_root_pubkey.clone(),
+                author_signature: route.author_signature.clone(),
             };
             if self
                 .write_account_record_in(ACCOUNT_SCOPE, "home_route", &record.id, &record)

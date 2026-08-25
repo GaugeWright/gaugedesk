@@ -81,6 +81,9 @@ impl Workbench {
                     home_id: home.clone(),
                     endpoint: reach.endpoint.clone(),
                     relay: reach.relay.clone(),
+                    author_authority: String::new(),
+                    author_root_pubkey: String::new(),
+                    author_signature: None,
                 };
                 let unchanged = existing.get(project).is_some_and(|current| {
                     current.op == RecordOp::Upsert
@@ -135,13 +138,16 @@ pub fn republish(workbench: &SharedWorkbench, route: &RelayRoute) {
         endpoint: String::new(),
         relay: Some(locator_of(route)),
     };
+    crate::federation::retract_departed_home_routes(workbench);
     let mut guard = workbench.lock_unpoisoned();
     let written = guard.author_home_routes(&reach);
+    drop(guard);
     if written > 0 {
         eprintln!(
             "[home-relay] re-authored {written} project route(s) at epoch {}",
             route.epoch
         );
+        crate::federation::distribute_authored_home_routes(workbench);
     }
 }
 

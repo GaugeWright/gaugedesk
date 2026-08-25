@@ -37,6 +37,7 @@ pub mod mobile_machine_session;
 pub mod mobile_wake;
 pub mod package_distribution;
 pub mod pinned_tls;
+pub mod protected_profile;
 pub mod rbac;
 pub mod recovery;
 pub mod remote_call;

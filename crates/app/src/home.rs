@@ -9,7 +9,9 @@
 use gaugedesk_core::ids::{AuthorityId, HomeId};
 use serde::{Deserialize, Serialize};
 
-pub use gaugedesk_directory_protocol::{OpaqueHomeRoute, OpaqueRelayLocator};
+pub use gaugedesk_directory_protocol::{
+    shared_home_route_verifies, sign_home_route, OpaqueHomeRoute, OpaqueRelayLocator,
+};
 
 /// Where a Home is operated. This is operational placement behind one product
 /// identity; changing a process/VM does not change the [`HomeId`].

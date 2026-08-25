@@ -21,7 +21,7 @@ pub async fn open_serve(addr: &str, root: &std::path::Path) -> std::io::Result<(
         let guard = wb.lock_unpoisoned();
         println!(
             "gaugewright authority `{}` governance key {}",
-            guard.authority().as_str(),
+            guard.federation_authority().as_str(),
             guard.governance_public_key().as_str(),
         );
     }
@@ -112,6 +112,7 @@ pub(crate) async fn supervise_home_reachability(
                 if let Some(leg) = parked.take() {
                     leg.release();
                 }
+                crate::federation::retract_all_home_routes(&wb);
                 // Withdraw the pointers with the leg. `author_home_routes`
                 // tombstones every route this Home claims once it reports no
                 // reachability, so a client that already holds a locator learns

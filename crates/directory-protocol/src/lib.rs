@@ -33,6 +33,60 @@ pub struct OpaqueHomeRoute {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<OpaqueRelayLocator>,
+    /// Present for a route authored by someone else's Home. The recipient's
+    /// account-root signature carries this proof to its other clients; the
+    /// serving root remains the actual route author.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author_authority: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author_root_pubkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_signature: Option<Signature>,
+}
+
+/// Exact bytes a serving Home signs for a shared project route. Proof fields
+/// are excluded so the signature cannot recursively contain itself.
+pub fn home_route_signing_bytes(
+    authority: &str,
+    route: &OpaqueHomeRoute,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&(
+        "gaugedesk-shared-home-route-v1",
+        authority,
+        &route.project,
+        &route.home_id,
+        &route.endpoint,
+        &route.relay,
+    ))
+}
+
+pub fn sign_home_route(
+    authority: &str,
+    mut route: OpaqueHomeRoute,
+    signing_key: &SigningKey,
+) -> Result<OpaqueHomeRoute, serde_json::Error> {
+    route.author_authority = authority.to_owned();
+    route.author_root_pubkey = signing_key.public_key().as_str().to_owned();
+    route.author_signature = Some(signing_key.sign(&home_route_signing_bytes(authority, &route)?));
+    Ok(route)
+}
+
+pub fn shared_home_route_verifies(route: &OpaqueHomeRoute) -> bool {
+    let Some(signature) = route.author_signature.as_ref() else {
+        return false;
+    };
+    if route.author_authority.is_empty() || route.author_root_pubkey.is_empty() {
+        return false;
+    }
+    let Ok(bytes) = home_route_signing_bytes(&route.author_authority, route) else {
+        return false;
+    };
+    verify_signature(
+        &bytes,
+        signature,
+        &PublicKey::new(route.author_root_pubkey.clone()),
+    )
+    .unwrap_or(false)
 }
 
 /// Readable identity and opaque routing facts stored by the blind directory.
@@ -122,10 +176,37 @@ mod tests {
                     home_id: HomeId::new("home:opaque"),
                     endpoint: String::new(),
                     relay: None,
+                    author_authority: String::new(),
+                    author_root_pubkey: String::new(),
+                    author_signature: None,
                 }],
             },
             sealed_blob: "deadbeef".into(),
         }
+    }
+
+    #[test]
+    fn a_shared_home_route_is_bound_to_its_author_and_every_reachability_field() {
+        let key = signer(9);
+        let route = OpaqueHomeRoute {
+            project: "project-shared".into(),
+            home_id: HomeId::new("home:root-p256:host"),
+            endpoint: "https://home.example".into(),
+            relay: None,
+            author_authority: String::new(),
+            author_root_pubkey: String::new(),
+            author_signature: None,
+        };
+        let signed = sign_home_route("root-p256:host", route, &key).unwrap();
+        assert!(shared_home_route_verifies(&signed));
+
+        let mut redirected = signed.clone();
+        redirected.endpoint = "https://attacker.example".into();
+        assert!(!shared_home_route_verifies(&redirected));
+
+        let mut renamed = signed;
+        renamed.author_authority = "root-p256:attacker".into();
+        assert!(!shared_home_route_verifies(&renamed));
     }
 
     #[test]

@@ -124,15 +124,6 @@ pub(crate) fn default_agent_definition() -> gaugedesk_boundary::definition::Agen
 /// single-user collapse. Multi-user identity is the G1/M2 deferral.
 pub const LOCAL_AUTHORITY: &str = "local-user";
 
-/// Whether the cross-authority **federation** surface is enabled (`GAUGEDESK_FEDERATION=1`).
-/// **PARKED off by default (ADR 0065):** the single-authority initial product needs no relay, so
-/// the federation subsystem is not opened and its routes are not mounted unless an operator
-/// explicitly opts in. The cross-authority machinery reactivates with D-ATTEST / a real
-/// multi-party push; until then it is dormant and unreachable in the product.
-pub(crate) fn federation_enabled() -> bool {
-    gaugedesk_env::var("FEDERATION").as_deref() == Some("1")
-}
-
 /// Whether the **attested-specific operator surface** is enabled (`GAUGEDESK_ATTESTATION=1`).
 /// **PARKED off by default (ADR 0065):** the measurement registry + attested-run entitlement
 /// routes are mounted only on opt-in. The attested accept path stays fail-closed

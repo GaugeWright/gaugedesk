@@ -51,7 +51,7 @@ export interface EngagementPaneApi {
     listPeers(): Promise<FederationPeer[]>;
     runQueue(): Promise<QueuedRun[]>;
     handoffRelocate(project: ProjectId, peer: string): Promise<HandoffStatus>;
-    invite(project: ProjectId): Promise<EngagementInvite>;
+    invite(project: ProjectId, disposition?: "relocate" | "join"): Promise<EngagementInvite>;
     inviteStatus(inviteId: string): Promise<{ accepted: boolean; accepted_by: string | null; confirm_code: string }>;
     handoffAbort(project: ProjectId): Promise<HandoffStatus>;
     handoffRevoke(project: ProjectId, authority: string, owns: string): Promise<void>;
@@ -162,25 +162,33 @@ export function EngagementPane(props: {
     };
     // Mint a combined invite for a *new* device (first contact, no prior pairing) and
     // poll until the client accepts — one link that pairs and hands off (ADR 0047).
-    const inviteNewDevice = async () => {
+    const inviteNewDevice = async (disposition: "relocate" | "join") => {
         try {
-            const inv = await props.api.invite(props.project);
+            const inv = await props.api.invite(props.project, disposition);
             setInvite(inv);
             setAccepted(false);
-            setStatus("invite ready — share the QR or link; waiting for the client to accept");
-            void pollInvite(inv.invite_id);
+            setStatus(
+                disposition === "join"
+                    ? "operator invite ready — the project Home will stay here"
+                    : "handoff invite ready — share the QR or link; waiting for the client to accept",
+            );
+            void pollInvite(inv);
         } catch (e) {
             setStatus(describeFailure("create the invite", e));
         }
     };
-    const pollInvite = async (inviteId: string) => {
+    const pollInvite = async (invitation: EngagementInvite) => {
         for (let i = 0; i < 60 && !accepted(); i++) {
             await new Promise((r) => setTimeout(r, 1000));
             try {
-                const s = await props.api.inviteStatus(inviteId);
+                const s = await props.api.inviteStatus(invitation.invite_id);
                 if (s.accepted) {
                     setAccepted(true);
                     setStatus(`accepted by ${s.accepted_by ?? "a device"} · confirm code ${s.confirm_code}`);
+                    if (invitation.disposition === "join") {
+                        refetchAll();
+                        return;
+                    }
                     // Acceptance resolves the pairing invitation before the
                     // origin's receiver finishes the two-phase relocation. A
                     // single refetch here can observe `offered` and then freeze
@@ -402,14 +410,23 @@ export function EngagementPane(props: {
                                     when={invite()}
                                     fallback={
                                         <div class="pair-device-actions">
-                                            {/* First contact: one invite that pairs + hands off. */}
+                                            {/* First contact uses one protocol with an explicit
+                                                relocate or non-relocating N-party disposition. */}
                                             <button
                                                 type="button"
                                                 class="tree-action"
                                                 data-engagement-invite
-                                                onClick={() => void inviteNewDevice()}
+                                                onClick={() => void inviteNewDevice("relocate")}
                                             >
-                                                Invite a new device
+                                                Move Home to a new device
+                                            </button>
+                                            <button
+                                                type="button"
+                                                class="tree-action"
+                                                data-engagement-join
+                                                onClick={() => void inviteNewDevice("join")}
+                                            >
+                                                Add an operator
                                             </button>
                                             {/* Already-paired device: hand off directly. */}
                                             <Show when={pairedPeers().length > 0}>
@@ -462,7 +479,9 @@ export function EngagementPane(props: {
                                             </div>
                                             <Show when={accepted()}>
                                                 <p class="status" data-engagement-accepted>
-                                                    ✓ accepted — home moving to the client
+                                                    {inv().disposition === "join"
+                                                        ? "✓ operator added — Home stays here"
+                                                        : "✓ accepted — Home moving to the client"}
                                                 </p>
                                             </Show>
                                         </div>

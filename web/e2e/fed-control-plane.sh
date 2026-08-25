@@ -22,11 +22,9 @@ ln -sfn "$REPO/plugin" "$STATE/plugin"
 # left unset for the 7878 instance so it stays `local-user`, keeping the existing
 # single-instance suite unchanged).
 export GAUGEDESK_TEST_RESET=1
-# Cross-authority federation is PARKED off by default in the product (ADR 0065): its
-# subsystem isn't opened and its routes aren't mounted unless opted in. The federation E2E
-# (pairing/handoff/co-drive over the relay) is precisely the opt-in case — turn it on so the
-# `/federation/*` surface (e.g. `POST /federation/pairing-ticket`) is reachable here.
-export GAUGEDESK_FEDERATION=1
+# Federation is part of the normal product composition. This harness supplies
+# explicit test identities and a hermetic relay; it does not enable a different
+# route surface.
 export GAUGEDESK_ADDR="127.0.0.1:${PORT}"
 export GAUGEDESK_RELAY_ENDPOINT="${GAUGEDESK_RELAY_ENDPOINT:-ws://127.0.0.1:7900}"
 # Each control plane is its OWN machine: pin its data root to its isolated state dir.

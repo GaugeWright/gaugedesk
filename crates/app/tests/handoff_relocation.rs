@@ -148,6 +148,28 @@ async fn pair(a: &Router, b: &Router) {
     assert_eq!(sb, StatusCode::OK);
 }
 
+/// A bridge proves who a peer is; it deliberately grants no authority on an unrelated
+/// project. Tests that exercise run admission without first relocating/joining declare the
+/// exact participant fact that those product journeys would have written.
+fn declare_operator(
+    host: &Arc<Mutex<Workbench>>,
+    project: &str,
+    host_authority: &str,
+    operator: &str,
+) {
+    let mut guard = host.lock().unwrap();
+    let scope = format!("project::{project}::participants");
+    for record in [
+        json!({ "authority": host_authority, "role": "host", "owns": "data", "revoked": false }),
+        json!({ "authority": operator, "role": "operator", "owns": "archetypes", "revoked": false }),
+    ] {
+        guard
+            .store_mut()
+            .append_record(&scope, "participant", &record.to_string())
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_project_home_relocates_to_a_paired_peer_with_its_log() {
     let (broker, _relay) = start_broker().await;
@@ -910,6 +932,66 @@ async fn a_combined_invite_pairs_and_hands_off_in_one_accept() {
 }
 
 #[tokio::test]
+async fn a_third_root_joins_an_existing_home_without_relocation_or_payload_copy() {
+    let (broker, _relay) = start_broker().await;
+    let (alice, _alice_wb, _ra) = instance("alice", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
+    let (carol, _carol_wb, _rc) = instance("carol", &broker);
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (created_status, created) = post(&bob, "/projects", json!({ "name": "N-party" })).await;
+    assert_eq!(created_status, StatusCode::CREATED, "project: {created}");
+    let project = created["id"].as_str().unwrap().to_owned();
+    declare_operator(&bob_wb, &project, "bob", "alice");
+
+    let (invite_status, invite) = post(
+        &bob,
+        "/federation/invite",
+        json!({ "project": project, "disposition": "join" }),
+    )
+    .await;
+    assert_eq!(invite_status, StatusCode::OK, "join invite: {invite}");
+    assert_eq!(invite["disposition"], "join");
+    let (accepted_status, accepted) = post(
+        &carol,
+        "/federation/invite/accept",
+        json!({ "invite": invite["invite_url"] }),
+    )
+    .await;
+    assert_eq!(accepted_status, StatusCode::OK, "join accept: {accepted}");
+    assert_eq!(accepted["disposition"], "join");
+
+    let (_, participants) = get(
+        &bob,
+        &format!("/federation/handoff/participants?project={project}"),
+    )
+    .await;
+    let participants = participants["participants"].as_array().unwrap();
+    assert!(participants.iter().any(|row| row["authority"] == "alice"));
+    assert!(participants.iter().any(|row| row["authority"] == "carol"));
+    assert!(participants.iter().any(|row| row["authority"] == "bob"));
+
+    let (_, home) = get(
+        &bob,
+        &format!("/federation/handoff/status?project={project}"),
+    )
+    .await;
+    assert_eq!(
+        home["phase"], "draft",
+        "join did not start a handoff: {home}"
+    );
+    assert_eq!(home["home_origin"], true, "the serving Home stayed on bob");
+    let (_, carol_workspace) = get(&carol, "/workspace").await;
+    assert!(
+        !carol_workspace["projects"]
+            .as_array()
+            .is_some_and(|projects| projects.iter().any(|row| row["id"] == project)),
+        "join copied the host project payload to carol: {carol_workspace}"
+    );
+}
+
+#[tokio::test]
 async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
     let (broker, _relay) = start_broker().await;
     let (alice, _alice_wb, _ra) = workspace_instance("alice", &broker);
@@ -1040,6 +1122,7 @@ async fn a_run_placement_refused_by_the_host_floor_is_forbidden_not_a_gateway_fa
     let (alice, _wa, _ra) = instance("alice", &broker);
     let (bob, bob_wb, _rb) = instance("bob", &broker);
     pair(&alice, &bob).await;
+    declare_operator(&bob_wb, "floor-blocked", "bob", "alice");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     {
@@ -1087,8 +1170,10 @@ async fn an_operator_run_is_gated_by_host_admission() {
     std::env::set_var("GAUGEDESK_FAKE_AGENT", "1"); // stub turn, no real model/runtime
     let (broker, _relay) = start_broker().await;
     let (alice, _wa, _ra) = instance("alice", &broker);
-    let (bob, _wb, _rb) = instance("bob", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
     pair(&alice, &bob).await;
+    declare_operator(&bob_wb, "engagement-cd", "bob", "alice");
+    declare_operator(&bob_wb, "engagement-other", "bob", "alice");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let place = |project: &str| {
@@ -1193,6 +1278,7 @@ async fn a_federated_run_drives_a_named_hub_workstream_chat_with_crossing_attrib
     assert_eq!(sj, StatusCode::OK, "join: {joined}");
 
     pair(&alice, &bob).await;
+    declare_operator(&bob_wb, &project_id, "bob", "alice");
     tokio::time::sleep(Duration::from_millis(400)).await;
     let (sa, _) = post(
         &bob,
@@ -1248,8 +1334,9 @@ async fn allow_once_executes_one_queued_run_and_delivers_the_result() {
     std::env::set_var("GAUGEDESK_FAKE_AGENT", "1");
     let (broker, _relay) = start_broker().await;
     let (alice, _wa, _ra) = instance("alice", &broker);
-    let (bob, _wb, _rb) = instance("bob", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
     pair(&alice, &bob).await;
+    declare_operator(&bob_wb, "engagement-once", "bob", "alice");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let place = json!({ "peer": "bob", "project": "engagement-once", "archetype": "analyst",
@@ -1413,6 +1500,7 @@ async fn an_admitted_run_records_the_envelope_set_it_was_checked_under() {
     let (alice, _wa, _ra) = instance("alice", &broker);
     let (bob, bob_wb, _rb) = instance("bob", &broker);
     pair(&alice, &bob).await;
+    declare_operator(&bob_wb, "supply-evidence", "bob", "alice");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let (status, body) = allow_and_place(&alice, &bob, "supply-evidence").await;
@@ -1447,6 +1535,7 @@ async fn a_root_signed_envelope_enters_the_composition_record() {
     let (alice, _wa, _ra) = instance("alice", &broker);
     let (bob, bob_wb, rb) = instance("bob", &broker);
     pair(&alice, &bob).await;
+    declare_operator(&bob_wb, "supply-governed", "bob", "alice");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     {
@@ -1502,6 +1591,7 @@ async fn a_subkey_signed_envelope_refuses_the_run() {
     let (alice, _wa, _ra) = instance("alice", &broker);
     let (bob, bob_wb, _rb) = instance("bob", &broker);
     pair(&alice, &bob).await;
+    declare_operator(&bob_wb, "supply-subkey", "bob", "alice");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     {
@@ -1540,6 +1630,7 @@ async fn an_envelope_for_a_non_stakeholder_refuses_the_run() {
     let (alice, _wa, _ra) = instance("alice", &broker);
     let (bob, bob_wb, _rb) = instance("bob", &broker);
     pair(&alice, &bob).await;
+    declare_operator(&bob_wb, "supply-stranger", "bob", "alice");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     {
@@ -1579,6 +1670,7 @@ async fn a_v1_signed_envelope_passes_supply_and_is_refused_by_the_meet() {
     let (alice, _wa, _ra) = instance("alice", &broker);
     let (bob, bob_wb, rb) = instance("bob", &broker);
     pair(&alice, &bob).await;
+    declare_operator(&bob_wb, "supply-v1", "bob", "alice");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     {
