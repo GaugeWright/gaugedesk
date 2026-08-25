@@ -10,8 +10,14 @@
  * rather than a second, drifting copy.
  */
 
-import { createSignal, For, lazy, Show, Suspense, type JSX } from "solid-js";
-import { groupTurns, type TranscriptLine, type TranscriptSegment } from "./transcript";
+import { createMemo, createSignal, For, lazy, onMount, Show, Suspense, type JSX } from "solid-js";
+import {
+    groupTurns,
+    reconcileLines,
+    reconcileSegments,
+    type TranscriptLine,
+    type TranscriptSegment,
+} from "./transcript";
 import {
     defaultPrefs,
     lineToolGroup,
@@ -317,7 +323,29 @@ export function TranscriptView(props: {
 }): JSX.Element {
     const prefs = () => props.prefs ?? defaultPrefs;
     const agentName = () => displayAgentName(props.agentName);
-    const segments = () => groupTurns(props.lines.filter((l) => lineVisible(l, prefs())));
+    // Rows are keyed by object reference (`For`), but every re-reduction and the
+    // settle-time snapshot swap rebuild the whole line list as fresh objects.
+    // Reconciling against the previous value keeps identity for everything that
+    // did not actually change, so a streaming delta re-renders only the open
+    // turn and a turn settling leaves every earlier row's DOM untouched —
+    // instead of tearing down and rebuilding the entire transcript.
+    const lines = createMemo<readonly TranscriptLine[]>(
+        (prev) => reconcileLines(prev, props.lines.filter((l) => lineVisible(l, prefs()))),
+        [],
+    );
+    const segments = createMemo<TranscriptSegment[]>(
+        (prev) => reconcileSegments(prev, groupTurns(lines())),
+        [],
+    );
+    // Warm the Markdown chunk before the first prose token needs it: the lazy
+    // split keeps tool-only transcripts lean, but resolving it mid-stream swaps
+    // the raw-text fallback for rendered Markdown under the reader. An idle
+    // prefetch keeps both: a lean first paint and no mid-reply swap.
+    onMount(() => {
+        const warm = () => void import("./MarkdownView");
+        if ("requestIdleCallback" in window) requestIdleCallback(warm);
+        else setTimeout(warm, 300);
+    });
     // The authoring chat of a segment's first line (ADR 0141): inherited lines
     // carry their origin, the chat's own lines none. A change of origin between
     // consecutive segments is a fork point — mark it, so where inherited

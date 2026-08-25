@@ -123,6 +123,27 @@ describe("transcript reduction", () => {
         expect(lines[lines.length - 1].origin).toBeUndefined();
     });
 
+    it("admits the streamed reply in place — one line flips tier, no duplicate below it", () => {
+        let t = empty;
+        t = reduce(t, { type: "user", text: "go" });
+        t = reduce(t, { type: "text", delta: "work" });
+        t = reduce(t, { type: "text", delta: "ing" });
+        t = reduce(t, { type: "assistant", text: "working", entry_id: 7, forkable: true });
+        expect(t.lines).toHaveLength(2);
+        expect(t.lines[1]).toMatchObject({
+            seq: 1, tier: "admitted", kind: "assistant", text: "working", entryId: 7,
+        });
+        expect(t.openText).toBeNull();
+    });
+
+    it("still appends the admitted reply when no streamed line is open", () => {
+        let t = reduce(empty, { type: "text", delta: "first thoughts" });
+        t = reduce(t, { type: "tool", tool: "read", mediated: true, call_id: "c1" });
+        t = reduce(t, { type: "assistant", text: "done" });
+        // the tool call closed the streamed line, so the admitted reply appends
+        expect(t.lines.map((l) => l.kind)).toEqual(["text", "tool", "assistant"]);
+    });
+
     it("keeps a pending user line across a lagging snapshot repair without duplicating admission", () => {
         const before = fromSnapshot([{ type: "user", text: "same words" }]);
 

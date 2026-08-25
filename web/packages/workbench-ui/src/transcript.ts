@@ -78,6 +78,15 @@ export function reduce(t: Transcript, ev: StreamEvent): Transcript {
                 seq, tier: "admitted", kind: "assistant", text: ev.text,
                 entryId: ev.entry_id, forkable: ev.forkable, origin: ev.origin,
             };
+            // The admitted message is the durable form of the prose that just
+            // streamed. Replace the open operational echo in place — admission
+            // flips one line's tier where it stands, instead of appending a
+            // second copy of the same reply below the streamed one.
+            if (t.openText !== null) {
+                const open = t.openText;
+                const lines = t.lines.map((l) => (l.seq === open ? { ...line, seq: open } : l));
+                return { lines, openText: null };
+            }
             return { lines: [...t.lines, line], openText: null };
         }
         case "text": {
@@ -204,4 +213,67 @@ export function groupTurns(lines: readonly TranscriptLine[]): TranscriptSegment[
     }
     flush();
     return segments;
+}
+
+/** Structural equality of two transcript lines (tool metadata included). */
+function sameLine(a: TranscriptLine, b: TranscriptLine): boolean {
+    if (
+        a.seq !== b.seq || a.tier !== b.tier || a.kind !== b.kind || a.text !== b.text ||
+        a.code !== b.code || a.entryId !== b.entryId || a.forkable !== b.forkable ||
+        a.origin !== b.origin
+    ) {
+        return false;
+    }
+    const at = a.tool;
+    const bt = b.tool;
+    if (!at || !bt) return at === bt;
+    return (
+        at.name === bt.name && at.callId === bt.callId && at.target === bt.target &&
+        at.args === bt.args && at.ok === bt.ok && at.result === bt.result
+    );
+}
+
+/** Preserve object identity across a transcript rebuild: a line structurally
+ *  equal to the one at its position in `prev` keeps the previous object. The
+ *  renderer keys rows by reference, so this is what lets a settle-time snapshot
+ *  swap (or any re-reduction) leave the DOM of unchanged rows untouched instead
+ *  of rebuilding the whole transcript. Returns `prev` itself when nothing
+ *  changed at all. */
+export function reconcileLines(
+    prev: readonly TranscriptLine[],
+    next: readonly TranscriptLine[],
+): readonly TranscriptLine[] {
+    let changed = prev.length !== next.length;
+    const out = next.map((line, i) => {
+        const old = prev[i];
+        if (old && sameLine(old, line)) return old;
+        changed = true;
+        return line;
+    });
+    return changed ? out : prev;
+}
+
+/** The segment-level counterpart of {@link reconcileLines}: a segment whose
+ *  constituent line objects are unchanged keeps its previous wrapper object, so
+ *  the row keyed on it is not torn down. Matching is positional — transcripts
+ *  grow at the tail, so earlier segments line up. */
+export function reconcileSegments(
+    prev: readonly TranscriptSegment[],
+    next: readonly TranscriptSegment[],
+): TranscriptSegment[] {
+    return next.map((seg, i) => {
+        const old = prev[i];
+        if (!old || old.type !== seg.type) return seg;
+        if (old.type === "line" && seg.type === "line") {
+            return old.line === seg.line ? old : seg;
+        }
+        if (old.type === "turn" && seg.type === "turn") {
+            const same =
+                old.id === seg.id &&
+                old.lines.length === seg.lines.length &&
+                old.lines.every((l, j) => l === seg.lines[j]);
+            return same ? old : seg;
+        }
+        return seg;
+    });
 }

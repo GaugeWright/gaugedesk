@@ -837,8 +837,14 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 /* A streaming reply arrives as an operational `text` line and is rendered as
    Markdown by the same path an admitted turn takes, so it takes the prose face
    too. Without this the live reply reads in the chrome face and switches faces
-   under the reader the moment the admitted `assistant` event replaces it. */
-.line.text { font-family: var(--font-prose); }
+   under the reader the moment the admitted `assistant` event replaces it.
+
+   The same argument holds for colour: the streamed prose *is* the reply the
+   reader is reading, and it will be admitted verbatim, so it reads in ink from
+   the first token — admission must not restyle text under the reader. The
+   in-progress state stays legible through the turn's activity indicator, and
+   the line's operational tier remains on the DOM class for tests and doctrine. */
+.line.text { font-family: var(--font-prose); color: var(--ink); }
 .line.user::before, .line.assistant::before { display: block; margin-bottom: 2px;
     font-family: var(--font-chrome);
     font-size: var(--fs-label); font-weight: 400; text-transform: uppercase; letter-spacing: 0.07em; }
@@ -936,6 +942,11 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
    tag, tighter top margin so the turn body is one block. */
 .turn-body .line.assistant, .turn-body .line.user { border-left: none; padding-left: 0; margin-top: 2px; }
 .turn-body .line.assistant::before { content: none; }
+/* Metric parity for the streamed line: inside a turn it must occupy exactly the
+   box the admitted `assistant` line will take (margin-top 2px, 4px vertical
+   padding), so the moment of admission changes nothing but the DOM class —
+   no colour flash, no pixel shift, no reflow under the reader. */
+.turn-body .line.text { margin-top: 2px; padding: 4px 0; }
 
 /* The diff projection is rendered by @git-diff-view/solid; we own the chrome
    (toolbar, per-file headers) and align its dark theme to the app palette. */
