@@ -64,6 +64,7 @@ pub mod library_state;
 pub mod lifecycle_routes;
 pub mod local_model_broker;
 pub mod local_routes;
+pub mod managed_entitlement;
 pub mod managed_inference;
 pub mod measurement_store;
 pub mod mobile_bridge;

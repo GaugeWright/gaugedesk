@@ -219,3 +219,35 @@ export async function createOrganization(
     })) as { tenant?: unknown };
     return parseTenant(o?.tenant);
 }
+
+/** A Hub-signed managed-inference entitlement (SOC 2 finding F-5.3 / DR-0089).
+ *
+ * The claims and the compact `r ‖ s` P-256 signature the public edge verifies
+ * before serving a managed-funded deployment. The shape is opaque to the browser
+ * — it holds the entitlement and hands it to the publisher deploy flow. */
+export interface ManagedInferenceEntitlement {
+    readonly claims: unknown;
+    readonly sig: string;
+}
+
+/** Mint a Hub-signed managed-inference entitlement for `tenantId`, bound to the
+ * publisher public key the caller will deploy with
+ * (`POST /account/tenants/{tenant}/managed-inference/entitlement`, F-5.3 /
+ * DR-0089).
+ *
+ * The caller must be an authenticated owner/admin of the tenant and the tenant's
+ * resolved managed plan must be active (`409` otherwise). `503` when the Hub has
+ * no entitlement signing key configured — it fails closed rather than returning
+ * an unsigned entitlement. */
+export async function mintManagedEntitlement(
+    json: RouteJson,
+    tenantId: string,
+    publisherKey: string,
+): Promise<ManagedInferenceEntitlement> {
+    const o = (await json(
+        "POST",
+        `/account/tenants/${encodeURIComponent(tenantId)}/managed-inference/entitlement`,
+        { publisher_key: publisherKey },
+    )) as ManagedInferenceEntitlement;
+    return o;
+}

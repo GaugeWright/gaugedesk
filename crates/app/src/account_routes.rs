@@ -200,10 +200,19 @@ fn shared_runtime_credential_routes() -> Router<SharedWorkbench> {
 /// Cloud Home receives the same admitted plan as an operational entitlement so
 /// its unattended resolver can fail closed without asking the browser.
 pub fn managed_inference_routes() -> Router<SharedWorkbench> {
-    Router::new().route(
-        "/account/managed-inference",
-        get(get_managed_inference).post(post_managed_inference),
-    )
+    Router::new()
+        .route(
+            "/account/managed-inference",
+            get(get_managed_inference).post(post_managed_inference),
+        )
+        // The Hub-signing half of SOC 2 finding F-5.3 / DR-0089: an authenticated
+        // account owner with an active managed plan mints a signed entitlement
+        // bound to the publisher key they will deploy with, so the otherwise
+        // anonymous edge publisher key ties back to an entitled account.
+        .route(
+            "/account/tenants/{tenant}/managed-inference/entitlement",
+            post(post_managed_entitlement),
+        )
 }
 
 pub(crate) fn secure_home_endpoint(endpoint: &str) -> bool {
@@ -637,6 +646,119 @@ pub async fn post_managed_inference(
     }
     wb.notify_library_changed("managed_inference_plan", &record.id, "upsert");
     (StatusCode::OK, Json(json!({ "plan": record.subscription }))).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct MintEntitlementBody {
+    /// The deploying publisher's uncompressed-SEC1 P-256 public key, lowercase
+    /// hex (130 chars). The minted entitlement is bound to exactly this key.
+    publisher_key: String,
+}
+
+/// Mint a Hub-signed managed-inference entitlement for `tenant`, bound to the
+/// caller-supplied publisher key (SOC 2 finding F-5.3 / DR-0089).
+///
+/// The caller must be an authenticated owner/admin of `tenant` and the tenant's
+/// resolved managed plan must be active. The signed entitlement carries the
+/// funding scope, plan, publisher authority, spend caps, and a one-day validity
+/// window; the public edge verifies the Hub signature before serving a
+/// managed-funded deployment. Signing fails closed (`503`) when the Hub is not
+/// configured with a signing key, so an unsigned entitlement is never returned.
+pub async fn post_managed_entitlement(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Path(tenant): Path<String>,
+    Json(body): Json<MintEntitlementBody>,
+) -> impl IntoResponse {
+    if !crate::managed_entitlement::valid_authority(&body.publisher_key) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "publisher_key must be a 130-character lowercase hex uncompressed P-256 public key",
+        )
+            .into_response();
+    }
+
+    let wb = wb.lock_unpoisoned();
+    let account_scope = wb.account_scope_for(net_http::bearer(&headers));
+    let actor = wb.actor(net_http::bearer(&headers));
+    if actor == "anonymous" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "authenticate to mint a managed-inference entitlement",
+        )
+            .into_response();
+    }
+
+    // Authorize against the caller's own tenant switcher: they must belong to
+    // this tenant and hold an administering role. This is the same account/tenant
+    // authorization the sibling tenant routes read (the person's folded Tenancy),
+    // so a person can only mint for a tenant they actually administer.
+    let tenancy = match crate::tenancy::Tenancy::rebuild_in(wb.store_ref(), &account_scope) {
+        Ok(tenancy) => tenancy,
+        Err(error) => return err_response(error),
+    };
+    let Some(tenant_ref) = tenancy.tenants.get(&tenant) else {
+        return (StatusCode::FORBIDDEN, "you do not administer this tenant").into_response();
+    };
+    if !matches!(tenant_ref.role.as_str(), "owner" | "admin") {
+        return (
+            StatusCode::FORBIDDEN,
+            "only an owner or admin can mint a managed-inference entitlement",
+        )
+            .into_response();
+    }
+
+    // Resolve the plan that funds this tenant (org billing, then the tenant's own
+    // plan, then the caller's account plan) and require it to be active.
+    let tenant_scope = crate::org::tenant_scope(&tenant);
+    let resolved =
+        match crate::managed_inference::resolve_plan(wb.store_ref(), &account_scope, &tenant_scope)
+        {
+            Ok(resolved) => resolved,
+            Err(error) => return err_response(error),
+        };
+    let Some((plan, funding_scope)) = resolved else {
+        return (StatusCode::CONFLICT, "no active managed plan").into_response();
+    };
+    if !plan.admits_future_run() {
+        return (StatusCode::CONFLICT, "no active managed plan").into_response();
+    }
+
+    // Only once the caller is authorized and entitled do we consult signing
+    // configuration, so an unauthenticated or unentitled caller never learns
+    // whether the Hub holds a key. Fail closed: an unsigned or wrongly-keyed
+    // entitlement is never returned.
+    let Some(signing_key) = crate::managed_entitlement::signing_key_from_env() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "managed entitlement signing is not configured",
+        )
+            .into_response();
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let claims = crate::managed_entitlement::build_claims(
+        &funding_scope,
+        &plan.plan,
+        &body.publisher_key,
+        now,
+    );
+    match crate::managed_entitlement::sign(&signing_key, &claims) {
+        Ok(entitlement_json) => {
+            match serde_json::from_str::<serde_json::Value>(&entitlement_json) {
+                Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "entitlement serialization failed",
+                )
+                    .into_response(),
+            }
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.message()).into_response(),
+    }
 }
 
 /// Publish the current account state to the blind directory (the `library_sync` facility). Builds
