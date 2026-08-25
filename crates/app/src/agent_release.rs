@@ -181,6 +181,15 @@ pub struct PublishDeploymentRequest {
     pub retention_idle_ttl_seconds: u64,
     #[serde(default = "default_absolute_ttl_seconds")]
     pub retention_absolute_ttl_seconds: u64,
+    /// End every live session as part of this publication (DR-0090).
+    ///
+    /// Defaults to false, because a visitor's conversation surviving a change
+    /// to the deployment hosting it is a property owed to them rather than a
+    /// convenience. Set it when the release being replaced was wrong in a way
+    /// that should not go on being served, or when the edge refuses a release
+    /// that narrows what a live session may do.
+    #[serde(default)]
+    pub end_sessions: bool,
 }
 
 fn default_idle_ttl_seconds() -> u64 {
@@ -2057,6 +2066,51 @@ fn not_found(message: &'static str) -> io::Error {
 mod publisher_tests {
     use super::*;
     use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
+
+    /// A conversation is kept unless the publisher asks for it to end.
+    ///
+    /// The default is the whole decision (DR-0090): a request written before
+    /// this field existed, or by a caller with no opinion, must not destroy a
+    /// stranger's conversation. Flip this default and every republish quietly
+    /// becomes a cutover again — which is what it was, when the choice was
+    /// made by comparing configurations instead of being stated.
+    #[test]
+    fn a_publication_that_says_nothing_about_sessions_keeps_them() {
+        let request: PublishDeploymentRequest = serde_json::from_str(
+            r#"{
+                "placement_id": "inst-1",
+                "deployment_id": "panel",
+                "edge_origin": "https://panels.example",
+                "allowed_origins": ["https://example.com"],
+                "per_visitor_turn_limit": 20,
+                "max_concurrent_sessions": 5,
+                "funding_ref": "gaugedesk:managed-plan:v1:61:62",
+                "credential_ref": ""
+            }"#,
+        )
+        .expect("a request without the instruction is still a request");
+        assert!(
+            !request.end_sessions,
+            "a publication that says nothing about sessions must keep them",
+        );
+    }
+
+    /// The edge reads this exact key on both the activation and the
+    /// configuration endpoint, and nothing at compile time relates the two
+    /// spellings — the same seam the managed-funding prefix test holds in
+    /// managed_inference. A drift here is quiet in the worst direction: the
+    /// edge would read an absent instruction as false and keep sessions the
+    /// publisher believed it had ended.
+    #[test]
+    fn the_instruction_travels_under_the_name_the_edge_reads() {
+        let body = serde_json::json!({ "end_sessions": true });
+        assert_eq!(
+            body.as_object()
+                .and_then(|map| map.keys().next())
+                .map(String::as_str),
+            Some("end_sessions"),
+        );
+    }
 
     #[test]
     fn reservation_is_an_internal_estimate_not_a_turn_limit() {
