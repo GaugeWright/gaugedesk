@@ -10,6 +10,7 @@
 //! reviewer's diff. This is the thin API the Solid frontend develops against.
 
 pub mod account;
+pub mod account_auth;
 pub mod account_routes;
 pub mod account_signin;
 pub mod advancement;
