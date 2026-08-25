@@ -1411,6 +1411,14 @@ impl Workbench {
             .values()
             .filter(|instance| instance.project_id.as_deref() == Some(project))
         {
+            if crate::protected_profiles::distribution_for(self.store_ref(), &instance.id)
+                .is_some_and(|record| {
+                    record.profile
+                        == crate::protected_profiles::DistributionProfile::ProtectedCommercial
+                })
+            {
+                continue;
+            }
             if let Some(target) = self.library.authoring_target_for(&instance.agent_id) {
                 target_ids.insert(target.id.clone());
             }

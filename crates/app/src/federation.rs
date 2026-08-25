@@ -2633,11 +2633,78 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
                 .map(str::to_string)
         })
         .collect();
-    let agents = latest_library_records(store, "agent", |v| {
+    let instance_values = instances
+        .iter()
+        .filter_map(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+        .collect::<Vec<_>>();
+    // Omit authoring bytes only when every placement of this Agent in the
+    // relocating project is protected. A mixed licensed/protected project
+    // retains the ordinary target for its licensed placement.
+    let protected_agent_ids: std::collections::BTreeSet<String> = agent_ids
+        .iter()
+        .filter(|agent| {
+            let matching = instance_values
+                .iter()
+                .filter(|value| {
+                    value.get("agent_id").and_then(|id| id.as_str()) == Some(agent.as_str())
+                })
+                .collect::<Vec<_>>();
+            !matching.is_empty()
+                && matching.iter().all(|value| {
+                    value
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .is_some_and(|placement| {
+                            crate::protected_profiles::distribution_for(store, placement)
+                                .is_some_and(|record| {
+                                    record.profile
+                                        == crate::protected_profiles::DistributionProfile::ProtectedCommercial
+                                })
+                        })
+                })
+        })
+        .cloned()
+        .collect();
+    let mut agents = latest_library_records(store, "agent", |v| {
         v.get("id")
             .and_then(|i| i.as_str())
             .is_some_and(|i| agent_ids.contains(i))
     });
+    let protected_authoring_instance_ids = agents
+        .iter()
+        .filter_map(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+        .filter(|value| {
+            value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .is_some_and(|id| protected_agent_ids.contains(id))
+        })
+        .filter_map(|value| {
+            value
+                .get("instance_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    // Protected placements carry public identity/version metadata but never the
+    // plaintext config or a usable authoring-target pointer. Those bytes live
+    // only inside the owner-authorized protected artifact.
+    for record in &mut agents {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&record.payload) else {
+            continue;
+        };
+        if value
+            .get("id")
+            .and_then(|id| id.as_str())
+            .is_some_and(|id| protected_agent_ids.contains(id))
+        {
+            value["config"] = serde_json::Value::String("{}".to_owned());
+            value["instance_id"] = serde_json::Value::String(String::new());
+            if let Ok(payload) = serde_json::to_string(&value) {
+                record.payload = payload;
+            }
+        }
+    }
     let authoring_instance_ids: std::collections::BTreeSet<String> = agents
         .iter()
         .filter_map(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
@@ -2652,6 +2719,9 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
         v.get("id")
             .and_then(|id| id.as_str())
             .is_some_and(|id| authoring_instance_ids.contains(id))
+            && v.get("agent_id")
+                .and_then(|id| id.as_str())
+                .is_none_or(|id| !protected_agent_ids.contains(id))
     });
     out.extend(instances);
     out.extend(authoring_instances);
@@ -2659,7 +2729,11 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
     // `project::<id>::*` namespace. Carry both using and referenced authoring
     // instance scopes so the target receives runnable placements and a usable
     // archetype definition rather than library nouns with missing state.
-    for instance_id in inst_ids.iter().chain(authoring_instance_ids.iter()) {
+    for instance_id in inst_ids.iter().chain(
+        authoring_instance_ids
+            .iter()
+            .filter(|id| !protected_authoring_instance_ids.contains(*id)),
+    ) {
         for (_position, kind, payload) in store.events(instance_id).unwrap_or_default() {
             out.push(HandoffLogRecord {
                 scope: instance_id.clone(),
@@ -2695,7 +2769,7 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
             && owner
                 .and_then(|owner| owner.get("archetype_id"))
                 .and_then(|id| id.as_str())
-                .is_some_and(|id| agent_ids.contains(id));
+                .is_some_and(|id| agent_ids.contains(id) && !protected_agent_ids.contains(id));
         project_owned || referenced_archetype
     });
     out.extend(targets);
@@ -2766,6 +2840,15 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
         },
     ));
     out.extend(agents);
+    out.extend(
+        crate::protected_profiles::distribution_records_for_placements(store, &inst_ids)
+            .into_iter()
+            .map(|payload| HandoffLogRecord {
+                scope: LIBRARY_SCOPE.to_owned(),
+                kind: "placement_distribution".to_owned(),
+                payload,
+            }),
+    );
     out
 }
 
@@ -3440,24 +3523,11 @@ async fn drive_relocate(
     project: &str,
     peer: &AuthorityId,
 ) -> (StatusCode, serde_json::Value) {
-    let (
-        broker,
-        me,
-        source_home,
-        subkey,
-        delegation,
-        pins,
-        peer_key,
-        project_credential_key,
-        log,
-        content,
-    ) = {
+    let (broker, me, source_home, subkey, delegation, pins, peer_key, project_credential_key) = {
         let guard = wb.lock_unpoisoned();
         let me = guard.federation_authority().clone();
         let root = federation_root_signing_key(&guard);
         let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
-        let log = collect_project_log(guard.store_ref(), project);
-        let content = collect_project_content(&guard, project);
         match guard.federation_ref() {
             Some(fed) => {
                 let peer_key = fed
@@ -3472,8 +3542,6 @@ async fn drive_relocate(
                     fed.pins_arc(),
                     peer_key,
                     guard.project_credential_key_for_handoff(project),
-                    log,
-                    content,
                 )
             }
             None => {
@@ -3489,6 +3557,26 @@ async fn drive_relocate(
             StatusCode::BAD_REQUEST,
             serde_json::json!({ "error": format!("not paired with {}", peer.as_str()) }),
         );
+    };
+    {
+        let mut guard = wb.lock_unpoisoned();
+        if let Err(error) = crate::protected_profiles::prepare_project_relocation(
+            &mut guard,
+            project,
+            peer_key.as_str(),
+        ) {
+            return (
+                StatusCode::FORBIDDEN,
+                serde_json::json!({ "error": format!("protected placement issuance failed: {error}") }),
+            );
+        }
+    }
+    let (log, content) = {
+        let guard = wb.lock_unpoisoned();
+        (
+            collect_project_log(guard.store_ref(), project),
+            collect_project_content(&guard, project),
+        )
     };
     let credential_key = match project_credential_key {
         Some(key) => match seal_to_subkey(&peer_key, &key) {
@@ -5398,6 +5486,26 @@ fn active_operator_participant(store: &Store, project: &str, authority: &str) ->
         })
 }
 
+pub(crate) fn distribution_operator_authorized(
+    store: &Store,
+    project: &str,
+    authority: &str,
+) -> bool {
+    let participants = participants_of(store, project);
+    participants.is_empty()
+        || participants.into_iter().any(|participant| {
+            participant
+                .get("authority")
+                .and_then(|value| value.as_str())
+                == Some(authority)
+                && participant.get("role").and_then(|value| value.as_str()) == Some("operator")
+                && !participant
+                    .get("revoked")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true)
+        })
+}
+
 /// The project's participants, folded latest-wins per (authority, owns) so a later
 /// revoke supersedes the grant.
 fn participants_of(store: &Store, project: &str) -> Vec<serde_json::Value> {
@@ -5870,6 +5978,118 @@ mod handoff_routes_tests {
 
     fn mem_store() -> Store {
         Store::open_in_memory().expect("in-memory store")
+    }
+
+    fn seed_relocation_agent(store: &mut Store, protected: bool) {
+        for (kind, value) in [
+            (
+                "instance",
+                serde_json::json!({
+                    "id": "placement-1",
+                    "project_id": "project-1",
+                    "agent_id": "agent-1"
+                }),
+            ),
+            (
+                "instance",
+                serde_json::json!({
+                    "id": "authoring-1",
+                    "project_id": null,
+                    "agent_id": "agent-1"
+                }),
+            ),
+            (
+                "agent",
+                serde_json::json!({
+                    "id": "agent-1",
+                    "instance_id": "authoring-1",
+                    "config": "{\"secret_prompt\":\"owner IP\"}"
+                }),
+            ),
+            (
+                "work_target",
+                serde_json::json!({
+                    "id": "authoring-target-1",
+                    "owner": {"kind": "archetype", "archetype_id": "agent-1"}
+                }),
+            ),
+        ] {
+            store
+                .append_record(LIBRARY_SCOPE, kind, &value.to_string())
+                .unwrap();
+        }
+        if protected {
+            store
+                .append_record(
+                    LIBRARY_SCOPE,
+                    "placement_distribution",
+                    &serde_json::json!({
+                        "placement_id": "placement-1",
+                        "profile": "protected_commercial",
+                        "recipient_authority": "tenant:recipient",
+                        "lease_seconds": 3600
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn protected_relocation_excludes_plaintext_agent_definition() {
+        let mut store = mem_store();
+        seed_relocation_agent(&mut store, true);
+
+        let log = collect_project_log(&store, "project-1");
+        let agent = log
+            .iter()
+            .find(|record| record.kind == "agent")
+            .and_then(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+            .expect("sanitized Agent record");
+        assert_eq!(agent["config"], "{}");
+        assert_eq!(agent["instance_id"], "");
+        assert!(!log.iter().any(|record| {
+            record.kind == "instance"
+                && serde_json::from_str::<serde_json::Value>(&record.payload)
+                    .ok()
+                    .and_then(|value| value["id"].as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some("authoring-1")
+        }));
+        assert!(!log.iter().any(|record| {
+            record.kind == "work_target"
+                && serde_json::from_str::<serde_json::Value>(&record.payload)
+                    .ok()
+                    .and_then(|value| value["id"].as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some("authoring-target-1")
+        }));
+        assert!(log
+            .iter()
+            .any(|record| record.kind == "placement_distribution"));
+    }
+
+    #[test]
+    fn licensed_relocation_keeps_the_agent_definition() {
+        let mut store = mem_store();
+        seed_relocation_agent(&mut store, false);
+
+        let log = collect_project_log(&store, "project-1");
+        let agent = log
+            .iter()
+            .find(|record| record.kind == "agent")
+            .and_then(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+            .expect("ordinary Agent record");
+        assert_eq!(agent["config"], "{\"secret_prompt\":\"owner IP\"}");
+        assert_eq!(agent["instance_id"], "authoring-1");
+        assert!(log.iter().any(|record| {
+            record.kind == "work_target"
+                && serde_json::from_str::<serde_json::Value>(&record.payload)
+                    .ok()
+                    .and_then(|value| value["id"].as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some("authoring-target-1")
+        }));
     }
 
     #[test]

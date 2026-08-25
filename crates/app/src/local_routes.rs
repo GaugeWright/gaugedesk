@@ -59,6 +59,23 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route("/placements/{id}/upgrade", post(lr::post_upgrade_placement))
         .route("/placements/{id}/accept", post(lr::post_accept_placement))
         .route(
+            "/placements/{id}/distribution",
+            get(crate::protected_profiles::get_distribution)
+                .put(crate::protected_profiles::put_distribution),
+        )
+        .route(
+            "/placements/{id}/distribution/revoke",
+            post(crate::protected_profiles::revoke_distribution),
+        )
+        .route(
+            "/placements/{id}/distribution/renew",
+            post(crate::protected_profiles::renew_distribution),
+        )
+        .route(
+            "/placements/{id}/distribution/audit",
+            get(crate::protected_profiles::get_distribution_audit),
+        )
+        .route(
             "/public-deployments",
             post(crate::publisher_routes::publish_deployment),
         )

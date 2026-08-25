@@ -804,6 +804,36 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.acceptPlacement(this.workbenchTransport(), placementId);
     }
 
+    getPlacementDistribution(placementId: PlacementId): Promise<workbenchClient.PlacementDistributionStatus> {
+        return workbenchClient.getPlacementDistribution(this.workbenchTransport(), placementId);
+    }
+
+    setPlacementDistribution(
+        placementId: PlacementId,
+        input: {
+            profile: workbenchClient.DistributionProfile;
+            recipient_authority?: string;
+            lease_seconds?: number;
+            max_runs?: number;
+        },
+    ): Promise<workbenchClient.PlacementDistributionStatus> {
+        return workbenchClient.setPlacementDistribution(this.workbenchTransport(), placementId, input);
+    }
+
+    revokePlacementDistribution(placementId: PlacementId): Promise<workbenchClient.PlacementDistributionStatus> {
+        return workbenchClient.revokePlacementDistribution(this.workbenchTransport(), placementId);
+    }
+
+    renewPlacementDistribution(placementId: PlacementId): Promise<workbenchClient.PlacementDistributionStatus> {
+        return workbenchClient.renewPlacementDistribution(this.workbenchTransport(), placementId);
+    }
+
+    getPlacementDistributionAudit(placementId: PlacementId): Promise<{
+        events: readonly { action: string; at: number; uses: number; detail: string }[];
+    }> {
+        return workbenchClient.getPlacementDistributionAudit(this.workbenchTransport(), placementId);
+    }
+
     getPlacementConfig(placementId: PlacementId): Promise<{ config: string; notes: string }> {
         return workbenchClient.getPlacementConfig(this.workbenchTransport(), placementId);
     }

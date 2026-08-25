@@ -358,6 +358,80 @@ export async function acceptPlacement(
     await transport.json("POST", `/placements/${placementId}/accept`, {});
 }
 
+export type DistributionProfile = "licensed" | "protected_commercial";
+
+export interface PlacementDistributionStatus {
+    readonly placement_id: string;
+    readonly profile: DistributionProfile;
+    readonly recipient_authority: string;
+    readonly service_origin: string;
+    readonly lease_seconds: number;
+    readonly max_runs: number;
+    readonly state: "licensed" | "awaiting_issue" | "issued" | "revoked";
+    readonly license_id: string | null;
+    readonly attribution_id: string | null;
+    readonly expires_at: number | null;
+}
+
+export async function getPlacementDistribution(
+    transport: WorkbenchTransport,
+    placementId: PlacementId,
+): Promise<PlacementDistributionStatus> {
+    return await transport.json(
+        "GET",
+        `/placements/${placementId}/distribution`,
+    ) as PlacementDistributionStatus;
+}
+
+export async function setPlacementDistribution(
+    transport: WorkbenchTransport,
+    placementId: PlacementId,
+    input: {
+        profile: DistributionProfile;
+        recipient_authority?: string;
+        lease_seconds?: number;
+        max_runs?: number;
+    },
+): Promise<PlacementDistributionStatus> {
+    return await transport.json(
+        "PUT",
+        `/placements/${placementId}/distribution`,
+        input,
+    ) as PlacementDistributionStatus;
+}
+
+export async function revokePlacementDistribution(
+    transport: WorkbenchTransport,
+    placementId: PlacementId,
+): Promise<PlacementDistributionStatus> {
+    return await transport.json(
+        "POST",
+        `/placements/${placementId}/distribution/revoke`,
+        {},
+    ) as PlacementDistributionStatus;
+}
+
+export async function renewPlacementDistribution(
+    transport: WorkbenchTransport,
+    placementId: PlacementId,
+): Promise<PlacementDistributionStatus> {
+    return await transport.json(
+        "POST",
+        `/placements/${placementId}/distribution/renew`,
+        {},
+    ) as PlacementDistributionStatus;
+}
+
+export async function getPlacementDistributionAudit(
+    transport: WorkbenchTransport,
+    placementId: PlacementId,
+): Promise<{ events: readonly { action: string; at: number; uses: number; detail: string }[] }> {
+    return await transport.json(
+        "GET",
+        `/placements/${placementId}/distribution/audit`,
+    ) as { events: readonly { action: string; at: number; uses: number; detail: string }[] };
+}
+
 export async function getPlacementConfig(
     transport: WorkbenchTransport,
     placementId: PlacementId,

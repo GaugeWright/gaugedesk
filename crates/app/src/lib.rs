@@ -84,6 +84,7 @@ pub mod package_flow;
 pub mod package_store;
 pub mod policy_compiler;
 pub mod project_credential_routes;
+pub mod protected_profiles;
 pub mod publisher_routes;
 pub mod quarantine;
 pub mod remote_runtime;

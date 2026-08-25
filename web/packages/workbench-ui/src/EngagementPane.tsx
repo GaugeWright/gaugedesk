@@ -13,13 +13,15 @@
  * incoming consent live in the global Devices modal (Settings ▸ Devices).
  */
 
-import { createResource, createSignal, For, Show, type JSX } from "solid-js";
+import { createEffect, createResource, createSignal, For, Show, type JSX } from "solid-js";
 import {
     describeFailure,
     type EngagementId,
     type ProjectId,
     type Workspace,
     type CreatedHomeInvitation,
+    type PlacementDistributionStatus,
+    type PlacementId,
 } from "@gaugewright/control-plane-client";
 import {
     type EngagementInvite,
@@ -51,6 +53,21 @@ export interface EngagementPaneApi {
     listPeers(): Promise<FederationPeer[]>;
     runQueue(): Promise<QueuedRun[]>;
     handoffRelocate(project: ProjectId, peer: string): Promise<HandoffStatus>;
+    getPlacementDistribution(placement: PlacementId): Promise<PlacementDistributionStatus>;
+    setPlacementDistribution(
+        placement: PlacementId,
+        input: {
+            profile: "licensed" | "protected_commercial";
+            recipient_authority?: string;
+            lease_seconds?: number;
+            max_runs?: number;
+        },
+    ): Promise<PlacementDistributionStatus>;
+    revokePlacementDistribution(placement: PlacementId): Promise<PlacementDistributionStatus>;
+    renewPlacementDistribution(placement: PlacementId): Promise<PlacementDistributionStatus>;
+    getPlacementDistributionAudit(placement: PlacementId): Promise<{
+        events: readonly { action: string; at: number; uses: number; detail: string }[];
+    }>;
     invite(project: ProjectId, disposition?: "relocate" | "join"): Promise<EngagementInvite>;
     inviteStatus(inviteId: string): Promise<{ accepted: boolean; accepted_by: string | null; confirm_code: string }>;
     handoffAbort(project: ProjectId): Promise<HandoffStatus>;
@@ -108,6 +125,85 @@ export function EngagementPane(props: {
     );
     const [peers] = createResource(() => props.api.listPeers());
     const [workspace] = createResource(() => props.api.getWorkspace());
+    const projectPlacements = () => workspace()?.projects
+        .find((project) => project.id === props.project)?.placements ?? [];
+    const [distributionPlacement, setDistributionPlacement] = createSignal("");
+    const selectedDistributionPlacement = () =>
+        distributionPlacement() || projectPlacements()[0]?.placementId || "";
+    const [distribution, { refetch: refetchDistribution }] = createResource(
+        selectedDistributionPlacement,
+        (placement) => placement
+            ? props.api.getPlacementDistribution(placement as PlacementId)
+            : Promise.resolve(null),
+    );
+    const [protectedProfile, setProtectedProfile] = createSignal(false);
+    const [recipientTenant, setRecipientTenant] = createSignal("");
+    const [leaseDays, setLeaseDays] = createSignal("30");
+    const [maxRuns, setMaxRuns] = createSignal("0");
+    const [distributionAudit, setDistributionAudit] = createSignal("");
+    createEffect(() => {
+        const current = distribution();
+        if (!current) return;
+        setProtectedProfile(current.profile === "protected_commercial");
+        setRecipientTenant(current.recipient_authority);
+        setLeaseDays(String(Math.max(1, Math.round(current.lease_seconds / 86_400))));
+        setMaxRuns(String(current.max_runs));
+    });
+
+    async function saveDistribution(): Promise<void> {
+        const placement = selectedDistributionPlacement();
+        if (!placement) return;
+        try {
+            const profile = protectedProfile() ? "protected_commercial" : "licensed";
+            const saved = await props.api.setPlacementDistribution(placement as PlacementId, {
+                profile,
+                ...(profile === "protected_commercial" ? {
+                    recipient_authority: recipientTenant().trim(),
+                    lease_seconds: Math.max(1, Number.parseInt(leaseDays(), 10)) * 86_400,
+                    max_runs: Math.max(0, Number.parseInt(maxRuns(), 10) || 0),
+                } : {}),
+            });
+            setStatus(saved.profile === "licensed"
+                ? "licensed distribution saved — ordinary cross-organization federation remains open"
+                : "protected commercial distribution saved — the exact recipient will be bound when the Home moves");
+            await refetchDistribution();
+        } catch (error) {
+            setStatus(describeFailure("save the Agent distribution profile", error));
+        }
+    }
+
+    async function revokeDistribution(): Promise<void> {
+        try {
+            await props.api.revokePlacementDistribution(selectedDistributionPlacement() as PlacementId);
+            setStatus("protected commercial lease revoked — future releases are refused");
+            await refetchDistribution();
+        } catch (error) {
+            setStatus(describeFailure("revoke the protected commercial lease", error));
+        }
+    }
+
+    async function renewDistribution(): Promise<void> {
+        try {
+            await props.api.renewPlacementDistribution(selectedDistributionPlacement() as PlacementId);
+            setStatus("protected commercial lease renewed for the exact recipient and current Agent revision");
+            await refetchDistribution();
+        } catch (error) {
+            setStatus(describeFailure("renew the protected commercial lease", error));
+        }
+    }
+
+    async function readDistributionAudit(): Promise<void> {
+        try {
+            const audit = await props.api.getPlacementDistributionAudit(
+                selectedDistributionPlacement() as PlacementId,
+            );
+            setDistributionAudit(audit.events
+                .map((event) => `${event.action} · ${event.uses} use(s)`)
+                .join("; "));
+        } catch (error) {
+            setStatus(describeFailure("read the protected commercial audit", error));
+        }
+    }
     // Co-drive (FED-7): the host's admission queue (pending operator runs for this
     // project), and the operator's place-a-run controls.
     const [queue, { refetch: refetchQueue }] = createResource(
@@ -392,6 +488,94 @@ export function EngagementPane(props: {
                     {" · "}
                     <span data-engagement-phase>{phase()}</span>
                 </p>
+
+                <Show when={projectPlacements().length > 0}>
+                    <section class="engagement-handoff" data-protected-profile>
+                        <h4>Agent distribution</h4>
+                        <p class="status">
+                            Cross-organization Agents are <strong>licensed by default</strong>.
+                            Protected commercial adds recipient-bound encryption, attribution,
+                            leases, metering, and revocation. A skilled operator of the recipient
+                            Home can still capture plaintext while it runs.
+                        </p>
+                        <select
+                            class="fed-paste"
+                            data-distribution-placement
+                            value={selectedDistributionPlacement()}
+                            onChange={(event) => setDistributionPlacement(event.currentTarget.value)}
+                        >
+                            <For each={projectPlacements()}>
+                                {(placement) => (
+                                    <option value={placement.placementId}>{placement.archetypeName}</option>
+                                )}
+                            </For>
+                        </select>
+                        <label class="status">
+                            <input
+                                type="checkbox"
+                                checked={protectedProfile()}
+                                onChange={(event) => setProtectedProfile(event.currentTarget.checked)}
+                            />
+                            Protect this placement commercially
+                        </label>
+                        <Show when={protectedProfile()}>
+                            <input
+                                class="fed-paste"
+                                data-distribution-recipient
+                                placeholder="Exact recipient tenant ID"
+                                value={recipientTenant()}
+                                onInput={(event) => setRecipientTenant(event.currentTarget.value)}
+                            />
+                            <input
+                                class="fed-paste"
+                                type="number"
+                                min="1"
+                                max="31"
+                                aria-label="Lease days"
+                                value={leaseDays()}
+                                onInput={(event) => setLeaseDays(event.currentTarget.value)}
+                            />
+                            <input
+                                class="fed-paste"
+                                type="number"
+                                min="0"
+                                aria-label="Maximum runs; zero means metered without a ceiling"
+                                value={maxRuns()}
+                                onInput={(event) => setMaxRuns(event.currentTarget.value)}
+                            />
+                        </Show>
+                        <button
+                            type="button"
+                            class="tree-action"
+                            data-distribution-save
+                            onClick={() => void saveDistribution()}
+                        >
+                            Save distribution
+                        </button>
+                        <p class="status" data-distribution-status>
+                            Current: {distribution()?.state ?? "licensed"}
+                            <Show when={distribution()?.license_id}>
+                                {(license) => <> · lease {license()}</>}
+                            </Show>
+                        </p>
+                        <Show when={distribution()?.license_id}>
+                            <div class="pair-device-actions">
+                                <button type="button" class="tree-action" onClick={() => void renewDistribution()}>
+                                    Renew lease
+                                </button>
+                                <button type="button" class="tree-action" onClick={() => void readDistributionAudit()}>
+                                    View audit
+                                </button>
+                                <button type="button" class="tree-action" onClick={() => void revokeDistribution()}>
+                                    Revoke lease
+                                </button>
+                            </div>
+                            <Show when={distributionAudit()}>
+                                <p class="status" data-distribution-audit>{distributionAudit()}</p>
+                            </Show>
+                        </Show>
+                    </section>
+                </Show>
 
                 {/* The single state-driven action — never the raw state machine. */}
                 <Show

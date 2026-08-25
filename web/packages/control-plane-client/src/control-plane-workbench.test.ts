@@ -1,14 +1,61 @@
 import { describe, expect, it, vi } from "vitest";
 import { engagementId } from "./control-plane-domain";
+import type { PlacementId } from "./control-plane-domain";
 import type { WorkbenchTransport } from "./control-plane-workbench";
 import {
     exportResourceToDisk,
+    getPlacementDistribution,
+    getPlacementDistributionAudit,
     getResourceExport,
     getResourceReview,
     resourceExportCommand,
     resourceReviewCommand,
+    renewPlacementDistribution,
+    revokePlacementDistribution,
     runTask,
+    setPlacementDistribution,
 } from "./control-plane-workbench";
+
+describe("placement distribution profiles", () => {
+    it("keeps licensed distribution explicit and addresses the full commercial lifecycle", async () => {
+        const licensed = {
+            placement_id: "placement-1",
+            profile: "licensed",
+            recipient_authority: "",
+            service_origin: "https://auth.gaugewright.com",
+            lease_seconds: 0,
+            max_runs: 0,
+            state: "licensed",
+        };
+        const json = vi.fn().mockResolvedValue(licensed);
+        const transport = { base: "", json } as WorkbenchTransport;
+        const placement = "placement-1" as PlacementId;
+
+        await getPlacementDistribution(transport, placement);
+        await setPlacementDistribution(transport, placement, {
+            profile: "protected_commercial",
+            recipient_authority: "tenant:recipient",
+            lease_seconds: 86_400,
+            max_runs: 5,
+        });
+        await renewPlacementDistribution(transport, placement);
+        await revokePlacementDistribution(transport, placement);
+        await getPlacementDistributionAudit(transport, placement);
+
+        expect(json.mock.calls).toEqual([
+            ["GET", "/placements/placement-1/distribution"],
+            ["PUT", "/placements/placement-1/distribution", {
+                profile: "protected_commercial",
+                recipient_authority: "tenant:recipient",
+                lease_seconds: 86_400,
+                max_runs: 5,
+            }],
+            ["POST", "/placements/placement-1/distribution/renew", {}],
+            ["POST", "/placements/placement-1/distribution/revoke", {}],
+            ["GET", "/placements/placement-1/distribution/audit"],
+        ]);
+    });
+});
 
 describe("resource protection routes", () => {
     it("addresses review and export through the encoded resource, never a caller scope", async () => {

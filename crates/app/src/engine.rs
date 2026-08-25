@@ -1467,6 +1467,22 @@ pub fn isolated_turn_descriptor(
     actor: &str,
 ) -> Result<IsolatedTurnDescriptor, String> {
     let guard = wb.lock_unpoisoned();
+    if guard
+        .library
+        .chats
+        .get(chat_id)
+        .and_then(|chat| {
+            crate::protected_profiles::distribution_for(guard.store_ref(), &chat.instance_id)
+        })
+        .is_some_and(|record| {
+            record.profile == crate::protected_profiles::DistributionProfile::ProtectedCommercial
+        })
+    {
+        return Err(
+            "protected-commercial Agents require the foreground managed release path; isolated background scheduling cannot retain plaintext package state"
+                .to_owned(),
+        );
+    }
     let config = AgentConfig::from_json(&guard.effective_agent_config_for_chat(chat_id)?)
         .unwrap_or_default();
     let provider = resolve_turn_provider(gaugedesk_env::var("MODEL_PROVIDER"), config.provider);
@@ -1566,9 +1582,24 @@ fn run_claimed_engagement_turn(
         runtime_command_id,
         harness_factory,
     } = input;
+    // A protected-commercial placement releases its owner-authorized package
+    // only for this turn. The TempDir guard remains live through the harness
+    // call and erases the material on every return path.
+    let protected_package = match mode {
+        ChatMode::Edit => None,
+        ChatMode::Use => {
+            let g = wb.lock_unpoisoned();
+            crate::protected_profiles::prepare_chat_package(&g, id)?
+        }
+    };
     let config = {
         let g = wb.lock_unpoisoned();
-        AgentConfig::from_json(&g.effective_agent_config_for_chat(id)?).unwrap_or_default()
+        let json = protected_package
+            .as_ref()
+            .map(|package| package.config.clone())
+            .map(Ok)
+            .unwrap_or_else(|| g.effective_agent_config_for_chat(id))?;
+        AgentConfig::from_json(&json).unwrap_or_default()
     };
     stop_checkpoint(id)?;
     let gate = MembraneGate::new(&config, default_external_tools()).with_mode(mode);
@@ -1578,16 +1609,24 @@ fn run_claimed_engagement_turn(
     // longer receives an ambient environment-shaped secret vector.
     let (whip_factory, actor, package_selection, selected_package_root) = {
         let g = wb.lock_unpoisoned();
-        if g.package_selection_for_chat(id).is_some() {
+        let protected_selection = protected_package
+            .as_ref()
+            .map(|package| (0, package.package_ref.clone()));
+        if protected_selection.is_none() && g.package_selection_for_chat(id).is_some() {
             g.refresh_chat_discipline_mount(id)?;
         }
         let factory = g
             .whip_harness_factory()
             .map_err(|error| error.to_string())?;
-        let package_selection = g.package_selection_for_chat(id);
-        let selected_package_root = package_selection
+        let package_selection = protected_selection.or_else(|| g.package_selection_for_chat(id));
+        let selected_package_root = protected_package
             .as_ref()
-            .and_then(|(version, _)| g.package_root_for_chat(id, *version));
+            .map(|package| package.package_root.clone())
+            .or_else(|| {
+                package_selection
+                    .as_ref()
+                    .and_then(|(version, _)| g.package_root_for_chat(id, *version))
+            });
         (
             factory,
             authenticated_actor

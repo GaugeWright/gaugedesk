@@ -232,6 +232,7 @@ fn build_workbench_with_content_keywrap_for_home(
     explicit_identity: Option<(HomeId, AuthorityId)>,
     content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
 ) -> std::io::Result<Workbench> {
+    crate::protected_profiles::scavenge_stale_materializations();
     let (root, targets_dir) = prepare_workbench_root(root)?;
 
     let (mut store, content_vault) = content_vault::open_startup_store(&root, content_keywrap)?;

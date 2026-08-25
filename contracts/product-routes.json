@@ -3884,6 +3884,186 @@
       }
     },
     {
+      "id": "home.placement.distribution.read",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/placements/:id/distribution",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "active-project-placement-operator",
+      "capability": "read-placement-distribution-profile",
+      "requestSchema": "http/path-placement-id",
+      "responseSchema": "rust:gaugedesk-app/protected_profiles/DistributionStatus",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/workbench-ui/src/EngagementPane.tsx#Protected commercial"
+        ],
+        "authority": [
+          "crates/app/src/federation.rs#distribution_operator_authorized"
+        ],
+        "journey": [
+          "web/packages/workbench-ui/src/EngagementPane.tsx#Protected commercial"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/federation.rs#protected_relocation_excludes_plaintext_agent_definition"
+        ]
+      }
+    },
+    {
+      "id": "home.placement.distribution.update",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "PUT",
+      "path": "/placements/:id/distribution",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "active-project-placement-operator",
+      "capability": "select-placement-distribution-profile",
+      "requestSchema": "rust:gaugedesk-app/protected_profiles/PutDistributionRequest",
+      "responseSchema": "rust:gaugedesk-app/protected_profiles/DistributionStatus",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/workbench-ui/src/EngagementPane.tsx#Save distribution"
+        ],
+        "authority": [
+          "crates/app/src/federation.rs#distribution_operator_authorized"
+        ],
+        "journey": [
+          "web/packages/workbench-ui/src/EngagementPane.tsx#Save distribution"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/federation.rs#licensed_relocation_keeps_the_agent_definition"
+        ]
+      }
+    },
+    {
+      "id": "home.placement.distribution.renew",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/placements/:id/distribution/renew",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "active-project-placement-operator",
+      "capability": "renew-protected-placement-license",
+      "requestSchema": "http/empty-json",
+      "responseSchema": "rust:gaugedesk-app/protected_profiles/DistributionStatus",
+      "sideEffect": "mutation-and-commercial-release",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/workbench-ui/src/EngagementPane.tsx#Renew lease"
+        ],
+        "authority": [
+          "crates/app/src/federation.rs#distribution_operator_authorized"
+        ],
+        "journey": [
+          "web/packages/workbench-ui/src/EngagementPane.tsx#Renew lease"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/core/src/protected_profile.rs#issue_authorization_bytes"
+        ]
+      }
+    },
+    {
+      "id": "home.placement.distribution.revoke",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/placements/:id/distribution/revoke",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "active-project-placement-operator",
+      "capability": "revoke-protected-placement-license",
+      "requestSchema": "http/empty-json",
+      "responseSchema": "rust:gaugedesk-app/protected_profiles/DistributionStatus",
+      "sideEffect": "mutation-and-commercial-revocation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/workbench-ui/src/EngagementPane.tsx#Revoke"
+        ],
+        "authority": [
+          "crates/app/src/federation.rs#distribution_operator_authorized"
+        ],
+        "journey": [
+          "web/packages/workbench-ui/src/EngagementPane.tsx#Revoke"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/protected_profiles.rs#revoked"
+        ]
+      }
+    },
+    {
+      "id": "home.placement.distribution.audit",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/placements/:id/distribution/audit",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "active-project-placement-operator",
+      "capability": "read-protected-placement-commercial-audit",
+      "requestSchema": "http/path-placement-id",
+      "responseSchema": "json:protected-profile-service/audit-events",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/workbench-ui/src/EngagementPane.tsx#View audit"
+        ],
+        "authority": [
+          "crates/app/src/federation.rs#distribution_operator_authorized"
+        ],
+        "journey": [
+          "web/packages/workbench-ui/src/EngagementPane.tsx#View audit"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/protected_profiles.rs#attribution_id"
+        ]
+      }
+    },
+    {
       "id": "home.placement.accept",
       "jurisdiction": "private-home",
       "transport": "http-json",
