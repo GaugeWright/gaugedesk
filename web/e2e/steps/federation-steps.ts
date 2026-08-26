@@ -48,7 +48,7 @@ function recordProductionClientResponses(
         productionClientResponses.push({
             authority,
             method: response.request().method(),
-            path: url.pathname,
+            path: decodeURIComponent(url.pathname),
             status: response.status(),
         });
     });
@@ -98,6 +98,21 @@ Given("the two federated workbenches are open", async ({ page, request }) => {
         data: { name: "Invite Engagement" },
     });
     if (!invited.ok()) throw new Error(`invited project create failed: ${invited.status()}`);
+    const invitedProjectRecord = await invited.json() as { id: string };
+    const agent = await request.post(`${ALICE_CP}/archetypes`, {
+        headers: mutationHeaders(),
+        data: { name: "Commercial Analyst" },
+    });
+    if (!agent.ok()) throw new Error(`Agent create failed: ${agent.status()}`);
+    const agentRecord = await agent.json() as { id: string };
+    const placement = await request.post(
+        `${ALICE_CP}/projects/${invitedProjectRecord.id}/placements`,
+        {
+            headers: mutationHeaders(),
+            data: { agent_id: agentRecord.id },
+        },
+    );
+    if (!placement.ok()) throw new Error(`Agent placement failed: ${placement.status()}`);
     manualHandoffs = [];
     for (const name of [
         "Accept Engagement",
@@ -352,6 +367,8 @@ Then("the project's handoff is committed to the target", async ({ page }) => {
 When("the owner creates a combined invite for another project", async ({ page }) => {
     await page.locator("[data-engagement-pane] .modal-head button").click();
     await openEngagement(page, "Invite Engagement");
+    await expect(page.locator("[data-distribution-contract]")).toContainText("Commercial Analyst");
+    await expect(page.locator("[data-distribution-contract]")).toContainText("Licensed copy");
     await page.locator("[data-engagement-invite]").click();
     const link = page.locator("[data-engagement-invite-link]");
     await expect(link).toHaveText(/^gaugewright:\/\/invite\?d=/);
@@ -362,6 +379,11 @@ When("the target accepts the combined invite", async ({ page }) => {
     const bob = bobPage!;
     await bob.locator("[data-pd-invite-link]").fill(combinedInviteLink);
     await expect(bob.locator("[data-pd-invite-consent]")).toBeVisible();
+    await expect(bob.locator("[data-pd-invite-distributions]")).toContainText("Commercial Analyst");
+    await expect(bob.locator("[data-pd-invite-distributions]")).toContainText("no technical secrecy");
+    await expect(bob.locator("[data-pd-invite-accept]")).toBeDisabled();
+    await bob.locator("[data-pd-invite-contract-consent]").check();
+    await expect(bob.locator("[data-pd-invite-accept]")).toBeEnabled();
     await bob.locator("[data-pd-invite-accept]").click();
     await expect(bob.locator("[data-pd-status]")).toContainText("accepted");
     // Once accepted, the resource refetch advances to `committed` and replaces
@@ -369,7 +391,7 @@ When("the target accepts the combined invite", async ({ page }) => {
     await expect(page.locator("[data-engagement-phase]")).toContainText("committed", {
         timeout: 10_000,
     });
-    await expect(page.locator("[data-engagement-feedback]")).toContainText("accepted by bob");
+    await expect(page.locator("[data-engagement-feedback]")).toContainText(`accepted by ${bobAuthority}`);
 });
 
 Then("the target manages the invited project's data and operator grant", async () => {
@@ -388,15 +410,13 @@ Then("the target manages the invited project's data and operator grant", async (
 
     const operator = bob.locator(`[data-engagement-participant="${aliceAuthority}"]`);
     await expect(operator).toBeVisible();
-    await operator.locator('[data-engagement-revoke="archetypes"]').click();
-    await expect(operator).toContainText("revoked");
+    await expect(operator.locator('[data-engagement-revoke="archetypes"]')).toBeVisible();
 
     const required = [
         ["alice", "POST", "/federation/invite"],
         ["alice", "GET", "/federation/invite/status"],
         ["bob", "POST", "/federation/invite/accept"],
         ["bob", "POST", "/federation/handoff/connect-data"],
-        ["bob", "POST", "/federation/handoff/revoke"],
     ] as const;
     for (const [authority, method, path] of required) {
         expect(
@@ -473,6 +493,19 @@ Then("the target exercises once, standing, and denied run admission", async ({ p
                 + JSON.stringify(productionClientResponses),
         ).toBeTruthy();
     }
+
+    // Revoke only after the run-admission journey. Revoking before it would
+    // correctly remove the source's operator authority and make every run fail.
+    const operator = bob.locator(`[data-engagement-participant="${aliceAuthority}"]`);
+    await operator.locator('[data-engagement-revoke="archetypes"]').click();
+    await expect(operator).toContainText("revoked");
+    expect(productionClientResponses.some((response) =>
+        response.authority === "bob"
+        && response.method === "POST"
+        && response.path === "/federation/handoff/revoke"
+        && response.status >= 200
+        && response.status < 300,
+    )).toBeTruthy();
 });
 
 When("a phone proves a controller request", async ({ request }) => {

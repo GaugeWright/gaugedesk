@@ -64,6 +64,10 @@ pub struct PlacementDistributionRecord {
     pub owner_authority: String,
     #[serde(default)]
     pub recipient_authority: String,
+    /// Human label selected by the owner. Authority remains the security key;
+    /// this is display-only and may never substitute for it.
+    #[serde(default)]
+    pub recipient_display_name: String,
     #[serde(default = "default_service_origin")]
     pub service_origin: String,
     #[serde(default)]
@@ -86,6 +90,8 @@ pub struct PutDistributionRequest {
     #[serde(default)]
     pub recipient_authority: String,
     #[serde(default)]
+    pub recipient_display_name: String,
+    #[serde(default)]
     pub lease_seconds: u64,
     #[serde(default)]
     pub max_runs: u64,
@@ -96,8 +102,15 @@ pub struct PutDistributionRequest {
 #[derive(Debug, Serialize)]
 pub struct DistributionStatus {
     pub placement_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub revision: String,
     pub profile: DistributionProfile,
+    pub owner_authority: String,
+    pub owner_root_pubkey: Option<String>,
     pub recipient_authority: String,
+    pub recipient_display_name: String,
+    pub recipient_root_pubkey: Option<String>,
     pub service_origin: String,
     pub lease_seconds: u64,
     pub max_runs: u64,
@@ -105,31 +118,140 @@ pub struct DistributionStatus {
     pub license_id: Option<String>,
     pub attribution_id: Option<String>,
     pub expires_at: Option<u64>,
+    pub plaintext_sha256: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub protection_blob_sha256: Option<String>,
+    pub issuer_authority: Option<String>,
+    pub can_manage: bool,
 }
 
-impl PlacementDistributionRecord {
-    fn status(&self) -> DistributionStatus {
-        let claims = self
+/// Secret-free contract copied into an engagement invitation so the recipient
+/// can consent before any project content moves. `release_digest` is the frozen
+/// package reference until a protected artifact exists, then the signed artifact
+/// digest. Neither form contains Agent body bytes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DistributionOfferSummary {
+    pub placement_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub revision: String,
+    pub release_digest: String,
+    pub profile: DistributionProfile,
+    pub owner_authority: String,
+    pub recipient_authority: String,
+    pub recipient_display_name: String,
+    pub lease_seconds: u64,
+    pub max_runs: u64,
+    pub expires_at: Option<u64>,
+}
+
+pub(crate) fn project_distribution_offers(
+    wb: &Workbench,
+    project: &str,
+) -> Vec<DistributionOfferSummary> {
+    let mut offers = wb
+        .library
+        .instances
+        .values()
+        .filter(|instance| instance.project_id.as_deref() == Some(project))
+        .filter_map(|instance| {
+            let agent = wb.library.agents.get(&instance.agent_id)?;
+            let version = agent.versions.get(&instance.version)?;
+            let record = distribution_for(wb.store_ref(), &instance.id);
+            let release = record.as_ref().and_then(|record| record.release.as_ref());
+            let claims = release.map(|release| &release.artifact.claims);
+            Some(DistributionOfferSummary {
+                placement_id: instance.id.clone(),
+                agent_id: agent.id.clone(),
+                agent_name: agent.name.clone(),
+                revision: instance.version.to_string(),
+                release_digest: release
+                    .map(|release| artifact_digest(&release.artifact))
+                    .unwrap_or_else(|| version.package_ref.clone()),
+                profile: record
+                    .as_ref()
+                    .map(|record| record.profile.clone())
+                    .unwrap_or_default(),
+                owner_authority: record
+                    .as_ref()
+                    .map(|record| record.owner_authority.clone())
+                    .filter(|authority| !authority.is_empty())
+                    .unwrap_or_else(|| wb.federation_authority().as_str().to_owned()),
+                recipient_authority: record
+                    .as_ref()
+                    .map(|record| record.recipient_authority.clone())
+                    .unwrap_or_default(),
+                recipient_display_name: record
+                    .as_ref()
+                    .map(|record| record.recipient_display_name.clone())
+                    .unwrap_or_default(),
+                lease_seconds: record
+                    .as_ref()
+                    .map(|record| record.lease_seconds)
+                    .unwrap_or(0),
+                max_runs: record.as_ref().map(|record| record.max_runs).unwrap_or(0),
+                expires_at: claims.map(|claims| claims.expires_at),
+            })
+        })
+        .collect::<Vec<_>>();
+    offers.sort_by(|left, right| left.agent_name.cmp(&right.agent_name));
+    offers
+}
+
+fn distribution_status(wb: &Workbench, record: &PlacementDistributionRecord) -> DistributionStatus {
+    let instance = wb.library.instances.get(&record.placement_id);
+    let agent = instance.and_then(|instance| wb.library.agents.get(&instance.agent_id));
+    let claims = record
+        .release
+        .as_ref()
+        .map(|release| &release.artifact.claims);
+    DistributionStatus {
+        placement_id: record.placement_id.clone(),
+        agent_id: instance
+            .map(|instance| instance.agent_id.clone())
+            .unwrap_or_default(),
+        agent_name: agent
+            .map(|agent| agent.name.clone())
+            .unwrap_or_else(|| "Agent".to_owned()),
+        revision: claims
+            .map(|claims| claims.revision.clone())
+            .or_else(|| instance.map(|instance| instance.version.to_string()))
+            .unwrap_or_default(),
+        profile: record.profile.clone(),
+        owner_authority: if record.owner_authority.is_empty() {
+            wb.federation_authority().as_str().to_owned()
+        } else {
+            record.owner_authority.clone()
+        },
+        owner_root_pubkey: claims.map(|claims| claims.owner_root_pubkey.clone()),
+        recipient_authority: record.recipient_authority.clone(),
+        recipient_display_name: record.recipient_display_name.clone(),
+        recipient_root_pubkey: claims.map(|claims| claims.recipient_root_pubkey.clone()),
+        service_origin: record.service_origin.clone(),
+        lease_seconds: record.lease_seconds,
+        max_runs: record.max_runs,
+        state: match (&record.profile, &record.release) {
+            (DistributionProfile::Licensed, _) => "licensed",
+            (DistributionProfile::ProtectedCommercial, None) => "awaiting_issue",
+            (DistributionProfile::ProtectedCommercial, Some(_)) if record.revoked => "revoked",
+            (DistributionProfile::ProtectedCommercial, Some(_))
+                if claims.is_some_and(|claims| claims.expires_at <= now_secs()) =>
+            {
+                "expired"
+            }
+            (DistributionProfile::ProtectedCommercial, Some(_)) => "issued",
+        },
+        license_id: claims.map(|claims| claims.license_id.clone()),
+        attribution_id: claims.map(|claims| claims.attribution_id.clone()),
+        expires_at: claims.map(|claims| claims.expires_at),
+        plaintext_sha256: claims.map(|claims| claims.plaintext_sha256.clone()),
+        artifact_sha256: record
             .release
             .as_ref()
-            .map(|release| &release.artifact.claims);
-        DistributionStatus {
-            placement_id: self.placement_id.clone(),
-            profile: self.profile.clone(),
-            recipient_authority: self.recipient_authority.clone(),
-            service_origin: self.service_origin.clone(),
-            lease_seconds: self.lease_seconds,
-            max_runs: self.max_runs,
-            state: match (&self.profile, &self.release) {
-                (DistributionProfile::Licensed, _) => "licensed",
-                (DistributionProfile::ProtectedCommercial, None) => "awaiting_issue",
-                (DistributionProfile::ProtectedCommercial, Some(_)) if self.revoked => "revoked",
-                (DistributionProfile::ProtectedCommercial, Some(_)) => "issued",
-            },
-            license_id: claims.map(|claims| claims.license_id.clone()),
-            attribution_id: claims.map(|claims| claims.attribution_id.clone()),
-            expires_at: claims.map(|claims| claims.expires_at),
-        }
+            .map(|release| artifact_digest(&release.artifact)),
+        protection_blob_sha256: claims.map(|claims| claims.protection_blob_sha256.clone()),
+        issuer_authority: claims.map(|claims| claims.issuer_authority.clone()),
+        can_manage: operator_may_manage(wb, &record.placement_id),
     }
 }
 
@@ -185,20 +307,21 @@ pub async fn get_distribution(
         )
             .into_response();
     }
-    let status = distribution_for(guard.store_ref(), &id)
-        .unwrap_or_else(|| PlacementDistributionRecord {
+    let status =
+        distribution_for(guard.store_ref(), &id).unwrap_or_else(|| PlacementDistributionRecord {
             placement_id: id,
             op: RecordOp::Upsert,
             profile: DistributionProfile::Licensed,
             owner_authority: String::new(),
             recipient_authority: String::new(),
+            recipient_display_name: String::new(),
             service_origin: default_service_origin(),
             lease_seconds: 0,
             max_runs: 0,
             release: None,
             revoked: false,
-        })
-        .status();
+        });
+    let status = distribution_status(&guard, &status);
     (StatusCode::OK, Json(serde_json::to_value(status).unwrap())).into_response()
 }
 
@@ -250,6 +373,7 @@ pub async fn put_distribution(
         profile: request.profile,
         owner_authority,
         recipient_authority: request.recipient_authority.trim().to_owned(),
+        recipient_display_name: request.recipient_display_name.trim().to_owned(),
         service_origin,
         lease_seconds: request.lease_seconds,
         max_runs: request.max_runs,
@@ -259,7 +383,7 @@ pub async fn put_distribution(
     match write_distribution(&mut guard, &record) {
         Ok(()) => (
             StatusCode::OK,
-            Json(serde_json::to_value(record.status()).unwrap()),
+            Json(serde_json::to_value(distribution_status(&guard, &record)).unwrap()),
         )
             .into_response(),
         Err(error) => (
@@ -303,7 +427,7 @@ pub async fn renew_distribution(
     match issue_placement_release(&mut guard, &id, &peer_root, record, Some(&license)) {
         Ok(record) => (
             StatusCode::OK,
-            Json(serde_json::to_value(record.status()).unwrap()),
+            Json(serde_json::to_value(distribution_status(&guard, &record)).unwrap()),
         )
             .into_response(),
         Err(error) => (
@@ -352,7 +476,7 @@ pub async fn revoke_distribution(
             match write_distribution(&mut guard, &record) {
                 Ok(()) => (
                     StatusCode::OK,
-                    Json(serde_json::to_value(record.status()).unwrap()),
+                    Json(serde_json::to_value(distribution_status(&guard, &record)).unwrap()),
                 )
                     .into_response(),
                 Err(error) => (

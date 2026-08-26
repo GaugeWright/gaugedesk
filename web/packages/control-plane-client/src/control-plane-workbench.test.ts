@@ -35,6 +35,7 @@ describe("placement distribution profiles", () => {
         await setPlacementDistribution(transport, placement, {
             profile: "protected_commercial",
             recipient_authority: "tenant:recipient",
+            recipient_display_name: "Recipient & Co",
             lease_seconds: 86_400,
             max_runs: 5,
         });
@@ -47,6 +48,7 @@ describe("placement distribution profiles", () => {
             ["PUT", "/placements/placement-1/distribution", {
                 profile: "protected_commercial",
                 recipient_authority: "tenant:recipient",
+                recipient_display_name: "Recipient & Co",
                 lease_seconds: 86_400,
                 max_runs: 5,
             }],

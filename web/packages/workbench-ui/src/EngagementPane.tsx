@@ -19,6 +19,7 @@ import {
     type EngagementId,
     type ProjectId,
     type Workspace,
+    type AccountTenant,
     type CreatedHomeInvitation,
     type PlacementDistributionStatus,
     type PlacementId,
@@ -45,8 +46,57 @@ function homeLabel(s: HandoffStatus | null | undefined): string {
     return "this device";
 }
 
+export function shortIdentity(value: string | null | undefined): string {
+    if (!value) return "pending";
+    return value.length > 18 ? `${value.slice(0, 10)}…${value.slice(-6)}` : value;
+}
+
+export function distributionStateLabel(state: PlacementDistributionStatus["state"]): string {
+    switch (state) {
+        case "licensed": return "Licensed copy";
+        case "awaiting_issue": return "Release pending";
+        case "issued": return "Ready";
+        case "expired": return "Expired";
+        case "revoked": return "Revoked";
+    }
+}
+
+export function protectedRunRefusal(reason: string | undefined): string | null {
+    if (!reason) return null;
+    const lower = reason.toLowerCase();
+    if (!lower.includes("protected") && !lower.includes("license") && !lower.includes("issuer")) {
+        return null;
+    }
+    if (lower.includes("revok")) return "The Agent owner revoked this protected release. Future runs are blocked.";
+    if (lower.includes("expir")) return "This protected release expired. The Agent owner must renew it before another run.";
+    if (lower.includes("limit") || lower.includes("ceiling")) return "This protected release has reached its run limit.";
+    if (lower.includes("bound to another") || lower.includes("wrong") || lower.includes("recipient")) {
+        return "This protected release is not bound to this Home and cannot run here.";
+    }
+    if (lower.includes("unavailable") || lower.includes("http") || lower.includes("service")) {
+        return "The protected-profile service is unavailable. GaugeDesk refused the run instead of using a licensed copy.";
+    }
+    return `Protected execution was refused: ${reason}`;
+}
+
+function formatExpiry(epochSeconds: number | null): string {
+    if (!epochSeconds) return "Issued when the recipient Home is bound";
+    return new Date(epochSeconds * 1000).toLocaleString();
+}
+
+function inviteQrSvg(link: string): string | null {
+    try {
+        return qrSvg(link);
+    } catch {
+        // A full multi-Agent contract can exceed QR capacity. The deep link is
+        // still complete and copyable; never discard contract terms to fit it.
+        return null;
+    }
+}
+
 export interface EngagementPaneApi {
     getWorkspace(): Promise<Workspace>;
+    accountTenants(): Promise<AccountTenant[]>;
     handoffStatus(project: ProjectId): Promise<HandoffStatus>;
     handoffParticipants(project: ProjectId): Promise<Participant[]>;
     handoffData(project: ProjectId): Promise<ConnectedData[]>;
@@ -59,6 +109,7 @@ export interface EngagementPaneApi {
         input: {
             profile: "licensed" | "protected_commercial";
             recipient_authority?: string;
+            recipient_display_name?: string;
             lease_seconds?: number;
             max_runs?: number;
         },
@@ -125,6 +176,13 @@ export function EngagementPane(props: {
     );
     const [peers] = createResource(() => props.api.listPeers());
     const [workspace] = createResource(() => props.api.getWorkspace());
+    const [accountTenants] = createResource(async () => {
+        try {
+            return await props.api.accountTenants();
+        } catch {
+            return [];
+        }
+    });
     const projectPlacements = () => workspace()?.projects
         .find((project) => project.id === props.project)?.placements ?? [];
     const [distributionPlacement, setDistributionPlacement] = createSignal("");
@@ -138,14 +196,36 @@ export function EngagementPane(props: {
     );
     const [protectedProfile, setProtectedProfile] = createSignal(false);
     const [recipientTenant, setRecipientTenant] = createSignal("");
+    const [recipientName, setRecipientName] = createSignal("");
+    const [manualRecipient, setManualRecipient] = createSignal(false);
     const [leaseDays, setLeaseDays] = createSignal("30");
     const [maxRuns, setMaxRuns] = createSignal("0");
     const [distributionAudit, setDistributionAudit] = createSignal("");
+    const [runProtectionNotice, setRunProtectionNotice] = createSignal("");
+    const recipientOptions = () => {
+        const options = [...(accountTenants() ?? [])];
+        const current = distribution();
+        if (current?.recipient_authority && !options.some((tenant) => tenant.id === current.recipient_authority)) {
+            options.push({
+                id: current.recipient_authority,
+                displayName: current.recipient_display_name || "External organization",
+                role: "recipient",
+                personal: false,
+                providerCommercial: false,
+            });
+        }
+        return options;
+    };
     createEffect(() => {
         const current = distribution();
         if (!current) return;
         setProtectedProfile(current.profile === "protected_commercial");
         setRecipientTenant(current.recipient_authority);
+        setRecipientName(current.recipient_display_name);
+        setManualRecipient(
+            Boolean(current.recipient_authority)
+            && !(accountTenants() ?? []).some((tenant) => tenant.id === current.recipient_authority),
+        );
         setLeaseDays(String(Math.max(1, Math.round(current.lease_seconds / 86_400))));
         setMaxRuns(String(current.max_runs));
     });
@@ -159,6 +239,7 @@ export function EngagementPane(props: {
                 profile,
                 ...(profile === "protected_commercial" ? {
                     recipient_authority: recipientTenant().trim(),
+                    recipient_display_name: recipientName().trim(),
                     lease_seconds: Math.max(1, Number.parseInt(leaseDays(), 10)) * 86_400,
                     max_runs: Math.max(0, Number.parseInt(maxRuns(), 10) || 0),
                 } : {}),
@@ -382,12 +463,16 @@ export function EngagementPane(props: {
                 runPrompt().trim() || "go",
                 targetChat,
             );
+            const protectionRefusal = r.status === "refused"
+                ? protectedRunRefusal(r.reason)
+                : null;
+            setRunProtectionNotice(protectionRefusal ?? "");
             setStatus(
                 r.status === "admitted"
                     ? `run executed on the host (${r.observations_admitted ?? 0} observations)`
                     : r.status === "pending"
                       ? "run placed — waiting for the host to admit it"
-                      : `run refused: ${r.reason ?? "?"}`,
+                      : protectionRefusal ?? `run refused: ${r.reason ?? "?"}`,
             );
             setRunPrompt("");
             refetchQueue();
@@ -510,68 +595,117 @@ export function EngagementPane(props: {
                                 )}
                             </For>
                         </select>
-                        <label class="status">
-                            <input
-                                type="checkbox"
-                                checked={protectedProfile()}
-                                onChange={(event) => setProtectedProfile(event.currentTarget.checked)}
-                            />
-                            Protect this placement commercially
-                        </label>
-                        <Show when={protectedProfile()}>
-                            <input
-                                class="fed-paste"
-                                data-distribution-recipient
-                                placeholder="Exact recipient tenant ID"
-                                value={recipientTenant()}
-                                onInput={(event) => setRecipientTenant(event.currentTarget.value)}
-                            />
-                            <input
-                                class="fed-paste"
-                                type="number"
-                                min="1"
-                                max="31"
-                                aria-label="Lease days"
-                                value={leaseDays()}
-                                onInput={(event) => setLeaseDays(event.currentTarget.value)}
-                            />
-                            <input
-                                class="fed-paste"
-                                type="number"
-                                min="0"
-                                aria-label="Maximum runs; zero means metered without a ceiling"
-                                value={maxRuns()}
-                                onInput={(event) => setMaxRuns(event.currentTarget.value)}
-                            />
+                        <Show when={distribution()}>
+                            {(contract) => (
+                                <div class="distribution-contract" data-distribution-contract>
+                                    <div class="distribution-contract-head">
+                                        <strong>Protection contract</strong>
+                                        <span class="distribution-state" data-state={contract().state}>
+                                            {distributionStateLabel(contract().state)}
+                                        </span>
+                                    </div>
+                                    <dl class="distribution-contract-grid">
+                                        <div><dt>Agent</dt><dd>{contract().agent_name}</dd></div>
+                                        <div><dt>Revision</dt><dd>{contract().revision}</dd></div>
+                                        <div><dt>Owner</dt><dd>{shortIdentity(contract().owner_authority)}</dd></div>
+                                        <div><dt>Recipient</dt><dd>{contract().recipient_display_name || shortIdentity(contract().recipient_authority)}</dd></div>
+                                        <div><dt>Execution</dt><dd>Recipient organization&apos;s Home</dd></div>
+                                        <div><dt>Use ceiling</dt><dd>{contract().max_runs > 0 ? `${contract().max_runs} runs` : "Metered; no signed ceiling"}</dd></div>
+                                        <div><dt>Expires</dt><dd>{formatExpiry(contract().expires_at)}</dd></div>
+                                        <div>
+                                            <dt>Security</dt>
+                                            <dd>{contract().profile === "protected_commercial"
+                                                ? "Recipient-bound encryption; plaintext visible during execution"
+                                                : "Licensed copy; no technical secrecy"}</dd>
+                                        </div>
+                                    </dl>
+                                    <details class="distribution-identifiers">
+                                        <summary>Contract identifiers and digests</summary>
+                                        <p class="status">Agent: {contract().agent_id}</p>
+                                        <p class="status">Owner authority: {contract().owner_authority}</p>
+                                        <p class="status">Recipient authority: {contract().recipient_authority || "Not selected"}</p>
+                                        <p class="status">License: {contract().license_id ?? "Not issued"}</p>
+                                        <p class="status">Attribution: {contract().attribution_id ?? "Not issued"}</p>
+                                        <p class="status">Plaintext digest: {contract().plaintext_sha256 ?? "Not issued"}</p>
+                                        <p class="status">Protected artifact digest: {contract().artifact_sha256 ?? "Not issued"}</p>
+                                        <p class="status">Issuer: {contract().issuer_authority ?? "Not issued"}</p>
+                                    </details>
+                                </div>
+                            )}
                         </Show>
-                        <button
-                            type="button"
-                            class="tree-action"
-                            data-distribution-save
-                            onClick={() => void saveDistribution()}
-                        >
-                            Save distribution
-                        </button>
-                        <p class="status" data-distribution-status>
-                            Current: {distribution()?.state ?? "licensed"}
-                            <Show when={distribution()?.license_id}>
-                                {(license) => <> · lease {license()}</>}
+                        <Show when={distribution()?.can_manage ?? true} fallback={<p class="status">Recipient view — the Agent owner manages these terms.</p>}>
+                            <label class="status">
+                                <input
+                                    type="checkbox"
+                                    checked={protectedProfile()}
+                                    onChange={(event) => setProtectedProfile(event.currentTarget.checked)}
+                                />
+                                Protect this placement commercially
+                            </label>
+                            <Show when={protectedProfile()}>
+                                <label class="distribution-field">
+                                    Recipient organization
+                                    <select
+                                        class="fed-paste"
+                                        data-distribution-recipient
+                                        value={manualRecipient() ? "__other" : recipientTenant()}
+                                        onChange={(event) => {
+                                            const value = event.currentTarget.value;
+                                            if (value === "__other") {
+                                                setManualRecipient(true);
+                                                setRecipientTenant("");
+                                                setRecipientName("");
+                                                return;
+                                            }
+                                            const tenant = recipientOptions().find((option) => option.id === value);
+                                            setManualRecipient(false);
+                                            setRecipientTenant(value);
+                                            setRecipientName(tenant?.displayName ?? "");
+                                        }}
+                                    >
+                                        <option value="">Choose an organization</option>
+                                        <For each={recipientOptions()}>
+                                            {(tenant) => <option value={tenant.id}>{tenant.displayName}</option>}
+                                        </For>
+                                        <option value="__other">Organization not listed…</option>
+                                    </select>
+                                </label>
+                                <Show when={manualRecipient()}>
+                                    <div class="distribution-manual-recipient">
+                                        <input
+                                            class="fed-paste"
+                                            data-distribution-recipient-name
+                                            placeholder="Organization name"
+                                            value={recipientName()}
+                                            onInput={(event) => setRecipientName(event.currentTarget.value)}
+                                        />
+                                        <details open>
+                                            <summary>Organization identifier</summary>
+                                            <input
+                                                class="fed-paste"
+                                                data-distribution-recipient-authority
+                                                placeholder="Exact tenant authority"
+                                                value={recipientTenant()}
+                                                onInput={(event) => setRecipientTenant(event.currentTarget.value)}
+                                            />
+                                        </details>
+                                    </div>
+                                </Show>
+                                <div class="distribution-limits">
+                                    <label>Lease days<input class="fed-paste" type="number" min="1" max="31" value={leaseDays()} onInput={(event) => setLeaseDays(event.currentTarget.value)} /></label>
+                                    <label>Maximum runs<input class="fed-paste" type="number" min="0" aria-label="Maximum runs; zero means metered without a ceiling" value={maxRuns()} onInput={(event) => setMaxRuns(event.currentTarget.value)} /></label>
+                                </div>
                             </Show>
-                        </p>
-                        <Show when={distribution()?.license_id}>
-                            <div class="pair-device-actions">
-                                <button type="button" class="tree-action" onClick={() => void renewDistribution()}>
-                                    Renew lease
-                                </button>
-                                <button type="button" class="tree-action" onClick={() => void readDistributionAudit()}>
-                                    View audit
-                                </button>
-                                <button type="button" class="tree-action" onClick={() => void revokeDistribution()}>
-                                    Revoke lease
-                                </button>
-                            </div>
-                            <Show when={distributionAudit()}>
-                                <p class="status" data-distribution-audit>{distributionAudit()}</p>
+                            <button type="button" class="tree-action" data-distribution-save disabled={protectedProfile() && !recipientTenant().trim()} onClick={() => void saveDistribution()}>
+                                Save distribution
+                            </button>
+                            <Show when={distribution()?.license_id}>
+                                <div class="pair-device-actions">
+                                    <button type="button" class="tree-action" onClick={() => void renewDistribution()}>Renew lease</button>
+                                    <button type="button" class="tree-action" onClick={() => void readDistributionAudit()}>View audit</button>
+                                    <button type="button" class="tree-action" onClick={() => void revokeDistribution()}>Revoke lease</button>
+                                </div>
+                                <Show when={distributionAudit()}><p class="status" data-distribution-audit>{distributionAudit()}</p></Show>
                             </Show>
                         </Show>
                     </section>
@@ -639,11 +773,19 @@ export function EngagementPane(props: {
                                     {(inv) => (
                                         <div class="engagement-invite">
                                             <p class="status">Have the client scan this or open the link:</p>
-                                            <div
-                                                class="pd-qr"
-                                                data-engagement-qr
-                                                innerHTML={qrSvg(inv().invite_url)}
-                                            />
+                                            <Show
+                                                when={inviteQrSvg(inv().invite_url)}
+                                                fallback={
+                                                    <p class="status" data-engagement-qr-too-large>
+                                                        This invite includes too much contract detail for a QR code.
+                                                        Copy the complete link instead.
+                                                    </p>
+                                                }
+                                            >
+                                                {(svg) => (
+                                                    <div class="pd-qr" data-engagement-qr innerHTML={svg()} />
+                                                )}
+                                            </Show>
                                             <code class="pair-ticket" data-engagement-invite-link>
                                                 {inv().invite_url}
                                             </code>
@@ -862,6 +1004,11 @@ export function EngagementPane(props: {
 
                 <Show when={status()}>
                     <p class="status" data-engagement-feedback>{status()}</p>
+                </Show>
+                <Show when={runProtectionNotice()}>
+                    <p class="status protected-run-refusal" role="alert" data-protected-run-refusal>
+                        {runProtectionNotice()} No licensed fallback was attempted.
+                    </p>
                 </Show>
             </div>
         </div>

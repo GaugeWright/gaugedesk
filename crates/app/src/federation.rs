@@ -3741,6 +3741,8 @@ struct EngagementInvite {
     deployment_mode: gaugedesk_core::boundary_lifecycle::Placement,
     #[serde(default)]
     manifest: Vec<String>,
+    #[serde(default)]
+    agent_distributions: Vec<crate::protected_profiles::DistributionOfferSummary>,
     confirm_code: String,
 }
 
@@ -3905,6 +3907,10 @@ pub async fn post_invite(
             disposition: req.disposition,
             deployment_mode,
             manifest: Vec::new(),
+            agent_distributions: crate::protected_profiles::project_distribution_offers(
+                &guard,
+                &req.project,
+            ),
             confirm_code: confirm.clone(),
         }
     };
@@ -6357,6 +6363,7 @@ mod handoff_routes_tests {
             disposition: InviteDisposition::Relocate,
             deployment_mode: gaugedesk_core::boundary_lifecycle::Placement::local(),
             manifest: Vec::new(),
+            agent_distributions: Vec::new(),
             confirm_code: "1-2-3".into(),
         };
         let app = featured_routes(true).with_state(Arc::new(Mutex::new(wb)));

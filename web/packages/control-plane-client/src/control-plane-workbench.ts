@@ -362,15 +362,27 @@ export type DistributionProfile = "licensed" | "protected_commercial";
 
 export interface PlacementDistributionStatus {
     readonly placement_id: string;
+    readonly agent_id: string;
+    readonly agent_name: string;
+    readonly revision: string;
     readonly profile: DistributionProfile;
+    readonly owner_authority: string;
+    readonly owner_root_pubkey: string | null;
     readonly recipient_authority: string;
+    readonly recipient_display_name: string;
+    readonly recipient_root_pubkey: string | null;
     readonly service_origin: string;
     readonly lease_seconds: number;
     readonly max_runs: number;
-    readonly state: "licensed" | "awaiting_issue" | "issued" | "revoked";
+    readonly state: "licensed" | "awaiting_issue" | "issued" | "expired" | "revoked";
     readonly license_id: string | null;
     readonly attribution_id: string | null;
     readonly expires_at: number | null;
+    readonly plaintext_sha256: string | null;
+    readonly artifact_sha256: string | null;
+    readonly protection_blob_sha256: string | null;
+    readonly issuer_authority: string | null;
+    readonly can_manage: boolean;
 }
 
 export async function getPlacementDistribution(
@@ -389,6 +401,7 @@ export async function setPlacementDistribution(
     input: {
         profile: DistributionProfile;
         recipient_authority?: string;
+        recipient_display_name?: string;
         lease_seconds?: number;
         max_runs?: number;
     },

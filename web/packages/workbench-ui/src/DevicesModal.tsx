@@ -57,6 +57,34 @@ function machineInvitationLink(invitation: MachineControllerInvitation): string 
     return `gaugewright://machine-enroll?d=${encoded}`;
 }
 
+export interface InviteDistributionSummary {
+    agent_id: string;
+    agent_name: string;
+    revision: string;
+    release_digest: string;
+    profile: "licensed" | "protected_commercial";
+    owner_authority: string;
+    recipient_authority: string;
+    recipient_display_name: string;
+    lease_seconds: number;
+    max_runs: number;
+    expires_at: number | null;
+}
+
+export function inviteRequiresDistributionConsent(
+    distributions: readonly InviteDistributionSummary[] | undefined,
+): boolean {
+    return (distributions?.length ?? 0) > 0;
+}
+
+function inviteDistributionExpiry(distribution: InviteDistributionSummary): string {
+    if (distribution.expires_at) return new Date(distribution.expires_at * 1000).toLocaleString();
+    if (distribution.profile === "protected_commercial") {
+        return `${Math.max(1, Math.round(distribution.lease_seconds / 86_400))} days after issue`;
+    }
+    return "No technical expiry";
+}
+
 export function DevicesModal(props: {
     api: DevicesModalApi;
     environment?: string;
@@ -78,6 +106,7 @@ export function DevicesModal(props: {
     const [confirmPeerRevoke, setConfirmPeerRevoke] = createSignal("");
     const [pasted, setPasted] = createSignal("");
     const [inviteLink, setInviteLink] = createSignal(props.initialInviteLink ?? "");
+    const [inviteContractAccepted, setInviteContractAccepted] = createSignal(false);
     const [controllerEndpoint, setControllerEndpoint] = createSignal("");
     const [controllerInvitation, setControllerInvitation] =
         createSignal<MachineControllerInvitation | null>(null);
@@ -367,6 +396,7 @@ export function DevicesModal(props: {
                 ticket?: { authority?: string };
                 confirm_code?: string;
                 manifest?: string[];
+                agent_distributions?: InviteDistributionSummary[];
                 deployment_mode?: unknown;
             };
             return {
@@ -385,6 +415,10 @@ export function DevicesModal(props: {
             setStatus("accept refused locally: this engagement does not satisfy organization policy");
             return;
         }
+        if (inviteRequiresDistributionConsent(invite.agent_distributions) && !inviteContractAccepted()) {
+            setStatus("review and accept the Agent distribution terms before setting up this project");
+            return;
+        }
         try {
             const r = await props.api.inviteAccept(inviteLink().trim());
             if (r.ok) {
@@ -392,6 +426,7 @@ export function DevicesModal(props: {
                     `accepted — ${r.origin} set up "${r.project_name ?? r.project}" here · code ${r.confirm_code}`,
                 );
                 setInviteLink("");
+                setInviteContractAccepted(false);
                 refetchPeers();
             } else {
                 setStatus(`accept declined: ${r.reason ?? "verification failed"}`);
@@ -697,7 +732,10 @@ export function DevicesModal(props: {
                     rows={2}
                     value={inviteLink()}
                     placeholder="paste an gaugewright://invite link"
-                    onInput={(e) => setInviteLink(e.currentTarget.value)}
+                    onInput={(e) => {
+                        setInviteLink(e.currentTarget.value);
+                        setInviteContractAccepted(false);
+                    }}
                 />
                 <Show when={decodedInvite()}>
                     {(d) => (
@@ -710,6 +748,50 @@ export function DevicesModal(props: {
                             </p>
                             <Show when={(d().manifest ?? []).length > 0}>
                                 <p class="status">Agents: {(d().manifest ?? []).join(", ")}</p>
+                            </Show>
+                            <Show when={(d().agent_distributions ?? []).length > 0}>
+                                <div class="invite-distributions" data-pd-invite-distributions>
+                                    <For each={d().agent_distributions ?? []}>
+                                        {(distribution) => (
+                                            <div class="distribution-contract invite-distribution">
+                                                <div class="distribution-contract-head">
+                                                    <strong>{distribution.agent_name}</strong>
+                                                    <span class="distribution-state">
+                                                        {distribution.profile === "protected_commercial"
+                                                            ? "Protected commercial"
+                                                            : "Licensed copy"}
+                                                    </span>
+                                                </div>
+                                                <dl class="distribution-contract-grid">
+                                                    <div><dt>Revision</dt><dd>{distribution.revision}</dd></div>
+                                                    <div><dt>Owner</dt><dd>{distribution.owner_authority}</dd></div>
+                                                    <div><dt>Recipient</dt><dd>{distribution.recipient_display_name || distribution.recipient_authority || "This organization"}</dd></div>
+                                                    <div><dt>Execution</dt><dd>This Home</dd></div>
+                                                    <div><dt>Expires</dt><dd>{inviteDistributionExpiry(distribution)}</dd></div>
+                                                    <div><dt>Use ceiling</dt><dd>{distribution.max_runs > 0 ? `${distribution.max_runs} runs` : "Metered; no signed ceiling"}</dd></div>
+                                                </dl>
+                                                <p class="status">
+                                                    {distribution.profile === "protected_commercial"
+                                                        ? "The release is recipient-bound, metered, revocable, and encrypted at rest. This Home's administrator can still inspect plaintext while it runs."
+                                                        : "This is a licensed copy. Its terms retain ownership and attribution, but it has no technical secrecy or remote revocation."}
+                                                </p>
+                                                <details class="distribution-identifiers">
+                                                    <summary>Release digest</summary>
+                                                    <code>{distribution.release_digest}</code>
+                                                </details>
+                                            </div>
+                                        )}
+                                    </For>
+                                    <label class="invite-contract-consent">
+                                        <input
+                                            type="checkbox"
+                                            data-pd-invite-contract-consent
+                                            checked={inviteContractAccepted()}
+                                            onChange={(event) => setInviteContractAccepted(event.currentTarget.checked)}
+                                        />
+                                        I accept these Agent distribution terms and understand the stated protection limits.
+                                    </label>
+                                </div>
                             </Show>
                             <p class="status">
                                 Confirm code: <strong>{d().confirm_code}</strong> — check it matches what they
@@ -726,7 +808,15 @@ export function DevicesModal(props: {
                         </div>
                     )}
                 </Show>
-                <button type="button" class="tree-action" data-pd-invite-accept disabled={!decodedInvite() || !deploymentAdmitted(decodedInvite()!.deployment)} onClick={() => void acceptInvite()}>
+                <button
+                    type="button"
+                    class="tree-action"
+                    data-pd-invite-accept
+                    disabled={!decodedInvite()
+                        || !deploymentAdmitted(decodedInvite()!.deployment)
+                        || (inviteRequiresDistributionConsent(decodedInvite()!.agent_distributions) && !inviteContractAccepted())}
+                    onClick={() => void acceptInvite()}
+                >
                     Accept &amp; set up
                 </button>
 

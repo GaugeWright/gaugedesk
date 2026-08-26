@@ -813,6 +813,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         input: {
             profile: workbenchClient.DistributionProfile;
             recipient_authority?: string;
+            recipient_display_name?: string;
             lease_seconds?: number;
             max_runs?: number;
         },

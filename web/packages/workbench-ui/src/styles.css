@@ -315,7 +315,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .pd-qr svg { display: block; width: 100%; height: 100%; }
 
 /* Cross-machine federation panel (D-REMOTE/SERVE-1) + FED-7 surfaces. */
-.engagement-pane { min-width: 420px; max-width: 560px; }
+.engagement-pane { min-width: 420px; max-width: 560px; max-height: 85vh; overflow-y: auto; }
 .fed-paste { width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: var(--fs-ui);
     background: var(--bg); color: inherit; border: 1px solid var(--edge); border-radius: 4px;
     padding: 6px 8px; margin-bottom: 6px; resize: vertical; }
@@ -326,6 +326,36 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .fed-peer-grant { color: var(--muted); font-size: var(--fs-ui); }
 .fed-peer .tree-action { width: auto; margin-left: auto; }
 .fed-peer .tree-action + .tree-action { margin-left: 0; }
+.distribution-contract { margin: 8px 0; padding: 10px; border: 1px solid var(--edge);
+    border-radius: 6px; background: color-mix(in srgb, var(--panel) 84%, var(--bg)); }
+.distribution-contract-head { display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 8px; }
+.distribution-state { color: var(--muted); font-size: var(--fs-label); text-transform: uppercase;
+    letter-spacing: .05em; }
+.distribution-state[data-state="issued"] { color: var(--ok, var(--accent)); }
+.distribution-state[data-state="expired"], .distribution-state[data-state="revoked"] { color: var(--bad); }
+.distribution-contract-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 14px; margin: 0; }
+.distribution-contract-grid div { min-width: 0; }
+.distribution-contract-grid dt { color: var(--muted); font-size: var(--fs-label);
+    text-transform: uppercase; letter-spacing: .05em; }
+.distribution-contract-grid dd { margin: 2px 0 0; overflow-wrap: anywhere; font-size: var(--fs-ui); }
+.distribution-identifiers { margin-top: 8px; color: var(--muted); font-size: var(--fs-label); }
+.distribution-identifiers summary { cursor: pointer; }
+.distribution-identifiers .status { overflow-wrap: anywhere; }
+.distribution-field, .distribution-limits label { display: flex; flex-direction: column;
+    gap: 4px; color: var(--muted); font-size: var(--fs-label); }
+.distribution-limits { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.distribution-manual-recipient details { margin-bottom: 6px; color: var(--muted); font-size: var(--fs-label); }
+.distribution-manual-recipient summary { margin-bottom: 4px; cursor: pointer; }
+.invite-distributions { display: flex; flex-direction: column; gap: 8px; }
+.invite-distribution { margin: 0; }
+.invite-contract-consent { display: flex; align-items: flex-start; gap: 7px; font-size: var(--fs-ui); }
+.invite-contract-consent input { margin-top: 2px; }
+.protected-run-refusal { padding: 8px; border: 1px solid var(--bad); border-radius: 5px; }
+@media (max-width: 520px) {
+    .distribution-contract-grid, .distribution-limits { grid-template-columns: 1fr; }
+}
 
 /* The human task queue (top bar). */
 .taskbar { display: flex; align-items: center; gap: 10px; min-height: 24px; }
