@@ -1397,7 +1397,7 @@ pub fn provider_model_wire_name(provider_name: &str) -> io::Result<&'static str>
     match provider_name {
         "anthropic" => Ok("anthropic-messages"),
         "openai" | "openai-codex" | "xai-grok" => Ok("openai-responses"),
-        "openai-generic" | "xai" => Ok("openai-chat-compat"),
+        "openai-generic" | "xai" | "openrouter" => Ok("openai-chat-compat"),
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("WhippleScript native provider `{provider_name}` has no declared wire"),
@@ -1516,6 +1516,17 @@ pub fn native_provider_descriptor(
         // `/chat/completions`, so the base URL must carry the `/v1` segment —
         // unlike the rows above, whose clients append the full `/v1/...` path.
         "xai" => ("https://api.x.ai/v1", "api.x.ai", "XAI_API_KEY", None),
+        // OpenRouter: a fixed-host aggregator on the same Chat Completions
+        // wire, so its base URL carries `/v1` for the same reason xAI's does.
+        // Its model ids are vendor-namespaced (`anthropic/claude-sonnet-4.5`)
+        // and its catalog turns over weekly, so there is no default model and
+        // no shipped catalog — the operator names the route (ADR 0148).
+        "openrouter" => (
+            "https://openrouter.ai/api/v1",
+            "openrouter.ai",
+            "OPENROUTER_API_KEY",
+            None,
+        ),
         "xai-grok" => (
             "https://cli-chat-proxy.grok.com",
             "cli-chat-proxy.grok.com",
@@ -1566,6 +1577,9 @@ impl ProviderConfig {
             "openai-generic" => ModelProvider::OpenAiCompat,
             // xai is a fixed-host endpoint on the same Chat Completions wire.
             "xai" => ModelProvider::OpenAiCompat,
+            // openrouter is likewise fixed-host on that wire; the vendor behind
+            // the route is the model id's business, not the client's.
+            "openrouter" => ModelProvider::OpenAiCompat,
             "xai-grok" => ModelProvider::XaiSubscription,
             "anthropic" => ModelProvider::Anthropic,
             "openai-codex" => ModelProvider::Codex,
@@ -2328,6 +2342,31 @@ mod tests {
             native_provider_descriptor("xai", Some("grok-4.6"), Some("https://evil.example"))
                 .expect("xai descriptor ignores base_url");
         assert_eq!(pinned.base_url, "https://api.x.ai/v1");
+    }
+
+    #[test]
+    fn openrouter_descriptor_is_fixed_host_compat_and_takes_a_namespaced_model() {
+        // Same `/v1`-in-base convention as xAI: the Chat Completions client
+        // appends only `/chat/completions`.
+        let desc =
+            native_provider_descriptor("openrouter", Some("anthropic/claude-sonnet-4.5"), None)
+                .expect("openrouter descriptor");
+        assert_eq!(desc.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(desc.endpoint_host, "openrouter.ai");
+        assert_eq!(desc.wire, "openai-chat-compat");
+        // A vendor-namespaced route survives descriptor derivation intact — the
+        // slash is part of the model id OpenRouter routes on, not a path.
+        assert_eq!(desc.model, "anthropic/claude-sonnet-4.5");
+        // No default model: OpenRouter's catalog turns over too fast to name one.
+        assert!(native_provider_descriptor("openrouter", None, None).is_err());
+        // Fixed host, so a carried base URL is ignored rather than honored.
+        let pinned = native_provider_descriptor(
+            "openrouter",
+            Some("openai/gpt-5"),
+            Some("https://evil.example"),
+        )
+        .expect("openrouter descriptor ignores base_url");
+        assert_eq!(pinned.base_url, "https://openrouter.ai/api/v1");
     }
 
     #[test]

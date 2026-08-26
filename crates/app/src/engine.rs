@@ -549,6 +549,7 @@ fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
         }
         p if p.contains("anthropic") => &["api.anthropic.com"],
         "xai" => &["api.x.ai"],
+        "openrouter" => &["openrouter.ai"],
         "xai-grok" => &["cli-chat-proxy.grok.com", "auth.x.ai"],
         p if p.contains("azure") => &["openai.azure.com"],
         // Unknown provider: default to the codex/OpenAI endpoints rather than
@@ -1516,7 +1517,7 @@ pub fn isolated_turn_descriptor(
             provider_descriptor.base_url.trim_end_matches('/')
         ),
         // Same Chat Completions shape; the descriptor base already ends in /v1.
-        "xai" => format!(
+        "xai" | "openrouter" => format!(
             "{}/chat/completions",
             provider_descriptor.base_url.trim_end_matches('/')
         ),
@@ -3011,6 +3012,17 @@ mod tests {
         assert!(model_endpoint_hosts(Some("cloudflare-workers-ai"))
             .iter()
             .any(|h| h == "api.cloudflare.com"));
+    }
+
+    // `openrouter` egresses to OpenRouter and nowhere else. The arm has to be
+    // explicit: the `starts_with("openai")` guard above misses it by two
+    // letters, so without its own row it would silently inherit the OpenAI
+    // fallthrough — reachable hosts it has no business talking to, and no
+    // route to the one it does.
+    #[test]
+    fn model_endpoint_hosts_routes_openrouter_to_its_own_host() {
+        let hosts = model_endpoint_hosts(Some("openrouter"));
+        assert_eq!(hosts, vec!["openrouter.ai".to_owned()]);
     }
 
     // CORE-5: GaugeDesk decides the per-turn egress posture; WhippleScript enforces

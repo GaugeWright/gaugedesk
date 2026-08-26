@@ -47,6 +47,7 @@ const INITIAL: SettingsModel = {
             { pin: "anthropic", label: "Anthropic", auth: "key" },
             { pin: "openai", label: "OpenAI", auth: "key" },
             { pin: "xai", label: "xAI (Grok)", auth: "key" },
+            { pin: "openrouter", label: "OpenRouter", auth: "key", note: "routes to many vendors; name models as vendor/model" },
             { pin: "openai-generic", label: "OpenAI-compatible", auth: "endpoint" },
         ],
         // One per provider, because that is how the store keys them. The bench holds the
@@ -68,6 +69,13 @@ const INITIAL: SettingsModel = {
                 models: ["llama-3.3-70b-instruct", "qwen2.5-coder-32b"],
                 removable: true,
             },
+            {
+                id: "openrouter",
+                pin: "openrouter",
+                status: "connected",
+                models: ["anthropic/claude-sonnet-4.5", "deepseek/deepseek-r1"],
+                removable: true,
+            },
         ],
         accountSignInAvailable: true,
         managed: {
@@ -80,6 +88,7 @@ const INITIAL: SettingsModel = {
             { key: "openai-codex:gpt-5-codex", label: "GPT-5 Codex", runsOn: "OpenAI (Codex)", alsoVia: [], primary: true, enabled: true },
             { key: "openai-codex:gpt-5", label: "GPT-5", runsOn: "OpenAI (Codex)", alsoVia: ["OpenAI"], primary: false, enabled: false },
             { key: "openai-generic:llama-3.3-70b-instruct", label: "llama-3.3-70b-instruct", runsOn: "OpenAI-compatible", alsoVia: [], primary: true, enabled: true },
+            { key: "openrouter:anthropic/claude-sonnet-4.5", label: "anthropic/claude-sonnet-4.5", runsOn: "OpenRouter", alsoVia: [], primary: true, enabled: true },
         ],
     },
     devices: {

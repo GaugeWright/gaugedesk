@@ -7,11 +7,17 @@ import {
     modelAcceptsImages,
     modelKey,
     modelOptions,
+    catalogWithEndpointModels,
+    declaredModelsFor,
     parseEnabledModels,
+    parseEndpointModels,
     pickableModels,
     providerTakesCustomModel,
+    providerTakesEndpoint,
     serializeEnabledModels,
+    serializeEndpointModels,
     thinkingLevelsFor,
+    withDeclaredModels,
 } from "./model-picker";
 
 // A small fixture so the tests don't ride on the live (regenerated) catalog.
@@ -166,6 +172,102 @@ describe("xai fixed-host provider", () => {
 
     it("is a catalog provider, not a free-text-model one", () => {
         expect(providerTakesCustomModel("xai")).toBe(false);
+    });
+});
+
+describe("openrouter fixed-host aggregator (ADR 0148)", () => {
+    it("takes a free-text model but no endpoint", () => {
+        // The two questions the old single predicate answered at once. OpenRouter
+        // separates them: GaugeDesk knows the host and does not know the models,
+        // so asking for an endpoint would invite a value the runtime ignores.
+        expect(providerTakesCustomModel("openrouter")).toBe(true);
+        expect(providerTakesEndpoint("openrouter")).toBe(false);
+        expect(providerTakesEndpoint("openai-generic")).toBe(true);
+        expect(providerTakesEndpoint("xai")).toBe(false);
+    });
+
+    it("ships no catalog rows of its own", () => {
+        // Unlike xAI, which ships Grok rows. Nothing is snapshot for a listing that
+        // turns over weekly, so a linked account with nothing declared contributes
+        // nothing rather than a stale menu.
+        expect(MODEL_CATALOG.some((m) => m.provider === "openrouter")).toBe(false);
+        expect(modelOptions(["openrouter"], null, undefined, MODEL_CATALOG).map((o) => o.label))
+            .toEqual(["Default"]);
+    });
+
+    it("contributes the operator's declared routes when the account is linked", () => {
+        // ACCOUNT_SOURCES membership is what makes a linked account contribute models;
+        // a provider missing there fails QUIET (zero models, no error).
+        const declared = { openrouter: ["anthropic/claude-sonnet-4.5"] };
+        const opts = modelOptions(
+            ["openrouter"],
+            null,
+            undefined,
+            catalogWithEndpointModels(declared, CAT),
+        );
+        const rows = opts.filter((o) => o.provider === "openrouter");
+        // The vendor-namespaced id survives whole: the slash is part of the route.
+        expect(rows.map((o) => o.id)).toEqual(["anthropic/claude-sonnet-4.5"]);
+    });
+
+    it("keeps a pinned route visible though nothing declared it", () => {
+        const opts = modelOptions(
+            ["openrouter"],
+            null,
+            { id: "meta-llama/llama-4-maverick", provider: "openrouter" },
+            CAT,
+        );
+        expect(opts.map((o) => o.label)).toEqual(["Default", "meta-llama/llama-4-maverick"]);
+    });
+});
+
+describe("declared models are keyed by provider", () => {
+    it("reads the pre-OpenRouter flat array as openai-generic's list", () => {
+        // Accounts that declared endpoint models before OpenRouter existed keep them;
+        // dropping the legacy form would silently empty their picker.
+        const declared = parseEndpointModels(JSON.stringify(["llama-3.3-70b", "qwen2.5-coder-32b"]));
+        expect(declaredModelsFor(declared, "openai-generic")).toEqual([
+            "llama-3.3-70b",
+            "qwen2.5-coder-32b",
+        ]);
+        expect(declaredModelsFor(declared, "openrouter")).toEqual([]);
+    });
+
+    it("round-trips the per-provider form and keeps the lists apart", () => {
+        const declared = withDeclaredModels(
+            { "openai-generic": ["llama-3.3-70b"] },
+            "openrouter",
+            ["openai/gpt-5", "  ", "openai/gpt-5"],
+        );
+        // Blank and duplicate ids are dropped rather than stored.
+        expect(declaredModelsFor(declared, "openrouter")).toEqual(["openai/gpt-5"]);
+        const reread = parseEndpointModels(serializeEndpointModels(declared));
+        expect(reread).toEqual({ "openai-generic": ["llama-3.3-70b"], openrouter: ["openai/gpt-5"] });
+        // Emptying a provider's list removes the key rather than leaving a husk.
+        expect(withDeclaredModels(reread, "openrouter", [])).toEqual({
+            "openai-generic": ["llama-3.3-70b"],
+        });
+    });
+
+    it("stamps each declared row with its own provider", () => {
+        const catalog = catalogWithEndpointModels(
+            { "openai-generic": ["llama-3.3-70b"], openrouter: ["openai/gpt-5"] },
+            CAT,
+        );
+        const declared = catalog.filter((m) => m.id === "llama-3.3-70b" || m.id === "openai/gpt-5");
+        expect(declared.map((m) => [m.provider, m.id])).toEqual([
+            ["openai-generic", "llama-3.3-70b"],
+            ["openrouter", "openai/gpt-5"],
+        ]);
+        // A linked endpoint account must not inherit the OpenRouter routes.
+        const endpointOnly = modelOptions(["openai-generic"], null, undefined, catalog);
+        expect(endpointOnly.map((o) => o.id)).toEqual(["", "llama-3.3-70b"]);
+    });
+
+    it("refuses an unreadable value rather than inventing models", () => {
+        expect(parseEndpointModels("not json")).toEqual({});
+        expect(parseEndpointModels(JSON.stringify({ openrouter: "openai/gpt-5" }))).toEqual({});
+        expect(parseEndpointModels(null)).toEqual({});
     });
 });
 

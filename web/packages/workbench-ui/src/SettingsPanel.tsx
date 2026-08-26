@@ -38,6 +38,7 @@ import {
 import { waitForCodexLink } from "./codex-link-poll";
 import {
     catalogWithEndpointModels,
+    declaredModelsFor,
     defaultVisibleKeys,
     ENABLED_MODELS_SETTING,
     ENDPOINT_MODELS_SETTING,
@@ -45,8 +46,12 @@ import {
     parseEnabledModels,
     parseEndpointModels,
     pickableModels,
+    providerTakesCustomModel,
+    providerTakesEndpoint,
     serializeEnabledModels,
     serializeEndpointModels,
+    withDeclaredModels,
+    type DeclaredModels,
 } from "./model-picker";
 import type { AccountPanelApi } from "./account-api";
 import { SettingsSurface, type SettingsModel, type SettingsRoom } from "./SettingsSurface";
@@ -103,6 +108,14 @@ const PROVIDERS: SettingsModel["models"]["providers"] = [
         label: "xAI Grok subscription",
         auth: "account",
         note: "uses your Grok or X Premium plan",
+    },
+    {
+        pin: "openrouter",
+        label: "OpenRouter",
+        auth: "key",
+        // The name says aggregator to someone who already knows; the note says which
+        // model ids to expect, which is the thing that trips a first-time linker.
+        note: "routes to many vendors; name models as vendor/model",
     },
     { pin: "openai-generic", label: "OpenAI-compatible endpoint", auth: "endpoint" },
 ];
@@ -224,8 +237,8 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
     };
 
     // --- model access -------------------------------------------------------------
-    const endpointModels = () => parseEndpointModels(settings()?.[ENDPOINT_MODELS_SETTING]);
-    const catalog = createMemo(() => catalogWithEndpointModels(endpointModels()));
+    const declaredModels = () => parseEndpointModels(settings()?.[ENDPOINT_MODELS_SETTING]);
+    const catalog = createMemo(() => catalogWithEndpointModels(declaredModels()));
     const linkedAccounts = createMemo(() => {
         const pins = (credentials() ?? []).filter((c) => c.linked).map((c) => c.provider);
         if (codex()?.linked) pins.push("openai-codex");
@@ -325,7 +338,12 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                 id: c.provider,
                 pin: c.provider,
                 status: "connected",
-                models: c.provider === "openai-generic" ? endpointModels() : undefined,
+                // Every no-catalog provider declares its own rows, so the list is
+                // read for the provider of this row rather than for the one
+                // provider that used to be the only one without a catalog.
+                models: providerTakesCustomModel(c.provider)
+                    ? declaredModelsFor(declaredModels(), c.provider)
+                    : undefined,
                 removable: true,
             });
         }
@@ -356,8 +374,8 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
         }));
     });
 
-    const writeEndpointModels = (ids: readonly string[]) =>
-        props.api.accountSetSetting(ENDPOINT_MODELS_SETTING, serializeEndpointModels(ids));
+    const writeDeclaredModels = (declared: DeclaredModels) =>
+        props.api.accountSetSetting(ENDPOINT_MODELS_SETTING, serializeEndpointModels(declared));
 
     // --- devices ------------------------------------------------------------------
     const librarySyncFacility = () =>
@@ -481,19 +499,32 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                 },
                 linkKey: ({ pin, token, endpoint }) => void act(`link ${pin}`, async () => {
                     if (!token) throw new Error("paste a token first");
-                    if (pin === "openai-generic" && !endpoint?.trim()) {
+                    if (providerTakesEndpoint(pin) && !endpoint?.trim()) {
                         throw new Error("enter the endpoint URL first");
                     }
                     await props.api.accountLinkCredential(pin, token, endpoint?.trim() || undefined);
                 }),
                 removeCredential: (id) => void act(`remove ${id}`, () => props.api.accountUnlinkCredential(id)),
-                addEndpointModel: (_credentialId, modelId) => void act("add the model", async () => {
-                    await writeEndpointModels([...endpointModels(), modelId]);
+                addEndpointModel: (credentialId, modelId) => void act("add the model", async () => {
+                    const declared = declaredModels();
+                    await writeDeclaredModels(
+                        withDeclaredModels(declared, credentialId, [
+                            ...declaredModelsFor(declared, credentialId),
+                            modelId,
+                        ]),
+                    );
                     await refetchSettings();
                     return `added ${modelId} ✓`;
                 }),
-                removeEndpointModel: (_credentialId, modelId) => void act("remove the model", async () => {
-                    await writeEndpointModels(endpointModels().filter((id) => id !== modelId));
+                removeEndpointModel: (credentialId, modelId) => void act("remove the model", async () => {
+                    const declared = declaredModels();
+                    await writeDeclaredModels(
+                        withDeclaredModels(
+                            declared,
+                            credentialId,
+                            declaredModelsFor(declared, credentialId).filter((id) => id !== modelId),
+                        ),
+                    );
                     await refetchSettings();
                     return `removed ${modelId}`;
                 }),

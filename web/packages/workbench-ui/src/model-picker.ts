@@ -45,6 +45,11 @@ const ACCOUNT_SOURCES: Record<string, AccountSource> = {
     // their catalog rows declare `thinking: ["off"]`.
     xai: { pin: "xai", primary: ["xai"], secondary: [] },
     "xai-grok": { pin: "xai-grok", primary: ["xai"], secondary: [] },
+    // OpenRouter (ADR 0148) is a fixed-host key provider that routes to every
+    // vendor it aggregates. Its catalog is hundreds of vendor-namespaced ids
+    // that turn over weekly, so — like openai-generic, and unlike xAI — nothing
+    // is shipped for it: its rows are the ones the operator declares.
+    openrouter: { pin: "openrouter", primary: ["openrouter"], secondary: [] },
 };
 
 /** A friendly provider name for the `(provider)` disambiguator suffix. */
@@ -55,12 +60,25 @@ const PROVIDER_LABEL: Record<string, string> = {
     "openai-generic": "OpenAI-compatible",
     xai: "xAI",
     "xai-grok": "Grok subscription",
+    openrouter: "OpenRouter",
 };
 
-/** Providers whose model id is entered free-text rather than picked from the catalog
- *  (the endpoint-configurable `openai-generic`, ADR 0083 — GaugeDesk cannot list its
- *  models). The composer offers a text field for these instead of catalog rows. */
+/** Providers whose model id is entered free-text rather than picked from the catalog,
+ *  because GaugeDesk ships no catalog for them: `openai-generic`, whose endpoint it
+ *  cannot list (ADR 0083), and `openrouter`, whose listing is too large and too
+ *  short-lived to snapshot honestly (ADR 0145). The composer offers a text field for
+ *  these alongside whatever rows the operator has declared.
+ *
+ *  This is NOT the same question as [`providerTakesEndpoint`]: OpenRouter takes a
+ *  free-text model on a host GaugeDesk already knows. */
 export function providerTakesCustomModel(provider: string): boolean {
+    return provider === "openai-generic" || provider === "openrouter";
+}
+
+/** Providers that carry an operator-configured base URL — only `openai-generic`
+ *  (ADR 0083). Every other provider is fixed-host, and asking for an endpoint would
+ *  invite a value the runtime is going to ignore. */
+export function providerTakesEndpoint(provider: string): boolean {
     return provider === "openai-generic";
 }
 
@@ -204,8 +222,9 @@ export function modelOptions(
         const found = all.find((m) => m.id === pinned.id && m.provider === pinned.provider);
         if (found) visible.push(found);
         else if (providerTakesCustomModel(pinned.provider)) {
-            // A custom openai-generic model has no catalog entry; keep the pin visible so
-            // the `<select>` reflects the chat's real config rather than snapping away.
+            // A free-text model (openai-generic, openrouter) has no catalog entry; keep the
+            // pin visible so the `<select>` reflects the chat's real config rather than
+            // snapping away.
             visible.push({
                 id: pinned.id,
                 provider: pinned.provider,
@@ -249,59 +268,114 @@ export function serializeEnabledModels(enabled: ReadonlySet<string>): string {
     return JSON.stringify([...enabled].sort());
 }
 
-// --- the operator's declared endpoint models (ADR 0083) ----------------------------
-// An OpenAI-compatible endpoint has no listing GaugeDesk trusts and no shipped catalog,
-// so the ids are the operator's to declare. They are stored per account rather than per
-// chat: the same endpoint serves every chat, and re-typing the id into each composer is
-// the papercut this replaces.
+// --- the operator's declared models (ADR 0083, ADR 0145) ---------------------------
+// Two providers ship no catalog: an OpenAI-compatible endpoint has no listing GaugeDesk
+// trusts, and OpenRouter's listing is hundreds of vendor-namespaced routes that turn over
+// weekly — snapshotting it would ship a lie with a version number on it. For both, the ids
+// are the operator's to declare. They are stored per account rather than per chat: the same
+// key serves every chat, and re-typing the id into each composer is the papercut this
+// replaces.
 
-/** The account-settings key holding the declared endpoint model ids (a JSON array). */
+/** The account-settings key holding the declared model ids: a JSON object keyed by
+ *  provider. A bare JSON array is the pre-OpenRouter form and still reads as
+ *  `openai-generic`'s list, so an account that declared models before this landed keeps
+ *  them. */
 export const ENDPOINT_MODELS_SETTING = "model_picker.endpoint_models";
+
+/** Declared model ids by provider pin. */
+export type DeclaredModels = Readonly<Record<string, readonly string[]>>;
+
+/** Clean one provider's ids: trimmed, non-empty, deduped, order preserved. */
+function cleanIds(ids: readonly unknown[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of ids) {
+        if (typeof raw !== "string") continue;
+        const id = raw.trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        out.push(id);
+    }
+    return out;
+}
 
 /** Parse the declared ids. Absent/blank/malformed → none: an unreadable value must not
  *  become a fictional model the picker offers and the engine cannot bind. */
-export function parseEndpointModels(raw: string | null | undefined): string[] {
-    if (!raw) return [];
+export function parseEndpointModels(raw: string | null | undefined): DeclaredModels {
+    if (!raw) return {};
     try {
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr)) {
-            return [...new Set(arr.filter((x): x is string => typeof x === "string" && x.trim() !== ""))];
+        const parsed = JSON.parse(raw);
+        // The legacy form: one flat array, which was only ever openai-generic's.
+        if (Array.isArray(parsed)) {
+            const ids = cleanIds(parsed);
+            return ids.length ? { "openai-generic": ids } : {};
+        }
+        if (parsed && typeof parsed === "object") {
+            const out: Record<string, readonly string[]> = {};
+            for (const [provider, ids] of Object.entries(parsed as Record<string, unknown>)) {
+                if (!Array.isArray(ids)) continue;
+                const clean = cleanIds(ids);
+                if (clean.length) out[provider] = clean;
+            }
+            return out;
         }
     } catch {
         /* fall through */
     }
-    return [];
+    return {};
 }
 
-/** Serialize declared ids for the account-settings store (deduped + sorted → stable). */
-export function serializeEndpointModels(ids: readonly string[]): string {
-    return JSON.stringify([...new Set(ids.map((id) => id.trim()).filter(Boolean))].sort());
+/** One provider's declared ids. */
+export function declaredModelsFor(declared: DeclaredModels, provider: string): readonly string[] {
+    return declared[provider] ?? [];
 }
 
-/** The declared ids as catalog entries. Their capabilities are unknown — the endpoint
- *  reports none — so they claim none: no reasoning levels beyond `off`, and text input
- *  only, a placeholder `modelAcceptsImages` deliberately declines to read as a refusal. */
-function endpointCatalog(ids: readonly string[]): CatalogModel[] {
-    const declared = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
-    return declared.map((id) => ({
-        provider: "openai-generic",
-        id,
-        name: id,
-        reasoning: false,
-        thinking: ["off"],
-        input: ["text"],
-    }));
+/** `declared` with one provider's list replaced — the shape a Settings edit writes back. */
+export function withDeclaredModels(
+    declared: DeclaredModels,
+    provider: string,
+    ids: readonly string[],
+): DeclaredModels {
+    const next: Record<string, readonly string[]> = { ...declared };
+    const clean = cleanIds(ids);
+    if (clean.length) next[provider] = clean;
+    else delete next[provider];
+    return next;
+}
+
+/** Serialize for the account-settings store (deduped + sorted → stable). */
+export function serializeEndpointModels(declared: DeclaredModels): string {
+    const out: Record<string, string[]> = {};
+    for (const provider of Object.keys(declared).sort()) {
+        const ids = cleanIds(declared[provider] ?? []).sort();
+        if (ids.length) out[provider] = ids;
+    }
+    return JSON.stringify(out);
+}
+
+/** The declared ids as catalog entries. Their capabilities are unknown — neither a bare
+ *  endpoint nor OpenRouter's routing layer reports them per model in a form GaugeDesk
+ *  trusts — so they claim none: no reasoning levels beyond `off`, and text input only, a
+ *  placeholder `modelAcceptsImages` deliberately declines to read as a refusal. */
+function endpointCatalog(declared: DeclaredModels): CatalogModel[] {
+    const rows: CatalogModel[] = [];
+    for (const provider of Object.keys(declared).sort()) {
+        for (const id of cleanIds(declared[provider] ?? [])) {
+            rows.push({ provider, id, name: id, reasoning: false, thinking: ["off"], input: ["text"] });
+        }
+    }
+    return rows;
 }
 
 /** The catalog every picker call in an account should use: the shipped snapshot plus the
- *  operator's declared endpoint models. One helper rather than an exported `MODEL_CATALOG`
+ *  operator's declared models. One helper rather than an exported `MODEL_CATALOG`
  *  and a spread at each call site, so a surface cannot half-remember the declared ids and
  *  offer a model the neighbouring surface does not. */
 export function catalogWithEndpointModels(
-    declaredEndpointModels: readonly string[],
+    declaredModels: DeclaredModels,
     catalog: readonly CatalogModel[] = MODEL_CATALOG,
 ): readonly CatalogModel[] {
-    const extra = endpointCatalog(declaredEndpointModels);
+    const extra = endpointCatalog(declaredModels);
     return extra.length ? [...catalog, ...extra] : catalog;
 }
 

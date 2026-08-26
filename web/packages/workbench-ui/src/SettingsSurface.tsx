@@ -536,7 +536,12 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
                                                             </Show>
                                                         </span>
                                                         <span class="settings-row-action">
-                                                            <Show when={provider()?.auth === "endpoint"}>
+                                                            {/* Whether a credential declares its own model rows is
+                                                                the model's answer (`models` present), not a guess from
+                                                                how it authorizes. OpenRouter is a *key* provider that
+                                                                still declares rows, and gating on `auth` would leave
+                                                                its list built but unreachable. */}
+                                                            <Show when={c.models !== undefined}>
                                                                 <button
                                                                     type="button"
                                                                     class="tree-action"
@@ -585,7 +590,9 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
                                                                         props.actions?.addEndpointModel?.(c.id, newModel().trim());
                                                                         setNewModel("");
                                                                     }}
-                                                                    placeholder="model id, e.g. llama-3.3-70b-instruct"
+                                                                    placeholder={c.pin === "openrouter"
+                                                                        ? "route id, e.g. anthropic/claude-sonnet-4.5"
+                                                                        : "model id, e.g. llama-3.3-70b-instruct"}
                                                                 />
                                                                 <button type="button" class="tree-action" disabled={!newModel().trim()}
                                                                     onClick={() => { props.actions?.addEndpointModel?.(c.id, newModel().trim()); setNewModel(""); }}

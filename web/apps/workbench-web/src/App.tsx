@@ -600,9 +600,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         return ps;
     });
     const enabledModels = createMemo(() => parseEnabledModels(acctSettings()?.[ENABLED_MODELS_SETTING]));
-    // An OpenAI-compatible endpoint (ADR 0083) has no listing, so its models are the ones
-    // the operator declared in Settings. They join the catalog here rather than at each
-    // call below, so the picker, the effort toggle and the vision check all see one set.
+    // The providers GaugeDesk ships no catalog for — an OpenAI-compatible endpoint with no
+    // listing (ADR 0083), OpenRouter with one too large and too short-lived to snapshot
+    // (ADR 0148) — contribute the models the operator declared in Settings. They join the
+    // catalog here rather than at each call below, so the picker, the effort toggle and the
+    // vision check all see one set.
     const modelCatalog = createMemo(() =>
         catalogWithEndpointModels(parseEndpointModels(acctSettings()?.[ENDPOINT_MODELS_SETTING])),
     );

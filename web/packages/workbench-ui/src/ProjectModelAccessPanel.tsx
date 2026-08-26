@@ -12,9 +12,9 @@
 
 import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import type { LinkedProvider } from "@gaugewright/control-plane-client";
-import { providerTakesCustomModel } from "./model-picker";
+import { providerTakesEndpoint } from "./model-picker";
 
-const PROVIDERS = ["openai", "anthropic", "xai", "openai-generic"];
+const PROVIDERS = ["openai", "anthropic", "xai", "openrouter", "openai-generic"];
 
 export interface ProjectModelAccessApi {
     projectCredentials(project: string): Promise<LinkedProvider[]>;
@@ -42,7 +42,7 @@ export function ProjectModelAccessPanel(props: {
     const [token, setToken] = createSignal("");
     // The OpenAI-compatible endpoint, shown + required only for openai-generic (ADR 0083).
     const [endpoint, setEndpoint] = createSignal("");
-    const needsEndpoint = () => providerTakesCustomModel(provider());
+    const needsEndpoint = () => providerTakesEndpoint(provider());
     const isLinked = (p: string) => (credentials() ?? []).some((c) => c.provider === p && c.linked);
 
     const link = async () => {
