@@ -617,7 +617,20 @@ fn migrate_agent_ability_manifests(
         let mut updated = archetype.clone();
         let mut references_changed = false;
         for version in archetype.versions.keys() {
-            let resolved = published_archetype_version(targets_dir, &target.id, *version)?;
+            let mut resolved = published_archetype_version(targets_dir, &target.id, *version)?;
+            // A frozen public profile is authored state, not a published
+            // artifact, so the resolver cannot know it and always answers
+            // `None`. Reconciling *references* therefore has to carry it
+            // across, or this writes a version record with the profile
+            // removed — and because the resolved record then always differs
+            // from the stored one, it did that on every open, for every Panel
+            // agent. The profile is what `publish_agent_deployment` reads, so
+            // the symptom was a Panel agent that could be published until the
+            // workbench was next opened and never again.
+            resolved.panel_profile = archetype
+                .versions
+                .get(version)
+                .and_then(|frozen| frozen.panel_profile.clone());
             if updated.versions.get(version) != Some(&resolved) {
                 updated.versions.insert(*version, resolved);
                 references_changed = true;
@@ -866,7 +879,14 @@ fn validate_archetype_versions(
             )
         })?;
         for (version, expected) in &archetype.versions {
-            let resolved = published_archetype_version(targets_dir, &target.id, *version)?;
+            let mut resolved = published_archetype_version(targets_dir, &target.id, *version)?;
+            // The check is that the *bytes* still match what the version names.
+            // A frozen public profile is authored state the resolver cannot
+            // know, so it always answers `None`; comparing it would make every
+            // Panel agent fail this validation and refuse to open the workbench
+            // it lives in. Carry it across so the comparison is about the two
+            // refs this validator is named for.
+            resolved.panel_profile = expected.panel_profile.clone();
             if &resolved != expected {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1254,6 +1274,139 @@ impl Workbench {
         });
         wb.default_instance = target_id;
         wb
+    }
+
+    /// Seed a Panel placement that `publish_agent_deployment` can name.
+    ///
+    /// Publishing needs a Panel-kind placement whose agent version carries a
+    /// frozen public profile. Authoring one is an agent-driven flow, every
+    /// release subcommand takes a placement that already exists, and this
+    /// repository builds the state in-process in its own tests — so nothing
+    /// outside this crate could produce it. gaugewright-cloud's composition
+    /// test is what paid for that: it drives the release binary against a fresh
+    /// workbench and never reached the publisher at all.
+    ///
+    /// It builds a whole archetype rather than a bare record, because a bare
+    /// one does not survive: every agent must own an authoring target, and
+    /// startup refuses to open a workbench where one does not. It is cloned
+    /// from the Default archetype so its authored files, package ref, and
+    /// discipline ref name artifacts that exist.
+    ///
+    /// It never touches an existing agent or placement. Freezing a profile is
+    /// the point here, so the one thing it must not do is freeze over
+    /// something a person authored.
+    pub fn seed_panel_placement(
+        &mut self,
+        placement_id: &str,
+        profile: crate::library::PanelPublicProfile,
+    ) -> std::io::Result<serde_json::Value> {
+        if placement_id.trim().is_empty() {
+            return Err(invalid_data("a seeded placement needs an id".to_owned()));
+        }
+        if self.library.instances.contains_key(placement_id) {
+            return Err(invalid_data(format!(
+                "placement {placement_id} already exists; seeding never overwrites"
+            )));
+        }
+        let agent_id = format!("{placement_id}-agent");
+        if self.library.agents.contains_key(&agent_id) {
+            return Err(invalid_data(format!(
+                "agent {agent_id} already exists; seeding never overwrites"
+            )));
+        }
+
+        let builtins = crate::app_support::builtin_archetypes();
+        let archetype = builtins
+            .iter()
+            .find(|archetype| archetype.id == DEFAULT_AGENT)
+            .ok_or_else(|| invalid_data("the Default archetype is not built in".to_owned()))?;
+        let definition = crate::app_support::builtin_agent_definition(archetype);
+        let skills = archetype
+            .official_skills
+            .then(crate::official_skills::office_skill_references)
+            .unwrap_or_default();
+        let authored = archetype_files(&definition, skills)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let authored = authored
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect::<Vec<_>>();
+
+        let targets_dir = self.targets_dir();
+        let authoring_target = authoring_target_id(&agent_id);
+        let basis =
+            init_managed_target(&targets_dir, &self.providers, &authoring_target, &authored)?;
+        let mut version = published_archetype_version(&targets_dir, &authoring_target, 1)?;
+        version.panel_profile = Some(profile.clone());
+
+        let authoring_instance = format!("{agent_id}-authoring");
+        let authoring = InstanceRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            id: authoring_instance.clone(),
+            op: RecordOp::Upsert,
+            kind: InstanceKind::Authoring,
+            placement_kind: crate::library::PlacementKind::Work,
+            agent_id: agent_id.clone(),
+            project_id: None,
+            version: 1,
+            admission: Admission::Active,
+            collection_recipient: None,
+        };
+        let agent = AgentRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            id: agent_id.clone(),
+            op: RecordOp::Upsert,
+            name: format!("Seeded panel agent for {placement_id}"),
+            agent_kind: crate::library::AgentKind::Panel,
+            panel_profile: Some(profile.clone()),
+            instance_id: authoring_instance,
+            config: "{}".into(),
+            current_version: 1,
+            versions: [(1, version)].into_iter().collect(),
+            auto_upgrade: false,
+            forked_from: None,
+        };
+        let target = managed_target_record(
+            authoring_target,
+            format!("Seeded panel agent for {placement_id} authoring"),
+            WorkTargetOwner::Archetype {
+                archetype_id: agent_id.clone(),
+            },
+            &self.home_id,
+            basis,
+        );
+        let placement = InstanceRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            id: placement_id.to_owned(),
+            op: RecordOp::Upsert,
+            kind: InstanceKind::Using,
+            placement_kind: crate::library::PlacementKind::Panel,
+            agent_id: agent_id.clone(),
+            project_id: Some(DEFAULT_PROJECT.to_owned()),
+            version: 1,
+            admission: Admission::Active,
+            collection_recipient: None,
+        };
+
+        let store = self.store_mut();
+        append_library_record(store, "instance", &authoring)?;
+        append_library_record(store, "agent", &agent)?;
+        append_library_record(store, "work_target", &target)?;
+        append_library_record(store, "instance", &placement)?;
+        // The publisher reads the folded projection, not the log, so a seed
+        // that only appended would be invisible to the command it exists for.
+        self.rebuild_library();
+
+        Ok(serde_json::json!({
+            "placement_id": placement_id,
+            "project_id": DEFAULT_PROJECT,
+            "agent_id": agent_id,
+            "version": 1,
+            "panels": profile.panels.components,
+        }))
     }
 
     /// Rebuild the cached library projection from the store. Federation handoff

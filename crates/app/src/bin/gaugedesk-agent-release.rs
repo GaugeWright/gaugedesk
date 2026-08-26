@@ -10,6 +10,7 @@ use gaugedesk_app::agent_release::{
     ErasePublicSessionRequest, ListPublicCredentialsRequest, ProvisionPublicCredentialRequest,
     PublishDeploymentRequest, ReleasePublishSpec, RevokePublicCredentialRequest,
 };
+use gaugedesk_app::library::PanelPublicProfile;
 use gaugedesk_app::{open_workbench, LockUnpoisoned, Workbench};
 use gaugedesk_core::agent_release::{
     AttributionPolicy, PanelManifest, ProviderPolicy, RetentionPolicy, SignedAgentRelease,
@@ -44,7 +45,9 @@ fn usage() -> io::Error {
            <deployment-id> <export.json> [--replace]\n  \
          gaugedesk-agent-release collection-recipient <workbench-root> <recipient-id>\n  \
          gaugedesk-agent-release collections-drain <workbench-root> <request.json>\n  \
-         gaugedesk-agent-release collections-acknowledge <workbench-root> <request.json>",
+         gaugedesk-agent-release collections-acknowledge <workbench-root> <request.json>\n  \
+         gaugedesk-agent-release seed-panel-placement <workbench-root> <placement-id> \
+           [profile.json]",
     )
 }
 
@@ -357,6 +360,35 @@ fn main() -> io::Result<()> {
                 "{}",
                 workbench.lock_unpoisoned().drain_collections(request)?,
             );
+        }
+        // Seed a Panel placement a publish can actually name. Publishing needs a
+        // Panel-kind placement whose agent version carries a frozen public
+        // profile, and nothing outside this crate could produce one: every
+        // other subcommand takes a placement that already exists, and this
+        // repository's own tests build the state in-process against library
+        // types. So an external suite — gaugewright-cloud's composition test is
+        // the one that matters — had no way to reach the publish path at all,
+        // and said so by failing on the first field of a request the publisher
+        // never got to read.
+        //
+        // It refuses to touch an agent that already carries an authored
+        // profile, and refuses a placement id that already exists. Fabricating
+        // a profile is the point here, so the one thing it must never do is
+        // fabricate over something a person authored.
+        Some("seed-panel-placement") => {
+            let root = path_arg(args.next())?;
+            let placement_id = string_arg(args.next())?;
+            let profile_path = args.next();
+            no_more(args)?;
+            let profile = match profile_path {
+                Some(path) => serde_json::from_slice(&fs::read(path)?).map_err(invalid)?,
+                None => PanelPublicProfile::default(),
+            };
+            let workbench = open_workbench(&root)?;
+            let seeded = workbench
+                .lock_unpoisoned()
+                .seed_panel_placement(&placement_id, profile)?;
+            println!("{}", serde_json::to_string(&seeded).map_err(invalid)?);
         }
         Some("collections-acknowledge") => {
             let root = path_arg(args.next())?;
