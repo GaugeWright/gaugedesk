@@ -282,8 +282,20 @@ impl AuthShellState {
 
 struct NativeHandoff {
     id_token: crate::secret::Secret,
+    /// The offline-access refresh token captured at the same callback, carried so
+    /// the exchange can seal the native session its own durable grant (ADR 0147 §2)
+    /// — independent of the browser `web` grant, which a prior logout may already
+    /// have tombstoned. `None` when the OP granted no refresh token.
+    refresh_token: Option<crate::secret::Secret>,
     challenge: String,
     expires_at: Instant,
+}
+
+/// What a redeemed native handoff yields: the id-token the native client presents
+/// as its bearer, and the refresh token (if any) to seal into its device-bound grant.
+struct RedeemedHandoff {
+    id_token: String,
+    refresh_token: Option<String>,
 }
 
 #[derive(Default)]
@@ -292,7 +304,13 @@ struct NativeHandoffStore {
 }
 
 impl NativeHandoffStore {
-    fn issue(&mut self, id_token: String, challenge: String, now: Instant) -> String {
+    fn issue(
+        &mut self,
+        id_token: String,
+        refresh_token: Option<String>,
+        challenge: String,
+        now: Instant,
+    ) -> String {
         self.by_code.retain(|_, handoff| handoff.expires_at > now);
         let code = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(crate::session::random_bytes::<32>());
@@ -300,6 +318,7 @@ impl NativeHandoffStore {
             code.clone(),
             NativeHandoff {
                 id_token: id_token.into(),
+                refresh_token: refresh_token.map(Into::into),
                 challenge,
                 expires_at: now + Duration::from_secs(5 * 60),
             },
@@ -307,14 +326,20 @@ impl NativeHandoffStore {
         code
     }
 
-    fn redeem(&mut self, code: &str, verifier: &str, now: Instant) -> Option<String> {
+    fn redeem(&mut self, code: &str, verifier: &str, now: Instant) -> Option<RedeemedHandoff> {
         let handoff = self.by_code.remove(code)?;
         if handoff.expires_at <= now
             || crate::identity_oidc::s256_challenge(verifier) != handoff.challenge
         {
             return None;
         }
-        Some(handoff.id_token.expose().to_string())
+        Some(RedeemedHandoff {
+            id_token: handoff.id_token.expose().to_string(),
+            refresh_token: handoff
+                .refresh_token
+                .as_ref()
+                .map(|token| token.expose().to_string()),
+        })
     }
 }
 
@@ -830,27 +855,78 @@ pub fn provision_web_account(
     crate::tenancy::provision_personal_tenant(wb.store_mut(), authority, "Personal").ok()
 }
 
-/// Seal `refresh_token` into `person`'s own account scope (`ADR 0077` session refresh). Sealed at
-/// rest by the control-plane authority (`SEC-4`); the per-person scope is the access boundary
-/// (`INV-1`). A single latest-wins `refresh` record — best-effort (a seal failure is a no-op, the
-/// session just falls back to re-login at id-token expiry).
-fn store_refresh_token(wb: &mut Workbench, person: &str, refresh_token: &str) {
+/// Seal `refresh_token` into `person`'s own account scope as a durable, bound,
+/// timestamped grant (`ADR 0147`). Sealed at rest by the control-plane authority
+/// (`SEC-4`); the per-person scope is the access boundary (`INV-1`). Keyed by the
+/// binding id — [`WEB_REFRESH_BINDING`](crate::account::WEB_REFRESH_BINDING) for the
+/// browser, the enrolled device id for a native client — so concurrent sessions
+/// coexist as distinct records rather than one latest-wins grant per person.
+/// Best-effort (a seal failure is a no-op, the session just falls back to re-login
+/// at id-token expiry).
+fn store_refresh_token(
+    wb: &mut Workbench,
+    person: &str,
+    refresh_token: &str,
+    binding: crate::account::RefreshBinding,
+    binding_id: &str,
+    device_id: &str,
+) {
     let Some(sealed) = wb.seal_account_secret(refresh_token) else {
         return;
     };
     let scope = crate::account::account_scope(person);
-    let rec = json!({ "id": "refresh", "sealed": sealed });
-    let _ = wb.write_account_record_in(&scope, "refresh", "refresh", &rec);
+    let now_ms = crate::account::session_now_ms();
+    let _ = wb.upsert_account_refresh_in(&scope, binding_id, binding, device_id, &sealed, now_ms);
 }
 
-/// The person's stored refresh token, unsealed — `None` if none is stored or it fails to open.
-fn resolve_refresh_token(wb: &Workbench, person: &str) -> Option<String> {
+/// The live refresh grant `person` holds for `binding_id`, or `None` if none is
+/// stored for that binding or it is tombstoned. Reads the **stored** grant, so a
+/// native caller cannot bypass its device binding by omitting a header (ADR 0147 §2).
+fn resolve_refresh_grant(
+    wb: &Workbench,
+    person: &str,
+    binding_id: &str,
+) -> Option<crate::account::RefreshRecord> {
     let scope = crate::account::account_scope(person);
-    let rows = wb.store_ref().records(&scope, "refresh").ok()?;
-    let last = rows.last()?; // latest-wins
-    let doc: serde_json::Value = serde_json::from_str(last).ok()?;
-    let sealed = doc.get("sealed").and_then(|v| v.as_str())?;
-    wb.unseal_account_secret(sealed)
+    wb.account_refresh_session_in(&scope, binding_id).ok()?
+}
+
+/// Admit (or refuse) a **browser** refresh for `person` at `now_ms` (ADR 0147 §4).
+/// The person's `web` grant must be live and within its personal-tenant bounds; an
+/// absent grant, or an elapsed absolute lifetime or idle timeout, refuses with the
+/// reason. Returns the live grant on success.
+fn admit_browser_refresh(
+    wb: &Workbench,
+    person: &str,
+    now_ms: u64,
+) -> Result<crate::account::RefreshRecord, &'static str> {
+    let grant = resolve_refresh_grant(wb, person, crate::account::WEB_REFRESH_BINDING)
+        .ok_or("no refresh token on file; sign in again")?;
+    crate::account::refresh_within_bounds(&grant, now_ms)?;
+    Ok(grant)
+}
+
+/// Admit (or refuse) a **native** refresh for `person` at `now_ms` (ADR 0147 §2/§4,
+/// SOC 2 F-4.2). The native client presents only its bearer — no device header — so
+/// admission resolves the person's durable native grant and reads the device it is
+/// bound to from the **stored** record, then requires that device to still be
+/// admitted and the grant to be within bounds. Because the bound device comes from
+/// the record and never from a request header, a caller cannot bypass device
+/// revocation by omitting or forging `x-gw-device`; the header is not consulted at
+/// all. A revoked device (whose grant the revocation cascade tombstones) refuses.
+/// Returns the live grant on success.
+fn admit_native_refresh(
+    wb: &Workbench,
+    person: &str,
+    now_ms: u64,
+) -> Result<crate::account::RefreshRecord, &'static str> {
+    let grant = resolve_refresh_grant(wb, person, crate::account::NATIVE_REFRESH_BINDING)
+        .ok_or("no refresh token on file; sign in again")?;
+    if !native_device_admitted(wb, person, &grant.device_id) {
+        return Err("this device's account session was revoked");
+    }
+    crate::account::refresh_within_bounds(&grant, now_ms)?;
+    Ok(grant)
 }
 
 /// A Google (or any OIDC) SSO connection for the hosted web account, from env — so the hub
@@ -1423,12 +1499,22 @@ pub async fn get_callback(
         // tenant-of-one (idempotent) so they land in the Console with their own space. No-op on
         // the enterprise/desktop paths (web-account mode off).
         provision_web_account(&mut wb, authority.as_str(), web_account_mode());
-        // Session refresh (ADR 0077): seal the offline-access refresh token into the person's own
-        // account scope, so /auth/refresh can mint fresh id-tokens without re-login. Only when the
-        // OP returned one (offline-access consent grant); best-effort.
+        // Session refresh (ADR 0147): seal the offline-access refresh token into the person's own
+        // account scope as the durable browser-bound grant, so /auth/refresh can mint fresh
+        // id-tokens without re-login. The callback is always the browser leg, so the grant binds
+        // to the stable per-person `web` key; a native client's device-bound grant is written at
+        // /auth/mobile/exchange once its device id is minted. Only when the OP returned a refresh
+        // token (offline-access consent grant); best-effort.
         if web_account_mode() {
             if let Some(rt) = &refresh_token {
-                store_refresh_token(&mut wb, authority.as_str(), rt);
+                store_refresh_token(
+                    &mut wb,
+                    authority.as_str(),
+                    rt,
+                    crate::account::RefreshBinding::Web,
+                    crate::account::WEB_REFRESH_BINDING,
+                    "",
+                );
             }
         }
     }
@@ -1444,9 +1530,12 @@ pub async fn get_callback(
             )
                 .into_response();
         };
-        let code = auth
-            .native_handoffs_mut()
-            .issue(id_token, challenge, Instant::now());
+        let code = auth.native_handoffs_mut().issue(
+            id_token,
+            refresh_token.clone(),
+            challenge,
+            Instant::now(),
+        );
         let target = format!("{native_return}#code={code}");
         return Redirect::to(&target).into_response();
     }
@@ -1498,15 +1587,22 @@ pub async fn get_refresh(
         return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
     }
     let bearer = crate::net_http::bearer(&headers).map(str::to_string);
-    // The still-valid session resolves to the person + their sealed refresh token (fail-closed:
-    // an expired id-token authenticates to nobody, so it cannot refresh itself).
+    // The still-valid session resolves to the person + their durable browser grant (fail-closed:
+    // an expired id-token authenticates to nobody, so it cannot refresh itself). The grant carries
+    // the session bounds: an elapsed absolute lifetime or idle timeout refuses refresh and ends the
+    // session on this surface (ADR 0147 §4, closes SOC 2 F-1.4 for the personal path).
+    let now_ms = crate::account::session_now_ms();
     let (person, refresh_token) = {
         let g = wb.lock_unpoisoned();
         let person = g.actor(bearer.as_deref());
         if person == "anonymous" {
             return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
         }
-        match resolve_refresh_token(&g, &person) {
+        let grant = match admit_browser_refresh(&g, &person, now_ms) {
+            Ok(grant) => grant,
+            Err(reason) => return (StatusCode::UNAUTHORIZED, reason).into_response(),
+        };
+        match g.unseal_account_secret(&grant.sealed) {
             Some(rt) => (person, rt),
             None => {
                 return (
@@ -1546,6 +1642,12 @@ pub async fn get_refresh(
             return (StatusCode::INTERNAL_SERVER_ERROR, "refresh task panicked").into_response()
         }
     };
+    // An admitted refresh touches the grant's last-seen so the idle clock resets (ADR 0147 §4).
+    {
+        let mut g = wb.lock_unpoisoned();
+        let scope = crate::account::account_scope(&person);
+        let _ = g.touch_account_refresh_in(&scope, crate::account::WEB_REFRESH_BINDING, now_ms);
+    }
     // Set the refreshed id-token as the shared session cookie; the person is unchanged.
     let mut resp = (
         StatusCode::OK,
@@ -1567,26 +1669,22 @@ pub async fn post_native_refresh(
         return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
     }
     let bearer = crate::net_http::bearer(&headers).map(str::to_string);
+    let now_ms = crate::account::session_now_ms();
+    // The native session is bound to its enrolled device (ADR 0147 §2). The client
+    // presents only its bearer — no device header — and admission reads the bound
+    // device from the STORED native grant, so omitting or forging `x-gw-device`
+    // cannot bypass revocation (SOC 2 F-4.2). The header is not consulted here.
     let (person, refresh_token) = {
         let g = wb.lock_unpoisoned();
         let person = g.actor(bearer.as_deref());
         if person == "anonymous" {
             return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
         }
-        // LOGIN-3 (ADR 0123 §4): a client that presents its device id binds
-        // this refresh to the trusted-devices registry — a revoked or unknown
-        // device is refused. Clients predating device binding present none and
-        // keep the bearer-only contract.
-        if let Some(device_id) = headers.get("x-gw-device").and_then(|v| v.to_str().ok()) {
-            if !native_device_admitted(&g, &person, device_id) {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    "this device's account session was revoked",
-                )
-                    .into_response();
-            }
-        }
-        match resolve_refresh_token(&g, &person) {
+        let grant = match admit_native_refresh(&g, &person, now_ms) {
+            Ok(grant) => grant,
+            Err(reason) => return (StatusCode::UNAUTHORIZED, reason).into_response(),
+        };
+        match g.unseal_account_secret(&grant.sealed) {
             Some(token) => (person, token),
             None => {
                 return (
@@ -1617,15 +1715,27 @@ pub async fn post_native_refresh(
     })
     .await;
     match refreshed {
-        Ok(Ok(id_token)) => (
-            StatusCode::OK,
-            Json(json!({
-                "person": person,
-                "id_token": id_token,
-                "token_type": "Bearer",
-            })),
-        )
-            .into_response(),
+        Ok(Ok(id_token)) => {
+            // An admitted refresh resets the native grant's idle clock (ADR 0147 §4).
+            {
+                let mut g = wb.lock_unpoisoned();
+                let scope = crate::account::account_scope(&person);
+                let _ = g.touch_account_refresh_in(
+                    &scope,
+                    crate::account::NATIVE_REFRESH_BINDING,
+                    now_ms,
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "person": person,
+                    "id_token": id_token,
+                    "token_type": "Bearer",
+                })),
+            )
+                .into_response()
+        }
         Ok(Err(error)) => {
             (StatusCode::BAD_GATEWAY, format!("refresh failed: {error}")).into_response()
         }
@@ -1683,6 +1793,38 @@ pub fn record_native_device(wb: &SharedWorkbench, person: &str, label: &str) -> 
     Some(id)
 }
 
+/// Write the native session's durable refresh grant (ADR 0147 §2), sealing the
+/// refresh token the handoff carried from the login callback and binding it to the
+/// enrolled `device_id`. The grant is the native session's **own** record — it does
+/// not read the browser `web` grant, which a prior logout may already have
+/// tombstoned (SOC 2 F-1.3), so a native session established after a browser logout
+/// is still valid. Best-effort: with no refresh token (the OP granted none) the
+/// native session simply has none and falls back to re-login, as before.
+fn bind_native_refresh_grant(
+    wb: &SharedWorkbench,
+    person: &str,
+    device_id: &str,
+    refresh_token: Option<&str>,
+) {
+    let Some(refresh_token) = refresh_token else {
+        return;
+    };
+    let mut g = wb.lock_unpoisoned();
+    let Some(sealed) = g.seal_account_secret(refresh_token) else {
+        return;
+    };
+    let scope = crate::account::account_scope(person);
+    let now_ms = crate::account::session_now_ms();
+    let _ = g.upsert_account_refresh_in(
+        &scope,
+        crate::account::NATIVE_REFRESH_BINDING,
+        crate::account::RefreshBinding::Device,
+        device_id,
+        &sealed,
+        now_ms,
+    );
+}
+
 /// Whether `device_id` may continue this person's account session: it must be
 /// a known, **unrevoked** device in their registry. Revocation flips the
 /// record's status — it stops refresh and future use without rewriting
@@ -1711,11 +1853,14 @@ pub async fn post_native_exchange(
     if !web_account_mode() {
         return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
     }
-    let token = auth
-        .native_handoffs_mut()
-        .redeem(&request.code, &request.verifier, Instant::now());
-    match token {
-        Some(id_token) => {
+    let redeemed =
+        auth.native_handoffs_mut()
+            .redeem(&request.code, &request.verifier, Instant::now());
+    match redeemed {
+        Some(RedeemedHandoff {
+            id_token,
+            refresh_token,
+        }) => {
             let device_id = subject_claim(&id_token).and_then(|person| {
                 let label = request
                     .device_label
@@ -1723,7 +1868,14 @@ pub async fn post_native_exchange(
                     .map(str::trim)
                     .filter(|label| !label.is_empty())
                     .unwrap_or("Native device");
-                record_native_device(&wb, &person, label)
+                let device_id = record_native_device(&wb, &person, label)?;
+                // Establish the native session's own durable refresh grant (ADR 0147
+                // §2), sealing the refresh token the handoff carried and binding it to
+                // this device. It does not depend on the browser `web` grant, which a
+                // prior logout may have tombstoned (F-1.3); admission later reads the
+                // bound device from this record, never a request header (F-4.2).
+                bind_native_refresh_grant(&wb, &person, &device_id, refresh_token.as_deref());
+                Some(device_id)
             });
             (
                 StatusCode::OK,
@@ -1751,8 +1903,23 @@ pub async fn post_logout(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Some(token) = crate::net_http::bearer(&headers) {
+    let bearer = crate::net_http::bearer(&headers).map(str::to_string);
+    if let Some(token) = &bearer {
         wb.lock_unpoisoned().account_sessions().revoke(token);
+    }
+    // Tombstone the browser session's durable refresh grant so refresh cannot mint a
+    // fresh id-token after logout (ADR 0147 §3, closes SOC 2 F-1.3 at the refresh
+    // level). This is the browser caller's own session: it ends only the `web` grant
+    // and never an independently-established native device session, which ends only
+    // when its device is revoked (or by a native logout). Future-only (`INV-18`);
+    // best-effort and idempotent, so an already-expired session still lands clean.
+    if web_account_mode() {
+        let mut g = wb.lock_unpoisoned();
+        let person = g.actor(bearer.as_deref());
+        if person != "anonymous" {
+            let scope = crate::account::account_scope(&person);
+            let _ = g.revoke_account_refresh_in(&scope, crate::account::WEB_REFRESH_BINDING);
+        }
     }
     let mut resp = StatusCode::NO_CONTENT.into_response();
     for value in [
@@ -2148,26 +2315,40 @@ iqlTEKVISscuchxZtKQJ4k8=
         let challenge = crate::identity_oidc::s256_challenge(verifier);
         let now = Instant::now();
         let mut store = NativeHandoffStore::default();
-        let code = store.issue("id-token".to_string(), challenge.clone(), now);
-        assert_eq!(store.redeem(&code, "wrong-verifier", now), None);
-        assert_eq!(
-            store.redeem(&code, verifier, now),
-            None,
+        let code = store.issue(
+            "id-token".to_string(),
+            Some("rt-native".to_string()),
+            challenge.clone(),
+            now,
+        );
+        assert!(store.redeem(&code, "wrong-verifier", now).is_none());
+        assert!(
+            store.redeem(&code, verifier, now).is_none(),
             "a failed proof consumes the code"
         );
 
-        let code = store.issue("id-token".to_string(), challenge.clone(), now);
-        assert_eq!(
-            store.redeem(&code, verifier, now),
-            Some("id-token".to_string())
+        let code = store.issue(
+            "id-token".to_string(),
+            Some("rt-native".to_string()),
+            challenge.clone(),
+            now,
         );
-        assert_eq!(store.redeem(&code, verifier, now), None);
+        let redeemed = store
+            .redeem(&code, verifier, now)
+            .expect("redeemed handoff");
+        // The handoff carries both the id-token bearer and the refresh token the
+        // native grant seals — the browser grant is not consulted (ADR 0147 §2).
+        assert_eq!(redeemed.id_token, "id-token");
+        assert_eq!(redeemed.refresh_token.as_deref(), Some("rt-native"));
+        assert!(
+            store.redeem(&code, verifier, now).is_none(),
+            "a redeemed code is single-use"
+        );
 
-        let code = store.issue("id-token".to_string(), challenge, now);
-        assert_eq!(
-            store.redeem(&code, verifier, now + Duration::from_secs(301)),
-            None,
-        );
+        let code = store.issue("id-token".to_string(), None, challenge, now);
+        assert!(store
+            .redeem(&code, verifier, now + Duration::from_secs(301))
+            .is_none());
     }
 
     #[test]
@@ -2696,6 +2877,180 @@ iqlTEKVISscuchxZtKQJ4k8=
                 account.devices.get(&device_id).unwrap().status,
                 DeviceStatus::Revoked,
                 "history is preserved, not rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_records_fold_and_enforce_bounds() {
+        use crate::account::{
+            account_scope, RefreshBinding, RefreshRecord, NATIVE_REFRESH_BINDING,
+            SESSION_ABSOLUTE_LIFETIME_MS, SESSION_IDLE_MS, WEB_REFRESH_BINDING,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let person = "google-sub-901";
+        let scope = account_scope(person);
+
+        // The callback seals a durable browser-bound grant, folded latest-wins by
+        // the stable `web` key.
+        {
+            let mut g = wb.lock_unpoisoned();
+            store_refresh_token(
+                &mut g,
+                person,
+                "rt-browser",
+                RefreshBinding::Web,
+                WEB_REFRESH_BINDING,
+                "",
+            );
+        }
+        let web = {
+            let g = wb.lock_unpoisoned();
+            resolve_refresh_grant(&g, person, WEB_REFRESH_BINDING).expect("web grant")
+        };
+        assert_eq!(web.id, WEB_REFRESH_BINDING);
+        assert_eq!(web.binding, RefreshBinding::Web);
+        assert!(web.issued_at_ms > 0 && web.last_seen_ms > 0);
+        {
+            // The browser grant opens back to its plaintext under the account key.
+            let g = wb.lock_unpoisoned();
+            assert_eq!(
+                g.unseal_account_secret(&web.sealed).as_deref(),
+                Some("rt-browser")
+            );
+        }
+
+        // F-1.3 independence: a browser logout tombstones the `web` grant BEFORE the
+        // native session is established (the e2e's exact order).
+        {
+            let mut g = wb.lock_unpoisoned();
+            g.revoke_account_refresh_in(&scope, WEB_REFRESH_BINDING)
+                .unwrap();
+        }
+
+        // A native exchange establishes the native session's OWN grant, sealing the
+        // refresh token the handoff carried — not a copy of the (now-tombstoned)
+        // browser grant. It is keyed by the stable native binding and carries the
+        // enrolled device as a stored field.
+        let device_id = record_native_device(&wb, person, "GaugeDesk native").unwrap();
+        bind_native_refresh_grant(&wb, person, &device_id, Some("rt-native"));
+        {
+            let g = wb.lock_unpoisoned();
+            let native =
+                resolve_refresh_grant(&g, person, NATIVE_REFRESH_BINDING).expect("native grant");
+            assert_eq!(native.binding, RefreshBinding::Device);
+            assert_eq!(native.id, NATIVE_REFRESH_BINDING);
+            assert_eq!(native.device_id, device_id);
+            // Its own captured token, independent of the browser grant.
+            assert_eq!(
+                g.unseal_account_secret(&native.sealed).as_deref(),
+                Some("rt-native")
+            );
+        }
+
+        // F-4.2 + F-1.3: native refresh admits WITHOUT any device header (the client
+        // sends none), reading the bound device from the stored grant — even though
+        // the browser grant was already tombstoned by logout.
+        {
+            let g = wb.lock_unpoisoned();
+            let now = crate::account::session_now_ms();
+            assert!(admit_native_refresh(&g, person, now).is_ok());
+        }
+
+        // F-4.2: revoking the device stops native refresh. The cascade tombstones the
+        // native grant (matched by its stored `device_id`), and the device is no
+        // longer admitted — no request header is ever consulted.
+        {
+            let mut g = wb.lock_unpoisoned();
+            g.revoke_account_device_in(&scope, &device_id).unwrap();
+        }
+        {
+            let g = wb.lock_unpoisoned();
+            let now = crate::account::session_now_ms();
+            assert!(resolve_refresh_grant(&g, person, NATIVE_REFRESH_BINDING).is_none());
+            assert_eq!(
+                admit_native_refresh(&g, person, now),
+                Err("no refresh token on file; sign in again"),
+            );
+        }
+
+        // F-1.4: the absolute-lifetime and idle bounds refuse an over-aged or idle
+        // grant on the browser path, and a live one within bounds is admitted.
+        {
+            let mut g = wb.lock_unpoisoned();
+            let base = 1_000_000_000_000_u64;
+            let aged = RefreshRecord {
+                id: WEB_REFRESH_BINDING.to_string(),
+                op: crate::account::RecordOp::Upsert,
+                sealed: web.sealed.clone(),
+                binding: RefreshBinding::Web,
+                device_id: String::new(),
+                issued_at_ms: base,
+                last_seen_ms: base,
+            };
+            g.write_account_record_in(&scope, "refresh", WEB_REFRESH_BINDING, &aged)
+                .unwrap();
+            let within = base + SESSION_IDLE_MS - 1;
+            assert!(admit_browser_refresh(&g, person, within).is_ok());
+            let over_absolute = base + SESSION_ABSOLUTE_LIFETIME_MS + 1;
+            assert_eq!(
+                admit_browser_refresh(&g, person, over_absolute),
+                Err("absolute session lifetime exceeded"),
+            );
+            let idle = base + SESSION_IDLE_MS + 1;
+            assert_eq!(
+                admit_browser_refresh(&g, person, idle),
+                Err("session idle timeout exceeded"),
+            );
+        }
+
+        // F-1.4: a refresh preserves issued-at (the absolute clock keeps running
+        // from the mint) while advancing last-seen.
+        {
+            let mut g = wb.lock_unpoisoned();
+            let issued = g
+                .account_refresh_session_in(&scope, WEB_REFRESH_BINDING)
+                .unwrap()
+                .unwrap()
+                .issued_at_ms;
+            let later = crate::account::session_now_ms() + 5;
+            g.upsert_account_refresh_in(
+                &scope,
+                WEB_REFRESH_BINDING,
+                RefreshBinding::Web,
+                "",
+                "rt-2",
+                later,
+            )
+            .unwrap();
+            let after = g
+                .account_refresh_session_in(&scope, WEB_REFRESH_BINDING)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.issued_at_ms, issued,
+                "issued-at is preserved across refresh"
+            );
+            assert_eq!(after.last_seen_ms, later, "last-seen advances");
+        }
+
+        // F-1.3: logout tombstones the browser grant so refresh cannot mint after
+        // it; the tombstone folds the grant out (future-only, INV-18).
+        {
+            let mut g = wb.lock_unpoisoned();
+            assert!(g
+                .revoke_account_refresh_in(&scope, WEB_REFRESH_BINDING)
+                .unwrap()
+                .is_some());
+        }
+        {
+            let g = wb.lock_unpoisoned();
+            assert!(resolve_refresh_grant(&g, person, WEB_REFRESH_BINDING).is_none());
+            let now = crate::account::session_now_ms();
+            assert_eq!(
+                admit_browser_refresh(&g, person, now),
+                Err("no refresh token on file; sign in again"),
             );
         }
     }

@@ -45,6 +45,12 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
             }
         })
         .route("/account/devices/{id}/revoke", post(post_device_revoke))
+        // Your sessions (ACCT-1 / B8, ADR 0147): the person lists and revokes their
+        // own durable refresh grants, parallel to the device list and scoped to
+        // their own account. Revocation tombstones the grant future-only (`INV-18`),
+        // so refresh cannot mint after it.
+        .route("/account/sessions", get(get_sessions))
+        .route("/account/sessions/{id}/revoke", post(post_session_revoke))
         // Device-enrollment handshake drive (ACCT-1, ADR 0055): the holder hosts +
         // authorizes; the new device joins. Both dial the rendezvous broker; status
         // GETs surface the phase + SAS for the out-of-band human compare. The account
@@ -1163,6 +1169,69 @@ mod home_directory_tests {
             "ed25519:second",
         );
     }
+
+    /// The "your sessions" surface (ADR 0147 §6): a person lists their durable
+    /// refresh grants and revokes one, and the revoked grant folds out — future-only
+    /// (`INV-18`), so it can no longer admit a refresh.
+    #[tokio::test]
+    async fn account_sessions_are_scoped_and_revocable() {
+        use crate::account::{RefreshBinding, ACCOUNT_SCOPE};
+        let dir = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(dir.path()).unwrap();
+        {
+            let mut g = wb.lock_unpoisoned();
+            g.upsert_account_refresh_in(
+                ACCOUNT_SCOPE,
+                "web",
+                RefreshBinding::Web,
+                "",
+                "sealed-web",
+                10,
+            )
+            .unwrap();
+            g.upsert_account_refresh_in(
+                ACCOUNT_SCOPE,
+                "native",
+                RefreshBinding::Device,
+                "native-abc",
+                "sealed-dev",
+                20,
+            )
+            .unwrap();
+        }
+        let app = routes().with_state(wb);
+
+        let (status, body) = call(&app, "GET", "/account/sessions", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let sessions = listed["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        // The surface lists bindings and bounds but never the sealed token.
+        assert!(!body.contains("sealed-web") && !body.contains("sealed-dev"));
+        assert!(sessions.iter().any(|s| s["binding"] == "web"));
+        // The native session names the device it is bound to, not its sealed token.
+        assert!(sessions.iter().any(|s| s["binding"] == "device"
+            && s["id"] == "native"
+            && s["device_id"] == "native-abc"));
+        assert_eq!(
+            sessions[0]["absolute_lifetime_ms"],
+            crate::account::SESSION_ABSOLUTE_LIFETIME_MS,
+        );
+
+        let (status, body) = call(&app, "POST", "/account/sessions/native/revoke", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["session"]["id"],
+            "native",
+        );
+
+        // The revoked grant is gone from the list; a second revoke is a 404.
+        let (_, body) = call(&app, "GET", "/account/sessions", None).await;
+        let remaining: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(remaining["sessions"].as_array().unwrap().len(), 1);
+        let (status, _) = call(&app, "POST", "/account/sessions/native/revoke", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }
 
 // ---- devices (the trusted-devices registry) ------------------------------
@@ -1237,6 +1306,62 @@ pub async fn post_device_revoke(
         Err(e) => return err_response(e),
     };
     (StatusCode::OK, Json(json!({ "device": record }))).into_response()
+}
+
+// ---- sessions (the durable refresh-grant registry, ADR 0147) --------------
+
+/// Project one refresh grant for the "your sessions" surface: its binding, the
+/// issued/last-seen timestamps, and the personal-tenant bounds it is enforced
+/// against. Never the sealed token — the surface lists sessions, it does not hand
+/// back the credential.
+fn session_view(record: &crate::account::RefreshRecord) -> serde_json::Value {
+    let binding = match record.binding {
+        crate::account::RefreshBinding::Web => "web",
+        crate::account::RefreshBinding::Device => "device",
+    };
+    json!({
+        "id": record.id,
+        "binding": binding,
+        "device_id": record.device_id,
+        "issued_at_ms": record.issued_at_ms,
+        "last_seen_ms": record.last_seen_ms,
+        "absolute_lifetime_ms": crate::account::SESSION_ABSOLUTE_LIFETIME_MS,
+        "idle_timeout_ms": crate::account::SESSION_IDLE_MS,
+    })
+}
+
+pub async fn get_sessions(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    match wb.account_refresh_sessions_in(&scope) {
+        Ok(sessions) => {
+            let sessions: Vec<_> = sessions.iter().map(session_view).collect();
+            (StatusCode::OK, Json(json!({ "sessions": sessions }))).into_response()
+        }
+        Err(e) => err_response(e),
+    }
+}
+
+pub async fn post_session_revoke(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    let record = match wb.revoke_account_refresh_in(&scope, &id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such session").into_response(),
+        Err(e) => return err_response(e),
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "session": session_view(&record) })),
+    )
+        .into_response()
 }
 
 // ---- device enrollment handshake (ACCT-1, ADR 0055) ----------------------

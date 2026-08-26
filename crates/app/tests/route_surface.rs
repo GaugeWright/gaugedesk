@@ -242,6 +242,40 @@ async fn local_library_sync_routes_reach_the_desktop_handler() {
     }
 }
 
+/// The "your sessions" surface (ACCT-1 / B8, ADR 0147) must be reachable through
+/// the real router: listing answers 200 with a `sessions` array, and revoking an
+/// absent grant reaches its handler's fail-closed 404 (a body, not silence).
+#[tokio::test]
+async fn hosted_account_sessions_list_and_revoke_reach_the_handler() {
+    let (_dir, app) = control_plane();
+
+    let (status, body) = send(&app, "GET", "/account/sessions", None).await;
+    assert_eq!(
+        status, 200,
+        "session list did not reach its handler: {body}"
+    );
+    assert!(
+        body.contains("\"sessions\""),
+        "session list did not return the projection: {body}",
+    );
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/account/sessions/native-absent/revoke",
+        Some(json!({}).to_string()),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "session revoke did not reach its handler: {body}"
+    );
+    assert!(
+        body.contains("no such session"),
+        "session revoke did not return its fail-closed refusal: {body}",
+    );
+}
+
 /// DR-0051 retires provisional federation drivers once the shipped Engagement
 /// operations subsume them. They must remain absent instead of silently returning
 /// as undocumented compatibility surface or browser-test shortcuts.

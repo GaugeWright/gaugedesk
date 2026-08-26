@@ -71,6 +71,104 @@ pub fn device_enrolled_at_now() -> u64 {
         .unwrap_or_default()
 }
 
+/// The platform-default **absolute session lifetime** for a hosted personal
+/// account — 30 days (ADR 0147 §4). A session older than this refuses refresh and
+/// refuses the request, regardless of activity. An organization Home draws its own
+/// bounds from its session policy and may be stricter; this default never loosens
+/// what an organization sets (`workbench_auth::session_bounds_ms`).
+pub const SESSION_ABSOLUTE_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The platform-default **idle timeout** for a hosted personal account — 7 days
+/// (ADR 0147 §4). A session unused for longer than this refuses refresh; each
+/// admitted refresh touches `last_seen_ms`.
+pub const SESSION_IDLE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The fixed binding id for the **browser** refresh grant. The consumer-OIDC
+/// browser path has no per-session id in this model — a per-session opaque token
+/// is the separate cookie-model change — so one stable per-person key names the
+/// browser's durable grant (ADR 0147 §2).
+pub const WEB_REFRESH_BINDING: &str = "web";
+
+/// The fixed binding id for the **native** refresh grant. A native client presents
+/// only its bearer on refresh (no per-session id, no device header), so one stable
+/// per-person key names its durable grant; the enrolled device it is bound to is
+/// carried in [`RefreshRecord::device_id`] and read from there on every refresh, so
+/// admission never depends on a request header (ADR 0147 §2; per-device native
+/// sessions arrive with the cookie-model change's per-session tokens).
+pub const NATIVE_REFRESH_BINDING: &str = "native";
+
+/// A wall-clock millisecond reading for a session's issued-at / last-seen. Carried
+/// into the reducer by the admission shell (`observeExpiry`), never read inside a
+/// pure decision (`account-session.md`).
+pub fn session_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// What a refresh grant is bound to (ADR 0147 §2). The browser grant is bound to
+/// the stable per-person [`WEB_REFRESH_BINDING`] key; a native grant is bound to
+/// the enrolled device whose id is the record's own `id`, so enforcement reads the
+/// **stored** binding rather than a request-supplied header.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RefreshBinding {
+    #[default]
+    Web,
+    Device,
+}
+
+/// One durable, bound, timestamped refresh grant (ADR 0147). Mirrors
+/// [`DeviceRecord`]'s op/tombstone shape: a grant is folded latest-wins by `id`
+/// (the binding discriminator — [`WEB_REFRESH_BINDING`] for the browser, the
+/// enrolled `DeviceId` for a native client), and revocation flips it to a
+/// tombstone (`INV-18`) rather than erasing history. The refresh token itself is
+/// held only as `SEC-4` `sealed` ciphertext (`INV-10`); the binding, issued-at,
+/// and last-seen are the admitted session facts.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RefreshRecord {
+    /// The binding discriminator: [`WEB_REFRESH_BINDING`] for the browser grant or
+    /// [`NATIVE_REFRESH_BINDING`] for the native grant.
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    /// `SEC-4` ciphertext of the OIDC refresh token; never plaintext at rest.
+    #[serde(default)]
+    pub sealed: String,
+    #[serde(default)]
+    pub binding: RefreshBinding,
+    /// The enrolled device this native grant is bound to (ADR 0147 §2). Empty for a
+    /// browser grant. Admission reads it from here — never from a request header —
+    /// so a native caller cannot bypass its device binding by omitting or forging a
+    /// header (SOC 2 F-4.2).
+    #[serde(default)]
+    pub device_id: String,
+    /// Milliseconds since the Unix epoch when the session was first minted. Held
+    /// across refreshes so the absolute-lifetime clock runs from the mint, not the
+    /// last refresh.
+    #[serde(default)]
+    pub issued_at_ms: u64,
+    /// Milliseconds since the Unix epoch of the most recent admitted refresh.
+    #[serde(default)]
+    pub last_seen_ms: u64,
+}
+
+/// Whether a refresh grant is still within its personal-tenant bounds at `now_ms`
+/// (ADR 0147 §4). `Err` names which bound elapsed, so a caller can log the reason
+/// while still refusing. Absolute lifetime is measured from `issued_at_ms`; idle
+/// from `last_seen_ms`. Fail-closed: a grant with no issued-at (a legacy record)
+/// reads as elapsed rather than unbounded.
+pub fn refresh_within_bounds(record: &RefreshRecord, now_ms: u64) -> Result<(), &'static str> {
+    if now_ms.saturating_sub(record.issued_at_ms) > SESSION_ABSOLUTE_LIFETIME_MS {
+        return Err("absolute session lifetime exceeded");
+    }
+    if now_ms.saturating_sub(record.last_seen_ms) > SESSION_IDLE_MS {
+        return Err("session idle timeout exceeded");
+    }
+    Ok(())
+}
+
 /// A latest-wins preference (`id` = the setting key).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SettingRecord {
@@ -237,6 +335,10 @@ impl From<HomeRouteRecord> for crate::home::OpaqueHomeRoute {
 #[derive(Default, Clone, Debug)]
 pub struct Account {
     pub devices: BTreeMap<String, DeviceRecord>,
+    /// Durable refresh grants, folded latest-wins by binding id (ADR 0147). One
+    /// browser grant keyed by [`WEB_REFRESH_BINDING`] plus a grant per enrolled
+    /// native device; a tombstoned grant folds out exactly as a revoked device does.
+    pub refresh_sessions: BTreeMap<String, RefreshRecord>,
     pub settings: BTreeMap<String, SettingRecord>,
     pub credentials: BTreeMap<String, CredentialRecord>,
     pub homes: BTreeMap<String, RegisteredHomeRecord>,
@@ -285,6 +387,10 @@ impl Account {
         for row in store.records(scope, "device")? {
             let r: DeviceRecord = serde_json::from_str(&row)?;
             fold(&mut acct.devices, r.id.clone(), r.op, r);
+        }
+        for row in store.records(scope, "refresh")? {
+            let r: RefreshRecord = serde_json::from_str(&row)?;
+            fold(&mut acct.refresh_sessions, r.id.clone(), r.op, r);
         }
         for row in store.records(scope, "setting")? {
             let r: SettingRecord = serde_json::from_str(&row)?;
@@ -995,6 +1101,10 @@ impl Workbench {
         record.status = DeviceStatus::Revoked;
         let id = record.id.clone();
         self.write_account_record_in(scope, "device", &id, &record)?;
+        // Revoking a device revokes the sessions bound to it (ADR 0147 §3): tombstone
+        // every refresh grant whose stored `device_id` names this device. Idempotent
+        // when the device holds no grant.
+        self.revoke_account_refresh_for_device_in(scope, &id)?;
         Ok(Some(record))
     }
 
@@ -1004,6 +1114,126 @@ impl Workbench {
         device_id: &str,
     ) -> Result<Option<DeviceRecord>, AdmitError> {
         self.revoke_account_device_in(ACCOUNT_SCOPE, device_id)
+    }
+
+    /// Folded refresh grants in `scope`, in stable id order (the "your sessions"
+    /// projection, ADR 0147 §6). Tombstoned grants have folded out.
+    pub fn account_refresh_sessions_in(
+        &self,
+        scope: &str,
+    ) -> Result<Vec<RefreshRecord>, AdmitError> {
+        Ok(Account::rebuild_in(self.store_ref(), scope)?
+            .refresh_sessions
+            .into_values()
+            .collect())
+    }
+
+    /// The single refresh grant bound to `binding_id` in `scope`, or `None` if none
+    /// is live (never stored, or tombstoned). Reads the **stored** binding, so a
+    /// native caller cannot escape device revocation by omitting a header.
+    pub fn account_refresh_session_in(
+        &self,
+        scope: &str,
+        binding_id: &str,
+    ) -> Result<Option<RefreshRecord>, AdmitError> {
+        Ok(Account::rebuild_in(self.store_ref(), scope)?
+            .refresh_sessions
+            .remove(binding_id))
+    }
+
+    /// Record (mint or update) one refresh grant in `scope`. `device_id` is the
+    /// enrolled device a native grant binds to (empty for a browser grant). On a
+    /// re-mint for a binding that already holds a live grant, `issued_at_ms` is
+    /// preserved so the absolute-lifetime clock keeps running from the original
+    /// mint; `last_seen_ms` is always advanced to `now_ms` (ADR 0147 §4).
+    pub fn upsert_account_refresh_in(
+        &mut self,
+        scope: &str,
+        binding_id: &str,
+        binding: RefreshBinding,
+        device_id: &str,
+        sealed: &str,
+        now_ms: u64,
+    ) -> Result<RefreshRecord, AdmitError> {
+        let existing = Account::rebuild_in(self.store_ref(), scope)?
+            .refresh_sessions
+            .remove(binding_id);
+        let issued_at_ms = existing.map(|record| record.issued_at_ms).unwrap_or(now_ms);
+        let record = RefreshRecord {
+            id: binding_id.to_string(),
+            op: RecordOp::Upsert,
+            sealed: sealed.to_string(),
+            binding,
+            device_id: device_id.to_string(),
+            issued_at_ms,
+            last_seen_ms: now_ms,
+        };
+        self.write_account_record_in(scope, "refresh", &record.id, &record)?;
+        Ok(record)
+    }
+
+    /// Advance a live grant's `last_seen_ms` after an admitted refresh (ADR 0147 §4).
+    /// A no-op if the binding holds no live grant.
+    pub fn touch_account_refresh_in(
+        &mut self,
+        scope: &str,
+        binding_id: &str,
+        now_ms: u64,
+    ) -> Result<(), AdmitError> {
+        let Some(mut record) = Account::rebuild_in(self.store_ref(), scope)?
+            .refresh_sessions
+            .remove(binding_id)
+        else {
+            return Ok(());
+        };
+        record.op = RecordOp::Upsert;
+        record.last_seen_ms = now_ms;
+        self.write_account_record_in(scope, "refresh", &record.id, &record)
+    }
+
+    /// Tombstone one refresh grant in `scope`, ending the session it holds
+    /// (ADR 0147 §3, `INV-18`). Future-only: the append-only log is preserved and a
+    /// revoked grant admits no refresh. Returns the tombstoned record, or `None` if
+    /// the binding held no live grant.
+    pub fn revoke_account_refresh_in(
+        &mut self,
+        scope: &str,
+        binding_id: &str,
+    ) -> Result<Option<RefreshRecord>, AdmitError> {
+        let Some(existing) = Account::rebuild_in(self.store_ref(), scope)?
+            .refresh_sessions
+            .remove(binding_id)
+        else {
+            return Ok(None);
+        };
+        let mut record = existing;
+        record.op = RecordOp::Tombstone;
+        self.write_account_record_in(scope, "refresh", &record.id, &record)?;
+        Ok(Some(record))
+    }
+
+    /// Tombstone every live refresh grant in `scope` bound to `device_id` (ADR 0147
+    /// §3): revoking a device revokes the sessions bound to it. Matches on the
+    /// stored `device_id` field, so it reaches the native grant whatever key holds
+    /// it. Returns how many grants were tombstoned.
+    pub fn revoke_account_refresh_for_device_in(
+        &mut self,
+        scope: &str,
+        device_id: &str,
+    ) -> Result<usize, AdmitError> {
+        let bound: Vec<String> = Account::rebuild_in(self.store_ref(), scope)?
+            .refresh_sessions
+            .into_values()
+            .filter(|record| record.device_id == device_id)
+            .map(|record| record.id)
+            .collect();
+        let mut revoked = 0;
+        for id in bound {
+            if self.revoke_account_refresh_in(scope, &id)?.is_some() {
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
     }
 
     /// Persist one account setting (default scope).

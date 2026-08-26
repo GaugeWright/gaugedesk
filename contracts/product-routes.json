@@ -2478,6 +2478,78 @@
       }
     },
     {
+      "id": "account.sessions.list",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/account/sessions",
+      "producer": "gaugedesk-app account_routes",
+      "consumer": "accountSessions via @gaugewright/control-plane-client",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "read-own-sessions",
+      "requestSchema": "http/empty",
+      "responseSchema": "gw://schemas/account/session-list/v1",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/route_surface.rs#hosted_account_sessions_list_and_revoke_reach_the_handler"
+        ],
+        "authority": [
+          "crates/app/src/account_routes.rs#account_sessions_are_scoped_and_revocable"
+        ],
+        "journey": [
+          "crates/app/tests/route_surface.rs#hosted_account_sessions_list_and_revoke_reach_the_handler"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/auth_oidc.rs#refresh_records_fold_and_enforce_bounds"
+        ]
+      }
+    },
+    {
+      "id": "account.sessions.revoke",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/account/sessions/:id/revoke",
+      "producer": "gaugedesk-app account_routes",
+      "consumer": "accountRevokeSession via @gaugewright/control-plane-client",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "revoke-own-session",
+      "requestSchema": "http/path-session-id",
+      "responseSchema": "gw://schemas/account/session/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/route_surface.rs#hosted_account_sessions_list_and_revoke_reach_the_handler"
+        ],
+        "authority": [
+          "crates/app/src/account_routes.rs#account_sessions_are_scoped_and_revocable"
+        ],
+        "journey": [
+          "crates/app/tests/route_surface.rs#hosted_account_sessions_list_and_revoke_reach_the_handler"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/auth_oidc.rs#refresh_records_fold_and_enforce_bounds"
+        ]
+      }
+    },
+    {
       "id": "account.settings.list",
       "jurisdiction": "hosted-person-account",
       "transport": "http-json",

@@ -252,6 +252,44 @@ export async function accountRevokeDevice(json: RouteJson, id: string): Promise<
     await json("POST", `/account/devices/${encodeURIComponent(id)}/revoke`);
 }
 
+/** One durable account session — a bound, timestamped refresh grant (ADR 0147).
+ *  Carries the binding, the issued/last-seen wall clock, and the personal-tenant
+ *  bounds the session is enforced against — never the sealed token. */
+export interface AccountSession {
+    readonly id: string;
+    readonly binding: string;
+    /** Milliseconds since the Unix epoch; zero means the fact was never recorded. */
+    readonly issuedAtMs: number;
+    readonly lastSeenMs: number;
+    readonly absoluteLifetimeMs: number;
+    readonly idleTimeoutMs: number;
+}
+
+/** Parse a session projection defensively: a malformed or missing timestamp never
+ *  becomes a fictional session clock. */
+export function parseAccountSession(value: unknown): AccountSession {
+    const session = (value ?? {}) as Record<string, unknown>;
+    const ms = (field: unknown): number =>
+        typeof field === "number" && Number.isFinite(field) ? Math.max(0, Math.floor(field)) : 0;
+    return {
+        id: typeof session.id === "string" ? session.id : "",
+        binding: typeof session.binding === "string" ? session.binding : "",
+        issuedAtMs: ms(session.issued_at_ms),
+        lastSeenMs: ms(session.last_seen_ms),
+        absoluteLifetimeMs: ms(session.absolute_lifetime_ms),
+        idleTimeoutMs: ms(session.idle_timeout_ms),
+    };
+}
+
+export async function accountSessions(json: RouteJson): Promise<AccountSession[]> {
+    const o = (await json("GET", "/account/sessions")) as { sessions?: unknown };
+    return Array.isArray(o?.sessions) ? o.sessions.map(parseAccountSession) : [];
+}
+
+export async function accountRevokeSession(json: RouteJson, id: string): Promise<void> {
+    await json("POST", `/account/sessions/${encodeURIComponent(id)}/revoke`);
+}
+
 /** An out-of-band device-enrollment ticket (ACCT-1, ADR 0055): the rendezvous session,
  *  the account root the new device pins, and the broker both legs dial. Carries no secret —
  *  the trust anchor is the SAS compare + the root-signed delegation. */
