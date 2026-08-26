@@ -119,6 +119,9 @@ pub struct Workbench {
     pub(crate) home_admissions: crate::home_admission::HomeAdmissionStore,
     /// The identity adapter that authenticates bearer credentials.
     pub(crate) idp: Option<Arc<dyn identity::IdentityProvider + Send + Sync>>,
+    /// Opaque Hub sessions authenticate a durable GaugeDesk account before any
+    /// organization-specific membership decision.
+    pub(crate) account_sessions: Arc<crate::account_session::AccountSessionStore>,
     /// Optional streaming audit sink (`AUD-4`).
     pub(crate) audit_sink: Option<Arc<dyn audit::AuditSink>>,
     /// Governance key store used to sign audit checkpoints (`SECAUD-2`).
@@ -302,6 +305,7 @@ impl Workbench {
             hosted_home_mode: false,
             home_admissions: crate::home_admission::HomeAdmissionStore::new(),
             idp: None,
+            account_sessions: Arc::new(crate::account_session::AccountSessionStore::new()),
             audit_sink: None,
             audit_signer: None,
             content_vault: None,

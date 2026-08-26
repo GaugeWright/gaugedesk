@@ -1974,6 +1974,222 @@
       }
     },
     {
+      "id": "account.passkey.email.start",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/email/start",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser using the WebAuthn API",
+      "authentication": "public-bounded-email-proof-initiation",
+      "scope": "single-use-email-verification-challenge",
+      "capability": "begin-account-email-verification",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/BeginEmailRequest",
+      "responseSchema": "gw://schemas/account/email-verification-challenge/v1",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "authority": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ]
+      }
+    },
+    {
+      "id": "account.passkey.email.complete",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/email/complete",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser using the WebAuthn API",
+      "authentication": "single-use-bounded-email-code",
+      "scope": "verified-email-ceremony-ticket",
+      "capability": "complete-account-email-verification",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/CompleteEmailRequest",
+      "responseSchema": "gw://schemas/account/verified-email-ticket/v1",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "authority": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ]
+      }
+    },
+    {
+      "id": "account.passkey.registration.start",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/passkey/register/start",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser using the WebAuthn API",
+      "authentication": "single-use-verified-email-ticket",
+      "scope": "pending-account-and-webauthn-registration",
+      "capability": "begin-account-passkey-registration",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/StartRegistrationRequest",
+      "responseSchema": "webauthn/PublicKeyCredentialCreationOptions",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "authority": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ]
+      }
+    },
+    {
+      "id": "account.passkey.registration.finish",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/passkey/register/finish",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser using the WebAuthn API",
+      "authentication": "verified-webauthn-registration-response",
+      "scope": "new-account-root-and-passkey-method",
+      "capability": "create-passkey-first-account",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/FinishRegistrationRequest",
+      "responseSchema": "gw://schemas/account/session/v1",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "authority": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ]
+      }
+    },
+    {
+      "id": "account.passkey.login.start",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/passkey/login/start",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser using the WebAuthn API",
+      "authentication": "verified-email-account-discovery",
+      "scope": "active-passkeys-for-discovered-account",
+      "capability": "begin-account-passkey-authentication",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/StartAuthenticationRequest",
+      "responseSchema": "webauthn/PublicKeyCredentialRequestOptions",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "authority": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ]
+      }
+    },
+    {
+      "id": "account.passkey.login.finish",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/passkey/login/finish",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser using the WebAuthn API",
+      "authentication": "verified-webauthn-assertion",
+      "scope": "authenticated-account",
+      "capability": "create-own-account-session",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/FinishAuthenticationRequest",
+      "responseSchema": "gw://schemas/account/session/v1",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "authority": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ]
+      }
+    },
+    {
       "id": "account.mobile-session.exchange",
       "jurisdiction": "native-person-account-session",
       "transport": "http-json",

@@ -4,7 +4,8 @@
 //! that person may authenticate to the private Hub account service: verified
 //! email contacts, WebAuthn public credentials, exact external-subject links,
 //! and salted recovery-code hashes. It stores no passkey private key, recovery
-//! plaintext, OIDC token, client secret, or account-root seed.
+//! plaintext, OIDC token, client secret, or plaintext account-root seed. The
+//! private Hub may retain only an envelope-encrypted root seed for recovery.
 //!
 //! All links share one Hub-owned scope. That is intentional: uniqueness of a
 //! `(connection, issuer, subject)` or WebAuthn credential id must be decided
@@ -29,6 +30,7 @@ const WEBAUTHN_KIND: &str = "account_auth_webauthn";
 const SUBJECT_KIND: &str = "account_auth_subject";
 const RECOVERY_BATCH_KIND: &str = "account_auth_recovery_batch";
 const RECOVERY_CODE_KIND: &str = "account_auth_recovery_code";
+const ROOT_CUSTODY_KIND: &str = "account_auth_root_custody";
 
 /// Future authentication standing. Revocation is an upsert, never deletion.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -56,7 +58,7 @@ pub struct VerifiedEmailRecord {
 impl VerifiedEmailRecord {
     /// Materialize a verified contact after the email challenge has completed.
     pub fn new(account_id: &str, email: &str, verified_at: u64) -> Result<Self, AuthRejection> {
-        let email = normalize_email(email).ok_or(AuthRejection::InvalidEmail)?;
+        let email = normalize_email_contact(email).ok_or(AuthRejection::InvalidEmail)?;
         Ok(Self {
             id: digest_id(b"gaugedesk:verified-email:v1", &[email.as_bytes()]),
             op: RecordOp::Upsert,
@@ -69,8 +71,8 @@ impl VerifiedEmailRecord {
 }
 
 /// One WebAuthn credential. Only verifier material is durable; the authenticator
-/// keeps the private key. `public_key_cose` and `credential_id` use base64url at
-/// the HTTP boundary, but this projection treats their validated form as opaque.
+/// keeps the private key. Credential ids use base64url at the HTTP boundary;
+/// the serialized verifier is validated by the WebAuthn ceremony adapter.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct WebAuthnMethodRecord {
     /// The WebAuthn credential id; globally unique in this Hub auth scope.
@@ -78,9 +80,10 @@ pub struct WebAuthnMethodRecord {
     #[serde(default)]
     pub op: RecordOp,
     pub account_id: String,
-    pub public_key_cose: String,
-    #[serde(default)]
-    pub sign_count: u32,
+    /// Serialized [`passkey_auth::PasskeyCredential`] verifier. It contains
+    /// only public key/counter/transport metadata; the authenticator retains
+    /// the private key.
+    pub verifier_json: String,
     #[serde(default)]
     pub label: String,
     pub created_at: u64,
@@ -93,8 +96,7 @@ impl WebAuthnMethodRecord {
     pub fn new(
         account_id: &str,
         credential_id: &str,
-        public_key_cose: &str,
-        sign_count: u32,
+        verifier_json: &str,
         label: &str,
         created_at: u64,
     ) -> Result<Self, AuthRejection> {
@@ -102,11 +104,37 @@ impl WebAuthnMethodRecord {
             id: required(credential_id)?,
             op: RecordOp::Upsert,
             account_id: required(account_id)?,
-            public_key_cose: required(public_key_cose)?,
-            sign_count,
+            verifier_json: required(verifier_json)?,
             label: label.trim().to_owned(),
             created_at,
             status: AuthMethodStatus::Active,
+        })
+    }
+}
+
+/// Default private-Hub custody for one governance root. `sealed_seed` is an
+/// envelope ciphertext produced by the Hub's account-secret encryptor; the
+/// plaintext seed never enters the append-only projection.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CustodiedAccountRootRecord {
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    pub sealed_seed: String,
+    pub created_at: u64,
+}
+
+impl CustodiedAccountRootRecord {
+    pub fn new(
+        account_id: &str,
+        sealed_seed: &str,
+        created_at: u64,
+    ) -> Result<Self, AuthRejection> {
+        Ok(Self {
+            id: required(account_id)?,
+            op: RecordOp::Upsert,
+            sealed_seed: required(sealed_seed)?,
+            created_at,
         })
     }
 }
@@ -230,6 +258,7 @@ impl RecoveryCodeRecord {
 /// Rebuildable Hub account-auth projection (`INV-5`).
 #[derive(Default, Clone, Debug)]
 pub struct AccountAuth {
+    pub roots: BTreeMap<String, CustodiedAccountRootRecord>,
     pub emails: BTreeMap<String, VerifiedEmailRecord>,
     pub webauthn_methods: BTreeMap<String, WebAuthnMethodRecord>,
     pub external_subjects: BTreeMap<String, ExternalSubjectRecord>,
@@ -240,6 +269,10 @@ pub struct AccountAuth {
 impl AccountAuth {
     pub fn rebuild(store: &Store) -> Result<Self, AdmitError> {
         let mut state = Self::default();
+        for row in store.records(ACCOUNT_AUTH_SCOPE, ROOT_CUSTODY_KIND)? {
+            let record: CustodiedAccountRootRecord = serde_json::from_str(&row)?;
+            fold(&mut state.roots, record.id.clone(), record.op, record);
+        }
         for row in store.records(ACCOUNT_AUTH_SCOPE, EMAIL_KIND)? {
             let record: VerifiedEmailRecord = serde_json::from_str(&row)?;
             fold(&mut state.emails, record.id.clone(), record.op, record);
@@ -365,6 +398,7 @@ pub struct AccountMethods<'a> {
 /// then rebuilds the projection; commands themselves are never product truth.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccountAuthFact {
+    RootCustody(CustodiedAccountRootRecord),
     Email(VerifiedEmailRecord),
     WebAuthn(WebAuthnMethodRecord),
     ExternalSubject(ExternalSubjectRecord),
@@ -375,6 +409,7 @@ pub enum AccountAuthFact {
 impl AccountAuthFact {
     fn kind(&self) -> &'static str {
         match self {
+            Self::RootCustody(_) => ROOT_CUSTODY_KIND,
             Self::Email(_) => EMAIL_KIND,
             Self::WebAuthn(_) => WEBAUTHN_KIND,
             Self::ExternalSubject(_) => SUBJECT_KIND,
@@ -385,6 +420,7 @@ impl AccountAuthFact {
 
     fn json(&self) -> Result<String, serde_json::Error> {
         match self {
+            Self::RootCustody(record) => serde_json::to_string(record),
             Self::Email(record) => serde_json::to_string(record),
             Self::WebAuthn(record) => serde_json::to_string(record),
             Self::ExternalSubject(record) => serde_json::to_string(record),
@@ -590,7 +626,7 @@ fn required(value: &str) -> Result<String, AuthRejection> {
     }
 }
 
-fn normalize_email(value: &str) -> Option<String> {
+pub fn normalize_email_contact(value: &str) -> Option<String> {
     let normalized = value.trim().to_lowercase();
     let (local, domain) = normalized.rsplit_once('@')?;
     (!local.is_empty()
@@ -659,12 +695,18 @@ mod tests {
     }
 
     fn passkey(account: &str, id: &str) -> WebAuthnMethodRecord {
-        WebAuthnMethodRecord::new(account, id, "public-cose", 0, "Security key", 10).unwrap()
+        WebAuthnMethodRecord::new(account, id, "public-verifier", "Security key", 10).unwrap()
     }
 
     fn apply(state: &mut AccountAuth, facts: &[AccountAuthFact]) {
         for fact in facts {
             match fact {
+                AccountAuthFact::RootCustody(record) => fold(
+                    &mut state.roots,
+                    record.id.clone(),
+                    record.op,
+                    record.clone(),
+                ),
                 AccountAuthFact::Email(record) => fold(
                     &mut state.emails,
                     record.id.clone(),
@@ -815,6 +857,9 @@ mod tests {
         let code =
             RecoveryCodeRecord::prepare("person", "batch", "random-salt", "SECRET-CODE").unwrap();
         let facts = vec![
+            AccountAuthFact::RootCustody(
+                CustodiedAccountRootRecord::new("person", "sealed-root", 1).unwrap(),
+            ),
             AccountAuthFact::Email(email),
             AccountAuthFact::WebAuthn(webauthn),
             AccountAuthFact::RecoveryBatch(RecoveryBatchRecord {
@@ -837,6 +882,7 @@ mod tests {
         assert_eq!(state.unused_recovery_code_count("person"), 1);
 
         for kind in [
+            ROOT_CUSTODY_KIND,
             EMAIL_KIND,
             WEBAUTHN_KIND,
             RECOVERY_BATCH_KIND,

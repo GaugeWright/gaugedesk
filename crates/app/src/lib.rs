@@ -11,7 +11,9 @@
 
 pub mod account;
 pub mod account_auth;
+pub mod account_auth_ceremony;
 pub mod account_routes;
+pub mod account_session;
 pub mod account_signin;
 pub mod advancement;
 pub mod agent_question;

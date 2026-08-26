@@ -207,6 +207,7 @@ pub fn auth_routes(state: AuthShellState) -> axum::Router<SharedWorkbench> {
         // Sign-out expires the shared HttpOnly account cookie. It remains reachable
         // with an expired/absent session so logout is always idempotent cleanup.
         .route("/auth/logout", post(post_logout))
+        .merge(crate::account_auth_ceremony::routes())
         .layer(Extension(state))
 }
 
@@ -223,6 +224,7 @@ pub struct AuthShellState {
     pending_auth: Arc<Mutex<PendingAuthStore>>,
     native_handoffs: Arc<Mutex<NativeHandoffStore>>,
     login_fold: Option<LoginFold>,
+    account_auth: Option<Arc<crate::account_auth_ceremony::AccountAuthRuntime>>,
 }
 
 /// What the composition folds after a verified login (ADR 0122 §3). The shell
@@ -237,13 +239,31 @@ pub type LoginFold = Arc<dyn Fn(&mut Workbench, &str, &str, &str) + Send + Sync>
 impl AuthShellState {
     /// Empty shell state (no composition fold).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            account_auth: crate::account_auth_ceremony::AccountAuthRuntime::from_env(),
+            ..Self::default()
+        }
     }
 
     /// Register the composition's post-login fold (ADR 0122 §3).
     pub fn with_login_fold(mut self, fold: LoginFold) -> Self {
         self.login_fold = Some(fold);
         self
+    }
+
+    /// Install the provider-neutral GaugeDesk account ceremony runtime.
+    pub fn with_account_auth(
+        mut self,
+        runtime: Arc<crate::account_auth_ceremony::AccountAuthRuntime>,
+    ) -> Self {
+        self.account_auth = Some(runtime);
+        self
+    }
+
+    pub(crate) fn account_auth(
+        &self,
+    ) -> Option<Arc<crate::account_auth_ceremony::AccountAuthRuntime>> {
+        self.account_auth.clone()
     }
 
     /// In-flight OIDC login store (`ID-3`), mutable: `/auth/login` records a
@@ -890,7 +910,15 @@ pub async fn get_session(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    if wb.actor(crate::net_http::bearer(&headers)) == "anonymous" {
+    let bearer = crate::net_http::bearer(&headers);
+    if bearer.is_some_and(|token| wb.account_sessions().resolve_now(token).is_some()) {
+        return (
+            StatusCode::OK,
+            Json(json!({ "method": "passkey", "label": "Passkey or security key" })),
+        )
+            .into_response();
+    }
+    if wb.actor(bearer) == "anonymous" {
         return (
             StatusCode::UNAUTHORIZED,
             "authenticate to view this session",
@@ -915,9 +943,9 @@ pub async fn get_session(
         .into_response()
 }
 
-/// The shared web-account session cookie (`ADR 0077`) carrying the verified id-token as its
-/// value (the same credential the control plane accepts, `net_http::bearer`). Pure; the env
-/// wrapper is [`session_cookie_header`]. `domain` (e.g. `.gaugewright.com`) makes one sign-in
+/// The shared web-account session cookie (`ADR 0077`) carrying an opaque account session or a
+/// verified legacy OIDC id-token (either credential is accepted by `net_http::bearer`). Pure;
+/// the env wrapper is [`session_cookie_header`]. `domain` (e.g. `.gaugewright.com`) makes one sign-in
 /// authenticate the whole site; omitted for loopback dev (a Domain cookie can't be set on
 /// `localhost`). `HttpOnly` (no JS reads it) + `SameSite=Lax` (survives the top-level OAuth
 /// redirect, blocks CSRF on cross-site POSTs); `Secure` off only for dev.
@@ -1025,9 +1053,9 @@ fn expired_session_hint_cookie_header() -> String {
 
 /// Append both session `Set-Cookie` headers — the `HttpOnly` credential and its JS-readable
 /// hint — so the pair can never drift apart at an issue site.
-fn append_session_cookies(resp: &mut axum::response::Response, id_token: &str) {
+pub(crate) fn append_session_cookies(resp: &mut axum::response::Response, credential: &str) {
     for value in [
-        session_cookie_header(id_token),
+        session_cookie_header(credential),
         session_hint_cookie_header(),
     ] {
         if let Ok(cookie) = axum::http::HeaderValue::from_str(&value) {
@@ -1715,11 +1743,17 @@ pub async fn post_native_exchange(
     }
 }
 
-/// `POST /auth/logout` — end the browser's hosted account session. The OIDC id-token is
-/// self-contained and naturally expires server-side; logout removes the browser's only copy of
-/// it. The handler is intentionally idempotent and does not require a still-valid session, so an
-/// expired user can always return to a clean signed-out state.
-pub async fn post_logout() -> impl IntoResponse {
+/// `POST /auth/logout` — end the browser's hosted account session. Opaque GaugeDesk account
+/// sessions are revoked server-side; legacy OIDC id-tokens are self-contained and naturally
+/// expire, so logout removes the browser's copy. The handler is intentionally idempotent and
+/// does not require a still-valid session, allowing an expired user to return to a clean state.
+pub async fn post_logout(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(token) = crate::net_http::bearer(&headers) {
+        wb.lock_unpoisoned().account_sessions().revoke(token);
+    }
     let mut resp = StatusCode::NO_CONTENT.into_response();
     for value in [
         expired_session_cookie_header(),

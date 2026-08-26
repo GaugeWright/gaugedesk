@@ -204,6 +204,25 @@ impl ContentVault {
             .join(format!("{}.dek", crate::org::sha256_hex(scope)))
     }
 
+    /// Seal private account-custody material under a per-account DEK whose only
+    /// durable form is wrapped by this vault's KEK/KMS boundary.
+    pub(crate) fn seal_private(&self, scope: &str, plaintext: &str) -> Option<String> {
+        let dek = self.dek_for(scope, true)?;
+        LocalAeadEncryptor::new(dek)
+            .encrypt(plaintext.as_bytes())
+            .ok()
+            .map(hex::encode)
+    }
+
+    /// Open private account-custody material. A missing/erased/wrong DEK fails
+    /// closed without distinguishing the cause.
+    pub(crate) fn open_private(&self, scope: &str, sealed: &str) -> Option<String> {
+        let dek = self.dek_for(scope, false)?;
+        let ciphertext = hex::decode(sealed).ok()?;
+        let plaintext = LocalAeadEncryptor::new(dek).decrypt(&ciphertext).ok()?;
+        String::from_utf8(plaintext).ok()
+    }
+
     /// The per-scope DEK. `create` mints + persists one on a miss (the write path);
     /// the read path passes `false`, so a scope whose key file is gone (crypto-erased)
     /// resolves to `None` — its content is unrecoverable.
@@ -305,6 +324,22 @@ impl ContentVault {
 
     fn is_content(&self, kind: &str) -> bool {
         self.kinds.contains(kind)
+    }
+}
+
+impl Workbench {
+    /// Envelope-seal a custodied account root under its own wrapped DEK.
+    pub fn seal_custodied_account_root(&self, account_id: &str, seed: &str) -> Option<String> {
+        self.content_vault
+            .as_ref()?
+            .seal_private(&crate::account::account_scope(account_id), seed)
+    }
+
+    /// Open a custodied account root inside the private Hub boundary.
+    pub fn unseal_custodied_account_root(&self, account_id: &str, sealed: &str) -> Option<String> {
+        self.content_vault
+            .as_ref()?
+            .open_private(&crate::account::account_scope(account_id), sealed)
     }
 }
 

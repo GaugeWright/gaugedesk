@@ -76,6 +76,34 @@ pub fn req_scope(headers: &HeaderMap) -> String {
 }
 
 impl Workbench {
+    /// Resolve the provider-neutral Hub account session first, then optional
+    /// OIDC. Both yield the same durable account/authority type; neither
+    /// credential becomes the identity.
+    pub fn authenticate_bearer(&self, token: &str) -> Option<gaugedesk_core::ids::AuthorityId> {
+        self.account_sessions
+            .resolve_now(token)
+            .map(gaugedesk_core::ids::AuthorityId::new)
+            .or_else(|| self.idp.as_ref().and_then(|idp| idp.authenticate(token)))
+    }
+
+    pub fn account_sessions(&self) -> Arc<crate::account_session::AccountSessionStore> {
+        Arc::clone(&self.account_sessions)
+    }
+
+    fn identity_claims(
+        &self,
+        bearer: Option<&str>,
+        authority: &gaugedesk_core::ids::AuthorityId,
+    ) -> gaugedesk_core::abac::AuthorityAttributes {
+        if bearer.is_some_and(|token| self.account_sessions.resolve_now(token).is_some()) {
+            return gaugedesk_core::abac::AuthorityAttributes::default();
+        }
+        self.idp
+            .as_ref()
+            .map(|idp| idp.claims(authority))
+            .unwrap_or_default()
+    }
+
     /// The SCIM failed-attempt throttle (`SECAUD-8`).
     pub fn scim_throttle(&self) -> &Arc<throttle::Throttle> {
         &self.scim_throttle
@@ -148,9 +176,9 @@ impl Workbench {
             return Ok(Vec::new());
         }
 
-        let authority = if let Some(idp) = &self.idp {
+        let authority = if self.idp.is_some() || web_account_mode() {
             bearer
-                .and_then(|token| idp.authenticate(token))
+                .and_then(|token| self.authenticate_bearer(token))
                 .ok_or((StatusCode::UNAUTHORIZED, "authenticate to administer"))?
                 .as_str()
                 .to_string()
@@ -206,7 +234,7 @@ impl Workbench {
         cap: Option<gaugedesk_core::rbac::Capability>,
         org_scope: &str,
     ) -> Result<(), (StatusCode, &'static str)> {
-        let Some(idp) = &self.idp else {
+        if self.idp.is_none() && !web_account_mode() {
             if self.hosted_home_mode() {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -214,7 +242,7 @@ impl Workbench {
                 ));
             }
             return Ok(()); // single-user local: ungated
-        };
+        }
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let provisioned = org
@@ -224,7 +252,7 @@ impl Workbench {
         if !provisioned && !self.hosted_home_mode() {
             return Ok(()); // bootstrap: directory not yet provisioned
         }
-        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+        let Some(authority) = bearer.and_then(|t| self.authenticate_bearer(t)) else {
             return Err((StatusCode::UNAUTHORIZED, "authenticate to administer"));
         };
         let Some(role) = org.role_of(authority.as_str()) else {
@@ -313,7 +341,7 @@ impl Workbench {
         client: crate::client_admission::ClientBuild,
         enforce_software: bool,
     ) -> Result<String, (StatusCode, &'static str)> {
-        let Some(idp) = &self.idp else {
+        if self.idp.is_none() && !web_account_mode() {
             if self.hosted_home_mode() {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -322,13 +350,13 @@ impl Workbench {
             }
             // single-user local / loopback: the operator's own channel.
             return Ok(self.authority().as_str().to_string());
-        };
+        }
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
-        let authority = bearer.and_then(|t| idp.authenticate(t));
-        // Hosted web account (ADR 0077): the session — a verified id-token (header or the
-        // shared `.gaugewright.com` cookie) — **is** the authorization. Every request must carry
-        // one; there is **no bootstrap-passthrough** here, because the "directory" is per-person
+        let authority = bearer.and_then(|t| self.authenticate_bearer(t));
+        // Hosted web account (ADR 0077): an opaque GaugeDesk session or legacy verified id-token
+        // (header or shared `.gaugewright.com` cookie) is the authorization. Every request must
+        // carry one; there is **no bootstrap-passthrough** here, because the "directory" is per-person
         // tenants, not the default org scope (so the `provisioned` check below is always false and
         // would otherwise leave `/account/*` open to anonymous callers). Fail-closed (`INV-20`).
         // The authenticated authority IS the person; per-person account-scope isolation is layered
@@ -414,7 +442,7 @@ impl Workbench {
         &self,
         bearer: Option<&str>,
     ) -> Result<gaugedesk_core::ids::AuthorityId, (StatusCode, &'static str)> {
-        let Some(idp) = &self.idp else {
+        if self.idp.is_none() && !web_account_mode() {
             if self.hosted_home_mode() {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -422,11 +450,13 @@ impl Workbench {
                 ));
             }
             return Ok(self.authority().clone());
-        };
-        bearer.and_then(|token| idp.authenticate(token)).ok_or((
-            StatusCode::UNAUTHORIZED,
-            "authenticate to accept this invitation",
-        ))
+        }
+        bearer
+            .and_then(|token| self.authenticate_bearer(token))
+            .ok_or((
+                StatusCode::UNAUTHORIZED,
+                "authenticate to accept this invitation",
+            ))
     }
 
     /// **ENTSEC-2** ([ADR 0065]): the set of projects a request's caller may **see** in the
@@ -450,12 +480,12 @@ impl Workbench {
         bearer: Option<&str>,
         org_scope: &str,
     ) -> ProjectVisibility {
-        let Some(idp) = &self.idp else {
+        if self.idp.is_none() && !web_account_mode() {
             if self.hosted_home_mode() {
                 return ProjectVisibility::Only(BTreeSet::new());
             }
             return ProjectVisibility::All; // solo / loopback: the operator's own channel
-        };
+        }
         let Ok(org) = org::Org::rebuild_in(self.store_ref(), org_scope) else {
             return ProjectVisibility::Only(BTreeSet::new()); // directory unreadable: leak nothing
         };
@@ -469,7 +499,7 @@ impl Workbench {
         if !provisioned {
             return ProjectVisibility::All; // bootstrap: nothing to scope against yet
         }
-        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+        let Some(authority) = bearer.and_then(|t| self.authenticate_bearer(t)) else {
             return ProjectVisibility::Only(BTreeSet::new()); // unauthenticated: leak nothing
         };
         match org.role_of(authority.as_str()) {
@@ -550,10 +580,10 @@ impl Workbench {
         target_team: Option<&str>,
         org_scope: &str,
     ) -> bool {
-        let Some(idp) = &self.idp else {
+        if self.idp.is_none() && !web_account_mode() {
             return true; // single-user local: ungated
-        };
-        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+        }
+        let Some(authority) = bearer.and_then(|t| self.authenticate_bearer(t)) else {
             return false;
         };
         let Ok(org) = org::Org::rebuild_in(self.store_ref(), org_scope) else {
@@ -576,12 +606,13 @@ impl Workbench {
     /// authenticate); in single-user local mode this control plane's own authority.
     /// Used to attribute audit entries to their actor (`INV-21`).
     pub fn actor(&self, bearer: Option<&str>) -> String {
-        match &self.idp {
-            Some(idp) => bearer
-                .and_then(|t| idp.authenticate(t))
-                .map(|a| a.as_str().to_string())
-                .unwrap_or_else(|| "anonymous".to_string()),
-            None => self.authority().as_str().to_string(),
+        if self.idp.is_some() || web_account_mode() {
+            bearer
+                .and_then(|token| self.authenticate_bearer(token))
+                .map(|authority| authority.as_str().to_string())
+                .unwrap_or_else(|| "anonymous".to_string())
+        } else {
+            self.authority().as_str().to_string()
         }
     }
 
@@ -632,9 +663,9 @@ impl Workbench {
         bearer: Option<&str>,
         org_scope: &str,
     ) -> Result<(), (StatusCode, &'static str)> {
-        let Some(idp) = &self.idp else {
+        if self.idp.is_none() && !web_account_mode() {
             return Ok(()); // single-user local: ungated
-        };
+        }
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let provisioned = org
@@ -644,7 +675,7 @@ impl Workbench {
         if !provisioned {
             return Ok(());
         }
-        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+        let Some(authority) = bearer.and_then(|t| self.authenticate_bearer(t)) else {
             return Err((StatusCode::UNAUTHORIZED, "authenticate to export"));
         };
         let Some(role) = org.role_of(authority.as_str()) else {
@@ -697,9 +728,9 @@ impl Workbench {
         res_id: &gaugedesk_core::resource::ResourceId,
         org_scope: &str,
     ) -> Result<(), (StatusCode, &'static str)> {
-        let Some(idp) = &self.idp else {
+        if self.idp.is_none() && !web_account_mode() {
             return Ok(()); // single-user local / loopback: ungated
-        };
+        }
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let provisioned = org
@@ -709,10 +740,11 @@ impl Workbench {
         if !provisioned {
             return Ok(());
         }
-        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+        let Some(authority) = bearer.and_then(|t| self.authenticate_bearer(t)) else {
             return Err((StatusCode::UNAUTHORIZED, "authenticate to export"));
         };
-        let actor = org.with_directory_role(idp.claims(&authority), authority.as_str());
+        let actor =
+            org.with_directory_role(self.identity_claims(bearer, &authority), authority.as_str());
         // A local/unattested egress edge: a `Pii` resource requires an attested ceiling,
         // so it is denied here (an attested boundary integration would pass `true`).
         let context = gaugedesk_core::abac::Context {
@@ -768,9 +800,9 @@ impl Workbench {
         res_id: &gaugedesk_core::resource::ResourceId,
         org_scope: &str,
     ) -> Result<(), (StatusCode, &'static str)> {
-        let Some(idp) = &self.idp else {
+        if self.idp.is_none() && !web_account_mode() {
             return Ok(()); // single-user local / loopback: ungated
-        };
+        }
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let provisioned = org
@@ -780,10 +812,11 @@ impl Workbench {
         if !provisioned {
             return Ok(());
         }
-        let Some(authority) = bearer.and_then(|t| idp.authenticate(t)) else {
+        let Some(authority) = bearer.and_then(|t| self.authenticate_bearer(t)) else {
             return Err((StatusCode::UNAUTHORIZED, "authenticate to grant access"));
         };
-        let actor = org.with_directory_role(idp.claims(&authority), authority.as_str());
+        let actor =
+            org.with_directory_role(self.identity_claims(bearer, &authority), authority.as_str());
         let context = gaugedesk_core::abac::Context {
             ceiling_attested: false,
         };
@@ -807,5 +840,40 @@ impl Workbench {
                 "resource access policy could not be evaluated",
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_neutral_identity_tests {
+    use super::*;
+    use gaugedesk_core::abac::{AuthorityAttributes, Role};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn account_session_never_inherits_claims_from_a_colliding_idp_authority() {
+        let account_id = gaugedesk_core::ids::AuthorityId::new("person-root");
+        let idp = crate::identity::LoopbackIdentityProvider::new().enroll(
+            "oidc-token",
+            account_id.clone(),
+            AuthorityAttributes {
+                roles: BTreeSet::from([Role::admin()]),
+                ..AuthorityAttributes::default()
+            },
+        );
+        let wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
+            .with_identity_provider(Arc::new(idp));
+        let account_token = wb
+            .account_sessions()
+            .issue("person-root", crate::account_session::unix_now(), 60)
+            .unwrap();
+
+        assert!(wb
+            .identity_claims(Some(&account_token), &account_id)
+            .roles
+            .is_empty());
+        assert!(wb
+            .identity_claims(Some("oidc-token"), &account_id)
+            .roles
+            .contains(&Role::admin()));
     }
 }
