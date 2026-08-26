@@ -157,6 +157,13 @@ run_contracts() {
         exit 1
     }
     mkdocs build --strict
+    # Rendered from tools/docs-theme/repo-check.mjs in the GaugeWright
+    # repository, which owns the documentation theme (DR-0093). It verifies both
+    # that this repository still carries what was rendered into it and that the
+    # theme reached the built page: --strict fails on a missing custom_dir but
+    # resolves neither extra_css nor a template's own references, so a build that
+    # lost its stylesheet, mark, or faces exits zero.
+    node scripts/check-docs-theme.mjs
 }
 
 run_rust() {
