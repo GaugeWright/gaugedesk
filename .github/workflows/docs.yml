@@ -14,6 +14,9 @@ on:
     paths:
       - 'docs/**'
       - 'mkdocs.yml'
+      # The theme's custom_dir. A masthead change touches only this, and without
+      # it here that change would never reach the deployed site.
+      - 'overrides/**'
   workflow_dispatch: {}
 
 permissions:

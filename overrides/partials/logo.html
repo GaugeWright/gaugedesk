@@ -1,0 +1,12 @@
+{#-
+  The GaugeWright masthead signature, drawn the same way gaugewright.com draws
+  it: the ring mark, the company name, and beneath the name the rule-and-diamond
+  figure. Material renders this partial in both the header and the drawer title,
+  so the sizing below is expressed once in `assets/brand.css` for each context.
+
+  Overriding this partial rather than `header.html` keeps the coupling to the
+  theme down to the eight lines Material generates here. The link's accessible
+  name stays the site name, which is what the header's own anchor sets.
+-#}
+<img class="gw-signature-mark" src="{{ 'assets/mark-clear-64.png' | url }}" alt="" width="26" height="26">
+<span class="gw-signature-word">GaugeWright<span class="gw-signature-orn" role="presentation"><span class="gw-signature-d"></span></span></span>

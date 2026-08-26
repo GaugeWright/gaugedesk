@@ -118,11 +118,20 @@
 :root {
   --gw-navy: #0e2d50;
   --gw-blue: #1f61c4;
+  --gw-gold: #c6952f;
+  /* The hairline the masthead signature and the site's dividers both draw. */
+  --gw-rule: color-mix(in srgb, var(--gw-gold) 62%, transparent);
   --gw-serif: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
   --md-text-font: "IBM Plex Serif", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
   --md-code-font: "CommitMono", "Commit Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
+  /* The theme's primary is `custom`, so every surface Material paints with it —
+     the header, the drawer title, the repository label — takes its colour from
+     here. Only the two Material actually reads are derived. */
   --md-primary-fg-color: var(--gw-navy);
+  --md-primary-fg-color--dark: #0a2140;
+  --md-primary-bg-color: #ffffff;
+  --md-primary-bg-color--light: #ffffffb3;
   --md-accent-fg-color: var(--gw-blue);
   --md-typeset-a-color: var(--gw-blue);
 
@@ -141,7 +150,9 @@
 
 /* Dark scheme: lighten accents for contrast on deep navy. */
 [data-md-color-scheme="slate"] {
+  /* The marketing site's own page background, so the two headers are one colour. */
   --md-primary-fg-color: #142238;
+  --md-primary-fg-color--dark: #0e1929;
   --md-accent-fg-color: #5f9bee;
   --md-typeset-a-color: #6aa3ff;
 }
@@ -200,9 +211,104 @@
 }
 .status.available { color: #2e9e6b; border-color: #2e9e6b66; background: #2e9e6b14; }
 .status.built     { color: #1f61c4; border-color: #1f61c466; background: #1f61c414; }
-.status.planned   { color: #c6952f; border-color: #c6952f66; background: #c6952f14; }
+.status.planned   { color: var(--gw-gold); border-color: #c6952f66; background: #c6952f14; }
 .status.none      { color: #b5342b; border-color: #b5342b66; background: #b5342b14; }
 [data-md-color-scheme="slate"] .status.available { color: #7fd6a6; }
 [data-md-color-scheme="slate"] .status.built     { color: #6aa3ff; }
 [data-md-color-scheme="slate"] .status.planned   { color: #e0b24e; }
 [data-md-color-scheme="slate"] .status.none      { color: #e87b74; }
+
+/* ---- The masthead signature ----------------------------------------------
+   gaugewright.com draws the company name as a signature rather than a boxed
+   logo: the ring mark, the name in the chrome face, and beneath the name the
+   same rule-and-diamond figure its section dividers carry. Material's default
+   masthead is an icon and a bold site name, so overrides/partials/logo.html
+   supplies the signature's markup and this draws it.
+
+   Every measurement derives from `--gw-sig-name`, the size of the name, in the
+   proportions the site uses: the mark runs 1.3x the name, the rule hangs 0.15x
+   beneath it, and the diamond is 0.2x. Setting that one value re-draws the
+   whole lockup, which is how the drawer below gets a larger copy.
+   ------------------------------------------------------------------------ */
+
+/* Both selectors carry Material's own specificity — `.md-header__button` sets
+   `display: inline-block` on every header button, and a bare `.md-logo` loses
+   to it. The lockup is a row, not an icon, so it has to win. */
+.md-header__button.md-logo,
+.md-nav__title .md-nav__button.md-logo {
+  --gw-sig-name: 1rem;
+  display: flex;
+  align-items: center;
+  gap: calc(var(--gw-sig-name) * 0.5);
+  width: auto;
+}
+
+/* Overrides Material's 1.2rem/2.4rem icon heights, which are sized for a square
+   glyph rather than a lockup. */
+.md-header__button.md-logo img.gw-signature-mark,
+.md-nav__title .md-nav__button.md-logo img.gw-signature-mark {
+  height: calc(var(--gw-sig-name) * 1.3);
+  width: calc(var(--gw-sig-name) * 1.3);
+  object-fit: contain;
+  flex: none;
+}
+
+.gw-signature-word {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: stretch;
+  /* The rule hangs about a descender's depth below the tail of the g. */
+  gap: calc(var(--gw-sig-name) * 0.15);
+  font-family: var(--gw-serif);
+  font-size: var(--gw-sig-name);
+  font-weight: 400;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.gw-signature-orn {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--gw-sig-name) * 0.3);
+}
+.gw-signature-orn::before,
+.gw-signature-orn::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--gw-rule));
+}
+.gw-signature-orn::after {
+  background: linear-gradient(90deg, var(--gw-rule), transparent);
+}
+.gw-signature-d {
+  width: calc(var(--gw-sig-name) * 0.2);
+  height: calc(var(--gw-sig-name) * 0.2);
+  flex: none;
+  transform: rotate(45deg);
+  border: 1px solid var(--gw-rule);
+}
+
+/* Header: the signature sits where Material's icon sat, and the site name keeps
+   its place to the right. Material's padding is sized for a square icon and
+   would push the header past its 2.4rem row. */
+.md-header__button.md-logo {
+  padding: 0.2rem 0.1rem;
+}
+
+/* Below the tablet breakpoint the header also carries the hamburger and the
+   search control, and a lockup wide enough to read leaves the page title a
+   couple of ellipsed words. The header keeps the mark there; the drawer it
+   opens carries the whole signature. */
+@media screen and (max-width: 59.9375em) {
+  .md-header__button.md-logo .gw-signature-word {
+    display: none;
+  }
+}
+
+/* Drawer: Material pins the logo across the top of the title block and sizes it
+   for a 2.4rem icon, so the signature is drawn larger there and centred. */
+.md-nav--primary .md-nav__title .md-logo {
+  --gw-sig-name: 1.4rem;
+  justify-content: center;
+}

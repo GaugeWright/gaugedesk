@@ -8,19 +8,28 @@ site_dir: site
 
 theme:
   name: material
+  # The masthead is the GaugeWright signature, drawn as gaugewright.com draws it.
+  # It replaces Material's default logo icon through overrides/partials/logo.html.
+  custom_dir: overrides
   # Brand fonts are self-hosted from docs/assets/brand.css. Disabling Material's
   # loader avoids requesting Commit Mono from Google Fonts, where it is absent.
   font: false
   palette:
     # Navy-led by default (matches the marketing site). Light is a toggle.
+    #
+    # `custom` rather than a named Material primary: `black` carries its own
+    # `.md-header { background-color: ... }` rule, which beat the navy declared
+    # in assets/brand.css and left the header near-black while the stylesheet
+    # said otherwise. With `custom`, Material emits no primary block and the
+    # surfaces below take --md-primary-* from brand.css.
     - scheme: slate
-      primary: black
+      primary: custom
       accent: blue
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
     - scheme: default
-      primary: black
+      primary: custom
       accent: blue
       toggle:
         icon: material/brightness-7
