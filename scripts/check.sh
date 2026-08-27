@@ -143,14 +143,18 @@ run_contracts() {
     python3 scripts/audit-gate.py
 
     # `validation.anchors: warn` in mkdocs.yml only rejects a broken heading
-    # link if something runs the strict build *before* the merge. Until this,
-    # nothing did: `docs.yml` builds on push to `main`, so the deploy log was
-    # the first place a broken link could appear, and by then the change that
-    # introduced it had already landed. It runs in `contracts` because that is
-    # the section whose gate already installs `docs/requirements.txt` (DOCS-1).
+    # link if something runs the strict build *before* the merge, and for a
+    # while nothing did: the deploy log was the first place a broken link could
+    # appear, and by then the change that introduced it had already landed. It
+    # runs in `contracts` because that is the section whose gate already
+    # installs `docs/requirements.txt` (DOCS-1).
     #
-    # Output goes to the gitignored `site/`, the same directory `docs.yml`
-    # deploys from, so a local run and the deploy build produce the same thing.
+    # This is now the only strict build of these docs that runs on a change to
+    # them. The site is composed and published from gaugewright-site (DR-0094),
+    # which cannot observe this repository, so a broken build caught here is
+    # caught before it reaches a publish rather than by one.
+    #
+    # Output goes to the gitignored `site/`.
     echo "== documentation =="
     command -v mkdocs >/dev/null || {
         echo "mkdocs is not installed; run: python3 -m pip install -r docs/requirements.txt" >&2
