@@ -78,6 +78,7 @@ fn workbench_with_idp_shared() -> (tempfile::TempDir, Router, Arc<Mutex<Workbenc
             ("member-auth", "member", None),
             ("viewer-auth", "viewer", None),
             ("admin-a", "admin", Some("A")),
+            ("auditor-auth", "auditor", None),
             ("billing-auth", "billing", None),
             ("alice", "member", Some("A")),
             ("bob", "member", Some("B")),
@@ -104,6 +105,11 @@ fn workbench_with_idp_shared() -> (tempfile::TempDir, Router, Arc<Mutex<Workbenc
         .enroll(
             "admin-a-token",
             AuthorityId::new("admin-a"),
+            AuthorityAttributes::default(),
+        )
+        .enroll(
+            "auditor-token",
+            AuthorityId::new("auditor-auth"),
             AuthorityAttributes::default(),
         )
         .enroll(
@@ -492,7 +498,22 @@ async fn capability_discovery_is_tenant_scoped_and_role_derived() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(owner["capabilities"].as_array().unwrap().len(), 7);
+    // ADR 0149: the matrix grew to nine capabilities; the owner holds every one.
+    assert_eq!(owner["capabilities"].as_array().unwrap().len(), 9);
+    {
+        let owner_caps = owner["capabilities"].as_array().unwrap();
+        for expected in [
+            "manage_org_lifecycle",
+            "grant_privileged_roles",
+            "manage_billing",
+            "view_audit",
+        ] {
+            assert!(
+                owner_caps.iter().any(|c| c == expected),
+                "owner should hold {expected}"
+            );
+        }
+    }
     assert_eq!(owner["agent"]["message_attachments"], false);
     assert_eq!(owner["agent"]["additional_tools"], false);
     assert_eq!(
@@ -517,6 +538,47 @@ async fn capability_discovery_is_tenant_scoped_and_role_derived() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(member["capabilities"], serde_json::json!([]));
     assert_eq!(member["agent"]["tools"], serde_json::json!([]));
+
+    // ADR 0149 §1/§2: admin operates the console but holds neither the owner-only
+    // lifecycle/privileged-grant capabilities nor billing.
+    let (status, admin) = send(
+        &app,
+        "GET",
+        "/admin/capabilities",
+        None,
+        Some("admin-a-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let admin_caps = admin["capabilities"].as_array().unwrap();
+    for denied in [
+        "manage_org_lifecycle",
+        "grant_privileged_roles",
+        "manage_billing",
+    ] {
+        assert!(
+            !admin_caps.iter().any(|c| c == denied),
+            "admin must not hold {denied}"
+        );
+    }
+    for held in ["manage_members", "configure_sso", "view_audit"] {
+        assert!(
+            admin_caps.iter().any(|c| c == held),
+            "admin should hold {held}"
+        );
+    }
+
+    // ADR 0149 §3: the read-only auditor holds view_audit and nothing else.
+    let (status, auditor) = send(
+        &app,
+        "GET",
+        "/admin/capabilities",
+        None,
+        Some("auditor-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(auditor["capabilities"], serde_json::json!(["view_audit"]));
 
     let (status, billing) = send(
         &app,
@@ -544,6 +606,84 @@ async fn capability_discovery_is_tenant_scoped_and_role_derived() {
 
     let (status, _) = send(&app, "GET", "/admin/capabilities", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// ADR 0149 §1 (SOC 2 F-2.5): granting a privileged role is owner-only. An admin holds
+/// `ManageMembers` but not `GrantPrivilegedRoles`, so it can neither seed nor elevate a
+/// principal into `owner`/`admin`; the owner can; and SCIM may never map a group into a
+/// privileged role. The target-role gate lives in the command planner, so the denial
+/// surfaces at submit before any proposal becomes durable.
+#[tokio::test]
+async fn privileged_role_grants_are_owner_only_and_scim_refuses_them() {
+    let (_dir, app) = workbench_with_idp();
+
+    // An admin cannot invite directly into a privileged role…
+    let (s, body) = admin(
+        &app,
+        Some("admin-a-token"),
+        "administration.access",
+        "member.invite",
+        serde_json::json!({"authority": "new-admin", "role": "admin"}),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "admin must not invite an admin: {body}"
+    );
+
+    // …nor elevate an existing (team-A) member to a privileged role (self-/lateral
+    // escalation is closed even inside the admin's own team scope).
+    let (s, body) = admin(
+        &app,
+        Some("admin-a-token"),
+        "administration.access",
+        "member.role.set",
+        serde_json::json!({"id": "alice", "role": "owner"}),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "admin must not elevate a member to owner: {body}"
+    );
+
+    // The owner holds GrantPrivilegedRoles and may assign the admin role.
+    let (s, body) = admin(
+        &app,
+        Some("owner-token"),
+        "administration.access",
+        "member.role.set",
+        serde_json::json!({"id": "member-auth", "role": "admin"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "owner may grant the admin role: {body}");
+
+    // SCIM group→role mapping refuses a privileged target…
+    let (s, body) = admin(
+        &app,
+        Some("owner-token"),
+        "administration.identity",
+        "group-mapping.set",
+        serde_json::json!({"group": "eng-leads", "role": "admin"}),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "SCIM must not map a group into admin: {body}"
+    );
+
+    // …while a non-privileged mapping is accepted.
+    let (s, body) = admin(
+        &app,
+        Some("owner-token"),
+        "administration.identity",
+        "group-mapping.set",
+        serde_json::json!({"group": "eng", "role": "member"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "SCIM maps a group into member: {body}");
 }
 
 #[tokio::test]

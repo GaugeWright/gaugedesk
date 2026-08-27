@@ -23,8 +23,8 @@ use gaugedesk_core::abac::Policy;
 use gaugedesk_core::rbac::Capability;
 
 use gaugedesk_app::org::{
-    is_valid_role, ArchetypeApprovalPolicyRecord, GroupMappingRecord, MemberGrantRecord,
-    MembershipRecord, MembershipStatus, Org, OrgRecord, PolicyRecord, RecordOp,
+    is_privileged_role, is_valid_role, ArchetypeApprovalPolicyRecord, GroupMappingRecord,
+    MemberGrantRecord, MembershipRecord, MembershipStatus, Org, OrgRecord, PolicyRecord, RecordOp,
     SecurityPolicyRecord, SoftwarePolicyRecord, SsoConnectionRecord, ORG_ID,
 };
 use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
@@ -433,6 +433,15 @@ pub async fn post_member(
     if !is_valid_role(&body.role) {
         return unprocessable(&format!("unknown role {:?}", body.role));
     }
+    // ADR 0149 §1: inviting a member directly into a privileged role (`owner`/`admin`)
+    // is a role grant, which requires the owner-only `GrantPrivilegedRoles` capability
+    // in addition to `ManageMembers`. An admin (which lacks it) cannot seed a privileged
+    // principal; fail-closed.
+    if is_privileged_role(&body.role) {
+        if let Some(resp) = deny(&wb, &headers, Some(Capability::GrantPrivilegedRoles)) {
+            return resp;
+        }
+    }
     if body.authority.trim().is_empty() {
         return unprocessable("authority is required");
     }
@@ -480,6 +489,16 @@ pub async fn post_member_role(
     let Some(existing) = org.members.get(&id) else {
         return (StatusCode::NOT_FOUND, "no such member").into_response();
     };
+    // ADR 0149 §1: elevating a principal *to* a privileged role (`owner`/`admin`) — the
+    // target role, regardless of the member's current one — requires the owner-only
+    // `GrantPrivilegedRoles` capability, over and above `ManageMembers`. This is the
+    // separation-of-duties gate that stops an admin from elevating anyone, including
+    // itself, to `owner`/`admin` (self- and lateral-escalation). Fail-closed.
+    if is_privileged_role(&body.role) {
+        if let Some(resp) = deny(&wb, &headers, Some(Capability::GrantPrivilegedRoles)) {
+            return resp;
+        }
+    }
     if !wb.team_scope_ok_in(
         bearer(&headers),
         existing.team.as_deref(),
@@ -650,6 +669,15 @@ pub async fn post_group_mapping(
 ) -> impl IntoResponse {
     if !is_valid_role(&body.role) {
         return unprocessable(&format!("unknown role {:?}", body.role));
+    }
+    // ADR 0149 §1: SCIM may never confer a privileged role. Refuse mapping a group into
+    // `owner`/`admin` at the config boundary (fail-closed); `role_for_groups` also drops
+    // any such mapping at read time as defense-in-depth.
+    if is_privileged_role(&body.role) {
+        return unprocessable(&format!(
+            "cannot map a group into the privileged role {:?}; owner/admin are owner-granted only",
+            body.role
+        ));
     }
     let mut wb = wb.lock_unpoisoned();
     if let Some(resp) = deny(&wb, &headers, Some(Capability::ConfigureProvisioning)) {

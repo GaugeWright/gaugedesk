@@ -19,7 +19,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::facility::{FacilityKind, FacilityOwner, FacilityRecord, FacilityStatus};
+use crate::workbench_auth::deny;
 use crate::{err_response, net_http, LockUnpoisoned, SharedWorkbench};
+use gaugedesk_core::rbac::Capability;
 
 /// The account-owner facility + tenant routes (ungated on loopback; the hub adds auth on top).
 pub fn routes() -> Router<SharedWorkbench> {
@@ -243,6 +245,17 @@ pub async fn delete_tenant(
             "authenticate to delete an organization",
         )
             .into_response();
+    }
+    // ADR 0149 §1 (SOC 2 F-2.5): ending or handing off the tenant is the owner-only
+    // `ManageOrgLifecycle` duty — an operational admin cannot delete/transfer the org.
+    // This org-console capability gate layers on top of the account-tenancy owner check
+    // that `delete_organization_in` already enforces (`Refusal::NotAnOwner`). It reads
+    // the request tenant's org directory: on the single-user/loopback desktop (no IdP)
+    // and against an unprovisioned directory it is a no-op, so the personal/solo path is
+    // unchanged; in a provisioned hosted org it requires `ManageOrgLifecycle`. The same
+    // capability governs an ownership-transfer route once one exists (none does yet).
+    if let Some(resp) = deny(&wb, &headers, Some(Capability::ManageOrgLifecycle)) {
+        return resp;
     }
     // Deleting also crypto-erases the tenant scope's content (SOC 2 finding 4.5 /
     // DR-0086): the command tombstones the org/membership/switcher records, then the

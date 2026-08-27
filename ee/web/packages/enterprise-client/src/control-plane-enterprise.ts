@@ -6,8 +6,13 @@ import {
 
 export type { PlacementPolicy } from "@gaugewright/control-plane-client";
 
-/** Stable server-derived Administration capabilities (`ADMIN-ENV-2`). */
+/** Stable server-derived Administration capabilities (`ADMIN-ENV-2`). The two
+ *  owner-only capabilities (`manage_org_lifecycle`, `grant_privileged_roles`) and the
+ *  read-only `auditor` role's `view_audit` are the ADR 0149 separation-of-duties
+ *  split; these names mirror `crate::core::rbac::Capability::as_str`. */
 export type AdminCapability =
+    | "manage_org_lifecycle"
+    | "grant_privileged_roles"
     | "edit_org_settings"
     | "manage_members"
     | "configure_sso"

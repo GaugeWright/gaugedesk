@@ -133,7 +133,10 @@ pub async fn post_invitation(
         || body.project.trim().is_empty()
         || !crate::account_routes::secure_home_endpoint(&body.endpoint)
         || !is_valid_role(&body.role)
-        || matches!(body.role.as_str(), "owner" | "admin" | "billing")
+        || matches!(
+            body.role.as_str(),
+            "owner" | "admin" | "auditor" | "billing"
+        )
     {
         return json_error(
             StatusCode::UNPROCESSABLE_ENTITY,

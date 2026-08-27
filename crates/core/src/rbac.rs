@@ -1,5 +1,7 @@
 //! Coarse RBAC for the **admin-console surface** — the workspace-administration
-//! capability matrix (M3 `RBAC-3`, [ADR 0043](../../../specs/decisions/0043-enterprise-readiness-mid-market.md) §2).
+//! capability matrix (M3 `RBAC-3`, [ADR 0043](../../../specs/decisions/0043-enterprise-readiness-mid-market.md) §2,
+//! separated into owner / admin / auditor / billing duties by
+//! [ADR 0149](../../../specs/decisions/0149-the-org-console-separates-owner-admin-and-auditor-duties.md)).
 //!
 //! Two distinct role mechanisms live under "roles are coarse ABAC" (ADR 0032), and
 //! they have **opposite default polarity** on purpose:
@@ -15,8 +17,14 @@
 //!   the restrict-only evaluator (default-allow-then-narrow) would fail *open*.
 //!
 //! Both are "roles as attributes", not a parallel permission system: the fixed roles
-//! are the same `owner`/`admin`/`member`/`viewer`/`billing` set, and custom roles +
-//! a policy-authoring surface stay upmarket (ADR 0043 §3).
+//! are the same `owner`/`admin`/`auditor`/`member`/`viewer`/`billing` set, and custom
+//! roles + a policy-authoring surface (and a finer `security-admin` tier, ADR 0149 §5)
+//! stay upmarket (ADR 0043 §3).
+//!
+//! ADR 0149 breaks the privileged tier apart: `owner` ⊋ `admin` (the two owner-only
+//! capabilities [`Capability::ManageOrgLifecycle`] and [`Capability::GrantPrivilegedRoles`]
+//! are removed from `admin`), `admin` loses [`Capability::ManageBilling`], the read-only
+//! `auditor` holds only [`Capability::ViewAudit`], and `billing` stays spend-only.
 //!
 //! See [`specs/primitives/organization.md`](../../../specs/primitives/organization.md)
 //! and [`specs/models/rbac.qnt`](../../../specs/models/rbac.qnt) (the Quint oracle).
@@ -27,9 +35,20 @@ use crate::abac::Role;
 /// a role holds a capability only if [`role_can`] lists it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Capability {
+    /// Delete/terminate the org or transfer ownership (ADR 0149 §1). **Owner-only** —
+    /// an operational admin cannot end or hand off the tenant.
+    ManageOrgLifecycle,
+    /// Assign the `owner` or `admin` role — grant a *privileged* role (ADR 0149 §1).
+    /// **Owner-only.** `admin`'s [`Capability::ManageMembers`] covers assigning the
+    /// non-privileged roles; elevating a principal to `owner`/`admin` requires this,
+    /// closing self- and lateral-escalation by an admin.
+    GrantPrivilegedRoles,
     /// Edit org profile / verified domains / default region (B10).
     EditOrgSettings,
-    /// Invite / assign-role / deactivate members (B11).
+    /// Invite / assign-role / deactivate members (B11) — the **non-privileged** roles
+    /// only (`member`/`viewer`/`billing`/`auditor`). Elevating to `owner`/`admin`
+    /// requires [`Capability::GrantPrivilegedRoles`] (ADR 0149 §1); the target-role
+    /// gate lives in the assign-role handler.
     ManageMembers,
     /// Connect an IdP, run test-connection, toggle enforce-SSO (B12).
     ConfigureSso,
@@ -45,7 +64,9 @@ pub enum Capability {
 
 impl Capability {
     /// Every capability — the iteration surface the model/tests quantify over.
-    pub const ALL: [Capability; 7] = [
+    pub const ALL: [Capability; 9] = [
+        Capability::ManageOrgLifecycle,
+        Capability::GrantPrivilegedRoles,
         Capability::EditOrgSettings,
         Capability::ManageMembers,
         Capability::ConfigureSso,
@@ -59,6 +80,8 @@ impl Capability {
     /// of the enterprise client/server contract, not UI labels.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Capability::ManageOrgLifecycle => "manage_org_lifecycle",
+            Capability::GrantPrivilegedRoles => "grant_privileged_roles",
             Capability::EditOrgSettings => "edit_org_settings",
             Capability::ManageMembers => "manage_members",
             Capability::ConfigureSso => "configure_sso",
@@ -70,23 +93,44 @@ impl Capability {
     }
 }
 
-/// Whether `role` may perform `cap`. The fixed matrix (admin-console.md):
+/// Whether `role` may perform `cap`. The fixed matrix (ADR 0149 §4, admin-console.md):
 ///
-/// - `owner` / `admin` — all capabilities (the full console).
-/// - `billing` — only [`Capability::ManageBilling`] (B16).
+/// - `owner` — every capability (the full console; `owner` ⊋ `admin`).
+/// - `admin` — everything **except** the two owner-only capabilities
+///   ([`Capability::ManageOrgLifecycle`], [`Capability::GrantPrivilegedRoles`]) **and**
+///   [`Capability::ManageBilling`]: it operates the org but cannot end/hand it off,
+///   elevate a principal to `owner`/`admin`, or control spend.
+/// - `auditor` — only [`Capability::ViewAudit`] (the read-only separation-of-duties
+///   reader; no write capability of any kind).
+/// - `billing` — only [`Capability::ManageBilling`] (B16; spend-only).
 /// - `member` / `viewer` — none (no console at all).
 /// - any other / unknown role — none (fail-closed, `INV-20`).
 pub fn role_can(role: &Role, cap: Capability) -> bool {
+    use Capability::*;
     match role.as_str() {
-        "owner" | "admin" => true,
-        "billing" => cap == Capability::ManageBilling,
+        "owner" => true,
+        // admin holds the full console minus the owner-only lifecycle/grant duties and
+        // billing (ADR 0149 §1, §2): default-deny, so only the listed capabilities.
+        "admin" => matches!(
+            cap,
+            EditOrgSettings
+                | ManageMembers
+                | ConfigureSso
+                | ConfigureProvisioning
+                | ConfigureSecurity
+                | ViewAudit
+        ),
+        // The read-only auditor (ADR 0149 §3): audit read/export, nothing else.
+        "auditor" => cap == ViewAudit,
+        "billing" => cap == ManageBilling,
         // member, viewer, and every unrecognized role: no admin capabilities.
         _ => false,
     }
 }
 
 /// Whether `role` may open the admin console at all — i.e. holds *some* capability.
-/// `member`/`viewer`/unknown see no console; `billing` sees only its billing surface.
+/// `member`/`viewer`/unknown see no console; `billing` sees only its billing surface;
+/// `auditor` sees only the audit surface.
 pub fn can_access_console(role: &Role) -> bool {
     Capability::ALL.iter().any(|&cap| role_can(role, cap))
 }
@@ -97,12 +141,47 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
-    fn owner_and_admin_have_every_capability() {
-        for role in [Role::owner(), Role::admin()] {
-            for cap in Capability::ALL {
-                assert!(role_can(&role, cap), "{role:?} should hold {cap:?}");
-            }
+    fn owner_has_every_capability() {
+        let owner = Role::owner();
+        for cap in Capability::ALL {
+            assert!(role_can(&owner, cap), "owner should hold {cap:?}");
         }
+    }
+
+    #[test]
+    fn admin_has_everything_except_owner_only_and_billing() {
+        // ADR 0149 §1/§2: admin loses ManageOrgLifecycle, GrantPrivilegedRoles, and
+        // ManageBilling; it keeps the operational configuration + audit-read set.
+        let admin = Role::admin();
+        let denied = [
+            Capability::ManageOrgLifecycle,
+            Capability::GrantPrivilegedRoles,
+            Capability::ManageBilling,
+        ];
+        for cap in Capability::ALL {
+            assert_eq!(
+                role_can(&admin, cap),
+                !denied.contains(&cap),
+                "admin holds {cap:?}?"
+            );
+        }
+        // Explicit: the separation-of-duties reductions ADR 0149 turns on.
+        assert!(!role_can(&admin, Capability::ManageBilling));
+        assert!(!role_can(&admin, Capability::ManageOrgLifecycle));
+        assert!(!role_can(&admin, Capability::GrantPrivilegedRoles));
+        assert!(role_can(&admin, Capability::ManageMembers));
+        assert!(role_can(&admin, Capability::ViewAudit));
+        assert!(can_access_console(&admin));
+    }
+
+    #[test]
+    fn auditor_holds_only_view_audit() {
+        // ADR 0149 §3: the read-only separation-of-duties reader.
+        let auditor = Role::auditor();
+        for cap in Capability::ALL {
+            assert_eq!(role_can(&auditor, cap), cap == Capability::ViewAudit);
+        }
+        assert!(can_access_console(&auditor));
     }
 
     #[test]
@@ -123,6 +202,8 @@ mod tests {
         assert_eq!(names.len(), Capability::ALL.len());
         assert!(names.contains("manage_billing"));
         assert!(names.contains("configure_security"));
+        assert!(names.contains("manage_org_lifecycle"));
+        assert!(names.contains("grant_privileged_roles"));
     }
 
     #[test]
@@ -150,15 +231,37 @@ mod tests {
     }
 
     proptest! {
-        /// No non-owner/admin role ever holds a non-billing capability (no privilege
-        /// escalation through an arbitrary role string).
+        /// The two owner-only capabilities (ADR 0149 §1) are held by `owner` and
+        /// nothing else — no arbitrary role string, including `admin`, elevates.
         #[test]
-        fn only_owner_admin_get_non_billing_caps(name in "[a-zA-Z]{0,12}") {
+        fn owner_only_caps_are_owner_only(name in "[a-zA-Z]{0,12}") {
             let role = Role::new(&name);
-            for cap in Capability::ALL {
-                if cap != Capability::ManageBilling && role_can(&role, cap) {
-                    prop_assert!(name == "owner" || name == "admin");
+            for cap in [Capability::ManageOrgLifecycle, Capability::GrantPrivilegedRoles] {
+                if role_can(&role, cap) {
+                    prop_assert_eq!(&name, "owner");
                 }
+            }
+        }
+
+        /// `ManageBilling` is held by `owner` and `billing` only (ADR 0149 §2): admin
+        /// no longer holds it, and no arbitrary role string does.
+        #[test]
+        fn billing_cap_is_owner_or_billing(name in "[a-zA-Z]{0,12}") {
+            let role = Role::new(&name);
+            if role_can(&role, Capability::ManageBilling) {
+                prop_assert!(name == "owner" || name == "billing");
+            }
+        }
+
+        /// Any role holding a capability is one of the four recognized console roles;
+        /// every unrecognized role string is fail-closed (`INV-20`).
+        #[test]
+        fn only_known_roles_hold_any_capability(name in "[a-zA-Z]{0,12}") {
+            let role = Role::new(&name);
+            if Capability::ALL.iter().any(|&c| role_can(&role, c)) {
+                prop_assert!(
+                    matches!(name.as_str(), "owner" | "admin" | "auditor" | "billing")
+                );
             }
         }
 

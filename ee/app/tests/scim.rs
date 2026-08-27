@@ -311,14 +311,32 @@ async fn scim_provision_and_deprovision() {
 #[tokio::test]
 async fn scim_groups_map_to_roles() {
     let (_dir, app) = workbench();
-    // Admin configures a group → role/team mapping (ungated single-user).
+
+    // ADR 0149 §1: SCIM may never confer a privileged role. Mapping a group into
+    // `owner`/`admin` is refused at the config boundary (fail-closed).
     let (s, _) = administration_command(
         &app,
         None,
         None,
         "administration.identity",
         "group-mapping.set",
-        json!({"group":"Engineering","role":"admin","team":"eng"}),
+        json!({"group":"Leads","role":"admin","team":"eng"}),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "SCIM must not map a group into admin"
+    );
+
+    // Admin configures a group → non-privileged-role/team mapping (ungated single-user).
+    let (s, _) = administration_command(
+        &app,
+        None,
+        None,
+        "administration.identity",
+        "group-mapping.set",
+        json!({"group":"Engineering","role":"viewer","team":"eng"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -345,7 +363,7 @@ async fn scim_groups_map_to_roles() {
         .find(|m| m["authority"] == "e@acme.com")
         .unwrap()
         .clone();
-    assert_eq!(m["role"], "admin");
+    assert_eq!(m["role"], "viewer");
     assert_eq!(m["team"], "eng");
 
     // A user with an unmapped group falls back to the default member role.

@@ -118,6 +118,11 @@ impl Role {
     pub fn billing() -> Self {
         Self("billing".into())
     }
+    /// The read-only separation-of-duties reader (ADR 0149 §3): holds `ViewAudit`
+    /// and no write capability of any kind.
+    pub fn auditor() -> Self {
+        Self("auditor".into())
+    }
     pub fn as_str(&self) -> &str {
         &self.0
     }

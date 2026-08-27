@@ -33,14 +33,27 @@ pub const ORG_SCOPE: &str = "org";
 /// multi-tenant): its record id is fixed.
 pub const ORG_ID: &str = "org";
 
-/// The fixed workspace-administration roles (ADR 0043 §2). Custom roles + a
-/// policy-authoring surface stay upmarket; M3 ships exactly these.
-pub const FIXED_ROLES: [&str; 5] = ["owner", "admin", "member", "viewer", "billing"];
+/// The fixed workspace-administration roles (ADR 0043 §2, separated by ADR 0149).
+/// Custom roles + a policy-authoring surface (and a finer `security-admin` tier,
+/// ADR 0149 §5) stay upmarket; M3 ships exactly these. `auditor` is the read-only
+/// separation-of-duties reader (ADR 0149 §3).
+pub const FIXED_ROLES: [&str; 6] = ["owner", "admin", "auditor", "member", "viewer", "billing"];
+
+/// The **privileged** roles (ADR 0149 §1): granting one requires the owner-only
+/// `GrantPrivilegedRoles` capability, and SCIM group→role mapping refuses to map a
+/// group into either. Everything else is a non-privileged role `ManageMembers` covers.
+pub const PRIVILEGED_ROLES: [&str; 2] = ["owner", "admin"];
 
 /// Whether `role` is one of the fixed workspace-admin roles. Assigning an unknown
 /// role is rejected at the boundary (fail-closed, `INV-20`).
 pub fn is_valid_role(role: &str) -> bool {
     FIXED_ROLES.contains(&role)
+}
+
+/// Whether `role` is a **privileged** role (`owner`/`admin`) — assignable only through
+/// the owner-only `GrantPrivilegedRoles` capability, and never via SCIM (ADR 0149 §1).
+pub fn is_privileged_role(role: &str) -> bool {
+    PRIVILEGED_ROLES.contains(&role)
 }
 
 /// A member's lifecycle status. `Invited`/sync-pending is operational evidence;
@@ -502,10 +515,18 @@ impl Org {
     /// configured group→role mappings (`SCIM-3`). The first matching mapping wins
     /// (stable BTreeMap order); `None` if no group matches (the caller defaults to
     /// `member`).
+    ///
+    /// A mapping into a **privileged** role (`owner`/`admin`) is refused fail-closed
+    /// (ADR 0149 §1): those roles are owner-granted only and can never be conferred by
+    /// SCIM. Such a mapping is dropped as if it did not match, so the caller falls back
+    /// to the non-privileged default rather than silently elevating a provisioned user.
+    /// (Creation of a privileged mapping is also rejected at the config boundary; this
+    /// is the defense-in-depth guarantee even if one is somehow present.)
     pub fn role_for_groups(&self, groups: &[String]) -> Option<(String, Option<String>)> {
         groups
             .iter()
             .find_map(|g| self.group_mappings.get(g))
+            .filter(|m| !is_privileged_role(&m.role))
             .map(|m| (m.role.clone(), m.team.clone()))
     }
 
@@ -1091,6 +1112,53 @@ mod tests {
     #[test]
     fn fixed_roles_validate() {
         assert!(is_valid_role("owner") && is_valid_role("billing"));
+        // ADR 0149 §3: the read-only auditor is a fixed role.
+        assert!(is_valid_role("auditor"));
         assert!(!is_valid_role("superuser") && !is_valid_role(""));
+    }
+
+    #[test]
+    fn privileged_roles_are_owner_and_admin_only() {
+        // ADR 0149 §1: only owner/admin are privileged (owner-granted only).
+        assert!(is_privileged_role("owner") && is_privileged_role("admin"));
+        for r in ["auditor", "member", "viewer", "billing", "", "superuser"] {
+            assert!(!is_privileged_role(r), "{r:?} must not be privileged");
+        }
+    }
+
+    fn group_mapping(group: &str, role: &str) -> String {
+        serde_json::to_string(&GroupMappingRecord {
+            id: group.into(),
+            op: RecordOp::Upsert,
+            group: group.into(),
+            role: role.into(),
+            team: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn scim_group_mapping_refuses_privileged_roles() {
+        // ADR 0149 §1: SCIM may never confer owner/admin. Even if a privileged mapping
+        // is somehow present, `role_for_groups` drops it (fail-closed to the default),
+        // while a non-privileged mapping resolves normally.
+        let store = store_with(&[
+            ("group_mapping", &group_mapping("eng-leads", "admin")),
+            ("group_mapping", &group_mapping("owners", "owner")),
+            ("group_mapping", &group_mapping("eng", "member")),
+            ("group_mapping", &group_mapping("finance", "billing")),
+        ]);
+        let org = Org::rebuild(&store).unwrap();
+
+        assert_eq!(org.role_for_groups(&["eng-leads".into()]), None);
+        assert_eq!(org.role_for_groups(&["owners".into()]), None);
+        assert_eq!(
+            org.role_for_groups(&["eng".into()]),
+            Some(("member".into(), None))
+        );
+        assert_eq!(
+            org.role_for_groups(&["finance".into()]),
+            Some(("billing".into(), None))
+        );
     }
 }

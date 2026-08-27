@@ -1125,6 +1125,38 @@ fn parse<T: serde::de::DeserializeOwned>(payload: &Value) -> Result<T, Response>
     })
 }
 
+/// ADR 0149 §1: granting a **privileged** role (`owner`/`admin`) — as the target of an
+/// invite or a role change — requires the owner-only `GrantPrivilegedRoles` capability,
+/// over and above the `ManageMembers` the `member.*` command already carries. The
+/// command adapter authorizes at capability granularity only (`decide_environment_command`
+/// checks the command's single capability), so this **target-role** gate lives in the
+/// planner, which re-runs on submit, apply, and review. Fail-closed: an admin — which
+/// holds `ManageMembers` but not `GrantPrivilegedRoles` — cannot elevate anyone,
+/// including itself, to `owner`/`admin`.
+fn ensure_can_grant_privileged_role(
+    wb: &Workbench,
+    headers: &HeaderMap,
+    target_role: &str,
+) -> Result<(), Response> {
+    if !gaugedesk_app::org::is_privileged_role(target_role) {
+        return Ok(());
+    }
+    let capabilities = wb
+        .admin_capabilities(bearer(headers), &req_scope(headers))
+        .map_err(|(status, message)| (status, Json(json!({ "error": message }))).into_response())?;
+    if capabilities.contains(&Capability::GrantPrivilegedRoles) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "granting the owner/admin role requires the owner-only GrantPrivilegedRoles capability"
+            })),
+        )
+            .into_response())
+    }
+}
+
 fn plan_command(
     wb: &Workbench,
     headers: &HeaderMap,
@@ -1233,6 +1265,7 @@ fn plan_command(
                 )
                     .into_response());
             }
+            ensure_can_grant_privileged_role(wb, headers, &value.role)?;
             let record = MembershipRecord {
                 id: value.id.unwrap_or_else(|| value.authority.clone()),
                 op: RecordOp::Upsert,
@@ -1261,6 +1294,7 @@ fn plan_command(
                 )
                     .into_response());
             }
+            ensure_can_grant_privileged_role(wb, headers, &value.role)?;
             let Some(existing) = org.members.get(&value.id) else {
                 return Err((
                     StatusCode::NOT_FOUND,
@@ -1405,6 +1439,18 @@ fn plan_command(
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(json!({ "error": "group and a fixed role are required" })),
+                )
+                    .into_response());
+            }
+            // ADR 0149 §1: SCIM may never confer a privileged role. Refuse a mapping
+            // into `owner`/`admin` at the config boundary (fail-closed); `role_for_groups`
+            // also drops any such mapping at read time as defense-in-depth.
+            if gaugedesk_app::org::is_privileged_role(&value.role) {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "error": "cannot map a group into owner/admin; those roles are owner-granted only"
+                    })),
                 )
                     .into_response());
             }
