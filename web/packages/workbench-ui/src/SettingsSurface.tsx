@@ -282,10 +282,15 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
                     >
                         <div class="modal-head">
                             <h3>Finish signing in</h3>
-                            <button type="button" onClick={() => props.actions?.cancelSignIn?.()}>cancel</button>
+                            {/* Named, because a journey that drives this flow has to
+                                address the code and the way out of it, and matching a
+                                class or the word "cancel" is how the last set of
+                                selectors here quietly stopped matching anything. */}
+                            <button type="button" data-device-cancel
+                                onClick={() => props.actions?.cancelSignIn?.()}>cancel</button>
                         </div>
                         <p class="muted">Enter this code on the page that opened in your browser.</p>
-                        <p class="settings-device-code">{pending().code}</p>
+                        <p class="settings-device-code" data-device-code>{pending().code}</p>
                         <Show when={pending().url}>
                             {(url) => <p class="muted device-url">{url()}</p>}
                         </Show>
