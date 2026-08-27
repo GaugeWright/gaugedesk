@@ -21,10 +21,17 @@ const MANAGED_FUNDING_PREFIX: &str = "gaugedesk:managed-plan:v1:";
 /// Stable, non-secret identity for the exact plan selected to fund a turn.
 /// Hex-encoding keeps arbitrary scope/plan names unambiguous inside the ref.
 pub fn funding_ref(scope: &str, plan: &ManagedInferencePlan) -> String {
+    funding_ref_for(scope, &plan.plan)
+}
+
+/// Stable reference from the exact scope and plan carried by a signed Hub
+/// entitlement. The deployment publisher uses this after minting so the UI
+/// never accepts or reconstructs a raw funding reference.
+pub fn funding_ref_for(scope: &str, plan: &str) -> String {
     format!(
         "{MANAGED_FUNDING_PREFIX}{}:{}",
         hex::encode(scope.as_bytes()),
-        hex::encode(plan.plan.as_bytes())
+        hex::encode(plan.as_bytes())
     )
 }
 

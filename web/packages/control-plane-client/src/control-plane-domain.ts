@@ -206,8 +206,16 @@ export interface PublicDeploymentInput {
     readonly max_turn_spend_cents: number | null;
     readonly per_visitor_turn_limit: number;
     readonly max_concurrent_sessions: number;
-    readonly funding_ref: string;
-    readonly credential_ref: string;
+    /** Product-facing funding choice. Managed funding names an authenticated
+     * account/tenant; the Hub-signed claims derive the hosted funding reference. */
+    readonly funding: {
+        readonly kind: "managed";
+        readonly tenant_id: string;
+        readonly entitlement?: import("./control-plane-tenant").ManagedInferenceEntitlement;
+    } | {
+        readonly kind: "byok";
+        readonly credential_ref: string;
+    };
     readonly audience?: {
         readonly anonymous_allowed: boolean;
         readonly oidc?: { readonly issuer: string; readonly audience: string };
@@ -220,6 +228,26 @@ export interface PublicDeploymentInput {
      *  server's defaults. */
     readonly retention_idle_ttl_seconds?: number;
     readonly retention_absolute_ttl_seconds?: number;
+    /** End already-open visitor sessions when activating this configuration. */
+    readonly end_sessions?: boolean;
+}
+
+export interface PanelPreviewInput {
+    readonly agent_id: ArchetypeId;
+    readonly placement_id?: PlacementId;
+    readonly edge_origin: string;
+    readonly allowed_origin: string;
+    readonly funding: PublicDeploymentInput["funding"];
+}
+
+export interface PanelPreviewOutcome {
+    readonly preview_id: string;
+    readonly deployment_id: string;
+    readonly release_id: string;
+    readonly edge_origin: string;
+    readonly deployment_url: string;
+    readonly panels: readonly string[];
+    readonly expires_at_unix_ms: number;
 }
 
 /** What a collecting deployment gathers, and who it seals to (ADR 0109 §5–§7).
@@ -329,6 +357,18 @@ export interface PublicDeploymentInspection {
             readonly max_turn_spend_cents: number | null;
             readonly per_visitor_turn_limit: number;
             readonly max_concurrent_sessions: number;
+            readonly funding_ref?: string;
+            readonly credential_class?: string;
+            readonly credential_ref?: string;
+            readonly audience?: {
+                readonly anonymous_allowed: boolean;
+                readonly oidc?: { readonly issuer: string; readonly audience: string };
+            };
+            readonly retention?: {
+                readonly idle_ttl_seconds: number;
+                readonly absolute_ttl_seconds: number;
+            };
+            readonly white_label?: boolean;
         };
         readonly active_release_id: string;
         readonly activation_revision: number;

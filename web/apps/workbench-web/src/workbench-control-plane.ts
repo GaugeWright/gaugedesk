@@ -15,6 +15,8 @@ import type {
     MergeState,
     PlacementId,
     PanelPublicProfile,
+    PanelPreviewInput,
+    PanelPreviewOutcome,
     CollectionRecipient,
     PublicDeploymentInput,
     PublicDeploymentInspection,
@@ -896,8 +898,54 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.placeArchetype(this.workbenchTransport(), pid, archetypeId, recipient);
     }
 
-    publishDeployment(input: PublicDeploymentInput): Promise<PublicDeploymentOutcome> {
-        return workbenchClient.publishDeployment(this.workbenchTransport(), input);
+    async publishDeployment(input: PublicDeploymentInput): Promise<PublicDeploymentOutcome> {
+        let admitted = input;
+        if (
+            this.splitHomes
+            && input.funding.kind === "managed"
+            && !input.funding.entitlement
+        ) {
+            const publicKey = await workbenchClient.publicPublisherKey(this.workbenchTransport());
+            const entitlement = await accountClient.mintManagedEntitlement(
+                this.route,
+                input.funding.tenant_id,
+                publicKey,
+            );
+            admitted = { ...input, funding: { ...input.funding, entitlement } };
+        }
+        return workbenchClient.publishDeployment(this.workbenchTransport(), admitted);
+    }
+
+    async startPanelPreview(input: PanelPreviewInput): Promise<PanelPreviewOutcome> {
+        let admitted = input;
+        if (
+            this.splitHomes
+            && input.funding.kind === "managed"
+            && !input.funding.entitlement
+        ) {
+            const publicKey = await workbenchClient.publicPublisherKey(this.workbenchTransport());
+            const entitlement = await accountClient.mintManagedEntitlement(
+                this.route,
+                input.funding.tenant_id,
+                publicKey,
+            );
+            admitted = { ...input, funding: { ...input.funding, entitlement } };
+        }
+        return workbenchClient.startPanelPreview(this.workbenchTransport(), admitted);
+    }
+
+    stopPanelPreview(previewId: string): Promise<void> {
+        return workbenchClient.stopPanelPreview(this.workbenchTransport(), previewId);
+    }
+
+    /** Owner/admin tenants eligible to be selected as managed deployment
+     * funding authority. Desktop reads them through its sealed Hub-session
+     * proxy; hosted GaugeDesk already runs in the browser-authenticated Hub
+     * plane. */
+    deploymentManagedTenants(): Promise<accountClient.AccountTenant[]> {
+        return this.splitHomes
+            ? accountClient.accountTenants(this.route)
+            : accountClient.hubSessionTenants(this.route);
     }
 
     importLegacyDeployment(input: PublicDeploymentInput) {

@@ -21,8 +21,9 @@ use whipplescript_store::skill_frontmatter::parse_skill_frontmatter;
 use crate::app_support::LockUnpoisoned;
 use crate::key_store::FileKeyStore;
 use crate::library::{
-    DeploymentAudience, DeploymentAudienceOidc, DeploymentBindingStatus,
-    DeploymentOperationalConfig, PlacementKind, PublicDeploymentBindingRecord, RecordOp,
+    Admission, ArchetypeVersionRecord, DeploymentAudience, DeploymentAudienceOidc,
+    DeploymentBindingStatus, DeploymentOperationalConfig, InstanceKind, InstanceRecord,
+    PlacementKind, PublicDeploymentBindingRecord, RecordOp, LIBRARY_RECORD_SCHEMA,
 };
 use crate::library_state::{published_discipline_root, published_package_root};
 use crate::Workbench;
@@ -52,6 +53,22 @@ fn reservation_cents_for_spend_guards(
     .unwrap_or(0)
 }
 
+fn preview_release_spec(
+    profile: &crate::library::PanelPublicProfile,
+    published_at_unix_ms: u64,
+) -> ReleasePublishSpec {
+    ReleasePublishSpec {
+        published_at_unix_ms,
+        public_abilities: profile.public_abilities.clone(),
+        panels: profile.panels.clone(),
+        audience_inputs: profile.audience_inputs.clone(),
+        provider: profile.provider.clone(),
+        retention: profile.retention.clone(),
+        initial_workspace: profile.initial_workspace.clone(),
+        collection: profile.collection.clone(),
+    }
+}
+
 fn discipline_media_type(path: &str) -> &'static str {
     if path.ends_with(".json") {
         "application/json"
@@ -59,6 +76,21 @@ fn discipline_media_type(path: &str) -> &'static str {
         "text/markdown"
     } else {
         "application/octet-stream"
+    }
+}
+
+/// Deletes only the two generated version directories named by a disposable
+/// draft snapshot. The authoring draft and every real numeric version are
+/// outside these exact paths.
+struct PreviewSnapshot {
+    roots: Vec<std::path::PathBuf>,
+}
+
+impl Drop for PreviewSnapshot {
+    fn drop(&mut self) {
+        for root in &self.roots {
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }
 
@@ -149,6 +181,23 @@ pub struct ReleasePublishSpec {
 pub type PublishAudience = DeploymentAudience;
 pub type PublishAudienceOidc = DeploymentAudienceOidc;
 
+/// Product-facing funding choice. The managed variant names the authenticated
+/// tenant, never a forgeable funding reference; the reference is derived from
+/// the Hub-signed claims after minting. Legacy request fields remain readable
+/// below for old automation during the migration window.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DeploymentFundingSelection {
+    Managed {
+        tenant_id: String,
+        #[serde(default)]
+        entitlement: Option<crate::managed_entitlement::Entitlement>,
+    },
+    Byok {
+        credential_ref: String,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishDeploymentRequest {
@@ -167,8 +216,22 @@ pub struct PublishDeploymentRequest {
     pub max_turn_spend_cents: Option<u64>,
     pub per_visitor_turn_limit: u64,
     pub max_concurrent_sessions: u64,
+    #[serde(default)]
+    pub funding: Option<DeploymentFundingSelection>,
+    #[serde(default)]
     pub funding_ref: String,
+    #[serde(default)]
     pub credential_ref: String,
+    /// The authenticated account/tenant selected to fund managed inference.
+    /// This is used only by the desktop route to acquire a fresh entitlement
+    /// from the Hub; it is never written into the hosted deployment config.
+    #[serde(default)]
+    pub managed_tenant_id: Option<String>,
+    /// A fresh Hub-signed entitlement bound to this Workbench's public
+    /// publisher key. Hosted compositions mint it in the authenticated browser
+    /// plane; the desktop route may acquire it from its sealed Hub session.
+    #[serde(default)]
+    pub funding_entitlement: Option<crate::managed_entitlement::Entitlement>,
     /// Audience admission for the public deployment. Anonymous remains the
     /// compatibility default, while an explicit OIDC tuple is carried into the
     /// signed publisher request consumed by the edge.
@@ -211,6 +274,46 @@ pub struct PublishDeploymentOutcome {
     pub deployment_url: String,
     pub embed_html: String,
     pub deployment: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartPanelPreviewRequest {
+    pub agent_id: String,
+    /// Present for a project-scoped preview. The placement's pinned version and
+    /// frozen profile win; the mutable Library draft is not consulted.
+    #[serde(default)]
+    pub placement_id: Option<String>,
+    pub edge_origin: String,
+    pub allowed_origin: String,
+    #[serde(default)]
+    pub funding: Option<DeploymentFundingSelection>,
+    #[serde(default)]
+    pub funding_ref: String,
+    #[serde(default)]
+    pub credential_ref: String,
+    #[serde(default)]
+    pub managed_tenant_id: Option<String>,
+    #[serde(default)]
+    pub funding_entitlement: Option<crate::managed_entitlement::Entitlement>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PanelPreviewOutcome {
+    pub preview_id: String,
+    pub deployment_id: String,
+    pub release_id: String,
+    pub edge_origin: String,
+    pub deployment_url: String,
+    pub panels: BTreeSet<String>,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ActivePanelPreview {
+    pub edge_origin: String,
+    pub deployment_id: String,
+    pub expires_at_unix_ms: u64,
 }
 
 const PUBLIC_EMBED_LOADER_URL: &str = "https://embed.gaugewright.com/embed.js";
@@ -500,6 +603,17 @@ impl Workbench {
         })
     }
 
+    /// The public half the Hub binds a managed-inference entitlement to.
+    /// Returning it is safe: every publisher command already presents this key
+    /// to the edge, while the private half never leaves the key-store boundary.
+    pub fn public_publisher_key(&self) -> io::Result<String> {
+        Ok(self
+            .public_publisher_signing_key()?
+            .public_key()
+            .as_str()
+            .to_owned())
+    }
+
     fn public_publisher_signing_key(&self) -> io::Result<gaugedesk_core::signature::SigningKey> {
         let authority = gaugedesk_core::ids::AuthorityId::new(format!(
             "{}{PUBLIC_PUBLISHER_KEY_SUFFIX}",
@@ -621,9 +735,9 @@ impl Workbench {
                 package.system_prompt_document().as_bytes().to_vec(),
             ),
         ];
-        if !spec.public_abilities.is_subset(&package_capabilities) {
+        if !spec.public_abilities.is_subset(&package_abilities) {
             return Err(invalid(
-                "public ability ceiling exceeds the package capability registry",
+                "public ability ceiling exceeds the package agent abilities",
             ));
         }
         let required = spec.public_abilities.clone();
@@ -678,7 +792,13 @@ impl Workbench {
                 ("public-do".to_owned(), "placement:public-do".to_owned()),
             ]),
             parties: BTreeMap::from([("audience".to_owned(), "audience".to_owned())]),
-            capabilities: required.clone(),
+            // WhippleScript validates the authored package against the complete
+            // package registry carried by the governance epoch. The release's
+            // `CapabilityManifest` below is the narrower Panel-agent ability
+            // set offered to the public model. Conflating the two made a
+            // chat-only Panel profile unable to run any ordinary authored
+            // package whose registry also contained workspace abilities.
+            capabilities: package_capabilities.clone(),
             provider_bindings: BTreeMap::from([(
                 "model".to_owned(),
                 gaugedesk_whip_runtime::ProviderBindingPolicy {
@@ -686,10 +806,7 @@ impl Workbench {
                     model: spec.provider.model.clone(),
                     base_url: spec.provider.base_url.clone(),
                     credential_ref: spec.provider.credential_class.clone(),
-                    wire: Some(
-                        gaugedesk_whip_runtime::provider_model_wire_name(&spec.provider.provider)?
-                            .to_owned(),
-                    ),
+                    wire: Some(provider_wire(&spec.provider)?.to_owned()),
                 },
             )]),
             placements: BTreeMap::from([(
@@ -768,6 +885,341 @@ impl Workbench {
                 &signing_key,
             )
             .map_err(invalid)
+    }
+
+    /// Construct the exact public release exercised by Preview without
+    /// publishing an Agent version or creating a project/chat record.
+    ///
+    /// A project preview uses the placement's real pinned version. A Library
+    /// preview copies the current draft package and discipline into a generated
+    /// high-numbered version directory solely long enough for the ordinary
+    /// release builder to validate and sign it. The generated directories and
+    /// the in-memory instance/version entries are removed before this method
+    /// returns; no append-only store fact is written.
+    pub fn build_panel_preview_release(
+        &mut self,
+        agent_id: &str,
+        placement_id: Option<&str>,
+        published_at_unix_ms: u64,
+    ) -> io::Result<(SignedAgentRelease, crate::library::PanelPublicProfile)> {
+        let agent = self
+            .library
+            .agents
+            .get(agent_id)
+            .filter(|agent| agent.agent_kind == crate::library::AgentKind::Panel)
+            .cloned()
+            .ok_or_else(|| invalid("preview requires a Panel agent"))?;
+        if let Some(placement_id) = placement_id {
+            let placement = self
+                .library
+                .instances
+                .get(placement_id)
+                .filter(|placement| {
+                    placement.kind == InstanceKind::Using
+                        && placement.placement_kind == PlacementKind::Panel
+                        && placement.agent_id == agent.id
+                })
+                .ok_or_else(|| invalid("project preview requires this Panel-agent placement"))?;
+            let profile = agent
+                .versions
+                .get(&placement.version)
+                .and_then(|version| version.panel_profile.clone())
+                .ok_or_else(|| invalid("project preview placement has no frozen public profile"))?;
+            let release = self.build_agent_release(
+                placement_id,
+                preview_release_spec(&profile, published_at_unix_ms),
+            )?;
+            return Ok((release, profile));
+        }
+
+        let profile = agent
+            .panel_profile
+            .clone()
+            .ok_or_else(|| invalid("Panel-agent draft has no public profile"))?;
+        let target_id = self
+            .library
+            .authoring_target_for(&agent.id)
+            .map(|target| target.id.clone())
+            .ok_or_else(|| not_found("Panel-agent authoring target does not exist"))?;
+        let repo = self.targets_dir().join(&target_id).join("repo");
+        let draft_package_root = repo.join(gaugedesk_boundary::definition::DRAFT_ROOT);
+        let draft_package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(&draft_package_root)
+            .map_err(invalid)?;
+        let draft_discipline = crate::discipline::load(
+            &repo.join(crate::discipline::DISCIPLINE_DRAFT_ROOT),
+            draft_package.capabilities().iter().cloned(),
+        )
+        .map_err(invalid)?;
+
+        let mut preview_version = u64::MAX;
+        while agent.versions.contains_key(&preview_version)
+            || published_package_root(&self.targets_dir(), &target_id, preview_version).exists()
+            || published_discipline_root(&self.targets_dir(), &target_id, preview_version).exists()
+        {
+            preview_version = preview_version
+                .checked_sub(1)
+                .ok_or_else(|| invalid("no disposable preview version is available"))?;
+        }
+        let package_root = published_package_root(&self.targets_dir(), &target_id, preview_version);
+        let discipline_root =
+            published_discipline_root(&self.targets_dir(), &target_id, preview_version);
+        std::fs::create_dir_all(&package_root)?;
+        std::fs::create_dir_all(&discipline_root)?;
+        let _snapshot = PreviewSnapshot {
+            roots: vec![package_root.clone(), discipline_root.clone()],
+        };
+        for file in [
+            gaugedesk_boundary::definition::MANIFEST_FILE,
+            gaugedesk_boundary::definition::SOURCE_FILE,
+            gaugedesk_boundary::definition::PERSONA_FILE,
+        ] {
+            std::fs::copy(draft_package_root.join(file), package_root.join(file))?;
+        }
+        for (path, body) in &draft_discipline.files {
+            let destination = discipline_root.join(path);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(destination, body)?;
+        }
+
+        let preview_instance_id = crate::library::gen_id("panel-preview-instance");
+        let version = ArchetypeVersionRecord {
+            package_ref: draft_package.version_ref().to_owned(),
+            discipline_ref: draft_discipline.reference,
+            panel_profile: Some(profile.clone()),
+        };
+        self.library
+            .agents
+            .get_mut(&agent.id)
+            .expect("agent was resolved above")
+            .versions
+            .insert(preview_version, version);
+        self.library.instances.insert(
+            preview_instance_id.clone(),
+            InstanceRecord {
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+                id: preview_instance_id.clone(),
+                op: RecordOp::Upsert,
+                kind: InstanceKind::Using,
+                placement_kind: PlacementKind::Panel,
+                agent_id: agent.id.clone(),
+                project_id: None,
+                version: preview_version,
+                admission: Admission::Active,
+                collection_recipient: None,
+            },
+        );
+        let release = self.build_agent_release(
+            &preview_instance_id,
+            preview_release_spec(&profile, published_at_unix_ms),
+        );
+        self.library.instances.remove(&preview_instance_id);
+        if let Some(agent) = self.library.agents.get_mut(&agent.id) {
+            agent.versions.remove(&preview_version);
+        }
+        release.map(|release| (release, profile))
+    }
+
+    /// Publish a bounded, expiring public deployment used only by the Preview
+    /// surface. It deliberately creates no local deployment binding: there is
+    /// no project and therefore no production Inbox or custody destination.
+    pub fn start_panel_preview(
+        &mut self,
+        request: StartPanelPreviewRequest,
+    ) -> io::Result<PanelPreviewOutcome> {
+        let edge = normalized_edge(&request.edge_origin)?;
+        if !request.allowed_origin.starts_with("https://")
+            || request.allowed_origin.contains('?')
+            || request.allowed_origin.contains('#')
+            || request.allowed_origin.trim_end_matches('/') != request.allowed_origin
+        {
+            return Err(invalid("preview origin must be one exact HTTPS origin"));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?;
+        let (release, profile) = self.build_panel_preview_release(
+            &request.agent_id,
+            request.placement_id.as_deref(),
+            now.as_millis().try_into().map_err(io::Error::other)?,
+        )?;
+        let managed = crate::managed_inference::is_managed_funding_ref(&request.funding_ref);
+        if request.funding_ref.trim().is_empty() {
+            return Err(invalid("preview funding is required"));
+        }
+        if managed {
+            if !request.credential_ref.trim().is_empty() {
+                return Err(invalid(
+                    "managed preview funding may not name an owner credential",
+                ));
+            }
+            request
+                .managed_tenant_id
+                .as_deref()
+                .filter(|tenant| !tenant.trim().is_empty())
+                .ok_or_else(|| invalid("managed preview requires an authenticated tenant"))?;
+            let entitlement = request
+                .funding_entitlement
+                .as_ref()
+                .ok_or_else(|| invalid("managed preview requires a Hub entitlement"))?;
+            if entitlement.claims.authority != self.public_publisher_key()? {
+                return Err(invalid(
+                    "managed preview entitlement is not bound to this publisher",
+                ));
+            }
+            if entitlement.claims.exp <= now.as_secs() {
+                return Err(invalid("managed preview entitlement has expired"));
+            }
+            if profile.provider.provider != crate::managed_inference::METERED_GATEWAY_PROVIDER {
+                return Err(invalid(
+                    "managed preview requires a Panel-agent draft authored for the metered gateway",
+                ));
+            }
+            if let Some(reason) = crate::managed_inference::metered_pairing_error(
+                &profile.provider.base_url,
+                &profile.provider.model,
+            ) {
+                return Err(invalid(reason));
+            }
+        } else {
+            if request.credential_ref.trim().is_empty() {
+                return Err(invalid("BYOK preview requires an exact owner credential"));
+            }
+            if request.funding_entitlement.is_some() || request.managed_tenant_id.is_some() {
+                return Err(invalid(
+                    "BYOK preview may not carry managed funding authority",
+                ));
+            }
+        }
+
+        const PREVIEW_LIFETIME_MS: u64 = 60 * 60 * 1_000;
+        const PREVIEW_TOTAL_CENTS: u64 = 100;
+        const PREVIEW_SESSION_CENTS: u64 = 50;
+        const PREVIEW_TURN_CENTS: u64 = 10;
+        let expires_at_unix_ms = u64::try_from(now.as_millis())
+            .map_err(io::Error::other)?
+            .saturating_add(PREVIEW_LIFETIME_MS);
+        let preview_id = crate::library::gen_id("panel-preview");
+        let deployment_id = preview_id.clone();
+        let release_bytes = release.canonical_bytes().map_err(io::Error::other)?;
+        send_publisher_request(
+            self,
+            &edge,
+            "PUT",
+            &format!("/v1/releases/{}", release.release_id()),
+            &release_bytes,
+            AGENT_RELEASE_MEDIA_TYPE,
+        )?;
+        let idle = profile.retention.idle_ttl_seconds.clamp(1, 3_600);
+        let absolute = profile.retention.absolute_ttl_seconds.min(3_600).max(idle);
+        let mut config = serde_json::json!({
+            "deployment_id": deployment_id,
+            "enabled": true,
+            "allowed_origins": [request.allowed_origin],
+            "panel_ceiling": profile.panels.components.clone(),
+            "max_spend_cents": PREVIEW_TOTAL_CENTS,
+            "max_session_spend_cents": PREVIEW_SESSION_CENTS,
+            "max_turn_spend_cents": PREVIEW_TURN_CENTS,
+            "reserve_cents_per_turn": DEFAULT_PUBLIC_TURN_RESERVE_CENTS,
+            "per_visitor_turn_limit": 20,
+            "max_concurrent_sessions": 1,
+            "funding_ref": request.funding_ref,
+            "credential_class": profile.provider.credential_class.clone(),
+            "credential_ref": request.credential_ref,
+            "audience": { "anonymous_allowed": true },
+            "pricing": crate::deployment_pricing::pricing_block(),
+            "retention": {
+                "idle_ttl_seconds": idle,
+                "absolute_ttl_seconds": absolute,
+                "transcript_retained": profile.retention.transcript_retained,
+                "workspace_retained": profile.retention.workspace_retained,
+            },
+            "white_label": false,
+            "preview_expires_at_unix_ms": expires_at_unix_ms,
+        });
+        if let Some(entitlement) = &request.funding_entitlement {
+            config["funding_entitlement"] =
+                serde_json::Value::String(serde_json::to_string(entitlement).map_err(invalid)?);
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "config": config,
+            "initial_release_id": release.release_id(),
+        }))
+        .map_err(invalid)?;
+        send_publisher_request(
+            self,
+            &edge,
+            "PUT",
+            &format!("/v1/deployments/{deployment_id}"),
+            &body,
+            "application/json",
+        )?;
+        self.panel_previews.insert(
+            preview_id.clone(),
+            ActivePanelPreview {
+                edge_origin: edge.clone(),
+                deployment_id: deployment_id.clone(),
+                expires_at_unix_ms,
+            },
+        );
+        Ok(PanelPreviewOutcome {
+            preview_id,
+            deployment_id: deployment_id.clone(),
+            release_id: release.release_id(),
+            edge_origin: edge.clone(),
+            deployment_url: format!("{edge}/d/{deployment_id}"),
+            panels: profile.panels.components,
+            expires_at_unix_ms,
+        })
+    }
+
+    /// Revoke an in-memory preview handle. A failed edge mutation keeps the
+    /// handle so the caller can retry; an already-expired preview is forgotten.
+    pub fn stop_panel_preview(&mut self, preview_id: &str) -> io::Result<()> {
+        let preview = self
+            .panel_previews
+            .get(preview_id)
+            .cloned()
+            .ok_or_else(|| not_found("panel preview does not exist"))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_millis() as u64;
+        if now >= preview.expires_at_unix_ms {
+            self.panel_previews.remove(preview_id);
+            return Ok(());
+        }
+        let path = format!("/v1/deployments/{}", preview.deployment_id);
+        let inspection = send_publisher_request(
+            self,
+            &preview.edge_origin,
+            "GET",
+            &path,
+            &[],
+            "application/json",
+        )?;
+        let inspection: serde_json::Value = serde_json::from_str(&inspection).map_err(invalid)?;
+        let revision = inspection
+            .pointer("/deployment/activation_revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| invalid("preview inspection omitted its revision"))?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "command": "revoke",
+            "expected_revision": revision,
+        }))
+        .map_err(invalid)?;
+        send_publisher_request(
+            self,
+            &preview.edge_origin,
+            "POST",
+            &format!("{path}/control"),
+            &body,
+            "application/json",
+        )?;
+        self.panel_previews.remove(preview_id);
+        Ok(())
     }
 
     /// Build, upload, and atomically create one public edge deployment.
@@ -863,6 +1315,40 @@ impl Workbench {
                 "deployment funding, credential, or quota is invalid",
             ));
         }
+        let operational = DeploymentOperationalConfig {
+            allowed_origins: request.allowed_origins.clone(),
+            audience: request.audience.clone(),
+            funding_ref: request.funding_ref.clone(),
+            credential_class: profile.provider.credential_class.clone(),
+            credential_ref: request.credential_ref.clone(),
+            max_spend_cents: request.max_spend_cents,
+            max_session_spend_cents: request.max_session_spend_cents,
+            max_turn_spend_cents,
+            per_visitor_turn_limit: request.per_visitor_turn_limit,
+            max_concurrent_sessions: request.max_concurrent_sessions,
+            white_label: request.white_label,
+            retention_idle_ttl_seconds: request.retention_idle_ttl_seconds,
+            retention_absolute_ttl_seconds: request.retention_absolute_ttl_seconds,
+        };
+        let existing = self
+            .library
+            .public_deployments
+            .values()
+            .find(|binding| {
+                binding.hosted_deployment_id == request.deployment_id && binding.edge_origin == edge
+            })
+            .cloned();
+        if existing
+            .as_ref()
+            .is_some_and(|binding| binding.placement_id != placement.id)
+        {
+            return Err(invalid(
+                "hosted deployment is already bound to a different Panel placement",
+            ));
+        }
+        let reuses_admitted_operational = existing.as_ref().is_some_and(|binding| {
+            binding.status == DeploymentBindingStatus::Active && binding.operational == operational
+        });
         // A managed plan funds the turn from GaugeWright's metered rail and the
         // owner is billed from usage, so there is no customer credential to name
         // (ADR 0085 §1, `FUND-1`). BYOK still requires one — an empty reference
@@ -880,6 +1366,40 @@ impl Workbench {
         if !managed && request.credential_ref.trim().is_empty() {
             return Err(invalid(
                 "BYOK funding requires the owner credential reference",
+            ));
+        }
+        if managed && !(reuses_admitted_operational && request.funding_entitlement.is_none()) {
+            let _tenant = request
+                .managed_tenant_id
+                .as_deref()
+                .filter(|tenant| !tenant.trim().is_empty())
+                .ok_or_else(|| invalid("managed funding requires an authenticated tenant"))?;
+            let entitlement = request
+                .funding_entitlement
+                .as_ref()
+                .ok_or_else(|| invalid("managed funding requires a Hub entitlement"))?;
+            let publisher_key = self.public_publisher_signing_key()?.public_key();
+            if entitlement.claims.authority != publisher_key.as_str() {
+                return Err(invalid(
+                    "managed funding entitlement is not bound to this publisher",
+                ));
+            }
+            if entitlement.claims.exp
+                <= SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(io::Error::other)?
+                    .as_secs()
+            {
+                return Err(invalid("managed funding entitlement has expired"));
+            }
+        } else if request.funding_entitlement.is_some()
+            || request
+                .managed_tenant_id
+                .as_deref()
+                .is_some_and(|tenant| !tenant.trim().is_empty())
+        {
+            return Err(invalid(
+                "BYOK funding may not carry a managed funding entitlement",
             ));
         }
         // A model and the surface it is admitted against are chosen together
@@ -903,22 +1423,6 @@ impl Workbench {
         let path = format!("/v1/deployments/{}", request.deployment_id);
         let inspected =
             send_publisher_response(self, &edge, "GET", &path, &[], "application/json")?;
-        let existing = self
-            .library
-            .public_deployments
-            .values()
-            .find(|binding| {
-                binding.hosted_deployment_id == request.deployment_id && binding.edge_origin == edge
-            })
-            .cloned();
-        if existing
-            .as_ref()
-            .is_some_and(|binding| binding.placement_id != placement.id)
-        {
-            return Err(invalid(
-                "hosted deployment is already bound to a different Panel placement",
-            ));
-        }
         if existing.is_none() && inspected.0 == 200 {
             return Err(invalid(
                 "legacy hosted deployment requires import and project confirmation before update",
@@ -951,26 +1455,11 @@ impl Workbench {
             },
         )?;
 
-        let operational = DeploymentOperationalConfig {
-            allowed_origins: request.allowed_origins.clone(),
-            audience: request.audience.clone(),
-            funding_ref: request.funding_ref.clone(),
-            credential_class: profile.provider.credential_class.clone(),
-            credential_ref: request.credential_ref.clone(),
-            max_spend_cents: request.max_spend_cents,
-            max_session_spend_cents: request.max_session_spend_cents,
-            max_turn_spend_cents,
-            per_visitor_turn_limit: request.per_visitor_turn_limit,
-            max_concurrent_sessions: request.max_concurrent_sessions,
-            white_label: request.white_label,
-            retention_idle_ttl_seconds: request.retention_idle_ttl_seconds,
-            retention_absolute_ttl_seconds: request.retention_absolute_ttl_seconds,
-        };
         let binding_id = existing
             .as_ref()
             .map(|binding| binding.id.clone())
             .unwrap_or_else(|| crate::library::gen_id("public-deployment"));
-        self.write_public_deployment_record(PublicDeploymentBindingRecord {
+        let pending_binding = PublicDeploymentBindingRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: binding_id.clone(),
@@ -984,7 +1473,18 @@ impl Workbench {
                 .and_then(|binding| binding.active_release_id.clone()),
             operational: operational.clone(),
             status: DeploymentBindingStatus::PendingPublish,
-        })?;
+        };
+        // An update already has durable active custody. Keep that exact active
+        // snapshot visible until the hosted mutation succeeds; overwriting it
+        // with `pending_publish` made a rejected update look like the serving
+        // release had disappeared. A never-active binding is still recorded
+        // before its first network mutation, as ADR 0143 requires.
+        if !existing
+            .as_ref()
+            .is_some_and(|binding| binding.status == DeploymentBindingStatus::Active)
+        {
+            self.write_public_deployment_record(pending_binding.clone())?;
+        }
         let release_bytes = release.canonical_bytes().map_err(io::Error::other)?;
         send_publisher_request(
             self,
@@ -1031,6 +1531,10 @@ impl Workbench {
             },
             "white_label": request.white_label
         });
+        if let Some(entitlement) = &request.funding_entitlement {
+            config["funding_entitlement"] =
+                serde_json::Value::String(serde_json::to_string(entitlement).map_err(invalid)?);
+        }
         if let (Some(collection), Some(recipient)) = (&profile.collection, &recipient) {
             // The release carries the class; the deployment names the exact
             // recipient reference and the edge proves the class before a
@@ -1066,10 +1570,13 @@ impl Workbench {
                     .pointer("/deployment/active_release_id")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| invalid("deployment inspection omitted its active release"))?;
-                if current.pointer("/deployment/config") == Some(&config) {
+                if reuses_admitted_operational
+                    || current.pointer("/deployment/config") == Some(&config)
+                {
                     let body = serde_json::to_vec(&serde_json::json!({
                         "expected_release_id": active,
                         "release_id": release.release_id(),
+                        "end_sessions": request.end_sessions,
                     }))
                     .map_err(invalid)?;
                     send_publisher_request(
@@ -1086,6 +1593,7 @@ impl Workbench {
                         "initial_release_id": release.release_id(),
                         "hard_cutover": true,
                         "expected_release_id": active,
+                        "end_sessions": request.end_sessions,
                     }))
                     .map_err(invalid)?;
                     send_publisher_request(self, &edge, "PUT", &path, &body, "application/json")?
@@ -1104,12 +1612,7 @@ impl Workbench {
         self.write_public_deployment_record(PublicDeploymentBindingRecord {
             active_release_id: Some(release.release_id().to_owned()),
             status: DeploymentBindingStatus::Active,
-            ..self
-                .library
-                .public_deployments
-                .get(&binding_id)
-                .cloned()
-                .ok_or_else(|| invalid("local deployment binding disappeared"))?
+            ..pending_binding
         })?;
         Ok(PublishDeploymentOutcome {
             binding_id,
@@ -1553,6 +2056,26 @@ impl Workbench {
         )?;
         serde_json::from_str(&response).map_err(invalid)
     }
+}
+
+/// Resolve the request dialect from the exact provider surface frozen into a
+/// release. Managed inference is one provider identity with three different
+/// wire protocols, so provider name alone is deliberately insufficient there.
+fn provider_wire(provider: &ProviderPolicy) -> io::Result<&'static str> {
+    if provider.provider != crate::managed_inference::METERED_GATEWAY_PROVIDER {
+        return gaugedesk_whip_runtime::provider_model_wire_name(&provider.provider);
+    }
+
+    let route = crate::managed_inference::metered_route(&provider.model);
+    if route.base_url.trim_end_matches('/') != provider.base_url.trim_end_matches('/')
+        || route.model != provider.model
+    {
+        return Err(invalid(format!(
+            "managed Panel provider must use model `{}` on `{}`",
+            route.model, route.base_url
+        )));
+    }
+    Ok(route.wire)
 }
 
 fn drain_collections_with(
@@ -2066,6 +2589,125 @@ fn not_found(message: &'static str) -> io::Error {
 mod publisher_tests {
     use super::*;
     use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
+
+    #[test]
+    fn library_preview_signs_the_draft_without_publishing_or_placing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let mut guard = workbench.lock_unpoisoned();
+        guard
+            .seed_panel_placement(
+                "inst-preview-source",
+                crate::library::PanelPublicProfile::default(),
+            )
+            .unwrap();
+        let agent_id = "inst-preview-source-agent";
+        let versions_before = guard.library.agents[agent_id].versions.clone();
+        let instances_before = guard.library.instances.len();
+        let records_before = guard
+            .store_ref()
+            .records(crate::library::LIBRARY_SCOPE, "agent")
+            .unwrap()
+            .len();
+
+        let (release, profile) = guard
+            .build_panel_preview_release(agent_id, None, 1_800_000_000_000)
+            .expect("the mutable draft can be exercised as a signed public release");
+
+        assert_eq!(profile, crate::library::PanelPublicProfile::default());
+        assert_eq!(release.payload.panels.components, profile.panels.components);
+        assert_eq!(guard.library.agents[agent_id].versions, versions_before);
+        assert_eq!(guard.library.instances.len(), instances_before);
+        assert_eq!(
+            guard
+                .store_ref()
+                .records(crate::library::LIBRARY_SCOPE, "agent")
+                .unwrap()
+                .len(),
+            records_before,
+            "preview appends no Library fact",
+        );
+        assert!(
+            !guard
+                .library
+                .instances
+                .keys()
+                .any(|id| id.starts_with("panel-preview-instance-")),
+            "the transient instance is gone before the preview is returned",
+        );
+    }
+
+    #[test]
+    fn project_preview_uses_the_placement_profile_not_the_later_library_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let mut guard = workbench.lock_unpoisoned();
+        guard
+            .seed_panel_placement(
+                "inst-preview-pinned",
+                crate::library::PanelPublicProfile::default(),
+            )
+            .unwrap();
+        let agent_id = "inst-preview-pinned-agent";
+        let mut changed = guard.panel_profile(agent_id).unwrap();
+        changed.panels.components.insert("gw-viewer".to_owned());
+        guard.set_panel_profile(agent_id, changed).unwrap();
+
+        let (release, tested) = guard
+            .build_panel_preview_release(agent_id, Some("inst-preview-pinned"), 1_800_000_000_000)
+            .unwrap();
+
+        assert_eq!(
+            tested.panels.components,
+            BTreeSet::from(["gw-chat".to_owned()])
+        );
+        assert_eq!(release.payload.panels.components, tested.panels.components);
+        assert!(
+            guard
+                .panel_profile(agent_id)
+                .unwrap()
+                .panels
+                .components
+                .contains("gw-viewer"),
+            "the mutable draft really did diverge from the pinned placement",
+        );
+    }
+
+    #[test]
+    fn managed_panel_provider_uses_the_wire_declared_by_its_exact_surface() {
+        let route = crate::managed_inference::metered_route("gpt-5.6-terra");
+        let provider = ProviderPolicy {
+            provider: crate::managed_inference::METERED_GATEWAY_PROVIDER.to_owned(),
+            model: route.model,
+            base_url: route.base_url,
+            credential_class: "managed-openai".to_owned(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+        };
+
+        assert_eq!(
+            provider_wire(&provider).unwrap(),
+            crate::managed_inference::WIRE_OPENAI_RESPONSES,
+        );
+    }
+
+    #[test]
+    fn managed_panel_provider_refuses_a_surface_other_than_the_metered_route() {
+        let provider = ProviderPolicy {
+            provider: crate::managed_inference::METERED_GATEWAY_PROVIDER.to_owned(),
+            model: "gpt-5.6-terra".to_owned(),
+            base_url: "https://gateway.example/compat".to_owned(),
+            credential_class: "managed-openai".to_owned(),
+            max_input_tokens: None,
+            max_output_tokens: None,
+        };
+
+        let error = provider_wire(&provider).expect_err("the exact metered route is required");
+        assert!(error
+            .to_string()
+            .contains("managed Panel provider must use"));
+        assert!(error.to_string().contains("/openai"));
+    }
 
     /// A conversation is kept unless the publisher asks for it to end.
     ///

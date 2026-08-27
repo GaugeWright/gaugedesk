@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -48,7 +48,7 @@ const NATIVE_RETURN: &str = "gaugewright://auth/callback";
 
 /// The Hub account-API base, or `None` when the surface is disabled.
 /// `GAUGEDESK_ACCOUNT_HUB_URL` overrides; explicitly empty disables.
-fn hub_base() -> Option<String> {
+pub(crate) fn hub_base() -> Option<String> {
     let configured = gaugedesk_env::var("ACCOUNT_HUB_URL")
         .map(|value| value.trim().to_string())
         .unwrap_or_else(|| "https://auth.gaugewright.com".to_string());
@@ -56,6 +56,112 @@ fn hub_base() -> Option<String> {
         return None;
     }
     Some(configured.trim_end_matches('/').to_string())
+}
+
+fn hub_tenant_url(hub: &str, tenant: &str, suffix: &[&str]) -> Result<String, String> {
+    let mut url = url::Url::parse(hub).map_err(|_| "the Hub URL is invalid".to_string())?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| "the Hub URL cannot carry account paths".to_string())?;
+        path.pop_if_empty();
+        path.extend(["account", "tenants", tenant]);
+        path.extend(suffix.iter().copied());
+    }
+    Ok(url.to_string())
+}
+
+/// Mint a fresh Hub entitlement through the desktop's sealed account session.
+/// Hosted compositions mint in their browser-authenticated Hub plane and pass
+/// the same public envelope to the Home; this is the native/Desktop crossing.
+pub async fn mint_managed_entitlement(
+    wb: &SharedWorkbench,
+    tenant: &str,
+    publisher_key: &str,
+) -> Result<crate::managed_entitlement::Entitlement, (StatusCode, String)> {
+    let Some(hub) = hub_base() else {
+        return Err((
+            StatusCode::CONFLICT,
+            "account sign-in is not configured for this runtime".to_owned(),
+        ));
+    };
+    let Some(bearer) = hub_session_token(wb) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "sign in to GaugeWright to use managed deployment funding".to_owned(),
+        ));
+    };
+    let url = hub_tenant_url(&hub, tenant, &["managed-inference", "entitlement"])
+        .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))?;
+    let body = json!({ "publisher_key": publisher_key }).to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        HttpClient::new().post_json_headers(
+            &url,
+            &[("authorization".to_owned(), format!("Bearer {bearer}"))],
+            &body,
+        )
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "managed entitlement task panicked".to_owned(),
+        )
+    })?
+    .map_err(|message| (StatusCode::BAD_GATEWAY, message))?;
+    let status = StatusCode::from_u16(result.0).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() {
+        let detail = serde_json::from_str::<Value>(&result.1)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "the Hub refused managed deployment funding".to_owned());
+        return Err((status, detail));
+    }
+    serde_json::from_str(&result.1).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "the Hub returned a malformed managed entitlement".to_owned(),
+        )
+    })
+}
+
+/// Desktop proxy for the signed-in person's tenant switcher. It exposes only
+/// the Hub's non-secret tenant projection; the sealed bearer stays local.
+pub async fn get_signin_tenants(State(wb): State<SharedWorkbench>) -> Response {
+    let Some(hub) = hub_base() else {
+        return (
+            StatusCode::CONFLICT,
+            "account sign-in is not configured for this runtime",
+        )
+            .into_response();
+    };
+    let Some(bearer) = hub_session_token(&wb) else {
+        return (StatusCode::UNAUTHORIZED, "sign in to read account tenants").into_response();
+    };
+    let fetched = tokio::task::spawn_blocking(move || {
+        HttpClient::new().get_string_headers(
+            &format!("{hub}/account/tenants"),
+            &[("authorization".to_owned(), format!("Bearer {bearer}"))],
+        )
+    })
+    .await;
+    let Ok(Ok((status, body))) = fetched else {
+        return (StatusCode::BAD_GATEWAY, "the Hub was unreachable").into_response();
+    };
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    match serde_json::from_str::<Value>(&body) {
+        Ok(value) => (status, Json(value)).into_response(),
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            "the Hub returned malformed tenants",
+        )
+            .into_response(),
+    }
 }
 
 /// One in-flight sign-in: the verifier stays here — in this process — until the

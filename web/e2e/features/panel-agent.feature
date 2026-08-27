@@ -8,6 +8,7 @@ Feature: Panel agents belong to the Library and deploy through projects
     When I preview the Panel agent "Public intake"
     Then its disposable public preview is open
     And the preview says it writes no production Inbox data
+    And the preview offers a real disposable Session
     When I close the Panel agent preview
     And I open settings for the Panel agent "Public intake"
     Then its Panel contract editor is open
@@ -17,5 +18,6 @@ Feature: Panel agents belong to the Library and deploy through projects
     Then project "Customer site" has a Panel-agent placement without a new-chat action
     When I open deployment for the Panel agent in project "Customer site"
     Then deployment shows the frozen public contract
+    And deployment exposes publication and Inbox controls
     When I open the deployment Inbox
     Then the project Inbox for "Customer site" is open

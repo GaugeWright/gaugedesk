@@ -82,6 +82,10 @@ pub struct Workbench {
     pub(crate) sessions: BTreeMap<String, SharedHarness>,
     /// One remote harness per remotely placed engagement (ADR 0020/0031).
     pub(crate) remote_sessions: BTreeMap<String, Box<dyn gaugedesk_harness::RemoteHarness>>,
+    /// Disposable public-session previews. These are operational, in-memory
+    /// handles only: no Agent, project, placement, chat, or Inbox fact is
+    /// appended for a preview (ADR 0143 §3).
+    pub(crate) panel_previews: BTreeMap<String, crate::agent_release::ActivePanelPreview>,
     /// One embedded WhippleScript tracker runtime per trust boundary (ADR 0075),
     /// keyed by boundary id (`account::global` in v1). Spawned on demand and held
     /// for the workbench's lifetime, mirroring `sessions`. Structural isolation:
@@ -290,6 +294,7 @@ impl Workbench {
             streams: BTreeMap::new(),
             sessions: BTreeMap::new(),
             remote_sessions: BTreeMap::new(),
+            panel_previews: BTreeMap::new(),
             tracker_runtimes: BTreeMap::new(),
             measurements: MeasurementStore::new(),
             sealed_keys: LoopbackKeyReleaseService::new(),

@@ -10,6 +10,7 @@ import {
     accountTenants,
     acceptAccountInvitation,
     createOrganization,
+    hubSessionTenants,
     parseFacility,
     parseInvitation,
     parseAccountSignInMethod,
@@ -96,6 +97,20 @@ describe("control-plane-tenant (ADR 0077 §7/§9)", () => {
         });
         const out = await accountTenants(json);
         expect(out).toEqual([{ id: "personal:root", displayName: "Personal", role: "owner", personal: true, providerCommercial: false }]);
+    });
+
+    it("lists the same safe tenant projection through Desktop's sealed Hub session", async () => {
+        const { json, calls } = fakeJson({
+            tenants: [{ id: "tenant:canary", display_name: "Canary", role: "admin", personal: false }],
+        });
+        await expect(hubSessionTenants(json)).resolves.toEqual([{
+            id: "tenant:canary",
+            displayName: "Canary",
+            role: "admin",
+            personal: false,
+            providerCommercial: false,
+        }]);
+        expect(calls).toEqual([["GET", "/account/hub-session/tenants", undefined]]);
     });
 
     it("creates a named organization through the account command", async () => {

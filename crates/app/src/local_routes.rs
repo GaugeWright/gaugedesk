@@ -80,6 +80,18 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             post(crate::publisher_routes::publish_deployment),
         )
         .route(
+            "/public-deployments/publisher-authority",
+            get(crate::publisher_routes::publisher_authority),
+        )
+        .route(
+            "/panel-previews",
+            post(crate::publisher_routes::start_panel_preview),
+        )
+        .route(
+            "/panel-previews/{id}",
+            delete(crate::publisher_routes::stop_panel_preview),
+        )
+        .route(
             "/public-deployments/import",
             post(crate::publisher_routes::import_legacy_deployment),
         )

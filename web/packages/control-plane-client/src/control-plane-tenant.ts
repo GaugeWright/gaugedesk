@@ -159,6 +159,13 @@ export async function accountTenants(json: RouteJson): Promise<AccountTenant[]> 
     return Array.isArray(o?.tenants) ? o.tenants.map(parseTenant) : [];
 }
 
+/** The native/Desktop control plane's bearer-free proxy to the Hub tenant
+ * switcher. The sealed Hub session never reaches the browser. */
+export async function hubSessionTenants(json: RouteJson): Promise<AccountTenant[]> {
+    const o = (await json("GET", "/account/hub-session/tenants")) as { tenants?: unknown[] };
+    return Array.isArray(o?.tenants) ? o.tenants.map(parseTenant) : [];
+}
+
 /** Pending workspace invitations for the signed-in person (`GET /account/invitations`). */
 export async function accountInvitations(json: RouteJson): Promise<AccountInvitation[]> {
     const o = (await json("GET", "/account/invitations")) as { invitations?: unknown[] };

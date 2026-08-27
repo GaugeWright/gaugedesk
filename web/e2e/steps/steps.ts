@@ -437,11 +437,21 @@ Then("its disposable public preview is open", async ({ page }) => {
 });
 
 Then("the preview says it writes no production Inbox data", async ({ page }) => {
-    await expect(page.getByText(/does not enter a project Inbox/)).toBeVisible();
+    await expect(page.getByText(/never enter Personal or a project Inbox/)).toBeVisible();
+});
+
+Then("the preview offers a real disposable Session", async ({ page }) => {
+    const dialog = page.getByRole("dialog", { name: /Preview/ });
+    await expect(dialog.getByRole("button", { name: "Start real Preview" })).toBeVisible();
+    await expect(dialog.getByText("GaugeWright managed inference", { exact: true })).toBeVisible();
+    await expect(dialog.getByText("Bring your own provider key", { exact: true })).toBeVisible();
 });
 
 When("I close the Panel agent preview", async ({ page }) => {
-    await page.getByRole("dialog", { name: /Preview/ }).getByRole("button", { name: "Close" }).click();
+    await page
+        .getByRole("dialog", { name: /Preview/ })
+        .locator('button[aria-label="Close"]')
+        .click();
 });
 
 When("I open settings for the Panel agent {string}", async ({ page }, name: string) => {
@@ -482,6 +492,12 @@ Then("deployment shows the frozen public contract", async ({ page }) => {
     await expect(page.getByRole("dialog", { name: "Deploy Panel agent" })).toBeVisible();
     await expect(page.getByText("Frozen public contract", { exact: true })).toBeVisible();
     await expect(page.getByText(/Deployment operates it; it does not redefine it/)).toBeVisible();
+});
+
+Then("deployment exposes publication and Inbox controls", async ({ page }) => {
+    const dialog = page.getByRole("dialog", { name: "Deploy Panel agent" });
+    await expect(dialog.getByRole("button", { name: "Publish deployment" })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Open Inbox" })).toBeVisible();
 });
 
 When("I open the deployment Inbox", async ({ page }) => {

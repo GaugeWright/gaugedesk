@@ -46,6 +46,7 @@ import {
     parseWebReturnHandoffCode,
     type HomeInvitationPreview,
     type PlacementPolicy,
+    type PlacementId,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
@@ -418,7 +419,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // UX-8: the fork-tree panel (chat fork lineage); holds the chat that opened it.
     const [forkTreeFor, setForkTreeFor] = createSignal<EngagementId | null>(null);
     const [deployment, setDeployment] = createSignal<DeploymentSelection | null>(null);
-    const [panelPreview, setPanelPreview] = createSignal<{ agent: ArchetypeNode; project?: ProjectNode } | null>(null);
+    const [panelPreview, setPanelPreview] = createSignal<{
+        agent: ArchetypeNode;
+        project?: ProjectNode;
+        placementId?: PlacementId;
+    } | null>(null);
     const [projectInbox, setProjectInbox] = createSignal<{ id: ProjectId; name: string } | null>(null);
 
     // Mirror the workspace *live* across clients over the workspace event stream
@@ -1443,7 +1448,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}
             onOpenProjectHome={(id, name) => setProjectHome({ id, name })}
             onDeployPlacement={setDeployment}
-            onPreviewPanel={(agent, project) => setPanelPreview({ agent, project })}
+            onPreviewPanel={(agent, project) => {
+                const placement = project?.placements.find((candidate) =>
+                    candidate.kind === "panel" && candidate.archetypeId === agent.id);
+                const pinnedProfile = placement?.panelProfile;
+                setPanelPreview({
+                    agent: pinnedProfile ? { ...agent, panelProfile: pinnedProfile } : agent,
+                    project,
+                    placementId: placement?.placementId,
+                });
+            }}
             onOpenInbox={(id, name) => setProjectInbox({ id, name })}
             onAttachTarget={(id, name, kind) => void attachTarget(id, name, kind)}
             onOpenForkTree={(chat) => setForkTreeFor(chat)}
@@ -1945,8 +1959,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     selection={selectedDeployment()}
                     defaultEdgeOrigin={import.meta.env.VITE_PUBLIC_EDGE_ORIGIN
                         || PUBLIC_EDGE_ORIGIN}
-                    defaultFundingRef={import.meta.env.VITE_PUBLIC_FUNDING_REF
-                        || ""}
                     defaultCredentialRef={import.meta.env.VITE_PUBLIC_CREDENTIAL_REF
                         || "credential:production:openai:v1"}
                     onOpenInbox={() => {
@@ -1958,8 +1970,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             )}</Show>
 
             <Show when={panelPreview()}>{(preview) => <PanelAgentPreview
+                api={api}
                 agent={preview().agent}
                 project={preview().project}
+                placementId={preview().placementId}
+                defaultEdgeOrigin={import.meta.env.VITE_PUBLIC_EDGE_ORIGIN
+                    || PUBLIC_EDGE_ORIGIN}
+                defaultCredentialRef={import.meta.env.VITE_PUBLIC_CREDENTIAL_REF
+                    || "credential:production:openai:v1"}
                 onClose={() => setPanelPreview(null)}
             />}</Show>
 

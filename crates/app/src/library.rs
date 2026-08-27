@@ -141,7 +141,10 @@ impl Default for PanelPublicProfile {
             provider: ProviderPolicy {
                 provider: "openai".to_owned(),
                 model: "gpt-5-mini".to_owned(),
-                base_url: "https://api.openai.com/v1".to_owned(),
+                // The native OpenAI Responses client appends `/v1/responses`.
+                // This is therefore the provider origin, not the SDK-style
+                // compat base used by `openai-generic` chat completions.
+                base_url: "https://api.openai.com".to_owned(),
                 credential_class: "openai-api-key".to_owned(),
                 max_input_tokens: None,
                 max_output_tokens: None,
@@ -380,7 +383,7 @@ pub struct DeploymentAudienceOidc {
 pub struct DeploymentAudience {
     #[serde(default = "default_true")]
     pub anonymous_allowed: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc: Option<DeploymentAudienceOidc>,
 }
 
@@ -1131,6 +1134,19 @@ pub fn gen_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_default_uses_the_openai_responses_origin() {
+        let profile = PanelPublicProfile::default();
+        assert_eq!(profile.provider.provider, "openai");
+        assert_eq!(profile.provider.base_url, "https://api.openai.com");
+    }
+
+    #[test]
+    fn anonymous_deployment_audience_omits_an_absent_oidc_provider() {
+        let value = serde_json::to_value(DeploymentAudience::default()).unwrap();
+        assert_eq!(value, serde_json::json!({ "anonymous_allowed": true }));
+    }
 
     #[test]
     fn chat_mode_serializes_as_edit_and_reads_the_legacy_build_value() {

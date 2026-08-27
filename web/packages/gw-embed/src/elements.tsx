@@ -246,6 +246,10 @@ interface TurnstileRequired {
 
 /** `<gw-session cp="…" engagement="…">`: builds + owns the scoped remote Session. */
 export class GwSessionElement extends HTMLElement {
+    static get observedAttributes(): string[] {
+        return ["host"];
+    }
+
     /** The Session its panel children render against (also settable directly). */
     session?: Session;
     /** The first-class producer that binds identity, placement transport, and
@@ -401,9 +405,32 @@ export class GwSessionElement extends HTMLElement {
         // Custom elements are inline by default. Make the provider a useful
         // zero-config block without replacing an intentional grid/flex layout.
         if (getComputedStyle(this).display === "inline") this.style.display = "block";
-        if (this.session || this._teardown) return; // already built, or injected via handle
+        if (this.session || this._teardown || this._base) return; // already built, booting, or injected via handle
         const host = this.getAttribute("host");
         if (host) void this.bootstrap(host);
+    }
+
+    /** Solid and other component runtimes may attach a custom element before
+     * spreading its attributes. Treat a later `host` attribute as the same
+     * bootstrap signal as parser-created markup, so embedding does not depend
+     * on framework insertion order. */
+    attributeChangedCallback(name: string, previous: string | null, next: string | null) {
+        if (
+            name !== "host"
+            || !this.isConnected
+            || !next
+            || next === previous
+            || this._base === next.replace(/\/$/, "")
+        ) return;
+        this._teardown?.();
+        this._teardown = undefined;
+        this.session = undefined;
+        this.environment = undefined;
+        this._base = null;
+        this.querySelectorAll<GwPanelElement>(
+            "gw-chat, gw-viewer, gw-files, gw-chats",
+        ).forEach((panel) => panel.resetBinding());
+        void this.bootstrap(next);
     }
 
     /** Admit or resume one hosted visitor engagement during page load, then

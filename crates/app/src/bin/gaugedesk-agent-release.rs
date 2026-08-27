@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gaugedesk_app::agent_release::{
-    AcknowledgeCollectionsRequest, ControlDeploymentRequest, DrainCollectionsRequest,
-    ErasePublicSessionRequest, ListPublicCredentialsRequest, ProvisionPublicCredentialRequest,
-    PublishDeploymentRequest, ReleasePublishSpec, RevokePublicCredentialRequest,
+    collect_into_project, AcknowledgeCollectionsRequest, CollectIntoProjectRequest,
+    ControlDeploymentRequest, DrainCollectionsRequest, ErasePublicSessionRequest,
+    ListPublicCredentialsRequest, ProvisionPublicCredentialRequest, PublishDeploymentRequest,
+    ReleasePublishSpec, RevokePublicCredentialRequest,
 };
-use gaugedesk_app::library::PanelPublicProfile;
+use gaugedesk_app::library::{PanelCollectionRecipient, PanelPublicProfile};
 use gaugedesk_app::{open_workbench, LockUnpoisoned, Workbench};
 use gaugedesk_core::agent_release::{
     AttributionPolicy, PanelManifest, ProviderPolicy, RetentionPolicy, SignedAgentRelease,
@@ -44,10 +45,11 @@ fn usage() -> io::Error {
          gaugedesk-agent-release deployment-import <workbench-root> <edge-origin> \
            <deployment-id> <export.json> [--replace]\n  \
          gaugedesk-agent-release collection-recipient <workbench-root> <recipient-id>\n  \
+         gaugedesk-agent-release collections-collect <workbench-root> <binding-id>\n  \
          gaugedesk-agent-release collections-drain <workbench-root> <request.json>\n  \
          gaugedesk-agent-release collections-acknowledge <workbench-root> <request.json>\n  \
          gaugedesk-agent-release seed-panel-placement <workbench-root> <placement-id> \
-           [profile.json]",
+           [profile.json [recipient-id recipient-public-key]]",
     )
 }
 
@@ -379,16 +381,44 @@ fn main() -> io::Result<()> {
             let root = path_arg(args.next())?;
             let placement_id = string_arg(args.next())?;
             let profile_path = args.next();
+            let recipient_id = args.next();
+            let recipient_public_key = args.next();
             no_more(args)?;
             let profile = match profile_path {
                 Some(path) => serde_json::from_slice(&fs::read(path)?).map_err(invalid)?,
                 None => PanelPublicProfile::default(),
             };
+            let recipient = match (recipient_id, recipient_public_key) {
+                (Some(recipient_ref), Some(public_key)) => Some(PanelCollectionRecipient {
+                    recipient_ref,
+                    recipient_public_keys: vec![public_key],
+                }),
+                (None, None) => None,
+                _ => {
+                    return Err(invalid(
+                        "a seeded collection recipient needs both its id and public key",
+                    ))
+                }
+            };
             let workbench = open_workbench(&root)?;
             let seeded = workbench
                 .lock_unpoisoned()
-                .seed_panel_placement(&placement_id, profile)?;
+                .seed_panel_placement_with_recipient(&placement_id, profile, recipient)?;
             println!("{}", serde_json::to_string(&seeded).map_err(invalid)?);
+        }
+        Some("collections-collect") => {
+            let root = path_arg(args.next())?;
+            let binding_id = string_arg(args.next())?;
+            no_more(args)?;
+            let workbench = open_workbench(&root)?;
+            let collected = collect_into_project(
+                &workbench,
+                CollectIntoProjectRequest {
+                    binding_id,
+                    after_unix_ms: None,
+                },
+            )?;
+            println!("{}", serde_json::to_string(&collected).map_err(invalid)?);
         }
         Some("collections-acknowledge") => {
             let root = path_arg(args.next())?;

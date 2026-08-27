@@ -31,6 +31,8 @@ import type {
     MergeAction,
     MergeState,
     PanelPublicProfile,
+    PanelPreviewInput,
+    PanelPreviewOutcome,
     PlacementId,
     ProjectId,
     CollectionRecipient,
@@ -576,6 +578,49 @@ export async function publishDeployment(
         throw new Error("deployment publisher response is malformed");
     }
     return response.deployment;
+}
+
+/** Public half of the Home's isolated deployment-publisher key. The Hub binds
+ * managed-funding entitlements to it; the private half remains in the Home. */
+export async function publicPublisherKey(
+    transport: WorkbenchTransport,
+): Promise<string> {
+    const response = await transport.json(
+        "GET",
+        "/public-deployments/publisher-authority",
+    ) as { public_key?: unknown };
+    if (typeof response.public_key !== "string" || !/^04[0-9a-f]{128}$/.test(response.public_key)) {
+        throw new Error("deployment publisher authority response is malformed");
+    }
+    return response.public_key;
+}
+
+export async function startPanelPreview(
+    transport: WorkbenchTransport,
+    input: PanelPreviewInput,
+): Promise<PanelPreviewOutcome> {
+    const response = await transport.json("POST", "/panel-previews", input) as {
+        preview?: PanelPreviewOutcome;
+    };
+    const preview = response.preview;
+    if (
+        !preview
+        || typeof preview.preview_id !== "string"
+        || typeof preview.deployment_id !== "string"
+        || typeof preview.release_id !== "string"
+        || typeof preview.edge_origin !== "string"
+        || typeof preview.deployment_url !== "string"
+        || !Array.isArray(preview.panels)
+        || !Number.isSafeInteger(preview.expires_at_unix_ms)
+    ) throw new Error("Panel preview response is malformed");
+    return preview;
+}
+
+export async function stopPanelPreview(
+    transport: WorkbenchTransport,
+    previewId: string,
+): Promise<void> {
+    await transport.json("DELETE", `/panel-previews/${encodeURIComponent(previewId)}`);
 }
 
 export async function importLegacyDeployment(

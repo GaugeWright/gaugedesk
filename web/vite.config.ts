@@ -36,6 +36,7 @@ const controlPlanePrefixes = [
     "/mobile",
     "/pairing-requests",
     "/pairing-status",
+    "/panel-previews",
     "/placements",
     "/projections",
     "/projects",

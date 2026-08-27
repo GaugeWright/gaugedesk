@@ -78,6 +78,7 @@ fn published_archetype_version(
 fn validate_panel_profile(
     profile: &PanelPublicProfile,
     package_capabilities: &[String],
+    package_agent_abilities: &[String],
 ) -> Result<(), String> {
     let supported_panels = ["gw-chat", "gw-viewer", "gw-files", "gw-chats"];
     if profile.panels.components.is_empty()
@@ -104,6 +105,11 @@ fn validate_panel_profile(
         if !package_capabilities.contains(ability) {
             return Err(format!(
                 "public ability `{ability}` is absent from the package capability registry"
+            ));
+        }
+        if !package_agent_abilities.contains(ability) {
+            return Err(format!(
+                "public ability `{ability}` is not granted to the authored agent"
             ));
         }
     }
@@ -1300,6 +1306,27 @@ impl Workbench {
         placement_id: &str,
         profile: crate::library::PanelPublicProfile,
     ) -> std::io::Result<serde_json::Value> {
+        self.seed_panel_placement_with_recipient(placement_id, profile, None)
+    }
+
+    /// The composition harness variant of [`Self::seed_panel_placement`]. A
+    /// collecting Panel placement freezes the same agent profile but also binds
+    /// the exact project-owned recipient that a product placement gets from the
+    /// placement route. Keeping that value on the placement is the behavior the
+    /// cross-repository host test needs to exercise; deployment publication must
+    /// not be allowed to invent it later.
+    pub fn seed_panel_placement_with_recipient(
+        &mut self,
+        placement_id: &str,
+        profile: crate::library::PanelPublicProfile,
+        collection_recipient: Option<crate::library::PanelCollectionRecipient>,
+    ) -> std::io::Result<serde_json::Value> {
+        if profile.collection.is_some() != collection_recipient.is_some() {
+            return Err(invalid_data(
+                "a seeded collection profile and project recipient must be supplied together"
+                    .to_owned(),
+            ));
+        }
         if placement_id.trim().is_empty() {
             return Err(invalid_data("a seeded placement needs an id".to_owned()));
         }
@@ -1388,7 +1415,7 @@ impl Workbench {
             project_id: Some(DEFAULT_PROJECT.to_owned()),
             version: 1,
             admission: Admission::Active,
-            collection_recipient: None,
+            collection_recipient,
         };
 
         let store = self.store_mut();
@@ -2406,7 +2433,7 @@ impl Workbench {
                 .join(gaugedesk_boundary::definition::DRAFT_ROOT),
         )
         .map_err(|error| error.to_string())?;
-        validate_panel_profile(&profile, package.capabilities())?;
+        validate_panel_profile(&profile, package.capabilities(), package.agent_abilities())?;
         agent.op = RecordOp::Upsert;
         agent.panel_profile = Some(profile.clone());
         self.write_agent_record(agent);
@@ -3269,7 +3296,7 @@ impl Workbench {
                 gaugedesk_whip_runtime::AuthoredAgentPackage::load(engagement.path().join(&target))
                     .map_err(PublishArchetypeError::InvalidPackage)?;
             if let Some(profile) = &panel_profile {
-                validate_panel_profile(profile, package.capabilities())
+                validate_panel_profile(profile, package.capabilities(), package.agent_abilities())
                     .map_err(PublishArchetypeError::InvalidPackage)?;
             }
             let discipline = crate::discipline::load(
