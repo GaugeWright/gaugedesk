@@ -165,15 +165,17 @@ describe("native account session transport", () => {
 });
 
 describe("hosted account session refresh", () => {
-    it("uses the credentialed production refresh route without exposing a token", async () => {
+    it("holds the refreshed id-token in memory as the Home credential (ADR 0147 §1)", async () => {
+        setBearer(null);
+        const idToken = fakeJwt({ sub: "person:one" });
         const fetch = vi.fn(async (
             _input: RequestInfo | URL,
             _init?: RequestInit,
         ) =>
-            new Response(JSON.stringify({ refreshed: true, person: "person:one" }), {
-                status: 200,
-                headers: { "content-type": "application/json" },
-            }));
+            new Response(
+                JSON.stringify({ refreshed: true, person: "person:one", id_token: idToken }),
+                { status: 200, headers: { "content-type": "application/json" } },
+            ));
         vi.stubGlobal("fetch", fetch);
 
         await expect(refreshHostedAccountSession("https://auth.example/")).resolves.toBe(true);
@@ -181,7 +183,24 @@ describe("hosted account session refresh", () => {
         const init = fetch.mock.calls[0]?.[1];
         expect(init?.method).toBe("GET");
         expect(init?.credentials).toBe("include");
+        // The opaque session cookie authenticates the refresh — no bearer header is sent.
         expect(new Headers(init?.headers).has("authorization")).toBe(false);
+        // The short-lived id-token is now held in memory (never at rest) for the Home bearer.
+        expect(bearer()).toBe(idToken);
+        setBearer(null);
+    });
+
+    it("still reports success when a deployment returns no id-token yet", async () => {
+        setBearer(null);
+        const fetch = vi.fn(async () =>
+            new Response(JSON.stringify({ refreshed: true, person: "person:one" }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            }));
+        vi.stubGlobal("fetch", fetch);
+
+        await expect(refreshHostedAccountSession("https://auth.example/")).resolves.toBe(true);
+        expect(bearer()).toBeNull();
 
         fetch.mockResolvedValueOnce(new Response(null, { status: 401 }));
         await expect(refreshHostedAccountSession("https://auth.example")).resolves.toBe(false);

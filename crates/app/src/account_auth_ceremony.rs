@@ -367,8 +367,7 @@ impl AccountAuthRuntime {
         append_facts(wb.store_mut(), &facts).map_err(|_| CeremonyError::Unavailable)?;
         crate::auth_oidc::provision_web_account(wb, &pending.account_id, true);
         let session = wb
-            .account_sessions()
-            .issue(&pending.account_id, now, self.session_ttl_secs)
+            .mint_account_session(&pending.account_id, "passkey", self.session_ttl_secs)
             .ok_or(CeremonyError::Unavailable)?;
         Ok((pending.account_id, session))
     }
@@ -462,8 +461,7 @@ impl AccountAuthRuntime {
         append_facts(wb.store_mut(), &[AccountAuthFact::WebAuthn(updated)])
             .map_err(|_| CeremonyError::Unavailable)?;
         let session = wb
-            .account_sessions()
-            .issue(&pending.account_id, now, self.session_ttl_secs)
+            .mint_account_session(&pending.account_id, "passkey", self.session_ttl_secs)
             .ok_or(CeremonyError::Unavailable)?;
         Ok((pending.account_id, session))
     }

@@ -90,6 +90,90 @@ impl Workbench {
         Arc::clone(&self.account_sessions)
     }
 
+    /// Mint a durable, opaque account session for `account_id` (`ADR 0147` §1). Mints
+    /// the bearer entropy into the in-memory hot cache and writes the digest-keyed
+    /// index record into the shared `account-auth` scope so the session survives a
+    /// restart and can be revoked server-side. `method` is `"oidc"` or `"passkey"` —
+    /// the session surface reports it. Returns the raw token to set as the cookie; the
+    /// caller keys the per-session refresh grant by [`account_session::session_id`].
+    /// `lifetime_secs` bounds the opaque token's cache liveness — the OIDC browser
+    /// path passes the platform absolute-lifetime (the refresh grant enforces the
+    /// idle bound), the passkey ceremony passes its own session TTL. Best-effort
+    /// durability: a store-write failure leaves a working cache session that simply
+    /// does not survive a restart.
+    pub fn mint_account_session(
+        &mut self,
+        account_id: &str,
+        method: &str,
+        lifetime_secs: u64,
+    ) -> Option<String> {
+        let now_ms = crate::account::session_now_ms();
+        let now_secs = now_ms / 1000;
+        let cache = Arc::clone(&self.account_sessions);
+        let token = cache.issue_with_method(account_id, method, now_secs, lifetime_secs)?;
+        let session_id = crate::account_session::session_id(&token);
+        if let Ok(record) = crate::account_auth::AccountSessionRecord::new(
+            &session_id,
+            account_id,
+            method,
+            now_ms,
+            lifetime_secs,
+        ) {
+            let _ = crate::account_auth::append_facts(
+                self.store_mut(),
+                &[crate::account_auth::AccountAuthFact::Session(record)],
+            );
+        }
+        Some(token)
+    }
+
+    /// Revoke the opaque session `token` names (`ADR 0147` §3): evict it from the hot
+    /// cache and tombstone its durable index record (future-only, `INV-18`), so the
+    /// token stops resolving now and after a restart. Returns whether a live cache
+    /// entry was removed. The caller separately tombstones the per-session refresh
+    /// grant keyed by the same session id.
+    pub fn revoke_account_session(&mut self, token: &str) -> bool {
+        let session_id = crate::account_session::session_id(token);
+        let removed = Arc::clone(&self.account_sessions).revoke(token);
+        let tombstone = crate::account_auth::AccountSessionRecord {
+            id: session_id,
+            op: crate::account_auth::RecordOp::Tombstone,
+            account_id: String::new(),
+            method: String::new(),
+            issued_at_ms: 0,
+            last_seen_ms: 0,
+            lifetime_secs: 0,
+        };
+        let _ = crate::account_auth::append_facts(
+            self.store_mut(),
+            &[crate::account_auth::AccountAuthFact::Session(tombstone)],
+        );
+        removed
+    }
+
+    /// Re-seat live opaque sessions into the hot cache from the durable index on
+    /// startup (`ADR 0147` §1) — the substrate that makes a hosted session survive a
+    /// restart. A session whose absolute lifetime has elapsed is left out.
+    pub(crate) fn restore_account_sessions(&mut self) {
+        let Ok(auth) = crate::account_auth::AccountAuth::rebuild(self.store_ref()) else {
+            return;
+        };
+        let now_ms = crate::account::session_now_ms();
+        for record in auth.sessions.values() {
+            let lifetime_ms = record.lifetime_secs.saturating_mul(1000);
+            let expires_ms = record.issued_at_ms.saturating_add(lifetime_ms);
+            if expires_ms <= now_ms {
+                continue;
+            }
+            self.account_sessions.insert_loaded(
+                &record.id,
+                &record.account_id,
+                &record.method,
+                expires_ms / 1000,
+            );
+        }
+    }
+
     fn identity_claims(
         &self,
         bearer: Option<&str>,
@@ -846,6 +930,7 @@ impl Workbench {
 #[cfg(test)]
 mod provider_neutral_identity_tests {
     use super::*;
+    use crate::app_support::LockUnpoisoned;
     use gaugedesk_core::abac::{AuthorityAttributes, Role};
     use std::collections::BTreeSet;
 
@@ -875,5 +960,82 @@ mod provider_neutral_identity_tests {
             .identity_claims(Some("oidc-token"), &account_id)
             .roles
             .contains(&Role::admin()));
+    }
+
+    #[test]
+    fn a_durable_opaque_session_survives_a_restart_and_revoke_is_future_only() {
+        let root = tempfile::tempdir().unwrap();
+        // First process: mint an OIDC-derived opaque session.
+        let token = {
+            let wb = crate::open_workbench(root.path()).unwrap();
+            let mut g = wb.lock_unpoisoned();
+            let token = g
+                .mint_account_session("person-root", "oidc", 24 * 60 * 60)
+                .unwrap();
+            assert_eq!(
+                g.account_sessions().resolve_now(&token).as_deref(),
+                Some("person-root")
+            );
+            // The session surface reads the true minting method from the record.
+            assert_eq!(
+                g.account_sessions().resolve_session(&token).unwrap().1,
+                "oidc"
+            );
+            token
+        };
+        // A fresh process re-seats the session from the durable index (ADR 0147 §1).
+        {
+            let wb = crate::open_workbench(root.path()).unwrap();
+            let g = wb.lock_unpoisoned();
+            assert_eq!(
+                g.account_sessions().resolve_now(&token).as_deref(),
+                Some("person-root"),
+                "an opaque session survives a restart"
+            );
+            assert_eq!(
+                g.account_sessions().resolve_session(&token).unwrap().1,
+                "oidc"
+            );
+        }
+        // Revoke it, then confirm it stays revoked across another restart (INV-18).
+        {
+            let wb = crate::open_workbench(root.path()).unwrap();
+            let mut g = wb.lock_unpoisoned();
+            assert!(g.revoke_account_session(&token));
+            assert!(g.account_sessions().resolve_now(&token).is_none());
+        }
+        {
+            let wb = crate::open_workbench(root.path()).unwrap();
+            let g = wb.lock_unpoisoned();
+            assert!(
+                g.account_sessions().resolve_now(&token).is_none(),
+                "a revoked session does not resurrect on restart"
+            );
+        }
+    }
+
+    #[test]
+    fn revoking_one_session_leaves_a_concurrent_session_live() {
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        let first = wb
+            .mint_account_session("person-root", "oidc", 3600)
+            .unwrap();
+        let second = wb
+            .mint_account_session("person-root", "passkey", 3600)
+            .unwrap();
+        assert_ne!(first, second, "each login mints its own opaque session");
+
+        // Logout/revoke ends only the caller's own session (ADR 0147 §3).
+        assert!(wb.revoke_account_session(&first));
+        assert!(wb.account_sessions().resolve_now(&first).is_none());
+        assert_eq!(
+            wb.account_sessions().resolve_now(&second).as_deref(),
+            Some("person-root"),
+            "a concurrent session of the same person stays live"
+        );
+        assert_eq!(
+            wb.account_sessions().resolve_session(&second).unwrap().1,
+            "passkey"
+        );
     }
 }

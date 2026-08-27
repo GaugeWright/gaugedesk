@@ -101,7 +101,21 @@ export interface HomePoolOptions<Api> {
      * re-reads once and retries rather than reporting the Home unreachable
      * (ADR 0131 §5). Without this seam the pool simply does not retry. */
     readonly refreshRoutes?: () => Promise<readonly OpaqueHomeRoute[]>;
+    /** How long `admit` waits for the in-memory bearer to (re)appear before
+     * refusing (ms, default {@link DEFAULT_BEARER_GRACE_MS}). After a page reload
+     * the opaque session cookie survives but the in-memory id-token is gone until
+     * the first `/auth/refresh` completes, so a project opened in that window would
+     * otherwise race the rehydration and be refused. `0` restores the immediate
+     * refusal (tests). */
+    readonly bearerGraceMs?: number;
 }
+
+/** How often {@link HomePool.awaitBearer} re-reads the bearer while waiting. */
+const BEARER_POLL_MS = 50;
+/** Default grace window for the bearer to rehydrate after a reload — comfortably
+ * over a `/auth/refresh` round trip, bounded so a genuinely signed-out caller is
+ * refused rather than hanging. */
+const DEFAULT_BEARER_GRACE_MS = 4000;
 
 /**
  * No route in this account names the Home a caller asked for.
@@ -147,6 +161,7 @@ export class HomePool<Api> {
     private readonly closeRoute: NonNullable<HomePoolOptions<Api>["closeRoute"]>;
     private readonly refreshRoutes: HomePoolOptions<Api>["refreshRoutes"];
     private readonly onStateChange: NonNullable<HomePoolOptions<Api>["onStateChange"]>;
+    private readonly bearerGraceMs: number;
 
     constructor(
         routes: readonly OpaqueHomeRoute[],
@@ -163,7 +178,25 @@ export class HomePool<Api> {
         this.resolveEndpoint = options.resolveEndpoint ?? (async (route) => route.endpoint);
         this.closeRoute = options.closeRoute ?? (async () => undefined);
         this.refreshRoutes = options.refreshRoutes;
+        this.bearerGraceMs = Math.max(0, options.bearerGraceMs ?? DEFAULT_BEARER_GRACE_MS);
         this.replaceRoutes(routes);
+    }
+
+    /** The in-memory bearer, waiting briefly for it to (re)appear if it is not yet
+     * set. On a page reload the opaque session cookie survives but the in-memory
+     * id-token is gone until the first `/auth/refresh` completes; opening a project
+     * in that window must wait for the rehydration rather than race it. Resolves the
+     * moment the bearer appears; returns `null` only after the grace window, i.e. a
+     * genuinely signed-out caller. */
+    private async awaitBearer(): Promise<string | null> {
+        const immediate = this.bearer();
+        if (immediate) return immediate;
+        for (let waited = 0; waited < this.bearerGraceMs; waited += BEARER_POLL_MS) {
+            await new Promise((resolve) => setTimeout(resolve, BEARER_POLL_MS));
+            const token = this.bearer();
+            if (token) return token;
+        }
+        return this.bearer();
     }
 
     replaceRoutes(routes: readonly OpaqueHomeRoute[]): void {
@@ -293,7 +326,12 @@ export class HomePool<Api> {
     }
 
     private async admit(route: OpaqueHomeRoute): Promise<MutableHomeConnection<Api>> {
-        if (!this.bearer()) throw new Error("sign in before opening a project");
+        // Fast path stays synchronous when the bearer is present (the common case):
+        // only a missing bearer waits for the reload rehydration, so admission timing
+        // is unchanged for an already-signed-in caller.
+        if (!(this.bearer() ?? (await this.awaitBearer()))) {
+            throw new Error("sign in before opening a project");
+        }
         let admission: string | null = null;
         const auth = {
             bearer: this.bearer,

@@ -188,9 +188,15 @@ export async function refreshMobileAccountToken(
     return body.id_token;
 }
 
-/** Proactively refresh one hosted HttpOnly-cookie account session. The cookie is
- * the only browser credential and remains unreadable to JavaScript; callers
- * receive only whether the server admitted and refreshed the session. */
+/** Proactively refresh one hosted account session (ADR 0147 §1). The opaque session
+ * **cookie** is the durable, revocable session and stays unreadable to JavaScript;
+ * `GET /auth/refresh` authenticates by that cookie and returns a fresh, short-lived
+ * **id-token in its body**. That id-token — never the session cookie — is the access
+ * credential the browser presents to project Homes (`Authorization: Bearer`), so we
+ * hold it in the in-memory {@link bearer} signal (never at rest, `ENTSEC-6`). This is
+ * also the reload-rehydration path: after a reload the in-memory id-token is gone but
+ * the opaque cookie survives, so one refresh re-obtains the Home credential. Callers
+ * receive only whether the server admitted the refresh; the token stays in memory. */
 export async function refreshHostedAccountSession(
     controlPlaneBase: string,
 ): Promise<boolean> {
@@ -200,26 +206,43 @@ export async function refreshHostedAccountSession(
         method: "GET",
         credentials: "include",
     });
-    return response.ok;
+    if (!response.ok) return false;
+    // Hold the short-lived id-token in memory as the Home access credential. Tolerate
+    // an absent token (a deployment that has not yet moved to the cookie model still
+    // reports a successful refresh) so refresh stays a boolean signal to the caller.
+    try {
+        const body = await response.json() as { id_token?: unknown };
+        if (typeof body.id_token === "string" && body.id_token) {
+            setBearer(body.id_token);
+        }
+    } catch {
+        /* no JSON body — the session was still refreshed */
+    }
+    return true;
 }
 
 /**
- * Keep a hosted **cookie session** alive (ADR 0077 session refresh). The hub sets an HttpOnly
- * `.gaugewright.com` session cookie carrying a ~1h id-token; `GET /auth/refresh` mints a fresh one
- * from the stored refresh token **while the current session is still valid** (proactive — an expired
- * cookie can't refresh itself). So the Console pings `/auth/refresh` on a timer well under the hour;
- * the browser swaps in the new cookie, and a long-open tab never gets logged out mid-use.
+ * Keep a hosted **cookie session** alive (ADR 0077 / ADR 0147 §1). The hub sets an HttpOnly
+ * `.gaugewright.com` **opaque** session cookie; `GET /auth/refresh` authenticates by it and returns
+ * a fresh ~1h **id-token in its body** while the session is still live (proactive — a revoked or
+ * expired session can't refresh itself). {@link refreshHostedAccountSession} holds that id-token in
+ * memory as the Home access credential, so this timer both keeps the session warm and keeps the
+ * Home credential fresh; a long-open tab never gets logged out mid-use.
  *
- * Fire-and-forget + credentialed (the HttpOnly cookie is not JS-readable). No-op unless `base` is a
- * remote `https` Hub API — the loopback desktop has no cookie session. Returns a
- * stop function. Safe when there is no `window`.
+ * The **first tick fires immediately**, which is the reload-rehydration path: the in-memory
+ * id-token is gone after a reload but the opaque cookie survives, so this re-obtains the Home
+ * credential without a re-login. Fire-and-forget + credentialed (the HttpOnly cookie is not
+ * JS-readable). No-op unless `base` is a remote `https` Hub API — the loopback desktop has no
+ * cookie session. Returns a stop function. Safe when there is no `window`.
  */
 export function startSessionRefresh(base: string, intervalMs = 45 * 60 * 1000): () => void {
     if (typeof window === "undefined" || !base.startsWith("https://")) return () => {};
     const tick = () => {
-        // Ignore the outcome: a 200 refreshed the cookie; a 401/404 just means re-login on next use.
+        // Ignore the outcome: a 200 refreshed the session and re-seated the in-memory id-token;
+        // a 401/404 just means re-login on next use.
         void refreshHostedAccountSession(base).catch(() => {});
     };
+    tick();
     const id = window.setInterval(tick, intervalMs);
     return () => window.clearInterval(id);
 }

@@ -31,6 +31,7 @@ const SUBJECT_KIND: &str = "account_auth_subject";
 const RECOVERY_BATCH_KIND: &str = "account_auth_recovery_batch";
 const RECOVERY_CODE_KIND: &str = "account_auth_recovery_code";
 const ROOT_CUSTODY_KIND: &str = "account_auth_root_custody";
+const SESSION_KIND: &str = "account_auth_session";
 
 /// Future authentication standing. Revocation is an upsert, never deletion.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -255,6 +256,62 @@ impl RecoveryCodeRecord {
     }
 }
 
+/// One durable, opaque Hub account session (`ADR 0147` §1). The record resolves a
+/// session token's digest to the account it authenticates **before the person is
+/// known** — so `authenticate_bearer` can admit an opaque bearer against one global,
+/// ordered projection exactly as the external-subject link resolves a subject. The
+/// raw session token is never stored; `id` is its domain-separated digest, which is
+/// also the session id the per-session refresh grant (`account::RefreshRecord`) is
+/// keyed by. Revocation is a future-only tombstone: a revoked session folds out of
+/// the live projection (`INV-18`), so its token stops resolving without rewriting the
+/// append-only log (`INV-6`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AccountSessionRecord {
+    /// The session id = domain-separated digest of the opaque token; never the token.
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    pub account_id: String,
+    /// The sign-in method that minted this session — `"oidc"` or `"passkey"`. The
+    /// session surface reports it; it is a projection of how the session began, not a
+    /// durable linked-method fact.
+    pub method: String,
+    /// Milliseconds since the Unix epoch when the session was minted.
+    #[serde(default)]
+    pub issued_at_ms: u64,
+    /// Milliseconds since the Unix epoch of the most recent admitted refresh.
+    #[serde(default)]
+    pub last_seen_ms: u64,
+    /// The opaque token's cache-liveness horizon in seconds from mint — the absolute
+    /// lifetime for a browser session, the ceremony TTL for a passkey session. Read on
+    /// restart to re-seat the cache with the correct expiry rather than over-extending
+    /// a short-lived session.
+    #[serde(default)]
+    pub lifetime_secs: u64,
+}
+
+impl AccountSessionRecord {
+    /// Materialize a session index record from a computed session id (the token
+    /// digest) — the raw token is never handed to this type.
+    pub fn new(
+        session_id: &str,
+        account_id: &str,
+        method: &str,
+        issued_at_ms: u64,
+        lifetime_secs: u64,
+    ) -> Result<Self, AuthRejection> {
+        Ok(Self {
+            id: required(session_id)?,
+            op: RecordOp::Upsert,
+            account_id: required(account_id)?,
+            method: required(method)?,
+            issued_at_ms,
+            last_seen_ms: issued_at_ms,
+            lifetime_secs,
+        })
+    }
+}
+
 /// Rebuildable Hub account-auth projection (`INV-5`).
 #[derive(Default, Clone, Debug)]
 pub struct AccountAuth {
@@ -264,6 +321,9 @@ pub struct AccountAuth {
     pub external_subjects: BTreeMap<String, ExternalSubjectRecord>,
     pub recovery_batches: BTreeMap<String, RecoveryBatchRecord>,
     pub recovery_codes: BTreeMap<String, RecoveryCodeRecord>,
+    /// Live opaque account sessions, keyed by session id (token digest). Tombstoned
+    /// (revoked) sessions have folded out (`ADR 0147` §1/§3).
+    pub sessions: BTreeMap<String, AccountSessionRecord>,
 }
 
 impl AccountAuth {
@@ -312,6 +372,10 @@ impl AccountAuth {
                 record.op,
                 record,
             );
+        }
+        for row in store.records(ACCOUNT_AUTH_SCOPE, SESSION_KIND)? {
+            let record: AccountSessionRecord = serde_json::from_str(&row)?;
+            fold(&mut state.sessions, record.id.clone(), record.op, record);
         }
         Ok(state)
     }
@@ -404,6 +468,7 @@ pub enum AccountAuthFact {
     ExternalSubject(ExternalSubjectRecord),
     RecoveryBatch(RecoveryBatchRecord),
     RecoveryCode(RecoveryCodeRecord),
+    Session(AccountSessionRecord),
 }
 
 impl AccountAuthFact {
@@ -415,6 +480,7 @@ impl AccountAuthFact {
             Self::ExternalSubject(_) => SUBJECT_KIND,
             Self::RecoveryBatch(_) => RECOVERY_BATCH_KIND,
             Self::RecoveryCode(_) => RECOVERY_CODE_KIND,
+            Self::Session(_) => SESSION_KIND,
         }
     }
 
@@ -426,6 +492,7 @@ impl AccountAuthFact {
             Self::ExternalSubject(record) => serde_json::to_string(record),
             Self::RecoveryBatch(record) => serde_json::to_string(record),
             Self::RecoveryCode(record) => serde_json::to_string(record),
+            Self::Session(record) => serde_json::to_string(record),
         }
     }
 }
@@ -733,6 +800,12 @@ mod tests {
                 ),
                 AccountAuthFact::RecoveryCode(record) => fold(
                     &mut state.recovery_codes,
+                    record.id.clone(),
+                    record.op,
+                    record.clone(),
+                ),
+                AccountAuthFact::Session(record) => fold(
+                    &mut state.sessions,
                     record.id.clone(),
                     record.op,
                     record.clone(),

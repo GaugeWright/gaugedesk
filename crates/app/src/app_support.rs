@@ -274,6 +274,7 @@ impl Workbench {
     pub(crate) fn restore_startup_local_projections(&mut self) {
         self.restore_workstream_homing();
         self.restore_measurements();
+        self.restore_account_sessions();
     }
 
     /// The underlying event store, mutable. Route owners and integration tests

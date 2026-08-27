@@ -891,16 +891,20 @@ fn resolve_refresh_grant(
     wb.account_refresh_session_in(&scope, binding_id).ok()?
 }
 
-/// Admit (or refuse) a **browser** refresh for `person` at `now_ms` (ADR 0147 §4).
-/// The person's `web` grant must be live and within its personal-tenant bounds; an
-/// absent grant, or an elapsed absolute lifetime or idle timeout, refuses with the
-/// reason. Returns the live grant on success.
+/// Admit (or refuse) a **browser** refresh for `person`'s session `session_id` at
+/// `now_ms` (ADR 0147 §2/§4). The per-session grant keyed by that session id must be
+/// live and within its personal-tenant bounds; an absent grant (never minted, or
+/// tombstoned by this session's logout/revoke), or an elapsed absolute lifetime or
+/// idle timeout, refuses with the reason. Keying by session id — not one coarse
+/// per-person `web` key — is what makes concurrent browser sessions independent and
+/// per-session revocation real. Returns the live grant on success.
 fn admit_browser_refresh(
     wb: &Workbench,
     person: &str,
+    session_id: &str,
     now_ms: u64,
 ) -> Result<crate::account::RefreshRecord, &'static str> {
-    let grant = resolve_refresh_grant(wb, person, crate::account::WEB_REFRESH_BINDING)
+    let grant = resolve_refresh_grant(wb, person, session_id)
         .ok_or("no refresh token on file; sign in again")?;
     crate::account::refresh_within_bounds(&grant, now_ms)?;
     Ok(grant)
@@ -978,6 +982,16 @@ fn session_method(sso: Option<&SsoConnectionRecord>) -> (&'static str, &'static 
     }
 }
 
+/// The `(method, label)` an opaque account session reports for its stored sign-in
+/// method (ADR 0147 §1). Unknown methods fall back to the passkey label, the safest
+/// default for a server-minted opaque session.
+fn session_label_for_method(method: &str) -> (&'static str, &'static str) {
+    match method {
+        "oidc" => ("oidc", "Single sign-on (OIDC)"),
+        _ => ("passkey", "Passkey or security key"),
+    }
+}
+
 /// `GET /auth/session` — the currently authenticated session's sign-in method.
 /// It exposes no token, email, subject, refresh state, or tenant membership and
 /// must not be rendered as a durable linked-method/custody fact.
@@ -987,10 +1001,16 @@ pub async fn get_session(
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
     let bearer = crate::net_http::bearer(&headers);
-    if bearer.is_some_and(|token| wb.account_sessions().resolve_now(token).is_some()) {
+    // An opaque account session reports the true sign-in method that minted it
+    // (ADR 0147 §1) — read from the durable session record, never hardcoded. An
+    // OIDC-derived session is "oidc"; a passkey ceremony session is "passkey".
+    if let Some((method, label)) = bearer
+        .and_then(|token| wb.account_sessions().resolve_session(token))
+        .map(|(_, method)| session_label_for_method(&method))
+    {
         return (
             StatusCode::OK,
-            Json(json!({ "method": "passkey", "label": "Passkey or security key" })),
+            Json(json!({ "method": method, "label": label })),
         )
             .into_response();
     }
@@ -1478,6 +1498,10 @@ pub async fn get_callback(
     // A completed exchange clears the tenant's failed-callback count (SECAUD-8).
     throttle.record_success(&tenant);
 
+    // The opaque session token minted for a hosted browser login (ADR 0147 §1). It —
+    // never the external id-token — is set as the session cookie below.
+    let mut web_session_token: Option<String> = None;
+
     // Attribute the login to the authenticated authority (`AUD-1` / `INV-21`), then
     // run the composition's registered fold (ADR 0122 §3 — e.g. verified-domain
     // JIT membership on the enterprise composition; nothing on a solo shell).
@@ -1499,22 +1523,35 @@ pub async fn get_callback(
         // tenant-of-one (idempotent) so they land in the Console with their own space. No-op on
         // the enterprise/desktop paths (web-account mode off).
         provision_web_account(&mut wb, authority.as_str(), web_account_mode());
-        // Session refresh (ADR 0147): seal the offline-access refresh token into the person's own
-        // account scope as the durable browser-bound grant, so /auth/refresh can mint fresh
-        // id-tokens without re-login. The callback is always the browser leg, so the grant binds
-        // to the stable per-person `web` key; a native client's device-bound grant is written at
-        // /auth/mobile/exchange once its device id is minted. Only when the OP returned a refresh
-        // token (offline-access consent grant); best-effort.
+        // Hosted browser session (ADR 0147 §1): mint a durable, opaque, per-session
+        // revocable session token. That token — never the external id-token — becomes
+        // the `gw_session` cookie. The external id-token stops being the session; the
+        // browser holds a fresh short-lived one in memory (obtained from /auth/refresh)
+        // as its Home access credential.
         if web_account_mode() {
-            if let Some(rt) = &refresh_token {
-                store_refresh_token(
-                    &mut wb,
-                    authority.as_str(),
-                    rt,
-                    crate::account::RefreshBinding::Web,
-                    crate::account::WEB_REFRESH_BINDING,
-                    "",
-                );
+            if let Some(token) = wb.mint_account_session(
+                authority.as_str(),
+                "oidc",
+                crate::account::SESSION_ABSOLUTE_LIFETIME_MS / 1000,
+            ) {
+                // Seal the offline-access refresh token as this session's OWN durable,
+                // bound grant, keyed by the session id (ADR 0147 §2) — not one coarse
+                // per-person `web` key — so each login is its own session and logout or
+                // revoke ends only it. Only when the OP returned a refresh token; a
+                // native client's device-bound grant is written at /auth/mobile/exchange.
+                // Best-effort.
+                let session_id = crate::account_session::session_id(&token);
+                if let Some(rt) = &refresh_token {
+                    store_refresh_token(
+                        &mut wb,
+                        authority.as_str(),
+                        rt,
+                        crate::account::RefreshBinding::Web,
+                        &session_id,
+                        "",
+                    );
+                }
+                web_session_token = Some(token);
             }
         }
     }
@@ -1540,16 +1577,20 @@ pub async fn get_callback(
         return Redirect::to(&target).into_response();
     }
 
-    // Hosted web account (ADR 0077): deliver the session as the shared `Domain=.gaugewright.com`
-    // cookie, not a URL-fragment bearer — one sign-in authenticates the whole site, and the cookie
-    // (unlike a header) rides SSE + top-level navigations. Redirect to the Console; the token never
-    // touches the URL.
+    // Hosted web account (ADR 0077 / ADR 0147 §1): deliver the session as the shared
+    // `Domain=.gaugewright.com` cookie carrying the **opaque** session token, not the
+    // external id-token and not a URL-fragment bearer — one sign-in authenticates the
+    // whole site, the cookie (unlike a header) rides SSE + top-level navigations, and
+    // the session is now server-side revocable. Redirect to the Console; no token
+    // touches the URL. The client obtains its short-lived id-token from /auth/refresh.
     if web_account_mode() {
         let post_login = gaugedesk_env::var("OIDC_POST_LOGIN_URL")
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| "/".to_string());
         let mut resp = Redirect::to(&post_login).into_response();
-        append_session_cookies(&mut resp, &id_token);
+        if let Some(token) = &web_session_token {
+            append_session_cookies(&mut resp, token);
+        }
         return resp;
     }
 
@@ -1574,11 +1615,16 @@ pub async fn get_callback(
         .into_response()
 }
 
-/// `GET /auth/refresh` (`ADR 0077` session refresh): mint a fresh id-token cookie from the person's
-/// stored refresh token — **without** re-login — but only while the current session is **still
-/// valid** (a still-authenticating id-token). An expired/absent session is `401` (re-login). This
-/// proactive model means the Console refreshes *before* expiry and an expired token can never
-/// refresh itself. Web-account only.
+/// `GET /auth/refresh` (`ADR 0147` §1/§4): mint a fresh short-lived id-token from this
+/// session's stored refresh grant and return it in the **body** — the browser holds it
+/// in memory as its Home access credential. The opaque session **cookie is unchanged**;
+/// it is the session, and the id-token is no longer the session. Admitted only while the
+/// current session is still live and within its bounds (fail-closed: the opaque cookie
+/// authenticates to nobody once revoked/expired, so it cannot refresh itself). An
+/// elapsed absolute lifetime or idle timeout refuses refresh and ends the session on
+/// this surface (ADR 0147 §4, closes SOC 2 F-1.4 for the personal path). Web-account
+/// only. Authenticated by the opaque cookie alone — never an `Authorization` bearer —
+/// so the session id resolves from the session token, not an in-memory id-token.
 pub async fn get_refresh(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
@@ -1587,23 +1633,26 @@ pub async fn get_refresh(
         return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
     }
     let bearer = crate::net_http::bearer(&headers).map(str::to_string);
-    // The still-valid session resolves to the person + their durable browser grant (fail-closed:
-    // an expired id-token authenticates to nobody, so it cannot refresh itself). The grant carries
-    // the session bounds: an elapsed absolute lifetime or idle timeout refuses refresh and ends the
-    // session on this surface (ADR 0147 §4, closes SOC 2 F-1.4 for the personal path).
     let now_ms = crate::account::session_now_ms();
-    let (person, refresh_token) = {
+    let (person, session_id, refresh_token) = {
         let g = wb.lock_unpoisoned();
         let person = g.actor(bearer.as_deref());
         if person == "anonymous" {
             return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
         }
-        let grant = match admit_browser_refresh(&g, &person, now_ms) {
+        // The opaque session token resolves to the session id that keys this session's
+        // own refresh grant (ADR 0147 §2). A non-anonymous person always carries a
+        // resolvable bearer here.
+        let Some(token) = bearer.as_deref() else {
+            return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
+        };
+        let session_id = crate::account_session::session_id(token);
+        let grant = match admit_browser_refresh(&g, &person, &session_id, now_ms) {
             Ok(grant) => grant,
             Err(reason) => return (StatusCode::UNAUTHORIZED, reason).into_response(),
         };
         match g.unseal_account_secret(&grant.sealed) {
-            Some(rt) => (person, rt),
+            Some(rt) => (person, session_id, rt),
             None => {
                 return (
                     StatusCode::UNAUTHORIZED,
@@ -1642,20 +1691,21 @@ pub async fn get_refresh(
             return (StatusCode::INTERNAL_SERVER_ERROR, "refresh task panicked").into_response()
         }
     };
-    // An admitted refresh touches the grant's last-seen so the idle clock resets (ADR 0147 §4).
+    // An admitted refresh touches this session's grant last-seen so the idle clock
+    // resets (ADR 0147 §4). Keyed by the session id, so it resets only this session.
     {
         let mut g = wb.lock_unpoisoned();
         let scope = crate::account::account_scope(&person);
-        let _ = g.touch_account_refresh_in(&scope, crate::account::WEB_REFRESH_BINDING, now_ms);
+        let _ = g.touch_account_refresh_in(&scope, &session_id, now_ms);
     }
-    // Set the refreshed id-token as the shared session cookie; the person is unchanged.
-    let mut resp = (
+    // Return the fresh id-token in the BODY so the client holds it in memory as the Home
+    // access credential (ADR 0147 §1). The opaque session cookie is deliberately left
+    // untouched — it is the session and it stays stable across refreshes.
+    (
         StatusCode::OK,
-        Json(json!({ "refreshed": true, "person": person })),
+        Json(json!({ "refreshed": true, "person": person, "id_token": new_id })),
     )
-        .into_response();
-    append_session_cookies(&mut resp, &new_id);
-    resp
+        .into_response()
 }
 
 /// Refresh a native GaugeDesk account session. A still-valid short-lived
@@ -1905,20 +1955,24 @@ pub async fn post_logout(
 ) -> impl IntoResponse {
     let bearer = crate::net_http::bearer(&headers).map(str::to_string);
     if let Some(token) = &bearer {
-        wb.lock_unpoisoned().account_sessions().revoke(token);
-    }
-    // Tombstone the browser session's durable refresh grant so refresh cannot mint a
-    // fresh id-token after logout (ADR 0147 §3, closes SOC 2 F-1.3 at the refresh
-    // level). This is the browser caller's own session: it ends only the `web` grant
-    // and never an independently-established native device session, which ends only
-    // when its device is revoked (or by a native logout). Future-only (`INV-18`);
-    // best-effort and idempotent, so an already-expired session still lands clean.
-    if web_account_mode() {
         let mut g = wb.lock_unpoisoned();
-        let person = g.actor(bearer.as_deref());
-        if person != "anonymous" {
+        // Resolve the caller's person and this session's id BEFORE revoking, so the
+        // per-session grant can be tombstoned too.
+        let person = g.actor(Some(token));
+        let session_id = crate::account_session::session_id(token);
+        // Durably revoke THIS opaque session server-side — evict the hot cache and
+        // tombstone the durable index — so its token stops resolving now and after a
+        // restart (ADR 0147 §3, `INV-18`). This is a true server-side session kill.
+        g.revoke_account_session(token);
+        // Tombstone this session's OWN refresh grant so refresh cannot mint a fresh
+        // id-token after logout (SOC 2 F-1.3). Keyed by the session id, it ends only
+        // this session: a concurrent browser session, or an independently-established
+        // native device session (which ends only when its device is revoked), stays
+        // live. Future-only (`INV-18`); best-effort and idempotent, so an already-
+        // expired session still lands clean.
+        if web_account_mode() && person != "anonymous" {
             let scope = crate::account::account_scope(&person);
-            let _ = g.revoke_account_refresh_in(&scope, crate::account::WEB_REFRESH_BINDING);
+            let _ = g.revoke_account_refresh_in(&scope, &session_id);
         }
     }
     let mut resp = StatusCode::NO_CONTENT.into_response();
@@ -2992,15 +3046,15 @@ iqlTEKVISscuchxZtKQJ4k8=
             g.write_account_record_in(&scope, "refresh", WEB_REFRESH_BINDING, &aged)
                 .unwrap();
             let within = base + SESSION_IDLE_MS - 1;
-            assert!(admit_browser_refresh(&g, person, within).is_ok());
+            assert!(admit_browser_refresh(&g, person, WEB_REFRESH_BINDING, within).is_ok());
             let over_absolute = base + SESSION_ABSOLUTE_LIFETIME_MS + 1;
             assert_eq!(
-                admit_browser_refresh(&g, person, over_absolute),
+                admit_browser_refresh(&g, person, WEB_REFRESH_BINDING, over_absolute),
                 Err("absolute session lifetime exceeded"),
             );
             let idle = base + SESSION_IDLE_MS + 1;
             assert_eq!(
-                admit_browser_refresh(&g, person, idle),
+                admit_browser_refresh(&g, person, WEB_REFRESH_BINDING, idle),
                 Err("session idle timeout exceeded"),
             );
         }
@@ -3049,10 +3103,29 @@ iqlTEKVISscuchxZtKQJ4k8=
             assert!(resolve_refresh_grant(&g, person, WEB_REFRESH_BINDING).is_none());
             let now = crate::account::session_now_ms();
             assert_eq!(
-                admit_browser_refresh(&g, person, now),
+                admit_browser_refresh(&g, person, WEB_REFRESH_BINDING, now),
                 Err("no refresh token on file; sign in again"),
             );
         }
+    }
+
+    #[test]
+    fn an_opaque_session_reports_its_true_minting_method() {
+        // ADR 0147 §1: the session surface reports the method the durable session
+        // record stores — an OIDC-derived session is "oidc", not a hardcoded label.
+        assert_eq!(
+            session_label_for_method("oidc"),
+            ("oidc", "Single sign-on (OIDC)")
+        );
+        assert_eq!(
+            session_label_for_method("passkey"),
+            ("passkey", "Passkey or security key")
+        );
+        // An unknown method falls back to the safe passkey label rather than leaking.
+        assert_eq!(
+            session_label_for_method("mystery"),
+            ("passkey", "Passkey or security key")
+        );
     }
 
     #[test]

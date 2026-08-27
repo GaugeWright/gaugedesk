@@ -198,3 +198,36 @@ describe("reaching a Home the caller already knows (ADR 0134 §3)", () => {
         );
     });
 });
+
+describe("admit waits for the in-memory bearer to rehydrate after a reload", () => {
+    function rehydratingPool(bearer: () => string | null, bearerGraceMs?: number) {
+        return new HomePool<{ endpoint: string }>(routes("A".repeat(43)), bearer, {
+            client: (context) => ({ endpoint: context.endpoint }),
+            resolveEndpoint: async () => "https://home.example",
+            routeJson: (() => (async (method: string) => {
+                if (method !== "POST") return {};
+                return { home: "home:a", admission: "token" };
+            })) as never,
+            ...(bearerGraceMs === undefined ? {} : { bearerGraceMs }),
+        });
+    }
+
+    it("connects once the first /auth/refresh repopulates the bearer", async () => {
+        // A fresh reload: the opaque session cookie survives but the in-memory
+        // id-token is gone until the immediate /auth/refresh lands a moment later.
+        let token: string | null = null;
+        const instance = rehydratingPool(() => token);
+        setTimeout(() => {
+            token = "id-token";
+        }, 120);
+        const connection = await instance.connectProject("proj" as ProjectId);
+        expect(connection.homeId).toBe("home:a");
+    });
+
+    it("refuses a genuinely signed-out caller without hanging (grace 0)", async () => {
+        const instance = rehydratingPool(() => null, 0);
+        await expect(instance.connectProject("proj" as ProjectId)).rejects.toThrow(
+            /sign in before opening a project/,
+        );
+    });
+});
