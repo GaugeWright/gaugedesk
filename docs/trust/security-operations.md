@@ -9,6 +9,7 @@
 | Recovery | Encrypted backups in a separate failure boundary; restore tested into an erased Home |
 | Access | Least privilege, provider MFA where supported, and quarterly privileged-access review |
 | Abuse controls | Cloudflare edge rate-limiting on the authentication routes and an origin request-body cap, with an IP-keyed in-process failed-attempt lockout as defense-in-depth; the edge is the primary control |
+| Data handling | Data is classified into public routing data, operational metadata, customer content (with personal data at the strictest bar), secrets, the audit trail, and ephemeral evidence, each with defined at-rest, retention, erasure, egress, and access handling |
 | Review | Annual risk, incident, restore, vendor, and end-to-end alert exercises; earlier after material changes |
 
 The alert path from ingestion to responder was exercised on July 29, 2026.
