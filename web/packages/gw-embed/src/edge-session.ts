@@ -503,6 +503,19 @@ export class EdgeSessionApi implements EmbedSessionApi {
             return "turn_queue_changed";
         }
         if (
+            message.type === "turn_command_applied" &&
+            message.kind === "compact" &&
+            typeof message.request_id === "string"
+        ) {
+            for (const [operationId, pending] of this.pendingQueueOperations) {
+                if (pending.payload.type !== "compact") continue;
+                if (pending.payload.request_id !== message.request_id) continue;
+                pending.resolve();
+                this.pendingQueueOperations.delete(operationId);
+            }
+            return "turn_command_applied";
+        }
+        if (
             message.type === "tool_call" &&
             typeof message.tool === "string" &&
             typeof message.call_id === "string"
@@ -752,6 +765,16 @@ export class EdgeSessionApi implements EmbedSessionApi {
             }),
         );
         return admitted;
+    }
+
+    /** Ask WhippleScript to run the turn's selected compactor at its next model
+     * boundary. The request id is durable and replay-safe; this promise settles
+     * only when the runtime publishes the applied-command acknowledgement. */
+    compactTurn(): Promise<void> {
+        return this.queueOperation({
+            type: "compact",
+            request_id: newIdempotencyKey().replaceAll("-", "_"),
+        });
     }
 
     getTurnQueue(): readonly EmbedQueuedTurn[] {

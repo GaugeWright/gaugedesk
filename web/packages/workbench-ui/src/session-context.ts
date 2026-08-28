@@ -262,6 +262,10 @@ export interface Session {
     readonly appliesComposedIdOnce?: boolean;
     /** Cooperatively cancel the current durable turn. */
     readonly stop?: () => Promise<void>;
+    /** Ask the active Managed runtime to apply its selected compactor at the
+     * next coherent model boundary. Absent means this Environment cannot issue
+     * the command; panels must not emulate it. */
+    readonly compact?: () => Promise<void>;
     /** Fork at an exact durable user/assistant boundary. Owner environments
      *  supply this; audience sessions intentionally omit it. */
     readonly forkAt?: (entryId: number, origin?: string) => void;

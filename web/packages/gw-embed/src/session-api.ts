@@ -72,6 +72,7 @@ export interface EmbedSessionApi {
     embedGetConfig(): Promise<{ white_label: boolean }>;
     getUsage?(): EdgeUsage | null;
     stopTurn?(): Promise<void>;
+    compactTurn?(): Promise<void>;
     getTurnQueue?(): readonly EmbedQueuedTurn[];
     subscribeTurnQueue?(listener: (queue: readonly EmbedQueuedTurn[]) => void): () => void;
     getTurnActivity?(): TurnObservation;

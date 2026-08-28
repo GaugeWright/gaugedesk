@@ -298,6 +298,21 @@ describe("EdgeSessionApi", () => {
         });
         await expect(followUp).resolves.toBeUndefined();
         expect(api.getTurnQueue()).toMatchObject([{ text: "and then summarize" }]);
+        const compact = api.compactTurn();
+        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(3));
+        const compactCommand = JSON.parse(sockets[0]!.sent[2]!) as {
+            operation_id: string;
+            request_id: string;
+        };
+        expect(compactCommand).toMatchObject({ type: "compact" });
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "turn_command_applied",
+                request_id: compactCommand.request_id,
+                kind: "compact",
+            }),
+        });
+        await expect(compact).resolves.toBeUndefined();
         sockets[0]!.emit("message", {
             data: JSON.stringify({
                 type: "turn_activity",
@@ -397,8 +412,8 @@ describe("EdgeSessionApi", () => {
             }),
         });
         const stop = api.stopTurn();
-        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(3));
-        const stopCommand = JSON.parse(sockets[0]!.sent[2]!) as Record<string, unknown>;
+        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(4));
+        const stopCommand = JSON.parse(sockets[0]!.sent[3]!) as Record<string, unknown>;
         expect(stopCommand).toMatchObject({
             type: "stop",
             request_id: sent.request_id,
@@ -477,6 +492,7 @@ describe("EdgeSessionApi", () => {
             "session_ready_received",
             "prompt_submitted",
             "command_sent",
+            "first_event_received",
             "first_event_received",
             "first_text_received",
             "direct_provider_headers",

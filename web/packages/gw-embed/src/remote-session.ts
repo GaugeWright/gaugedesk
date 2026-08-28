@@ -185,6 +185,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         onContentSaved: () => void Promise.allSettled([refetchDiff(), refetchMerge()]),
         send,
         stop: api.stopTurn ? () => api.stopTurn!() : undefined,
+        compact: api.compactTurn ? () => api.compactTurn!() : undefined,
     };
     return {
         session,

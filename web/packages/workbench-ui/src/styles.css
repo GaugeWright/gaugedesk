@@ -1256,6 +1256,15 @@ input {
 .context-meter[data-tone="ok"] { color: var(--muted); }
 .context-meter[data-tone="warn"] { color: var(--warn); }
 .context-meter[data-tone="bad"] { color: var(--bad); }
+.context-compact { display: inline-flex; padding: 0; border: 0; background: transparent;
+    color: inherit; cursor: pointer; border-radius: 999px; }
+.context-compact:hover:not(:disabled), .context-compact:focus-visible { background: var(--surface-hover); }
+.context-compact:disabled { cursor: default; opacity: 0.55; }
+.compact-context-action { border: 0; background: transparent; color: var(--text-muted);
+  padding: 3px 6px; border-radius: 5px; font: inherit; font-size: 11px; cursor: pointer; }
+.compact-context-action:hover:not(:disabled), .compact-context-action:focus-visible {
+  background: var(--surface-hover); color: var(--text); }
+.compact-context-action:disabled { cursor: default; opacity: 0.55; }
 
 /* Account panel: the "models in the picker" checklist — a scrollable list of toggles. */
 @layer primitives {

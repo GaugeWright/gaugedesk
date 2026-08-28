@@ -127,6 +127,8 @@ export function SessionComposer(props: {
         throw new Error("SessionComposer requires a Session or a bound controller");
     }
     const session = props.session;
+    const [compactPending, setCompactPending] = createSignal(false);
+    const [compactError, setCompactError] = createSignal<string | undefined>();
     const controller = props.controller ?? createSessionComposerController({
         scope: () => String(session!.engagementId() ?? "session"),
         busy: session!.busy,
@@ -145,6 +147,16 @@ export function SessionComposer(props: {
     // together or not at all. Where the queue is runtime-owned neither appears
     // yet, rather than appearing and silently doing nothing.
     const canHold = () => hasQueue() && controller.canHold();
+    const compact = session?.compact
+        ? () => {
+            if (compactPending() || !controller.busy()) return;
+            setCompactError(undefined);
+            setCompactPending(true);
+            void session.compact!()
+                .catch(() => setCompactError("Could not compact context."))
+                .finally(() => setCompactPending(false));
+        }
+        : undefined;
     return (
         <ChatComposer
             draft={controller.draft()}
@@ -158,13 +170,15 @@ export function SessionComposer(props: {
             defaultMode={props.defaultMode}
             onSetDefaultMode={props.onSetDefaultMode}
             canSubmit={controller.canSubmit()}
-            error={controller.error()}
+            error={compactError() ?? controller.error()}
             attaching={controller.attaching()}
             audience={props.audience}
             quickStart={props.quickStart}
             modelToolbar={controller.modelToolbar?.()}
             modelToolbarStacked={controller.modelToolbar?.(true)}
             context={props.context}
+            onCompact={compact}
+            compactPending={compactPending()}
             onDraft={controller.setDraft}
             onSubmit={(destination) => {
                 if (destination === "fork") props.onFork?.();

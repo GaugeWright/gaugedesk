@@ -22,12 +22,16 @@ export interface ContextUsage {
 
 const CIRCUMFERENCE = 2 * Math.PI * 5;
 
-export function ContextMeter(props: { readonly usage: ContextUsage }): JSX.Element {
+export function ContextMeter(props: {
+    readonly usage: ContextUsage;
+    readonly onCompact?: () => void;
+    readonly compactDisabled?: boolean;
+}): JSX.Element {
     const fraction = () =>
         props.usage.limit > 0 ? Math.min(1, Math.max(0, props.usage.used / props.usage.limit)) : 0;
     const percent = () => Math.round(fraction() * 100);
     const tone = () => (percent() >= 90 ? "bad" : percent() >= 75 ? "warn" : "ok");
-    return (
+    const ring = () => (
         <span
             class="context-meter"
             data-context-meter
@@ -49,6 +53,21 @@ export function ContextMeter(props: { readonly usage: ContextUsage }): JSX.Eleme
             </svg>
         </span>
     );
+    return props.onCompact ? (
+        <button
+            type="button"
+            class="context-compact"
+            data-context-compact
+            disabled={props.compactDisabled}
+            aria-label="Compact context now"
+            title={props.compactDisabled
+                ? "Context can be compacted while the agent is running"
+                : "Compact context now using the runtime's selected compactor"}
+            onClick={props.onCompact}
+        >
+            {ring()}
+        </button>
+    ) : ring();
 }
 
 function format(tokens: number): string {

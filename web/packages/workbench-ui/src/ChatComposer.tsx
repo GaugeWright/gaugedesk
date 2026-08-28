@@ -131,6 +131,10 @@ export interface ChatComposerProps {
     /** How full the pinned model's context window is. Absent on Environments that
      *  cannot measure it (the audience embed does not see transcript size). */
     readonly context?: ContextUsage;
+    /** Runtime-owned manual compaction. Present only when the Session can issue
+     * the durable command; the composer never summarizes locally. */
+    readonly onCompact?: () => void;
+    readonly compactPending?: boolean;
     readonly onDraft: (value: string) => void;
     /** Dispatch the draft. `send` while a turn is running is a steer. */
     readonly onSubmit: (destination: ComposerDestination) => void;
@@ -671,8 +675,27 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                         effort — those describe the run, this describes the keystroke. */}
                     <div class="composer-settings">
                         {modeSetting()}
-                        <Show when={props.context}>
-                            <ContextMeter usage={props.context!} />
+                        <Show when={props.context} fallback={
+                            <Show when={props.onCompact}>
+                                <button
+                                    type="button"
+                                    class="compact-context-action"
+                                    data-context-compact
+                                    disabled={!props.busy || props.blocked || props.compactPending}
+                                    title={!props.busy
+                                        ? "Context can be compacted while the agent is running"
+                                        : "Compact context now using the runtime's selected compactor"}
+                                    onClick={props.onCompact}
+                                >
+                                    {props.compactPending ? "Compacting…" : "Compact context"}
+                                </button>
+                            </Show>
+                        }>
+                            <ContextMeter
+                                usage={props.context!}
+                                onCompact={props.onCompact}
+                                compactDisabled={!props.busy || props.blocked || props.compactPending}
+                            />
                         </Show>
                     </div>
                 </div>

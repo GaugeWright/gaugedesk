@@ -65,6 +65,27 @@ describe("createRemoteSession", () => {
         });
     });
 
+    it("projects manual compaction only when the runtime advertises it", async () => {
+        const without = fakeApi();
+        createRoot((dispose) => {
+            const { session } = createRemoteSession({ api: without.api, engagementId: ENG });
+            expect(session.compact).toBeUndefined();
+            dispose();
+        });
+
+        const withCompact = fakeApi();
+        const compactTurn = vi.fn(async () => undefined);
+        withCompact.api.compactTurn = compactTurn;
+        let compact: Promise<void> | undefined;
+        createRoot((dispose) => {
+            const { session } = createRemoteSession({ api: withCompact.api, engagementId: ENG });
+            compact = session.compact?.();
+            dispose();
+        });
+        await compact;
+        expect(compactTurn).toHaveBeenCalledOnce();
+    });
+
     it("reduces live stream events into the transcript projection", () => {
         createRoot((dispose) => {
             const f = fakeApi();
