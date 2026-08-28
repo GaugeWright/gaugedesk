@@ -1438,21 +1438,32 @@ fn callback_err(e: CallbackError) -> axum::response::Response {
 pub async fn get_callback(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
+    crate::workbench_auth::PeerIp(peer): crate::workbench_auth::PeerIp,
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> impl IntoResponse {
-    // SECAUD-8: per-tenant failed-callback lockout (429 when locked) — defense-in-depth
+    // SECAUD-8: per-**client-IP** failed-callback lockout (429 when locked) — defense-in-depth
     // behind the edge rate-limit, mirroring the SCIM guard. A bad/replayed state or a failed
-    // token exchange records a failure; a completed login clears the tenant's count.
-    let tenant = crate::workbench_auth::req_scope(&headers);
+    // token exchange records a failure; a completed login clears the IP's count. The key is the
+    // real client IP (CF-Connecting-IP at the hosted edge, else the socket peer below it), never
+    // the client-supplied tenant header — spoofing/rotating that header must not move the bucket.
+    // `None` = the client cannot be identified (no edge, no peer), so the in-process backstop is
+    // skipped rather than keyed on one shared bucket; the edge remains the primary control.
+    let throttle_key = crate::workbench_auth::throttle_scope(
+        &headers,
+        peer,
+        crate::workbench_auth::web_account_mode(),
+    );
     let throttle = wb.lock_unpoisoned().oidc_throttle().clone();
     let now = throttle.now_ms();
-    if !throttle.allowed(&tenant, now) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed SSO callbacks; retry later",
-        )
-            .into_response();
+    if let Some(key) = &throttle_key {
+        if !throttle.allowed(key, now) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed SSO callbacks; retry later",
+            )
+                .into_response();
+        }
     }
     if let Some(err) = q.error {
         let desc = q.error_description.unwrap_or_default();
@@ -1465,7 +1476,9 @@ pub async fn get_callback(
             .into_response();
     }
     let (Some(code), Some(state)) = (q.code, q.state) else {
-        throttle.record_failure(&tenant, now);
+        if let Some(key) = &throttle_key {
+            throttle.record_failure(key, now);
+        }
         return (StatusCode::BAD_REQUEST, "missing code or state").into_response();
     };
 
@@ -1473,7 +1486,9 @@ pub async fn get_callback(
     // (CSRF guard).
     let pending = auth.pending_auth_mut().take(&state, Instant::now());
     let Some(pending) = pending else {
-        throttle.record_failure(&tenant, now);
+        if let Some(key) = &throttle_key {
+            throttle.record_failure(key, now);
+        }
         return (StatusCode::BAD_REQUEST, "unknown or expired state").into_response();
     };
     let native_return = pending.native_return.clone();
@@ -1487,7 +1502,9 @@ pub async fn get_callback(
     let (authority, id_token, refresh_token) = match finished {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
-            throttle.record_failure(&tenant, now);
+            if let Some(key) = &throttle_key {
+                throttle.record_failure(key, now);
+            }
             return callback_err(e);
         }
         Err(_) => {
@@ -1495,8 +1512,10 @@ pub async fn get_callback(
         }
     };
 
-    // A completed exchange clears the tenant's failed-callback count (SECAUD-8).
-    throttle.record_success(&tenant);
+    // A completed exchange clears this client IP's failed-callback count (SECAUD-8).
+    if let Some(key) = &throttle_key {
+        throttle.record_success(key);
+    }
 
     // The opaque session token minted for a hosted browser login (ADR 0147 §1). It —
     // never the external id-token — is set as the session cookie below.

@@ -54,14 +54,33 @@ fn scim_authed(wb: &Workbench, headers: &HeaderMap) -> bool {
     }
 }
 
-/// **SECAUD-8** (CC6.6/CC6.7): throttle then authenticate a SCIM request. A per-tenant
-/// failed-attempt lockout (`429` when locked) wraps the bearer check (`401` on a bad
-/// token); a success clears the tenant's failure count. Defense-in-depth behind the
-/// edge rate-limit — a brute-force loop against one tenant's token is slowed without
-/// locking out another tenant.
-fn scim_guard(wb: &Workbench, headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
-    let key = crate::org_routes::req_scope(headers);
+/// **SECAUD-8** (CC6.6/CC6.7): throttle then authenticate a SCIM request. A per-**client-IP**
+/// failed-attempt lockout (`429` when locked) wraps the bearer check (`401` on a bad token); a
+/// success clears that IP's failure count. Defense-in-depth behind the edge rate-limit — a
+/// brute-force loop from one client IP is slowed without another client (or another tenant)
+/// being lockable by it.
+///
+/// The key is the real client IP (`peer` resolves it via CF-Connecting-IP / socket peer),
+/// **never** the client-supplied tenant header — that let an attacker rotate the header for a
+/// fresh bucket per request, or spoof a victim's tenant to lock the victim out. `None` = the
+/// client cannot be identified (no edge, no peer); the in-process backstop is skipped rather
+/// than keyed on one shared bucket, and the edge stays the primary control.
+fn scim_guard(
+    wb: &Workbench,
+    headers: &HeaderMap,
+    peer: Option<std::net::IpAddr>,
+) -> Result<(), (StatusCode, &'static str)> {
     let throttle = wb.scim_throttle();
+    let Some(key) =
+        crate::org_routes::throttle_scope(headers, peer, crate::org_routes::web_account_mode())
+    else {
+        // Unidentifiable client: authenticate without the lockout (the edge is the control).
+        return if scim_authed(wb, headers) {
+            Ok(())
+        } else {
+            Err((StatusCode::UNAUTHORIZED, "invalid SCIM token"))
+        };
+    };
     let now = throttle.now_ms();
     if !throttle.allowed(&key, now) {
         return Err((
@@ -144,11 +163,12 @@ pub struct ScimUserBody {
 /// configured group→role mapping (`SCIM-3`), the member takes that role/team.
 pub async fn post_scim_user(
     State(wb): State<SharedWorkbench>,
+    crate::org_routes::PeerIp(peer): crate::org_routes::PeerIp,
     headers: HeaderMap,
     Json(body): Json<ScimUserBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    if let Err((code, msg)) = scim_guard(&wb, &headers) {
+    if let Err((code, msg)) = scim_guard(&wb, &headers, peer) {
         return (code, msg).into_response();
     }
     if body.user_name.trim().is_empty() {
@@ -224,11 +244,12 @@ pub fn parse_scim_patch(body: &serde_json::Value) -> Result<bool, &'static str> 
 pub async fn patch_scim_user(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    crate::org_routes::PeerIp(peer): crate::org_routes::PeerIp,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    if let Err((code, msg)) = scim_guard(&wb, &headers) {
+    if let Err((code, msg)) = scim_guard(&wb, &headers, peer) {
         return (code, msg).into_response();
     }
     let active = match parse_scim_patch(&body) {
@@ -247,10 +268,11 @@ pub async fn patch_scim_user(
 pub async fn delete_scim_user(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    crate::org_routes::PeerIp(peer): crate::org_routes::PeerIp,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    if let Err((code, msg)) = scim_guard(&wb, &headers) {
+    if let Err((code, msg)) = scim_guard(&wb, &headers, peer) {
         return (code, msg).into_response();
     }
     set_active(&mut wb, &crate::org_routes::req_scope(&headers), &id, false)

@@ -33,7 +33,15 @@ pub async fn open_serve(addr: &str, root: &std::path::Path) -> std::io::Result<(
         root.to_path_buf(),
         configured_relay_endpoint(),
     ));
-    axum::serve(listener, open_control_plane(wb)).await
+    // `ConnectInfo` exposes the connection peer address to handlers so the SECAUD-8
+    // failed-attempt throttle keeps a socket-peer fallback key below the edge (where no
+    // `CF-Connecting-IP` is set). Harmless on the loopback/dev path; the hosted edge's
+    // header is preferred when present.
+    axum::serve(
+        listener,
+        open_control_plane(wb).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
 }
 
 /// One parked relay leg and the tasks that keep it current.

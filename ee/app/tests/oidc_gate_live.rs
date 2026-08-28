@@ -143,8 +143,28 @@ async fn admin_gate_admits_a_real_member_token_and_refuses_others() {
     println!("OIDC admin-gate VERIFIED ✔  member={subject}");
 }
 
-/// SECAUD-8: the OIDC callback is per-tenant rate-limited (defense-in-depth behind the edge
-/// limit), mirroring the SCIM guard. A brute-force loop against the callback with a bogus
+/// A bogus-`state` callback carrying a chosen client IP (`CF-Connecting-IP`, the hosted
+/// edge's throttle key) and an optional tenant header — so a test can hold the IP key fixed
+/// while varying the spoofable tenant.
+async fn callback_status(
+    app: &Router,
+    cf_ip: &str,
+    state: &str,
+    tenant: Option<&str>,
+) -> StatusCode {
+    let mut b = Request::builder()
+        .method("GET")
+        .uri(format!("/auth/callback?state={state}&code=x"))
+        .header("cf-connecting-ip", cf_ip);
+    if let Some(t) = tenant {
+        b = b.header("x-gaugewright-tenant", t);
+    }
+    let req = b.body(Body::empty()).unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// SECAUD-8: the OIDC callback is per-**client-IP** rate-limited (defense-in-depth behind the
+/// edge limit), mirroring the SCIM guard. A brute-force loop against the callback with a bogus
 /// `state` (each a `400 unknown-or-expired state`) trips the lockout after 10 failures within
 /// the window, and the 11th attempt is refused `429`. No live OP / SSO config needed — an
 /// unknown `state` fails the CSRF take before any token exchange. Runs in-process (no #[ignore]).
@@ -153,14 +173,14 @@ async fn oidc_callback_throttles_after_repeated_failures() {
     let wb = Workbench::new(Store::open_in_memory().unwrap());
     let app = enterprise_control_plane(Arc::new(Mutex::new(wb)));
 
-    // 10 bogus-state callbacks: each is a fail-closed 400, and each records a failure.
+    // 10 bogus-state callbacks from one IP, each rotating the (spoofable) tenant header — the
+    // old bypass. Each is a fail-closed 400, and each records a failure against the IP.
     for i in 0..10 {
-        let s = status(
+        let s = callback_status(
             &app,
-            "GET",
-            &format!("/auth/callback?state=bogus-{i}&code=x"),
-            None,
-            None,
+            "203.0.113.7",
+            &format!("bogus-{i}"),
+            Some(&format!("t-{i}")),
         )
         .await;
         assert_eq!(
@@ -170,18 +190,20 @@ async fn oidc_callback_throttles_after_repeated_failures() {
         );
     }
 
-    // The 11th is locked out — the throttle, not the CSRF check, answers now.
-    let s = status(
-        &app,
-        "GET",
-        "/auth/callback?state=bogus-11&code=x",
-        None,
-        None,
-    )
-    .await;
+    // The 11th from the same IP is locked out — rotating the tenant header did not reset the
+    // bucket, and the throttle (not the CSRF check) answers now.
+    let s = callback_status(&app, "203.0.113.7", "bogus-11", Some("t-fresh")).await;
     assert_eq!(
         s,
         StatusCode::TOO_MANY_REQUESTS,
-        "the tenant's SSO callback is throttled after 10 failures"
+        "the client IP's SSO callback is throttled after 10 failures, tenant header notwithstanding"
+    );
+
+    // A different client IP is an independent bucket — no cross-client callback DoS.
+    let other = callback_status(&app, "203.0.113.8", "bogus-other", None).await;
+    assert_eq!(
+        other,
+        StatusCode::BAD_REQUEST,
+        "a different IP is unaffected by the first IP's lockout"
     );
 }

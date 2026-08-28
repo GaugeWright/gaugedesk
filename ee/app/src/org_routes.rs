@@ -187,7 +187,9 @@ pub use gaugedesk_app::net_http::bearer;
 /// re-exported so the ee route surface and its sibling modules keep one import home.
 /// The settlement plane (`gaugewright-cloud-settlement`) consumes the same seams
 /// directly from the open crate.
-pub use gaugedesk_app::workbench_auth::{deny, req_scope};
+pub use gaugedesk_app::workbench_auth::{
+    deny, req_scope, throttle_scope, web_account_mode, PeerIp,
+};
 
 /// ENTSEC-1: paths that bypass the enterprise data-route auth gate — the pre-auth and
 /// own-auth flows. `/health` (readiness), `/auth/*` (the OIDC login/callback that *mints* the

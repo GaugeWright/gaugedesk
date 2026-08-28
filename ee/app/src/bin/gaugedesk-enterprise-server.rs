@@ -44,7 +44,14 @@ async fn main() {
     let app = gaugedesk_ee::org_routes::enterprise_control_plane(wb);
     let listener = open_listener(&addr).await.expect("bind enterprise server");
     println!("gaugewright enterprise control plane listening on http://{addr}");
-    axum::serve(listener, app)
-        .await
-        .expect("serve enterprise control plane");
+    // `ConnectInfo` exposes the connection peer address to handlers, so the SECAUD-8
+    // failed-attempt throttle has a socket-peer fallback key below the edge (where no
+    // `CF-Connecting-IP` is set). Behind the hosted edge the header is preferred; this is
+    // the self-hosted / local path.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("serve enterprise control plane");
 }

@@ -144,35 +144,83 @@ async fn send_t(
     )
 }
 
+/// A bad-token SCIM POST that carries a chosen client IP (`CF-Connecting-IP`, the hosted
+/// edge's key) and, optionally, a tenant header — so a test can vary the (spoofable) tenant
+/// while holding the (IP) throttle key fixed, and vice versa.
+async fn bad_scim_from(app: &Router, cf_ip: &str, tenant: Option<&str>) -> StatusCode {
+    static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/scim/v2/Users")
+        .header("cf-connecting-ip", cf_ip)
+        .header("authorization", "Bearer bad-token")
+        .header("content-type", "application/json")
+        .header(
+            "idempotency-key",
+            format!("scim-ip-test-{}", NEXT_KEY.fetch_add(1, Ordering::Relaxed)),
+        );
+    if let Some(t) = tenant {
+        b = b.header("x-gaugewright-tenant", t);
+    }
+    let req = b.body(Body::from(r#"{"userName":"x@e.com"}"#)).unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
 #[tokio::test]
 async fn scim_throttles_after_repeated_bad_tokens() {
     // SECAUD-8 (CC6.6/CC6.7): a brute-force loop against the SCIM bearer is locked out
     // after the failure threshold (10/min) — the 11th attempt is 429, not another 401,
-    // so guessing is slowed even if the edge rate-limit is absent.
+    // so guessing is slowed even if the edge rate-limit is absent. Keyed on the client IP
+    // (CF-Connecting-IP), so a fixed attacker IP trips the lockout.
     let (_dir, app) = workbench();
     for _ in 0..10 {
-        let (s, _) = send(
-            &app,
-            "POST",
-            "/scim/v2/Users",
-            Some(r#"{"userName":"x@e.com"}"#),
-            Some("bad-token"),
-        )
-        .await;
-        assert_eq!(s, StatusCode::UNAUTHORIZED, "a bad token is unauthorized");
+        assert_eq!(
+            bad_scim_from(&app, "203.0.113.7", None).await,
+            StatusCode::UNAUTHORIZED,
+            "a bad token is unauthorized"
+        );
     }
-    let (s, _) = send(
-        &app,
-        "POST",
-        "/scim/v2/Users",
-        Some(r#"{"userName":"x@e.com"}"#),
-        Some("bad-token"),
-    )
-    .await;
     assert_eq!(
-        s,
+        bad_scim_from(&app, "203.0.113.7", None).await,
         StatusCode::TOO_MANY_REQUESTS,
         "locked out after the threshold"
+    );
+}
+
+#[tokio::test]
+async fn scim_lockout_keys_on_ip_not_the_spoofable_tenant_header() {
+    // The security fix: the throttle key is the client IP, never the client-supplied
+    // X-Gaugewright-Tenant header. So (a) rotating/omitting the tenant header on every
+    // request does NOT mint a fresh bucket — a fixed IP still locks out — and (b) a
+    // different IP is an independent bucket that the first IP's failures never touch.
+    let (_dir, app) = workbench();
+
+    // Ten failures from one IP, each carrying a *different* tenant header (the old bypass).
+    for i in 0..10 {
+        let tenant = format!("rotated-tenant-{i}");
+        assert_eq!(
+            bad_scim_from(&app, "198.51.100.9", Some(&tenant)).await,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+    // Rotating the tenant one more time does not escape the IP-keyed lockout.
+    assert_eq!(
+        bad_scim_from(&app, "198.51.100.9", Some("yet-another-tenant")).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "rotating the tenant header did not reset the IP's bucket",
+    );
+    // Omitting the tenant header entirely is still the same locked IP bucket.
+    assert_eq!(
+        bad_scim_from(&app, "198.51.100.9", None).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "omitting the tenant header did not reset the IP's bucket",
+    );
+
+    // A different client IP is untouched by the first IP's lockout — no cross-client DoS.
+    assert_eq!(
+        bad_scim_from(&app, "198.51.100.10", None).await,
+        StatusCode::UNAUTHORIZED,
+        "a different IP has an independent bucket",
     );
 }
 

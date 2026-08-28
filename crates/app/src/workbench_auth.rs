@@ -75,6 +75,84 @@ pub fn req_scope(headers: &HeaderMap) -> String {
     org::tenant_scope(tenant)
 }
 
+/// The connection's remote IP, read from axum's [`ConnectInfo`](axum::extract::ConnectInfo)
+/// as an **infallible** extractor: `None` when the server was not wired with
+/// `into_make_service_with_connect_info` (or has no peer), never a request rejection.
+/// This is the *fallback* client-IP source for [`throttle_scope`] below the edge; the
+/// hosted origin's `CF-Connecting-IP` is preferred whenever it is present. `pub` so the
+/// extracted enterprise band (`gaugedesk-ee`) attaches it on the throttled SCIM handlers.
+pub struct PeerIp(pub Option<std::net::IpAddr>);
+
+impl<S> axum::extract::FromRequestParts<S> for PeerIp
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(PeerIp(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0.ip()),
+        ))
+    }
+}
+
+/// The first comma-separated value of header `name`, parsed as an [`IpAddr`](std::net::IpAddr)
+/// and re-rendered canonically. Parsing rejects a garbage / non-IP value (so it can never
+/// become a bucket key), and canonicalization means `::1` and `[::1]` collapse to one key.
+fn first_header_ip(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(name)?.to_str().ok()?;
+    let first = raw.split(',').next()?.trim();
+    first
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
+}
+
+/// The throttle-bucket key for a failed-attempt lockout: the **real client IP**, never the
+/// client-supplied tenant header. Returns `None` when the client cannot be identified at
+/// all, which tells the caller to *skip* the in-process backstop rather than collapse every
+/// unidentifiable request onto one shared bucket (an empty/constant key would let anyone lock
+/// out everyone — the very footgun this function exists to avoid).
+///
+/// Source order:
+/// 1. **`CF-Connecting-IP`** — the internet-trusted client IP. The hosted origin is reachable
+///    *only* through Cloudflare (Full-strict, origin-locked → Caddy → app), and Cloudflare
+///    overwrites any client-supplied `CF-Connecting-IP` at the edge, so a value here is the
+///    true client address. This is why the tenant header must never key throttling again: it
+///    is client-controlled, so rotating/omitting it minted a fresh bucket per request, and
+///    spoofing a victim's value locked that victim out.
+/// 2. In hosted (`web_account`) mode with no `CF-Connecting-IP`, the request did not traverse
+///    Cloudflare (or arrived from below the edge). A client forwarding header is untrusted
+///    here, and the socket peer is the co-located proxy — one address shared by every caller —
+///    so keying on either would let one loop lock out the whole deployment. Skip (`None`); the
+///    edge is the primary rate-limit control.
+/// 3. Local / dev (not hosted): the trust boundary is the developer's own machine, so a local
+///    reverse proxy's left-most `X-Forwarded-For` is honest when present, and otherwise the
+///    real connection peer (`peer`) identifies the caller. `None` only if there is no peer
+///    either (e.g. a serve path without `ConnectInfo`), in which case the backstop is skipped.
+pub fn throttle_scope(
+    headers: &HeaderMap,
+    peer: Option<std::net::IpAddr>,
+    web_account: bool,
+) -> Option<String> {
+    if let Some(ip) = first_header_ip(headers, "cf-connecting-ip") {
+        return Some(ip);
+    }
+    if web_account {
+        return None;
+    }
+    if let Some(ip) = first_header_ip(headers, "x-forwarded-for") {
+        return Some(ip);
+    }
+    peer.map(|ip| ip.to_string())
+}
+
 impl Workbench {
     /// Resolve the provider-neutral Hub account session first, then optional
     /// OIDC. Both yield the same durable account/authority type; neither
@@ -1036,6 +1114,117 @@ mod provider_neutral_identity_tests {
         assert_eq!(
             wb.account_sessions().resolve_session(&second).unwrap().1,
             "passkey"
+        );
+    }
+}
+
+#[cfg(test)]
+mod throttle_scope_tests {
+    use super::throttle_scope;
+    use axum::http::HeaderMap;
+    use std::net::IpAddr;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        h
+    }
+
+    fn ip(s: &str) -> Option<IpAddr> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn hosted_keys_on_cf_connecting_ip_and_ignores_the_tenant_header() {
+        // The tenant header is present and different on each call, but the key follows
+        // only CF-Connecting-IP — the spoofable header can neither reset nor move the bucket.
+        let a = throttle_scope(
+            &headers(&[
+                ("cf-connecting-ip", "203.0.113.7"),
+                ("x-gaugewright-tenant", "acme"),
+            ]),
+            ip("10.0.0.1"), // a co-located proxy peer — must be ignored while CF is present
+            true,
+        );
+        let b = throttle_scope(
+            &headers(&[
+                ("cf-connecting-ip", "203.0.113.7"),
+                ("x-gaugewright-tenant", "globex"),
+            ]),
+            ip("10.0.0.2"),
+            true,
+        );
+        assert_eq!(a.as_deref(), Some("203.0.113.7"));
+        assert_eq!(
+            a, b,
+            "rotating the tenant header does not change the IP-keyed bucket"
+        );
+    }
+
+    #[test]
+    fn two_different_client_ips_get_independent_buckets() {
+        let one = throttle_scope(
+            &headers(&[("cf-connecting-ip", "198.51.100.1")]),
+            None,
+            true,
+        );
+        let two = throttle_scope(
+            &headers(&[("cf-connecting-ip", "198.51.100.2")]),
+            None,
+            true,
+        );
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn hosted_never_trusts_a_forwarding_header_or_the_proxy_peer() {
+        // No CF-Connecting-IP in hosted mode: a client-set X-Forwarded-For must not be
+        // trusted (spoof → victim lockout), and the shared proxy peer must not become a
+        // global bucket. The backstop is skipped; the edge is the control.
+        let key = throttle_scope(
+            &headers(&[
+                ("x-forwarded-for", "203.0.113.9"),
+                ("x-gaugewright-tenant", "acme"),
+            ]),
+            ip("127.0.0.1"),
+            true,
+        );
+        assert_eq!(
+            key, None,
+            "hosted-without-CF must skip, not key on spoofable inputs"
+        );
+    }
+
+    #[test]
+    fn dev_falls_back_to_forwarded_for_then_the_socket_peer() {
+        // Local reverse proxy present: left-most X-Forwarded-For is the client.
+        let via_proxy = throttle_scope(
+            &headers(&[("x-forwarded-for", "192.0.2.5, 10.0.0.1")]),
+            ip("10.0.0.1"),
+            false,
+        );
+        assert_eq!(via_proxy.as_deref(), Some("192.0.2.5"));
+
+        // No proxy header: the real connection peer identifies the caller.
+        let via_peer = throttle_scope(&HeaderMap::new(), ip("192.0.2.9"), false);
+        assert_eq!(via_peer.as_deref(), Some("192.0.2.9"));
+    }
+
+    #[test]
+    fn unknown_client_yields_none_so_the_caller_skips_rather_than_sharing_a_bucket() {
+        // No edge header, no proxy header, no peer (e.g. a serve path without ConnectInfo):
+        // there is nothing to key on, so returning None makes the caller skip the backstop
+        // instead of collapsing every such request onto one shared, everyone-locks-everyone key.
+        assert_eq!(throttle_scope(&HeaderMap::new(), None, false), None);
+        // A garbage CF-Connecting-IP is rejected by the IP parse rather than used as a key.
+        assert_eq!(
+            throttle_scope(&headers(&[("cf-connecting-ip", "not-an-ip")]), None, true),
+            None,
         );
     }
 }

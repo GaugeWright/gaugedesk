@@ -7,10 +7,12 @@
 //! a window, the key is **locked out** until the window passes, so a guessing loop is
 //! slowed even if it reaches the process directly.
 //!
-//! Fixed-window lockout, keyed by an arbitrary string (e.g. the tenant scope, so one
-//! tenant's brute force never locks out another). Time is supplied as monotonic
-//! milliseconds so the policy is pure and unit-testable; production reads it from an
-//! internal start [`Instant`](std::time::Instant) via [`Throttle::now_ms`].
+//! Fixed-window lockout, keyed by an arbitrary string. Callers key it on the **real client
+//! IP** (`workbench_auth::throttle_scope` — `CF-Connecting-IP` at the hosted edge, the socket
+//! peer below it), never on a client-supplied header: a header an attacker controls could be
+//! rotated for a fresh bucket per request, or spoofed to lock a victim out. Time is supplied
+//! as monotonic milliseconds so the policy is pure and unit-testable; production reads it from
+//! an internal start [`Instant`](std::time::Instant) via [`Throttle::now_ms`].
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -119,9 +121,11 @@ mod tests {
 
     #[test]
     fn keys_are_isolated() {
+        // Keys are opaque strings; callers pass a client IP, so one abused client never
+        // locks out another (nor, at the callsite, another tenant).
         let t = Throttle::new(1, 1000);
-        t.record_failure("tenant-a", 0);
-        assert!(!t.allowed("tenant-a", 1), "the abused key is locked");
-        assert!(t.allowed("tenant-b", 1), "another key is unaffected");
+        t.record_failure("198.51.100.1", 0);
+        assert!(!t.allowed("198.51.100.1", 1), "the abused key is locked");
+        assert!(t.allowed("198.51.100.2", 1), "another key is unaffected");
     }
 }
