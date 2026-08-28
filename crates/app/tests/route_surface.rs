@@ -229,7 +229,11 @@ async fn test_only_harness_routes_refuse_without_activation_guard() {
 #[tokio::test]
 async fn local_library_sync_routes_reach_the_desktop_handler() {
     let (_dir, app) = control_plane();
-    for path in ["/account/library-sync", "/account/library-sync/pull"] {
+    for path in [
+        "/account/library-sync",
+        "/account/library-sync/pull",
+        "/account/library-sync/retract",
+    ] {
         let (status, response) = send(&app, "POST", path, Some(json!({}).to_string())).await;
         assert_eq!(
             status, 409,

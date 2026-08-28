@@ -98,6 +98,10 @@ fn library_sync_routes() -> Router<SharedWorkbench> {
     Router::new()
         .route("/account/library-sync", post(post_library_sync_publish))
         .route("/account/library-sync/pull", post(post_library_sync_pull))
+        .route(
+            "/account/library-sync/retract",
+            post(post_library_sync_retract),
+        )
 }
 
 /// Complete co-resident/local account surface. Hosted compositions choose the
@@ -843,6 +847,69 @@ pub async fn post_library_sync_publish(State(wb): State<SharedWorkbench>) -> imp
     }
 }
 
+/// Retract this account's blind-directory entry (ADR 0153, the `library_sync` facility): publish
+/// a root-signed retraction so `GET /directory/:root` folds to `410 Gone`, withdrawing the
+/// account's published routing. Builds the retraction under the lock and PUTs it off the lock,
+/// the same discipline as [`post_library_sync_publish`]. `409` if sync is off; `200
+/// {"retracted": bool}` otherwise (`false` when there was nothing live to retract — never
+/// published, already retracted, or no on-disk root key); `502` if the directory host errored.
+pub async fn post_library_sync_retract(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+    let base = crate::directory_sync::directory_url_from_env();
+    let (active, root) = {
+        let wb = wb.lock_unpoisoned();
+        (wb.library_sync_active(), wb.library_sync_root())
+    };
+    if !active {
+        return (StatusCode::CONFLICT, "library sync is not active").into_response();
+    }
+    match retract_published_entry(&wb, &base, &root).await {
+        Ok(retracted) => (StatusCode::OK, Json(json!({ "retracted": retracted }))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+/// Withdraw the blind-directory entry for `root` (ADR 0153): read the generation head off the
+/// lock, sign a retraction at the next generation under the lock (the on-disk root key), and PUT
+/// it off the lock. `Ok(true)` when a live entry was retracted, `Ok(false)` when there was
+/// nothing to retract (never published, already retracted, or no on-disk root key to sign with),
+/// `Err` when the directory host could not be reached or refused. The single place the
+/// retraction's sign-under-lock / PUT-off-lock discipline lives; callers gate on
+/// `library_sync_active()`. Account-erase (`erase_account`) drives it after a successful erase.
+async fn retract_published_entry(
+    wb: &SharedWorkbench,
+    base: &str,
+    root: &str,
+) -> Result<bool, String> {
+    let head_base = base.to_string();
+    let head_root = root.to_string();
+    let current = tokio::task::spawn_blocking(move || {
+        crate::directory_sync::fetch(&crate::net_http::HttpClient::new(), &head_base, &head_root)
+    })
+    .await
+    .map_err(|_| "directory head task panicked".to_string())??;
+    let generation = match current {
+        // Never published, or already retracted — nothing to do (idempotent).
+        None => return Ok(false),
+        Some(entry) if entry.retracted => return Ok(false),
+        Some(entry) => match entry.generation.checked_add(1) {
+            Some(generation) => generation,
+            None => return Err("directory generation is exhausted".to_string()),
+        },
+    };
+    let put = wb.lock_unpoisoned().library_sync_signed_retract(generation);
+    let Some(put) = put else {
+        // No on-disk root key to sign with (a loopback/test workbench).
+        return Ok(false);
+    };
+    let base = base.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::directory_sync::publish(&crate::net_http::HttpClient::new(), &base, &put)
+    })
+    .await
+    .map_err(|_| "directory retract task panicked".to_string())??;
+    Ok(true)
+}
+
 /// Pull the account state from the blind directory and merge it locally (the `library_sync`
 /// facility). Fetches off the lock, then merges under it. `409` if sync is off / unconfigured.
 pub async fn post_library_sync_pull(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
@@ -859,6 +926,10 @@ pub async fn post_library_sync_pull(State(wb): State<SharedWorkbench>) -> impl I
     })
     .await;
     let entry = match fetched {
+        // A retracted entry (ADR 0153) carries no sealed blob to open — nothing to merge.
+        Ok(Ok(Some(e))) if e.retracted => {
+            return (StatusCode::OK, Json(json!({ "found": false, "merged": 0 }))).into_response()
+        }
         Ok(Ok(Some(e))) => e,
         Ok(Ok(None)) => {
             return (StatusCode::OK, Json(json!({ "found": false, "merged": 0 }))).into_response()
@@ -1633,33 +1704,68 @@ pub async fn erase_account(
     Json(body): Json<EraseAccountBody>,
 ) -> impl IntoResponse {
     use crate::account::AccountEraseRefusal as Refusal;
-    let mut wb = wb.lock_unpoisoned();
-    let actor = wb.actor(net_http::bearer(&headers));
-    if actor == "anonymous" {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "authenticate to erase your account",
+    // Validate (authentication + explicit confirm) and capture what a directory retraction will
+    // need — the account root and whether it has a published entry — under a short lock, before
+    // any destructive work.
+    let (actor, account_scope, root, published) = {
+        let wb = wb.lock_unpoisoned();
+        let actor = wb.actor(net_http::bearer(&headers));
+        if actor == "anonymous" {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "authenticate to erase your account",
+            )
+                .into_response();
+        }
+        if !body.confirm {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "confirm is required to erase your account",
+            )
+                .into_response();
+        }
+        let account_scope = wb.account_scope_for(net_http::bearer(&headers));
+        (
+            actor,
+            account_scope,
+            wb.library_sync_root(),
+            wb.library_sync_active(),
         )
-            .into_response();
+    };
+    // Crypto-erase under the lock. A refusal (still owns orgs) leaves the account intact, so the
+    // directory entry must *not* be retracted in that case — fall through to the retraction only
+    // on a successful erase.
+    {
+        let mut wb = wb.lock_unpoisoned();
+        match wb.erase_account_in(&actor, &account_scope) {
+            Ok(Ok(())) => {}
+            Ok(Err(Refusal::OwnsOrganizations(_))) => {
+                return (
+                    StatusCode::CONFLICT,
+                    "delete the organizations you own through the tenant-delete path before \
+                     erasing your account",
+                )
+                    .into_response()
+            }
+            Err(e) => return err_response(e),
+        }
     }
-    if !body.confirm {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "confirm is required to erase your account",
-        )
-            .into_response();
+    // Only now that the account is erased, withdraw its published routing (ADR 0153 §4). The
+    // on-disk root key survives the crypto-erase, so the retraction is still signable; the
+    // captured root means it needs none of the erased account state. Best-effort and owed: a
+    // directory the client cannot reach never fails a completed erase — the retraction is
+    // idempotent/retryable through `POST /account/library-sync/retract`.
+    if published {
+        let base = crate::directory_sync::directory_url_from_env();
+        if let Err(error) = retract_published_entry(&wb, &base, &root).await {
+            tracing::warn!(
+                %error,
+                "account erased but its blind-directory entry could not be retracted; \
+                 retraction owed (idempotent/retryable via POST /account/library-sync/retract)"
+            );
+        }
     }
-    let account_scope = wb.account_scope_for(net_http::bearer(&headers));
-    match wb.erase_account_in(&actor, &account_scope) {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(Refusal::OwnsOrganizations(_))) => (
-            StatusCode::CONFLICT,
-            "delete the organizations you own through the tenant-delete path before \
-             erasing your account",
-        )
-            .into_response(),
-        Err(e) => err_response(e),
-    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub async fn delete_credential(

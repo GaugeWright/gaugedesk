@@ -110,6 +110,49 @@ pub struct DirectoryEntry {
     pub directory: DirectoryRecord,
     /// Opaque hex ciphertext. The directory never opens this value.
     pub sealed_blob: String,
+    /// A root-signed **retraction** (ADR 0153): the latest entry for a root that
+    /// withdraws its published presence. The host folds a retracted latest entry
+    /// to *absent*, serving `410 Gone` on read. It is a terminal append, not a
+    /// deletion — append-only (`INV-6`) is preserved and the generation fence still
+    /// advances exactly once, so it cannot be replayed to un-retract and a stale
+    /// retraction cannot clobber a newer publish. A retraction carries an empty
+    /// routing record and empty sealed blob (see [`retraction_entry`]), so it
+    /// discloses nothing beyond the already-public root pubkey. Skipped when false
+    /// so every pre-retraction entry serializes byte-for-byte as before — existing
+    /// signatures and canonical bytes (`INV-5`) are unchanged.
+    #[serde(default, skip_serializing_if = "is_not_retracted")]
+    pub retracted: bool,
+}
+
+/// `serde` skip predicate: a non-retracted entry omits the `retracted` field entirely,
+/// so its signed bytes match those written before retraction existed.
+fn is_not_retracted(retracted: &bool) -> bool {
+    !*retracted
+}
+
+/// The canonical **retraction** entry for `root_pubkey` at `generation` (ADR 0153): an
+/// empty routing record and empty sealed blob with `retracted` set, so the record itself
+/// discloses nothing beyond the already-public root pubkey. Sign it with [`sign_entry`]
+/// under the root key and publish it like any other generation-advancing entry; the host
+/// folds a retracted latest entry to `410 Gone`.
+pub fn retraction_entry(root_pubkey: String, generation: u64) -> DirectoryEntry {
+    DirectoryEntry {
+        generation,
+        directory: DirectoryRecord {
+            root_pubkey,
+            device_pubkeys: Vec::new(),
+            placement_pointers: Vec::new(),
+            home_routes: Vec::new(),
+        },
+        sealed_blob: String::new(),
+        retracted: true,
+    }
+}
+
+/// Whether a (verified) entry is a retraction — the host serves `410 Gone` for a root
+/// whose latest entry is one (ADR 0153).
+pub fn is_retraction(entry: &DirectoryEntry) -> bool {
+    entry.retracted
 }
 
 /// A root-authorized append request.
@@ -182,6 +225,7 @@ mod tests {
                 }],
             },
             sealed_blob: "deadbeef".into(),
+            retracted: false,
         }
     }
 
@@ -242,6 +286,48 @@ mod tests {
                 key.public_key()
             )
         );
+    }
+
+    #[test]
+    fn a_signed_retraction_verifies_and_discloses_no_routing() {
+        let key = signer(7);
+        let root = key.public_key().as_str().to_string();
+        let put = sign_entry(retraction_entry(root.clone(), 3), &key).unwrap();
+        // Round-trips, verifies under the root's own key, and is recognizable as a retraction.
+        let json = serde_json::to_string(&put).unwrap();
+        let decoded: SignedDirectoryPut = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, put);
+        assert!(put_verifies(&decoded));
+        assert!(is_retraction(&decoded.entry));
+        // The retraction record itself carries no routing beyond the (already public) root.
+        assert_eq!(decoded.entry.directory.root_pubkey, root);
+        assert!(decoded.entry.directory.device_pubkeys.is_empty());
+        assert!(decoded.entry.directory.placement_pointers.is_empty());
+        assert!(decoded.entry.directory.home_routes.is_empty());
+        assert!(decoded.entry.sealed_blob.is_empty());
+    }
+
+    #[test]
+    fn flipping_the_retracted_flag_after_signing_fails_closed() {
+        let key = signer(7);
+        // A publish cannot be turned into a retraction (or vice versa) by an intermediary:
+        // the flag is inside the signed bytes.
+        let mut put = sign_entry(entry(key.public_key().as_str().into()), &key).unwrap();
+        put.entry.retracted = true;
+        assert!(!put_verifies(&put));
+
+        let root = key.public_key().as_str().to_string();
+        let mut retraction = sign_entry(retraction_entry(root, 1), &key).unwrap();
+        retraction.entry.retracted = false;
+        assert!(!put_verifies(&retraction));
+    }
+
+    #[test]
+    fn a_non_retracted_entry_serializes_without_the_flag() {
+        // Byte-compat: `retracted:false` is skipped, so pre-retraction signatures are unchanged.
+        let key = signer(7);
+        let bytes = signing_bytes(&entry(key.public_key().as_str().into())).unwrap();
+        assert!(!String::from_utf8(bytes).unwrap().contains("retracted"));
     }
 
     #[test]

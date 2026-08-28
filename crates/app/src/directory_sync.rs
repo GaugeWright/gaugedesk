@@ -46,7 +46,23 @@ pub fn signed_put(
         generation,
         directory: directory_record(&root_pubkey, acct, placement_pointers, home_routes),
         sealed_blob: seal_account_blob(key, acct)?,
+        retracted: false,
     };
+    gaugedesk_directory_protocol::sign_entry(entry, signing_key).ok()
+}
+
+/// Build the signed **retraction** for the account rooted at `signing_key` (ADR 0153): an
+/// empty routing record + empty sealed blob marked `retracted`, signed with the root key.
+/// Publishing it withdraws the account's published presence — the host folds a retracted
+/// latest entry to `410 Gone`. Pure (no I/O); unlike [`signed_put`] it needs no account key
+/// or state (a retraction discloses nothing beyond the already-public root pubkey), so it can
+/// be signed even as the account is being erased. `None` for the read-only `generation == 0`.
+pub fn signed_retract(signing_key: &SigningKey, generation: u64) -> Option<SignedDirectoryPut> {
+    if generation == 0 {
+        return None;
+    }
+    let root_pubkey = signing_key.public_key().as_str().to_string();
+    let entry = gaugedesk_directory_protocol::retraction_entry(root_pubkey, generation);
     gaugedesk_directory_protocol::sign_entry(entry, signing_key).ok()
 }
 
@@ -82,11 +98,18 @@ pub fn publish(http: &HttpClient, base: &str, put: &SignedDirectoryPut) -> Resul
 /// other.
 pub fn fetch(http: &HttpClient, base: &str, root: &str) -> Result<Option<DirectoryEntry>, String> {
     let url = format!("{}/directory/{}", base.trim_end_matches('/'), root);
-    match http.get_string(&url) {
-        Ok(body) => Ok(Some(parse_fetched_entry(&body)?)),
-        // get_string errors on non-2xx; a 404 (no record yet) is not a failure.
-        Err(e) if e.contains("HTTP 404") => Ok(None),
-        Err(e) => Err(e),
+    let (status, body) = http.get_string_headers(&url, &[])?;
+    match status {
+        200..=299 => Ok(Some(parse_fetched_entry(&body)?)),
+        // A **retracted** root is served `410 Gone` (ADR 0153) with the empty retraction entry
+        // as its body — it discloses nothing beyond the already-public root, so returning it to
+        // the caller is safe and lets the owner read the generation (to re-publish and re-appear)
+        // and the `retracted` flag (to treat a re-retraction as idempotent). A public reader
+        // still sees `410`; this client authenticates by the sealed blob opening, not the status.
+        410 => Ok(Some(parse_fetched_entry(&body)?)),
+        // No record yet — not a failure.
+        404 => Ok(None),
+        _ => Err(format!("directory fetch HTTP {status}: {body}")),
     }
 }
 
@@ -131,6 +154,24 @@ impl crate::Workbench {
             vec![],
             home_routes,
         )
+    }
+
+    /// The signed **retraction** for this account's directory entry (ADR 0153) — built under
+    /// the workbench lock so the caller can PUT it *off* the lock, mirroring
+    /// [`library_sync_signed_put`](Self::library_sync_signed_put). Unlike a publish it is not
+    /// gated on the `library_sync` facility being active: a retraction withdraws whatever is
+    /// published regardless of the facility's current state, so a person who has since turned
+    /// sync off can still remove a live entry (and account-erase can retract it). `None` when
+    /// there is no on-disk root key to sign with (a loopback/test workbench, `root_path()`
+    /// empty — the same discriminator [`crate::Workbench::governance_seed`] uses) or for the
+    /// read-only `generation == 0`.
+    pub fn library_sync_signed_retract(&self, generation: u64) -> Option<SignedDirectoryPut> {
+        if self.root_path().as_os_str().is_empty() {
+            return None;
+        }
+        let signing_key = crate::key_store::FileKeyStore::new(self.root_path().join("keys"))
+            .signing_key(self.authority());
+        signed_retract(&signing_key, generation)
     }
 
     /// Merge a fetched directory entry's sealed blob into the local account scope (the pull half):
@@ -269,6 +310,29 @@ mod tests {
         assert!(!put_verifies(&forged));
         assert!(
             signed_put(&k, AKEY, &seeded_account(), 0, vec![], vec![]).is_none(),
+            "generation zero is reserved for reading legacy entries"
+        );
+    }
+
+    #[test]
+    fn signed_retract_verifies_and_carries_no_routing() {
+        // A retraction the client signs passes the same PUT verification as a publish, so the
+        // directory host accepts it — but it discloses nothing beyond the already-public root, and
+        // it needs no account key or state (it can be signed as the account is being erased).
+        let k = key();
+        let retract = signed_retract(&k, 4).expect("signs a retraction");
+        assert!(
+            put_verifies(&retract),
+            "retraction verifies under its own root key"
+        );
+        assert_eq!(retract.entry.generation, 4);
+        assert_eq!(retract.entry.directory.root_pubkey, k.public_key().as_str());
+        assert!(retract.entry.retracted);
+        assert!(retract.entry.directory.device_pubkeys.is_empty());
+        assert!(retract.entry.directory.placement_pointers.is_empty());
+        assert!(retract.entry.sealed_blob.is_empty());
+        assert!(
+            signed_retract(&k, 0).is_none(),
             "generation zero is reserved for reading legacy entries"
         );
     }
