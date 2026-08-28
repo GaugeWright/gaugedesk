@@ -827,12 +827,23 @@ export class GwChatsElement extends GwPanelElement {
     }
 }
 
-/** Register the embed custom elements (idempotent). */
+/** Register the embed custom elements (idempotent).
+ *
+ * The panels are defined before `<gw-session>`, and the order is load-bearing.
+ * Defining an element upgrades the ones the parser already built, and an
+ * upgrade runs `attributeChangedCallback` synchronously — so registering the
+ * session first ran its `host` callback while its own children were still
+ * plain `HTMLElement`s, and `panel.resetBinding()` threw. That is the ordinary
+ * embed markup: `<gw-session host="…"><gw-chat></gw-chat></gw-session>`.
+ *
+ * Panels upgrade safely in either order. A panel's `bind()` resolves its
+ * ancestor session and returns when there is no session on it yet, and the
+ * session re-drives every panel once it has bootstrapped. */
 export function registerEmbedElements() {
     if (typeof customElements === "undefined" || customElements.get("gw-session")) return;
-    customElements.define("gw-session", GwSessionElement);
     customElements.define("gw-chat", GwChatElement);
     customElements.define("gw-viewer", GwViewerElement);
     customElements.define("gw-files", GwFilesElement);
     customElements.define("gw-chats", GwChatsElement);
+    customElements.define("gw-session", GwSessionElement);
 }
