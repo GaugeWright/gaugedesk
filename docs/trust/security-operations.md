@@ -8,6 +8,7 @@
 | Retention | 30 days for metadata-only central production events |
 | Recovery | Encrypted backups in a separate failure boundary; restore tested into an erased Home |
 | Access | Least privilege, provider MFA where supported, and quarterly privileged-access review |
+| Abuse controls | Cloudflare edge rate-limiting on the authentication routes and an origin request-body cap, with an IP-keyed in-process failed-attempt lockout as defense-in-depth; the edge is the primary control |
 | Review | Annual risk, incident, restore, vendor, and end-to-end alert exercises; earlier after material changes |
 
 The alert path from ingestion to responder was exercised on July 29, 2026.
