@@ -204,12 +204,13 @@ fn execute(
                     "local Codex credential is unavailable",
                 )
             })?;
-        let owner = hex::encode(authority.as_bytes());
         (
             authority,
-            format!(
-                "gaugedesk:credential:v2:account:{owner}:openai-codex:{}",
-                record.version
+            crate::account::canonical_credential_ref(
+                "account",
+                workbench.authority().as_str(),
+                "openai-codex",
+                record.version,
             ),
         )
     };
@@ -331,10 +332,11 @@ mod tests {
             .unwrap();
         let envelope = BrokerEnvelope {
             protocol: PROTOCOL.into(),
-            credential_ref: format!(
-                "gaugedesk:credential:v2:account:{}:openai-codex:{}",
-                hex::encode(authority.as_bytes()),
-                record.version
+            credential_ref: crate::account::canonical_credential_ref(
+                "account",
+                &authority,
+                "openai-codex",
+                record.version,
             ),
             provider: "openai-codex".into(),
             request: ProviderRequest {

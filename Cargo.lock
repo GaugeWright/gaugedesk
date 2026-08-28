@@ -3382,7 +3382,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3993,8 +3993,7 @@ dependencies = [
 [[package]]
 name = "whipplescript"
 version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1292e3fc3efb83aaf521192c4ef1f74062e8df4f3021a435c091499d1e21430e"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=47e16505666a54d472f804a990139a111e6cf32b#47e16505666a54d472f804a990139a111e6cf32b"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4017,8 +4016,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-core"
 version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01297ac0f084bde22af38f70f084a014e9a3f6a61acbba1d311364a5ecef43bd"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=47e16505666a54d472f804a990139a111e6cf32b#47e16505666a54d472f804a990139a111e6cf32b"
 dependencies = [
  "serde",
  "serde_json",
@@ -4027,8 +4025,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-custody"
 version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "095f952a96ce6d1162e5b01e4b7cfb04ca16cea50def3d24112212e0ac618eaa"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=47e16505666a54d472f804a990139a111e6cf32b#47e16505666a54d472f804a990139a111e6cf32b"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -4039,8 +4036,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-kernel"
 version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d51f0165bda4d3105724d9165ad9dbf157e8cf0b50d193eedb3c84889efd857a"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=47e16505666a54d472f804a990139a111e6cf32b#47e16505666a54d472f804a990139a111e6cf32b"
 dependencies = [
  "bashkit",
  "chrono",
@@ -4059,8 +4055,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-parser"
 version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48980176ff2006bb5432506de6a4382133809ec53a43aacf4c506245b0f02a92"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=47e16505666a54d472f804a990139a111e6cf32b#47e16505666a54d472f804a990139a111e6cf32b"
 dependencies = [
  "serde_json",
  "sha2 0.11.0",
@@ -4071,8 +4066,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-store"
 version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1efa76aa458c7d3b96a7dc29827d6f562670c7a95df8ff2aaedec092adcefaad"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=47e16505666a54d472f804a990139a111e6cf32b#47e16505666a54d472f804a990139a111e6cf32b"
 dependencies = [
  "rusqlite",
  "serde",

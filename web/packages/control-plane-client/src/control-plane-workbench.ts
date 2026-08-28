@@ -36,6 +36,7 @@ import type {
     PlacementId,
     ProjectId,
     CollectionRecipient,
+    CollaborationStatus,
     PublicDeploymentInput,
     PublicDeploymentInspection,
     PublicDeploymentOutcome,
@@ -50,6 +51,8 @@ import type {
     RunState,
     ScopeId,
     SearchHit,
+    TargetActKind,
+    TargetSettlementStatus,
     WorkTargetId,
     WorkTargetKind,
     WorkTargetNode,
@@ -470,17 +473,24 @@ export async function setPlacementConfig(
 export async function forkChat(
     transport: WorkbenchTransport,
     id: EngagementId,
+    destination: ForkDestination = { kind: "inherit" },
 ): Promise<EngagementId> {
-    const o = (await transport.json("POST", `/chats/${id}/fork`, {})) as { id: string };
+    const o = (await transport.json("POST", `/chats/${id}/fork`, { destination })) as { id: string };
     return o.id as EngagementId;
 }
+
+export type ForkDestination =
+    | { readonly kind: "inherit" }
+    | { readonly kind: "main" }
+    | { readonly kind: "workstream"; readonly workstream_id: string };
 
 export async function forkChatAt(
     transport: WorkbenchTransport,
     id: EngagementId,
     entryId: number,
+    destination: ForkDestination = { kind: "inherit" },
 ): Promise<EngagementId> {
-    const o = (await transport.json("POST", `/chats/${id}/fork/${entryId}`, {})) as { id: string };
+    const o = (await transport.json("POST", `/chats/${id}/fork/${entryId}`, { destination })) as { id: string };
     return o.id as EngagementId;
 }
 
@@ -779,13 +789,28 @@ export async function createChatUnderPlacement(
     pid: ProjectId,
     placementId: PlacementId,
     title: string,
-    targetId: WorkTargetId,
+    targetIds: readonly WorkTargetId[],
 ): Promise<EngagementId> {
+    if (targetIds.length === 0) throw new Error("a work chat requires at least one target");
     const o = (await transport.json("POST", `/projects/${pid}/placements/${placementId}/chats`, {
         title,
-        target_id: targetId,
+        target_ids: targetIds,
     })) as { id: string };
     return engagementId(o.id);
+}
+
+export async function reviseChatTargets(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    targets: readonly { targetId: WorkTargetId; participation: "read-only" | "writable" }[],
+): Promise<unknown> {
+    if (targets.length === 0) throw new Error("a work chat requires at least one target");
+    return transport.json("PUT", `/chats/${id}/targets`, {
+        targets: targets.map((target) => ({
+            target_id: target.targetId,
+            participation: target.participation,
+        })),
+    });
 }
 
 export async function renameChat(
@@ -880,20 +905,10 @@ export async function createWorkstream(
     transport: WorkbenchTransport,
     placementId: PlacementId,
     name: string,
-    targetId: WorkTargetId,
 ): Promise<WorkstreamNode> {
     const o = (await transport.json("POST", `/placements/${placementId}/workstreams`, {
         name,
-        target_id: targetId,
-    })) as {
-        id: string;
-        name: string;
-        placement_id: string;
-        workspace_root: string;
-        target_id: string;
-        status?: string;
-        members?: string[];
-    };
+    })) as Parameters<typeof parseWorkstream>[0];
     return parseWorkstream(o);
 }
 
@@ -902,7 +917,7 @@ export async function listWorkstreams(
     placementId: PlacementId,
 ): Promise<WorkstreamNode[]> {
     const o = (await transport.json("GET", `/placements/${placementId}/workstreams`)) as {
-        workstreams?: { id: string; name: string; placement_id: string; workspace_root: string; target_id: string; status?: string; members?: string[] }[];
+        workstreams?: Parameters<typeof parseWorkstream>[0][];
     };
     return (o.workstreams ?? []).map(parseWorkstream);
 }
@@ -930,11 +945,171 @@ export async function archiveWorkstream(
     await transport.json("POST", `/workstreams/${ws}/archive`);
 }
 
+export interface WorkstreamSettlementRequest {
+    readonly target_id: WorkTargetId;
+    readonly act: TargetActKind;
+}
+
+export async function settleChatTargets(
+    transport: WorkbenchTransport,
+    chat: EngagementId,
+    members: readonly WorkstreamSettlementRequest[],
+): Promise<unknown> {
+    const state = await transport.json("POST", `/chats/${chat}/settlements`, { members }) as {
+        declaration?: { declaration_id?: string; members?: { member_id?: string }[] };
+    };
+    const declarationId = state.declaration?.declaration_id;
+    if (!declarationId) throw new Error("settlement response did not identify its declaration");
+    let current: unknown = state;
+    for (const member of state.declaration?.members ?? []) {
+        if (!member.member_id) throw new Error("settlement response did not identify every member");
+        try {
+            current = await transport.json(
+                "POST",
+                `/target-settlements/${encodeURIComponent(declarationId)}/members/${encodeURIComponent(member.member_id)}/execute`,
+                {},
+            );
+        } catch {
+            // A proven member failure is represented by 409, but it must not
+            // prevent later preflighted members from receiving their one
+            // ordered attempt. The final coordinator query below is the honest
+            // combined result (partial/unknown are never returned as success).
+        }
+    }
+    return await getTargetSettlement(transport, declarationId) ?? current;
+}
+
+export interface WorkstreamPromotionResult {
+    readonly promoted: string;
+    readonly collaboration: CollaborationStatus;
+    readonly target_settlement: TargetSettlementStatus;
+    readonly promotion_manifest: unknown;
+    readonly receipt: unknown;
+    readonly archived: boolean;
+}
+
 export async function promoteWorkstream(
     transport: WorkbenchTransport,
     ws: WorkstreamId,
-): Promise<void> {
-    await transport.json("POST", `/workstreams/${ws}/promote`);
+    settlementMembers: readonly WorkstreamSettlementRequest[] = [],
+): Promise<WorkstreamPromotionResult> {
+    return await transport.json("POST", `/workstreams/${ws}/promote`, {
+        settlement_members: settlementMembers,
+    }) as WorkstreamPromotionResult;
+}
+
+export async function createWorkstreamSettlement(
+    transport: WorkbenchTransport,
+    ws: WorkstreamId,
+    members: readonly WorkstreamSettlementRequest[],
+    promotionManifestRef?: string,
+): Promise<unknown> {
+    return transport.json("POST", `/workstreams/${ws}/settlements`, {
+        ...(promotionManifestRef ? { promotion_manifest_ref: promotionManifestRef } : {}),
+        members,
+    });
+}
+
+/** Start a later, target-specific settlement from an already accepted promotion.
+ * Promotion remains complete even if this target act later becomes partial/unknown. */
+export async function settleWorkstreamTarget(
+    transport: WorkbenchTransport,
+    ws: WorkstreamId,
+    targetId: WorkTargetId,
+    act: TargetActKind,
+    promotionManifestRef?: string,
+): Promise<unknown> {
+    const created = await createWorkstreamSettlement(
+        transport,
+        ws,
+        [{ target_id: targetId, act }],
+        promotionManifestRef,
+    ) as {
+        target_settlement?: {
+            declaration?: { declaration_id?: string; members?: { member_id?: string; target_id?: string }[] };
+        };
+    };
+    const declaration = created.target_settlement?.declaration;
+    const declarationId = declaration?.declaration_id;
+    const memberId = declaration?.members?.find((member) => member.target_id === targetId)?.member_id;
+    if (!declarationId || !memberId) throw new Error("settlement response did not identify the admitted target member");
+    return transport.json(
+        "POST",
+        `/target-settlements/${encodeURIComponent(declarationId)}/members/${encodeURIComponent(memberId)}/execute`,
+        {},
+    );
+}
+
+export async function listWorkstreamPromotionManifests(
+    transport: WorkbenchTransport,
+    ws: WorkstreamId,
+): Promise<unknown[]> {
+    const response = await transport.json("GET", `/workstreams/${ws}/promotion-manifests`) as { manifests?: unknown[] };
+    return response.manifests ?? [];
+}
+
+export async function getTargetSettlement(
+    transport: WorkbenchTransport,
+    declarationId: string,
+): Promise<unknown> {
+    return transport.json("GET", `/target-settlements/${encodeURIComponent(declarationId)}`);
+}
+
+export async function queryTargetSettlementMember(
+    transport: WorkbenchTransport,
+    declarationId: string,
+    memberId: string,
+): Promise<unknown> {
+    return transport.json("POST", `/target-settlements/${encodeURIComponent(declarationId)}/members/${encodeURIComponent(memberId)}/query`, {});
+}
+
+export async function retryTargetSettlementMember(
+    transport: WorkbenchTransport,
+    declarationId: string,
+    memberId: string,
+): Promise<unknown> {
+    return transport.json("POST", `/target-settlements/${encodeURIComponent(declarationId)}/members/${encodeURIComponent(memberId)}/retry`, {});
+}
+
+export async function supersedeTargetSettlementMember(
+    transport: WorkbenchTransport,
+    declarationId: string,
+    memberId: string,
+    laterDeclarationId: string,
+    laterMemberId: string,
+): Promise<unknown> {
+    return transport.json("POST", `/target-settlements/${encodeURIComponent(declarationId)}/members/${encodeURIComponent(memberId)}/supersede`, {
+        later_declaration_id: laterDeclarationId,
+        later_member_id: laterMemberId,
+    });
+}
+
+export async function compensateTargetSettlement(
+    transport: WorkbenchTransport,
+    declarationId: string,
+    receiptRefs: readonly string[],
+    reconciliationComplete: boolean,
+): Promise<unknown> {
+    return transport.json("POST", `/target-settlements/${encodeURIComponent(declarationId)}/compensate`, {
+        receipt_refs: receiptRefs,
+        reconciliation_complete: reconciliationComplete,
+    });
+}
+
+export async function abandonTargetSettlement(
+    transport: WorkbenchTransport,
+    declarationId: string,
+    reason: string,
+): Promise<unknown> {
+    return transport.json("POST", `/target-settlements/${encodeURIComponent(declarationId)}/abandon`, { reason });
+}
+
+export async function cancelTargetSettlement(
+    transport: WorkbenchTransport,
+    declarationId: string,
+    reason: string,
+): Promise<unknown> {
+    return transport.json("POST", `/target-settlements/${encodeURIComponent(declarationId)}/cancel`, { reason });
 }
 
 export async function getMerge(transport: WorkbenchTransport, id: EngagementId): Promise<MergeState> {
@@ -1501,8 +1676,12 @@ export async function ingestContext(
     transport: WorkbenchTransport,
     id: EngagementId,
     path: string,
+    targetId?: WorkTargetId,
 ): Promise<number> {
-    const o = (await transport.json("POST", `/chats/${id}/context`, { path })) as {
+    const o = (await transport.json("POST", `/chats/${id}/context`, {
+        path,
+        ...(targetId ? { target_id: targetId } : {}),
+    })) as {
         ingested: number;
     };
     return o.ingested;
@@ -1526,8 +1705,12 @@ export async function ingestContextUpload(
     transport: WorkbenchTransport,
     id: EngagementId,
     files: UploadContextFile[],
+    targetId?: WorkTargetId,
 ): Promise<number> {
-    const o = (await transport.json("POST", `/chats/${id}/context/upload`, { files })) as {
+    const o = (await transport.json("POST", `/chats/${id}/context/upload`, {
+        files,
+        ...(targetId ? { target_id: targetId } : {}),
+    })) as {
         ingested: number;
     };
     return o.ingested;

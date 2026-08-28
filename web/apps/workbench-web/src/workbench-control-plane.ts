@@ -845,12 +845,12 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.setPlacementConfig(this.workbenchTransport(), placementId, config, notes);
     }
 
-    forkChat(id: EngagementId): Promise<EngagementId> {
-        return workbenchClient.forkChat(this.workbenchTransport(), id);
+    forkChat(id: EngagementId, destination?: workbenchClient.ForkDestination): Promise<EngagementId> {
+        return workbenchClient.forkChat(this.workbenchTransport(), id, destination);
     }
 
-    forkChatAt(id: EngagementId, entryId: number): Promise<EngagementId> {
-        return workbenchClient.forkChatAt(this.workbenchTransport(), id, entryId);
+    forkChatAt(id: EngagementId, entryId: number, destination?: workbenchClient.ForkDestination): Promise<EngagementId> {
+        return workbenchClient.forkChatAt(this.workbenchTransport(), id, entryId, destination);
     }
 
     revertChat(id: EngagementId): Promise<void> {
@@ -1027,8 +1027,12 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.useArchetype(this.workbenchTransport(), archetypeId, title);
     }
 
-    createChatUnderPlacement(pid: ProjectId, placementId: PlacementId, title: string, targetId: WorkTargetId): Promise<EngagementId> {
-        return workbenchClient.createChatUnderPlacement(this.workbenchTransport(), pid, placementId, title, targetId);
+    createChatUnderPlacement(pid: ProjectId, placementId: PlacementId, title: string, targetIds: readonly WorkTargetId[]): Promise<EngagementId> {
+        return workbenchClient.createChatUnderPlacement(this.workbenchTransport(), pid, placementId, title, targetIds);
+    }
+
+    async reviseChatTargets(id: EngagementId, targets: readonly { targetId: WorkTargetId; participation: "read-only" | "writable" }[]): Promise<void> {
+        await workbenchClient.reviseChatTargets(this.workbenchTransport(), id, targets);
     }
 
     renameChat(id: EngagementId, title: string): Promise<void> {
@@ -1068,8 +1072,8 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.syncFromMain(this.workbenchTransport(), id);
     }
 
-    createWorkstream(placementId: PlacementId, name: string, targetId: WorkTargetId): Promise<WorkstreamNode> {
-        return workbenchClient.createWorkstream(this.workbenchTransport(), placementId, name, targetId);
+    createWorkstream(placementId: PlacementId, name: string): Promise<WorkstreamNode> {
+        return workbenchClient.createWorkstream(this.workbenchTransport(), placementId, name);
     }
 
     listWorkstreams(placementId: PlacementId): Promise<WorkstreamNode[]> {
@@ -1088,8 +1092,49 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.archiveWorkstream(this.workbenchTransport(), ws);
     }
 
-    promoteWorkstream(ws: WorkstreamId): Promise<void> {
-        return workbenchClient.promoteWorkstream(this.workbenchTransport(), ws);
+    async promoteWorkstream(ws: WorkstreamId): Promise<void> {
+        await workbenchClient.promoteWorkstream(this.workbenchTransport(), ws);
+    }
+
+    async settleWorkstreamTarget(
+        ws: WorkstreamId,
+        target: WorkTargetId,
+        act: "apply" | "publish" | "release",
+        promotionManifestRef?: string,
+    ): Promise<void> {
+        await workbenchClient.settleWorkstreamTarget(this.workbenchTransport(), ws, target, act, promotionManifestRef);
+    }
+
+    async settleChatTargets(chat: EngagementId, members: readonly { target_id: WorkTargetId; act: "apply" | "publish" | "release" }[]): Promise<void> {
+        await workbenchClient.settleChatTargets(this.workbenchTransport(), chat, members);
+    }
+
+    async getTargetSettlement(declarationId: string): Promise<void> {
+        await workbenchClient.getTargetSettlement(this.workbenchTransport(), declarationId);
+    }
+
+    async queryTargetSettlementMember(declarationId: string, memberId: string): Promise<void> {
+        await workbenchClient.queryTargetSettlementMember(this.workbenchTransport(), declarationId, memberId);
+    }
+
+    async retryTargetSettlementMember(declarationId: string, memberId: string): Promise<void> {
+        await workbenchClient.retryTargetSettlementMember(this.workbenchTransport(), declarationId, memberId);
+    }
+
+    async supersedeTargetSettlementMember(declarationId: string, memberId: string, laterDeclarationId: string, laterMemberId: string): Promise<void> {
+        await workbenchClient.supersedeTargetSettlementMember(this.workbenchTransport(), declarationId, memberId, laterDeclarationId, laterMemberId);
+    }
+
+    async compensateTargetSettlement(declarationId: string, receiptRefs: readonly string[], reconciliationComplete: boolean): Promise<void> {
+        await workbenchClient.compensateTargetSettlement(this.workbenchTransport(), declarationId, receiptRefs, reconciliationComplete);
+    }
+
+    async abandonTargetSettlement(declarationId: string, reason: string): Promise<void> {
+        await workbenchClient.abandonTargetSettlement(this.workbenchTransport(), declarationId, reason);
+    }
+
+    async cancelTargetSettlement(declarationId: string, reason: string): Promise<void> {
+        await workbenchClient.cancelTargetSettlement(this.workbenchTransport(), declarationId, reason);
     }
 
     getMerge(id: EngagementId): Promise<MergeState> {
@@ -1316,12 +1361,12 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.putConfig(this.workbenchTransport(), id, raw);
     }
 
-    ingestContext(id: EngagementId, path: string): Promise<number> {
-        return workbenchClient.ingestContext(this.workbenchTransport(), id, path);
+    ingestContext(id: EngagementId, path: string, targetId?: WorkTargetId): Promise<number> {
+        return workbenchClient.ingestContext(this.workbenchTransport(), id, path, targetId);
     }
 
-    ingestContextUpload(id: EngagementId, files: workbenchClient.UploadContextFile[]): Promise<number> {
-        return workbenchClient.ingestContextUpload(this.workbenchTransport(), id, files);
+    ingestContextUpload(id: EngagementId, files: workbenchClient.UploadContextFile[], targetId?: WorkTargetId): Promise<number> {
+        return workbenchClient.ingestContextUpload(this.workbenchTransport(), id, files, targetId);
     }
 
     openPairing(device: string, bridgeGrant: string | null): Promise<{ pairingId: string; bridgeGrant: string }> {

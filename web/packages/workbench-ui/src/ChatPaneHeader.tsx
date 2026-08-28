@@ -24,6 +24,7 @@ import { PanelCollapseIcon } from "./PanelCollapseIcon";
 import { StatusGem, type GemKind } from "./StatusGem";
 import { type ChatRunTone } from "./chat-run-state";
 import { type FreshnessStatus } from "./desktop-freshness";
+import type { ChatTargetMember } from "@gaugewright/control-plane-client";
 
 export interface ChatPaneHeaderProps {
     /** The shell supplies the persistent CHAT label; this is only a selected-chat title. */
@@ -51,6 +52,8 @@ export interface ChatPaneHeaderProps {
     readonly workstream?: string;
     /** That line's sync state in words, e.g. `up to date`. */
     readonly workstreamState?: string;
+    /** Explicit execution scope, separate from the collaboration line. */
+    readonly targets?: readonly ChatTargetMember[];
     /**
      * Whether we can still vouch for what is shown (RF-E4). It paints the workstream
      * label rather than the gem: reachability is a property of the line we sync to,
@@ -133,6 +136,17 @@ export function ChatPaneHeader(props: ChatPaneHeaderProps): JSX.Element {
                     <Show when={props.workstreamState}>
                         <span class="chat-workstream-state">{props.workstreamState}</span>
                     </Show>
+                </span>
+            </Show>
+            <Show when={(props.targets?.length ?? 0) > 0}>
+                <span
+                    class="chat-targets"
+                    data-chat-targets={props.targets?.length}
+                    title="This chat's selected work targets; each retains its own basis and authority"
+                >
+                    {(props.targets ?? []).map((target) =>
+                        `${target.name}${target.participation === "read-only" ? " (read-only)" : ""}`,
+                    ).join(" + ")}
                 </span>
             </Show>
             {props.actions}

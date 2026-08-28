@@ -158,6 +158,42 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             post(crate::target_adapter::request_terminal_target_act),
         )
         .route(
+            "/chats/{id}/settlements",
+            post(crate::target_settlement::create_target_settlement),
+        )
+        .route(
+            "/target-settlements/{id}",
+            get(crate::target_settlement::get_target_settlement),
+        )
+        .route(
+            "/target-settlements/{id}/members/{member_id}/execute",
+            post(crate::target_settlement::execute_target_settlement_member),
+        )
+        .route(
+            "/target-settlements/{id}/members/{member_id}/query",
+            post(crate::target_settlement::query_target_settlement_member),
+        )
+        .route(
+            "/target-settlements/{id}/members/{member_id}/retry",
+            post(crate::target_settlement::retry_target_settlement_member),
+        )
+        .route(
+            "/target-settlements/{id}/members/{member_id}/supersede",
+            post(crate::target_settlement::supersede_target_settlement_member),
+        )
+        .route(
+            "/target-settlements/{id}/compensate",
+            post(crate::target_settlement::compensate_target_settlement),
+        )
+        .route(
+            "/target-settlements/{id}/abandon",
+            post(crate::target_settlement::abandon_target_settlement),
+        )
+        .route(
+            "/target-settlements/{id}/cancel",
+            post(crate::target_settlement::cancel_target_settlement),
+        )
+        .route(
             "/projects/{id}",
             put(lr::update_project).delete(lr::delete_project),
         )
@@ -182,6 +218,14 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route("/workstreams/{id}/archive", post(wr::archive_workstream))
         .route("/workstreams/{id}/promote", post(wr::promote_workstream))
         .route(
+            "/workstreams/{id}/settlements",
+            post(wr::create_workstream_settlement),
+        )
+        .route(
+            "/workstreams/{id}/promotion-manifests",
+            get(wr::list_workstream_promotion_manifests),
+        )
+        .route(
             "/projects/{pid}/placements/{iid}/chats",
             post(lr::create_chat_under_instance),
         )
@@ -196,6 +240,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .merge(federation::featured_routes(federation_on))
         .route("/chats/{id}/fork", post(lr::fork_chat))
         .route("/chats/{id}/fork/{entry_id}", post(lr::fork_chat_at))
+        .route("/chats/{id}/targets", put(lr::revise_chat_targets))
         .route("/chats/{id}/sync", post(er::post_sync))
         .route("/chats/{id}/stop", post(er::post_stop))
         .route("/chats/{id}", delete(lr::delete_chat))

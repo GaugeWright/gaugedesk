@@ -17,9 +17,10 @@ use gaugedesk_harness::{
 use serde_json::{json, Value};
 
 use super::{
-    AuthoredAgentPackage, CredentialRef, EventPosition, ForkInstanceCommand, OpenInstanceCommand,
-    PolicyEpochRef, ProviderBindingRef, ResourceRef, StartTurnCommand, TurnInput,
-    WhipHarnessFactory, HOST_PROTOCOL,
+    validate_workspace_targets, workspace_resource_refs, AuthoredAgentPackage, CredentialRef,
+    EventPosition, ForkInstanceCommand, OpenInstanceCommand, PolicyEpochRef, ProviderBindingRef,
+    ResourceRef, StartTurnCommand, TurnInput, WhipHarnessFactory, HOST_PROTOCOL,
+    TARGET_MANIFEST_SELECTOR,
 };
 
 const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -202,6 +203,7 @@ pub(crate) fn create_harness(
         spec.package_version_ref.as_deref(),
         spec.system_prompt.as_deref(),
     )?;
+    validate_workspace_targets(&spec.workspace_targets).map_err(invalid_data)?;
     let package_ms = package_started.elapsed().as_secs_f64() * 1000.0;
     let epoch = required(spec.policy_epoch, "policy epoch")?;
     let signed = required_ref(
@@ -247,7 +249,27 @@ pub(crate) fn create_harness(
         .ok_or_else(|| invalid_data("DO open response omitted instance_ref"))?
         .to_owned();
 
-    let read_only = spec.sandbox.read_only_roots.to_vec();
+    let mut read_only = spec
+        .sandbox
+        .read_only_roots
+        .iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                spec.worktree.join(path)
+            }
+        })
+        .collect::<Vec<_>>();
+    read_only.extend(
+        spec.workspace_targets
+            .iter()
+            .filter(|target| !target.writable)
+            .map(|target| spec.worktree.join(&target.root)),
+    );
+    if !spec.workspace_targets.is_empty() {
+        read_only.push(spec.worktree.join(TARGET_MANIFEST_SELECTOR));
+    }
     let mut harness = DoHarness {
         config: config.clone(),
         placement: placement.to_owned(),
@@ -263,6 +285,7 @@ pub(crate) fn create_harness(
         )?
         .to_owned(),
         credential_ref: required_ref(spec.credential_ref.as_deref(), "credential ref")?.to_owned(),
+        workspace_targets: spec.workspace_targets.clone(),
         provider: required_ref(spec.provider.as_deref(), "provider")?.to_owned(),
         model: required_ref(spec.model.as_deref(), "model")?.to_owned(),
         placement_ceiling_ref: required_ref(
@@ -415,6 +438,64 @@ pub(crate) fn clone_continuity(
     Ok(())
 }
 
+pub(crate) fn discard_continuity(
+    config: &DoHostConfig,
+    target: &HarnessContinuitySpec,
+) -> io::Result<()> {
+    let placement = required_ref(
+        target.runtime_placement_id.as_deref(),
+        "hosted continuity target placement",
+    )?;
+    let package = WhipHarnessFactory::package_for(
+        target.mode,
+        target.package_root.as_deref(),
+        target.package_version_ref.as_deref(),
+        target.system_prompt.as_deref(),
+    )?;
+    let epoch = required(target.policy_epoch, "WhippleScript target policy epoch")?;
+    let signed = required_ref(
+        target.signed_policy_envelope.as_deref(),
+        "WhippleScript target signed policy",
+    )?;
+    let policy: PolicyEpochRef = serde_json::from_value(post_json(
+        config,
+        placement,
+        "/host/policy",
+        &json!({ "epoch": epoch, "signed_envelope": signed }),
+    )?)
+    .map_err(invalid_data)?;
+    let open = continuity_open_command(&target.chat_id, package.version_ref(), policy.clone());
+    let opened = post_json(
+        config,
+        placement,
+        "/host/instances/open",
+        &host_request(&open, &package)?,
+    )?;
+    let instance_ref = required_json_string(&opened, "instance_ref", "DO target open")?;
+    let command = json!({
+        "protocol": HOST_PROTOCOL,
+        "request_id": format!("gaugedesk:discard:{}", target.chat_id),
+        "instance_ref": instance_ref,
+        "policy": policy,
+    });
+    let discarded = post_json(
+        config,
+        placement,
+        &format!("/host/instances/{}/discard", encode(&instance_ref)),
+        &json!({ "command": command }),
+    )?;
+    if discarded.get("instance_ref").and_then(Value::as_str) != Some(instance_ref.as_str())
+        || discarded
+            .get("discarded_at")
+            .and_then(|position| position.get("instance_ref"))
+            .and_then(Value::as_str)
+            != Some(instance_ref.as_str())
+    {
+        return Err(invalid_data("DO continuity discard receipt mismatch"));
+    }
+    Ok(())
+}
+
 fn continuity_open_command(
     chat_id: &str,
     package_version_ref: &str,
@@ -442,6 +523,7 @@ struct DoHarness {
     chat_id: String,
     provider_binding_ref: String,
     credential_ref: String,
+    workspace_targets: Vec<gaugedesk_harness::WorkspaceTargetBinding>,
     provider: String,
     model: String,
     placement_ceiling_ref: String,
@@ -501,17 +583,14 @@ impl Harness for DoHarness {
                 .any(|item| item == name)
         };
         if has("workspace.read") || has("workspace.write") {
-            resources.push(ResourceRef {
-                handle: "project".into(),
-                kind: "file_store".into(),
-                selector: None,
-            });
+            resources.extend(workspace_resource_refs(&self.workspace_targets));
         }
         if has("command.run") {
             resources.push(ResourceRef {
                 handle: "command".into(),
                 kind: "command".into(),
                 selector: None,
+                writable: None,
             });
         }
         // ADR 0111: no suspended epoch to resume. Every hosted turn is an
@@ -536,6 +615,7 @@ impl Harness for DoHarness {
                         handle: "turn_images".into(),
                         kind: "image".into(),
                         selector: Some(index.to_string()),
+                        writable: None,
                     })
                     .collect(),
             },
@@ -666,7 +746,7 @@ impl Harness for DoHarness {
 
 impl DoHarness {
     fn push_workspace(&mut self) -> io::Result<()> {
-        let files = collect_files(&self.worktree, &self.read_only)?;
+        let files = collect_files(&self.worktree)?;
         self.synced_paths = files.keys().cloned().collect();
         let mut chunk = Vec::new();
         let mut bytes = 0usize;
@@ -708,7 +788,7 @@ impl DoHarness {
             &self.placement,
             &format!("/host/instances/{}/files", encode(&self.instance_ref)),
         )?;
-        let mut remote = BTreeSet::new();
+        let mut remote = BTreeMap::new();
         for item in listing
             .get("files")
             .and_then(Value::as_array)
@@ -719,7 +799,6 @@ impl DoHarness {
                 continue;
             };
             validate_path(path)?;
-            remote.insert(path.to_owned());
             let content = get_text(
                 &self.config,
                 &self.placement,
@@ -729,19 +808,60 @@ impl DoHarness {
                     encode(path)
                 ),
             )?;
+            remote.insert(path.to_owned(), content);
+        }
+
+        // Validate the entire remote projection before changing the local
+        // workspace. Read-only roots were synced so the hosted model could
+        // inspect them, but any changed or removed protected file is a runtime
+        // contract violation and imports nothing.
+        for path in &self.synced_paths {
             let target = self.worktree.join(path);
+            if !self.is_read_only(&target) {
+                continue;
+            }
+            let Some(remote_content) = remote.get(path) else {
+                return Err(invalid_data(format!(
+                    "hosted runtime removed read-only workspace path `{path}`"
+                )));
+            };
+            let local = fs::read_to_string(&target)?;
+            if &local != remote_content {
+                return Err(invalid_data(format!(
+                    "hosted runtime changed read-only workspace path `{path}`"
+                )));
+            }
+        }
+        for (path, content) in &remote {
+            let target = self.worktree.join(path);
+            if self.is_read_only(&target) {
+                if !self.synced_paths.contains(path) {
+                    return Err(invalid_data(format!(
+                        "hosted runtime created read-only workspace path `{path}`"
+                    )));
+                }
+                continue;
+            }
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::write(target, content)?;
         }
-        for removed in self.synced_paths.difference(&remote) {
+        let remote_paths = remote.keys().cloned().collect::<BTreeSet<_>>();
+        for removed in self.synced_paths.difference(&remote_paths) {
             let target = self.worktree.join(removed);
+            if self.is_read_only(&target) {
+                continue;
+            }
             if target.exists() {
                 fs::remove_file(target)?;
             }
         }
         Ok(())
+    }
+
+    fn is_read_only(&self, path: &Path) -> bool {
+        self.read_only.iter().any(|root| path.starts_with(root))
     }
 }
 
@@ -1095,24 +1215,17 @@ fn required_json_string(value: &Value, field: &str, name: &str) -> io::Result<St
         .ok_or_else(|| invalid_data(format!("{name} omitted {field}")))
 }
 
-fn collect_files(root: &Path, read_only: &[PathBuf]) -> io::Result<BTreeMap<String, String>> {
-    fn walk(
-        root: &Path,
-        dir: &Path,
-        read_only: &[PathBuf],
-        out: &mut BTreeMap<String, String>,
-    ) -> io::Result<()> {
+fn collect_files(root: &Path) -> io::Result<BTreeMap<String, String>> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) -> io::Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.file_name().and_then(|v| v.to_str()) == Some(".git")
-                || read_only.iter().any(|item| path.starts_with(item))
-            {
+            if path.file_name().and_then(|v| v.to_str()) == Some(".git") {
                 continue;
             }
             let ty = entry.file_type()?;
             if ty.is_dir() {
-                walk(root, &path, read_only, out)?;
+                walk(root, &path, out)?;
             } else if ty.is_file() {
                 if out.len() >= MAX_FILES {
                     return Err(invalid_data("workspace exceeds 5000-file DO limit"));
@@ -1135,7 +1248,7 @@ fn collect_files(root: &Path, read_only: &[PathBuf]) -> io::Result<BTreeMap<Stri
         Ok(())
     }
     let mut out = BTreeMap::new();
-    walk(root, root, read_only, &mut out)?;
+    walk(root, root, &mut out)?;
     Ok(out)
 }
 
@@ -1490,6 +1603,33 @@ mod tests {
         requests: Mutex<Vec<DoHostRequest>>,
     }
 
+    #[derive(Debug, Default)]
+    struct DiscardTransport {
+        requests: Mutex<Vec<DoHostRequest>>,
+    }
+
+    impl DoHostTransport for DiscardTransport {
+        fn send(&self, request: DoHostRequest) -> io::Result<DoHostResponse> {
+            let path = request.path.clone();
+            self.requests.lock().unwrap().push(request);
+            let body = if path == "/host/policy" {
+                serde_json::to_vec(&json!({
+                    "epoch": 3,
+                    "envelope_hash": "sha256:policy",
+                    "signer": "gaugedesk",
+                }))
+                .unwrap()
+            } else if path == "/host/instances/open" {
+                br#"{"instance_ref":"whip:instance:fork"}"#.to_vec()
+            } else if path == "/host/instances/whip%3Ainstance%3Afork/discard" {
+                br#"{"instance_ref":"whip:instance:fork","discarded_at":{"instance_ref":"whip:instance:fork","sequence":4}}"#.to_vec()
+            } else {
+                return Err(io::Error::other(format!("unexpected request {path}")));
+            };
+            Ok(DoHostResponse { status: 200, body })
+        }
+    }
+
     impl DoHostTransport for RecordingTransport {
         fn send(&self, request: DoHostRequest) -> io::Result<DoHostResponse> {
             self.requests.lock().unwrap().push(request);
@@ -1525,6 +1665,37 @@ mod tests {
             serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
             json!({ "command": "one" })
         );
+    }
+
+    #[test]
+    fn hosted_continuity_discard_is_policy_bound_and_receipted() {
+        let transport = Arc::new(DiscardTransport::default());
+        let config = DoHostConfig::with_transport("tenant", transport.clone(), false).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let target = HarnessContinuitySpec {
+            chat_id: "fork-chat".into(),
+            runtime_placement_id: Some("placement".into()),
+            worktree: root.path().to_path_buf(),
+            mode: gaugedesk_harness::ChatMode::Edit,
+            package_root: None,
+            package_version_ref: None,
+            system_prompt: Some("edit safely".into()),
+            policy_epoch: Some(3),
+            signed_policy_envelope: Some("signed-policy".into()),
+            source_position: None,
+        };
+
+        discard_continuity(&config, &target).expect("discard");
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[2].path,
+            "/host/instances/whip%3Ainstance%3Afork/discard"
+        );
+        let body: Value = serde_json::from_slice(&requests[2].body).unwrap();
+        assert_eq!(body["command"]["request_id"], "gaugedesk:discard:fork-chat");
+        assert_eq!(body["command"]["policy"]["epoch"], 3);
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) {
@@ -1647,6 +1818,7 @@ mod tests {
             handle: "command".into(),
             kind: "command".into(),
             selector: None,
+            writable: None,
         }];
         let mut streamed = Vec::new();
         let outcome = project_result(&result, &resources, "openai", "gpt-test", &mut |item| {

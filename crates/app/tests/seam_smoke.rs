@@ -96,6 +96,7 @@ fn full_turn_runs_over_workspace_and_harness_trait_objects() {
         provider_binding_ref: None,
         credential_ref: None,
         placement_ceiling_ref: None,
+        workspace_targets: Vec::new(),
         runtime_placement_id: None,
         provider: None,
         model: None,

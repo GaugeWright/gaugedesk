@@ -18,11 +18,13 @@ use gaugedesk_workspace::{ChatWorkspace, Instance, MergeOutcome, Workspace, Work
 use crate::attestation_verifier::{LoopbackVerifier, QuoteVerifier, RealQuoteVerifierError};
 use crate::boundary_keeper::{accept_boundary_attested, AcceptError};
 use crate::library::{
-    Admission, AgentKind, AgentRecord, ArchetypeVersionRecord, ChatRecord, ChatTargetBindingRecord,
-    InstanceKind, InstanceRecord, PanelCollectionRecipient, PanelPublicProfile, PlacementKind,
-    PlacementTargetsRecord, ProjectRecord, PublicDeploymentBindingRecord, RecordOp,
-    TargetCapabilities, TargetVcsPosture, WorkTargetKind, WorkTargetOwner, WorkTargetRecord,
-    WorkTargetStatus, WorkstreamRecord, WorkstreamRootRecord, LIBRARY_SCOPE,
+    Admission, AgentKind, AgentRecord, ArchetypeVersionRecord, ChatRecord, ChatTargetBasisRecord,
+    ChatTargetBindingRecord, ChatTargetSetMemberRecord, ChatTargetSetRevisionRecord, InstanceKind,
+    InstanceRecord, PanelCollectionRecipient, PanelPublicProfile, PlacementKind,
+    PlacementTargetsRecord, ProjectCollaborationWorkspaceRecord, ProjectRecord,
+    PublicDeploymentBindingRecord, RecordOp, TargetCapabilities, TargetParticipationMode,
+    TargetVcsPosture, WorkTargetKind, WorkTargetOwner, WorkTargetRecord, WorkTargetStatus,
+    WorkstreamRecord, WorkstreamRootRecord, LIBRARY_RECORD_SCHEMA, LIBRARY_SCOPE,
 };
 use crate::workbench_state::{provider_for, WorkspaceProviders};
 use crate::{
@@ -250,6 +252,21 @@ pub(crate) struct ForkedChat {
     pub(crate) title: String,
     pub(crate) forked_from: String,
     pub(crate) forked_from_entry: Option<i64>,
+    pub(crate) admitted_home: Option<whipplescript_store::workstreams::BranchHomeReceiptV1>,
+}
+
+/// Where a new chat is admitted after its historical content/runtime cut has
+/// been cloned.  The destination is topology only: it never changes which
+/// files or transcript position the fork materializes.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ForkDestination {
+    #[default]
+    Inherit,
+    Main,
+    Workstream {
+        workstream_id: String,
+    },
 }
 
 pub(crate) enum ForkChatError {
@@ -259,6 +276,7 @@ pub(crate) enum ForkChatError {
     Create(String),
     Continuity(String),
     PointNotForkable,
+    HistoricalHomeClosed,
 }
 
 struct ResolvedForkPoint {
@@ -270,6 +288,29 @@ struct ResolvedForkPoint {
     workspace_cut: String,
     runtime_position: gaugedesk_harness::RuntimePosition,
     reads: Vec<String>,
+    taint_evidence_digest: String,
+    fork_snapshot: crate::engine::TurnForkSnapshot,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ChatForkAdmissionRecord {
+    schema: String,
+    source_chat_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_entry_id: Option<i64>,
+    historical_home: whipplescript_store::workstreams::BranchHomeReceiptV1,
+    requested_destination: ForkDestination,
+    admitted_home: whipplescript_store::workstreams::BranchHomeReceiptV1,
+    taint_evidence_digest: String,
+    #[serde(default)]
+    pub(crate) visible_settlements: Vec<crate::engine::VisibleSettlementSnapshot>,
+}
+
+pub(crate) const CHAT_FORK_ADMISSION_KIND: &str = "chat_fork_admission";
+
+struct ResolvedForkDestination {
+    line_ref: String,
+    workstream_id: Option<String>,
 }
 
 pub(crate) struct CreatedPairingRequest {
@@ -301,6 +342,7 @@ pub(crate) enum BoundaryAcceptError {
 pub(crate) struct StartupLibraryState {
     pub(crate) library: crate::library::Library,
     pub(crate) targets: BTreeMap<String, Box<dyn Workspace>>,
+    pub(crate) collaboration_workspaces: BTreeMap<String, Box<dyn Workspace>>,
     pub(crate) engagements: BTreeMap<String, Box<dyn ChatWorkspace>>,
     pub(crate) engagement_index: BTreeMap<String, String>,
 }
@@ -323,23 +365,230 @@ pub(crate) fn load_startup_library_state(
         seed_default_agent(store, &mut library, targets_dir, providers, home_id)?;
     }
     ensure_builtin_archetypes(store, &mut library, targets_dir, providers, home_id)?;
-    validate_target_cutover(&library)?;
+    if migrate_project_workspaces_and_target_sets(store, &library)? {
+        library = crate::library::Library::rebuild(store).map_err(io)?;
+    }
+    validate_target_cutover(&library, targets_dir)?;
     if migrate_agent_ability_manifests(store, &library, targets_dir, providers)? {
         library = crate::library::Library::rebuild(store).map_err(io)?;
     }
     validate_archetype_versions(&library, targets_dir)?;
     let deleted_chats = explicitly_deleted_chats(store)?;
-    let (targets, mut engagements, engagement_index) =
+    let (targets, mut engagements, mut engagement_index) =
         open_startup_targets(&library, targets_dir, providers, &deleted_chats)?;
+    let collaboration_workspaces =
+        open_project_collaboration_workspaces(&library, targets_dir, providers)?;
+    seed_empty_collaboration_workspaces(&library, &targets, &collaboration_workspaces)?;
+    migrate_legacy_project_topology(
+        store,
+        &mut library,
+        &targets,
+        &collaboration_workspaces,
+        &mut engagements,
+        &mut engagement_index,
+    )?;
+    recover_project_workstream_promotions(store, &mut library, &collaboration_workspaces)?;
+    open_project_chat_engagements(
+        &library,
+        &collaboration_workspaces,
+        &mut engagements,
+        &mut engagement_index,
+        None,
+    )?;
     for engagement in engagements.values_mut() {
         let _ = engagement.sync_from_main();
     }
     Ok(StartupLibraryState {
         library,
         targets,
+        collaboration_workspaces,
         engagements,
         engagement_index,
     })
+}
+
+/// ADR 0150/0151's exact additive cutover. A project gains one distinct
+/// collaboration workspace, and every singular chat binding becomes revision
+/// zero of a non-empty stable-ID target set. The legacy binding remains as
+/// historical evidence and compatibility input; new code reads the revisioned
+/// set. The whole migration is one store transaction and is idempotent.
+fn migrate_project_workspaces_and_target_sets(
+    store: &mut Store,
+    library: &crate::library::Library,
+) -> std::io::Result<bool> {
+    let mut records: Vec<(&'static str, String)> = Vec::new();
+
+    for project in library.projects.values() {
+        if library
+            .project_collaboration_workspaces
+            .contains_key(&project.id)
+        {
+            continue;
+        }
+        if project.home_id.as_str().is_empty() {
+            return Err(invalid_data(format!(
+                "project {} has no Home for its collaboration workspace; repair the project Home binding or reset this pre-release state root",
+                project.id
+            )));
+        }
+        let needs_legacy_topology_migration = library.chats.values().any(|chat| {
+            library
+                .instances
+                .get(&chat.instance_id)
+                .is_some_and(|instance| instance.project_id.as_deref() == Some(project.id.as_str()))
+                && !library.chat_target_sets.contains_key(&chat.id)
+        }) || library.workstream_roots.values().any(|root| {
+            library
+                .instances
+                .get(&root.placement_id)
+                .is_some_and(|instance| {
+                    instance.kind == InstanceKind::Using
+                        && instance.project_id.as_deref() == Some(project.id.as_str())
+                })
+                && root.project_id.is_empty()
+        });
+        let record = ProjectCollaborationWorkspaceRecord {
+            project_id: project.id.clone(),
+            workspace_id: format!("project-workspace-{}", project.id),
+            home_id: project.home_id.clone(),
+            substrate: "whipplescript".to_owned(),
+            host_contract_revision: crate::workstream_host_contract::REVISION.to_owned(),
+            host_contract_digest: crate::workstream_host_contract::DIGEST.to_owned(),
+            op: RecordOp::Upsert,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: if needs_legacy_topology_migration {
+                [(
+                    "migration_source".to_owned(),
+                    serde_json::Value::String("singular-target-v1".to_owned()),
+                )]
+                .into_iter()
+                .collect()
+            } else {
+                Default::default()
+            },
+        };
+        records.push((
+            "project_collaboration_workspace",
+            serde_json::to_string(&record).map_err(io)?,
+        ));
+    }
+
+    for chat in library.chats.values() {
+        if library.chat_target_sets.contains_key(&chat.id) {
+            continue;
+        }
+        let binding = library.chat_targets.get(&chat.id).ok_or_else(|| {
+            invalid_data(format!(
+                "chat {} has no singular target binding to migrate; repair or reset this pre-release chat",
+                chat.id
+            ))
+        })?;
+        let target = library
+            .work_targets
+            .get(&binding.target_id)
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "chat {} target {} is missing during target-set migration",
+                    chat.id, binding.target_id
+                ))
+            })?;
+        let record = ChatTargetSetRevisionRecord {
+            chat_id: chat.id.clone(),
+            revision: 0,
+            members: vec![ChatTargetSetMemberRecord {
+                target_id: target.id.clone(),
+                adapter_family: target.adapter_family.clone(),
+                path_scope: binding.path_scope.clone(),
+                capability_ceiling: binding.capabilities.clone(),
+                participation: if binding.capabilities.propose {
+                    TargetParticipationMode::Writable
+                } else {
+                    TargetParticipationMode::ReadOnly
+                },
+            }],
+            created_position: 0,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        };
+        records.push((
+            "chat_target_set",
+            serde_json::to_string(&record).map_err(io)?,
+        ));
+    }
+
+    for workstream in library.workstreams.values() {
+        let Some(root) = library.workstream_roots.get(&workstream.id) else {
+            continue;
+        };
+        if !root.project_id.is_empty() {
+            continue;
+        }
+        let instance = library.instances.get(&root.placement_id).ok_or_else(|| {
+            invalid_data(format!(
+                "workstream {} creator placement is missing during migration",
+                workstream.id
+            ))
+        })?;
+        if instance.kind != InstanceKind::Using {
+            continue;
+        }
+        let project_id = instance.project_id.as_deref().ok_or_else(|| {
+            invalid_data(format!(
+                "workstream {} has no project mapping; reset/repair this pre-project-workstream state",
+                workstream.id
+            ))
+        })?;
+        let project_has_historical_turns = library
+            .chats
+            .values()
+            .filter(|chat| {
+                library
+                    .instances
+                    .get(&chat.instance_id)
+                    .and_then(|instance| instance.project_id.as_deref())
+                    == Some(project_id)
+            })
+            .try_fold(false, |found, chat| {
+                store
+                    .records(&chat.id, crate::engine::TURN_BOUNDARY_KIND)
+                    .map(|records| found || !records.is_empty())
+                    .map_err(io)
+            })?;
+        if project_has_historical_turns {
+            return Err(invalid_data(format!(
+                "workstream {} has historical target-workspace turn coordinates that cannot be translated exactly; export the project and use the workstream repair/reset flow",
+                workstream.id
+            )));
+        }
+        let workspace_id = library
+            .project_collaboration_workspaces
+            .get(project_id)
+            .map(|record| record.workspace_id.clone())
+            .unwrap_or_else(|| format!("project-workspace-{project_id}"));
+        let mut migrated = root.clone();
+        migrated.project_id = project_id.to_owned();
+        migrated.workspace_id = workspace_id;
+        migrated.extra.insert(
+            "migrated_legacy_target_id".to_owned(),
+            serde_json::Value::String(root.target_id.clone()),
+        );
+        migrated.target_id.clear();
+        migrated.adapter_family.clear();
+        records.push((
+            "workstream_root",
+            serde_json::to_string(&migrated).map_err(io)?,
+        ));
+    }
+
+    if records.is_empty() {
+        return Ok(false);
+    }
+    let facts = records
+        .iter()
+        .map(|(kind, payload)| (LIBRARY_SCOPE, *kind, payload.as_str()))
+        .collect::<Vec<_>>();
+    store.append_records_atomically(&facts).map_err(io)?;
+    Ok(true)
 }
 
 pub(crate) fn authoring_target_id(archetype_id: &str) -> String {
@@ -461,6 +710,8 @@ fn migrate_exact_pre_target_defaults(
         && library.work_targets.is_empty()
         && library.placement_targets.is_empty()
         && library.chat_targets.is_empty()
+        && library.chat_target_sets.is_empty()
+        && library.project_collaboration_workspaces.is_empty()
         && library.workstream_roots.is_empty()
         && agent.name == "assistant"
         && agent.instance_id == DEFAULT_INSTANCE
@@ -659,6 +910,280 @@ fn remove_legacy_human_authority(source: &str) -> String {
         .replace("\n      with access to human {\n        ask\n      }", "")
 }
 
+#[cfg(test)]
+mod target_set_migration_tests {
+    use super::*;
+    use crate::LockUnpoisoned;
+
+    #[test]
+    fn singular_binding_migrates_once_to_revision_zero_and_a_distinct_project_workspace() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut library = crate::library::Library::default();
+        library.apply_project(ProjectRecord {
+            id: "project-1".to_owned(),
+            op: RecordOp::Upsert,
+            name: "Project".to_owned(),
+            is_default: false,
+            home_id: gaugedesk_core::ids::HomeId::new("home-1"),
+            network_isolated: false,
+            run_purpose: None,
+            deployment_mode: None,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        library.apply_instance(InstanceRecord {
+            id: "placement-1".to_owned(),
+            op: RecordOp::Upsert,
+            kind: InstanceKind::Using,
+            placement_kind: PlacementKind::Work,
+            agent_id: "agent-1".to_owned(),
+            project_id: Some("project-1".to_owned()),
+            version: 1,
+            admission: Admission::Active,
+            collection_recipient: None,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        library.apply_chat(ChatRecord {
+            id: "chat-1".to_owned(),
+            op: RecordOp::Upsert,
+            instance_id: "placement-1".to_owned(),
+            title: "Chat".to_owned(),
+            created_position: 1,
+            forked_from: None,
+            forked_from_entry: None,
+            forked_from_cut: None,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        library.apply_work_target(WorkTargetRecord {
+            id: "target/frontend".to_owned(),
+            op: RecordOp::Upsert,
+            name: "Frontend".to_owned(),
+            owner: WorkTargetOwner::Project {
+                project_id: "project-1".to_owned(),
+            },
+            kind: WorkTargetKind::Managed,
+            authority: "home-1".to_owned(),
+            parties: vec!["home-1".to_owned()],
+            locator_handle: "managed:frontend".to_owned(),
+            adapter: "whipplescript".to_owned(),
+            adapter_family: "whipplescript-v1".to_owned(),
+            vcs_posture: TargetVcsPosture::Managed,
+            current_basis: Some("cut-1".to_owned()),
+            path_scope: vec!["".to_owned()],
+            capabilities: TargetCapabilities::managed_default(),
+            status: WorkTargetStatus::Available,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        library.apply_chat_target(ChatTargetBindingRecord {
+            chat_id: "chat-1".to_owned(),
+            op: RecordOp::Upsert,
+            target_id: "target/frontend".to_owned(),
+            basis: "cut-1".to_owned(),
+            path_scope: vec!["".to_owned()],
+            capabilities: TargetCapabilities::managed_default(),
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        library.apply_workstream(WorkstreamRecord {
+            id: "workstream-1".to_owned(),
+            op: RecordOp::Upsert,
+            instance_id: "placement-1".to_owned(),
+            name: "Feature".to_owned(),
+            created_position: 2,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        library.apply_workstream_root(WorkstreamRootRecord {
+            workstream_id: "workstream-1".to_owned(),
+            op: RecordOp::Upsert,
+            placement_id: "placement-1".to_owned(),
+            project_id: String::new(),
+            workspace_id: String::new(),
+            target_id: "target/frontend".to_owned(),
+            adapter_family: "whipplescript-v1".to_owned(),
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+
+        assert!(migrate_project_workspaces_and_target_sets(&mut store, &library).unwrap());
+        let migrated = crate::library::Library::rebuild(&store).unwrap();
+        let set = migrated.current_target_set("chat-1").unwrap();
+        assert_eq!(set.revision, 0);
+        assert_eq!(set.members[0].target_id, "target/frontend");
+        assert_eq!(
+            set.members[0].participation,
+            TargetParticipationMode::Writable
+        );
+        let workspace = &migrated.project_collaboration_workspaces["project-1"];
+        assert_eq!(workspace.workspace_id, "project-workspace-project-1");
+        assert!(!migrated.work_targets.contains_key(&workspace.workspace_id));
+        assert_eq!(workspace.extra["migration_source"], "singular-target-v1");
+        let workstream_root = &migrated.workstream_roots["workstream-1"];
+        assert_eq!(workstream_root.project_id, "project-1");
+        assert_eq!(workstream_root.workspace_id, workspace.workspace_id);
+        assert!(workstream_root.target_id.is_empty());
+        assert_eq!(
+            workstream_root.extra["migrated_legacy_target_id"],
+            "target/frontend"
+        );
+
+        library.chat_target_sets = migrated.chat_target_sets;
+        library.project_collaboration_workspaces = migrated.project_collaboration_workspaces;
+        library.workstream_roots = migrated.workstream_roots;
+        assert!(!migrate_project_workspaces_and_target_sets(&mut store, &library).unwrap());
+    }
+
+    #[test]
+    fn legacy_workstream_with_untranslatable_turn_coordinates_requires_repair() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut library = crate::library::Library::default();
+        library.apply_project(ProjectRecord {
+            id: "project".into(),
+            op: RecordOp::Upsert,
+            name: "Project".into(),
+            is_default: false,
+            home_id: gaugedesk_core::ids::HomeId::new("home"),
+            network_isolated: false,
+            run_purpose: None,
+            deployment_mode: None,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        library.apply_instance(InstanceRecord {
+            id: "placement".into(),
+            op: RecordOp::Upsert,
+            kind: InstanceKind::Using,
+            placement_kind: PlacementKind::Work,
+            agent_id: "agent".into(),
+            project_id: Some("project".into()),
+            version: 1,
+            admission: Admission::Active,
+            collection_recipient: None,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        library.apply_chat(ChatRecord {
+            id: "chat".into(),
+            op: RecordOp::Upsert,
+            instance_id: "placement".into(),
+            title: "Chat".into(),
+            created_position: 1,
+            forked_from: None,
+            forked_from_entry: None,
+            forked_from_cut: None,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        library
+            .apply_chat_target_set(ChatTargetSetRevisionRecord {
+                chat_id: "chat".into(),
+                revision: 0,
+                members: vec![ChatTargetSetMemberRecord {
+                    target_id: "target".into(),
+                    adapter_family: "whipplescript-v1".into(),
+                    path_scope: vec![".".into()],
+                    capability_ceiling: TargetCapabilities::managed_default(),
+                    participation: TargetParticipationMode::Writable,
+                }],
+                created_position: 0,
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+            })
+            .unwrap();
+        library.apply_workstream(WorkstreamRecord {
+            id: "stream".into(),
+            op: RecordOp::Upsert,
+            instance_id: "placement".into(),
+            name: "Stream".into(),
+            created_position: 2,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        library.apply_workstream_root(WorkstreamRootRecord {
+            workstream_id: "stream".into(),
+            op: RecordOp::Upsert,
+            placement_id: "placement".into(),
+            project_id: String::new(),
+            workspace_id: String::new(),
+            target_id: "target".into(),
+            adapter_family: "whipplescript-v1".into(),
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        store
+            .append_record("chat", crate::engine::TURN_BOUNDARY_KIND, "legacy-boundary")
+            .unwrap();
+        let error = migrate_project_workspaces_and_target_sets(&mut store, &library).unwrap_err();
+        assert!(error.to_string().contains("cannot be translated exactly"));
+        assert!(error.to_string().contains("repair/reset"));
+    }
+
+    #[test]
+    fn startup_cancels_a_bare_reservation_before_any_main_advance() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        {
+            let mut workbench = workbench.lock_unpoisoned();
+            let collaboration =
+                workbench.library.project_collaboration_workspaces[DEFAULT_PROJECT].clone();
+            workbench
+                .workspace_by_storage_id(&collaboration.workspace_id)
+                .unwrap()
+                .create_named_workstream("recover-stream", Some("Recover"))
+                .unwrap();
+            workbench.write_workstream_record(WorkstreamRecord {
+                id: "recover-stream".into(),
+                op: RecordOp::Upsert,
+                instance_id: DEFAULT_PLACEMENT.into(),
+                name: "Recover".into(),
+                created_position: 0,
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+            });
+            workbench.write_workstream_root_record(WorkstreamRootRecord {
+                workstream_id: "recover-stream".into(),
+                op: RecordOp::Upsert,
+                placement_id: DEFAULT_PLACEMENT.into(),
+                project_id: DEFAULT_PROJECT.into(),
+                workspace_id: collaboration.workspace_id.clone(),
+                target_id: String::new(),
+                adapter_family: String::new(),
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+            });
+            let reserved = workbench
+                .workspace_by_storage_id(&collaboration.workspace_id)
+                .unwrap()
+                .reserve_workstream_promotion_boundary("recover-stream", "reservation-crash")
+                .unwrap();
+            assert_eq!(reserved.reservation_id, "reservation-crash");
+        }
+        drop(workbench);
+
+        let reopened = crate::open_workbench(root.path()).unwrap();
+        let reopened = reopened.lock_unpoisoned();
+        let collaboration = &reopened.library.project_collaboration_workspaces[DEFAULT_PROJECT];
+        let row = reopened
+            .workspace_by_storage_id(&collaboration.workspace_id)
+            .unwrap()
+            .workstream("recover-stream")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.status,
+            whipplescript_store::workstreams::StreamStatus::Active,
+            "startup cancels a reservation whose pre-CAS intent is not durable"
+        );
+        assert_eq!(
+            reopened.library.workstreams["recover-stream"].extra["promotion_recovery"]["status"],
+            "cancelled-before-advance"
+        );
+    }
+}
+
 fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
 }
@@ -666,7 +1191,105 @@ fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
 /// TARGET-1 rejects every pre-target shape not admitted by ADR 0104 instead of
 /// inventing compatibility aliases that would preserve the wrong authority
 /// boundary. Such state requires its own explicit migration decision.
-fn validate_target_cutover(library: &crate::library::Library) -> std::io::Result<()> {
+fn normalized_target_scope(scope: &str) -> Result<Vec<&str>, String> {
+    if scope.is_empty() || scope == "." {
+        return Ok(Vec::new());
+    }
+    if scope.starts_with('/') || scope.contains('\\') || scope.chars().any(char::is_control) {
+        return Err(format!("unsafe target path scope `{scope}`"));
+    }
+    let parts = scope.split('/').collect::<Vec<_>>();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return Err(format!("unsafe target path scope `{scope}`"));
+    }
+    Ok(parts)
+}
+
+fn target_scopes_physically_overlap(
+    targets_dir: &std::path::Path,
+    left_target: &WorkTargetRecord,
+    left_scopes: &[String],
+    right_target: &WorkTargetRecord,
+    right_scopes: &[String],
+) -> Result<bool, String> {
+    let left_root = crate::target_adapter::protected_target_root(targets_dir, left_target)?;
+    let right_root = crate::target_adapter::protected_target_root(targets_dir, right_target)?;
+    for left in left_scopes {
+        let left = normalized_target_scope(left)?
+            .into_iter()
+            .fold(left_root.clone(), |path, part| path.join(part));
+        for right in right_scopes {
+            let right = normalized_target_scope(right)?
+                .into_iter()
+                .fold(right_root.clone(), |path, part| path.join(part));
+            if left.starts_with(&right) || right.starts_with(&left) {
+                return Ok(true);
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        fn file_identities(root: &std::path::Path) -> Result<BTreeSet<(u64, u64)>, String> {
+            let mut identities = BTreeSet::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(path) = pending.pop() {
+                let metadata = match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.to_string()),
+                };
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    for entry in std::fs::read_dir(&path).map_err(|error| error.to_string())? {
+                        pending.push(entry.map_err(|error| error.to_string())?.path());
+                    }
+                } else if metadata.is_file() && metadata.nlink() > 1 {
+                    identities.insert((metadata.dev(), metadata.ino()));
+                }
+            }
+            Ok(identities)
+        }
+
+        let mut left_identities = BTreeSet::new();
+        for scope in left_scopes {
+            let path = normalized_target_scope(scope)?
+                .into_iter()
+                .fold(left_root.clone(), |path, part| path.join(part));
+            left_identities.extend(file_identities(&path)?);
+        }
+        for scope in right_scopes {
+            let path = normalized_target_scope(scope)?
+                .into_iter()
+                .fold(right_root.clone(), |path, part| path.join(part));
+            if file_identities(&path)?
+                .iter()
+                .any(|identity| left_identities.contains(identity))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if left_target.kind != WorkTargetKind::Managed || right_target.kind != WorkTargetKind::Managed {
+        return Err(format!(
+            "cannot prove hard-link alias safety between external targets {} and {} on this platform",
+            left_target.id, right_target.id
+        ));
+    }
+    Ok(false)
+}
+
+fn validate_target_cutover(
+    library: &crate::library::Library,
+    targets_dir: &std::path::Path,
+) -> std::io::Result<()> {
     let invalid = |message: String| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
 
     for target in library.work_targets.values() {
@@ -733,6 +1356,25 @@ fn validate_target_cutover(library: &crate::library::Library) -> std::io::Result
                 project.id
             )));
         }
+        let workspace = library
+            .project_collaboration_workspaces
+            .get(&project.id)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "project {} has no collaboration workspace; rerun the exact target-set migration",
+                    project.id
+                ))
+            })?;
+        if workspace.home_id != project.home_id
+            || workspace.substrate != "whipplescript"
+            || workspace.host_contract_revision != crate::workstream_host_contract::REVISION
+            || workspace.host_contract_digest != crate::workstream_host_contract::DIGEST
+        {
+            return Err(invalid(format!(
+                "project {} collaboration workspace has a mismatched Home or WhippleScript contract pin",
+                project.id
+            )));
+        }
     }
     for placement in library
         .instances
@@ -788,77 +1430,194 @@ fn validate_target_cutover(library: &crate::library::Library) -> std::io::Result
         }
     }
     for chat in library.chats.values() {
-        let binding = library.chat_targets.get(&chat.id).ok_or_else(|| {
+        let target_set = library.current_target_set(&chat.id).ok_or_else(|| {
             invalid(format!(
-                "pre-TARGET workspace: chat {} has no exact target binding; reset this pre-release state root",
+                "chat {} has no immutable target-set revision",
                 chat.id
             ))
         })?;
-        let target = library
-            .work_targets
-            .get(&binding.target_id)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "chat {} target {} is missing",
-                    chat.id, binding.target_id
-                ))
-            })?;
+        let binding = library.chat_targets.get(&chat.id);
+        if target_set.members.len() == 1 && binding.is_none() {
+            return Err(invalid(format!(
+                "one-target chat {} has no compatibility binding",
+                chat.id
+            )));
+        }
+        if target_set.members.len() > 1 && binding.is_some() {
+            return Err(invalid(format!(
+                "multi-target chat {} has a misleading singular binding",
+                chat.id
+            )));
+        }
         let root = library.instances.get(&chat.instance_id).ok_or_else(|| {
             invalid(format!(
                 "chat {} root {} is missing",
                 chat.id, chat.instance_id
             ))
         })?;
-        let eligible = match root.kind {
-            InstanceKind::Authoring => matches!(
-                &target.owner,
-                WorkTargetOwner::Archetype { archetype_id } if archetype_id == &root.agent_id
-            ),
-            InstanceKind::Using => library
-                .placement_targets
-                .get(&root.id)
-                .is_some_and(|record| record.target_ids.contains(&binding.target_id)),
-        };
-        let caps_fit = (!binding.capabilities.read || target.capabilities.read)
-            && (!binding.capabilities.propose || target.capabilities.propose)
-            && (!binding.capabilities.apply || target.capabilities.apply)
-            && (!binding.capabilities.publish || target.capabilities.publish)
-            && (!binding.capabilities.release || target.capabilities.release);
-        if !eligible
-            || binding.basis.is_empty()
-            || binding.path_scope.is_empty()
-            || !binding
-                .path_scope
-                .iter()
-                .all(|path| target.path_scope.contains(path))
-            || !caps_fit
-        {
-            return Err(invalid(format!(
-                "chat {} has an invalid target binding",
-                chat.id
-            )));
+        if let Some(binding) = binding {
+            let target = library
+                .work_targets
+                .get(&binding.target_id)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "chat {} target {} is missing",
+                        chat.id, binding.target_id
+                    ))
+                })?;
+            let eligible = match root.kind {
+                InstanceKind::Authoring => matches!(
+                    &target.owner,
+                    WorkTargetOwner::Archetype { archetype_id } if archetype_id == &root.agent_id
+                ),
+                InstanceKind::Using => library
+                    .placement_targets
+                    .get(&root.id)
+                    .is_some_and(|record| record.target_ids.contains(&binding.target_id)),
+            };
+            let caps_fit = (!binding.capabilities.read || target.capabilities.read)
+                && (!binding.capabilities.propose || target.capabilities.propose)
+                && (!binding.capabilities.apply || target.capabilities.apply)
+                && (!binding.capabilities.publish || target.capabilities.publish)
+                && (!binding.capabilities.release || target.capabilities.release);
+            if !eligible
+                || binding.basis.is_empty()
+                || binding.path_scope.is_empty()
+                || !binding
+                    .path_scope
+                    .iter()
+                    .all(|path| target.path_scope.contains(path))
+                || !caps_fit
+                || binding.target_id != target_set.members[0].target_id
+            {
+                return Err(invalid(format!(
+                    "chat {} has an invalid target binding",
+                    chat.id
+                )));
+            }
+        }
+        let project_id = root.project_id.as_deref();
+        for member in &target_set.members {
+            let member_target = library.work_targets.get(&member.target_id).ok_or_else(|| {
+                invalid(format!(
+                    "chat {} target-set member {} is missing",
+                    chat.id, member.target_id
+                ))
+            })?;
+            let owner_matches = match root.kind {
+                InstanceKind::Authoring => matches!(
+                    &member_target.owner,
+                    WorkTargetOwner::Archetype { archetype_id } if archetype_id == &root.agent_id
+                ),
+                InstanceKind::Using => matches!(
+                    (&member_target.owner, project_id),
+                    (WorkTargetOwner::Project { project_id: owner }, Some(project_id))
+                        if owner == project_id
+                ),
+            };
+            let eligible = match root.kind {
+                InstanceKind::Authoring => owner_matches,
+                InstanceKind::Using => library
+                    .placement_targets
+                    .get(&root.id)
+                    .is_some_and(|record| record.target_ids.contains(&member.target_id)),
+            };
+            if !owner_matches
+                || !eligible
+                || member.adapter_family != member_target.adapter_family
+                || member.path_scope.is_empty()
+                || member
+                    .path_scope
+                    .iter()
+                    .any(|path| normalized_target_scope(path).is_err())
+                || !member
+                    .path_scope
+                    .iter()
+                    .all(|path| member_target.path_scope.contains(path))
+            {
+                return Err(invalid(format!(
+                    "chat {} target-set member {} is outside its root, Home, adapter, or path authority",
+                    chat.id, member.target_id
+                )));
+            }
+        }
+        for (index, left) in target_set.members.iter().enumerate() {
+            let left_target = &library.work_targets[&left.target_id];
+            for right in target_set.members.iter().skip(index + 1) {
+                let right_target = &library.work_targets[&right.target_id];
+                if target_scopes_physically_overlap(
+                    targets_dir,
+                    left_target,
+                    &left.path_scope,
+                    right_target,
+                    &right.path_scope,
+                )
+                .map_err(invalid)?
+                {
+                    return Err(invalid(format!(
+                        "chat {} target scopes overlap between {} and {}",
+                        chat.id, left.target_id, right.target_id
+                    )));
+                }
+            }
         }
     }
     for workstream in library.workstreams.values() {
-        let root = library.workstream_roots.get(&workstream.id).ok_or_else(|| {
-            invalid(format!(
-                "pre-TARGET workspace: workstream {} has no target root; reset this pre-release state root",
-                workstream.id
-            ))
-        })?;
-        let target = library.work_targets.get(&root.target_id);
-        let root_eligible = library
-            .placement_targets
-            .get(&root.placement_id)
-            .is_some_and(|record| record.target_ids.contains(&root.target_id));
-        if root.placement_id != workstream.instance_id
-            || !root_eligible
-            || target.is_none_or(|target| target.adapter_family != root.adapter_family)
-        {
+        let root = library
+            .workstream_roots
+            .get(&workstream.id)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "workstream {} has no collaboration root",
+                    workstream.id
+                ))
+            })?;
+        if root.placement_id != workstream.instance_id {
             return Err(invalid(format!(
-                "workstream {} has an invalid target root",
+                "workstream {} disagrees with its creator placement",
                 workstream.id
             )));
+        }
+        if !root.project_id.is_empty() {
+            let collaboration = library
+                .project_collaboration_workspaces
+                .get(&root.project_id);
+            if !library.projects.contains_key(&root.project_id)
+                || !root.target_id.is_empty()
+                || !root.adapter_family.is_empty()
+                || collaboration.is_none_or(|record| record.workspace_id != root.workspace_id)
+            {
+                return Err(invalid(format!(
+                    "workstream {} has an invalid project collaboration root; reset/repair this pre-project-workstream state",
+                    workstream.id
+                )));
+            }
+        } else {
+            let instance = library.instances.get(&root.placement_id).ok_or_else(|| {
+                invalid(format!(
+                    "authoring workstream {} creator placement is missing",
+                    workstream.id
+                ))
+            })?;
+            match instance.kind {
+                InstanceKind::Using => {
+                    return Err(invalid(format!(
+                        "workstream {} has a pre-project target root; reset/repair this state",
+                        workstream.id
+                    )));
+                }
+                InstanceKind::Authoring => {
+                    let target = library.work_targets.get(&root.target_id);
+                    if !root.workspace_id.is_empty()
+                        || target.is_none_or(|target| target.adapter_family != root.adapter_family)
+                    {
+                        return Err(invalid(format!(
+                            "workstream {} has an invalid authoring target root",
+                            workstream.id
+                        )));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -991,6 +1750,427 @@ fn open_startup_targets(
         targets.insert(target.id.clone(), workspace);
     }
     Ok((targets, engagements, engagement_index))
+}
+
+fn collaboration_workspaces_dir(targets_dir: &std::path::Path) -> std::path::PathBuf {
+    targets_dir
+        .parent()
+        .unwrap_or(targets_dir)
+        .join("collaboration-workspaces")
+}
+
+fn open_project_collaboration_workspaces(
+    library: &crate::library::Library,
+    targets_dir: &std::path::Path,
+    providers: &WorkspaceProviders,
+) -> std::io::Result<BTreeMap<String, Box<dyn Workspace>>> {
+    let root = collaboration_workspaces_dir(targets_dir);
+    let mut workspaces = BTreeMap::new();
+    for record in library.project_collaboration_workspaces.values() {
+        let path = root.join(&record.workspace_id);
+        let workspace = if path.join("repo").exists() {
+            provider_for(providers, &record.workspace_id).open_at(&path)
+        } else {
+            provider_for(providers, &record.workspace_id)
+                .init_at(&path)
+                .map_err(io)?
+        };
+        workspaces.insert(record.workspace_id.clone(), workspace);
+    }
+    Ok(workspaces)
+}
+
+fn seed_empty_collaboration_workspaces(
+    library: &crate::library::Library,
+    targets: &BTreeMap<String, Box<dyn Workspace>>,
+    collaborations: &BTreeMap<String, Box<dyn Workspace>>,
+) -> std::io::Result<()> {
+    for record in library.project_collaboration_workspaces.values() {
+        let collaboration = collaborations.get(&record.workspace_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "declared project collaboration workspace is not open",
+            )
+        })?;
+        let probe_id = library::gen_id("collaboration-probe");
+        let probe = collaboration.create_engagement(&probe_id).map_err(io)?;
+        let already_seeded = probe.tree().map_err(io)?.iter().any(|entry| !entry.is_dir);
+        drop(probe);
+        collaboration.remove_engagement(&probe_id).map_err(io)?;
+        if already_seeded {
+            continue;
+        }
+
+        let mut owned = Vec::new();
+        for target in library.targets_for_project(&record.project_id) {
+            let source = targets.get(&target.id).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("project target {} is not open", target.id),
+                )
+            })?;
+            let source_probe_id = library::gen_id("partition-source");
+            let source_probe = source.create_engagement(&source_probe_id).map_err(io)?;
+            let encoded = crate::library::target_id_path_v1(&target.id)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            for entry in source_probe.tree().map_err(io)? {
+                if entry.is_dir || entry.path.starts_with(".gaugedesk-runtime/") {
+                    continue;
+                }
+                let body = source_probe.read_file(&entry.path).map_err(io)?;
+                owned.push((format!("targets/{encoded}/{}", entry.path), body));
+            }
+            drop(source_probe);
+            source.remove_engagement(&source_probe_id).map_err(io)?;
+        }
+        let borrowed = owned
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_str()))
+            .collect::<Vec<_>>();
+        collaboration.seed_main(&borrowed).map_err(io)?;
+    }
+    Ok(())
+}
+
+/// Recover a promotion whose durable WhippleScript boundary survived a Home
+/// restart. A bare reservation does not prove that manifest construction or a
+/// combined target-settlement preflight completed, so startup cancels it before
+/// Main moves and records the repair. Once the ref is durably advanced, startup
+/// may only close forward by archiving/re-homing the line.
+fn recover_project_workstream_promotions(
+    store: &mut Store,
+    library: &mut crate::library::Library,
+    collaborations: &BTreeMap<String, Box<dyn Workspace>>,
+) -> std::io::Result<()> {
+    let workstreams = library.workstreams.values().cloned().collect::<Vec<_>>();
+    for workstream in workstreams {
+        let Some(root) = library.workstream_roots.get(&workstream.id) else {
+            continue;
+        };
+        if root.project_id.is_empty() {
+            continue;
+        }
+        let workspace = collaborations.get(&root.workspace_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "workstream {} collaboration workspace is unavailable",
+                    workstream.id
+                ),
+            )
+        })?;
+        let Some(row) = workspace.workstream(&workstream.id).map_err(io)? else {
+            continue;
+        };
+        use whipplescript_store::workstreams::StreamStatus;
+        if !matches!(
+            row.status,
+            StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced
+        ) {
+            continue;
+        }
+        let reservation_id = row.reservation_id.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "workstream {} has a promotion state without its reservation",
+                    workstream.id
+                ),
+            )
+        })?;
+        if row.status == StreamStatus::BoundaryReserved {
+            workspace
+                .release_workstream_promotion_boundary(&workstream.id, reservation_id)
+                .map_err(io)?;
+            let mut repaired = workstream.clone();
+            repaired.extra.insert(
+                "promotion_recovery".to_owned(),
+                serde_json::json!({
+                    "status": "cancelled-before-advance",
+                    "reservation_id": reservation_id,
+                }),
+            );
+            store
+                .append_record(
+                    LIBRARY_SCOPE,
+                    "workstream",
+                    &serde_json::to_string(&repaired).map_err(io)?,
+                )
+                .map_err(io)?;
+            library.apply_workstream(repaired);
+            continue;
+        }
+        match workspace
+            .promote_workstream_boundary(&workstream.id, &root.workspace_id, reservation_id)
+            .map_err(io)?
+        {
+            gaugedesk_workspace::WorkstreamPromotionOutcome::Promoted { .. } => {}
+            gaugedesk_workspace::WorkstreamPromotionOutcome::Conflicted { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "workstream {} changed after its Main ref advance; promotion recovery cannot close exactly",
+                        workstream.id
+                    ),
+                ));
+            }
+            gaugedesk_workspace::WorkstreamPromotionOutcome::Refused(reason) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "workstream {} promotion recovery was refused: {reason}",
+                        workstream.id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Materialize the current substance and topology of the pre-ADR-0151
+/// one-target workspace into the new project collaboration workspace. The
+/// record migration above refuses projects with historical workstream turn
+/// coordinates; this function therefore has an exact current-state mapping and
+/// never pretends old cut ids survived a cross-workspace rewrite.
+#[allow(clippy::too_many_arguments)]
+fn migrate_legacy_project_topology(
+    store: &mut Store,
+    library: &mut crate::library::Library,
+    targets: &BTreeMap<String, Box<dyn Workspace>>,
+    collaborations: &BTreeMap<String, Box<dyn Workspace>>,
+    engagements: &mut BTreeMap<String, Box<dyn ChatWorkspace>>,
+    engagement_index: &mut BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    let pending = library
+        .project_collaboration_workspaces
+        .values()
+        .filter(|record| {
+            record
+                .extra
+                .get("migration_source")
+                .and_then(serde_json::Value::as_str)
+                == Some("singular-target-v1")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for collaboration_record in pending {
+        let collaboration = collaborations
+            .get(&collaboration_record.workspace_id)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "project {} migration collaboration workspace is unavailable",
+                        collaboration_record.project_id
+                    ),
+                )
+            })?;
+        let project_chats = library
+            .chats
+            .values()
+            .filter(|chat| {
+                library
+                    .instances
+                    .get(&chat.instance_id)
+                    .and_then(|instance| instance.project_id.as_deref())
+                    == Some(collaboration_record.project_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for chat in project_chats {
+            let Some(binding) = library.chat_targets.get(&chat.id) else {
+                continue;
+            };
+            let Some(source) = engagements.get(&chat.id) else {
+                continue;
+            };
+            let encoded = crate::library::target_id_path_v1(&binding.target_id)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let prefix = format!("targets/{encoded}");
+            let roots = [prefix.clone()].into_iter().collect::<BTreeSet<_>>();
+            let migrated = collaboration
+                .create_engagement_subset(&chat.id, collaboration.mainline(), &roots)
+                .map_err(io)?;
+            let source_files = source
+                .tree()
+                .map_err(io)?
+                .into_iter()
+                .filter(|entry| !entry.is_dir && !entry.path.starts_with(".gaugedesk-runtime/"))
+                .map(|entry| entry.path)
+                .collect::<BTreeSet<_>>();
+            let migrated_files = migrated
+                .tree()
+                .map_err(io)?
+                .into_iter()
+                .filter(|entry| !entry.is_dir && entry.path.starts_with(&format!("{prefix}/")))
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>();
+            for path in migrated_files {
+                let relative = path.strip_prefix(&format!("{prefix}/")).unwrap_or_default();
+                if !source_files.contains(relative) {
+                    migrated.remove_file(&path).map_err(io)?;
+                }
+            }
+            for relative in source_files {
+                let body = source
+                    .read_file_bytes_capped(&relative, usize::MAX)
+                    .map_err(io)?
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("legacy chat {} file {relative} disappeared", chat.id),
+                        )
+                    })?;
+                migrated
+                    .write_file_bytes(&format!("{prefix}/{relative}"), &body)
+                    .map_err(io)?;
+            }
+            let _ = migrated
+                .commit_turn("migrate singular target candidate")
+                .map_err(io)?;
+            engagement_index.insert(chat.id.clone(), collaboration_record.workspace_id.clone());
+            engagements.insert(chat.id, migrated);
+        }
+
+        let roots = library
+            .workstream_roots
+            .values()
+            .filter(|root| root.project_id == collaboration_record.project_id)
+            .filter_map(|root| {
+                root.extra
+                    .get("migrated_legacy_target_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|target_id| (root.clone(), target_id.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        for (root, source_target_id) in roots {
+            let workstream = library
+                .workstreams
+                .get(&root.workstream_id)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "legacy workstream {} declaration is unavailable",
+                            root.workstream_id
+                        ),
+                    )
+                })?;
+            let source = targets.get(&source_target_id).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "legacy workstream {} target is unavailable",
+                        root.workstream_id
+                    ),
+                )
+            })?;
+            let source_row = source.workstream(&root.workstream_id).map_err(io)?;
+            collaboration
+                .create_named_workstream(&root.workstream_id, Some(&workstream.name))
+                .map_err(io)?;
+            if let Some(source_row) = source_row {
+                if source_row.status == whipplescript_store::workstreams::StreamStatus::Archived {
+                    collaboration
+                        .archive_workstream(&root.workstream_id)
+                        .map_err(io)?;
+                } else {
+                    for chat_id in source.workstream_members(&root.workstream_id).map_err(io)? {
+                        collaboration
+                            .transfer_engagement_to_workstream(&chat_id, &root.workstream_id)
+                            .map_err(io)?;
+                        if let Some(engagement) = engagements.get_mut(&chat_id) {
+                            engagement
+                                .set_target(&collaboration.workstream_ref(&root.workstream_id))
+                                .map_err(io)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut completed = collaboration_record.clone();
+        completed.extra.remove("migration_source");
+        completed.extra.insert(
+            "migration_completed".to_owned(),
+            serde_json::Value::String("singular-target-v1".to_owned()),
+        );
+        append_library_record(store, "project_collaboration_workspace", &completed)?;
+        library.apply_project_collaboration_workspace(completed);
+    }
+    Ok(())
+}
+
+fn open_project_chat_engagements(
+    library: &crate::library::Library,
+    collaborations: &BTreeMap<String, Box<dyn Workspace>>,
+    engagements: &mut BTreeMap<String, Box<dyn ChatWorkspace>>,
+    engagement_index: &mut BTreeMap<String, String>,
+    only_workspace_id: Option<&str>,
+) -> std::io::Result<()> {
+    for chat in library.chats.values() {
+        let Some(instance) = library.instances.get(&chat.instance_id) else {
+            continue;
+        };
+        if instance.kind != InstanceKind::Using {
+            continue;
+        }
+        let project_id = instance.project_id.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("work chat {} has no project", chat.id),
+            )
+        })?;
+        let collaboration_record = library
+            .project_collaboration_workspaces
+            .get(project_id)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("work chat {} has no collaboration workspace", chat.id),
+                )
+            })?;
+        if only_workspace_id.is_some_and(|id| id != collaboration_record.workspace_id) {
+            continue;
+        }
+        let workspace = collaborations
+            .get(&collaboration_record.workspace_id)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("work chat {} collaboration workspace is not open", chat.id),
+                )
+            })?;
+        let roots = library
+            .current_target_set(&chat.id)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("work chat {} has no target set", chat.id),
+                )
+            })?
+            .members
+            .iter()
+            .map(|member| {
+                crate::library::target_id_path_v1(&member.target_id)
+                    .map(|encoded| format!("targets/{encoded}"))
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            })
+            .collect::<std::io::Result<BTreeSet<_>>>()?;
+        let home = workspace.engagement_home_receipt(&chat.id).map_err(io)?;
+        let target = home
+            .line_branch_id
+            .as_deref()
+            .unwrap_or(workspace.mainline());
+        let engagement = workspace
+            .create_engagement_subset(&chat.id, target, &roots)
+            .map_err(io)?;
+        engagements.insert(chat.id.clone(), engagement);
+        engagement_index.insert(chat.id.clone(), collaboration_record.workspace_id.clone());
+    }
+    Ok(())
 }
 
 fn builtin_instance_id(archetype: &crate::app_support::BuiltinArchetype) -> String {
@@ -1233,22 +2413,65 @@ pub(crate) fn seed_default_agent(
 impl Workbench {
     pub(crate) fn apply_startup_library_state(&mut self, state: StartupLibraryState) {
         self.targets = state.targets;
+        self.collaboration_workspaces = state.collaboration_workspaces;
         self.engagements = state.engagements;
         self.engagement_index = state.engagement_index;
         self.library = state.library;
         self.default_instance = DEFAULT_PLACEMENT.to_owned();
     }
 
+    /// Reopen the chats in one imported project workspace with their exact
+    /// target-set roots. A raw workspace reconcile would reopen every branch
+    /// without sparse roots and expose unrelated project partitions.
+    pub(crate) fn reopen_collaboration_workspace_engagements(
+        &mut self,
+        workspace_id: &str,
+    ) -> std::io::Result<()> {
+        let stale = self
+            .engagement_index
+            .iter()
+            .filter_map(|(chat_id, storage_id)| {
+                (storage_id == workspace_id).then_some(chat_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for chat_id in stale {
+            self.engagement_index.remove(&chat_id);
+            self.engagements.remove(&chat_id);
+        }
+        open_project_chat_engagements(
+            &self.library,
+            &self.collaboration_workspaces,
+            &mut self.engagements,
+            &mut self.engagement_index,
+            Some(workspace_id),
+        )
+    }
+
     /// A test workbench with one managed target as its default chat root.
     pub fn with_target(target_id: impl Into<String>, target: Instance, store: Store) -> Self {
         let target_id = target_id.into();
         let mut wb = Self::new(store);
-        // Managed targets live at `<targets-root>/<target-id>/repo`.
-        if let Some(root) = target.repo().parent().and_then(|p| p.parent()) {
-            wb.targets_root = root.to_path_buf();
+        // This explicit constructor is a test/composition seam; its caller may
+        // provide a standalone repo rather than the production nested layout.
+        if let Some(root) = target.repo().parent() {
+            wb.targets_root = root.join("targets");
         }
         wb.targets.insert(target_id.clone(), Box::new(target));
         let home_id = wb.home_id().clone();
+        if !wb.library.projects.contains_key("test-project") {
+            wb.write_project_record(ProjectRecord {
+                id: "test-project".to_owned(),
+                op: RecordOp::Upsert,
+                name: "Test project".to_owned(),
+                home_id: home_id.clone(),
+                is_default: false,
+                network_isolated: false,
+                run_purpose: None,
+                deployment_mode: None,
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+            });
+        }
         wb.write_work_target_record(managed_target_record(
             target_id.clone(),
             "Test target".to_owned(),
@@ -1278,6 +2501,21 @@ impl Workbench {
             admission: Admission::Active,
             collection_recipient: None,
         });
+        wb.write_project_collaboration_workspace_record(ProjectCollaborationWorkspaceRecord {
+            project_id: "test-project".to_owned(),
+            workspace_id: "project-workspace-test-project".to_owned(),
+            home_id: home_id.clone(),
+            substrate: "whipplescript".to_owned(),
+            host_contract_revision: crate::workstream_host_contract::REVISION.to_owned(),
+            host_contract_digest: crate::workstream_host_contract::DIGEST.to_owned(),
+            op: RecordOp::Upsert,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        wb.ensure_project_collaboration_workspace("test-project")
+            .expect("test project collaboration workspace");
+        wb.ensure_collaboration_target_partition("test-project", &target_id)
+            .expect("test target collaboration partition");
         wb.default_instance = target_id;
         wb
     }
@@ -1577,7 +2815,7 @@ impl Workbench {
     pub(crate) fn library_project_relocation_content_bundles(
         &self,
         project: &str,
-    ) -> Vec<(String, String, Vec<u8>)> {
+    ) -> Vec<(String, String, Vec<u8>, bool)> {
         let mut out = Vec::new();
         let mut target_ids = self
             .library
@@ -1616,12 +2854,33 @@ impl Workbench {
                         target.id.clone(),
                         inst.export_format().to_string(),
                         export.0,
+                        false,
                     )),
                     Err(e) => {
                         tracing::warn!("handoff: cannot bundle target {}: {e}", target.id)
                     }
                 },
                 None => tracing::warn!("handoff: no live store for target {}", target.id),
+            }
+        }
+        if let Some(record) = self.library.project_collaboration_workspaces.get(project) {
+            match self.collaboration_workspaces.get(&record.workspace_id) {
+                Some(workspace) => match workspace.export() {
+                    Ok(export) => out.push((
+                        record.workspace_id.clone(),
+                        workspace.export_format().to_owned(),
+                        export.0,
+                        true,
+                    )),
+                    Err(error) => tracing::warn!(
+                        "handoff: cannot bundle collaboration workspace {}: {error}",
+                        record.workspace_id
+                    ),
+                },
+                None => tracing::warn!(
+                    "handoff: project collaboration workspace {} is not open",
+                    record.workspace_id
+                ),
             }
         }
         out
@@ -1719,10 +2978,6 @@ impl Workbench {
         self.notify_library_changed("chat", &id, op);
     }
 
-    pub(crate) fn library_workstream_ids(&self) -> Vec<String> {
-        self.library.workstreams.keys().cloned().collect()
-    }
-
     pub(crate) fn write_workstream_record(&mut self, record: WorkstreamRecord) -> i64 {
         let id = record.id.clone();
         let op = Self::library_op_str(record.op);
@@ -1795,6 +3050,150 @@ impl Workbench {
         );
         self.library.apply_chat_target(record);
         self.notify_library_changed("chat", &id, op);
+    }
+
+    pub(crate) fn write_chat_target_set_record(
+        &mut self,
+        record: ChatTargetSetRevisionRecord,
+    ) -> Result<(), String> {
+        if let Some(current) = self.library.current_target_set(&record.chat_id) {
+            if record.revision <= current.revision {
+                return Err(format!(
+                    "target-set revision must advance past {}",
+                    current.revision
+                ));
+            }
+        } else if record.revision != 0 {
+            return Err("the first target-set revision must be zero".to_owned());
+        }
+        let payload = serde_json::to_string(&record).map_err(|error| error.to_string())?;
+        self.store_mut()
+            .append_record(LIBRARY_SCOPE, "chat_target_set", &payload)
+            .map_err(|error| format!("{error:?}"))?;
+        let id = record.chat_id.clone();
+        self.library.apply_chat_target_set(record)?;
+        self.notify_library_changed("chat", &id, "upsert");
+        Ok(())
+    }
+
+    pub(crate) fn write_chat_target_basis_record(
+        &mut self,
+        record: ChatTargetBasisRecord,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_string(&record).map_err(|error| error.to_string())?;
+        self.store_mut()
+            .append_record(LIBRARY_SCOPE, "chat_target_basis", &payload)
+            .map_err(|error| format!("{error:?}"))?;
+        let id = record.chat_id.clone();
+        self.library.apply_chat_target_basis(record);
+        self.notify_library_changed("chat", &id, "upsert");
+        Ok(())
+    }
+
+    pub(crate) fn write_project_collaboration_workspace_record(
+        &mut self,
+        record: ProjectCollaborationWorkspaceRecord,
+    ) {
+        let id = record.project_id.clone();
+        let op = Self::library_op_str(record.op);
+        let _ = self.store_mut().append_record(
+            LIBRARY_SCOPE,
+            "project_collaboration_workspace",
+            &serde_json::to_string(&record).unwrap(),
+        );
+        self.library.apply_project_collaboration_workspace(record);
+        self.notify_library_changed("project", &id, op);
+    }
+
+    pub(crate) fn ensure_project_collaboration_workspace(
+        &mut self,
+        project_id: &str,
+    ) -> Result<(), String> {
+        let record = self
+            .library
+            .project_collaboration_workspaces
+            .get(project_id)
+            .ok_or_else(|| "project collaboration workspace is undeclared".to_owned())?;
+        if self
+            .collaboration_workspaces
+            .contains_key(&record.workspace_id)
+        {
+            return Ok(());
+        }
+        let path = collaboration_workspaces_dir(&self.targets_dir()).join(&record.workspace_id);
+        let workspace = self
+            .workspace_provider(&record.workspace_id)
+            .init_at(&path)
+            .map_err(|error| error.to_string())?;
+        self.collaboration_workspaces
+            .insert(record.workspace_id.clone(), workspace);
+        Ok(())
+    }
+
+    pub(crate) fn ensure_collaboration_target_partition(
+        &mut self,
+        project_id: &str,
+        target_id: &str,
+    ) -> Result<(), String> {
+        self.ensure_project_collaboration_workspace(project_id)?;
+        let record = self
+            .library
+            .project_collaboration_workspaces
+            .get(project_id)
+            .ok_or_else(|| "project collaboration workspace is undeclared".to_owned())?;
+        let workspace_id = record.workspace_id.clone();
+        let root = format!("targets/{}", crate::library::target_id_path_v1(target_id)?);
+
+        let collaboration = self
+            .collaboration_workspaces
+            .get(&workspace_id)
+            .ok_or_else(|| "project collaboration workspace is not open".to_owned())?;
+        let collab_probe_id = library::gen_id("partition-probe");
+        let collab_probe = collaboration
+            .create_engagement(&collab_probe_id)
+            .map_err(|error| error.to_string())?;
+        let exists = collab_probe
+            .tree()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|entry| entry.path == root || entry.path.starts_with(&format!("{root}/")));
+        drop(collab_probe);
+        collaboration
+            .remove_engagement(&collab_probe_id)
+            .map_err(|error| error.to_string())?;
+        if exists {
+            return Ok(());
+        }
+
+        let probe_id = library::gen_id("partition-source");
+        let source = self
+            .targets
+            .get(target_id)
+            .ok_or_else(|| "target storage is not open".to_owned())?;
+        let probe = source
+            .create_engagement(&probe_id)
+            .map_err(|error| error.to_string())?;
+        let mut owned = Vec::new();
+        for entry in probe.tree().map_err(|error| error.to_string())? {
+            if entry.is_dir || entry.path.starts_with(".gaugedesk-runtime/") {
+                continue;
+            }
+            let body = probe
+                .read_file(&entry.path)
+                .map_err(|error| error.to_string())?;
+            owned.push((format!("{root}/{}", entry.path), body));
+        }
+        drop(probe);
+        let _ = source.remove_engagement(&probe_id);
+        let borrowed = owned
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_str()))
+            .collect::<Vec<_>>();
+        self.collaboration_workspaces
+            .get(&workspace_id)
+            .ok_or_else(|| "project collaboration workspace is not open".to_owned())?
+            .seed_main(&borrowed)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn write_workstream_root_record(&mut self, record: WorkstreamRootRecord) {
@@ -1880,6 +3279,7 @@ impl Workbench {
                 target_ids: vec![target_id.clone()],
             });
         }
+        self.ensure_collaboration_target_partition(project_id, &target_id)?;
         Ok(target_id)
     }
 
@@ -1897,7 +3297,26 @@ impl Workbench {
     }
 
     pub(crate) fn library_workstreams_in(&self, instance_id: &str) -> Vec<&WorkstreamRecord> {
-        self.library.workstreams_in(instance_id)
+        let Some(instance) = self.library.instances.get(instance_id) else {
+            return Vec::new();
+        };
+        if instance.kind == InstanceKind::Authoring {
+            return self.library.workstreams_in(instance_id);
+        }
+        let project_id = instance.project_id.as_deref().unwrap_or_default();
+        let mut records = self
+            .library
+            .workstreams
+            .values()
+            .filter(|record| {
+                self.library
+                    .workstream_roots
+                    .get(&record.id)
+                    .is_some_and(|root| root.project_id == project_id)
+            })
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| record.created_position);
+        records
     }
 
     pub(crate) fn library_workstream(&self, workstream_id: &str) -> Option<WorkstreamRecord> {
@@ -1959,40 +3378,12 @@ impl Workbench {
         Ok(target)
     }
 
-    pub(crate) fn managed_target_storage_id(&self, target_id: &str) -> Option<&str> {
-        self.library
-            .work_targets
-            .get(target_id)
-            .filter(|target| target.kind == WorkTargetKind::Managed)
-            .map(|target| target.id.as_str())
-    }
-
-    pub(crate) fn create_target_workstream_ref(
-        &self,
-        target_id: &str,
-        workstream_id: &str,
-    ) -> std::io::Result<()> {
-        let Some(target) = self.targets.get(target_id) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "managed target is not open",
-            ));
-        };
-        target.create_workstream(workstream_id).map_err(io)
-    }
-
-    pub(crate) fn promote_target_workstream_ref_to_main(
-        &self,
-        workstream_id: &str,
-        target_id: &str,
-    ) -> std::io::Result<MergeOutcome> {
-        let Some(target) = self.targets.get(target_id) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "managed target is not open",
-            ));
-        };
-        target.promote_workstream_to_main(workstream_id).map_err(io)
+    pub(crate) fn workspace_by_storage_id(&self, storage_id: &str) -> Option<&dyn Workspace> {
+        self.targets.get(storage_id).map(Box::as_ref).or_else(|| {
+            self.collaboration_workspaces
+                .get(storage_id)
+                .map(Box::as_ref)
+        })
     }
 
     #[cfg(test)]
@@ -2085,6 +3476,11 @@ impl Workbench {
     }
 
     pub(crate) fn destroy_instance(&mut self, inst_id: &str) {
+        let instance_kind = self
+            .library
+            .instances
+            .get(inst_id)
+            .map(|instance| instance.kind);
         let authoring_target = self
             .library
             .instances
@@ -2102,17 +3498,19 @@ impl Workbench {
         for chat_id in chat_ids {
             self.destroy_chat(&chat_id);
         }
-        // A workstream declaration and its target root are children of the
-        // placement. Leaving either live while tombstoning the placement makes
-        // the durable library fail closed on its next startup because the root
-        // can no longer be eligible for that placement.
-        let workstream_ids: Vec<String> = self
-            .library
-            .workstreams
-            .values()
-            .filter(|workstream| workstream.instance_id == inst_id)
-            .map(|workstream| workstream.id.clone())
-            .collect();
+        // Authoring workstreams remain children of their authoring placement.
+        // Work workstreams are project-owned: `instance_id` is only immutable
+        // creator provenance, so unbinding that placement must not retire them.
+        let workstream_ids: Vec<String> = if instance_kind == Some(InstanceKind::Authoring) {
+            self.library
+                .workstreams
+                .values()
+                .filter(|workstream| workstream.instance_id == inst_id)
+                .map(|workstream| workstream.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         for workstream_id in workstream_ids {
             if let Some(existing) = self.library.workstreams.get(&workstream_id).cloned() {
                 self.write_workstream_record(WorkstreamRecord {
@@ -2267,7 +3665,172 @@ impl Workbench {
             }
             std::fs::write(destination, body).map_err(|error| error.to_string())?;
         }
+        self.refresh_chat_target_set_mount(chat_id)
+    }
+
+    /// Refresh the host-owned target-set declaration independently of an agent
+    /// discipline package. Project workspaces need this declaration even in
+    /// composition tests (and recovery states) where no archetype is mounted.
+    pub(crate) fn refresh_chat_target_set_mount(&self, chat_id: &str) -> Result<(), String> {
+        let engagement = self
+            .engagements
+            .get(chat_id)
+            .ok_or_else(|| "chat target candidate is unavailable".to_owned())?;
+        let mount = engagement
+            .path()
+            .join(gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT);
+        std::fs::create_dir_all(&mount).map_err(|error| error.to_string())?;
+        let target_set = self
+            .library
+            .current_target_set(chat_id)
+            .ok_or_else(|| "chat target set is unavailable".to_owned())?;
+        let members = target_set
+            .members
+            .iter()
+            .map(|member| {
+                let target = self
+                    .library
+                    .work_targets
+                    .get(&member.target_id)
+                    .ok_or_else(|| format!("target {} is unavailable", member.target_id))?;
+                Ok(serde_json::json!({
+                    "target_id": member.target_id,
+                    "display_name": target.name,
+                    "root": format!("targets/{}", crate::library::target_id_path_v1(&member.target_id)?),
+                    "kind": target.kind,
+                    "adapter_family": member.adapter_family,
+                    "basis": self.library.chat_target_basis(chat_id, &member.target_id)
+                        .map(str::to_owned)
+                        .or_else(|| target.current_basis.clone()),
+                    "path_scope": member.path_scope,
+                    "capability_ceiling": member.capability_ceiling,
+                    "participation": member.participation,
+                }))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let manifest = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "gaugedesk.target-set.v1",
+            "chat_id": chat_id,
+            "target_set_revision": target_set.revision,
+            "targets": members,
+        }))
+        .map_err(|error| error.to_string())?;
+        std::fs::write(mount.join("target-set.json"), manifest)
+            .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    /// Capture the GaugeDesk coordinates WhippleScript cuts do not themselves
+    /// version.  This is called while turn admission still owns the current
+    /// project/target facts; the engine adds the before/after collaboration cuts
+    /// to the same immutable boundary record.
+    pub(crate) fn turn_fork_snapshot(
+        &self,
+        chat_id: &str,
+        governance_epoch: Option<u64>,
+        signed_governance_envelope: Option<&str>,
+        process_declaration: Option<crate::target_change_set::TurnProcessDeclaration>,
+    ) -> Result<Option<crate::engine::TurnForkSnapshot>, String> {
+        use sha2::{Digest, Sha256};
+
+        let Some(chat) = self.library.chats.get(chat_id) else {
+            // Low-level harness/composition tests can register an ephemeral
+            // workspace without a durable project chat. There is no project
+            // fork vector to capture for that compatibility seam.
+            return Ok(None);
+        };
+        let instance = self
+            .library
+            .instances
+            .get(&chat.instance_id)
+            .ok_or_else(|| "chat placement is unavailable".to_owned())?;
+        if instance.kind != InstanceKind::Using {
+            return Ok(None);
+        }
+        let project_id = instance
+            .project_id
+            .as_deref()
+            .ok_or_else(|| "work chat has no project".to_owned())?;
+        let collaboration = self
+            .library
+            .project_collaboration_workspaces
+            .get(project_id)
+            .ok_or_else(|| "project collaboration workspace is unavailable".to_owned())?;
+        let workspace = self
+            .collaboration_workspaces
+            .get(&collaboration.workspace_id)
+            .ok_or_else(|| "project collaboration workspace is not open".to_owned())?;
+        let target_set = self
+            .library
+            .current_target_set(chat_id)
+            .ok_or_else(|| "chat target set is unavailable".to_owned())?;
+        let compatibility_binding = self.library.chat_targets.get(chat_id);
+        let mut targets = target_set
+            .members
+            .iter()
+            .map(|member| {
+                let target = self
+                    .library
+                    .work_targets
+                    .get(&member.target_id)
+                    .ok_or_else(|| format!("target {} is unavailable", member.target_id))?;
+                let native_basis = self
+                    .library
+                    .chat_target_basis(chat_id, &member.target_id)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        compatibility_binding
+                            .filter(|binding| binding.target_id == member.target_id)
+                            .map(|binding| binding.basis.clone())
+                            .or_else(|| target.current_basis.clone())
+                    })
+                    .ok_or_else(|| format!("target {} has no exact basis", member.target_id))?;
+                Ok(crate::engine::TurnTargetMemberSnapshot {
+                    target_id: member.target_id.clone(),
+                    native_basis,
+                    adapter_family: member.adapter_family.clone(),
+                    path_scope: member.path_scope.clone(),
+                    capabilities: member.capability_ceiling.clone(),
+                    participation: member.participation,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        targets.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+        let envelope = signed_governance_envelope.unwrap_or_default();
+        let reads = crate::resource_store::engagement_reads(&self.store, chat_id)
+            .map_err(|error| format!("{error:?}"))?
+            .items()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let taint_evidence_digest = crate::engine::taint_evidence_digest(&reads);
+        let visible_settlements = self.visible_target_settlement_evidence(chat_id)?;
+        let visible_settlement_handles = visible_settlements
+            .iter()
+            .flat_map(|evidence| evidence.receipt_handles.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(Some(crate::engine::TurnForkSnapshot {
+            target_set_revision: target_set.revision,
+            targets,
+            collaboration_workspace_id: collaboration.workspace_id.clone(),
+            historical_home: workspace
+                .engagement_home_receipt(chat_id)
+                .map_err(|error| error.to_string())?,
+            governance_epoch: governance_epoch.unwrap_or_default(),
+            governance_envelope_digest: format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(envelope.as_bytes()))
+            ),
+            process_declaration,
+            visible_settlement_handles,
+            visible_settlements,
+            before_taint_evidence_digest: taint_evidence_digest.clone(),
+            after_taint_evidence_digest: taint_evidence_digest,
+            before_collaboration_cut: String::new(),
+            after_collaboration_cut: String::new(),
+        }))
     }
 
     pub(crate) fn create_chat_in_instance(
@@ -2283,6 +3846,19 @@ impl Workbench {
         inst_id: &str,
         title: &str,
         requested_target_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let requested = requested_target_id
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        self.create_chat_in_instance_on_targets(inst_id, title, &requested)
+    }
+
+    pub(crate) fn create_chat_in_instance_on_targets(
+        &mut self,
+        inst_id: &str,
+        title: &str,
+        requested_target_ids: &[String],
     ) -> Result<serde_json::Value, String> {
         let Some(inst_rec) = self.library.instances.get(inst_id).cloned() else {
             return Err("no such instance".into());
@@ -2305,34 +3881,112 @@ impl Workbench {
         {
             return Err("instance is not runnable (suspended or torn down)".into());
         }
-        let target = match inst_rec.kind {
-            InstanceKind::Using => self.resolve_placement_target(inst_id, requested_target_id)?,
+        let targets = match inst_rec.kind {
+            InstanceKind::Using => {
+                let requested = if requested_target_ids.is_empty() {
+                    let eligible = self
+                        .library
+                        .placement_targets
+                        .get(inst_id)
+                        .map(|record| record.target_ids.as_slice())
+                        .unwrap_or_default();
+                    match eligible {
+                        [only] => vec![only.clone()],
+                        [] => return Err("placement has no work target".to_owned()),
+                        _ => return Err("select one or more work targets".to_owned()),
+                    }
+                } else {
+                    requested_target_ids.to_vec()
+                };
+                let mut seen = BTreeSet::new();
+                let mut targets = Vec::with_capacity(requested.len());
+                for target_id in requested {
+                    if !seen.insert(target_id.clone()) {
+                        return Err(format!("target set repeats stable target id {target_id}"));
+                    }
+                    targets.push(self.resolve_placement_target(inst_id, Some(&target_id))?);
+                }
+                targets
+            }
             InstanceKind::Authoring => {
                 let target = self
                     .library
                     .authoring_target_for(&inst_rec.agent_id)
                     .cloned()
                     .ok_or_else(|| "archetype authoring target is unresolved".to_owned())?;
-                if requested_target_id.is_some_and(|requested| requested != target.id) {
+                if requested_target_ids
+                    .iter()
+                    .any(|requested| requested != &target.id)
+                    || requested_target_ids.len() > 1
+                {
                     return Err("edit chat target does not belong to this archetype".to_owned());
                 }
-                target
+                vec![target]
             }
         };
-        let target_id = target.id.clone();
-        if !target.capabilities.read || !target.capabilities.propose {
-            return Err("work target does not grant read and propose".to_owned());
+        for target in &targets {
+            if !target.capabilities.read {
+                return Err(format!("work target {} does not grant read", target.id));
+            }
         }
-        let Some(inst) = self.targets.get(&target_id) else {
-            return Err("work target storage is not open".into());
+        for (index, left) in targets.iter().enumerate() {
+            for right in targets.iter().skip(index + 1) {
+                if target_scopes_physically_overlap(
+                    &self.targets_dir(),
+                    left,
+                    &left.path_scope,
+                    right,
+                    &right.path_scope,
+                )? {
+                    return Err(format!(
+                        "targets {} and {} have overlapping physical scopes",
+                        left.id, right.id
+                    ));
+                }
+            }
+        }
+        let target_id = targets[0].id.clone();
+        let (storage_id, sparse_roots) = match inst_rec.kind {
+            InstanceKind::Using => {
+                let project_id = inst_rec
+                    .project_id
+                    .as_deref()
+                    .ok_or_else(|| "work placement has no project".to_owned())?;
+                for target in &targets {
+                    self.ensure_collaboration_target_partition(project_id, &target.id)?;
+                }
+                let workspace = self
+                    .library
+                    .project_collaboration_workspaces
+                    .get(project_id)
+                    .ok_or_else(|| "project collaboration workspace is unresolved".to_owned())?;
+                let roots = targets
+                    .iter()
+                    .map(|target| {
+                        crate::library::target_id_path_v1(&target.id)
+                            .map(|encoded| format!("targets/{encoded}"))
+                    })
+                    .collect::<Result<BTreeSet<_>, _>>()?;
+                (workspace.workspace_id.clone(), Some(roots))
+            }
+            InstanceKind::Authoring => (target_id.clone(), None),
+        };
+        let Some(storage) = self.workspace_by_storage_id(&storage_id) else {
+            return Err("chat collaboration storage is not open".into());
         };
         let chat_id = library::gen_id("chat");
-        let eng = inst
-            .create_engagement(&chat_id)
-            .map_err(|e| e.to_string())?;
+        let eng = match &sparse_roots {
+            Some(roots) => storage.create_engagement_subset(&chat_id, storage.mainline(), roots),
+            None => storage.create_engagement(&chat_id),
+        }
+        .map_err(|e| e.to_string())?;
         // Pin the exact standing target basis. Runtime config and discipline
         // are control/materialized state and never mint target cuts.
-        let basis = eng.boundary_cut().map_err(|error| error.to_string())?.0;
+        let _candidate = eng.boundary_cut().map_err(|error| error.to_string())?.0;
+        let basis = targets[0]
+            .current_basis
+            .clone()
+            .ok_or_else(|| "work target has no exact standing basis".to_owned())?;
         let rec = ChatRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
@@ -2355,37 +4009,199 @@ impl Workbench {
         };
         self.library.apply_chat(rec);
         self.notify_library_changed("chat", &chat_id, "upsert");
-        let mut standing_target = target.clone();
-        standing_target.current_basis = Some(basis.clone());
-        self.write_work_target_record(standing_target);
-        self.write_chat_target_record(ChatTargetBindingRecord {
+        let binding = (targets.len() == 1).then(|| ChatTargetBindingRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             chat_id: chat_id.clone(),
             op: RecordOp::Upsert,
             target_id: target_id.clone(),
             basis: basis.clone(),
-            path_scope: target.path_scope,
-            capabilities: target.capabilities,
+            path_scope: targets[0].path_scope.clone(),
+            capabilities: targets[0].capabilities.clone(),
         });
-        self.register_engagement(chat_id.clone(), target_id.clone(), eng);
+        if let Some(binding) = binding.clone() {
+            self.write_chat_target_record(binding);
+        }
+        self.write_chat_target_set_record(ChatTargetSetRevisionRecord {
+            chat_id: chat_id.clone(),
+            revision: 0,
+            members: targets
+                .iter()
+                .map(|target| ChatTargetSetMemberRecord {
+                    target_id: target.id.clone(),
+                    adapter_family: target.adapter_family.clone(),
+                    path_scope: target.path_scope.clone(),
+                    capability_ceiling: target.capabilities.clone(),
+                    participation: if target.capabilities.propose {
+                        TargetParticipationMode::Writable
+                    } else {
+                        TargetParticipationMode::ReadOnly
+                    },
+                })
+                .collect(),
+            created_position: 0,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        })?;
+        self.register_engagement(chat_id.clone(), storage_id, eng);
         self.refresh_chat_discipline_mount(&chat_id)?;
-        self.record_target_act(
-            Some(&chat_id),
-            &target_id,
-            crate::target_adapter::TargetActKind::Read,
-            None,
-            Vec::new(),
-            None,
-            crate::target_adapter::TargetActStatus::Completed,
-            None,
-        )?;
+        for target in &targets {
+            self.record_target_act(
+                Some(&chat_id),
+                &target.id,
+                crate::target_adapter::TargetActKind::Read,
+                None,
+                Vec::new(),
+                None,
+                crate::target_adapter::TargetActStatus::Completed,
+                None,
+            )?;
+        }
         Ok(serde_json::json!({
             "id": chat_id,
             "title": title,
             "kind": kind,
-            "target_id": target_id,
+            // Compatibility-only singular projection.  A multi-target chat has
+            // no distinguished or "primary" target.
+            "target_id": (targets.len() == 1).then_some(target_id),
+            "target_ids": targets.iter().map(|target| target.id.clone()).collect::<Vec<_>>(),
             "basis": basis,
+        }))
+    }
+
+    /// Admit a new immutable target-set revision between settled turns.  This
+    /// changes only the chat's sparse view; WhippleScript branch membership and
+    /// named-workstream topology are deliberately untouched.
+    pub(crate) fn revise_chat_targets(
+        &mut self,
+        chat_id: &str,
+        requested: &[(String, TargetParticipationMode)],
+    ) -> Result<serde_json::Value, String> {
+        if requested.is_empty() {
+            return Err("a chat target set cannot be empty".to_owned());
+        }
+        if crate::engine::turn_is_live(chat_id) {
+            return Err("target set cannot change while a turn is live".to_owned());
+        }
+        if self.engagement_rehome_blocked(chat_id) {
+            return Err("settle or discard the current candidate before changing targets".into());
+        }
+        let chat = self
+            .library
+            .chats
+            .get(chat_id)
+            .cloned()
+            .ok_or_else(|| "no such chat".to_owned())?;
+        let instance = self
+            .library
+            .instances
+            .get(&chat.instance_id)
+            .cloned()
+            .ok_or_else(|| "chat placement is unavailable".to_owned())?;
+        if instance.kind != InstanceKind::Using {
+            return Err("an edit chat keeps its one managed authoring target".to_owned());
+        }
+        let project_id = instance
+            .project_id
+            .as_deref()
+            .ok_or_else(|| "work chat has no project".to_owned())?;
+        let mut seen = BTreeSet::new();
+        let mut targets = Vec::with_capacity(requested.len());
+        for (target_id, participation) in requested {
+            if !seen.insert(target_id.clone()) {
+                return Err(format!("target set repeats stable target id {target_id}"));
+            }
+            let target = self.resolve_placement_target(&chat.instance_id, Some(target_id))?;
+            if !target.capabilities.read {
+                return Err(format!("target {} does not grant read", target.id));
+            }
+            if *participation == TargetParticipationMode::Writable && !target.capabilities.propose {
+                return Err(format!("target {} does not grant propose", target.id));
+            }
+            targets.push((target, *participation));
+        }
+        for (index, (left, _)) in targets.iter().enumerate() {
+            for (right, _) in targets.iter().skip(index + 1) {
+                if target_scopes_physically_overlap(
+                    &self.targets_dir(),
+                    left,
+                    &left.path_scope,
+                    right,
+                    &right.path_scope,
+                )? {
+                    return Err(format!(
+                        "targets {} and {} have overlapping physical scopes",
+                        left.id, right.id
+                    ));
+                }
+            }
+        }
+        for (target, _) in &targets {
+            self.ensure_collaboration_target_partition(project_id, &target.id)?;
+        }
+        let roots = targets
+            .iter()
+            .map(|(target, _)| {
+                crate::library::target_id_path_v1(&target.id)
+                    .map(|encoded| format!("targets/{encoded}"))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        self.engagements
+            .get_mut(chat_id)
+            .ok_or_else(|| "chat collaboration branch is unavailable".to_owned())?
+            .replace_sparse_roots(&roots)
+            .map_err(|error| error.to_string())?;
+
+        let revision = self
+            .library
+            .current_target_set(chat_id)
+            .map_or(0, |current| current.revision + 1);
+        let members = targets
+            .iter()
+            .map(|(target, participation)| ChatTargetSetMemberRecord {
+                target_id: target.id.clone(),
+                adapter_family: target.adapter_family.clone(),
+                path_scope: target.path_scope.clone(),
+                capability_ceiling: target.capabilities.clone(),
+                participation: *participation,
+            })
+            .collect::<Vec<_>>();
+        self.write_chat_target_set_record(ChatTargetSetRevisionRecord {
+            chat_id: chat_id.to_owned(),
+            revision,
+            members,
+            created_position: 0,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        })?;
+        if let [(target, _)] = targets.as_slice() {
+            self.write_chat_target_record(ChatTargetBindingRecord {
+                chat_id: chat_id.to_owned(),
+                op: RecordOp::Upsert,
+                target_id: target.id.clone(),
+                basis: target
+                    .current_basis
+                    .clone()
+                    .ok_or_else(|| "selected target has no exact basis".to_owned())?,
+                path_scope: target.path_scope.clone(),
+                capabilities: target.capabilities.clone(),
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+            });
+        } else if let Some(binding) = self.library.chat_targets.get(chat_id).cloned() {
+            self.write_chat_target_record(ChatTargetBindingRecord {
+                op: RecordOp::Tombstone,
+                ..binding
+            });
+        }
+        self.refresh_chat_discipline_mount(chat_id)?;
+        Ok(serde_json::json!({
+            "chat_id": chat_id,
+            "target_set_revision": revision,
+            "targets": targets.iter().map(|(target, participation)| serde_json::json!({
+                "target_id": target.id,
+                "participation": participation,
+            })).collect::<Vec<_>>(),
         }))
     }
 
@@ -2820,6 +4636,45 @@ impl Workbench {
                     ..target
                 });
             }
+        }
+        let project_workstreams = self
+            .library
+            .workstream_roots
+            .values()
+            .filter(|root| root.project_id == id)
+            .map(|root| root.workstream_id.clone())
+            .collect::<Vec<_>>();
+        for workstream_id in project_workstreams {
+            if let Some(existing) = self.library.workstreams.get(&workstream_id).cloned() {
+                self.write_workstream_record(WorkstreamRecord {
+                    op: RecordOp::Tombstone,
+                    ..existing
+                });
+            }
+            if let Some(existing) = self.library.workstream_roots.get(&workstream_id).cloned() {
+                self.write_workstream_root_record(WorkstreamRootRecord {
+                    op: RecordOp::Tombstone,
+                    ..existing
+                });
+            }
+        }
+        if let Some(workspace) = self
+            .library
+            .project_collaboration_workspaces
+            .get(id)
+            .cloned()
+        {
+            let workspace_id = workspace.workspace_id.clone();
+            self.write_project_collaboration_workspace_record(
+                ProjectCollaborationWorkspaceRecord {
+                    op: RecordOp::Tombstone,
+                    ..workspace
+                },
+            );
+            self.collaboration_workspaces.remove(&workspace_id);
+            let _ = std::fs::remove_dir_all(
+                collaboration_workspaces_dir(&self.targets_dir()).join(&workspace_id),
+            );
         }
         self.write_project_record(ProjectRecord {
             op: RecordOp::Tombstone,
@@ -3565,17 +5420,56 @@ impl Workbench {
             .map_err(CreateArchetypeChatError::Create)
     }
 
-    pub(crate) fn fork_chat(&mut self, id: &str) -> Result<ForkedChat, ForkChatError> {
-        self.fork_chat_from(id, None)
+    fn compensate_failed_chat_fork(
+        &mut self,
+        storage_id: &str,
+        chat_id: &str,
+        continuity: &gaugedesk_harness::HarnessContinuitySpec,
+    ) {
+        if let Some(harness) = self.sessions.remove(chat_id) {
+            crate::workbench_state::shutdown_shared_harness(harness);
+        }
+        self.engagements.remove(chat_id);
+        self.engagement_index.remove(chat_id);
+        if let Some(workspace) = self.workspace_by_storage_id(storage_id) {
+            let _ = workspace.leave_engagement_workstream(chat_id);
+            let _ = workspace.remove_engagement(chat_id);
+            let _ = workspace.purge_unreachable_objects();
+        }
+        if let Ok(factory) = self.whip_harness_factory() {
+            let _ = factory.discard_continuity(continuity);
+        }
+        if let Some(existing) = self.library.chats.get(chat_id).cloned() {
+            self.write_chat_record(ChatRecord {
+                op: RecordOp::Tombstone,
+                ..existing
+            });
+        }
+        if let Some(existing) = self.library.chat_targets.get(chat_id).cloned() {
+            self.write_chat_target_record(ChatTargetBindingRecord {
+                op: RecordOp::Tombstone,
+                ..existing
+            });
+        }
+        self.crypto_erase_content(chat_id);
     }
 
-    pub(crate) fn fork_chat_at(
+    pub(crate) fn fork_chat_with_destination(
+        &mut self,
+        id: &str,
+        destination: ForkDestination,
+    ) -> Result<ForkedChat, ForkChatError> {
+        self.fork_chat_from(id, None, destination)
+    }
+
+    pub(crate) fn fork_chat_at_with_destination(
         &mut self,
         id: &str,
         entry_id: i64,
+        destination: ForkDestination,
     ) -> Result<ForkedChat, ForkChatError> {
         let point = self.resolve_fork_point(id, entry_id)?;
-        self.fork_chat_from(id, Some(point))
+        self.fork_chat_from(id, Some(point), destination)
     }
 
     fn resolve_fork_point(
@@ -3583,6 +5477,15 @@ impl Workbench {
         id: &str,
         entry_id: i64,
     ) -> Result<ResolvedForkPoint, ForkChatError> {
+        let exact_snapshot = |snapshot: crate::engine::TurnForkSnapshot| {
+            if !snapshot.visible_settlement_handles.is_empty()
+                && snapshot.visible_settlements.is_empty()
+            {
+                Err(ForkChatError::PointNotForkable)
+            } else {
+                Ok(snapshot)
+            }
+        };
         let boundaries = self
             .store
             .records(id, crate::engine::TURN_BOUNDARY_KIND)
@@ -3591,53 +5494,246 @@ impl Workbench {
             let boundary: crate::engine::TurnBoundaryRecord = serde_json::from_str(&payload)
                 .map_err(|error| ForkChatError::Continuity(error.to_string()))?;
             if boundary.user_entry_id == entry_id {
+                let fork_snapshot = exact_snapshot(
+                    boundary
+                        .fork_snapshot
+                        .ok_or(ForkChatError::PointNotForkable)?,
+                )?;
                 return Ok(ResolvedForkPoint {
                     entry_id,
                     inherited_cut: entry_id - 1,
                     workspace_cut: boundary.before_workspace_cut,
                     runtime_position: boundary.runtime_before,
                     reads: boundary.reads_before,
+                    taint_evidence_digest: fork_snapshot.before_taint_evidence_digest.clone(),
+                    fork_snapshot,
                 });
             }
             if boundary.assistant_entry_id == entry_id {
+                let fork_snapshot = exact_snapshot(
+                    boundary
+                        .fork_snapshot
+                        .ok_or(ForkChatError::PointNotForkable)?,
+                )?;
                 return Ok(ResolvedForkPoint {
                     entry_id,
                     inherited_cut: entry_id,
                     workspace_cut: boundary.after_workspace_cut,
                     runtime_position: boundary.runtime_after,
                     reads: boundary.reads_after,
+                    taint_evidence_digest: fork_snapshot.after_taint_evidence_digest.clone(),
+                    fork_snapshot,
                 });
             }
         }
         Err(ForkChatError::PointNotForkable)
     }
 
+    fn resolve_fork_destination(
+        &self,
+        instance_kind: InstanceKind,
+        storage_id: &str,
+        snapshot: Option<&crate::engine::TurnForkSnapshot>,
+        destination: &ForkDestination,
+    ) -> Result<Option<ResolvedForkDestination>, ForkChatError> {
+        if instance_kind != InstanceKind::Using {
+            return match destination {
+                ForkDestination::Inherit => Ok(None),
+                _ => Err(ForkChatError::Continuity(
+                    "explicit project destinations require a work chat".to_owned(),
+                )),
+            };
+        }
+        let snapshot = snapshot.ok_or(ForkChatError::SourceNotLive)?;
+        if snapshot.collaboration_workspace_id != storage_id {
+            return Err(ForkChatError::Continuity(
+                "historical fork point belongs to a different collaboration workspace".to_owned(),
+            ));
+        }
+        let workspace = self
+            .workspace_by_storage_id(storage_id)
+            .ok_or(ForkChatError::InstanceNotOpen)?;
+        let active_workstream = |workstream_id: &str,
+                                 inherited: bool|
+         -> Result<ResolvedForkDestination, ForkChatError> {
+            if workstream_id.is_empty() {
+                return Err(ForkChatError::Continuity(
+                    "fork destination workstream id is empty".to_owned(),
+                ));
+            }
+            let row = workspace
+                .workstream(workstream_id)
+                .map_err(|error| ForkChatError::Continuity(error.to_string()))?
+                .ok_or_else(|| {
+                    ForkChatError::Continuity(
+                        "fork destination workstream is unavailable".to_owned(),
+                    )
+                })?;
+            if row.status == whipplescript_store::workstreams::StreamStatus::Archived {
+                return if inherited {
+                    Err(ForkChatError::HistoricalHomeClosed)
+                } else {
+                    Err(ForkChatError::Continuity(
+                        "fork destination workstream is archived".to_owned(),
+                    ))
+                };
+            }
+            if row.status != whipplescript_store::workstreams::StreamStatus::Active {
+                return Err(ForkChatError::Continuity(
+                    "fork destination workstream is not active".to_owned(),
+                ));
+            }
+            Ok(ResolvedForkDestination {
+                line_ref: row.line_branch_id,
+                workstream_id: Some(workstream_id.to_owned()),
+            })
+        };
+        match destination {
+            ForkDestination::Inherit => match snapshot.historical_home.stream_id.as_deref() {
+                Some(workstream_id) => active_workstream(workstream_id, true).map(Some),
+                None => Ok(Some(ResolvedForkDestination {
+                    line_ref: workspace.mainline().to_owned(),
+                    workstream_id: None,
+                })),
+            },
+            ForkDestination::Main => Ok(Some(ResolvedForkDestination {
+                line_ref: workspace.mainline().to_owned(),
+                workstream_id: None,
+            })),
+            ForkDestination::Workstream { workstream_id } => {
+                active_workstream(workstream_id, false).map(Some)
+            }
+        }
+    }
+
     fn fork_chat_from(
         &mut self,
         id: &str,
         point: Option<ResolvedForkPoint>,
+        destination: ForkDestination,
     ) -> Result<ForkedChat, ForkChatError> {
         let Some(src_chat) = self.library.chats.get(id).cloned() else {
             return Err(ForkChatError::NotFound);
         };
-        let source_binding = self
+        let runtime_placement_id = self.library_placement_of_chat(id);
+        let inst_id = src_chat.instance_id.clone();
+        let source_binding = self.library.chat_targets.get(id).cloned();
+        let instance = self
             .library
-            .chat_targets
+            .instances
+            .get(&inst_id)
+            .cloned()
+            .ok_or(ForkChatError::SourceNotLive)?;
+        let storage_id = self
+            .engagement_index
             .get(id)
             .cloned()
             .ok_or(ForkChatError::SourceNotLive)?;
-        let source_target_record = self
-            .library
-            .work_targets
-            .get(&source_binding.target_id)
-            .cloned()
+        let current_snapshot = if point.is_none() && instance.kind == InstanceKind::Using {
+            let policy = self.latest_whipple_policy(id).ok().flatten();
+            self.turn_fork_snapshot(
+                id,
+                policy.as_ref().map(|(epoch, _)| *epoch),
+                policy.as_ref().map(|(_, envelope)| envelope.as_str()),
+                None,
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let historical_snapshot = point
+            .as_ref()
+            .map(|point| point.fork_snapshot.clone())
+            .or(current_snapshot);
+        let members = historical_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .targets
+                    .iter()
+                    .map(|target| ChatTargetSetMemberRecord {
+                        target_id: target.target_id.clone(),
+                        adapter_family: target.adapter_family.clone(),
+                        path_scope: target.path_scope.clone(),
+                        capability_ceiling: target.capabilities.clone(),
+                        participation: target.participation,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                self.library
+                    .current_target_set(id)
+                    .map(|set| set.members.clone())
+            })
+            .or_else(|| {
+                source_binding.as_ref().and_then(|binding| {
+                    self.library
+                        .work_targets
+                        .get(&binding.target_id)
+                        .map(|target| {
+                            vec![ChatTargetSetMemberRecord {
+                                target_id: binding.target_id.clone(),
+                                adapter_family: target.adapter_family.clone(),
+                                path_scope: binding.path_scope.clone(),
+                                capability_ceiling: binding.capabilities.clone(),
+                                participation: if binding.capabilities.propose {
+                                    TargetParticipationMode::Writable
+                                } else {
+                                    TargetParticipationMode::ReadOnly
+                                },
+                            }]
+                        })
+                })
+            })
             .ok_or(ForkChatError::SourceNotLive)?;
-        if source_target_record.kind != WorkTargetKind::Managed {
-            return Err(ForkChatError::InstanceNotOpen);
-        }
-        let storage_target_id = source_target_record.id;
-        let runtime_placement_id = self.library_placement_of_chat(id);
-        let inst_id = src_chat.instance_id.clone();
+        let member_bases = members
+            .iter()
+            .map(|member| {
+                let basis = historical_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .targets
+                            .iter()
+                            .find(|target| target.target_id == member.target_id)
+                    })
+                    .map(|target| target.native_basis.clone())
+                    .or_else(|| {
+                        self.library
+                            .chat_target_basis(id, &member.target_id)
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| {
+                        self.library
+                            .chat_targets
+                            .get(id)
+                            .filter(|binding| binding.target_id == member.target_id)
+                            .map(|binding| binding.basis.clone())
+                    })
+                    .or_else(|| {
+                        self.library
+                            .work_targets
+                            .get(&member.target_id)
+                            .and_then(|target| target.current_basis.clone())
+                    })
+                    .ok_or(ForkChatError::SourceNotLive)?;
+                Ok((member.target_id.clone(), basis))
+            })
+            .collect::<Result<BTreeMap<_, _>, ForkChatError>>()?;
+        let singular_basis = members
+            .first()
+            .filter(|_| members.len() == 1)
+            .and_then(|member| member_bases.get(&member.target_id).cloned());
+        // Resolve current topology before creating either the collaboration
+        // branch or runtime fork. Historical home is provenance; current Home
+        // decides whether and where the child may join.
+        let resolved_destination = self.resolve_fork_destination(
+            instance.kind,
+            &storage_id,
+            historical_snapshot.as_ref(),
+            &destination,
+        )?;
         let (src_path, source_branch, source_target, current_cut) = {
             let Some(src_eng) = self.engagements.get(id) else {
                 return Err(ForkChatError::SourceNotLive);
@@ -3657,20 +5753,38 @@ impl Workbench {
             .map(|point| point.workspace_cut.as_str())
             .unwrap_or(current_cut.as_str());
         let new_id = library::gen_id("chat");
-        let (new_eng, new_path, mode) = {
-            let Some(inst) = self.targets.get(&storage_target_id) else {
+        let (mut new_eng, new_path, mode) = {
+            let Some(inst) = self.workspace_by_storage_id(&storage_id) else {
                 return Err(ForkChatError::InstanceNotOpen);
             };
-            let eng = inst
-                .fork_engagement_at(&new_id, &source_branch, &source_target, workspace_cut)
-                .map_err(|error| ForkChatError::Create(error.to_string()))?;
+            let sparse_roots = (instance.kind == InstanceKind::Using
+                && historical_snapshot.is_some())
+            .then(|| {
+                members
+                    .iter()
+                    .map(|member| {
+                        crate::library::target_id_path_v1(&member.target_id)
+                            .map(|encoded| format!("targets/{encoded}"))
+                    })
+                    .collect::<Result<BTreeSet<_>, _>>()
+            })
+            .transpose()
+            .map_err(ForkChatError::Create)?;
+            let eng = match &sparse_roots {
+                Some(roots) => inst.fork_engagement_subset_at(
+                    &new_id,
+                    &source_branch,
+                    &source_target,
+                    workspace_cut,
+                    roots,
+                ),
+                None => {
+                    inst.fork_engagement_at(&new_id, &source_branch, &source_target, workspace_cut)
+                }
+            }
+            .map_err(|error| ForkChatError::Create(error.to_string()))?;
             let path = eng.path().to_path_buf();
-            let mode = self
-                .library
-                .instances
-                .get(&inst_id)
-                .map(|instance| instance.kind.chat_mode())
-                .unwrap_or_default();
+            let mode = instance.kind.chat_mode();
             (eng, path, mode)
         };
         // Continuity belongs to WhippleScript even when the fake is active. A
@@ -3735,11 +5849,48 @@ impl Workbench {
             .and_then(|factory| factory.clone_continuity(&source_continuity, &target_continuity));
         if let Err(error) = continuity {
             drop(new_eng);
-            if let Some(inst) = self.targets.get(&storage_target_id) {
-                let _ = inst.remove_engagement(&new_id);
-            }
+            self.compensate_failed_chat_fork(&storage_id, &new_id, &target_continuity);
             return Err(ForkChatError::Continuity(error.to_string()));
         }
+        // The forked branch stays at the promised historical cut.  Its active
+        // home is admitted separately; changing the topology must not pull the
+        // destination's latest files into this initial materialization.
+        let topology_admission = (|| {
+            let Some(admitted) = &resolved_destination else {
+                return Ok(None);
+            };
+            let workspace = self
+                .workspace_by_storage_id(&storage_id)
+                .ok_or(ForkChatError::InstanceNotOpen)?;
+            if let Some(stream_id) = admitted.workstream_id.as_deref() {
+                match workspace
+                    .transfer_engagement_to_workstream(&new_id, stream_id)
+                    .map_err(|error| ForkChatError::Continuity(error.to_string()))?
+                {
+                    gaugedesk_workspace::WorkstreamTransferOutcome::Joined { .. } => {}
+                    outcome => {
+                        return Err(ForkChatError::Continuity(format!(
+                            "fork destination workstream join refused: {outcome:?}"
+                        )));
+                    }
+                }
+            }
+            new_eng
+                .set_target(&admitted.line_ref)
+                .map_err(|error| ForkChatError::Continuity(error.to_string()))?;
+            workspace
+                .engagement_home_receipt(&new_id)
+                .map(Some)
+                .map_err(|error| ForkChatError::Continuity(error.to_string()))
+        })();
+        let admitted_home = match topology_admission {
+            Ok(home) => home,
+            Err(error) => {
+                drop(new_eng);
+                self.compensate_failed_chat_fork(&storage_id, &new_id, &target_continuity);
+                return Err(error);
+            }
+        };
         let source_events = self
             .store
             .events(id)
@@ -3748,29 +5899,61 @@ impl Workbench {
             .as_ref()
             .map(|point| point.entry_id)
             .unwrap_or(i64::MAX);
-        for (_, kind, payload) in source_events
-            .iter()
-            .filter(|(position, kind, _)| *position <= through && kind == "resource")
-        {
-            self.store
-                .append_record(&new_id, kind, payload)
-                .map_err(|error| ForkChatError::Continuity(format!("{error:?}")))?;
-        }
-        let reads = match &point {
-            Some(point) => point.reads.clone(),
-            None => crate::resource_store::engagement_reads(&self.store, id)
-                .map_err(|error| ForkChatError::Continuity(format!("{error:?}")))?
-                .items()
+        let inherited_records = (|| {
+            let mut records = Vec::<(String, String, String)>::new();
+            for (_, kind, payload) in source_events
                 .iter()
-                .cloned()
-                .collect(),
-        };
-        for read in reads {
+                .filter(|(position, kind, _)| *position <= through && kind == "resource")
+            {
+                records.push((new_id.clone(), kind.clone(), payload.clone()));
+            }
+            let reads = match &point {
+                Some(point) => point.reads.clone(),
+                None => crate::resource_store::engagement_reads(&self.store, id)
+                    .map_err(|error| ForkChatError::Continuity(format!("{error:?}")))?
+                    .items()
+                    .iter()
+                    .cloned()
+                    .collect(),
+            };
+            for read in reads {
+                records.push((new_id.clone(), "read".to_owned(), read));
+            }
+            if let (Some(snapshot), Some(admitted_home)) =
+                (historical_snapshot.as_ref(), admitted_home.as_ref())
+            {
+                let admission = ChatForkAdmissionRecord {
+                    schema: "gaugedesk.chat-fork-admission.v1".to_owned(),
+                    source_chat_id: id.to_owned(),
+                    source_entry_id: point.as_ref().map(|point| point.entry_id),
+                    historical_home: snapshot.historical_home.clone(),
+                    requested_destination: destination.clone(),
+                    admitted_home: admitted_home.clone(),
+                    taint_evidence_digest: point
+                        .as_ref()
+                        .map(|point| point.taint_evidence_digest.clone())
+                        .unwrap_or_else(|| snapshot.after_taint_evidence_digest.clone()),
+                    visible_settlements: snapshot.visible_settlements.clone(),
+                };
+                let payload = serde_json::to_string(&admission)
+                    .map_err(|error| ForkChatError::Continuity(error.to_string()))?;
+                records.push((new_id.clone(), CHAT_FORK_ADMISSION_KIND.to_owned(), payload));
+            }
+            let borrowed = records
+                .iter()
+                .map(|(scope, kind, payload)| (scope.as_str(), kind.as_str(), payload.as_str()))
+                .collect::<Vec<_>>();
             self.store
-                .append_record(&new_id, "read", &read)
+                .append_records_atomically(&borrowed)
                 .map_err(|error| ForkChatError::Continuity(format!("{error:?}")))?;
+            Ok(())
+        })();
+        if let Err(error) = inherited_records {
+            drop(new_eng);
+            self.compensate_failed_chat_fork(&storage_id, &new_id, &target_continuity);
+            return Err(error);
         }
-        self.register_engagement(new_id.clone(), storage_target_id, new_eng);
+        self.register_engagement(new_id.clone(), storage_id.clone(), new_eng);
         let title = format!("{} (fork)", src_chat.title);
         // ADR 0141: the durable log forks by lineage, not by copy. The cut is
         // the inclusive bound on the parent-scope records this child inherits —
@@ -3794,32 +5977,69 @@ impl Workbench {
             forked_from_entry: point.as_ref().map(|point| point.entry_id),
             forked_from_cut: Some(inherited_cut),
         };
-        let pos = self
-            .store
-            .append_record(LIBRARY_SCOPE, "chat", &serde_json::to_string(&rec).unwrap())
-            .unwrap_or(0);
+        let pos = match self.store.append_record(
+            LIBRARY_SCOPE,
+            "chat",
+            &serde_json::to_string(&rec).unwrap(),
+        ) {
+            Ok(pos) => pos,
+            Err(error) => {
+                self.compensate_failed_chat_fork(&storage_id, &new_id, &target_continuity);
+                return Err(ForkChatError::Continuity(format!("{error:?}")));
+            }
+        };
         self.library.apply_chat(ChatRecord {
             created_position: pos,
             ..rec
         });
-        self.write_chat_target_record(ChatTargetBindingRecord {
-            schema: crate::library::LIBRARY_RECORD_SCHEMA,
-            extra: Default::default(),
+        // Keep the former singular record strictly as a one-member wire/storage
+        // compatibility projection.  A multi-target child has no primary.
+        if let ([member], Some(basis)) = (members.as_slice(), singular_basis) {
+            self.write_chat_target_record(ChatTargetBindingRecord {
+                schema: crate::library::LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+                chat_id: new_id.clone(),
+                op: RecordOp::Upsert,
+                target_id: member.target_id.clone(),
+                basis,
+                path_scope: member.path_scope.clone(),
+                capabilities: member.capability_ceiling.clone(),
+            });
+        }
+        if let Err(error) = self.write_chat_target_set_record(ChatTargetSetRevisionRecord {
             chat_id: new_id.clone(),
-            op: RecordOp::Upsert,
-            target_id: source_binding.target_id,
-            basis: workspace_cut.to_owned(),
-            path_scope: source_binding.path_scope,
-            capabilities: source_binding.capabilities,
-        });
-        self.refresh_chat_discipline_mount(&new_id)
-            .map_err(ForkChatError::Create)?;
+            revision: 0,
+            members,
+            created_position: 0,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        }) {
+            self.compensate_failed_chat_fork(&storage_id, &new_id, &target_continuity);
+            return Err(ForkChatError::Create(error));
+        }
+        for (target_id, basis) in member_bases {
+            if let Err(error) = self.write_chat_target_basis_record(ChatTargetBasisRecord {
+                chat_id: new_id.clone(),
+                target_id,
+                basis,
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+            }) {
+                self.compensate_failed_chat_fork(&storage_id, &new_id, &target_continuity);
+                return Err(ForkChatError::Create(error));
+            }
+        }
+        if let Err(error) = self.refresh_chat_discipline_mount(&new_id) {
+            self.compensate_failed_chat_fork(&storage_id, &new_id, &target_continuity);
+            return Err(ForkChatError::Create(error));
+        }
         self.notify_library_changed("chat", &new_id, "upsert");
         Ok(ForkedChat {
             id: new_id,
             title,
             forked_from: id.to_string(),
             forked_from_entry: point.map(|point| point.entry_id),
+            admitted_home,
         })
     }
 
@@ -3951,27 +6171,100 @@ impl Workbench {
             .unwrap_or("work");
         let conflict = self.library_chat_conflicted(&chat.id, rules);
         let rehome_blocked = self.library_chat_rehome_blocked(&chat.id);
-        let binding = self
+        let binding = self.library.chat_targets.get(&chat.id);
+        let current_set = self.library.current_target_set(&chat.id);
+        let (target_set_revision, target_set_members) = match (current_set, binding) {
+            (Some(set), _) => (set.revision, set.members.clone()),
+            (None, Some(binding)) => {
+                let target = self
+                    .library
+                    .work_targets
+                    .get(&binding.target_id)
+                    .expect("validated chat binding names a target");
+                (
+                    0,
+                    vec![ChatTargetSetMemberRecord {
+                        target_id: binding.target_id.clone(),
+                        adapter_family: target.adapter_family.clone(),
+                        path_scope: binding.path_scope.clone(),
+                        capability_ceiling: binding.capabilities.clone(),
+                        participation: if binding.capabilities.propose {
+                            TargetParticipationMode::Writable
+                        } else {
+                            TargetParticipationMode::ReadOnly
+                        },
+                    }],
+                )
+            }
+            (None, None) => panic!("validated chat has a target set"),
+        };
+        let singular = (target_set_members.len() == 1).then(|| {
+            self.library
+                .work_targets
+                .get(&target_set_members[0].target_id)
+                .expect("validated target-set member names a target")
+        });
+        let collaboration_workspace_id = self
             .library
-            .chat_targets
-            .get(&chat.id)
-            .expect("validated chat has a target binding");
-        let target = self
-            .library
-            .work_targets
-            .get(&binding.target_id)
-            .expect("validated chat binding names a target");
-        let workspace_root = format!(
-            "{}::{}::{}",
-            chat.instance_id, binding.target_id, target.adapter_family
-        );
+            .project_of_chat(&chat.id)
+            .and_then(|project_id| {
+                self.library
+                    .project_collaboration_workspaces
+                    .get(project_id)
+            })
+            .map(|workspace| workspace.workspace_id.clone());
+        let workspace_root = collaboration_workspace_id.clone().unwrap_or_else(|| {
+            let target = singular.expect("edit chat has one target");
+            format!(
+                "{}::{}::{}",
+                chat.instance_id, target.id, target.adapter_family
+            )
+        });
         let candidate_revision = self
             .engagements
             .get(&chat.id)
             .and_then(|engagement| engagement.current_cut().ok())
             .flatten()
-            .unwrap_or_else(|| binding.basis.clone());
+            .or_else(|| binding.map(|binding| binding.basis.clone()))
+            .unwrap_or_default();
         let available_acts = self.available_target_acts(&chat.id);
+        let target_members = target_set_members
+            .iter()
+            .map(|member| {
+                let member_target = self
+                    .library
+                    .work_targets
+                    .get(&member.target_id)
+                    .expect("validated target-set member names a target");
+                let basis = self
+                    .library
+                    .chat_target_basis(&chat.id, &member.target_id)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        binding
+                            .filter(|binding| member.target_id == binding.target_id)
+                            .map(|binding| binding.basis.clone())
+                            .or_else(|| member_target.current_basis.clone())
+                    })
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "target_id": member.target_id,
+                    "root": format!(
+                        "targets/{}",
+                        crate::library::target_id_path_v1(&member.target_id)
+                            .expect("validated stable target id has a path encoding")
+                    ),
+                    "name": member_target.name,
+                    "kind": member_target.kind,
+                    "adapter": member_target.adapter,
+                    "adapter_family": member.adapter_family,
+                    "basis": basis,
+                    "path_scope": member.path_scope,
+                    "capability_ceiling": member.capability_ceiling,
+                    "participation": member.participation,
+                })
+            })
+            .collect::<Vec<_>>();
         serde_json::json!({
             "id": chat.id,
             "title": chat.title,
@@ -3979,14 +6272,17 @@ impl Workbench {
             "forked_from": chat.forked_from,
             "placement": chat.instance_id,
             "workspace_root": workspace_root,
-            "target_id": binding.target_id,
-            "target_basis": binding.basis,
-            "target_kind": target.kind,
-            "target_adapter": target.adapter,
-            "target_path_scope": binding.path_scope,
-            "target_capabilities": binding.capabilities,
+            "target_id": singular.map(|target| target.id.clone()),
+            "target_basis": binding.map(|binding| binding.basis.clone()),
+            "target_kind": singular.map(|target| target.kind),
+            "target_adapter": singular.map(|target| target.adapter.clone()),
+            "target_path_scope": binding.map(|binding| binding.path_scope.clone()),
+            "target_capabilities": binding.map(|binding| binding.capabilities.clone()),
             "candidate_revision": candidate_revision,
             "available_acts": available_acts,
+            "target_set_revision": target_set_revision,
+            "targets": target_members,
+            "collaboration_workspace_id": collaboration_workspace_id,
             "workstream": chat_ws.get(&chat.id),
             "conflict": conflict,
             "rehome_blocked": rehome_blocked,
@@ -4034,6 +6330,24 @@ impl Workbench {
         );
         let mut chat_ws: std::collections::BTreeMap<String, String> = Default::default();
         for workstream in lib.workstreams.values() {
+            if let Some(root) = lib
+                .workstream_roots
+                .get(&workstream.id)
+                .filter(|root| !root.project_id.is_empty())
+            {
+                let active = self
+                    .workspace_by_storage_id(&root.workspace_id)
+                    .and_then(|workspace| workspace.workstream(&workstream.id).ok().flatten())
+                    .is_some_and(|row| {
+                        row.status == whipplescript_store::workstreams::StreamStatus::Active
+                    });
+                if active {
+                    for member in self.workstream_members(&workstream.id) {
+                        chat_ws.insert(member, workstream.id.clone());
+                    }
+                }
+                continue;
+            }
             if let Ok(state) = self.store_ref().fold::<WorkstreamState>(&workstream.id) {
                 if state.phase != WorkstreamPhase::Active {
                     continue;
@@ -4062,7 +6376,7 @@ impl Workbench {
                     "forked_from": agent.forked_from,
                     "forked_from_name": agent.forked_from.as_ref().and_then(|src| lib.agents.get(src).map(|source| source.name.clone())),
                     "chats": lib.chats_in(&agent.instance_id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules)).collect::<Vec<_>>(),
-                    "workstreams": lib.workstreams_in(&agent.instance_id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
+                    "workstreams": self.library_workstreams_in(&agent.instance_id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -4129,7 +6443,7 @@ impl Workbench {
                             })).collect::<Vec<_>>(),
                             "target_ids": lib.placement_targets.get(&instance.id).map(|targets| targets.target_ids.clone()).unwrap_or_default(),
                             "chats": lib.chats_in(&instance.id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules)).collect::<Vec<_>>(),
-                            "workstreams": lib.workstreams_in(&instance.id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
+                            "workstreams": self.library_workstreams_in(&instance.id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
                         })
                     })
                     .collect();
@@ -4165,46 +6479,15 @@ impl Workbench {
                     .and_then(|instance| lib.agents.get(&instance.agent_id))
                     .map(|agent| agent.name.clone())
                     .unwrap_or_default();
-                let kind = inst
-                    .map(|instance| instance.kind.chat_kind())
-                    .unwrap_or("work");
-                let conflict = self.library_chat_conflicted(&chat.id, &rules);
-                let binding = lib
-                    .chat_targets
-                    .get(&chat.id)
-                    .expect("validated chat has a target binding");
-                let target = lib
-                    .work_targets
-                    .get(&binding.target_id)
-                    .expect("validated chat binding names a target");
-                let workspace_root = format!(
-                    "{}::{}::{}",
-                    chat.instance_id, binding.target_id, target.adapter_family
-                );
-                let candidate_revision = self
-                    .engagements
-                    .get(&chat.id)
-                    .and_then(|engagement| engagement.current_cut().ok())
-                    .flatten()
-                    .unwrap_or_else(|| binding.basis.clone());
-                serde_json::json!({
-                    "id": chat.id,
-                    "title": chat.title,
-                    "archetype": archetype_name,
-                    "kind": kind,
-                    "forked_from": chat.forked_from,
-                    "placement": chat.instance_id,
-                    "workspace_root": workspace_root,
-                    "target_id": binding.target_id,
-                    "target_basis": binding.basis,
-                    "target_kind": target.kind,
-                    "target_adapter": target.adapter,
-                    "candidate_revision": candidate_revision,
-                    "available_acts": self.available_target_acts(&chat.id),
-                    "workstream": chat_ws.get(&chat.id),
-                            "conflict": conflict,
-                    "rehome_blocked": self.library_chat_rehome_blocked(&chat.id),
-                })
+                let mut projected = self.library_chat_json(chat, &chat_ws, &rules);
+                projected
+                    .as_object_mut()
+                    .expect("chat projections are objects")
+                    .insert(
+                        "archetype".to_owned(),
+                        serde_json::Value::String(archetype_name),
+                    );
+                projected
             })
             .collect();
 

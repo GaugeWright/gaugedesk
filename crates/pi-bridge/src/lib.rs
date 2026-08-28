@@ -1356,6 +1356,7 @@ mod tests {
                 provider_binding_ref: None,
                 credential_ref: None,
                 placement_ceiling_ref: None,
+                workspace_targets: Vec::new(),
                 runtime_placement_id: None,
                 provider: Some("openai-codex".into()),
                 model: Some("gpt-5.5".into()),
@@ -1462,6 +1463,7 @@ mod tests {
                 provider_binding_ref: None,
                 credential_ref: None,
                 placement_ceiling_ref: None,
+                workspace_targets: Vec::new(),
                 runtime_placement_id: None,
                 // AM-9: the federation peer path keeps provider/model unset so
                 // Pi's own default resolution (the authed OAuth provider) holds.

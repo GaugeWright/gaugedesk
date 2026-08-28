@@ -994,8 +994,8 @@ async fn a_third_root_joins_an_existing_home_without_relocation_or_payload_copy(
 #[tokio::test]
 async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
     let (broker, _relay) = start_broker().await;
-    let (alice, _alice_wb, _ra) = workspace_instance("alice", &broker);
-    let (bob, _bob_wb, _rb) = workspace_instance("bob", &broker);
+    let (alice, alice_wb, alice_root) = workspace_instance("alice", &broker);
+    let (bob, _bob_wb, bob_root) = workspace_instance("bob", &broker);
 
     let (sp, project) = post(&alice, "/projects", json!({ "name": "Relocated line" })).await;
     assert_eq!(sp, StatusCode::CREATED, "project: {project}");
@@ -1012,6 +1012,84 @@ async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
     .await;
     assert_eq!(sb, StatusCode::CREATED, "placement: {placement}");
     let placement_id = placement["instance_id"].as_str().unwrap().to_owned();
+
+    // Give the project a genuinely independent second managed target. A
+    // second chat selects it so both partitions exist in the collaboration
+    // workspace, while the workstream chat below remains scoped to only the
+    // original target.
+    let secondary_target_id = "target-relocation-secondary";
+    {
+        let secondary =
+            Instance::init_at(alice_root.path().join("targets").join(secondary_target_id)).unwrap();
+        secondary
+            .seed_main(&[("secondary.txt", "secondary-only")])
+            .unwrap();
+        let basis = secondary
+            .create_engagement("secondary-basis-probe")
+            .unwrap()
+            .boundary_cut()
+            .unwrap()
+            .to_string();
+        secondary
+            .remove_engagement("secondary-basis-probe")
+            .unwrap();
+        let mut guard = alice_wb.lock().unwrap();
+        guard
+            .store_mut()
+            .append_record(
+                "library",
+                "work_target",
+                &json!({
+                    "id": secondary_target_id,
+                    "op": "upsert",
+                    "name": "Secondary files",
+                    "owner": { "kind": "project", "project_id": project_id },
+                    "kind": "managed",
+                    "authority": "alice",
+                    "parties": ["alice"],
+                    "locator_handle": format!("managed:{secondary_target_id}"),
+                    "adapter": "whipplescript",
+                    "adapter_family": "whipplescript-v1",
+                    "vcs_posture": "managed",
+                    "current_basis": basis,
+                    "path_scope": ["."],
+                    "capabilities": {
+                        "read": true,
+                        "propose": true,
+                        "apply": true,
+                        "publish": false,
+                        "release": false
+                    },
+                    "status": "available"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        guard
+            .store_mut()
+            .append_record(
+                "library",
+                "placement_targets",
+                &json!({
+                    "placement_id": placement_id,
+                    "op": "upsert",
+                    "target_ids": [target_id, secondary_target_id]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        guard.register_target(secondary_target_id, Box::new(secondary));
+        guard.rebuild_library();
+    }
+    let (ss, secondary_chat) = post(
+        &alice,
+        &format!("/projects/{project_id}/placements/{placement_id}/chats"),
+        json!({ "title": "Secondary-only chat", "target_id": secondary_target_id }),
+    )
+    .await;
+    assert_eq!(ss, StatusCode::CREATED, "secondary chat: {secondary_chat}");
+    let secondary_chat_id = secondary_chat["id"].as_str().unwrap().to_owned();
+
     let (sc, chat) = post(
         &alice,
         &format!("/projects/{project_id}/placements/{placement_id}/chats"),
@@ -1071,6 +1149,42 @@ async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
                         .is_some_and(|target| target == format!("target-archetype-{archetype_id}"))
             })),
         "the target received the custom archetype and its authoring target: {workspace}"
+    );
+    let relocated_chat = workspace["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["id"] == chat_id)
+        .expect("relocated workstream chat is projected");
+    let collaboration_workspace_id = relocated_chat["collaboration_workspace_id"]
+        .as_str()
+        .expect("work chat names its project collaboration workspace");
+    let secondary_root = gaugedesk_app::library::target_id_path_v1(secondary_target_id).unwrap();
+    let worktrees = bob_root
+        .path()
+        .join("collaboration-workspaces")
+        .join(collaboration_workspace_id)
+        .join("worktrees");
+    assert!(
+        !worktrees
+            .join(&chat_id)
+            .join("targets")
+            .join(&secondary_root)
+            .exists(),
+        "relocation must not widen the workstream chat to an unrelated target partition"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            worktrees
+                .join(&secondary_chat_id)
+                .join("targets")
+                .join(&secondary_root)
+                .join("secondary.txt")
+        )
+        .ok()
+        .as_deref(),
+        Some("secondary-only"),
+        "the independently scoped chat retained its selected target partition"
     );
     let (sabilities, abilities) = get(&bob, &format!("/placements/{placement_id}/abilities")).await;
     assert_eq!(
@@ -1317,9 +1431,7 @@ async fn a_federated_run_drives_a_named_hub_workstream_chat_with_crossing_attrib
         .unwrap();
     assert!(
         events.iter().any(|(_, kind, payload)| {
-            kind == "workstream"
-                && payload.contains("ContributionAdmitted")
-                && payload.contains("alice")
+            kind == "workstream_contribution" && payload.contains("alice")
         }),
         "workstream contribution is attributed to alice: {events:?}",
     );

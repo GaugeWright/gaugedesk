@@ -17,12 +17,14 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::library::{
-    gen_id, AgentKind, PanelCollectionRecipient, PanelPublicProfile, ProjectRecord, RecordOp,
+    gen_id, AgentKind, PanelCollectionRecipient, PanelPublicProfile,
+    ProjectCollaborationWorkspaceRecord, ProjectRecord, RecordOp, TargetParticipationMode,
+    LIBRARY_RECORD_SCHEMA,
 };
 use crate::library_state::{
     AgentDeleteError, BindPlacementError, BoundaryAcceptError, BoundaryAttestationInput,
     CreateArchetypeChatError, CreateArchetypeError, ForkArchetypeError, ForkChatError,
-    PublishArchetypeError, PullArchetypeError, UpgradePlacementError,
+    ForkDestination, PublishArchetypeError, PullArchetypeError, UpgradePlacementError,
 };
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench, DEFAULT_AGENT};
 use gaugedesk_store::AdmitError;
@@ -43,9 +45,9 @@ fn create_chat_in(
     wb: &mut Workbench,
     inst_id: &str,
     title: &str,
-    target_id: Option<&str>,
+    target_ids: &[String],
 ) -> Result<serde_json::Value, String> {
-    wb.create_chat_in_instance_on_target(inst_id, title, target_id)
+    wb.create_chat_in_instance_on_targets(inst_id, title, target_ids)
 }
 
 // ---- GET /workspace ------------------------------------------------------
@@ -200,7 +202,14 @@ pub fn workspace_delta_value(
             "chat" => has_id(value),
             "placement" => value.get("placement").and_then(|v| v.as_str()) == Some(id),
             "workstream" => value.get("workstream").and_then(|v| v.as_str()) == Some(id),
-            "work_target" => value.get("target_id").and_then(|v| v.as_str()) == Some(id),
+            "work_target" => value
+                .get("targets")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|targets| {
+                    targets.iter().any(|target| {
+                        target.get("target_id").and_then(|value| value.as_str()) == Some(id)
+                    })
+                }),
             _ => false,
         })
         .cloned()
@@ -209,8 +218,6 @@ pub fn workspace_delta_value(
         .iter()
         .filter(|value| {
             (record == "workstream" && has_id(value))
-                || (record == "work_target"
-                    && value.get("target_id").and_then(|v| v.as_str()) == Some(id))
                 || (record == "chat"
                     && value
                         .get("members")
@@ -732,6 +739,25 @@ pub async fn create_project(
             deployment_mode: None,
         },
     );
+    wb.write_project_collaboration_workspace_record(ProjectCollaborationWorkspaceRecord {
+        project_id: id.clone(),
+        workspace_id: format!("project-workspace-{id}"),
+        home_id: home_id.clone(),
+        substrate: "whipplescript".to_owned(),
+        host_contract_revision: crate::workstream_host_contract::REVISION.to_owned(),
+        host_contract_digest: crate::workstream_host_contract::DIGEST.to_owned(),
+        op: RecordOp::Upsert,
+        schema: LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+    });
+    if let Err(error) = wb.ensure_project_collaboration_workspace(&id) {
+        wb.delete_project_cascade(&id);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+            .into_response();
+    }
     let target_id = match wb.create_managed_project_target(&id, format!("{} files", body.name)) {
         Ok(target_id) => target_id,
         Err(error) => {
@@ -1040,6 +1066,26 @@ pub struct CreateChat {
     /// managed authoring target.
     #[serde(default)]
     pub target_id: Option<String>,
+    /// Canonical multi-target input. Compatibility callers may send exactly
+    /// one `target_id`; sending both forms is refused.
+    #[serde(default)]
+    pub target_ids: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+pub struct ReviseChatTargets {
+    pub targets: Vec<RevisedChatTarget>,
+}
+
+#[derive(Deserialize)]
+pub struct RevisedChatTarget {
+    pub target_id: String,
+    #[serde(default = "writable_participation")]
+    pub participation: TargetParticipationMode,
+}
+
+fn writable_participation() -> TargetParticipationMode {
+    TargetParticipationMode::Writable
 }
 fn default_title() -> String {
     "new chat".into()
@@ -1084,14 +1130,17 @@ pub async fn create_chat_under_instance(
         )
             .into_response();
     }
-    let Some(target_id) = body.target_id.as_deref() else {
+    if body.target_id.is_some() && body.target_ids.is_some() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "target_id is required" })),
+            Json(json!({ "error": "send target_ids or compatibility target_id, not both" })),
         )
             .into_response();
-    };
-    match create_chat_in(&mut wb, &iid, &body.title, Some(target_id)) {
+    }
+    let target_ids = body
+        .target_ids
+        .unwrap_or_else(|| body.target_id.into_iter().collect());
+    match create_chat_in(&mut wb, &iid, &body.title, &target_ids) {
         Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
         Err(e) => {
             let status = if e == "no such instance" {
@@ -1102,6 +1151,32 @@ pub async fn create_chat_under_instance(
                 StatusCode::BAD_REQUEST
             };
             (status, Json(json!({ "error": e }))).into_response()
+        }
+    }
+}
+
+pub async fn revise_chat_targets(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<ReviseChatTargets>,
+) -> impl IntoResponse {
+    let requested = body
+        .targets
+        .into_iter()
+        .map(|target| (target.target_id, target.participation))
+        .collect::<Vec<_>>();
+    match wb.lock_unpoisoned().revise_chat_targets(&id, &requested) {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => {
+            let status = if error == "no such chat" {
+                StatusCode::NOT_FOUND
+            } else if error.contains("while a turn is live") || error.contains("settle or discard")
+            {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(json!({ "error": error }))).into_response()
         }
     }
 }
@@ -1138,15 +1213,23 @@ pub async fn use_archetype(
 /// **same** placement/archetype and kind, recording `forked_from`. The fork's worktree
 /// inherits the parent's files, and WhippleScript seeds a distinct target instance
 /// from the parent's exact durable thread position.
+#[derive(Default, Deserialize)]
+pub struct ForkChatRequest {
+    #[serde(default)]
+    destination: ForkDestination,
+}
+
 pub async fn fork_chat(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    body: Option<Json<ForkChatRequest>>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    match wb.fork_chat(&id) {
+    let destination = body.map(|Json(body)| body.destination).unwrap_or_default();
+    match wb.fork_chat_with_destination(&id, destination) {
         Ok(forked) => (
             StatusCode::CREATED,
-            Json(json!({ "id": forked.id, "title": forked.title, "forked_from": forked.forked_from, "forked_from_entry": forked.forked_from_entry })),
+            Json(json!({ "id": forked.id, "title": forked.title, "forked_from": forked.forked_from, "forked_from_entry": forked.forked_from_entry, "admitted_home": forked.admitted_home })),
         )
             .into_response(),
         Err(ForkChatError::NotFound) => (
@@ -1179,6 +1262,14 @@ pub async fn fork_chat(
             Json(json!({ "error": "transcript entry is not a durable fork point" })),
         )
             .into_response(),
+        Err(ForkChatError::HistoricalHomeClosed) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "historical-home-closed",
+                "message": "the historical workstream is archived; choose Main or another active workstream"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1187,9 +1278,11 @@ pub async fn fork_chat(
 pub async fn fork_chat_at(
     State(wb): State<SharedWorkbench>,
     Path((id, entry_id)): Path<(String, i64)>,
+    body: Option<Json<ForkChatRequest>>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    match wb.fork_chat_at(&id, entry_id) {
+    let destination = body.map(|Json(body)| body.destination).unwrap_or_default();
+    match wb.fork_chat_at_with_destination(&id, entry_id, destination) {
         Ok(forked) => (
             StatusCode::CREATED,
             Json(json!({
@@ -1197,6 +1290,7 @@ pub async fn fork_chat_at(
                 "title": forked.title,
                 "forked_from": forked.forked_from,
                 "forked_from_entry": forked.forked_from_entry,
+                "admitted_home": forked.admitted_home,
             })),
         )
             .into_response(),
@@ -1208,6 +1302,14 @@ pub async fn fork_chat_at(
         Err(ForkChatError::PointNotForkable) => (
             StatusCode::CONFLICT,
             Json(json!({ "error": "transcript entry is not a durable fork point" })),
+        )
+            .into_response(),
+        Err(ForkChatError::HistoricalHomeClosed) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "historical-home-closed",
+                "message": "the historical workstream is archived; choose Main or another active workstream"
+            })),
         )
             .into_response(),
         Err(ForkChatError::SourceNotLive) => (
@@ -2163,9 +2265,9 @@ mod search_tests {
             .unwrap_or_else(|_| panic!("create default engagement"));
         {
             // Write via the same path-confined worktree API the walk reads back through.
-            let eng = wb.engagements.get("chat-f").unwrap();
             for (path, content) in files {
-                eng.write_file(path, content).unwrap();
+                let path = wb.engagement_workspace_path("chat-f", path);
+                wb.engagements["chat-f"].write_file(&path, content).unwrap();
             }
         }
         (dir, open_control_plane(Arc::new(Mutex::new(wb))))
@@ -2187,7 +2289,11 @@ mod search_tests {
         );
         assert_eq!(hits[0]["id"], "chat-f");
         assert_eq!(hits[0]["tier"], "file");
-        assert_eq!(hits[0]["path"], "notes/spec.md");
+        assert!(
+            hits[0]["path"].as_str().is_some_and(
+                |path| path.starts_with("targets/t-") && path.ends_with("/notes/spec.md")
+            )
+        );
         let snippet = hits[0]["snippet"].as_str().unwrap();
         assert!(
             snippet.contains("WIDGETRON"),
@@ -2260,10 +2366,9 @@ mod search_tests {
         let mut wb = Workbench::with_target("inst-test", instance, store);
         wb.create_default_engagement("chat-both".into(), "both tiers".into())
             .unwrap_or_else(|_| panic!("create default engagement"));
-        wb.engagements
-            .get("chat-both")
-            .unwrap()
-            .write_file("note.txt", "the SENTINEL token in a file")
+        let note_path = wb.engagement_workspace_path("chat-both", "note.txt");
+        wb.engagements["chat-both"]
+            .write_file(&note_path, "the SENTINEL token in a file")
             .unwrap();
         // The same term also in the chat's log.
         wb.write_chat_transcript_event(

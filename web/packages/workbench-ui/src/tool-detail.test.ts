@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isBoilerplateResult, toolDetail, toolHeaderTarget } from "./tool-detail";
+import { isBoilerplateResult, partitionedToolTarget, toolDetail, toolHeaderTarget } from "./tool-detail";
 
 describe("toolDetail — additive-only disclosure (no redundant restatement)", () => {
     it("reveals a bash call's full command, not a {command:…} blob", () => {
@@ -58,6 +58,15 @@ describe("toolHeaderTarget — the collapsed line's target", () => {
     it("is undefined when there is no target at all", () => {
         expect(toolHeaderTarget("write", undefined, undefined)).toBeUndefined();
         expect(toolHeaderTarget("write", undefined, "")).toBeUndefined();
+    });
+});
+
+describe("partitionedToolTarget", () => {
+    it("keeps the stable target partition explicit while presenting the relative path", () => {
+        expect(partitionedToolTarget("targets/t-mfrgg/src/app.ts")).toEqual({
+            targetRoot: "t-mfrgg",
+            relativePath: "src/app.ts",
+        });
     });
 });
 

@@ -14,7 +14,7 @@ use gaugedesk_core::abac::{
 use gaugedesk_core::resource::ResourceRecord;
 use gaugedesk_whip_runtime::{
     sign_policy_envelope, HostGovernancePolicy, ProviderBindingPolicy, ResourcePolicy,
-    WhipplePlacementPolicy,
+    WhipplePlacementPolicy, TARGET_MANIFEST_RESOURCE,
 };
 
 use crate::library::RecordOp;
@@ -42,6 +42,9 @@ pub(crate) struct PolicyCompilationInput {
     pub placement_kind: String,
     pub command_network: bool,
     pub resources: Vec<ResourceRecord>,
+    /// Complete stable-target process binding derived from the chat's pinned
+    /// target-set revision. Empty is the single undivided edit-workspace shape.
+    pub target_bindings: Vec<crate::target_change_set::ProcessTargetBinding>,
     /// The operator's auto-keep scopes (ATTN-3), declared into the envelope as
     /// the [`crate::advancement::OPERATOR_WRITES_GUARANTEE`] dynamic guarantee
     /// (ADR 0082 §5, WhippleScript DR-0036). Empty = nothing declared.
@@ -224,6 +227,13 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
     for record in &active_resources {
         workspace_readers.extend(resource_reader_roles(record));
     }
+    workspace_readers.extend(
+        input
+            .target_bindings
+            .iter()
+            .flat_map(|binding| binding.authorities.iter())
+            .map(|authority| authority_role(authority)),
+    );
     if workspace_readers.is_empty() {
         workspace_readers.insert(actor_role.clone());
     }
@@ -243,40 +253,50 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
         input.placement_kind,
         input.project_id.as_deref().unwrap_or("personal")
     );
+    let mut policy_resources = BTreeMap::from([
+        (
+            format!("memory:turn-images:{}", input.chat_id),
+            labeled(false),
+        ),
+        (
+            format!("command:workspace:{}", input.chat_id),
+            labeled(true),
+        ),
+        (format!("human:{}", input.actor), labeled(true)),
+        (provider_address.clone(), labeled(true)),
+        ("provider:owned".to_owned(), labeled(true)),
+        (placement_address.clone(), labeled(true)),
+    ]);
+    let mut policy_bindings = BTreeMap::from([
+        (
+            "turn_images".to_owned(),
+            format!("memory:turn-images:{}", input.chat_id),
+        ),
+        (
+            "command".to_owned(),
+            format!("command:workspace:{}", input.chat_id),
+        ),
+        ("human".to_owned(), format!("human:{}", input.actor)),
+        (PROVIDER_BINDING_HANDLE.to_owned(), provider_address),
+        ("owned".to_owned(), "provider:owned".to_owned()),
+        (PLACEMENT_HANDLE.to_owned(), placement_address),
+    ]);
+    // Authored host packages statically declare `project`; it remains an
+    // abstract IFC surface so WhippleScript can verify the package. A sparse
+    // target turn never sends this handle to a resolver, so it cannot restore
+    // undivided workspace access. Concrete runtime access comes only from the
+    // per-target bindings below.
+    let project_address = format!("file:workspace:{}", input.chat_id);
+    policy_resources.insert(project_address.clone(), labeled(false));
+    policy_bindings.insert("project".to_owned(), project_address);
+    if !input.target_bindings.is_empty() {
+        let address = format!("file:target-manifest:{}", input.chat_id);
+        policy_resources.insert(address.clone(), labeled(false));
+        policy_bindings.insert(TARGET_MANIFEST_RESOURCE.to_owned(), address);
+    }
     let mut policy = HostGovernancePolicy {
-        resources: BTreeMap::from([
-            (format!("file:workspace:{}", input.chat_id), labeled(false)),
-            (
-                format!("memory:turn-images:{}", input.chat_id),
-                labeled(false),
-            ),
-            (
-                format!("command:workspace:{}", input.chat_id),
-                labeled(true),
-            ),
-            (format!("human:{}", input.actor), labeled(true)),
-            (provider_address.clone(), labeled(true)),
-            ("provider:owned".to_owned(), labeled(true)),
-            (placement_address.clone(), labeled(true)),
-        ]),
-        bindings: BTreeMap::from([
-            (
-                "project".to_owned(),
-                format!("file:workspace:{}", input.chat_id),
-            ),
-            (
-                "turn_images".to_owned(),
-                format!("memory:turn-images:{}", input.chat_id),
-            ),
-            (
-                "command".to_owned(),
-                format!("command:workspace:{}", input.chat_id),
-            ),
-            ("human".to_owned(), format!("human:{}", input.actor)),
-            (PROVIDER_BINDING_HANDLE.to_owned(), provider_address),
-            ("owned".to_owned(), "provider:owned".to_owned()),
-            (PLACEMENT_HANDLE.to_owned(), placement_address),
-        ]),
+        resources: policy_resources,
+        bindings: policy_bindings,
         parties: BTreeMap::from([(input.actor.clone(), actor_role.clone())]),
         capabilities: input.package_capabilities.clone(),
         provider_bindings: BTreeMap::from([(
@@ -299,6 +319,42 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
         )]),
         ..HostGovernancePolicy::default()
     };
+
+    for binding in &input.target_bindings {
+        let address = format!("file:target:{}", short_hash(&binding.target_id));
+        let mut reader = binding
+            .authorities
+            .iter()
+            .map(|authority| authority_role(authority))
+            .collect::<BTreeSet<_>>();
+        // Selection/access admission has already established this actor's read
+        // authority. Supplying it here is faithful carriage, not a second
+        // target-boundary decision.
+        reader.insert(actor_role.clone());
+        policy.resources.insert(
+            address.clone(),
+            ResourcePolicy {
+                reader,
+                // This is the integrity label of data written through the
+                // resource, not an ACL. Read-only participation is carried as
+                // ResourceRef capability attenuation and enforced by Whip on
+                // both placements; an empty writer label would mean untrusted
+                // data, not "nobody may write".
+                writer: BTreeSet::from([actor_role.clone()]),
+                principal: false,
+                internal: false,
+            },
+        );
+        policy
+            .bindings
+            .insert(binding.resource_handle.clone(), address);
+        for authority in &binding.authorities {
+            policy
+                .parties
+                .entry(authority.clone())
+                .or_insert_with(|| authority_role(authority));
+        }
+    }
 
     for record in active_resources {
         let id = record.resource.id.as_str();
@@ -365,6 +421,14 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
                 .stakeholders
                 .iter()
                 .map(|authority| authority_role(authority.as_str())),
+        );
+    }
+    for binding in &input.target_bindings {
+        clearances.extend(
+            binding
+                .authorities
+                .iter()
+                .map(|authority| authority_role(authority)),
         );
     }
     policy.delegations.extend(
@@ -446,11 +510,12 @@ mod tests {
             provider: "openai".to_owned(),
             model: "gpt-5".to_owned(),
             base_url: "https://api.openai.com".to_owned(),
-            credential_ref: "gaugedesk:credential:account:openai".to_owned(),
+            credential_ref: "credential:gaugedesk/account/alice/openai/v1".to_owned(),
             wire: "openai-responses".to_owned(),
             placement_kind: "local".to_owned(),
             command_network: false,
             resources: Vec::new(),
+            target_bindings: Vec::new(),
             advancement_scopes: Vec::new(),
         }
     }
@@ -537,7 +602,7 @@ mod tests {
                 .provider_bindings
                 .get(PROVIDER_BINDING_HANDLE)
                 .map(|binding| binding.credential_ref.as_str()),
-            Some("gaugedesk:credential:account:openai")
+            Some("credential:gaugedesk/account/alice/openai/v1")
         );
         assert_eq!(
             policy
@@ -550,6 +615,77 @@ mod tests {
             .placements
             .get(PLACEMENT_HANDLE)
             .is_some_and(|placement| !placement.command_network));
+    }
+
+    #[test]
+    fn compilation_binds_the_complete_sparse_target_set_with_write_ceiling() {
+        let mut input = input();
+        input.target_bindings = vec![
+            crate::target_change_set::ProcessTargetBinding {
+                target_id: "target-a".to_owned(),
+                resource_handle: "target:t-a".to_owned(),
+                root: "targets/t-a".to_owned(),
+                native_basis: "git:aaaa".to_owned(),
+                adapter_family: "git".to_owned(),
+                path_scope: vec![".".to_owned()],
+                capabilities: crate::library::TargetCapabilities::managed_default(),
+                participation: crate::library::TargetParticipationMode::Writable,
+                authorities: vec!["client-a".to_owned()],
+                readable: true,
+                writable: true,
+                output: true,
+            },
+            crate::target_change_set::ProcessTargetBinding {
+                target_id: "target-b".to_owned(),
+                resource_handle: "target:t-b".to_owned(),
+                root: "targets/t-b".to_owned(),
+                native_basis: "folder:bbbb".to_owned(),
+                adapter_family: "folder".to_owned(),
+                path_scope: vec!["docs/**".to_owned()],
+                capabilities: crate::library::TargetCapabilities::managed_default(),
+                participation: crate::library::TargetParticipationMode::ReadOnly,
+                authorities: vec!["client-b".to_owned()],
+                readable: true,
+                writable: false,
+                output: false,
+            },
+        ];
+
+        let policy = compile_policy(&input).expect("multi-target policy");
+        assert!(policy.bindings.contains_key("project"));
+        assert!(policy.bindings.contains_key(TARGET_MANIFEST_RESOURCE));
+        let writable_address = policy.bindings.get("target:t-a").expect("writable handle");
+        let read_only_address = policy.bindings.get("target:t-b").expect("read-only handle");
+        assert!(!policy.resources[writable_address].writer.is_empty());
+        assert!(!policy.resources[read_only_address].writer.is_empty());
+        assert!(policy.resources[writable_address]
+            .reader
+            .contains(&authority_role("client-a")));
+        assert!(policy.resources[read_only_address]
+            .reader
+            .contains(&authority_role("client-b")));
+
+        // Exercise the actual WhippleScript trust boundary, not only this
+        // compiler's Rust shape. The authored package still names its abstract
+        // `project` surface, while runtime commands carry only these concrete
+        // target handles and the immutable manifest.
+        let authority = gaugedesk_core::ids::AuthorityId::new("authority:policy-test");
+        let key = gaugedesk_core::signature::SigningKey::from_seed(&[41u8; 32]).unwrap();
+        let signed =
+            sign_policy_envelope(&policy.to_json().expect("policy json"), &authority, &key)
+                .expect("signed policy");
+        let verifier =
+            gaugedesk_whip_runtime::GovernanceRootVerifier::new(authority, key.public_key());
+        let admitted = gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+            gaugedesk_whip_runtime::PolicyEpoch::new(1).unwrap(),
+            &signed,
+            &verifier,
+        )
+        .expect("WhippleScript admits the exact sparse policy");
+        assert!(admitted.governs("project"));
+        assert!(admitted.governs("target:t-a"));
+        assert!(admitted.governs("target:t-b"));
+        assert!(admitted.governs(TARGET_MANIFEST_RESOURCE));
     }
 
     #[test]

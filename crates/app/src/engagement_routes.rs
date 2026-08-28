@@ -4,7 +4,7 @@
 //! reads/writes, transcript/events, merge/revert/sync, task
 //! turns, and e2e reset hooks.
 
-use std::convert::Infallible;
+use std::{collections::BTreeSet, convert::Infallible};
 
 use axum::{
     extract::{Path, Query, State},
@@ -69,6 +69,86 @@ pub struct EngagementTaskContext {
 }
 
 impl Workbench {
+    fn engagement_single_target_root(&self, chat_id: &str) -> Option<String> {
+        let chat = self.library.chats.get(chat_id)?;
+        self.library
+            .instances
+            .get(&chat.instance_id)
+            .is_some_and(|instance| instance.kind == crate::library::InstanceKind::Using)
+            .then_some(())?;
+        let set = self.library.current_target_set(chat_id)?;
+        let [member] = set.members.as_slice() else {
+            return None;
+        };
+        crate::library::target_id_path_v1(&member.target_id)
+            .ok()
+            .map(|root| format!("targets/{root}"))
+    }
+
+    fn engagement_context_target_root(
+        &self,
+        chat_id: &str,
+        requested_target_id: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let chat = self
+            .library
+            .chats
+            .get(chat_id)
+            .ok_or_else(|| "no such engagement".to_owned())?;
+        let Some(instance) = self.library.instances.get(&chat.instance_id) else {
+            return Err("chat placement is unavailable".to_owned());
+        };
+        if instance.kind != crate::library::InstanceKind::Using {
+            return if requested_target_id.is_some() {
+                Err("edit-chat context does not select a work target".to_owned())
+            } else {
+                Ok(None)
+            };
+        }
+        let set = self
+            .library
+            .current_target_set(chat_id)
+            .ok_or_else(|| "chat target set is unavailable".to_owned())?;
+        let member = match requested_target_id {
+            Some(target_id) => set
+                .members
+                .iter()
+                .find(|member| member.target_id == target_id)
+                .ok_or_else(|| "context target is not selected by this chat".to_owned())?,
+            None => match set.members.as_slice() {
+                [member] => member,
+                _ => return Err("select one writable target_id for context ingest".to_owned()),
+            },
+        };
+        if member.participation != crate::library::TargetParticipationMode::Writable
+            || !member.capability_ceiling.propose
+        {
+            return Err(format!(
+                "context target {} is read-only in this chat",
+                member.target_id
+            ));
+        }
+        crate::library::target_id_path_v1(&member.target_id)
+            .map(|root| Some(format!("targets/{root}")))
+    }
+
+    pub(crate) fn engagement_workspace_path(&self, chat_id: &str, path: &str) -> String {
+        if path == "targets"
+            || path.starts_with("targets/")
+            || path == gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT
+            || path.starts_with(&format!(
+                "{}/",
+                gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT
+            ))
+        {
+            return path.to_owned();
+        }
+        let Some(root) = self.engagement_single_target_root(chat_id) else {
+            return path.to_owned();
+        };
+        format!("{root}/{path}")
+    }
+
     pub(crate) fn create_default_engagement(
         &mut self,
         id: String,
@@ -81,16 +161,40 @@ impl Workbench {
         let target = self
             .resolve_placement_target(&root_id, None)
             .map_err(EngagementCreateError::Git)?;
-        let Some(workspace) = self.targets.get(&target.id) else {
+        let project_id = self
+            .library
+            .instances
+            .get(&root_id)
+            .and_then(|instance| instance.project_id.clone())
+            .ok_or_else(|| EngagementCreateError::Git("default placement has no project".into()))?;
+        self.ensure_collaboration_target_partition(&project_id, &target.id)
+            .map_err(EngagementCreateError::Git)?;
+        let collaboration_workspace_id = self
+            .library
+            .project_collaboration_workspaces
+            .get(&project_id)
+            .ok_or_else(|| {
+                EngagementCreateError::Git(
+                    "default project collaboration workspace is unavailable".into(),
+                )
+            })?
+            .workspace_id
+            .clone();
+        let Some(workspace) = self
+            .collaboration_workspaces
+            .get(&collaboration_workspace_id)
+        else {
             return Err(EngagementCreateError::NoDefaultInstance);
         };
+        let root = crate::library::target_id_path_v1(&target.id)
+            .map(|encoded| format!("targets/{encoded}"))
+            .map_err(EngagementCreateError::Git)?;
         let eng = workspace
-            .create_engagement(&id)
+            .create_engagement_subset(&id, workspace.mainline(), &BTreeSet::from([root]))
             .map_err(|e| EngagementCreateError::Git(e.to_string()))?;
-        let basis = eng
-            .boundary_cut()
-            .map_err(|e| EngagementCreateError::Git(e.to_string()))?
-            .0;
+        let basis = target.current_basis.clone().ok_or_else(|| {
+            EngagementCreateError::Git("default work target has no exact basis".into())
+        })?;
         let branch = eng.branch().to_string();
         let path = eng.path().to_string_lossy().to_string();
         self.write_created_chat_record(ChatRecord {
@@ -112,10 +216,32 @@ impl Workbench {
             op: RecordOp::Upsert,
             target_id: target.id.clone(),
             basis,
-            path_scope: target.path_scope,
-            capabilities: target.capabilities,
+            path_scope: target.path_scope.clone(),
+            capabilities: target.capabilities.clone(),
         });
-        self.register_engagement(id.clone(), target.id, eng);
+        self.write_chat_target_set_record(crate::library::ChatTargetSetRevisionRecord {
+            chat_id: id.clone(),
+            revision: 0,
+            members: vec![crate::library::ChatTargetSetMemberRecord {
+                target_id: target.id,
+                adapter_family: target.adapter_family,
+                path_scope: target.path_scope,
+                capability_ceiling: target.capabilities,
+                participation: crate::library::TargetParticipationMode::Writable,
+            }],
+            created_position: 0,
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        })
+        .map_err(EngagementCreateError::Git)?;
+        self.register_engagement(id.clone(), collaboration_workspace_id, eng);
+        if self.library.agents.contains_key(crate::DEFAULT_AGENT) {
+            self.refresh_chat_discipline_mount(&id)
+                .map_err(EngagementCreateError::Git)?;
+        } else {
+            self.refresh_chat_target_set_mount(&id)
+                .map_err(EngagementCreateError::Git)?;
+        }
         Ok(CreatedEngagement { id, branch, path })
     }
 
@@ -296,15 +422,24 @@ impl Workbench {
         &mut self,
         chat_id: &str,
         path: &std::path::Path,
-    ) -> Option<Result<(usize, String), WorkspaceError>> {
+        target_id: Option<&str>,
+    ) -> Option<Result<(usize, String), String>> {
+        let prefix = match self.engagement_context_target_root(chat_id, target_id) {
+            Ok(prefix) => prefix,
+            Err(error) => return Some(Err(error)),
+        };
         let eng = self.engagements.get(chat_id)?;
-        let n = match eng.ingest(path) {
+        let result = match prefix {
+            Some(prefix) => eng.ingest_into(&prefix, path),
+            None => eng.ingest(path),
+        };
+        let n = match result {
             Ok(n) => n,
-            Err(e) => return Some(Err(e)),
+            Err(e) => return Some(Err(e.to_string())),
         };
         let commit = match eng.commit_turn(&format!("ingest context: {}", path.display())) {
             Ok(commit) => commit.map(|c| c.0).unwrap_or_default(),
-            Err(e) => return Some(Err(e)),
+            Err(e) => return Some(Err(e.to_string())),
         };
         Some(Ok((n, commit)))
     }
@@ -317,15 +452,24 @@ impl Workbench {
         &mut self,
         chat_id: &str,
         files: &[(String, String)],
-    ) -> Option<Result<(usize, String), WorkspaceError>> {
+        target_id: Option<&str>,
+    ) -> Option<Result<(usize, String), String>> {
+        let prefix = match self.engagement_context_target_root(chat_id, target_id) {
+            Ok(prefix) => prefix,
+            Err(error) => return Some(Err(error)),
+        };
         let eng = self.engagements.get(chat_id)?;
-        let n = match eng.ingest_upload(files) {
+        let result = match prefix {
+            Some(prefix) => eng.ingest_upload_into(&prefix, files),
+            None => eng.ingest_upload(files),
+        };
+        let n = match result {
             Ok(n) => n,
-            Err(e) => return Some(Err(e)),
+            Err(e) => return Some(Err(e.to_string())),
         };
         let commit = match eng.commit_turn(&format!("ingest uploaded context: {n} file(s)")) {
             Ok(commit) => commit.map(|c| c.0).unwrap_or_default(),
-            Err(e) => return Some(Err(e)),
+            Err(e) => return Some(Err(e.to_string())),
         };
         Some(Ok((n, commit)))
     }
@@ -341,7 +485,10 @@ impl Workbench {
         chat_id: &str,
         path: &str,
     ) -> Option<Result<String, WorkspaceError>> {
-        self.engagements.get(chat_id).map(|eng| eng.read_file(path))
+        let path = self.engagement_workspace_path(chat_id, path);
+        self.engagements
+            .get(chat_id)
+            .map(|eng| eng.read_file(&path))
     }
 
     /// The engagement's current cut — minted on demand so what the reader
@@ -362,9 +509,10 @@ impl Workbench {
         draft: &str,
         base_cut: &str,
     ) -> Option<Result<Option<MergePreview>, WorkspaceError>> {
+        let path = self.engagement_workspace_path(chat_id, path);
         self.engagements
             .get(chat_id)
-            .map(|eng| eng.merge_preview(path, draft, base_cut))
+            .map(|eng| eng.merge_preview(&path, draft, base_cut))
     }
 
     pub(crate) fn write_engagement_file(
@@ -373,9 +521,10 @@ impl Workbench {
         path: &str,
         body: &str,
     ) -> Option<Result<(), WorkspaceError>> {
+        let workspace_path = self.engagement_workspace_path(chat_id, path);
         let eng = self.engagements.get(chat_id)?;
         let result = eng
-            .write_file(path, body)
+            .write_file(&workspace_path, body)
             .and_then(|_| eng.commit_turn(&format!("edit {path}")).map(|_| ()));
         if result.is_ok() {
             let ev = ServerEvent::Admitted {
@@ -404,8 +553,9 @@ impl Workbench {
         base: SaveBase<'_>,
         resolutions: &[RegionResolution],
     ) -> Option<Result<SaveFileOutcome, WorkspaceError>> {
+        let workspace_path = self.engagement_workspace_path(chat_id, path);
         let eng = self.engagements.get(chat_id)?;
-        let outcome = match eng.save_file_with_base(path, draft, base, resolutions) {
+        let outcome = match eng.save_file_with_base(&workspace_path, draft, base, resolutions) {
             Ok(outcome) => outcome,
             Err(error) => return Some(Err(error)),
         };
@@ -458,6 +608,59 @@ impl Workbench {
         Some(Ok(outcome))
     }
 
+    fn resolve_file_edit_target(
+        &self,
+        chat_id: &str,
+        path: &str,
+    ) -> Result<(crate::library::ChatTargetSetMemberRecord, String), &'static str> {
+        let Some(target_set) = self.library.current_target_set(chat_id) else {
+            let binding = self
+                .library_chat_target_binding(chat_id)
+                .ok_or("chat target binding is unavailable")?;
+            return Ok((
+                crate::library::ChatTargetSetMemberRecord {
+                    target_id: binding.target_id,
+                    adapter_family: String::new(),
+                    path_scope: binding.path_scope,
+                    capability_ceiling: binding.capabilities,
+                    participation: crate::library::TargetParticipationMode::Writable,
+                },
+                path.to_owned(),
+            ));
+        };
+        let normalized = path.trim_start_matches("./");
+        let (member, relative) = if let Some(rooted) = normalized.strip_prefix("targets/") {
+            let (encoded_target, relative) = rooted
+                .split_once('/')
+                .ok_or("a target-rooted edit must name a target-relative path")?;
+            let member = target_set
+                .members
+                .iter()
+                .find(|member| {
+                    crate::library::target_id_path_v1(&member.target_id)
+                        .is_ok_and(|encoded| encoded == encoded_target)
+                })
+                .ok_or("path does not resolve to a selected chat target")?;
+            (member, relative)
+        } else if let [member] = target_set.members.as_slice() {
+            // One-member pre-cutover worktrees used target-relative editor paths.
+            // Keep that exact compatibility seam without making an unrooted path
+            // ambiguous once a chat selects more than one target.
+            (member, normalized)
+        } else {
+            return Err("a multi-target edit must name one selected target root");
+        };
+        if member.participation != crate::library::TargetParticipationMode::Writable
+            || !member.capability_ceiling.propose
+        {
+            return Err("the selected chat target is read-only");
+        }
+        if !path_is_in_scope(relative, &member.path_scope) {
+            return Err("path is outside the chat's admitted target scope");
+        }
+        Ok((member.clone(), relative.to_owned()))
+    }
+
     fn authorize_file_edit(&self, chat_id: &str, path: &str) -> Result<(), &'static str> {
         let normalized = path.trim_start_matches("./");
         if gaugedesk_boundary::is_control_surface_path(normalized) {
@@ -485,21 +688,18 @@ impl Workbench {
                 return Err("work chats cannot edit their installed WhippleScript package");
             }
         }
-        let binding = self
-            .library_chat_target_binding(chat_id)
-            .ok_or("chat target binding is unavailable")?;
-        if !path_is_in_scope(normalized, &binding.path_scope) {
-            return Err("path is outside the chat's admitted target scope");
-        }
+        self.resolve_file_edit_target(chat_id, normalized)?;
         Ok(())
     }
 
     fn candidate_within_target_scope(&self, chat_id: &str) -> Result<(), String> {
-        let Some(binding) = self.library_chat_target_binding(chat_id) else {
+        if self.library.current_target_set(chat_id).is_none()
+            && self.library_chat_target_binding(chat_id).is_none()
+        {
             // Low-level in-memory workspace tests do not construct the durable
             // library. Production startup rejects every unbound chat.
             return Ok(());
-        };
+        }
         let diff = self
             .engagements
             .get(chat_id)
@@ -510,11 +710,13 @@ impl Workbench {
             .lines()
             .filter_map(|line| line.strip_prefix("diff --git a/"))
             .filter_map(|line| line.split_once(" b/").map(|(path, _)| path))
-            .find(|path| !path_is_in_scope(path, &binding.path_scope));
+            .find_map(|path| {
+                self.resolve_file_edit_target(chat_id, path)
+                    .err()
+                    .map(|reason| (path, reason))
+            });
         match escaped {
-            Some(path) => Err(format!(
-                "candidate path `{path}` is outside the admitted target scope"
-            )),
+            Some((path, reason)) => Err(format!("candidate path `{path}` is refused: {reason}")),
             None => Ok(()),
         }
     }
@@ -1751,5 +1953,69 @@ mod task_failure_status_tests {
         );
         assert!(!message.is_policy_denial());
         assert_eq!(task_failure_status(&message), StatusCode::BAD_GATEWAY);
+    }
+}
+
+#[cfg(test)]
+mod multi_target_edit_authorization_tests {
+    use crate::{open_workbench, LockUnpoisoned, DEFAULT_PLACEMENT, DEFAULT_PROJECT};
+
+    #[test]
+    fn editor_resolves_one_target_root_and_refuses_read_only_members() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("reference.txt"), "reference\n").unwrap();
+        let workbench = open_workbench(root.path()).unwrap();
+        let mut workbench = workbench.lock_unpoisoned();
+        let default_target =
+            workbench.library.placement_targets[DEFAULT_PLACEMENT].target_ids[0].clone();
+        let reference = workbench
+            .attach_external_target(
+                DEFAULT_PROJECT,
+                crate::target_adapter::AttachTargetBody {
+                    name: "Reference".to_owned(),
+                    kind: crate::library::WorkTargetKind::ExternalFolder,
+                    path: external.path().to_path_buf(),
+                    path_scope: vec![".".to_owned()],
+                },
+            )
+            .unwrap();
+        let chat = workbench
+            .create_chat_in_instance_on_targets(
+                DEFAULT_PLACEMENT,
+                "two roots",
+                &[default_target.clone(), reference.id.clone()],
+            )
+            .unwrap();
+        let chat_id = chat["id"].as_str().unwrap();
+        workbench
+            .revise_chat_targets(
+                chat_id,
+                &[
+                    (
+                        default_target.clone(),
+                        crate::library::TargetParticipationMode::Writable,
+                    ),
+                    (
+                        reference.id.clone(),
+                        crate::library::TargetParticipationMode::ReadOnly,
+                    ),
+                ],
+            )
+            .unwrap();
+        let default_root = crate::library::target_id_path_v1(&default_target).unwrap();
+        let reference_root = crate::library::target_id_path_v1(&reference.id).unwrap();
+        assert!(workbench
+            .authorize_file_edit(chat_id, &format!("targets/{default_root}/new.txt"))
+            .is_ok());
+        assert_eq!(
+            workbench
+                .authorize_file_edit(chat_id, &format!("targets/{reference_root}/reference.txt")),
+            Err("the selected chat target is read-only")
+        );
+        assert_eq!(
+            workbench.authorize_file_edit(chat_id, "unrooted.txt"),
+            Err("a multi-target edit must name one selected target root")
+        );
     }
 }

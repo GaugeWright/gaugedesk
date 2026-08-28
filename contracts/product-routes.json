@@ -4650,8 +4650,440 @@
       "authentication": "account-session-and-home-admission",
       "scope": "person-home-project-placement-workstream",
       "capability": "promote-workstream-to-project-mainline",
-      "requestSchema": "http/empty",
+      "requestSchema": "rust:gaugedesk-app/workstream_routes/PromoteWorkstreamBody",
       "responseSchema": "gw://schemas/workstream/promotion/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.workstream.promotion-manifests.list",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/workstreams/:id/promotion-manifests",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-placement-workstream",
+      "capability": "read-immutable-workstream-promotion-manifests",
+      "requestSchema": "http/path-workstream-id",
+      "responseSchema": "rust:gaugedesk-app/workstream_promotion/WorkstreamPromotionManifest[]",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.workstream.settlement.create",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/workstreams/:id/settlements",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-placement-workstream",
+      "capability": "declare-and-preflight-target-settlement-from-accepted-promotion",
+      "requestSchema": "rust:gaugedesk-app/workstream_routes/CreateWorkstreamSettlementBody",
+      "responseSchema": "rust:gaugedesk-core/target_settlement/TargetSettlementState",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.chat.targets.revise",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "PUT",
+      "path": "/chats/:id/targets",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-placement-chat",
+      "capability": "revise-settled-chat-target-set",
+      "requestSchema": "rust:gaugedesk-app/library_routes/ReviseChatTargets",
+      "responseSchema": "gw://schemas/chat/target-set-revision/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#chat-lifecycle-command-production-client"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#chat-lifecycle-command-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#chat-lifecycle-command-production-client"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#chat-lifecycle-command-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.chat.settlement.create",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/chats/:id/settlements",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-placement-chat",
+      "capability": "declare-and-preflight-chat-target-settlement",
+      "requestSchema": "rust:gaugedesk-app/target_settlement/CreateTargetSettlementBody",
+      "responseSchema": "rust:gaugedesk-core/target_settlement/TargetSettlementState",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#chat-lifecycle-command-production-client"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#chat-lifecycle-command-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#chat-lifecycle-command-production-client"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#chat-lifecycle-command-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.target-settlement.read",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/target-settlements/:id",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-target-settlement",
+      "capability": "read-target-settlement-state",
+      "requestSchema": "http/path-target-settlement-id",
+      "responseSchema": "rust:gaugedesk-core/target_settlement/TargetSettlementState",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.target-settlement.member.execute",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/target-settlements/:id/members/:member_id/execute",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-target-settlement",
+      "capability": "execute-admitted-target-settlement-member",
+      "requestSchema": "http/path-target-settlement-and-member-id+empty-json",
+      "responseSchema": "rust:gaugedesk-core/target_settlement/TargetSettlementState",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.target-settlement.member.query",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/target-settlements/:id/members/:member_id/query",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-target-settlement",
+      "capability": "query-unknown-target-settlement-member",
+      "requestSchema": "http/path-target-settlement-and-member-id+empty",
+      "responseSchema": "rust:gaugedesk-core/target_settlement/TargetSettlementState",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.target-settlement.member.retry",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/target-settlements/:id/members/:member_id/retry",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-target-settlement",
+      "capability": "retry-proven-safe-target-settlement-member",
+      "requestSchema": "http/path-target-settlement-and-member-id+empty-json",
+      "responseSchema": "rust:gaugedesk-core/target_settlement/TargetSettlementState",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.target-settlement.member.supersede",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/target-settlements/:id/members/:member_id/supersede",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-target-settlement",
+      "capability": "supersede-not-started-target-settlement-member",
+      "requestSchema": "rust:gaugedesk-app/target_settlement/SupersedeTargetSettlementMemberBody",
+      "responseSchema": "rust:gaugedesk-core/target_settlement/TargetSettlementState",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.target-settlement.compensate",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/target-settlements/:id/compensate",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-target-settlement",
+      "capability": "record-forward-target-settlement-compensation",
+      "requestSchema": "rust:gaugedesk-app/target_settlement/CompensateTargetSettlementBody",
+      "responseSchema": "rust:gaugedesk-core/target_settlement/TargetSettlementState",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.target-settlement.abandon",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/target-settlements/:id/abandon",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-target-settlement",
+      "capability": "abandon-partial-target-settlement",
+      "requestSchema": "rust:gaugedesk-app/target_settlement/AbandonTargetSettlementBody",
+      "responseSchema": "rust:gaugedesk-core/target_settlement/TargetSettlementState",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-production-client-lifecycle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#workstream-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.target-settlement.cancel",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/target-settlements/:id/cancel",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-target-settlement",
+      "capability": "cancel-not-started-target-settlement",
+      "requestSchema": "rust:gaugedesk-app/target_settlement/CancelTargetSettlementBody",
+      "responseSchema": "rust:gaugedesk-core/target_settlement/TargetSettlementState",
       "sideEffect": "mutation",
       "risk": "critical",
       "compatibility": {
@@ -5982,7 +6414,7 @@
       "authentication": "account-session-and-home-admission",
       "scope": "person-home-project-placement-chat",
       "capability": "fork-live-managed-chat",
-      "requestSchema": "http/path-chat-id+empty-json",
+      "requestSchema": "rust:gaugedesk-app/library_routes/ForkChatRequest",
       "responseSchema": "gw://schemas/chat/fork-created/v1",
       "sideEffect": "mutation",
       "risk": "critical",
@@ -7278,7 +7710,7 @@
       "authentication": "account-session-and-home-admission",
       "scope": "person-home-project-placement-chat",
       "capability": "fork-chat-at-durable-transcript-entry",
-      "requestSchema": "http/path-chat-id+safe-integer-entry-id+empty-json",
+      "requestSchema": "rust:gaugedesk-app/library_routes/ForkChatRequest+http/safe-integer-entry-id",
       "responseSchema": "gw://schemas/chat/point-fork-created/v1",
       "sideEffect": "mutation",
       "risk": "critical",

@@ -247,6 +247,19 @@ pub enum ChatMode {
     Edit,
 }
 
+/// One stable target root declared to a runtime process before a turn starts.
+/// The host derives this list from the immutable chat target-set revision; a
+/// model or tool cannot add an entry by writing a manifest or naming a path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceTargetBinding {
+    pub target_id: String,
+    pub resource_handle: String,
+    pub root: String,
+    pub readable: bool,
+    pub writable: bool,
+    pub output: bool,
+}
+
 /// An out-of-band interrupt for a turn in flight, captured at turn start. It is
 /// invokable **without the harness**: the workbench mutex is held for the whole
 /// turn, so the Stop route can never reach `&self` — it only ever holds a handle
@@ -344,6 +357,10 @@ pub struct HarnessSpec {
     pub provider_binding_ref: Option<String>,
     pub credential_ref: Option<String>,
     pub placement_ceiling_ref: Option<String>,
+    /// Complete process-level target I/O declaration for this turn. Empty is
+    /// the exact compatibility shape for an archetype edit workspace or a
+    /// legacy/test harness with one undivided workspace capability.
+    pub workspace_targets: Vec<WorkspaceTargetBinding>,
     /// Product placement identity used only to address a remote host. This is
     /// distinct from the governed placement-ceiling handle above.
     pub runtime_placement_id: Option<String>,
@@ -491,6 +508,12 @@ pub trait HarnessFactory: Send + Sync {
         _source: &HarnessContinuitySpec,
         _target: &HarnessContinuitySpec,
     ) -> io::Result<()> {
+        Ok(())
+    }
+    /// Best-effort compensation for a continuity clone that could not be
+    /// admitted as a live chat. Implementations with durable per-chat state
+    /// must make this idempotent.
+    fn discard_continuity(&self, _target: &HarnessContinuitySpec) -> io::Result<()> {
         Ok(())
     }
     /// Adapter-answerable credential probe: is the runtime's own credential

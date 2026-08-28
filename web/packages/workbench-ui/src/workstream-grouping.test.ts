@@ -2,13 +2,20 @@ import { describe, expect, it } from "vitest";
 import type { EngagementId, WorkstreamId, WorkstreamNode } from "@gaugewright/control-plane-client";
 import { groupChatsByWorkstream, hasWorkstreams } from "./workstream-grouping";
 
-const ws = (id: string, status: "active" | "archived" = "active"): WorkstreamNode => ({
+const ws = (id: string, status: "active" | "promoted" = "active"): WorkstreamNode => ({
     id: id as WorkstreamId,
     name: id,
     placementId: "p1" as never,
+    projectId: null,
     workspaceRoot: "p1" as never,
     targetId: "target:p1" as never,
     status,
+    collaboration: status,
+    promotionManifestRef: null,
+    promotionTargets: [],
+    targetSettlement: "not-requested",
+    targetSettlementDeclaration: null,
+    targetSettlementMembers: [],
     members: [],
 });
 const chat = (id: string, workstream: string | null) => ({
@@ -34,12 +41,12 @@ describe("groupChatsByWorkstream", () => {
         expect(main?.map((c) => c.id)).toEqual(["a"]);
     });
 
-    it("treats membership in an archived/foreign workstream as ungrouped", () => {
+    it("treats membership in a promoted/foreign workstream as ungrouped", () => {
         const { groups, main, ungrouped } = groupChatsByWorkstream(
             [chat("a", "old"), chat("b", "gone")],
-            [ws("old", "archived")],
+            [ws("old", "promoted")],
         );
-        expect(groups).toHaveLength(0); // archived stream is not a group
+        expect(groups).toHaveLength(0); // promoted stream is not a group
         expect(ungrouped.map((c) => c.id)).toEqual(["a", "b"]);
         expect(main).toBeNull();
     });
@@ -58,7 +65,7 @@ describe("groupChatsByWorkstream", () => {
 describe("hasWorkstreams", () => {
     it("is true only when an active workstream exists", () => {
         expect(hasWorkstreams([])).toBe(false);
-        expect(hasWorkstreams([ws("w", "archived")])).toBe(false);
+        expect(hasWorkstreams([ws("w", "promoted")])).toBe(false);
         expect(hasWorkstreams([ws("w")])).toBe(true);
     });
 });

@@ -51,6 +51,9 @@ run_contracts() {
     echo "== product contracts =="
     node scripts/check-product-contracts.mjs --enforce-local-evidence
 
+    echo "== WhippleScript workstream host contract =="
+    node scripts/check-whipplescript-workstream-contract.mjs
+
     # The updater endpoint is compiled into every shipped binary and cannot be
     # corrected for a client that already has it, so its mistakes are permanent
     # in the field and silent at build time. In particular an endpoint missing

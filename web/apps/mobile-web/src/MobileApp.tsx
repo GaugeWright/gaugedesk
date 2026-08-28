@@ -1484,14 +1484,34 @@ function MobileSession(props: {
         try {
             const project = props.account?.project;
             const placement = project?.placements.find((candidate) => candidate.isDefault);
-            const target = placement?.targetIds[0];
-            const eng = project && placement && target
+            let targetIds = placement?.targetIds ?? [];
+            if (targetIds.length > 1) {
+                const workspace = (await api.getWorkspaceCarriage()).value;
+                const options = targetIds.map((id, index) => {
+                    const target = workspace.workTargets.find((candidate) => candidate.id === id);
+                    return `${index + 1}. ${target?.name ?? id}`;
+                });
+                const answer = window.prompt(
+                    `Choose one or more targets (comma-separated numbers):\n${options.join("\n")}`,
+                    "",
+                );
+                if (answer === null) return;
+                const selected = [...new Set(answer.split(",").map((part) => Number(part.trim()) - 1))]
+                    .filter((index) => Number.isInteger(index) && index >= 0 && index < targetIds.length)
+                    .map((index) => targetIds[index]);
+                if (selected.length === 0) {
+                    append("new chat needs at least one selected target");
+                    return;
+                }
+                targetIds = selected;
+            }
+            const eng = project && placement && targetIds.length > 0
                 ? {
                     id: await api.createChatUnderPlacement(
                         project.id,
                         placement.placementId,
                         "New chat",
-                        target,
+                        targetIds,
                     ),
                 }
                 : await api.createEngagement();

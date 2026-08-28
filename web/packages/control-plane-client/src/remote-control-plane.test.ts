@@ -21,6 +21,32 @@ describe("RemoteControlPlane", () => {
         ]);
     });
 
+    it("carries explicit multi-target and fork-destination commands remotely", async () => {
+        const calls: unknown[][] = [];
+        const control = new RemoteControlPlane("https://home.example", {
+            route: async (method, path, body) => {
+                calls.push([method, path, body]);
+                return { id: path.includes("fork") ? "chat-fork" : "chat-a" };
+            },
+        });
+
+        await control.createChatUnderPlacement(
+            "project-a" as never,
+            "placement-a" as never,
+            "Across",
+            ["target-a" as never, "target-b" as never],
+        );
+        await control.forkChat(engagementId("chat-a"), { kind: "main" });
+
+        expect(calls).toEqual([
+            ["POST", "/projects/project-a/placements/placement-a/chats", {
+                title: "Across",
+                target_ids: ["target-a", "target-b"],
+            }],
+            ["POST", "/chats/chat-a/fork", { destination: { kind: "main" } }],
+        ]);
+    });
+
     it("authenticates raw file transport and never sends it over an ambient local path", async () => {
         const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
             new Response("hello", { status: 200 }));

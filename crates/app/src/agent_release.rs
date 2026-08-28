@@ -805,7 +805,9 @@ impl Workbench {
                     provider: spec.provider.provider.clone(),
                     model: spec.provider.model.clone(),
                     base_url: spec.provider.base_url.clone(),
-                    credential_ref: spec.provider.credential_class.clone(),
+                    credential_ref: crate::account::canonical_credential_class_ref(
+                        &spec.provider.credential_class,
+                    ),
                     wire: Some(provider_wire(&spec.provider)?.to_owned()),
                 },
             )]),

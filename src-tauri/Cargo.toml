@@ -18,6 +18,15 @@ path = "src/main.rs"
 
 [workspace]
 
+# Keep the packaged desktop on the same exact WhippleScript collaboration-host
+# contract as the backend workspace. This nested Cargo workspace has its own
+# resolver and lockfile, so the root patch does not apply here.
+[patch.crates-io]
+whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "47e16505666a54d472f804a990139a111e6cf32b" }
+whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "47e16505666a54d472f804a990139a111e6cf32b" }
+whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "47e16505666a54d472f804a990139a111e6cf32b" }
+whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "47e16505666a54d472f804a990139a111e6cf32b" }
+
 [profile.release]
 strip = "symbols"
 

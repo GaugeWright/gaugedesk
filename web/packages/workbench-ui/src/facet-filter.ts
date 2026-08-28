@@ -50,23 +50,27 @@ const NO_CONTENT: ReadonlySet<string> = new Set();
 
 /** Does a chat match — by its title (label tier) or by its content (the chat-log
  *  tier, i.e. its id is in the server's `contentHits` set)? */
-export function chatMatches(c: { title: string; id?: string }, query: string, contentHits: ReadonlySet<string> = NO_CONTENT): boolean {
-    return hit(c.title, query) || (c.id !== undefined && contentHits.has(c.id));
+function chatLabelMatches(c: { title: string; targets?: readonly { name: string }[] }, query: string): boolean {
+    return hit(c.title, query) || (c.targets ?? []).some((target) => hit(target.name, query));
+}
+
+export function chatMatches(c: { title: string; id?: string; targets?: readonly { name: string }[] }, query: string, contentHits: ReadonlySet<string> = NO_CONTENT): boolean {
+    return chatLabelMatches(c, query) || (c.id !== undefined && contentHits.has(c.id));
 }
 
 /** The matching children of a narrowed group, **title hits first** then
  *  content-only hits (each keeping original order) — so the strongest signal leads
  *  the group (`navigation.md` "Search scope and relevance"). */
-function ranked<T extends { title: string; id?: string }>(children: readonly T[], query: string, contentHits: ReadonlySet<string>): T[] {
-    const titled = children.filter((c) => hit(c.title, query));
-    const contentOnly = children.filter((c) => !hit(c.title, query) && c.id !== undefined && contentHits.has(c.id));
+function ranked<T extends { title: string; id?: string; targets?: readonly { name: string }[] }>(children: readonly T[], query: string, contentHits: ReadonlySet<string>): T[] {
+    const titled = children.filter((c) => chatLabelMatches(c, query));
+    const contentOnly = children.filter((c) => !chatLabelMatches(c, query) && c.id !== undefined && contentHits.has(c.id));
     return [...titled, ...contentOnly];
 }
 
 /** For a parent node kept by the search: if the parent's own label matches, keep
  *  every child (the group matched as a whole); otherwise keep only the children
  *  that match — by title or content — title hits first (narrow into the group). */
-export function childrenFor<T extends { title: string; id?: string }>(parentLabel: string, children: readonly T[], query: string, contentHits: ReadonlySet<string> = NO_CONTENT): T[] {
+export function childrenFor<T extends { title: string; id?: string; targets?: readonly { name: string }[] }>(parentLabel: string, children: readonly T[], query: string, contentHits: ReadonlySet<string> = NO_CONTENT): T[] {
     return hit(parentLabel, query) ? [...children] : ranked(children, query, contentHits);
 }
 
@@ -77,6 +81,7 @@ export interface FilterChat {
     /** The chat id, used to test membership in the content-hit set. Optional so
      *  pure title-only callers (and tests) need not supply it. */
     readonly id?: string;
+    readonly targets?: readonly { name: string }[];
 }
 export interface FilterPlacement {
     readonly archetypeName: string;
@@ -129,12 +134,12 @@ export function recentLineage(
 /** A Recent row matches its title, its displayed lineage, or a server-projected
  * content hit. This keeps search useful without reconstructing rooted groups. */
 export function recentVisible(
-    chat: { title: string; id?: string },
+    chat: { title: string; id?: string; targets?: readonly { name: string }[] },
     lineage: string,
     query: string,
     contentHits: ReadonlySet<string> = NO_CONTENT,
 ): boolean {
-    return hit(chat.title, query) || hit(lineage, query) || (chat.id !== undefined && contentHits.has(chat.id));
+    return chatLabelMatches(chat, query) || hit(lineage, query) || (chat.id !== undefined && contentHits.has(chat.id));
 }
 
 /** Group "All chats" by their owning archetype, after dropping rows that match

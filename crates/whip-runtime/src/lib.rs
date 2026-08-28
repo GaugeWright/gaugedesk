@@ -71,6 +71,65 @@ pub fn compile_whip_program(source: &str) -> CompiledWhipProgram {
             .collect(),
     }
 }
+
+pub(crate) fn validate_workspace_targets(
+    targets: &[gaugedesk_harness::WorkspaceTargetBinding],
+) -> Result<(), String> {
+    let mut ids = BTreeSet::new();
+    let mut handles = BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    for target in targets {
+        if target.target_id.is_empty()
+            || !ids.insert(target.target_id.as_str())
+            || !handles.insert(target.resource_handle.as_str())
+            || !roots.insert(target.root.as_str())
+        {
+            return Err("workspace target declaration has an empty or duplicate identity".into());
+        }
+        let mut components = target.root.split('/');
+        if components.next() != Some("targets")
+            || !components.next().is_some_and(|root| root.starts_with("t-"))
+            || components.next().is_some()
+            || !target.resource_handle.starts_with("target:")
+        {
+            return Err("workspace target declaration has a non-canonical root or handle".into());
+        }
+        if !target.readable || (target.output && !target.writable) {
+            return Err("workspace target declaration has impossible I/O capabilities".into());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn workspace_resource_refs(
+    targets: &[gaugedesk_harness::WorkspaceTargetBinding],
+) -> Vec<ResourceRef> {
+    if targets.is_empty() {
+        vec![ResourceRef {
+            handle: "project".to_owned(),
+            kind: "file_store".to_owned(),
+            selector: None,
+            writable: None,
+        }]
+    } else {
+        let mut resources = targets
+            .iter()
+            .map(|target| ResourceRef {
+                handle: target.resource_handle.clone(),
+                kind: "file_store".to_owned(),
+                selector: Some(target.root.clone()),
+                writable: Some(target.writable),
+            })
+            .collect::<Vec<_>>();
+        resources.push(ResourceRef {
+            handle: TARGET_MANIFEST_RESOURCE.to_owned(),
+            kind: "file_store".to_owned(),
+            selector: Some(TARGET_MANIFEST_SELECTOR.to_owned()),
+            writable: Some(false),
+        });
+        resources
+    }
+}
 use whipplescript::ifc::VerifiedEnvelope;
 
 pub mod gate_runner;
@@ -94,6 +153,8 @@ pub const QUESTION_ASK_CAPABILITY: &str = "question.ask";
 /// `execute_tool` refuses `ask` without it, exactly as `bash` refuses without
 /// `command`.
 pub const QUESTION_RESOURCE: &str = "question";
+pub const TARGET_MANIFEST_RESOURCE: &str = "target_manifest";
+pub const TARGET_MANIFEST_SELECTOR: &str = ".gaugedesk-runtime/target-set.json";
 
 /// The pinned GaugeDesk governance root WhippleScript calls to verify an
 /// externally signed policy envelope. Both the responsible authority identity
@@ -521,7 +582,8 @@ impl WhipHarnessFactory {
             .map(|fork| fork.target)
             .map_err(invalid_data)?;
 
-        let read_only = spec
+        validate_workspace_targets(&spec.workspace_targets).map_err(invalid_data)?;
+        let mut read_only = spec
             .sandbox
             .read_only_roots
             .iter()
@@ -536,6 +598,15 @@ impl WhipHarnessFactory {
                     })
             })
             .collect::<io::Result<Vec<_>>>()?;
+        read_only.extend(
+            spec.workspace_targets
+                .iter()
+                .filter(|target| !target.writable)
+                .map(|target| PathBuf::from(&target.root)),
+        );
+        if !spec.workspace_targets.is_empty() {
+            read_only.push(PathBuf::from(TARGET_MANIFEST_SELECTOR));
+        }
         let workspace = NativeWorkspaceResolver::new(&spec.worktree)
             .and_then(|resolver| resolver.read_only(read_only))
             .map_err(invalid_data)?;
@@ -557,6 +628,7 @@ impl WhipHarnessFactory {
             credential_ref: spec.credential_ref.clone().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "credential ref is required")
             })?,
+            workspace_targets: spec.workspace_targets.clone(),
             placement_ceiling_ref: spec.placement_ceiling_ref.clone().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -695,6 +767,27 @@ impl HarnessFactory for WhipHarnessFactory {
             .map_err(invalid_data)
     }
 
+    fn discard_continuity(&self, target: &HarnessContinuitySpec) -> io::Result<()> {
+        if let Some(config) = &self.hosted {
+            return hosted::discard_continuity(config, target);
+        }
+        let database = self
+            .runtime_root
+            .join(format!("{}.sqlite", hex::encode(target.chat_id.as_bytes())));
+        for path in [
+            database.clone(),
+            database.with_extension("sqlite-wal"),
+            database.with_extension("sqlite-shm"),
+        ] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     fn credential_status(
         &self,
         provider: &str,
@@ -730,6 +823,7 @@ struct WhipHarness {
     chat_id: String,
     provider_binding_ref: String,
     credential_ref: String,
+    workspace_targets: Vec<gaugedesk_harness::WorkspaceTargetBinding>,
     placement_ceiling_ref: String,
     respondent_ref: String,
     turn_sequence: u64,
@@ -876,17 +970,14 @@ impl WhipHarness {
         };
         let mut resources = Vec::new();
         if has("workspace.read") || has("workspace.write") {
-            resources.push(ResourceRef {
-                handle: "project".to_owned(),
-                kind: "file_store".to_owned(),
-                selector: None,
-            });
+            resources.extend(workspace_resource_refs(&self.workspace_targets));
         }
         if has("command.run") {
             resources.push(ResourceRef {
                 handle: "command".to_owned(),
                 kind: "command".to_owned(),
                 selector: None,
+                writable: None,
             });
         }
         // ADR 0113: asking is a governed ability. An archetype whose ceiling
@@ -897,6 +988,7 @@ impl WhipHarness {
                 handle: QUESTION_RESOURCE.to_owned(),
                 kind: QUESTION_RESOURCE.to_owned(),
                 selector: None,
+                writable: None,
             });
         }
         StartTurnCommand {
@@ -916,6 +1008,7 @@ impl WhipHarness {
                         handle: "turn_images".to_owned(),
                         kind: "image".to_owned(),
                         selector: Some(index.to_string()),
+                        writable: None,
                     })
                     .collect(),
             },
@@ -2052,6 +2145,109 @@ impl std::error::Error for PolicyAdmissionError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_target_resources_are_exact_and_never_include_project() {
+        let targets = vec![
+            gaugedesk_harness::WorkspaceTargetBinding {
+                target_id: "target-a".to_owned(),
+                resource_handle: "target:t-a".to_owned(),
+                root: "targets/t-a".to_owned(),
+                readable: true,
+                writable: true,
+                output: true,
+            },
+            gaugedesk_harness::WorkspaceTargetBinding {
+                target_id: "target-b".to_owned(),
+                resource_handle: "target:t-b".to_owned(),
+                root: "targets/t-b".to_owned(),
+                readable: true,
+                writable: false,
+                output: false,
+            },
+        ];
+        super::validate_workspace_targets(&targets).expect("valid sparse targets");
+        let resources = super::workspace_resource_refs(&targets);
+        assert_eq!(resources.len(), 3);
+        assert_eq!(resources[0].handle, "target:t-a");
+        assert_eq!(resources[0].selector.as_deref(), Some("targets/t-a"));
+        assert_eq!(resources[0].writable, Some(true));
+        assert_eq!(resources[1].handle, "target:t-b");
+        assert_eq!(resources[1].selector.as_deref(), Some("targets/t-b"));
+        assert_eq!(resources[1].writable, Some(false));
+        assert_eq!(resources[2].handle, super::TARGET_MANIFEST_RESOURCE);
+        assert_eq!(
+            resources[2].selector.as_deref(),
+            Some(super::TARGET_MANIFEST_SELECTOR)
+        );
+        assert_eq!(resources[2].writable, Some(false));
+        assert!(resources
+            .iter()
+            .all(|resource| resource.handle != "project"));
+
+        let duplicate = vec![targets[0].clone(), targets[0].clone()];
+        assert!(super::validate_workspace_targets(&duplicate).is_err());
+        let mut impossible = targets[1].clone();
+        impossible.output = true;
+        assert!(super::validate_workspace_targets(&[impossible]).is_err());
+    }
+
+    #[test]
+    fn native_workspace_rejects_writes_below_a_read_only_target_root() {
+        use whipplescript::host_runtime::{NativeWorkspaceResolver, ResourceResolver};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let read_only = root.path().join("targets/t-read-only");
+        let writable = root.path().join("targets/t-writable");
+        std::fs::create_dir_all(&read_only).expect("read-only root");
+        std::fs::create_dir_all(&writable).expect("writable root");
+        std::fs::create_dir_all(root.path().join(".gaugedesk-runtime")).expect("manifest root");
+        std::fs::write(root.path().join(super::TARGET_MANIFEST_SELECTOR), "{}").expect("manifest");
+        let workspace = NativeWorkspaceResolver::new(root.path())
+            .and_then(|resolver| {
+                resolver.read_only([
+                    std::path::PathBuf::from("targets/t-read-only"),
+                    std::path::PathBuf::from(super::TARGET_MANIFEST_SELECTOR),
+                ])
+            })
+            .expect("resolver");
+        let resources = super::workspace_resource_refs(&[
+            gaugedesk_harness::WorkspaceTargetBinding {
+                target_id: "read-only".to_owned(),
+                resource_handle: "target:t-read-only".to_owned(),
+                root: "targets/t-read-only".to_owned(),
+                readable: true,
+                writable: false,
+                output: false,
+            },
+            gaugedesk_harness::WorkspaceTargetBinding {
+                target_id: "writable".to_owned(),
+                resource_handle: "target:t-writable".to_owned(),
+                root: "targets/t-writable".to_owned(),
+                readable: true,
+                writable: true,
+                output: true,
+            },
+        ]);
+        let write = |path: &str| super::ToolCall {
+            id: format!("write-{path}"),
+            name: "write".to_owned(),
+            arguments: serde_json::json!({ "path": path, "content": "candidate" }),
+        };
+        assert!(workspace
+            .execute_tool(&resources, &write("targets/t-read-only/note.txt"))
+            .is_err());
+        assert!(workspace
+            .execute_tool(&resources, &write(super::TARGET_MANIFEST_SELECTOR))
+            .is_err());
+        workspace
+            .execute_tool(&resources, &write("targets/t-writable/note.txt"))
+            .expect("writable target");
+        assert_eq!(
+            std::fs::read_to_string(writable.join("note.txt")).expect("written candidate"),
+            "candidate"
+        );
+    }
+
     /// The native answer-delta relay: WhippleScript's `observe_text_delta`
     /// lands in the engine's observation sink as the same operational `text`
     /// event the hosted harness emits, and marks the turn streamed so the
@@ -2173,7 +2369,7 @@ mod tests {
 
     fn test_credential_capability() -> Arc<dyn CredentialCapability> {
         Arc::new(TestCredentialCapability {
-            credential_ref: "gaugedesk:credential:account:openai".to_owned(),
+            credential_ref: "credential:gaugedesk/account/616c696365/6f70656e6169/v1".to_owned(),
         })
     }
 
@@ -2232,7 +2428,8 @@ mod tests {
                     provider: "openai".to_owned(),
                     model: "gpt-test".to_owned(),
                     base_url: "https://api.openai.com".to_owned(),
-                    credential_ref: "gaugedesk:credential:account:openai".to_owned(),
+                    credential_ref: "credential:gaugedesk/account/616c696365/6f70656e6169/v1"
+                        .to_owned(),
                     wire: Some("openai-responses".to_owned()),
                 },
             )]),
@@ -2416,11 +2613,13 @@ mod tests {
                 handle: "gaugedesk:resource:project".to_owned(),
                 kind: "file_store".to_owned(),
                 selector: None,
+                writable: None,
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "gaugedesk:provider:primary".to_owned(),
                 credential: CredentialRef {
-                    credential_id: "gaugedesk:credential:account:openai".to_owned(),
+                    credential_id: "credential:gaugedesk/account/616c696365/6f70656e6169/v1"
+                        .to_owned(),
                 },
             },
             placement_ceiling_ref: "gaugedesk:placement:local".to_owned(),
@@ -2533,8 +2732,11 @@ workflow Method {
             policy_epoch: Some(1),
             signed_policy_envelope: Some(signed_harness_policy()),
             provider_binding_ref: Some("model".to_owned()),
-            credential_ref: Some("gaugedesk:credential:account:openai".to_owned()),
+            credential_ref: Some(
+                "credential:gaugedesk/account/616c696365/6f70656e6169/v1".to_owned(),
+            ),
             placement_ceiling_ref: Some("local".to_owned()),
+            workspace_targets: Vec::new(),
             runtime_placement_id: Some("placement-test".to_owned()),
             provider: Some("openai".to_owned()),
             model: Some("gpt-test".to_owned()),

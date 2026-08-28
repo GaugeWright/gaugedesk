@@ -211,7 +211,10 @@ impl WhipTrackerHandle {
 
     /// Close an issue (open/in_progress → closed). Returns whether a row moved.
     pub fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> TrackerResult<bool> {
-        Ok(self.items.finish_item(item_id, summary)?)
+        Ok(matches!(
+            self.items.finish_item(item_id, summary, None)?,
+            whipplescript_store::items::FinishOutcome::Finished
+        ))
     }
 
     /// Whether any issue has been filed into `queue` — used to seed the

@@ -30,6 +30,14 @@ use whipplescript_store::vcs::{
     MergeProbeOutcome, NativeWorkspaceVcs, ReconcileOutcome, RestoreOutcome, VcsMergeOutcome,
     VcsWriteOutcome,
 };
+use whipplescript_store::workstreams::{
+    ArchiveOutcome, BoundaryReservation, ClosePromotedOutcome, CreateStreamOutcome,
+    RecordRefAdvancedOutcome, ReserveBoundaryOutcome, WorkstreamStore, Workstreams,
+};
+pub use whipplescript_store::workstreams::{
+    BranchHomeReceiptV1, JoinOutcome as WorkstreamTransferOutcome, StreamStatus,
+    WorkstreamBoundaryReceiptV1, WorkstreamRow,
+};
 
 mod external;
 pub use external::{ExternalTargetKind, ExternalWorkspace};
@@ -45,10 +53,22 @@ fn is_chat_local_path(path: &str) -> bool {
         .any(|root| path == *root || path.starts_with(&format!("{root}/")))
 }
 
-/// Same-provider export envelope: raw snapshots of the two store files.
-/// Full fidelity (every branch, cut, op, and blob travels), version-stamped.
-pub const EXPORT_FORMAT: &str = "whipplescript-vcs-export-v1";
-const EXPORT_MAGIC: &[u8; 8] = b"WSVCSEX1";
+fn nonempty(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
+/// Same-provider export envelope: raw snapshots of the native VCS and
+/// workstream-authority stores. Full fidelity (every branch, cut, op, blob,
+/// stream, membership, and branch-home receipt travels), version-stamped.
+pub const EXPORT_FORMAT: &str = "whipplescript-vcs-export-v2";
+const EXPORT_MAGIC: &[u8; 8] = b"WSVCSEX2";
+const LEGACY_EXPORT_MAGIC: &[u8; 8] = b"WSVCSEX1";
+
+struct ExportStores {
+    branches: Vec<u8>,
+    content: Vec<u8>,
+    workstreams: Option<Vec<u8>>,
+}
 
 #[derive(Debug)]
 pub struct WorkspaceError {
@@ -95,6 +115,29 @@ pub struct FileEntry {
 pub enum MergeOutcome {
     Clean,
     Conflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkstreamPromotionOutcome {
+    Promoted {
+        receipt: Box<WorkstreamBoundaryReceiptV1>,
+        rehomed_chat_ids: Vec<String>,
+    },
+    Conflicted {
+        paths: Vec<String>,
+    },
+    Refused(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct WorkstreamPromotionReservation {
+    pub workstream_id: String,
+    pub reservation_id: String,
+    pub line_branch_id: String,
+    pub expected_line_cut: String,
+    pub expected_main_cut: String,
+    pub proposed_main_cut: String,
+    pub changed_paths: Vec<String>,
 }
 
 /// Whip's merge-piece surface, re-exported so consumers (the fold UI's
@@ -258,6 +301,10 @@ impl Instance {
         Self::open(dir.as_ref().join("repo"), dir.as_ref().join("worktrees"))
     }
 
+    fn workstreams(&self) -> Result<WorkstreamStore> {
+        WorkstreamStore::open(self.store_root.join("workstreams.sqlite")).map_err(Into::into)
+    }
+
     pub fn repo(&self) -> &Path {
         &self.repo
     }
@@ -285,15 +332,15 @@ impl Instance {
 
     pub fn export(&self) -> Result<WorkspaceExport> {
         let _ = self.store()?;
+        let _ = self.workstreams()?;
         let branches = snapshot_sqlite(&self.store_root.join("branches.sqlite"))?;
         let content = snapshot_sqlite(&self.store_root.join("content.sqlite"))?;
-        let mut bytes = Vec::with_capacity(16 + 16 + branches.len() + content.len());
-        bytes.extend_from_slice(EXPORT_MAGIC);
-        bytes.extend_from_slice(&(branches.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&branches);
-        bytes.extend_from_slice(&(content.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&content);
-        Ok(WorkspaceExport(bytes))
+        let workstreams = snapshot_sqlite(&self.store_root.join("workstreams.sqlite"))?;
+        Ok(WorkspaceExport(encode_export(
+            &branches,
+            &content,
+            &workstreams,
+        )))
     }
 
     pub fn export_format(&self) -> &'static str {
@@ -301,7 +348,11 @@ impl Instance {
     }
 
     pub fn from_export_at(dir: impl AsRef<Path>, export: &[u8]) -> Result<Self> {
-        let (branches, content) = parse_export(export)?;
+        let ExportStores {
+            branches,
+            content,
+            workstreams,
+        } = parse_export(export)?;
         let dir = dir.as_ref();
         let repo = dir.join("repo");
         let worktrees = dir.join("worktrees");
@@ -311,12 +362,19 @@ impl Instance {
         std::fs::create_dir_all(&store_root).map_err(WorkspaceError::io)?;
         std::fs::write(store_root.join("branches.sqlite"), branches).map_err(WorkspaceError::io)?;
         std::fs::write(store_root.join("content.sqlite"), content).map_err(WorkspaceError::io)?;
+        if let Some(workstreams) = workstreams {
+            std::fs::write(store_root.join("workstreams.sqlite"), workstreams)
+                .map_err(WorkspaceError::io)?;
+        }
         write_substrate_stamp(&store_root)?;
         let instance = Self {
             repo,
             worktrees,
             store_root,
         };
+        // A legacy v1 export had no topology store. Open creates an empty one;
+        // v2 opens and validates the transported authoritative state.
+        let _ = instance.workstreams()?;
         let mut vcs = instance.store()?;
         sync_out(
             &mut vcs,
@@ -335,12 +393,15 @@ impl Instance {
     pub fn fork_from_at(dir: impl AsRef<Path>, source: &PeerSource) -> Result<Self> {
         let branches = snapshot_sqlite(&source.0.join("branches.sqlite"))?;
         let content = snapshot_sqlite(&source.0.join("content.sqlite"))?;
-        let mut export = Vec::new();
-        export.extend_from_slice(EXPORT_MAGIC);
-        export.extend_from_slice(&(branches.len() as u64).to_le_bytes());
-        export.extend_from_slice(&branches);
-        export.extend_from_slice(&(content.len() as u64).to_le_bytes());
-        export.extend_from_slice(&content);
+        let workstreams_path = source.0.join("workstreams.sqlite");
+        let workstreams = if workstreams_path.exists() {
+            snapshot_sqlite(&workstreams_path)?
+        } else {
+            let store = WorkstreamStore::open(&workstreams_path)?;
+            drop(store);
+            snapshot_sqlite(&workstreams_path)?
+        };
+        let export = encode_export(&branches, &content, &workstreams);
         Self::from_export_at(dir, &export)
     }
 
@@ -487,7 +548,25 @@ impl Instance {
         self.create_engagement_on(id, MAINLINE_BRANCH_ID)
     }
 
+    pub fn create_engagement_subset(
+        &self,
+        id: &str,
+        target: &str,
+        roots: &BTreeSet<String>,
+    ) -> Result<Engagement> {
+        self.create_engagement_on_with_roots(id, target, Some(roots.clone()))
+    }
+
     pub fn create_engagement_on(&self, id: &str, target: &str) -> Result<Engagement> {
+        self.create_engagement_on_with_roots(id, target, None)
+    }
+
+    fn create_engagement_on_with_roots(
+        &self,
+        id: &str,
+        target: &str,
+        sparse_roots: Option<BTreeSet<String>>,
+    ) -> Result<Engagement> {
         let mut vcs = self.store()?;
         let branch = engagement_line(id);
         match vcs.create_branch(&branch, None, target, &now_at())? {
@@ -499,13 +578,20 @@ impl Instance {
             }
         }
         let path = self.worktrees.join(id);
-        sync_out(&mut vcs, &self.store_root, &branch, &path)?;
+        sync_out_with_roots(
+            &mut vcs,
+            &self.store_root,
+            &branch,
+            &path,
+            sparse_roots.as_ref(),
+        )?;
         Ok(Engagement {
             store_root: self.store_root.clone(),
             repo: self.repo.clone(),
             path,
             branch,
             target: target.into(),
+            sparse_roots,
         })
     }
 
@@ -518,6 +604,28 @@ impl Instance {
         target: &str,
         cut_id: &str,
     ) -> Result<Engagement> {
+        self.fork_engagement_at_with_roots(id, source_branch, target, cut_id, None)
+    }
+
+    pub fn fork_engagement_subset_at(
+        &self,
+        id: &str,
+        source_branch: &str,
+        target: &str,
+        cut_id: &str,
+        roots: &BTreeSet<String>,
+    ) -> Result<Engagement> {
+        self.fork_engagement_at_with_roots(id, source_branch, target, cut_id, Some(roots.clone()))
+    }
+
+    fn fork_engagement_at_with_roots(
+        &self,
+        id: &str,
+        source_branch: &str,
+        target: &str,
+        cut_id: &str,
+        sparse_roots: Option<BTreeSet<String>>,
+    ) -> Result<Engagement> {
         let mut vcs = self.store()?;
         let branch = engagement_line(id);
         match vcs.fork_with_lineage(&branch, None, source_branch, Some(cut_id), &now_at())? {
@@ -529,13 +637,20 @@ impl Instance {
             }
         }
         let path = self.worktrees.join(id);
-        sync_out(&mut vcs, &self.store_root, &branch, &path)?;
+        sync_out_with_roots(
+            &mut vcs,
+            &self.store_root,
+            &branch,
+            &path,
+            sparse_roots.as_ref(),
+        )?;
         Ok(Engagement {
             store_root: self.store_root.clone(),
             repo: self.repo.clone(),
             path,
             branch,
             target: target.into(),
+            sparse_roots,
         })
     }
 
@@ -552,7 +667,7 @@ impl Instance {
     /// can name survives; per-blob erasure stays the honesty path for
     /// payloads that must actually go.
     pub fn purge_unreachable_objects(&self) -> Result<()> {
-        let _ = self.store()?.purge_unreachable()?;
+        let _ = self.store()?.purge_unreachable(&now_at())?;
         Ok(())
     }
 
@@ -582,6 +697,7 @@ impl Instance {
                         .parent_branch_id
                         .clone()
                         .unwrap_or_else(|| MAINLINE_BRANCH_ID.to_owned()),
+                    sparse_roots: None,
                 },
             ));
         }
@@ -594,33 +710,370 @@ impl Instance {
     }
 
     pub fn create_workstream(&self, id: &str) -> Result<()> {
+        self.create_named_workstream(id, None)
+    }
+
+    /// Create the shared line and its authoritative WhippleScript topology row.
+    /// The line may be left as an unreachable orphan if the topology write
+    /// fails; membership can never observe it because Workstreams is the sole
+    /// admission authority.
+    pub fn create_named_workstream(&self, id: &str, name: Option<&str>) -> Result<()> {
         let mut vcs = self.store()?;
         let line = Self::workstream_ref(id);
         match vcs.create_branch(&line, None, MAINLINE_BRANCH_ID, &now_at())? {
-            CreateBranchOutcome::Created(_) | CreateBranchOutcome::Existing(_) => Ok(()),
+            CreateBranchOutcome::Created(_) | CreateBranchOutcome::Existing(_) => {}
             other => Err(WorkspaceError::msg(format!(
                 "could not create workstream line `{line}`: {other:?}"
+            )))?,
+        }
+        let at = now_at();
+        match self
+            .workstreams()?
+            .create_stream(id, name, &line, &at, Some(id))?
+        {
+            CreateStreamOutcome::Created(_) | CreateStreamOutcome::Existing(_) => Ok(()),
+            CreateStreamOutcome::NameTaken { holder_stream_id } => Err(WorkspaceError::msg(
+                format!("workstream name is already held by `{holder_stream_id}`"),
+            )),
+        }
+    }
+
+    pub fn transfer_engagement_to_workstream(
+        &self,
+        engagement_id: &str,
+        workstream_id: &str,
+    ) -> Result<WorkstreamTransferOutcome> {
+        Ok(self.workstreams()?.transfer(
+            &engagement_line(engagement_id),
+            workstream_id,
+            &now_at(),
+        )?)
+    }
+
+    pub fn leave_engagement_workstream(&self, engagement_id: &str) -> Result<Option<String>> {
+        Ok(self.workstreams()?.leave(&engagement_line(engagement_id))?)
+    }
+
+    pub fn engagement_home_receipt(&self, engagement_id: &str) -> Result<BranchHomeReceiptV1> {
+        Ok(self
+            .workstreams()?
+            .home_receipt(&engagement_line(engagement_id))?)
+    }
+
+    pub fn workstream(&self, workstream_id: &str) -> Result<Option<WorkstreamRow>> {
+        Ok(self.workstreams()?.get_stream(workstream_id)?)
+    }
+
+    pub fn workstream_members(&self, workstream_id: &str) -> Result<Vec<String>> {
+        self.workstreams()?
+            .members(workstream_id)
+            .map(|members| {
+                members
+                    .into_iter()
+                    .filter_map(|branch| branch.strip_prefix("engagement/").map(str::to_owned))
+                    .collect()
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn archive_workstream(&self, workstream_id: &str) -> Result<Vec<String>> {
+        match self
+            .workstreams()?
+            .archive_stream(workstream_id, &now_at())?
+        {
+            ArchiveOutcome::Archived { rehomed_branch_ids } => Ok(rehomed_branch_ids
+                .into_iter()
+                .filter_map(|branch| branch.strip_prefix("engagement/").map(str::to_owned))
+                .collect()),
+            ArchiveOutcome::AlreadyArchived => Ok(Vec::new()),
+            other => Err(WorkspaceError::msg(format!(
+                "workstream archive refused: {other:?}"
+            ))),
+        }
+    }
+
+    /// Freeze one exact named-line/Main pair before the product builds its
+    /// immutable promotion manifest or preflights optional native effects.
+    pub fn reserve_workstream_promotion_boundary(
+        &self,
+        id: &str,
+        reservation_id: &str,
+    ) -> Result<WorkstreamPromotionReservation> {
+        let mut vcs = self.store()?;
+        sync_in(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
+        let at = now_at();
+        let mut streams = self.workstreams()?;
+        let mut stream = streams
+            .get_stream(id)?
+            .ok_or_else(|| WorkspaceError::msg(format!("no such workstream `{id}`")))?;
+        if stream.status == StreamStatus::Active {
+            let line = vcs
+                .get_branch(&stream.line_branch_id)?
+                .ok_or_else(|| WorkspaceError::msg("workstream line is missing"))?;
+            let main = vcs
+                .get_branch(MAINLINE_BRANCH_ID)?
+                .ok_or_else(|| WorkspaceError::msg("collaboration Main is missing"))?;
+            let expected_line = line.head_cut_id.unwrap_or_default();
+            let expected_main = main.head_cut_id.unwrap_or_default();
+            let proposed_main = fresh_cut_id("promote-main");
+            stream = match streams.reserve_boundary(
+                id,
+                BoundaryReservation {
+                    reservation_id,
+                    expected_line_cut: &expected_line,
+                    expected_main_cut: &expected_main,
+                    proposed_main_cut: &proposed_main,
+                    at: &at,
+                },
+            )? {
+                ReserveBoundaryOutcome::Reserved(row) | ReserveBoundaryOutcome::Existing(row) => {
+                    row
+                }
+                outcome => {
+                    return Err(WorkspaceError::msg(format!(
+                        "promotion reservation refused: {outcome:?}"
+                    )))
+                }
+            };
+        }
+        if !matches!(
+            stream.status,
+            StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced | StreamStatus::Archived
+        ) {
+            return Err(WorkspaceError::msg(format!(
+                "workstream cannot reserve promotion from {}",
+                stream.status.as_str()
+            )));
+        }
+        let expected_line_cut = stream.expected_line_cut.clone().unwrap_or_default();
+        let expected_main_cut = stream.expected_main_cut.clone().unwrap_or_default();
+        let line_manifest = if expected_line_cut.is_empty() {
+            BTreeMap::new()
+        } else {
+            vcs.cut_manifest(&expected_line_cut)?
+                .ok_or_else(|| WorkspaceError::msg("reserved line cut is unavailable"))?
+        };
+        let main_manifest = if expected_main_cut.is_empty() {
+            BTreeMap::new()
+        } else {
+            vcs.cut_manifest(&expected_main_cut)?
+                .ok_or_else(|| WorkspaceError::msg("reserved Main cut is unavailable"))?
+        };
+        let mut changed_paths = line_manifest
+            .keys()
+            .chain(main_manifest.keys())
+            .filter(|path| line_manifest.get(*path) != main_manifest.get(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        changed_paths.sort();
+        changed_paths.dedup();
+        Ok(WorkstreamPromotionReservation {
+            workstream_id: id.to_owned(),
+            reservation_id: stream.reservation_id.unwrap_or_default(),
+            line_branch_id: stream.line_branch_id,
+            expected_line_cut,
+            expected_main_cut,
+            proposed_main_cut: stream.proposed_main_cut.unwrap_or_default(),
+            changed_paths,
+        })
+    }
+
+    pub fn release_workstream_promotion_boundary(
+        &self,
+        id: &str,
+        reservation_id: &str,
+    ) -> Result<()> {
+        let mut streams = self.workstreams()?;
+        match streams.release_boundary(id, reservation_id, &now_at())? {
+            whipplescript_store::workstreams::ReleaseBoundaryOutcome::Released
+            | whipplescript_store::workstreams::ReleaseBoundaryOutcome::AlreadyActive => Ok(()),
+            outcome => Err(WorkspaceError::msg(format!(
+                "promotion reservation release refused: {outcome:?}"
             ))),
         }
     }
 
     pub fn promote_workstream_to_main(&self, id: &str) -> Result<MergeOutcome> {
+        match self.promote_workstream_boundary(
+            id,
+            "native-workspace",
+            &fresh_cut_id("promotion-reservation"),
+        )? {
+            WorkstreamPromotionOutcome::Promoted { .. } => Ok(MergeOutcome::Clean),
+            WorkstreamPromotionOutcome::Conflicted { .. } => Ok(MergeOutcome::Conflict),
+            WorkstreamPromotionOutcome::Refused(reason) => Err(WorkspaceError::msg(reason)),
+        }
+    }
+
+    /// DR-0078's recoverable `active → reserved → ref-advanced → archived`
+    /// sequence. The WhippleScript row freezes every topology/contribution path;
+    /// the exact Main CAS is the sole collaboration acceptance boundary.
+    pub fn promote_workstream_boundary(
+        &self,
+        id: &str,
+        workspace_authority_id: &str,
+        reservation_id: &str,
+    ) -> Result<WorkstreamPromotionOutcome> {
         let mut vcs = self.store()?;
         sync_in(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
-        match vcs.merge_keeping(
-            &Self::workstream_ref(id),
-            &fresh_cut_id("promote"),
-            &now_at(),
-        )? {
-            VcsMergeOutcome::Landed { .. } | VcsMergeOutcome::Adopted { .. } => {
-                sync_out(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
-                Ok(MergeOutcome::Clean)
-            }
-            VcsMergeOutcome::Conflicted { .. } => Ok(MergeOutcome::Conflict),
-            other => Err(WorkspaceError::msg(format!(
-                "workstream promotion refused: {other:?}"
-            ))),
+        let at = now_at();
+        let mut streams = self.workstreams()?;
+        let mut stream = streams
+            .get_stream(id)?
+            .ok_or_else(|| WorkspaceError::msg(format!("no such workstream `{id}`")))?;
+        if stream.status == StreamStatus::Archived {
+            let receipt = stream
+                .boundary_receipt(workspace_authority_id)
+                .ok_or_else(|| WorkspaceError::msg("archived workstream has no receipt"))?;
+            return Ok(WorkstreamPromotionOutcome::Promoted {
+                receipt: Box::new(receipt),
+                rehomed_chat_ids: Vec::new(),
+            });
         }
+        if stream.status == StreamStatus::Active {
+            let line = vcs
+                .get_branch(&stream.line_branch_id)?
+                .ok_or_else(|| WorkspaceError::msg("workstream line is missing"))?;
+            let main = vcs
+                .get_branch(MAINLINE_BRANCH_ID)?
+                .ok_or_else(|| WorkspaceError::msg("collaboration Main is missing"))?;
+            let expected_line = line.head_cut_id.unwrap_or_default();
+            let expected_main = main.head_cut_id.unwrap_or_default();
+            let proposed_main = fresh_cut_id("promote-main");
+            stream = match streams.reserve_boundary(
+                id,
+                BoundaryReservation {
+                    reservation_id,
+                    expected_line_cut: &expected_line,
+                    expected_main_cut: &expected_main,
+                    proposed_main_cut: &proposed_main,
+                    at: &at,
+                },
+            )? {
+                ReserveBoundaryOutcome::Reserved(row) | ReserveBoundaryOutcome::Existing(row) => {
+                    row
+                }
+                outcome => {
+                    return Ok(WorkstreamPromotionOutcome::Refused(format!(
+                        "promotion reservation refused: {outcome:?}"
+                    )))
+                }
+            };
+        }
+        let reservation = stream.reservation_id.clone().unwrap_or_default();
+        if stream.status == StreamStatus::RefAdvanced {
+            let rehomed_branch_ids = match streams.close_promoted(id, &reservation, &at)? {
+                ClosePromotedOutcome::Closed { rehomed_branch_ids } => rehomed_branch_ids,
+                ClosePromotedOutcome::AlreadyClosed => Vec::new(),
+                outcome => {
+                    return Ok(WorkstreamPromotionOutcome::Refused(format!(
+                        "post-CAS close refused: {outcome:?}"
+                    )))
+                }
+            };
+            let row = streams
+                .get_stream(id)?
+                .ok_or_else(|| WorkspaceError::msg("closed workstream disappeared"))?;
+            let receipt = row
+                .boundary_receipt(workspace_authority_id)
+                .ok_or_else(|| WorkspaceError::msg("closed workstream has no boundary receipt"))?;
+            return Ok(WorkstreamPromotionOutcome::Promoted {
+                receipt: Box::new(receipt),
+                rehomed_chat_ids: rehomed_branch_ids
+                    .into_iter()
+                    .filter_map(|branch| branch.strip_prefix("engagement/").map(str::to_owned))
+                    .collect(),
+            });
+        }
+        if stream.status != StreamStatus::BoundaryReserved {
+            return Ok(WorkstreamPromotionOutcome::Refused(format!(
+                "workstream cannot promote from {}",
+                stream.status.as_str()
+            )));
+        }
+        let expected_line = stream.expected_line_cut.clone().unwrap_or_default();
+        let expected_main = stream.expected_main_cut.clone().unwrap_or_default();
+        let proposed_main = stream.proposed_main_cut.clone().unwrap_or_default();
+        if let Some((position, handle)) = vcs.boundary_ref_evidence(
+            &stream.line_branch_id,
+            nonempty(&expected_main),
+            &proposed_main,
+        )? {
+            match streams.record_ref_advanced(id, &reservation, position, &handle, &at)? {
+                RecordRefAdvancedOutcome::Recorded(_) | RecordRefAdvancedOutcome::Existing(_) => {}
+                outcome => {
+                    return Ok(WorkstreamPromotionOutcome::Refused(format!(
+                        "promotion receipt refused: {outcome:?}"
+                    )))
+                }
+            }
+        } else {
+            match vcs.promote_line_exact(
+                &stream.line_branch_id,
+                nonempty(&expected_line),
+                nonempty(&expected_main),
+                &proposed_main,
+                &at,
+            )? {
+                whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
+                    ref_position,
+                    ref_receipt_handle,
+                    ..
+                } => match streams.record_ref_advanced(
+                    id,
+                    &reservation,
+                    ref_position,
+                    &ref_receipt_handle,
+                    &at,
+                )? {
+                    RecordRefAdvancedOutcome::Recorded(_)
+                    | RecordRefAdvancedOutcome::Existing(_) => {}
+                    outcome => {
+                        return Ok(WorkstreamPromotionOutcome::Refused(format!(
+                            "promotion receipt refused: {outcome:?}"
+                        )))
+                    }
+                },
+                whipplescript_store::vcs::BoundaryPromotionOutcome::Conflicted { conflicts } => {
+                    let _ = streams.release_boundary(id, &reservation, &at);
+                    return Ok(WorkstreamPromotionOutcome::Conflicted {
+                        paths: conflicts
+                            .into_iter()
+                            .map(|conflict| conflict.path)
+                            .collect(),
+                    });
+                }
+                outcome => {
+                    let _ = streams.release_boundary(id, &reservation, &at);
+                    return Ok(WorkstreamPromotionOutcome::Refused(format!(
+                        "exact collaboration cuts moved or promotion was refused: {outcome:?}"
+                    )));
+                }
+            }
+        }
+        let members = streams.members(id)?;
+        match streams.close_promoted(id, &reservation, &at)? {
+            ClosePromotedOutcome::Closed { .. } | ClosePromotedOutcome::AlreadyClosed => {}
+            outcome => {
+                return Ok(WorkstreamPromotionOutcome::Refused(format!(
+                    "post-CAS close refused: {outcome:?}"
+                )))
+            }
+        }
+        sync_out(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
+        let row = streams
+            .get_stream(id)?
+            .ok_or_else(|| WorkspaceError::msg("closed workstream disappeared"))?;
+        let receipt = row
+            .boundary_receipt(workspace_authority_id)
+            .ok_or_else(|| WorkspaceError::msg("closed workstream has no boundary receipt"))?;
+        Ok(WorkstreamPromotionOutcome::Promoted {
+            receipt: Box::new(receipt),
+            rehomed_chat_ids: members
+                .into_iter()
+                .filter_map(|branch| branch.strip_prefix("engagement/").map(str::to_owned))
+                .collect(),
+        })
     }
 }
 
@@ -631,6 +1084,9 @@ pub struct Engagement {
     path: PathBuf,
     branch: String,
     target: String,
+    /// Stable target-root prefixes selected for this chat. `None` is the
+    /// full-manifest compatibility path used by archetype edit workspaces.
+    sparse_roots: Option<BTreeSet<String>>,
 }
 
 impl Engagement {
@@ -646,11 +1102,53 @@ impl Engagement {
     /// Import the worktree (and mainline's repo, when it is the target's
     /// disk tree) so store-level verbs see what's actually on disk.
     fn import_sides(&self, vcs: &mut NativeWorkspaceVcs) -> Result<()> {
-        sync_in(vcs, &self.store_root, &self.branch, &self.path)?;
+        sync_in_with_roots(
+            vcs,
+            &self.store_root,
+            &self.branch,
+            &self.path,
+            self.sparse_roots.as_ref(),
+        )?;
         if self.target == MAINLINE_BRANCH_ID {
             sync_in(vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
         }
         Ok(())
+    }
+
+    fn project_branch(&self, vcs: &mut NativeWorkspaceVcs) -> Result<()> {
+        sync_out_with_roots(
+            vcs,
+            &self.store_root,
+            &self.branch,
+            &self.path,
+            self.sparse_roots.as_ref(),
+        )
+    }
+
+    fn import_branch(&self, vcs: &mut NativeWorkspaceVcs) -> Result<Option<String>> {
+        sync_in_with_roots(
+            vcs,
+            &self.store_root,
+            &self.branch,
+            &self.path,
+            self.sparse_roots.as_ref(),
+        )
+    }
+
+    fn ensure_selected_path(&self, relative: &str) -> Result<()> {
+        if is_chat_local_path(relative)
+            || self.sparse_roots.as_ref().is_none_or(|roots| {
+                roots
+                    .iter()
+                    .any(|root| relative == root || relative.starts_with(&format!("{root}/")))
+            })
+        {
+            Ok(())
+        } else {
+            Err(WorkspaceError::msg(format!(
+                "path `{relative}` is outside this chat's selected target roots"
+            )))
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -661,6 +1159,28 @@ impl Engagement {
     }
     pub fn target(&self) -> &str {
         &self.target
+    }
+
+    /// Replace only this checkout's sparse view.  The collaboration branch and
+    /// WhippleScript workstream membership are unchanged; omitted partitions
+    /// remain in the branch manifest and cannot be interpreted as deletions.
+    pub fn replace_sparse_roots(&mut self, roots: &BTreeSet<String>) -> Result<()> {
+        if roots.is_empty() {
+            return Err(WorkspaceError::msg("a chat sparse view cannot be empty"));
+        }
+        let mut vcs = self.store()?;
+        // Preserve any pending work in the old admitted view before changing
+        // what this handle may import.
+        self.import_branch(&mut vcs)?;
+        sync_out_with_roots(
+            &mut vcs,
+            &self.store_root,
+            &self.branch,
+            &self.path,
+            Some(roots),
+        )?;
+        self.sparse_roots = Some(roots.clone());
+        Ok(())
     }
 
     pub fn set_target(&mut self, target: impl Into<String>) -> Result<()> {
@@ -728,7 +1248,7 @@ impl Engagement {
             }
             None => {
                 clear_worktree(&self.path)?;
-                sync_in(&mut vcs, &self.store_root, &self.branch, &self.path).map(|_| ())
+                self.import_branch(&mut vcs).map(|_| ())
             }
         };
         if let Err(error) = restored {
@@ -736,7 +1256,7 @@ impl Engagement {
             return Err(error);
         }
 
-        sync_out(&mut vcs, &self.store_root, &self.branch, &self.path)?;
+        self.project_branch(&mut vcs)?;
         for (path, body) in local_overlays {
             self.write_file(&path, &body)?;
         }
@@ -745,10 +1265,24 @@ impl Engagement {
     }
 
     pub fn commit_turn(&self, _message: &str) -> Result<Option<RevisionId>> {
+        // Import and projection are one branch-writer transaction. Releasing
+        // the writer after `import_diff` let another turn scan while this turn
+        // was materializing the new head, so the scanner could hash a file in
+        // the middle of replacement and receive a false content-moved conflict.
+        let writer = workspace_writer(&self.store_root, &self.branch);
+        let _writing = writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut vcs = self.store()?;
-        if let Some(cut) = sync_in(&mut vcs, &self.store_root, &self.branch, &self.path)? {
+        if let Some(cut) = sync_in_with_roots_under_writer(
+            &mut vcs,
+            &self.store_root,
+            &self.branch,
+            &self.path,
+            self.sparse_roots.as_ref(),
+        )? {
+            self.project_branch(&mut vcs)?;
             return Ok(Some(RevisionId(cut)));
         }
+        self.project_branch(&mut vcs)?;
         let cut_id = fresh_cut_id("turn-boundary");
         let cut = vcs
             .cut_at_quiescence(&self.branch, &cut_id, &now_at())?
@@ -788,10 +1322,10 @@ impl Engagement {
                 // Virgin target: revert means "empty tree" — import the
                 // cleared worktree as this branch's own cut.
                 clear_worktree(&self.path)?;
-                sync_in(&mut vcs, &self.store_root, &self.branch, &self.path)?;
+                self.import_branch(&mut vcs)?;
             }
         }
-        sync_out(&mut vcs, &self.store_root, &self.branch, &self.path)
+        self.project_branch(&mut vcs)
     }
 
     pub fn merge_probe(&self) -> Result<MergeOutcome> {
@@ -821,7 +1355,7 @@ impl Engagement {
                 if self.target == MAINLINE_BRANCH_ID {
                     sync_out(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
                 }
-                sync_out(&mut vcs, &self.store_root, &self.branch, &self.path)?;
+                self.project_branch(&mut vcs)?;
                 Ok(MergeOutcome::Clean)
             }
             VcsMergeOutcome::Conflicted { .. } => Ok(MergeOutcome::Conflict),
@@ -836,7 +1370,7 @@ impl Engagement {
         self.import_sides(&mut vcs)?;
         match vcs.reconcile_branch(&self.branch, true, &fresh_cut_id("sync"), &now_at())? {
             ReconcileOutcome::Rebased { .. } | ReconcileOutcome::UpToDate => {
-                sync_out(&mut vcs, &self.store_root, &self.branch, &self.path)?;
+                self.project_branch(&mut vcs)?;
                 Ok(MergeOutcome::Clean)
             }
             ReconcileOutcome::Conflicts { .. } => Ok(MergeOutcome::Conflict),
@@ -859,6 +1393,26 @@ impl Engagement {
         }
     }
 
+    /// Ingest beneath one admitted sparse root without flattening the target
+    /// partition. This preserves binary files for local-path context ingest.
+    pub fn ingest_into(&self, prefix: &str, source: &Path) -> Result<usize> {
+        self.ensure_selected_path(prefix)?;
+        let destination = safe_path(&self.path, prefix)?;
+        std::fs::create_dir_all(&destination).map_err(WorkspaceError::io)?;
+        if source.is_file() {
+            let name = source.file_name().ok_or_else(|| {
+                WorkspaceError::msg(format!(
+                    "ingest {}: context path has no file name",
+                    source.display()
+                ))
+            })?;
+            std::fs::copy(source, destination.join(name)).map_err(WorkspaceError::io)?;
+            Ok(1)
+        } else {
+            copy_dir(source, &destination)
+        }
+    }
+
     pub fn ingest_upload(&self, files: &[(String, String)]) -> Result<usize> {
         for (name, content) in files {
             let base = Path::new(name)
@@ -874,6 +1428,22 @@ impl Engagement {
         Ok(files.len())
     }
 
+    pub fn ingest_upload_into(&self, prefix: &str, files: &[(String, String)]) -> Result<usize> {
+        self.ensure_selected_path(prefix)?;
+        for (name, content) in files {
+            let base = Path::new(name)
+                .file_name()
+                .ok_or_else(|| {
+                    WorkspaceError::msg(format!(
+                        "ingest upload: uploaded file has no name: {name:?}"
+                    ))
+                })?
+                .to_string_lossy();
+            self.write_file(&format!("{prefix}/{base}"), content)?;
+        }
+        Ok(files.len())
+    }
+
     pub fn tree(&self) -> Result<Vec<FileEntry>> {
         let mut result = Vec::new();
         walk_tree(&self.path, &self.path, &mut result).map_err(WorkspaceError::io)?;
@@ -882,11 +1452,13 @@ impl Engagement {
     }
 
     pub fn read_file(&self, relative: &str) -> Result<String> {
+        self.ensure_selected_path(relative)?;
         std::fs::read_to_string(safe_path(&self.path, relative)?).map_err(WorkspaceError::io)
     }
 
     pub fn read_file_capped(&self, relative: &str, max_bytes: usize) -> Result<Option<String>> {
         use std::io::Read;
+        self.ensure_selected_path(relative)?;
         let file =
             std::fs::File::open(safe_path(&self.path, relative)?).map_err(WorkspaceError::io)?;
         let mut bytes = Vec::new();
@@ -901,6 +1473,7 @@ impl Engagement {
     }
 
     pub fn write_file(&self, relative: &str, content: &str) -> Result<()> {
+        self.ensure_selected_path(relative)?;
         let path = safe_path(&self.path, relative)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(WorkspaceError::io)?;
@@ -913,7 +1486,7 @@ impl Engagement {
     /// spec §12: the state you saw is always a recorded cut).
     pub fn current_cut(&self) -> Result<Option<String>> {
         let mut vcs = self.store()?;
-        sync_in(&mut vcs, &self.store_root, &self.branch, &self.path)?;
+        self.import_branch(&mut vcs)?;
         Ok(vcs
             .get_branch(&self.branch)?
             .and_then(|row| row.head_cut_id))
@@ -936,8 +1509,9 @@ impl Engagement {
         resolutions: &[RegionResolution],
     ) -> Result<SaveFileOutcome> {
         use whipplescript_store::vcs::SaveWithBaseOutcome;
+        self.ensure_selected_path(relative)?;
         let mut vcs = self.store()?;
-        sync_in(&mut vcs, &self.store_root, &self.branch, &self.path)?;
+        self.import_branch(&mut vcs)?;
         let base_cut = match base {
             SaveBase::Cut(cut) => Some(cut.to_owned()),
             SaveBase::Content(body) => {
@@ -1037,8 +1611,9 @@ impl Engagement {
         draft: &str,
         base_cut: &str,
     ) -> Result<Option<MergePreview>> {
+        self.ensure_selected_path(relative)?;
         let mut vcs = self.store()?;
-        sync_in(&mut vcs, &self.store_root, &self.branch, &self.path)?;
+        self.import_branch(&mut vcs)?;
         let Some(preview) = vcs.merge_preview(&self.branch, relative, draft, base_cut)? else {
             return Ok(None);
         };
@@ -1160,11 +1735,36 @@ fn sync_in(
     branch: &str,
     root: &Path,
 ) -> Result<Option<String>> {
+    sync_in_with_roots(vcs, store_root, branch, root, None)
+}
+
+fn sync_in_with_roots(
+    vcs: &mut NativeWorkspaceVcs,
+    store_root: &Path,
+    branch: &str,
+    root: &Path,
+    sparse_roots: Option<&BTreeSet<String>>,
+) -> Result<Option<String>> {
     if !root.is_dir() {
         return Ok(None);
     }
     let writer = workspace_writer(store_root, branch);
     let _writing = writer.lock().unwrap_or_else(PoisonError::into_inner);
+    sync_in_with_roots_under_writer(vcs, store_root, branch, root, sparse_roots)
+}
+
+/// `sync_in_with_roots` with the per-branch writer already held by a caller
+/// that must keep import and the following branch projection indivisible.
+fn sync_in_with_roots_under_writer(
+    vcs: &mut NativeWorkspaceVcs,
+    store_root: &Path,
+    branch: &str,
+    root: &Path,
+    sparse_roots: Option<&BTreeSet<String>>,
+) -> Result<Option<String>> {
+    if !root.is_dir() {
+        return Ok(None);
+    }
     let scratch = load_scratch(vcs, store_root, branch);
     let import = whipplescript_store::materialize::import_scratch(
         root,
@@ -1174,11 +1774,20 @@ fn sync_in(
     )?;
     let manifest = vcs.manifest(branch)?.unwrap_or_default();
     let mut changed = import.changed;
-    changed.retain(|path, hash| !is_chat_local_path(path) && manifest.get(path) != Some(hash));
+    let selected = |path: &str| {
+        sparse_roots.is_none_or(|roots| {
+            roots
+                .iter()
+                .any(|root| path == root || path.starts_with(&format!("{root}/")))
+        })
+    };
+    changed.retain(|path, hash| {
+        selected(path) && !is_chat_local_path(path) && manifest.get(path) != Some(hash)
+    });
     let removed: Vec<String> = import
         .removed
         .into_iter()
-        .filter(|path| !is_chat_local_path(path) && manifest.contains_key(path))
+        .filter(|path| selected(path) && !is_chat_local_path(path) && manifest.contains_key(path))
         .collect();
     if changed.is_empty() && removed.is_empty() {
         persist_scratch(store_root, branch, &import.cache)?;
@@ -1210,9 +1819,38 @@ fn sync_out(
     branch: &str,
     root: &Path,
 ) -> Result<()> {
-    let manifest = vcs
+    sync_out_with_roots(vcs, store_root, branch, root, None)
+}
+
+fn sync_out_with_roots(
+    vcs: &mut NativeWorkspaceVcs,
+    store_root: &Path,
+    branch: &str,
+    root: &Path,
+    sparse_roots: Option<&BTreeSet<String>>,
+) -> Result<()> {
+    let full_manifest = vcs
         .manifest(branch)?
         .ok_or_else(|| WorkspaceError::msg(format!("no line `{branch}` to materialize")))?;
+    let include = sparse_roots.map(|roots| {
+        full_manifest
+            .keys()
+            .filter(|path| {
+                roots
+                    .iter()
+                    .any(|root| *path == root || path.starts_with(&format!("{root}/")))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    });
+    let manifest = match &include {
+        Some(include) => full_manifest
+            .iter()
+            .filter(|(path, _)| include.contains(*path))
+            .map(|(path, hash)| (path.clone(), hash.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        None => full_manifest.clone(),
+    };
     std::fs::create_dir_all(root).map_err(WorkspaceError::io)?;
     let mut on_disk = Vec::new();
     walk_tree(root, root, &mut on_disk).map_err(WorkspaceError::io)?;
@@ -1243,9 +1881,14 @@ fn sync_out(
         // Bottom-up best-effort prune; non-empty directories refuse.
         let _ = std::fs::remove_dir(root.join(&entry.path));
     }
-    let scratch = vcs
-        .materialize_branch(branch, root, scan_stamp())?
-        .ok_or_else(|| WorkspaceError::msg(format!("no line `{branch}` to materialize")))?;
+    let scratch = whipplescript_store::materialize::materialize_manifest_subset(
+        &full_manifest,
+        include.as_ref(),
+        vcs.content_store(),
+        root,
+        scan_stamp(),
+        &whipplescript_store::materialize::MaterializeLimits::default(),
+    )?;
     persist_scratch(store_root, branch, &scratch.cache)
 }
 
@@ -1314,7 +1957,23 @@ fn snapshot_sqlite(path: &Path) -> Result<Vec<u8>> {
     bytes
 }
 
-fn parse_export(export: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+fn encode_export(branches: &[u8], content: &[u8], workstreams: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(
+        EXPORT_MAGIC.len()
+            + 3 * std::mem::size_of::<u64>()
+            + branches.len()
+            + content.len()
+            + workstreams.len(),
+    );
+    bytes.extend_from_slice(EXPORT_MAGIC);
+    for store in [branches, content, workstreams] {
+        bytes.extend_from_slice(&(store.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(store);
+    }
+    bytes
+}
+
+fn parse_export(export: &[u8]) -> Result<ExportStores> {
     let need = |condition: bool| {
         if condition {
             Ok(())
@@ -1322,7 +1981,10 @@ fn parse_export(export: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
             Err(WorkspaceError::msg("malformed workspace export"))
         }
     };
-    need(export.len() >= 16 && &export[..8] == EXPORT_MAGIC)?;
+    need(
+        export.len() >= 16 && (&export[..8] == EXPORT_MAGIC || &export[..8] == LEGACY_EXPORT_MAGIC),
+    )?;
+    let legacy = &export[..8] == LEGACY_EXPORT_MAGIC;
     let mut offset = 8;
     let mut take = |bytes: &[u8]| -> Result<Vec<u8>> {
         need(bytes.len() >= offset + 8)?;
@@ -1336,7 +1998,13 @@ fn parse_export(export: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     };
     let branches = take(export)?;
     let content = take(export)?;
-    Ok((branches, content))
+    let workstreams = if legacy { None } else { Some(take(export)?) };
+    need(offset == export.len())?;
+    Ok(ExportStores {
+        branches,
+        content,
+        workstreams,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1348,6 +2016,15 @@ pub trait Workspace: Send {
     fn workstream_id_of(&self, target: &str) -> Option<String>;
     fn create_engagement(&self, id: &str) -> Result<Box<dyn ChatWorkspace>>;
     fn create_engagement_on(&self, id: &str, target: &str) -> Result<Box<dyn ChatWorkspace>>;
+    fn create_engagement_subset(
+        &self,
+        id: &str,
+        target: &str,
+        roots: &BTreeSet<String>,
+    ) -> Result<Box<dyn ChatWorkspace>> {
+        let _ = roots;
+        self.create_engagement_on(id, target)
+    }
     fn fork_engagement_at(
         &self,
         id: &str,
@@ -1355,10 +2032,86 @@ pub trait Workspace: Send {
         target: &str,
         cut_id: &str,
     ) -> Result<Box<dyn ChatWorkspace>>;
+    fn fork_engagement_subset_at(
+        &self,
+        id: &str,
+        source_branch: &str,
+        target: &str,
+        cut_id: &str,
+        roots: &BTreeSet<String>,
+    ) -> Result<Box<dyn ChatWorkspace>> {
+        let _ = roots;
+        self.fork_engagement_at(id, source_branch, target, cut_id)
+    }
     fn remove_engagement(&self, id: &str) -> Result<()>;
     fn purge_unreachable_objects(&self) -> Result<()>;
     fn reconcile_engagements(&self) -> Result<Vec<(String, Box<dyn ChatWorkspace>)>>;
     fn create_workstream(&self, ws_id: &str) -> Result<()>;
+    fn create_named_workstream(&self, ws_id: &str, _name: Option<&str>) -> Result<()> {
+        self.create_workstream(ws_id)
+    }
+    fn transfer_engagement_to_workstream(
+        &self,
+        _engagement_id: &str,
+        _workstream_id: &str,
+    ) -> Result<WorkstreamTransferOutcome> {
+        Err(WorkspaceError::msg(
+            "this workspace has no WhippleScript workstream topology",
+        ))
+    }
+    fn leave_engagement_workstream(&self, _engagement_id: &str) -> Result<Option<String>> {
+        Err(WorkspaceError::msg(
+            "this workspace has no WhippleScript workstream topology",
+        ))
+    }
+    fn engagement_home_receipt(&self, _engagement_id: &str) -> Result<BranchHomeReceiptV1> {
+        Err(WorkspaceError::msg(
+            "this workspace has no WhippleScript workstream topology",
+        ))
+    }
+    fn workstream(&self, _workstream_id: &str) -> Result<Option<WorkstreamRow>> {
+        Err(WorkspaceError::msg(
+            "this workspace has no WhippleScript workstream topology",
+        ))
+    }
+    fn workstream_members(&self, _workstream_id: &str) -> Result<Vec<String>> {
+        Err(WorkspaceError::msg(
+            "this workspace has no WhippleScript workstream topology",
+        ))
+    }
+    fn archive_workstream(&self, _workstream_id: &str) -> Result<Vec<String>> {
+        Err(WorkspaceError::msg(
+            "this workspace has no WhippleScript workstream topology",
+        ))
+    }
+    fn promote_workstream_boundary(
+        &self,
+        _workstream_id: &str,
+        _workspace_authority_id: &str,
+        _reservation_id: &str,
+    ) -> Result<WorkstreamPromotionOutcome> {
+        Err(WorkspaceError::msg(
+            "this workspace has no recoverable workstream promotion boundary",
+        ))
+    }
+    fn reserve_workstream_promotion_boundary(
+        &self,
+        _workstream_id: &str,
+        _reservation_id: &str,
+    ) -> Result<WorkstreamPromotionReservation> {
+        Err(WorkspaceError::msg(
+            "this workspace has no recoverable workstream promotion reservation",
+        ))
+    }
+    fn release_workstream_promotion_boundary(
+        &self,
+        _workstream_id: &str,
+        _reservation_id: &str,
+    ) -> Result<()> {
+        Err(WorkspaceError::msg(
+            "this workspace has no recoverable workstream promotion reservation",
+        ))
+    }
     fn promote_workstream_to_main(&self, ws_id: &str) -> Result<MergeOutcome>;
     fn seed_main(&self, files: &[(&str, &str)]) -> Result<()>;
     fn export(&self) -> Result<WorkspaceExport>;
@@ -1380,6 +2133,11 @@ pub trait ChatWorkspace: Send {
     fn target(&self) -> &str;
     fn set_target(&mut self, target: &str) -> Result<()>;
     fn rehome(&mut self, target: &str) -> Result<()>;
+    fn replace_sparse_roots(&mut self, _roots: &BTreeSet<String>) -> Result<()> {
+        Err(WorkspaceError::msg(
+            "this workspace does not support sparse target views",
+        ))
+    }
     fn commit_turn(&self, message: &str) -> Result<Option<RevisionId>>;
     fn boundary_cut(&self) -> Result<RevisionId>;
     /// Exact revision/fingerprint currently held by the target authority.
@@ -1397,11 +2155,46 @@ pub trait ChatWorkspace: Send {
     fn merge_probe(&self) -> Result<MergeOutcome>;
     fn merge_into_main(&self) -> Result<MergeOutcome>;
     fn ingest(&self, source: &Path) -> Result<usize>;
+    fn ingest_into(&self, prefix: &str, source: &Path) -> Result<usize> {
+        if prefix.is_empty() {
+            self.ingest(source)
+        } else {
+            Err(WorkspaceError::msg(
+                "this workspace does not support partitioned ingest",
+            ))
+        }
+    }
     fn ingest_upload(&self, files: &[(String, String)]) -> Result<usize>;
+    fn ingest_upload_into(&self, prefix: &str, files: &[(String, String)]) -> Result<usize> {
+        if prefix.is_empty() {
+            self.ingest_upload(files)
+        } else {
+            Err(WorkspaceError::msg(
+                "this workspace does not support partitioned upload ingest",
+            ))
+        }
+    }
     fn tree(&self) -> Result<Vec<FileEntry>>;
     fn read_file(&self, rel: &str) -> Result<String>;
     fn read_file_capped(&self, rel: &str, max_bytes: usize) -> Result<Option<String>>;
+    /// Read exact bytes without silently converting non-UTF-8 target content.
+    fn read_file_bytes_capped(&self, rel: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        self.read_file_capped(rel, max_bytes)
+            .map(|body| body.map(String::into_bytes))
+    }
     fn write_file(&self, rel: &str, content: &str) -> Result<()>;
+    /// Write exact bytes for an admitted target effect.
+    fn write_file_bytes(&self, rel: &str, content: &[u8]) -> Result<()> {
+        let body = std::str::from_utf8(content)
+            .map_err(|_| WorkspaceError::msg("this workspace adapter cannot write binary files"))?;
+        self.write_file(rel, body)
+    }
+    fn remove_file(&self, rel: &str) -> Result<()> {
+        let _ = rel;
+        Err(WorkspaceError::msg(
+            "this workspace adapter cannot remove candidate files",
+        ))
+    }
     fn current_cut(&self) -> Result<Option<String>>;
     fn save_file_with_base(
         &self,
@@ -1433,6 +2226,16 @@ impl Workspace for Instance {
     fn create_engagement_on(&self, id: &str, target: &str) -> Result<Box<dyn ChatWorkspace>> {
         Ok(Box::new(Self::create_engagement_on(self, id, target)?))
     }
+    fn create_engagement_subset(
+        &self,
+        id: &str,
+        target: &str,
+        roots: &BTreeSet<String>,
+    ) -> Result<Box<dyn ChatWorkspace>> {
+        Ok(Box::new(Self::create_engagement_subset(
+            self, id, target, roots,
+        )?))
+    }
     fn fork_engagement_at(
         &self,
         id: &str,
@@ -1446,6 +2249,23 @@ impl Workspace for Instance {
             source_branch,
             target,
             cut_id,
+        )?))
+    }
+    fn fork_engagement_subset_at(
+        &self,
+        id: &str,
+        source_branch: &str,
+        target: &str,
+        cut_id: &str,
+        roots: &BTreeSet<String>,
+    ) -> Result<Box<dyn ChatWorkspace>> {
+        Ok(Box::new(Self::fork_engagement_subset_at(
+            self,
+            id,
+            source_branch,
+            target,
+            cut_id,
+            roots,
         )?))
     }
     fn remove_engagement(&self, id: &str) -> Result<()> {
@@ -1462,6 +2282,58 @@ impl Workspace for Instance {
     }
     fn create_workstream(&self, id: &str) -> Result<()> {
         Self::create_workstream(self, id)
+    }
+    fn create_named_workstream(&self, id: &str, name: Option<&str>) -> Result<()> {
+        Self::create_named_workstream(self, id, name)
+    }
+    fn transfer_engagement_to_workstream(
+        &self,
+        engagement_id: &str,
+        workstream_id: &str,
+    ) -> Result<WorkstreamTransferOutcome> {
+        Self::transfer_engagement_to_workstream(self, engagement_id, workstream_id)
+    }
+    fn leave_engagement_workstream(&self, engagement_id: &str) -> Result<Option<String>> {
+        Self::leave_engagement_workstream(self, engagement_id)
+    }
+    fn engagement_home_receipt(&self, engagement_id: &str) -> Result<BranchHomeReceiptV1> {
+        Self::engagement_home_receipt(self, engagement_id)
+    }
+    fn workstream(&self, workstream_id: &str) -> Result<Option<WorkstreamRow>> {
+        Self::workstream(self, workstream_id)
+    }
+    fn workstream_members(&self, workstream_id: &str) -> Result<Vec<String>> {
+        Self::workstream_members(self, workstream_id)
+    }
+    fn archive_workstream(&self, workstream_id: &str) -> Result<Vec<String>> {
+        Self::archive_workstream(self, workstream_id)
+    }
+    fn promote_workstream_boundary(
+        &self,
+        workstream_id: &str,
+        workspace_authority_id: &str,
+        reservation_id: &str,
+    ) -> Result<WorkstreamPromotionOutcome> {
+        Self::promote_workstream_boundary(
+            self,
+            workstream_id,
+            workspace_authority_id,
+            reservation_id,
+        )
+    }
+    fn reserve_workstream_promotion_boundary(
+        &self,
+        workstream_id: &str,
+        reservation_id: &str,
+    ) -> Result<WorkstreamPromotionReservation> {
+        Self::reserve_workstream_promotion_boundary(self, workstream_id, reservation_id)
+    }
+    fn release_workstream_promotion_boundary(
+        &self,
+        workstream_id: &str,
+        reservation_id: &str,
+    ) -> Result<()> {
+        Self::release_workstream_promotion_boundary(self, workstream_id, reservation_id)
     }
     fn promote_workstream_to_main(&self, id: &str) -> Result<MergeOutcome> {
         Self::promote_workstream_to_main(self, id)
@@ -1502,6 +2374,9 @@ impl ChatWorkspace for Engagement {
     fn rehome(&mut self, target: &str) -> Result<()> {
         self.rehome(target)
     }
+    fn replace_sparse_roots(&mut self, roots: &BTreeSet<String>) -> Result<()> {
+        self.replace_sparse_roots(roots)
+    }
     fn commit_turn(&self, message: &str) -> Result<Option<RevisionId>> {
         self.commit_turn(message)
     }
@@ -1529,8 +2404,14 @@ impl ChatWorkspace for Engagement {
     fn ingest(&self, source: &Path) -> Result<usize> {
         self.ingest(source)
     }
+    fn ingest_into(&self, prefix: &str, source: &Path) -> Result<usize> {
+        self.ingest_into(prefix, source)
+    }
     fn ingest_upload(&self, files: &[(String, String)]) -> Result<usize> {
         self.ingest_upload(files)
+    }
+    fn ingest_upload_into(&self, prefix: &str, files: &[(String, String)]) -> Result<usize> {
+        self.ingest_upload_into(prefix, files)
     }
     fn tree(&self) -> Result<Vec<FileEntry>> {
         self.tree()
@@ -1541,8 +2422,30 @@ impl ChatWorkspace for Engagement {
     fn read_file_capped(&self, relative: &str, max_bytes: usize) -> Result<Option<String>> {
         self.read_file_capped(relative, max_bytes)
     }
+    fn read_file_bytes_capped(&self, relative: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        self.ensure_selected_path(relative)?;
+        let bytes = std::fs::read(safe_path(&self.path, relative)?).map_err(WorkspaceError::io)?;
+        Ok((bytes.len() <= max_bytes).then_some(bytes))
+    }
     fn write_file(&self, relative: &str, content: &str) -> Result<()> {
         self.write_file(relative, content)
+    }
+    fn write_file_bytes(&self, relative: &str, content: &[u8]) -> Result<()> {
+        self.ensure_selected_path(relative)?;
+        let path = safe_path(&self.path, relative)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(WorkspaceError::io)?;
+        }
+        std::fs::write(path, content).map_err(WorkspaceError::io)
+    }
+    fn remove_file(&self, relative: &str) -> Result<()> {
+        self.ensure_selected_path(relative)?;
+        let path = safe_path(&self.path, relative)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WorkspaceError::io(error)),
+        }
     }
     fn current_cut(&self) -> Result<Option<String>> {
         self.current_cut()
@@ -2018,14 +2921,121 @@ mod tests {
             MergeOutcome::Clean
         );
         chat.revert_to_main().expect("restore");
+        instance
+            .create_named_workstream("ongoing", Some("Ongoing"))
+            .expect("ongoing workstream");
+        assert!(matches!(
+            instance
+                .transfer_engagement_to_workstream("chat", "ongoing")
+                .expect("join ongoing"),
+            WorkstreamTransferOutcome::Joined { .. }
+        ));
         let export = instance.export().expect("export");
         assert_eq!(instance.export_format(), EXPORT_FORMAT);
         let target = tempfile::tempdir().expect("target");
         let imported = Instance::from_export_at(target.path(), &export.0).expect("import");
         assert!(imported.repo().join("work.txt").exists());
+        assert_eq!(
+            imported.workstream_members("ongoing").expect("members"),
+            vec!["chat"]
+        );
+        assert_eq!(
+            imported
+                .engagement_home_receipt("chat")
+                .expect("imported home")
+                .stream_id
+                .as_deref(),
+            Some("ongoing")
+        );
         let fork = tempfile::tempdir().expect("fork");
         let forked = Instance::fork_from_at(fork.path(), &instance.peer_source()).expect("fork");
         assert!(forked.repo().join("work.txt").exists());
+        assert_eq!(
+            forked.workstream_members("ongoing").expect("fork members"),
+            vec!["chat"]
+        );
+    }
+
+    #[test]
+    fn whipplescript_workstreams_are_the_authoritative_home_store() {
+        let (_directory, instance) = instance();
+        instance
+            .create_named_workstream("team", Some("Team"))
+            .expect("workstream");
+        instance.create_engagement("chat").expect("chat");
+
+        assert_eq!(
+            instance
+                .engagement_home_receipt("chat")
+                .expect("main home")
+                .stream_id,
+            None
+        );
+        assert!(matches!(
+            instance
+                .transfer_engagement_to_workstream("chat", "team")
+                .expect("join"),
+            WorkstreamTransferOutcome::Joined { .. }
+        ));
+        let receipt = instance
+            .engagement_home_receipt("chat")
+            .expect("named home");
+        assert_eq!(receipt.stream_id.as_deref(), Some("team"));
+        assert_eq!(
+            instance.workstream_members("team").expect("members"),
+            vec!["chat"]
+        );
+        assert_eq!(
+            instance
+                .leave_engagement_workstream("chat")
+                .expect("leave")
+                .as_deref(),
+            Some("team")
+        );
+        assert_eq!(
+            instance
+                .engagement_home_receipt("chat")
+                .expect("main again")
+                .stream_id,
+            None
+        );
+    }
+
+    #[test]
+    fn sparse_engagement_neither_materializes_nor_removes_unselected_partitions() {
+        let (_directory, instance) = instance();
+        instance
+            .seed_main(&[
+                ("targets/t-one/one.txt", "one"),
+                ("targets/t-two/two.txt", "two"),
+            ])
+            .expect("seed partitions");
+        let chat = instance
+            .create_engagement_subset(
+                "chat",
+                MAINLINE_BRANCH_ID,
+                &BTreeSet::from(["targets/t-one".to_owned()]),
+            )
+            .expect("sparse chat");
+        assert!(chat.path().join("targets/t-one/one.txt").is_file());
+        assert!(!chat.path().join("targets/t-two").exists());
+        assert!(chat.write_file("outside.txt", "refused").is_err());
+
+        chat.write_file("targets/t-one/one.txt", "changed")
+            .expect("write selected partition");
+        chat.commit_turn("turn").expect("cut");
+        chat.sync_from_main().expect("sparse reconcile");
+        assert!(!chat.path().join("targets/t-two").exists());
+
+        let complete = instance
+            .create_engagement("complete")
+            .expect("complete view");
+        assert_eq!(
+            complete
+                .read_file("targets/t-two/two.txt")
+                .expect("unselected partition survives"),
+            "two"
+        );
     }
 
     #[test]
@@ -2082,6 +3092,82 @@ mod tests {
         assert_eq!(a.merge_into_main().expect("promote"), MergeOutcome::Clean);
         assert_eq!(b.sync_from_main().expect("sync"), MergeOutcome::Clean);
         assert_eq!(b.read_file("shared.txt").expect("materialized"), "from a");
+    }
+
+    #[test]
+    fn promotion_reopens_after_main_cas_and_closes_forward_without_repeating_it() {
+        let (directory, instance) = instance();
+        instance
+            .create_named_workstream("team", Some("Team"))
+            .expect("workstream");
+        let chat = instance.create_engagement("chat").expect("chat");
+        instance
+            .transfer_engagement_to_workstream("chat", "team")
+            .expect("join");
+        chat.write_file("accepted.txt", "candidate").expect("write");
+        chat.commit_turn("candidate").expect("cut");
+        assert_eq!(
+            chat.merge_into_main().expect("line advance"),
+            MergeOutcome::Clean
+        );
+
+        let reservation = instance
+            .reserve_workstream_promotion_boundary("team", "reservation-crash")
+            .expect("reserve");
+        let at = now_at();
+        let mut vcs = instance.store().expect("vcs");
+        let promoted = vcs
+            .promote_line_exact(
+                &reservation.line_branch_id,
+                nonempty(&reservation.expected_line_cut),
+                nonempty(&reservation.expected_main_cut),
+                &reservation.proposed_main_cut,
+                &at,
+            )
+            .expect("main CAS");
+        let (position, handle) = match promoted {
+            whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
+                ref_position,
+                ref_receipt_handle,
+                ..
+            } => (ref_position, ref_receipt_handle),
+            other => panic!("expected promoted CAS, got {other:?}"),
+        };
+        instance
+            .workstreams()
+            .expect("topology")
+            .record_ref_advanced("team", "reservation-crash", position, &handle, &at)
+            .expect("record landed CAS");
+        drop(vcs);
+        drop(instance);
+
+        let reopened = Instance::open(
+            directory.path().join("repo"),
+            directory.path().join("worktrees"),
+        );
+        let outcome = reopened
+            .promote_workstream_boundary("team", "workspace-authority", "reservation-crash")
+            .expect("recover close");
+        assert!(matches!(
+            outcome,
+            WorkstreamPromotionOutcome::Promoted { .. }
+        ));
+        let row = reopened.workstream("team").expect("row").expect("team");
+        assert_eq!(row.status, StreamStatus::Archived);
+        assert!(reopened
+            .workstream_members("team")
+            .expect("members")
+            .is_empty());
+        let replay = reopened
+            .promote_workstream_boundary("team", "workspace-authority", "reservation-crash")
+            .expect("idempotent closed recovery");
+        assert!(matches!(
+            replay,
+            WorkstreamPromotionOutcome::Promoted {
+                rehomed_chat_ids,
+                ..
+            } if rehomed_chat_ids.is_empty()
+        ));
     }
 
     #[test]

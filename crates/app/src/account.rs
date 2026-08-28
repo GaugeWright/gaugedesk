@@ -603,6 +603,29 @@ struct SelectedCredential {
     record: CredentialRecord,
 }
 
+/// WhippleScript credential resource identities use its canonical
+/// `credential:<name>` namespace. Hex segments preserve GaugeDesk's exact
+/// scope/provider identity without relying on either value's path grammar.
+pub(crate) fn canonical_credential_ref(
+    kind: &str,
+    owner: &str,
+    provider: &str,
+    version: u64,
+) -> String {
+    format!(
+        "credential:gaugedesk/{kind}/{}/{}/v{version}",
+        hex::encode(owner.as_bytes()),
+        hex::encode(provider.as_bytes())
+    )
+}
+
+pub(crate) fn canonical_credential_class_ref(class: &str) -> String {
+    format!(
+        "credential:gaugedesk/class/{}",
+        hex::encode(class.as_bytes())
+    )
+}
+
 impl Workbench {
     /// The **account encryption key** this workbench seals/unseals account state with
     /// (ADR 0053 §4). Resolution order: the key this device **recovered** over enrollment
@@ -802,10 +825,7 @@ impl Workbench {
             SelectedCredentialScope::Account(authority) => ("account", authority.as_str()),
             SelectedCredentialScope::Project(project) => ("project", project.as_str()),
         };
-        format!(
-            "gaugedesk:credential:v2:{kind}:{}:{provider}:{version}",
-            hex::encode(owner.as_bytes())
-        )
+        canonical_credential_ref(kind, owner, provider, version)
     }
 
     /// Stable, non-secret identity for the credential selected by the same
@@ -1818,14 +1838,14 @@ mod tests {
 
         assert_eq!(
             wb.credential_ref_for_chat("unknown-chat", "openai", "alice"),
-            "gaugedesk:credential:v2:account:616c696365:openai:1"
+            "credential:gaugedesk/account/616c696365/6f70656e6169/v1"
         );
         let capability = wb
             .credential_capability_for_chat("unknown-chat", "openai", "alice")
             .expect("alice's Home-scoped credential resolves");
         assert_eq!(
             capability.credential_ref(),
-            "gaugedesk:credential:v2:account:616c696365:openai:1"
+            "credential:gaugedesk/account/616c696365/6f70656e6169/v1"
         );
         assert_eq!(
             capability
@@ -1854,7 +1874,7 @@ mod tests {
         }
         assert_eq!(
             wb.credential_ref_for_chat("unknown-chat", "openai", "alice"),
-            "gaugedesk:credential:v2:account:616c696365:openai:2"
+            "credential:gaugedesk/account/616c696365/6f70656e6169/v2"
         );
 
         wb.tombstone_account_credential_in(&scope, "openai".to_owned())
@@ -1913,7 +1933,7 @@ mod tests {
                 "alice",
                 ModelExecutionClass::PublicDeployment,
             ),
-            "gaugedesk:credential:v2:account:616c696365:openai:1"
+            "credential:gaugedesk/account/616c696365/6f70656e6169/v1"
         );
         assert!(wb
             .credential_capability_for_chat_in_class(

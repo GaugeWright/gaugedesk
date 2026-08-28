@@ -459,6 +459,178 @@ async fn point_fork_rejects_an_unmapped_transcript_entry() {
 }
 
 #[tokio::test]
+async fn archived_historical_home_requires_an_explicit_current_destination() {
+    let _fake_agent = fake_agent_env();
+    let (_dir, wb) = seeded_workbench();
+    let inspect = Arc::clone(&wb);
+    let app = open_control_plane(wb);
+
+    let (status, project_body) =
+        send(&app, "POST", "/projects", Some(r#"{"name":"fork home"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED, "project: {project_body}");
+    let project: serde_json::Value = serde_json::from_str(&project_body).unwrap();
+    let project_id = project["id"].as_str().unwrap();
+    let placement_id = project["placement"].as_str().unwrap();
+    let target_id = project["target_id"].as_str().unwrap();
+    let (status, chat_body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{project_id}/placements/{placement_id}/chats"),
+        Some(&serde_json::json!({"title":"historical member","target_id":target_id}).to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "chat: {chat_body}");
+    let chat_id = serde_json::from_str::<serde_json::Value>(&chat_body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, stream_body) = send(
+        &app,
+        "POST",
+        &format!("/placements/{placement_id}/workstreams"),
+        Some(r#"{"name":"historical line"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "workstream: {stream_body}");
+    let stream_id = serde_json::from_str::<serde_json::Value>(&stream_body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/workstreams/{stream_id}/join"),
+        Some(&serde_json::json!({"chat":chat_id}).to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "join: {body}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/chats/{chat_id}/task"),
+        Some(r#"{"prompt":"remember this exact point"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "turn: {body}");
+
+    let (assistant_entry, historical_cut, workspace_id, before_chats, before_branches) = {
+        let guard = inspect.lock_unpoisoned();
+        let boundary: crate::engine::TurnBoundaryRecord = serde_json::from_str(
+            &guard
+                .store_ref()
+                .records(&chat_id, crate::engine::TURN_BOUNDARY_KIND)
+                .unwrap()
+                .into_iter()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        let workspace_id = guard.engagement_index[&chat_id].clone();
+        let workspace = guard.workspace_by_storage_id(&workspace_id).unwrap();
+        workspace.archive_workstream(&stream_id).unwrap();
+        (
+            boundary.assistant_entry_id,
+            boundary.after_workspace_cut,
+            workspace_id,
+            guard.library.chats.len(),
+            workspace.reconcile_engagements().unwrap().len(),
+        )
+    };
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/chats/{chat_id}/fork/{assistant_entry}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "inherit: {body}");
+    assert!(body.contains("historical-home-closed"), "inherit: {body}");
+    {
+        let guard = inspect.lock_unpoisoned();
+        let workspace = guard.workspace_by_storage_id(&workspace_id).unwrap();
+        assert_eq!(guard.library.chats.len(), before_chats);
+        assert_eq!(
+            workspace.reconcile_engagements().unwrap().len(),
+            before_branches
+        );
+    }
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/chats/{chat_id}/fork/{assistant_entry}"),
+        Some(r#"{"destination":{"kind":"main"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "explicit Main: {body}");
+    let fork: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(fork["admitted_home"]["stream_id"].is_null());
+    let fork_id = fork["id"].as_str().unwrap();
+    {
+        let guard = inspect.lock_unpoisoned();
+        assert_eq!(
+            guard.engagements[fork_id].boundary_cut().unwrap().0,
+            historical_cut,
+            "destination admission must not rematerialize over the historical cut"
+        );
+        let workspace = guard.workspace_by_storage_id(&workspace_id).unwrap();
+        assert_eq!(
+            workspace
+                .engagement_home_receipt(fork_id)
+                .unwrap()
+                .stream_id,
+            None
+        );
+    }
+
+    let (status, stream_body) = send(
+        &app,
+        "POST",
+        &format!("/placements/{placement_id}/workstreams"),
+        Some(r#"{"name":"current destination"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "second workstream: {stream_body}"
+    );
+    let current_stream = serde_json::from_str::<serde_json::Value>(&stream_body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/chats/{chat_id}/fork/{assistant_entry}"),
+        Some(
+            &serde_json::json!({
+                "destination": {"kind":"workstream", "workstream_id":current_stream}
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "explicit workstream: {body}");
+    let fork: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(fork["admitted_home"]["stream_id"], current_stream);
+    let fork_id = fork["id"].as_str().unwrap();
+    let guard = inspect.lock_unpoisoned();
+    assert_eq!(
+        guard.engagements[fork_id].boundary_cut().unwrap().0,
+        historical_cut
+    );
+    let admissions = guard
+        .store_ref()
+        .records(fork_id, crate::library_state::CHAT_FORK_ADMISSION_KIND)
+        .unwrap();
+    let admission: serde_json::Value = serde_json::from_str(admissions.last().unwrap()).unwrap();
+    assert_eq!(admission["historical_home"]["stream_id"], stream_id);
+    assert_eq!(admission["admitted_home"]["stream_id"], current_stream);
+}
+
+#[tokio::test]
 async fn explicit_resource_access_request_approve_revoke_routes() {
     // CORE-3: the multi-party request → approve → grant → revoke lifecycle over HTTP.
     let (_dir, wb) = workbench();
@@ -1038,9 +1210,13 @@ async fn export_to_disk_is_gated_then_writes_bytes_and_records_egress() {
         b.contains("agent-note.txt"),
         "the deliverable file is reported: {b}"
     );
+    let exported_note = dest
+        .join("targets")
+        .join(crate::library::target_id_path_v1("inst-test").unwrap())
+        .join("agent-note.txt");
     assert!(
-        dest.join("agent-note.txt").exists(),
-        "the bytes actually landed on disk"
+        exported_note.exists(),
+        "the partitioned bytes actually landed on disk"
     );
     let (_, state) = send(
         &app,
@@ -2047,7 +2223,9 @@ async fn placement_routes_reject_a_mismatched_project_path_without_mutation() {
 /// `parseWorkTarget` client throw after the durable attach has already happened.
 #[tokio::test]
 async fn attached_target_response_matches_the_workspace_projection() {
+    let _fake_agent = fake_agent_env();
     let (_d, wb) = seeded_workbench();
+    let inspect = wb.clone();
     let app = open_control_plane(wb);
     let source = tempfile::tempdir().unwrap();
     std::fs::write(source.path().join("work.txt"), "basis\n").unwrap();
@@ -2061,6 +2239,8 @@ async fn attached_target_response_matches_the_workspace_projection() {
     .await;
     let project: serde_json::Value = serde_json::from_str(&project_body).unwrap();
     let project_id = project["id"].as_str().unwrap();
+    let default_target = project["target_id"].as_str().unwrap();
+    let placement_id = project["placement"].as_str().unwrap();
     let attach_body = serde_json::json!({
         "name": "Existing folder",
         "kind": "external-folder",
@@ -2100,6 +2280,414 @@ async fn attached_target_response_matches_the_workspace_projection() {
         .find(|target| target["id"] == attached["id"])
         .expect("attached target is projected");
     assert_eq!(&attached, projected);
+
+    let (status, chat_body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{project_id}/placements/{placement_id}/chats"),
+        Some(
+            &serde_json::json!({
+                "title": "full stack",
+                "target_ids": [default_target, attached["id"].as_str().unwrap()],
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "multi-target chat: {chat_body}"
+    );
+    let chat: serde_json::Value = serde_json::from_str(&chat_body).unwrap();
+    let chat_id = chat["id"].as_str().unwrap();
+    assert_eq!(chat["target_ids"].as_array().map(Vec::len), Some(2));
+    let (_, workspace_body) = send(&app, "GET", "/workspace", None).await;
+    let workspace: serde_json::Value = serde_json::from_str(&workspace_body).unwrap();
+    let projected_chat = workspace["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["id"] == chat_id)
+        .unwrap();
+    assert!(projected_chat["target_id"].is_null());
+    assert_eq!(projected_chat["targets"].as_array().map(Vec::len), Some(2));
+    let (status, delta_body) = send(
+        &app,
+        "GET",
+        &format!(
+            "/projections/library/workspace/work_target/{}?freshness=live",
+            attached["id"].as_str().unwrap()
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "multi-target delta: {delta_body}");
+    let delta: serde_json::Value = serde_json::from_str(&delta_body).unwrap();
+    assert!(delta["value"]["recent"]
+        .as_array()
+        .is_some_and(|recent| recent.iter().any(|candidate| candidate["id"] == chat_id)));
+    {
+        let guard = inspect.lock_unpoisoned();
+        let engagement = &guard.engagements[chat_id];
+        for target in projected_chat["targets"].as_array().unwrap() {
+            assert!(engagement
+                .path()
+                .join(target["root"].as_str().unwrap())
+                .is_dir());
+        }
+    }
+
+    let (status, turn_body) = send(
+        &app,
+        "POST",
+        &format!("/chats/{chat_id}/task"),
+        Some(r#"{"prompt":"update both targets [all-writable]","review":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "multi-target turn: {turn_body}");
+    {
+        let guard = inspect.lock_unpoisoned();
+        let processes = guard
+            .store_ref()
+            .records(
+                chat_id,
+                crate::target_change_set::TURN_PROCESS_DECLARATION_KIND,
+            )
+            .unwrap();
+        assert_eq!(processes.len(), 1, "one process declaration per turn");
+        let process: crate::target_change_set::TurnProcessDeclaration =
+            serde_json::from_str(&processes[0]).unwrap();
+        assert_eq!(process.read_targets.len(), 2);
+        assert_eq!(process.write_targets.len(), 2);
+        assert_eq!(process.output_targets.len(), 2);
+        assert!(process
+            .bindings
+            .iter()
+            .all(|binding| binding.root.starts_with("targets/t-")));
+
+        let declarations = guard
+            .store_ref()
+            .records(
+                chat_id,
+                crate::target_change_set::TARGET_CHANGE_SET_DECLARATION_KIND,
+            )
+            .unwrap();
+        assert_eq!(
+            declarations.len(),
+            1,
+            "all touched targets share one immutable declaration"
+        );
+        let declaration: crate::target_change_set::TargetChangeSetDeclaration =
+            serde_json::from_str(&declarations[0]).unwrap();
+        assert_eq!(declaration.turn_process_declaration_id, process.id);
+        assert_eq!(declaration.target_set_revision, 0);
+        assert_eq!(declaration.candidate_snapshots.len(), 2);
+        assert_eq!(declaration.requested_acts.len(), 2);
+        assert!(declaration
+            .candidate_snapshots
+            .iter()
+            .all(|candidate| candidate.changed_paths == ["agent-note.txt"]));
+        let declared_targets = declaration
+            .candidate_snapshots
+            .iter()
+            .map(|candidate| candidate.target_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            declared_targets,
+            std::collections::BTreeSet::from([default_target, attached["id"].as_str().unwrap()])
+        );
+        assert!(declaration
+            .requested_acts
+            .iter()
+            .all(|act| !act.operation_id.is_empty()));
+    }
+    {
+        let mut guard = inspect.lock_unpoisoned();
+        let before = guard
+            .store_ref()
+            .records(
+                chat_id,
+                crate::target_change_set::TARGET_CHANGE_SET_DECLARATION_KIND,
+            )
+            .unwrap()
+            .len();
+        let process: crate::target_change_set::TurnProcessDeclaration = serde_json::from_str(
+            &guard
+                .store_ref()
+                .records(
+                    chat_id,
+                    crate::target_change_set::TURN_PROCESS_DECLARATION_KIND,
+                )
+                .unwrap()[0],
+        )
+        .unwrap();
+        let valid_path = format!("{}/agent-note.txt", process.bindings[0].root);
+        let invalid = crate::engine::TaskResult {
+            run_phase: gaugedesk_core::run::RunPhase::Completed,
+            assistant_text: String::new(),
+            diff: format!(
+                "diff --git a/{valid_path} b/{valid_path}\ndiff --git a/outside.txt b/outside.txt\n"
+            ),
+            commit: Some("candidate-with-undeclared-path".to_owned()),
+            merge_phase: gaugedesk_core::merge::MergePhase::Clean,
+            mediated_tool_calls: Vec::new(),
+            blocked_effects: Vec::new(),
+            pending_approvals: Vec::new(),
+            asked_questions: Vec::new(),
+            error: None,
+            guarantee_outcomes: Vec::new(),
+            usage_observation: None,
+        };
+        assert!(guard.record_target_change_set(chat_id, &invalid).is_err());
+        let after = guard
+            .store_ref()
+            .records(
+                chat_id,
+                crate::target_change_set::TARGET_CHANGE_SET_DECLARATION_KIND,
+            )
+            .unwrap()
+            .len();
+        assert_eq!(
+            after, before,
+            "a malformed multi-target candidate admits no partial declaration"
+        );
+    }
+
+    // Workstream membership is project topology, not a target-set or creator-
+    // placement property. A second placement with a genuinely different sparse
+    // target view can discover and join the same named line.
+    let (status, second_placement_body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{project_id}/placements"),
+        Some(r#"{"agent_id":"agent-default"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "second placement: {second_placement_body}"
+    );
+    let second_placement = serde_json::from_str::<serde_json::Value>(&second_placement_body)
+        .unwrap()["instance_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, narrow_chat_body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{project_id}/placements/{second_placement}/chats"),
+        Some(
+            &serde_json::json!({
+                "title": "narrow target view",
+                "target_ids": [attached["id"].as_str().unwrap()],
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "narrow chat: {narrow_chat_body}"
+    );
+    let narrow_chat = serde_json::from_str::<serde_json::Value>(&narrow_chat_body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, workstream_body) = send(
+        &app,
+        "POST",
+        &format!("/placements/{placement_id}/workstreams"),
+        Some(r#"{"name":"project-wide line"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "workstream: {workstream_body}");
+    let workstream_id = serde_json::from_str::<serde_json::Value>(&workstream_body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for member in [chat_id, narrow_chat.as_str()] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            &format!("/workstreams/{workstream_id}/join"),
+            Some(&serde_json::json!({ "chat": member }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "join {member}: {body}");
+    }
+    let (status, second_view) = send(
+        &app,
+        "GET",
+        &format!("/placements/{second_placement}/workstreams"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "second placement view: {second_view}"
+    );
+    let second_view: serde_json::Value = serde_json::from_str(&second_view).unwrap();
+    let project_stream = second_view["workstreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stream| stream["id"] == workstream_id)
+        .expect("project workstream is visible through every project placement");
+    assert_eq!(project_stream["members"].as_array().map(Vec::len), Some(2));
+    let (_, grouped_workspace_body) = send(&app, "GET", "/workspace", None).await;
+    let grouped_workspace: serde_json::Value =
+        serde_json::from_str(&grouped_workspace_body).unwrap();
+    let grouped = grouped_workspace["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|chat| {
+            [chat_id, narrow_chat.as_str()].contains(&chat["id"].as_str().unwrap_or_default())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(grouped.len(), 2);
+    assert!(grouped
+        .iter()
+        .all(|chat| chat["workstream"] == workstream_id));
+
+    let (status, revision_body) = send(
+        &app,
+        "PUT",
+        &format!("/chats/{chat_id}/targets"),
+        Some(
+            &serde_json::json!({
+                "targets": [{
+                    "target_id": attached["id"],
+                    "participation": "read-only",
+                }],
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "target revision: {revision_body}");
+    let revision: serde_json::Value = serde_json::from_str(&revision_body).unwrap();
+    assert_eq!(revision["target_set_revision"], 1);
+    let (_, workstreams_after_revision) = send(
+        &app,
+        "GET",
+        &format!("/placements/{second_placement}/workstreams"),
+        None,
+    )
+    .await;
+    let workstreams_after_revision: serde_json::Value =
+        serde_json::from_str(&workstreams_after_revision).unwrap();
+    let members = workstreams_after_revision["workstreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stream| stream["id"] == workstream_id)
+        .unwrap()["members"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        members.len(),
+        2,
+        "changing a chat's sparse target view does not change WhippleScript workstream membership"
+    );
+
+    // The earlier post-assistant point still carries both targets and their
+    // native bases even after the parent removes one member and both native
+    // authorities move. The child persists those bases rather than consulting
+    // either the parent's current set or each target's current basis.
+    let (assistant_entry, historical_bases, selected_target_ids) = {
+        let mut guard = inspect.lock_unpoisoned();
+        let boundary: crate::engine::TurnBoundaryRecord = serde_json::from_str(
+            &guard
+                .store_ref()
+                .records(chat_id, crate::engine::TURN_BOUNDARY_KIND)
+                .unwrap()[0],
+        )
+        .unwrap();
+        let snapshot = boundary.fork_snapshot.unwrap();
+        let historical_bases = snapshot
+            .targets
+            .iter()
+            .map(|target| (target.target_id.clone(), target.native_basis.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let selected_target_ids = historical_bases.keys().cloned().collect::<Vec<_>>();
+        for target_id in &selected_target_ids {
+            let mut target = guard.library.work_targets[target_id].clone();
+            target.current_basis = Some(format!("moved-native-basis-{target_id}"));
+            guard.write_work_target_record(target);
+        }
+        (
+            boundary.assistant_entry_id,
+            historical_bases,
+            selected_target_ids,
+        )
+    };
+    let (status, point_fork_body) = send(
+        &app,
+        "POST",
+        &format!("/chats/{chat_id}/fork/{assistant_entry}"),
+        Some(r#"{"destination":{"kind":"main"}}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "exact point fork: {point_fork_body}"
+    );
+    let point_fork: serde_json::Value = serde_json::from_str(&point_fork_body).unwrap();
+    let point_fork_id = point_fork["id"].as_str().unwrap();
+    {
+        let guard = inspect.lock_unpoisoned();
+        let child_set = guard.library.current_target_set(point_fork_id).unwrap();
+        assert_eq!(
+            child_set
+                .members
+                .iter()
+                .map(|member| member.target_id.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            selected_target_ids.into_iter().collect()
+        );
+        let child_snapshot = guard
+            .turn_fork_snapshot(point_fork_id, Some(9), Some("current-policy"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child_snapshot
+                .targets
+                .into_iter()
+                .map(|target| (target.target_id, target.native_basis))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            historical_bases,
+            "the child's next turn continues from every historical native basis"
+        );
+    }
+
+    // A tip fork inherits this exact revision and sparse view. It does not use
+    // the parent's original target set or manufacture a primary target.
+    let (status, fork_body) = send(&app, "POST", &format!("/chats/{chat_id}/fork"), None).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "multi-target fork: {fork_body}"
+    );
+    let fork: serde_json::Value = serde_json::from_str(&fork_body).unwrap();
+    let fork_id = fork["id"].as_str().unwrap();
+    let guard = inspect.lock_unpoisoned();
+    let fork_set = guard.library.current_target_set(fork_id).unwrap();
+    assert_eq!(fork_set.members.len(), 1);
+    assert_eq!(fork_set.members[0].target_id, attached["id"]);
+    assert_eq!(
+        fork_set.members[0].participation,
+        crate::library::TargetParticipationMode::ReadOnly
+    );
+    assert_eq!(
+        guard.engagement_index[fork_id], guard.engagement_index[chat_id],
+        "fork remains in the one project collaboration workspace"
+    );
 }
 
 /// A minted **context** is owned by the authority the agent will act-for, so the
@@ -2661,6 +3249,15 @@ async fn target_binding_basis_and_candidate_survive_restart() {
         .unwrap();
     assert_eq!(chat["target_id"], target_id);
     assert_eq!(chat["target_basis"], basis);
+    assert_eq!(chat["target_set_revision"], 0);
+    assert_eq!(chat["targets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(chat["targets"][0]["target_id"], target_id);
+    assert!(chat["targets"][0]["root"]
+        .as_str()
+        .is_some_and(|root| root.starts_with("targets/t-")));
+    assert!(chat["collaboration_workspace_id"]
+        .as_str()
+        .is_some_and(|workspace| workspace.starts_with("project-workspace-")));
     let (status, diff) = send(&app, "GET", &format!("/chats/{chat_id}/diff"), None).await;
     assert_eq!(status, StatusCode::OK, "{diff}");
     assert!(diff.contains("candidate.md"), "{diff}");
@@ -3671,6 +4268,7 @@ fn append_turn(wb: &mut Workbench, chat: &str, user: &str, assistant: &str) -> (
         },
         reads_before: vec![],
         reads_after: vec![],
+        fork_snapshot: None,
     };
     wb.store_mut()
         .append_record(
@@ -4568,7 +5166,7 @@ async fn workstream_sync_route_is_clean_with_nothing_to_pull() {
 }
 
 #[tokio::test]
-async fn unbinding_a_placement_tombstones_its_workstream_roots() {
+async fn unbinding_a_placement_preserves_project_owned_workstreams() {
     let (_d, wb) = seeded_workbench();
     let app = open_control_plane(wb.clone());
     let target_id = library_state::managed_project_target_id(DEFAULT_PROJECT);
@@ -4578,7 +5176,7 @@ async fn unbinding_a_placement_tombstones_its_workstream_roots() {
         &format!("/placements/{DEFAULT_PLACEMENT}/workstreams"),
         Some(
             &serde_json::json!({
-                "name": "retired with placement",
+                "name": "survives creator placement",
                 "target_id": target_id,
             })
             .to_string(),
@@ -4601,11 +5199,17 @@ async fn unbinding_a_placement_tombstones_its_workstream_roots() {
     assert_eq!(status, StatusCode::OK, "unbind placement: {body}");
 
     let guard = wb.lock_unpoisoned();
-    assert!(!guard.library.workstreams.contains_key(&workstream_id));
-    assert!(!guard.library.workstream_roots.contains_key(&workstream_id));
+    assert!(guard.library.workstreams.contains_key(&workstream_id));
+    assert_eq!(
+        guard.library.workstream_roots[&workstream_id].project_id,
+        DEFAULT_PROJECT
+    );
     let rebuilt = crate::library::Library::rebuild(guard.store_ref()).expect("rebuild library");
-    assert!(!rebuilt.workstreams.contains_key(&workstream_id));
-    assert!(!rebuilt.workstream_roots.contains_key(&workstream_id));
+    assert!(rebuilt.workstreams.contains_key(&workstream_id));
+    assert_eq!(
+        rebuilt.workstream_roots[&workstream_id].project_id,
+        DEFAULT_PROJECT
+    );
 }
 
 #[tokio::test]
@@ -4794,7 +5398,7 @@ async fn project_credential_override_pins_seals_and_lists() {
 #[tokio::test]
 async fn project_creation_binds_the_serving_home_and_refuses_a_foreign_home() {
     let (_d, wb) = seeded_workbench();
-    let app = open_control_plane(wb);
+    let app = open_control_plane(wb.clone());
 
     let (status, body) = send(
         &app,
@@ -4809,6 +5413,21 @@ async fn project_creation_binds_the_serving_home_and_refuses_a_foreign_home() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(created["home_id"], "home:local-user");
+
+    {
+        let guard = wb.lock_unpoisoned();
+        let project_id = created["id"].as_str().unwrap();
+        let collaboration = &guard.library.project_collaboration_workspaces[project_id];
+        assert_eq!(collaboration.home_id.as_str(), "home:local-user");
+        assert_eq!(
+            collaboration.host_contract_revision,
+            crate::workstream_host_contract::REVISION
+        );
+        assert!(!guard
+            .library
+            .work_targets
+            .contains_key(&collaboration.workspace_id));
+    }
 
     let (_, workspace) = send(&app, "GET", "/workspace", None).await;
     let workspace: serde_json::Value = serde_json::from_str(&workspace).unwrap();
@@ -4849,6 +5468,7 @@ fn startup_rejects_a_project_without_a_home_bound_target() {
 #[tokio::test]
 async fn project_binds_an_agent_and_hosts_a_chat() {
     let (_d, wb) = seeded_workbench();
+    let inspect = wb.clone();
     let app = open_control_plane(wb);
 
     let (_, body) = send(&app, "POST", "/projects", Some(r#"{"name":"client-site"}"#)).await;
@@ -4871,7 +5491,7 @@ async fn project_binds_an_agent_and_hosts_a_chat() {
         .to_string();
 
     // chat under the binding.
-    let (s, _) = send(
+    let (s, chat_body) = send(
         &app,
         "POST",
         &format!("/projects/{pid}/placements/{iid}/chats"),
@@ -4881,6 +5501,24 @@ async fn project_binds_an_agent_and_hosts_a_chat() {
     )
     .await;
     assert_eq!(s, StatusCode::CREATED);
+    let chat: serde_json::Value = serde_json::from_str(&chat_body).unwrap();
+    let chat_id = chat["id"].as_str().unwrap();
+    {
+        let guard = inspect.lock_unpoisoned();
+        let workspace_id = &guard.library.project_collaboration_workspaces[&pid].workspace_id;
+        assert_eq!(
+            guard.engagement_index.get(chat_id).map(String::as_str),
+            Some(workspace_id.as_str())
+        );
+        assert!(guard.collaboration_workspaces.contains_key(workspace_id));
+        assert_ne!(workspace_id, &target_id);
+        let engagement = &guard.engagements[chat_id];
+        let manifest =
+            std::fs::read_to_string(engagement.path().join(".gaugedesk-runtime/target-set.json"))
+                .unwrap();
+        assert!(manifest.contains(&target_id));
+        assert!(engagement.path().join("targets").is_dir());
+    }
     let (_, body) = send(&app, "GET", "/workspace", None).await;
     assert!(
         body.contains("client-site") && body.contains("triage"),

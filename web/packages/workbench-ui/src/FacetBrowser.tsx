@@ -120,17 +120,27 @@ export interface FacetBrowserApi {
     renameArchetype(id: ArchetypeId, name: string): Promise<void>;
     renameProject(id: ProjectId, name: string): Promise<void>;
     renameChat(id: EngagementId, title: string): Promise<void>;
-    createWorkstream(placementId: PlacementId, name: string, targetId: WorkTargetId): Promise<WorkstreamNode>;
+    createWorkstream(placementId: PlacementId, name: string): Promise<WorkstreamNode>;
     joinWorkstream(ws: WorkstreamId, chat: EngagementId): Promise<void>;
     leaveWorkstream(ws: WorkstreamId, chat: EngagementId): Promise<void>;
     promoteWorkstream(ws: WorkstreamId): Promise<void>;
+    settleWorkstreamTarget(ws: WorkstreamId, target: WorkTargetId, act: "apply" | "publish" | "release", promotionManifestRef?: string): Promise<void>;
+    settleChatTargets(chat: EngagementId, members: readonly { target_id: WorkTargetId; act: "apply" | "publish" | "release" }[]): Promise<void>;
+    queryTargetSettlementMember(declarationId: string, memberId: string): Promise<void>;
+    retryTargetSettlementMember(declarationId: string, memberId: string): Promise<void>;
+    getTargetSettlement(declarationId: string): Promise<void>;
+    supersedeTargetSettlementMember(declarationId: string, memberId: string, laterDeclarationId: string, laterMemberId: string): Promise<void>;
+    compensateTargetSettlement(declarationId: string, receiptRefs: readonly string[], reconciliationComplete: boolean): Promise<void>;
+    abandonTargetSettlement(declarationId: string, reason: string): Promise<void>;
+    cancelTargetSettlement(declarationId: string, reason: string): Promise<void>;
     archiveWorkstream(ws: WorkstreamId): Promise<void>;
     createChatUnderArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId>;
-    createChatUnderPlacement(pid: ProjectId, placementId: PlacementId, title: string, targetId: WorkTargetId): Promise<EngagementId>;
+    createChatUnderPlacement(pid: ProjectId, placementId: PlacementId, title: string, targetIds: readonly WorkTargetId[]): Promise<EngagementId>;
+    reviseChatTargets(id: EngagementId, targets: readonly { targetId: WorkTargetId; participation: "read-only" | "writable" }[]): Promise<void>;
     useArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId>;
     createEngagement(): Promise<Engagement>;
     deleteChat(id: EngagementId): Promise<void>;
-    forkChat(id: EngagementId): Promise<EngagementId>;
+    forkChat(id: EngagementId, destination?: { kind: "inherit" } | { kind: "main" } | { kind: "workstream"; workstream_id: string }): Promise<EngagementId>;
     deleteProject(id: ProjectId): Promise<void>;
     upgradePlacement(placementId: PlacementId): Promise<number>;
     acceptPlacement(placementId: PlacementId): Promise<void>;
@@ -411,8 +421,8 @@ export function FacetBrowser(props: {
     >(null);
     const [pickerQuery, setPickerQuery] = createSignal("");
     const [targetChoice, setTargetChoice] = createSignal<
-        | { kind: "chat"; pid: ProjectId; placementId: PlacementId; targets: WorkTargetNode[] }
-        | { kind: "workstream"; placementId: PlacementId; name: string; targets: WorkTargetNode[]; joinChat?: EngagementId }
+        | { kind: "chat"; pid: ProjectId; placementId: PlacementId; targets: WorkTargetNode[]; selected: readonly WorkTargetId[] }
+        | { kind: "revise"; chatId: EngagementId; targets: WorkTargetNode[]; selected: readonly { targetId: WorkTargetId; participation: "read-only" | "writable" }[] }
         | null
     >(null);
 
@@ -547,7 +557,13 @@ export function FacetBrowser(props: {
         await withRefresh(() => props.api.leaveWorkstream(wsId, chat), "left the workstream — back on the mainline");
     }
     async function promoteWs(wsId: WorkstreamId) {
-        await withRefresh(() => props.api.promoteWorkstream(wsId), "promoted the workstream into the mainline");
+        await withRefresh(() => props.api.promoteWorkstream(wsId), "collaboration promoted into Main — target settlement remains separate");
+    }
+    async function settleWsTarget(ws: WorkstreamNode, target: WorkTargetNode, act: "apply" | "publish" | "release") {
+        await withRefresh(
+            () => props.api.settleWorkstreamTarget(ws.id, target.id, act, ws.promotionManifestRef ?? undefined),
+            `${target.name}: ${act} settlement requested`,
+        );
     }
     function requestPromoteWs(wsId: WorkstreamId) {
         if (confirmingMerge() !== wsId) {
@@ -626,6 +642,26 @@ export function FacetBrowser(props: {
         await withRefresh(() => props.api.archiveWorkstream(wsId), "workstream archived — its chats are back on the mainline");
     }
 
+    async function forkChatWithRetry(chat: { id: EngagementId; workspaceRoot: WorkspaceRootId }): Promise<EngagementId> {
+        try {
+            return await props.api.forkChat(chat.id);
+        } catch (error) {
+            if (!String(error).includes("historical-home-closed")) throw error;
+            const destinations = (tree()?.workstreams ?? []).filter((workstream) =>
+                workstream.status === "active" && workstream.workspaceRoot === chat.workspaceRoot);
+            const answer = window.prompt(
+                `That historical workstream is archived. Choose a current destination:\n0. Main\n${destinations.map((workstream, index) => `${index + 1}. ${workstream.name}`).join("\n")}`,
+                "0",
+            );
+            if (answer === null) throw error;
+            const choice = Number(answer.trim());
+            if (choice === 0) return props.api.forkChat(chat.id, { kind: "main" });
+            const destination = destinations[choice - 1];
+            if (!destination) throw new Error("no valid fork destination was selected");
+            return props.api.forkChat(chat.id, { kind: "workstream", workstream_id: destination.id });
+        }
+    }
+
     // An EDIT chat is rooted on an archetype (improve the method).
     async function newEditChat(archetypeId: ArchetypeId) {
         await withRefresh(async () => {
@@ -645,58 +681,100 @@ export function FacetBrowser(props: {
                   .find((placement) => placement.placementId === placementId)?.targetIds ?? [];
         return targetIds
             .map((id) => workspace.workTargets.find((target) => target.id === id))
-            .filter((target): target is WorkTargetNode => !!target && target.status === "available" && target.capabilities.propose);
+            .filter((target): target is WorkTargetNode => !!target && target.status === "available" && target.capabilities.read);
     }
 
-    async function newWorkChat(pid: ProjectId, placementId: PlacementId, targetId?: WorkTargetId) {
+    async function newWorkChat(pid: ProjectId, placementId: PlacementId, targetIds?: readonly WorkTargetId[]) {
         const targets = targetsForPlacement(placementId);
-        const selected = targetId ? targets.find((target) => target.id === targetId) : targets[0];
-        if (!targetId && targets.length > 1) {
-            setTargetChoice({ kind: "chat", pid, placementId, targets });
+        if (!targetIds && targets.length > 1) {
+            setTargetChoice({ kind: "chat", pid, placementId, targets, selected: [] });
             return;
         }
-        if (!selected) {
-            props.onStatus("no available work target can accept proposals");
+        const selected = targetIds ?? (targets.length === 1 ? [targets[0].id] : []);
+        if (selected.length === 0) {
+            props.onStatus("no available work target can be read");
             return;
         }
         await withRefresh(async () => {
-            const id = await props.api.createChatUnderPlacement(pid, placementId, "new chat", selected.id);
+            const id = await props.api.createChatUnderPlacement(pid, placementId, "new chat", selected);
             props.onSelect(id);
         }, "new work chat");
     }
 
     async function createNamedWorkstream(placementId: PlacementId, name: string, joinChat?: EngagementId) {
-        const chatTarget = joinChat
-            ? tree()?.recent.find((chat) => chat.id === joinChat)?.targetId
-            : undefined;
-        const targets = targetsForPlacement(placementId);
-        const selected = chatTarget ? targets.find((target) => target.id === chatTarget) : targets[0];
-        if (!chatTarget && targets.length > 1) {
-            setTargetChoice({ kind: "workstream", placementId, name, targets, joinChat });
-            return;
-        }
-        if (!selected) {
-            props.onStatus("no available work target can host this workstream");
-            return;
-        }
         await withRefresh(async () => {
-            const ws = await props.api.createWorkstream(placementId, name, selected.id);
+            const ws = await props.api.createWorkstream(placementId, name);
             if (joinChat) await props.api.joinWorkstream(ws.id, joinChat);
         }, `workstream "${name}" created`);
     }
 
-    async function chooseTarget(target: WorkTargetNode) {
+    function toggleTarget(target: WorkTargetNode) {
         const choice = targetChoice();
-        setTargetChoice(null);
         if (!choice) return;
-        if (choice.kind === "chat") {
-            await newWorkChat(choice.pid, choice.placementId, target.id);
+        if (choice.kind === "revise") {
+            const current = choice.selected.find((member) => member.targetId === target.id);
+            const selected = current
+                ? current.participation === "read-only" && target.capabilities.propose
+                    ? choice.selected.map((member) => member.targetId === target.id ? { ...member, participation: "writable" as const } : member)
+                    : choice.selected.filter((member) => member.targetId !== target.id)
+                : [...choice.selected, { targetId: target.id, participation: "read-only" as const }];
+            setTargetChoice({ ...choice, selected });
             return;
         }
-        await withRefresh(async () => {
-            const ws = await props.api.createWorkstream(choice.placementId, choice.name, target.id);
-            if (choice.joinChat) await props.api.joinWorkstream(ws.id, choice.joinChat);
-        }, `workstream "${choice.name}" created`);
+        const selected = choice.selected.includes(target.id)
+            ? choice.selected.filter((id) => id !== target.id)
+            : [...choice.selected, target.id];
+        setTargetChoice({ ...choice, selected });
+    }
+    function targetChoiceParticipation(
+        choice: NonNullable<ReturnType<typeof targetChoice>>,
+        targetId: WorkTargetId,
+    ): "read-only" | "writable" | null {
+        if (choice.kind === "chat") return choice.selected.includes(targetId) ? "writable" : null;
+        return choice.selected.find((member) => member.targetId === targetId)?.participation ?? null;
+    }
+
+    async function confirmTargetChoice() {
+        const choice = targetChoice();
+        if (!choice || choice.selected.length === 0) return;
+        setTargetChoice(null);
+        if (choice.kind === "chat") {
+            await newWorkChat(choice.pid, choice.placementId, choice.selected);
+        } else {
+            await withRefresh(
+                () => props.api.reviseChatTargets(choice.chatId, choice.selected),
+                "chat target set revised for the next turn",
+            );
+        }
+    }
+
+    function reviseTargets(chat: { id: EngagementId; placement?: PlacementId | null; targets?: readonly { targetId: WorkTargetId; participation: "read-only" | "writable" }[] }) {
+        if (!chat.placement) return;
+        setTargetChoice({
+            kind: "revise",
+            chatId: chat.id,
+            targets: targetsForPlacement(chat.placement),
+            selected: (chat.targets ?? []).map((target) => ({ targetId: target.targetId, participation: target.participation })),
+        });
+    }
+    function settleChatTargetChanges(chat: { id: EngagementId; targets?: readonly { targetId: WorkTargetId; participation: "read-only" | "writable" }[] }) {
+        const members = (chat.targets ?? []).flatMap((member) => {
+            if (member.participation !== "writable") return [];
+            const target = tree()?.workTargets.find((candidate) => candidate.id === member.targetId);
+            const act: "apply" | "publish" | "release" | null = target?.capabilities.apply ? "apply"
+                : target?.capabilities.publish ? "publish"
+                : target?.capabilities.release ? "release"
+                : null;
+            return act ? [{ target_id: member.targetId, act }] : [];
+        });
+        if (members.length === 0) {
+            props.onStatus("no writable chat target has an apply, publish, or release capability");
+            return;
+        }
+        void withRefresh(
+            () => props.api.settleChatTargets(chat.id, members),
+            "started settlement for every writable target candidate",
+        );
     }
     // USE an archetype with no placement ceremony (ADR 0045/0036): a work chat in
     // the explicit Personal project. The server finds/creates its placement.
@@ -1024,12 +1102,10 @@ export function FacetBrowser(props: {
             .flatMap((pl) => chatsFor(`${p.name} ${pl.archetypeName}`, pl.chats).map((chat) => ({ chat, pl })))
             .sort((a, b) =>
                 (rank.get(a.chat.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.chat.id) ?? Number.MAX_SAFE_INTEGER));
-        return (
-            <For each={rows} fallback={<div class="status">no chats yet — start one from the row above</div>}>
-                {({ chat, pl }) =>
-                    chatRow(chat, pl.isDefault ? undefined : pl.archetypeName, pl.workstreams, false)}
-            </For>
-        );
+        const projectWorkstreams = (tree()?.workstreams ?? []).filter((workstream) =>
+            workstream.projectId === p.id);
+        if (rows.length === 0) return <div class="status">no chats yet — start one from the row above</div>;
+        return chatGroups(rows.map(({ chat }) => chat), projectWorkstreams);
     };
 
     // The structural chat-leaf renderer for Projects and Library.
@@ -1050,7 +1126,7 @@ export function FacetBrowser(props: {
         displayChatTitle(chat.title, untitledTag(chat.id));
 
     const chatRow = (
-        chat: { id: EngagementId; title: string; kind: "edit" | "work"; workstream?: WorkstreamId | null; placement?: PlacementId | null; workspaceRoot: WorkspaceRootId; rehomeBlocked: boolean; changes?: boolean; conflict?: boolean },
+        chat: { id: EngagementId; title: string; kind: "edit" | "work"; workstream?: WorkstreamId | null; placement?: PlacementId | null; workspaceRoot: WorkspaceRootId; targets?: readonly { targetId: WorkTargetId; name: string; participation: "read-only" | "writable" }[]; rehomeBlocked: boolean; changes?: boolean; conflict?: boolean },
         meta?: string,
         // The placement's workstreams (WS-F), present only in the Projects facet, so a
         // work chat's menu can offer join/leave and its row can badge membership.
@@ -1142,7 +1218,7 @@ export function FacetBrowser(props: {
                         label: "fork",
                         run: () =>
                             void withRefresh(async () => {
-                                const fid = await props.api.forkChat(chat.id);
+                                const fid = await forkChatWithRetry(chat);
                                 props.onSelect(fid);
                             }, "chat forked"),
                     },
@@ -1166,10 +1242,24 @@ export function FacetBrowser(props: {
                             run: () => void joinWs(w.id, chat.id),
                         })),
                     ...(chat.rehomeBlocked
+                        ? [
+                            ...(chat.kind === "work" ? [{
+                                label: "settle target changes",
+                                hint: "Preflight every writable target before applying the chat's immutable change set",
+                                run: () => settleChatTargetChanges(chat),
+                            }] : []),
+                            {
+                                label: "settle changes before moving",
+                                hint: "Finish, repair, review, or discard this candidate before changing lines",
+                                run: () => props.onStatus("this chat has active or unsettled changes and cannot move yet"),
+                            },
+                        ]
+                        : []),
+                    ...(chat.kind === "work" && !chat.rehomeBlocked && chat.placement
                         ? [{
-                            label: "settle changes before moving",
-                            hint: "Finish, repair, review, or discard this candidate before changing lines",
-                            run: () => props.onStatus("this chat has active or unsettled changes and cannot move yet"),
+                            label: "change targets…",
+                            hint: "Add, remove, or change read-only/writable participation before the next turn",
+                            run: () => reviseTargets(chat),
                         }]
                         : []),
                     // Start a fresh shared line from this chat (WS-H): works in any facet,
@@ -1208,6 +1298,13 @@ export function FacetBrowser(props: {
                                     {mark(lineage())}
                                 </span>
                             )}
+                        </Show>
+                        <Show when={(chat.targets?.length ?? 0) > 0}>
+                            <span class="leaf-sub" data-chat-target-count={chat.targets?.length}>
+                                {(chat.targets ?? []).map((target) =>
+                                    `${target.name}${target.participation === "read-only" ? " (read-only)" : ""}`,
+                                ).join(" + ")}
+                            </span>
                         </Show>
                         {/* Chat-log hit (SEARCH-1): when this row surfaced because the
                             query matched its transcript, show a one-line snippet of the
@@ -1265,7 +1362,7 @@ export function FacetBrowser(props: {
     // affordance. Each group supplies only its root's workstreams to chatRow, so
     // cross-root destinations never become commands.
     const chatGroups = (
-        chats: { id: EngagementId; title: string; kind: "edit" | "work"; workstream?: WorkstreamId | null; placement?: PlacementId | null; workspaceRoot: WorkspaceRootId; rehomeBlocked: boolean; changes?: boolean; conflict?: boolean }[],
+        chats: { id: EngagementId; title: string; kind: "edit" | "work"; workstream?: WorkstreamId | null; placement?: PlacementId | null; workspaceRoot: WorkspaceRootId; targets?: readonly { targetId: WorkTargetId; name: string; participation: "read-only" | "writable" }[]; rehomeBlocked: boolean; changes?: boolean; conflict?: boolean }[],
         workstreams: WorkstreamNode[],
     ) => {
         const { groups, main, ungrouped } = groupChatsByWorkstream(chats, workstreams);
@@ -1403,6 +1500,12 @@ export function FacetBrowser(props: {
                                     <Icon name="git-branch" />
                                 </span>
                                 <span class="ws-label-name">{mark(g.ws.name)}</span>
+                                <span class="ws-status" data-collaboration-status={g.ws.collaboration}>
+                                    collaboration: {g.ws.collaboration}
+                                </span>
+                                <span class="ws-status" data-settlement-status={g.ws.targetSettlement}>
+                                    targets: {g.ws.targetSettlement}
+                                </span>
                                 <Show when={canDropOnWorkstream(draggingChat(), g.ws)}>
                                     <span class="ws-drop-hint">
                                         {dropTarget() === g.ws.id ? "Release to move" : "Drop chat here"}
@@ -1440,6 +1543,101 @@ export function FacetBrowser(props: {
                 <Show when={main === null}>
                     <For each={ungrouped}>{(c) => chatRow(c, undefined, joinTargets)}</For>
                 </Show>
+                <For each={workstreams.filter((workstream) =>
+                    workstream.status === "promoted" && workstream.promotionManifestRef !== null)}>
+                    {(workstream) => (
+                        <div class="ws-settlement" data-promoted-workstream={workstream.id}>
+                            <div class="ws-label">
+                                <span class="ws-label-name">{workstream.name}</span>
+                                <span class="ws-status" data-collaboration-status={workstream.collaboration}>
+                                    collaboration: promoted
+                                </span>
+                                <span class="ws-status" data-settlement-status={workstream.targetSettlement}>
+                                    target settlement: {workstream.targetSettlement}
+                                </span>
+                            </div>
+                            <For each={workstream.promotionTargets}>
+                                {(targetId) => {
+                                    const target = () => tree()?.workTargets.find((candidate) => candidate.id === targetId);
+                                    const member = () => workstream.targetSettlementMembers.find((candidate) => candidate.targetId === targetId);
+                                    const declaration = () => workstream.targetSettlementDeclaration;
+                                    return (
+                                        <div class="target-settlement-row" data-settlement-target={targetId}>
+                                            <span>{target()?.name ?? targetId}</span>
+                                            <span>{member()?.phase ?? "not requested"}</span>
+                                            <Show when={!member() && target()?.capabilities.apply}>
+                                                <button type="button" onClick={() => void settleWsTarget(workstream, target()!, "apply")}>Apply</button>
+                                            </Show>
+                                            <Show when={!member() && target()?.capabilities.publish}>
+                                                <button type="button" onClick={() => void settleWsTarget(workstream, target()!, "publish")}>Publish</button>
+                                            </Show>
+                                            <Show when={!member() && target()?.capabilities.release}>
+                                                <button type="button" onClick={() => void settleWsTarget(workstream, target()!, "release")}>Release</button>
+                                            </Show>
+                                            <Show when={declaration() && member()?.phase === "unknown"}>
+                                                <button type="button" onClick={() => void withRefresh(
+                                                    () => props.api.queryTargetSettlementMember(declaration()!, member()!.memberId),
+                                                    "queried the target authority",
+                                                )}>Query outcome</button>
+                                            </Show>
+                                            <Show when={declaration() && member()?.phase === "failed"}>
+                                                <button type="button" onClick={() => void withRefresh(
+                                                    () => props.api.retryTargetSettlementMember(declaration()!, member()!.memberId),
+                                                    "retried the proven no-effect target act",
+                                                )}>Retry</button>
+                                            </Show>
+                                            <Show when={declaration() && (member()?.phase === "pending" || member()?.phase === "preflight-passed")}>
+                                                <button type="button" onClick={() => void withRefresh(
+                                                    () => props.api.cancelTargetSettlement(declaration()!, "cancelled from the workstream settlement panel"),
+                                                    "cancelled not-started target acts",
+                                                )}>Cancel pending</button>
+                                                <button type="button" onClick={() => {
+                                                    const later = window.prompt("Later declaration id and member id, separated by a space");
+                                                    const [laterDeclarationId, laterMemberId] = later?.trim().split(/\s+/, 2) ?? [];
+                                                    if (!laterDeclarationId || !laterMemberId) return;
+                                                    void withRefresh(
+                                                        () => props.api.supersedeTargetSettlementMember(declaration()!, member()!.memberId, laterDeclarationId, laterMemberId),
+                                                        "superseded the not-started target act",
+                                                    );
+                                                }}>Supersede…</button>
+                                            </Show>
+                                        </div>
+                                    );
+                                }}
+                            </For>
+                            <Show when={workstream.targetSettlementDeclaration}>
+                                {(declarationId) => (
+                                    <div class="target-settlement-recovery" data-settlement-recovery={declarationId()}>
+                                        <button type="button" onClick={() => void withRefresh(
+                                            () => props.api.getTargetSettlement(declarationId()),
+                                            "refreshed durable settlement diagnostics",
+                                        )}>Refresh diagnostics</button>
+                                        <Show when={workstream.targetSettlement === "partially-applied" || workstream.targetSettlement === "reconciliation-required"}>
+                                            <button type="button" onClick={() => {
+                                                const receipts = window.prompt("Authenticated compensation receipt references, separated by commas");
+                                                if (receipts === null) return;
+                                                const refs = receipts.split(",").map((value) => value.trim()).filter(Boolean);
+                                                if (refs.length === 0) return;
+                                                void withRefresh(
+                                                    () => props.api.compensateTargetSettlement(declarationId(), refs, workstream.targetSettlement !== "reconciliation-required"),
+                                                    "recorded forward compensation receipts",
+                                                );
+                                            }}>Record compensation…</button>
+                                            <button type="button" onClick={() => {
+                                                const reason = window.prompt("Why is this partial settlement being abandoned?");
+                                                if (!reason?.trim()) return;
+                                                void withRefresh(
+                                                    () => props.api.abandonTargetSettlement(declarationId(), reason.trim()),
+                                                    "partial settlement abandoned with durable reason",
+                                                );
+                                            }}>Abandon partial…</button>
+                                        </Show>
+                                    </div>
+                                )}
+                            </Show>
+                        </div>
+                    )}
+                </For>
             </>
         );
     };
@@ -1522,7 +1720,7 @@ export function FacetBrowser(props: {
                                     {(chat) => chatRow(
                                         chat,
                                         undefined,
-                                        t().workstreams.filter((workstream) => workstream.placementId === chat.placement),
+                                        t().workstreams.filter((workstream) => workstream.workspaceRoot === chat.workspaceRoot),
                                         false,
                                         recentLineage(chat, t().projects, t().workstreams),
                                     )}
@@ -1625,21 +1823,19 @@ export function FacetBrowser(props: {
                                             </Show>
                                         </Show>
                                         <Show when={lensOf(p.id) === "archetype"}>
-                                        {/* The structural `by archetype` lens: the project's general
-                                            workspace first — its built-in general-assistant placement
-                                            is implementation detail, never a node; its chats sit
-                                            directly under the project. Deliberately placed archetypes
-                                            appear as their own nodes below. */}
+                                        {/* Workstreams are project topology, so even this structural
+                                            placement lens keeps every chat in the one project-wide
+                                            collaboration grouping. Agent placements remain below as
+                                            configuration/start-chat nodes; they never manufacture a
+                                            second per-placement view of Main or a named line. */}
                                         {(() => {
                                             const generals = p.placements.filter((pl) => pl.isDefault);
                                             const home = generals[0];
-                                            const homeChats = generals.flatMap((pl) => pl.chats);
-                                            const homeWs = generals.flatMap((pl) => pl.workstreams);
                                             return (
                                                 <Show when={home}>
                                                     {wsEditorFor(home!.placementId)}
                                                     <div class="project-home" data-project-home={p.id}>
-                                                        {chatGroups(chatsFor(p.name, homeChats), homeWs)}
+                                                        {flatProjectChats(p)}
                                                     </div>
                                                 </Show>
                                             );
@@ -1750,11 +1946,7 @@ export function FacetBrowser(props: {
                                                     </div>
                                                     <Show when={pl.kind === "work" && !isCollapsed(pl.placementId)}>
                                                         {wsEditorFor(pl.placementId)}
-                                                        {/* Chats grouped by workstream (WS-F). */}
-                                                        {chatGroups(
-                                                            chatsFor(`${p.name} ${pl.archetypeName}`, pl.chats),
-                                                            pl.workstreams,
-                                                        )}
+                                                        <div class="status">Chats are grouped by project workstream above.</div>
                                                     </Show>
                                                 </div>
                                             )}
@@ -1930,11 +2122,11 @@ export function FacetBrowser(props: {
                             onKeyDown={(e) => e.key === "Escape" && setTargetChoice(null)}
                         >
                             <div class="modal-head">
-                                <h3>Choose files to work on</h3>
+                                <h3>{choice().kind === "chat" ? "Choose one or more targets" : "Change chat targets"}</h3>
                                 <button onClick={() => setTargetChoice(null)}>close</button>
                             </div>
                             <p class="status" style={{ margin: "0 0 8px" }}>
-                                This placement can work on more than one independently versioned target.
+                                Each target keeps its own basis, permissions, diff, and settlement status.
                             </p>
                             <div class="picker-list">
                                 <For each={choice().targets}>
@@ -1943,17 +2135,32 @@ export function FacetBrowser(props: {
                                             type="button"
                                             class="picker-row target-picker-row"
                                             data-target-choice={target.id}
-                                            onClick={() => void chooseTarget(target)}
+                                            aria-pressed={targetChoiceParticipation(choice(), target.id) !== null}
+                                            onClick={() => toggleTarget(target)}
                                         >
-                                            <span>{target.name}</span>
+                                            <span>{choice().kind === "chat"
+                                                ? targetChoiceParticipation(choice(), target.id) ? "✓ " : ""
+                                                : targetChoiceParticipation(choice(), target.id) === "writable" ? "✎ "
+                                                : targetChoiceParticipation(choice(), target.id) === "read-only" ? "◉ " : ""}{target.name}</span>
                                             <small>
-                                                {target.kind} · {target.concurrency}
+                                                {target.capabilities.propose ? "writable" : "read-only"} · {target.kind} · {target.concurrency}
                                                 {target.concurrency === "compare-before-write-weak" ? " (no multi-writer guarantee)" : ""}
                                                 {` · ${target.currentBasis ?? "basis unavailable"}`}
                                             </small>
                                         </button>
                                     )}
                                 </For>
+                            </div>
+                            <div class="modal-actions">
+                                <button type="button" onClick={() => setTargetChoice(null)}>Cancel</button>
+                                <button
+                                    type="button"
+                                    data-create-multi-target-chat
+                                    disabled={choice().selected.length === 0}
+                                    onClick={() => void confirmTargetChoice()}
+                                >
+                                    {choice().kind === "chat" ? "Start chat with" : "Save"} {choice().selected.length || "selected"} target{choice().selected.length === 1 ? "" : "s"}
+                                </button>
                             </div>
                         </div>
                     </div>

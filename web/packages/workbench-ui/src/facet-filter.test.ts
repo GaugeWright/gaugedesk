@@ -71,6 +71,12 @@ describe("childrenFor", () => {
         expect(childrenFor("Reviewer", chats, "mail")).toEqual([{ title: "mailout" }]);
     });
 
+    it("finds a chat by any selected target name", () => {
+        const multi = [{ title: "launch", targets: [{ name: "Frontend" }, { name: "Payments API" }] }];
+        expect(childrenFor("Project", multi, "payments")).toEqual(multi);
+        expect(chatMatches(multi[0], "frontend")).toBe(true);
+    });
+
     it("returns a fresh array (does not alias the input)", () => {
         const out = childrenFor("x", chats, "");
         expect(out).not.toBe(chats);

@@ -62,12 +62,18 @@ pub(crate) fn provider_for(
 pub struct Workbench {
     /// Open GaugeDesk-managed work-target stores, keyed only by target id.
     pub(crate) targets: BTreeMap<String, Box<dyn Workspace>>,
+    /// Home-local project collaboration stores. These are deliberately
+    /// separate from work targets: their Main refs record accepted candidate
+    /// collaboration, never native target settlement.
+    pub(crate) collaboration_workspaces: BTreeMap<String, Box<dyn Workspace>>,
     /// Workspace construction providers, keyed by substrate id; managed targets
     /// resolve theirs via [`target_substrate_id`].
     pub(crate) providers: WorkspaceProviders,
     /// The default logical placement selected by the zero-setup chat route.
     pub(crate) default_instance: String,
-    pub(crate) engagement_index: BTreeMap<String, String>, // chat id -> target id
+    /// Chat id -> physical WhippleScript workspace id. For legacy/edit chats
+    /// this is a target id; project chats use their collaboration workspace id.
+    pub(crate) engagement_index: BTreeMap<String, String>,
     pub(crate) library: Library,
     pub(crate) store: Store,
     pub(crate) engagements: BTreeMap<String, Box<dyn ChatWorkspace>>,
@@ -285,6 +291,7 @@ impl Workbench {
     pub fn new(store: Store) -> Self {
         Self {
             targets: BTreeMap::new(),
+            collaboration_workspaces: BTreeMap::new(),
             providers: default_workspace_providers(),
             default_instance: String::new(),
             engagement_index: BTreeMap::new(),

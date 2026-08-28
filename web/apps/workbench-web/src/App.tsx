@@ -47,6 +47,8 @@ import {
     type HomeInvitationPreview,
     type PlacementPolicy,
     type PlacementId,
+    type WorkTargetId,
+    type WorkTargetNode,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
@@ -623,6 +625,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // startNewChat, then cleared. The composer is one component either way.
     const [pendingPin, setPendingPin] = createSignal<{ id: string; provider: string } | null>(null);
     const [pendingThinking, setPendingThinking] = createSignal("");
+    const [quickTargetChoice, setQuickTargetChoice] = createSignal<{
+        projectId: ProjectId;
+        placementId: PlacementId;
+        targets: readonly WorkTargetNode[];
+        selected: WorkTargetId[];
+        prompt?: string;
+        images: ImageRef[];
+    } | null>(null);
     const paneModel = () =>
         selected()
             ? { id: chatModel(), provider: chatProvider() }
@@ -712,7 +722,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             for (const pl of p.placements) {
                 const c = pl.chats.find((c) => c.id === id);
                 if (c) {
-                    const target = p.targets.find((target) => target.id === c.targetId);
+                    const targets = c.targets.map((member) => ({
+                        ...member,
+                        concurrency: p.targets.find((target) => target.id === member.targetId)?.concurrency,
+                    }));
                     return {
                         kind: c.kind,
                         lineage: `${pl.archetypeName} · ${p.name}`,
@@ -725,15 +738,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         // navigation row reads, so the two cannot disagree.
                         conflict: c.conflict,
                         // The line this chat's work lands on: its workstream when it is
-                        // homed to one, else the work target — the default mainline is a
-                        // workstream of one.
+                        // homed to one, else project collaboration Main. Target identity
+                        // is a separate execution-scope axis and is rendered below.
                         workstream: ws.workstreams.find((w) => w.id === c.workstream)?.name
-                            ?? target?.name ?? String(c.targetId),
+                            ?? "Main",
                         title: c.title,
-                        target: target?.name ?? String(c.targetId),
-                        targetKind: c.targetKind,
-                        targetConcurrency: target?.concurrency,
-                        basis: c.targetBasis,
+                        targets,
+                        target: targets.map((target) => target.name).join(", "),
+                        targetKind: targets.length === 1 ? targets[0].kind : undefined,
+                        targetConcurrency: targets.length === 1 ? targets[0].concurrency : undefined,
+                        basis: targets.map((target) => target.basis).join(" · "),
                         candidate: c.candidateRevision,
                         acts: c.availableActs,
                         // The project this chat lives in drives the network-egress
@@ -747,7 +761,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         for (const a of ws.archetypes) {
             const c = a.chats.find((c) => c.id === id);
             if (c) {
-                const target = ws.workTargets.find((target) => target.id === c.targetId);
+                const targets = c.targets.map((member) => ({
+                    ...member,
+                    concurrency: ws.workTargets.find((target) => target.id === member.targetId)?.concurrency,
+                }));
                 return {
                     kind: c.kind,
                     lineage: `${a.name} · Library`,
@@ -755,12 +772,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     context: a.name,
                     conflict: c.conflict,
                     workstream: ws.workstreams.find((w) => w.id === c.workstream)?.name
-                        ?? target?.name ?? String(c.targetId),
+                        ?? "Main",
                     title: c.title,
-                    target: target?.name ?? String(c.targetId),
-                    targetKind: c.targetKind,
-                    targetConcurrency: target?.concurrency,
-                    basis: c.targetBasis,
+                    targets,
+                    target: targets.map((target) => target.name).join(", "),
+                    targetKind: targets.length === 1 ? targets[0].kind : undefined,
+                    targetConcurrency: targets.length === 1 ? targets[0].concurrency : undefined,
+                    basis: targets.map((target) => target.basis).join(" · "),
                     candidate: c.candidateRevision,
                     acts: c.availableActs,
                 };
@@ -768,6 +786,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
         // Fallback to the flat recent list (archetype name only).
         const r = ws.recent.find((c) => c.id === id);
+        const targets = (r?.targets ?? []).map((member) => ({
+            ...member,
+            concurrency: ws.workTargets.find((target) => target.id === member.targetId)?.concurrency,
+        }));
         return {
             kind: r?.kind ?? "work",
             lineage: r?.archetype ?? "",
@@ -775,14 +797,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             context: "",
             conflict: false,
             changes: false,
-            workstream: r
-                ? (ws.workTargets.find((target) => target.id === r.targetId)?.name ?? String(r.targetId))
-                : "",
+            workstream: r ? (ws.workstreams.find((workstream) => workstream.id === r.workstream)?.name ?? "Main") : "",
             title: r?.title ?? "",
-            target: r ? (ws.workTargets.find((target) => target.id === r.targetId)?.name ?? String(r.targetId)) : "",
-            targetKind: r?.targetKind,
-            targetConcurrency: r ? ws.workTargets.find((target) => target.id === r.targetId)?.concurrency : undefined,
-            basis: r?.targetBasis,
+            targets,
+            target: targets.map((target) => target.name).join(", "),
+            targetKind: targets.length === 1 ? targets[0].kind : undefined,
+            targetConcurrency: targets.length === 1 ? targets[0].concurrency : undefined,
+            basis: targets.map((target) => target.basis).join(" · "),
             candidate: r?.candidateRevision,
             acts: r?.availableActs,
         };
@@ -1086,40 +1107,89 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             });
     }
 
-    // Start a fresh chat on the hidden Personal default placement (ADR 0036) — the
-    // same "just start typing" path as the nav's "+ new chat". Wired to the mobile
-    // carousel's Chat tab so it's never a dead control when no chat is open yet.
+    async function finishNewChat(id: EngagementId, prompt?: string, images: ImageRef[] = []) {
+        // The quick-start composer's model/effort choices were held as pending
+        // pins (no chat existed to own them); write them into the new chat's
+        // config before its first turn so the first message runs with them.
+        const pin = pendingPin();
+        const thinking = pendingThinking();
+        if (pin || thinking) {
+            try {
+                let cfg = "{}";
+                if (pin) cfg = writeChatModelPin(cfg, pin);
+                if (thinking) cfg = writeChatThinking(cfg, thinking);
+                await api.putConfig(id, cfg);
+            } catch {
+                setStatus("couldn't carry the model choice onto the new chat");
+            }
+            setPendingPin(null);
+            setPendingThinking("");
+        }
+        setStatus("new chat");
+        bumpNav();
+        openChat(id);
+        if (prompt) {
+            // Let the selected-chat effect subscribe before the first turn starts;
+            // otherwise an eager turn can race the fresh transcript reset.
+            queueMicrotask(() => void runPrompt(id, prompt, images).catch(() => undefined));
+        }
+    }
+
+    // Start a fresh chat on the Personal default placement (ADR 0036). When that
+    // placement can read several targets, the prominent empty-state path uses the
+    // same explicit target-set rule as navigation instead of submitting an
+    // ambiguous singular create request that the server must refuse.
     async function startNewChat(initialPrompt?: string, images: ImageRef[] = []) {
-        const prompt = initialPrompt?.trim();
+        const prompt = initialPrompt?.trim() || undefined;
         try {
+            const workspace = await api.getWorkspace();
+            const placementId = workspace.personalPlacement;
+            const project = placementId
+                ? workspace.projects.find((candidate) => candidate.placements.some((placement) => placement.placementId === placementId))
+                : undefined;
+            const placement = project?.placements.find((candidate) => candidate.placementId === placementId);
+            const targets = (placement?.targetIds ?? [])
+                .map((targetId) => workspace.workTargets.find((target) => target.id === targetId))
+                .filter((target): target is WorkTargetNode => !!target && target.status === "available" && target.capabilities.read);
+            if (project && placementId && targets.length > 1) {
+                setQuickTargetChoice({ projectId: project.id, placementId, targets, selected: [], prompt, images });
+                return;
+            }
+            if (project && placementId && targets.length === 1) {
+                const id = await api.createChatUnderPlacement(project.id, placementId, "new chat", [targets[0].id]);
+                await finishNewChat(id, prompt, images);
+                return;
+            }
             const eng = await api.createEngagement();
-            // The quick-start composer's model/effort choices were held as pending
-            // pins (no chat existed to own them); write them into the new chat's
-            // config before its first turn so the first message runs with them.
-            const pin = pendingPin();
-            const thinking = pendingThinking();
-            if (pin || thinking) {
-                try {
-                    let cfg = "{}";
-                    if (pin) cfg = writeChatModelPin(cfg, pin);
-                    if (thinking) cfg = writeChatThinking(cfg, thinking);
-                    await api.putConfig(eng.id, cfg);
-                } catch {
-                    setStatus("couldn't carry the model choice onto the new chat");
-                }
-                setPendingPin(null);
-                setPendingThinking("");
-            }
-            setStatus("new chat");
-            bumpNav(); // surface the new chat in the nav (the event stream also will)
-            openChat(eng.id); // selects it and (on mobile) brings the chat pane on-screen
-            if (prompt) {
-                // Let the selected-chat effect subscribe before the first turn starts;
-                // otherwise an eager turn can race the fresh transcript reset.
-                queueMicrotask(() => void runPrompt(eng.id, prompt, images).catch(() => undefined));
-            }
+            await finishNewChat(eng.id, prompt, images);
         } catch (e) {
             setStatus(`couldn't start a chat — ${String(e)}`);
+        }
+    }
+
+    function toggleQuickTarget(targetId: WorkTargetId) {
+        const choice = quickTargetChoice();
+        if (!choice) return;
+        const selected = choice.selected.includes(targetId)
+            ? choice.selected.filter((candidate) => candidate !== targetId)
+            : [...choice.selected, targetId];
+        setQuickTargetChoice({ ...choice, selected });
+    }
+
+    async function confirmQuickTargets() {
+        const choice = quickTargetChoice();
+        if (!choice || choice.selected.length === 0) return;
+        setQuickTargetChoice(null);
+        try {
+            const id = await api.createChatUnderPlacement(
+                choice.projectId,
+                choice.placementId,
+                "new chat",
+                choice.selected,
+            );
+            await finishNewChat(id, choice.prompt, choice.images);
+        } catch (error) {
+            setStatus(`couldn't start a chat — ${String(error)}`);
         }
     }
 
@@ -1278,11 +1348,35 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
     }
 
+    function contextDestination() {
+        const info = chatInfo();
+        if (!info || info.kind === "edit") return undefined;
+        const writable = info.targets.filter((target) => target.participation === "writable");
+        if (writable.length === 0) {
+            setStatus("context needs a writable target; every selected target is read-only");
+            return null;
+        }
+        if (writable.length === 1) return writable[0].targetId;
+        const answer = window.prompt(
+            `Choose the target that will receive this context:\n${writable.map((target, index) => `${index + 1}. ${target.name}`).join("\n")}`,
+            "1",
+        );
+        if (answer === null) return null;
+        const selected = writable[Number(answer.trim()) - 1];
+        if (!selected) {
+            setStatus("context was not ingested — choose one listed target");
+            return null;
+        }
+        return selected.targetId;
+    }
+
     async function ingestPath(path: string) {
         const id = selected();
         if (!id || !path) return;
+        const targetId = contextDestination();
+        if (targetId === null) return;
         try {
-            const c = await api.ingestContext(id, path);
+            const c = await api.ingestContext(id, path, targetId);
             setStatus(`ingested ${c} file(s)`);
             await Promise.all([refetchDiff(), refetchMerge()]);
         } catch (e) {
@@ -1321,8 +1415,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             setStatus(`nothing ingested — ${skipped.length} file(s) too large or unreadable`);
             return;
         }
+        const targetId = contextDestination();
+        if (targetId === null) return;
         try {
-            const n = await api.ingestContextUpload(id, files);
+            const n = await api.ingestContextUpload(id, files, targetId);
             setStatus(skipped.length ? `ingested ${n} file(s); skipped ${skipped.length}` : `ingested ${n} file(s)`);
             await Promise.all([refetchDiff(), refetchMerge()]);
         } catch (e) {
@@ -1612,13 +1708,40 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
      *
      *  Refuses rather than half-acts: if the branch cannot be made, the draft
      *  stays where it is and the failure is reported. */
+    async function forkWithDestinationRetry(source: EngagementId, entryId?: number): Promise<EngagementId> {
+        const invoke = (destination?: { kind: "inherit" } | { kind: "main" } | { kind: "workstream"; workstream_id: string }) =>
+            entryId === undefined
+                ? api.forkChat(source, destination)
+                : api.forkChatAt(source, entryId, destination);
+        try {
+            return await invoke();
+        } catch (error) {
+            if (!(error instanceof Rejected) || error.reason !== "historical-home-closed") throw error;
+            const workspace = await api.getWorkspace();
+            const sourceChat = workspace.recent.find((chat) => chat.id === source);
+            const destinations = workspace.workstreams.filter((workstream) =>
+                workstream.status === "active" && workstream.workspaceRoot === sourceChat?.workspaceRoot);
+            const menu = ["0. Main", ...destinations.map((workstream, index) => `${index + 1}. ${workstream.name}`)];
+            const answer = window.prompt(
+                `That historical workstream is archived. Choose where the exact historical fork should join now:\n${menu.join("\n")}`,
+                "0",
+            );
+            if (answer === null) throw error;
+            const choice = Number(answer.trim());
+            if (choice === 0) return invoke({ kind: "main" });
+            const workstream = destinations[choice - 1];
+            if (!workstream) throw new Error("no valid fork destination was selected");
+            return invoke({ kind: "workstream", workstream_id: workstream.id });
+        }
+    }
+
     async function forkWithDraft() {
         const id = selected();
         if (!id) return;
         const composed = desktopComposerController.takeComposed();
         if (!composed) return;
         try {
-            const branch = await api.forkChat(id);
+            const branch = await forkWithDestinationRetry(id);
             openChat(branch);
             await runPrompt(branch, composed.text, [...composed.images]);
         } catch (error) {
@@ -1742,6 +1865,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             <Show when={selected()} keyed fallback={<div class="status">Each chat's working files are listed here.</div>}>
                 {(id) => (
                     <SessionProvider value={desktopEnvironment.openSession(id).session}>
+                        <Show when={(chatInfo()?.targets?.length ?? 0) > 0}>
+                            <div class="target-partitions" data-target-partitions>
+                                <For each={chatInfo()!.targets}>
+                                    {(target) => (
+                                        <span class="target-partition" data-target-id={target.targetId}>
+                                            {target.name} · {target.participation} · {target.root}
+                                        </span>
+                                    )}
+                                </For>
+                            </div>
+                        </Show>
                         <Workspace />
                     </SessionProvider>
                 )}
@@ -1762,6 +1896,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 contextKind={selected() ? chatKind() : undefined}
                 workstream={selected() ? chatInfo()?.workstream : undefined}
                 workstreamState={selected() ? workstreamState() : undefined}
+                targets={selected() ? chatInfo()?.targets : undefined}
                 connection={selected() ? freshnessStatus() : undefined}
                 mobile={workbenchShell.isMobile()}
                 onCollapse={() => workbenchShell.setCollapsed("chat", true)}
@@ -1886,6 +2021,55 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // shell is active, so both the desktop grid and the mobile carousel mount them.
     const overlays = () => (
         <>
+            <Show when={quickTargetChoice()}>
+                {(choice) => (
+                    <div class="modal-overlay" data-quick-target-picker onClick={() => setQuickTargetChoice(null)}>
+                        <div
+                            class="modal place-picker"
+                            role="dialog"
+                            aria-modal="true"
+                            aria-label="Choose work targets for the new chat"
+                            onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => event.key === "Escape" && setQuickTargetChoice(null)}
+                        >
+                            <div class="modal-head">
+                                <h3>Choose one or more targets</h3>
+                                <button type="button" onClick={() => setQuickTargetChoice(null)}>close</button>
+                            </div>
+                            <p class="status" style={{ margin: "0 0 8px" }}>
+                                The chat can modify only the targets selected here. Each target keeps its own basis and settlement.
+                            </p>
+                            <div class="picker-list">
+                                <For each={choice().targets}>
+                                    {(target) => (
+                                        <button
+                                            type="button"
+                                            class="picker-row target-picker-row"
+                                            data-quick-target-choice={target.id}
+                                            aria-pressed={choice().selected.includes(target.id)}
+                                            onClick={() => toggleQuickTarget(target.id)}
+                                        >
+                                            <span>{choice().selected.includes(target.id) ? "✓ " : ""}{target.name}</span>
+                                            <small>{target.capabilities.propose ? "writable" : "read-only"} · {target.kind} · {target.currentBasis ?? "basis unavailable"}</small>
+                                        </button>
+                                    )}
+                                </For>
+                            </div>
+                            <div class="modal-actions">
+                                <button type="button" onClick={() => setQuickTargetChoice(null)}>Cancel</button>
+                                <button
+                                    type="button"
+                                    data-confirm-quick-targets
+                                    disabled={choice().selected.length === 0}
+                                    onClick={() => void confirmQuickTargets()}
+                                >
+                                    Start chat with {choice().selected.length || "selected"} target{choice().selected.length === 1 ? "" : "s"}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </Show>
             <Show when={agentSettings()}>
                 {(a) => (
                     <div class="modal-overlay" onClick={() => setAgentSettings(null)}>
@@ -2054,7 +2238,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             // ADR 0141: an inherited line's entry id is scoped to its authoring
             // chat, and forking there IS forking that ancestor at its own entry
             // — the new branch becomes the ancestor's child in the fork tree.
-            void api.forkChatAt((origin as EngagementId | undefined) ?? id, entryId).then(openChat);
+            void forkWithDestinationRetry((origin as EngagementId | undefined) ?? id, entryId)
+                .then(openChat)
+                .catch((error) => setStatus(`couldn't fork this point — ${String(error)}`));
         },
     });
     const desktopEnvironment = new Environment({

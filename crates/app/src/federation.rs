@@ -204,13 +204,37 @@ impl Workbench {
         Ok(())
     }
 
+    pub fn materialize_collaboration_workspace(
+        &mut self,
+        workspace_id: &str,
+        format: &str,
+        bundle: &[u8],
+    ) -> std::io::Result<()> {
+        let dir = self
+            .root
+            .join("collaboration-workspaces")
+            .join(workspace_id);
+        let provider = self.workspace_provider(workspace_id);
+        if format != provider.export_format() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "collaboration workspace export format is incompatible",
+            ));
+        }
+        let workspace = provider.from_export_at(&dir, bundle).map_err(io)?;
+        self.collaboration_workspaces
+            .insert(workspace_id.to_owned(), workspace);
+        self.reopen_collaboration_workspace_engagements(workspace_id)?;
+        Ok(())
+    }
+
     /// Collect the content bundles for every live managed target owned by a
     /// project relocation. Federation owns the wire shape and uses this helper to
     /// produce the opaque bytes behind relocated handles.
     pub(crate) fn project_relocation_content_bundles(
         &self,
         project: &str,
-    ) -> Vec<(String, String, Vec<u8>)> {
+    ) -> Vec<(String, String, Vec<u8>, bool)> {
         self.library_project_relocation_content_bundles(project)
     }
 }
@@ -2490,6 +2514,10 @@ struct HandoffContentBundle {
     target_id: String,
     format: String,
     bundle: Vec<u8>,
+    /// True for the one project collaboration workspace; false for a native
+    /// work target or referenced authoring target.
+    #[serde(default)]
+    collaboration: bool,
 }
 
 /// What a handoff message asks the receiver to do.
@@ -2589,6 +2617,26 @@ fn latest_library_records_by(
         .collect()
 }
 
+fn library_records_where(
+    store: &Store,
+    kind: &str,
+    keep: impl Fn(&serde_json::Value) -> bool,
+) -> Vec<HandoffLogRecord> {
+    store
+        .records(LIBRARY_SCOPE, kind)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|payload| {
+            serde_json::from_str::<serde_json::Value>(payload).is_ok_and(|value| keep(&value))
+        })
+        .map(|payload| HandoffLogRecord {
+            scope: LIBRARY_SCOPE.to_owned(),
+            kind: kind.to_owned(),
+            payload,
+        })
+        .collect()
+}
+
 /// The origin's snapshot of a project's relocatable log: **every** record under
 /// **every** scope the project owns (`project_log::<id>` and `project::<id>::*`),
 /// across all kinds, plus the project's `library` nouns (its `ProjectRecord`, the
@@ -2614,6 +2662,12 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
     out.extend(latest_library_records(store, "project", |v| {
         v.get("id").and_then(|i| i.as_str()) == Some(project)
     }));
+    out.extend(latest_library_records_by(
+        store,
+        "project_collaboration_workspace",
+        "project_id",
+        |v| v.get("project_id").and_then(|id| id.as_str()) == Some(project),
+    ));
     // The using-instances bound into the project — and, via them, the chats they hold
     // and the agents they bind, so the relocated project is a complete library subtree.
     let instances = latest_library_records(store, "instance", |v| {
@@ -2772,6 +2826,28 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
                 .is_some_and(|id| agent_ids.contains(id) && !protected_agent_ids.contains(id));
         project_owned || referenced_archetype
     });
+    let project_target_ids = targets
+        .iter()
+        .filter_map(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+        .filter(|value| {
+            value
+                .get("owner")
+                .and_then(|owner| owner.get("kind"))
+                .and_then(|kind| kind.as_str())
+                == Some("project")
+                && value
+                    .get("owner")
+                    .and_then(|owner| owner.get("project_id"))
+                    .and_then(|id| id.as_str())
+                    == Some(project)
+        })
+        .filter_map(|value| {
+            value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     out.extend(targets);
     let chats = latest_library_records(store, "chat", |v| {
         v.get("instance_id")
@@ -2789,6 +2865,26 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
         })
         .collect();
     out.extend(chats);
+    let mut settlement_ids = std::collections::BTreeSet::new();
+    // Chat scopes carry transcript/fork vectors plus change-set and settlement
+    // references. They are project content even though their stable ids are not
+    // syntactically nested beneath `project::<id>`.
+    for chat_id in &chat_ids {
+        for (_position, kind, payload) in store.events(chat_id).unwrap_or_default() {
+            if kind == "target_settlement_ref" {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    if let Some(id) = value.get("declaration_id").and_then(|id| id.as_str()) {
+                        settlement_ids.insert(id.to_owned());
+                    }
+                }
+            }
+            out.push(HandoffLogRecord {
+                scope: chat_id.clone(),
+                kind,
+                payload,
+            });
+        }
+    }
     out.extend(latest_library_records_by(
         store,
         "chat_target",
@@ -2799,6 +2895,11 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
                 .is_some_and(|id| chat_ids.contains(id))
         },
     ));
+    out.extend(library_records_where(store, "chat_target_set", |v| {
+        v.get("chat_id")
+            .and_then(|id| id.as_str())
+            .is_some_and(|id| chat_ids.contains(id))
+    }));
     let workstreams = latest_library_records(store, "workstream", |v| {
         v.get("instance_id")
             .and_then(|id| id.as_str())
@@ -2822,8 +2923,39 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
     // refuses a production co-drive run aimed at the relocated chat.
     for workstream_id in &workstream_ids {
         for (_position, kind, payload) in store.events(workstream_id).unwrap_or_default() {
+            if kind == "workstream_target_settlement_ref" {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    if let Some(id) = value.get("declaration_id").and_then(|id| id.as_str()) {
+                        settlement_ids.insert(id.to_owned());
+                    }
+                }
+            }
             out.push(HandoffLogRecord {
                 scope: workstream_id.clone(),
+                kind,
+                payload,
+            });
+        }
+    }
+    // A reference is not the coordinator state. Carry every referenced
+    // declaration scope and the Home-owned ordered lanes for project-owned
+    // targets so partial/unknown outcomes and not-started ordering survive a
+    // project Home relocation without becoming retryable guesses.
+    for declaration_id in settlement_ids {
+        let scope = format!("target-settlement::{declaration_id}");
+        for (_position, kind, payload) in store.events(&scope).unwrap_or_default() {
+            out.push(HandoffLogRecord {
+                scope: scope.clone(),
+                kind,
+                payload,
+            });
+        }
+    }
+    for target_id in project_target_ids {
+        let scope = format!("target-settlement-lane::{target_id}");
+        for (_position, kind, payload) in store.events(&scope).unwrap_or_default() {
+            out.push(HandoffLogRecord {
+                scope: scope.clone(),
                 kind,
                 payload,
             });
@@ -2859,11 +2991,14 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
 fn collect_project_content(wb: &Workbench, project: &str) -> Vec<HandoffContentBundle> {
     wb.project_relocation_content_bundles(project)
         .into_iter()
-        .map(|(target_id, format, bundle)| HandoffContentBundle {
-            target_id,
-            format,
-            bundle,
-        })
+        .map(
+            |(target_id, format, bundle, collaboration)| HandoffContentBundle {
+                target_id,
+                format,
+                bundle,
+                collaboration,
+            },
+        )
         .collect()
 }
 
@@ -3172,10 +3307,19 @@ fn commit_incoming_handoff(
         tracing::warn!("handoff commit: OfferHandoff failed for {project}: {e:?}");
         return false;
     }
+    // Imported target sets and collaboration-workspace bindings must be folded
+    // before workspace branches are reopened so each chat is materialized with
+    // its exact sparse roots.
+    guard.rebuild_library();
     // 2. Materialize the content bytes behind the project's handles BEFORE the home can
     //    commit (STATE_BEFORE_HOME). A bundle that will not lay down blocks the commit.
     for b in content {
-        if let Err(e) = guard.materialize_target(&b.target_id, &b.format, &b.bundle) {
+        let materialized = if b.collaboration {
+            guard.materialize_collaboration_workspace(&b.target_id, &b.format, &b.bundle)
+        } else {
+            guard.materialize_target(&b.target_id, &b.format, &b.bundle)
+        };
+        if let Err(e) = materialized {
             tracing::warn!(
                 "handoff commit: materialize instance {} failed: {e:?}",
                 b.target_id
@@ -4323,19 +4467,15 @@ fn admit_run_place(
             return refused("source is not an active operator participant in the project");
         }
         if let Some(target_chat) = wire.target_chat.as_deref() {
-            use gaugedesk_core::workstream::{WorkstreamPhase, WorkstreamState};
-
             let target_is_member = guard.library.project_of_chat(target_chat)
                 == Some(wire.project.as_str())
                 && guard.engagements.contains_key(target_chat)
-                && guard.library.workstreams.values().any(|workstream| {
-                    guard
-                        .store_ref()
-                        .fold::<WorkstreamState>(&workstream.id)
-                        .is_ok_and(|state| {
-                            state.phase == WorkstreamPhase::Active
-                                && state.members.contains(target_chat)
-                        })
+                && guard.library.workstream_roots.values().any(|root| {
+                    root.project_id == wire.project
+                        && guard
+                            .workstream_members(&root.workstream_id)
+                            .iter()
+                            .any(|member| member == target_chat)
                 });
             if !target_is_member {
                 return refused(
@@ -6096,6 +6236,95 @@ mod handoff_routes_tests {
                     .as_deref()
                     == Some("authoring-target-1")
         }));
+    }
+
+    #[test]
+    fn relocation_carries_chat_fork_and_referenced_settlement_state_without_foreign_lanes() {
+        let mut store = mem_store();
+        for (kind, value) in [
+            (
+                "instance",
+                serde_json::json!({
+                    "id": "placement-1", "project_id": "project-1", "agent_id": "agent-1"
+                }),
+            ),
+            (
+                "chat",
+                serde_json::json!({
+                    "id": "chat-1", "instance_id": "placement-1"
+                }),
+            ),
+            (
+                "workstream",
+                serde_json::json!({
+                    "id": "workstream-1", "instance_id": "placement-1"
+                }),
+            ),
+            (
+                "work_target",
+                serde_json::json!({
+                    "id": "target-1", "owner": {"kind": "project", "project_id": "project-1"}
+                }),
+            ),
+            (
+                "work_target",
+                serde_json::json!({
+                    "id": "foreign-target", "owner": {"kind": "project", "project_id": "project-2"}
+                }),
+            ),
+        ] {
+            store
+                .append_record(LIBRARY_SCOPE, kind, &value.to_string())
+                .unwrap();
+        }
+        store
+            .append_record("chat-1", "turn_fork_snapshot", r#"{"snapshot":"exact"}"#)
+            .unwrap();
+        store
+            .append_record(
+                "chat-1",
+                "target_settlement_ref",
+                r#"{"declaration_id":"settlement-1"}"#,
+            )
+            .unwrap();
+        store
+            .append_record(
+                "workstream-1",
+                "workstream_target_settlement_ref",
+                r#"{"manifest_id":"manifest-1","declaration_id":"settlement-1"}"#,
+            )
+            .unwrap();
+        store
+            .append_record(
+                "target-settlement::settlement-1",
+                "target_settlement",
+                r#"{"phase":"reconciliation_required"}"#,
+            )
+            .unwrap();
+        store
+            .append_record(
+                "target-settlement-lane::target-1",
+                "target_lane",
+                r#"{"next_sequence":4}"#,
+            )
+            .unwrap();
+        store
+            .append_record(
+                "target-settlement-lane::foreign-target",
+                "target_lane",
+                r#"{"secret":"other project"}"#,
+            )
+            .unwrap();
+
+        let log = collect_project_log(&store, "project-1");
+        let scopes = log
+            .iter()
+            .map(|record| record.scope.as_str())
+            .collect::<Vec<_>>();
+        assert!(scopes.contains(&"chat-1"));
+        assert!(scopes.contains(&"target-settlement::settlement-1"));
+        assert!(scopes.contains(&"target-settlement-lane::target-1"));
+        assert!(!scopes.contains(&"target-settlement-lane::foreign-target"));
     }
 
     #[test]

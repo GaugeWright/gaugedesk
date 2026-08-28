@@ -19,12 +19,83 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::library::{gen_id, RecordOp, WorkstreamRecord, WorkstreamRootRecord};
+use crate::target_adapter::TargetActKind;
+use crate::target_settlement::RequestedSettlementMember;
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
-use gaugedesk_core::merge::{MergeCommand, MergePhase, MergeState};
+use gaugedesk_core::merge::{MergePhase, MergeState};
 use gaugedesk_core::run::{RunPhase, RunState};
-use gaugedesk_core::workstream::{WorkstreamCommand, WorkstreamPhase, WorkstreamState};
-use gaugedesk_store::AdmitError;
-use gaugedesk_workspace::MergeOutcome;
+use gaugedesk_core::target_settlement::{
+    SettlementMemberPhase, SettlementPhase, TargetSettlementState,
+};
+use gaugedesk_workspace::{MergeOutcome, WorkstreamTransferOutcome};
+use whipplescript_store::workstreams::StreamStatus;
+
+const PROMOTION_CONFLICT_PATHS: &str = "promotion_conflict_paths";
+
+fn collaboration_projection(rec: &WorkstreamRecord, status: Option<StreamStatus>) -> &'static str {
+    match status {
+        Some(StreamStatus::Archived) => "promoted",
+        Some(StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced) => "promoting",
+        Some(StreamStatus::Active) if rec.extra.contains_key(PROMOTION_CONFLICT_PATHS) => {
+            "conflicted"
+        }
+        Some(StreamStatus::Active) => "active",
+        None => "conflicted",
+    }
+}
+
+fn target_settlement_projection(phase: Option<SettlementPhase>) -> &'static str {
+    match phase {
+        None
+        | Some(
+            SettlementPhase::Undeclared
+            | SettlementPhase::Refused
+            | SettlementPhase::Cancelled
+            | SettlementPhase::Expired,
+        ) => "not-requested",
+        Some(
+            SettlementPhase::Declared | SettlementPhase::Preflighting | SettlementPhase::Ready,
+        ) => "preflighting",
+        Some(SettlementPhase::Applying) => "applying",
+        Some(SettlementPhase::Completed) => "completed",
+        Some(SettlementPhase::PartiallyApplied) => "partially-applied",
+        Some(SettlementPhase::ReconciliationRequired) => "reconciliation-required",
+        Some(SettlementPhase::Compensated) => "compensated",
+        Some(SettlementPhase::AbandonedPartial) => "abandoned-partial",
+    }
+}
+
+fn settlement_member_projection(phase: SettlementMemberPhase) -> &'static str {
+    match phase {
+        SettlementMemberPhase::Pending => "pending",
+        SettlementMemberPhase::PreflightPassed => "preflight-passed",
+        SettlementMemberPhase::Started => "started",
+        SettlementMemberPhase::Succeeded => "succeeded",
+        SettlementMemberPhase::Failed => "failed",
+        SettlementMemberPhase::Unknown => "unknown",
+        SettlementMemberPhase::CancelledBeforeStart => "cancelled-before-start",
+        SettlementMemberPhase::SupersededBeforeStart => "superseded-before-start",
+    }
+}
+
+fn clear_promotion_conflict(wb: &mut Workbench, workstream_id: &str) {
+    let Some(mut record) = wb.library.workstreams.get(workstream_id).cloned() else {
+        return;
+    };
+    if record.extra.remove(PROMOTION_CONFLICT_PATHS).is_some() {
+        wb.write_workstream_record(record);
+    }
+}
+
+fn record_promotion_conflict(wb: &mut Workbench, workstream_id: &str, paths: &[String]) {
+    let Some(mut record) = wb.library.workstreams.get(workstream_id).cloned() else {
+        return;
+    };
+    record
+        .extra
+        .insert(PROMOTION_CONFLICT_PATHS.to_owned(), json!(paths));
+    wb.write_workstream_record(record);
+}
 
 /// Whether a rendered provider diff contains collaborative workspace changes.
 /// `.agent-config.json` is a host-owned per-chat overlay, preserved across re-home;
@@ -39,7 +110,10 @@ fn diff_has_shared_line_changes(diff: &str) -> bool {
 #[derive(Deserialize)]
 pub struct CreateWorkstreamBody {
     pub name: String,
-    pub target_id: String,
+    /// Accepted only as a compatibility hint. Project workstreams are rooted in
+    /// the collaboration workspace, never in one selected target.
+    #[serde(default)]
+    pub target_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -47,55 +121,46 @@ pub struct MemberBody {
     pub chat: String,
 }
 
+#[derive(Default, Deserialize)]
+pub struct PromoteWorkstreamBody {
+    #[serde(default)]
+    pub settlement_members: Vec<WorkstreamSettlementMemberBody>,
+}
+
+#[derive(Deserialize)]
+pub struct WorkstreamSettlementMemberBody {
+    pub target_id: String,
+    pub act: TargetActKind,
+}
+
+#[derive(Deserialize)]
+pub struct CreateWorkstreamSettlementBody {
+    #[serde(default)]
+    pub promotion_manifest_ref: Option<String>,
+    pub members: Vec<WorkstreamSettlementMemberBody>,
+}
+
 impl Workbench {
-    /// Ensure every durable managed-target workstream has a native shared line,
-    /// then re-home its members from folded reducer membership (`WS-E`).
+    /// Rebuild the in-memory chat target tokens from WhippleScript's durable
+    /// branch-home receipts. GaugeDesk reducers are not a second membership
+    /// authority.
     pub fn restore_workstream_homing(&mut self) {
-        let ws_ids = self.library_workstream_ids();
-        for ws_id in ws_ids {
-            if let Some(root) = self.library_workstream_root(&ws_id) {
-                if let Some(storage) = self.managed_target_storage_id(&root.target_id) {
-                    let _ = self.create_target_workstream_ref(storage, &ws_id);
-                }
-            }
-            let members: Vec<String> = self
-                .store_ref()
-                .fold::<WorkstreamState>(&ws_id)
-                .ok()
-                .filter(|state| state.phase == WorkstreamPhase::Active)
-                .map(|s| s.members.into_iter().collect())
-                .unwrap_or_default();
-            for chat in members {
-                // The chat's owning placement mints the stream ref token — no
-                // ref-format knowledge outside the workspace seam (W7).
-                let Some(target) = self
-                    .library_workstream_root(&ws_id)
-                    .and_then(|root| {
-                        self.managed_target_storage_id(&root.target_id)
-                            .map(str::to_owned)
-                    })
-                    .and_then(|iid| self.workstream_target(&iid, &ws_id))
-                else {
-                    continue;
-                };
-                self.set_engagement_target(&chat, target);
-            }
+        let chats = self.engagement_index.keys().cloned().collect::<Vec<_>>();
+        for chat in chats {
+            let Some(storage_id) = self.engagement_index.get(&chat).cloned() else {
+                continue;
+            };
+            let Some(workspace) = self.workspace_by_storage_id(&storage_id) else {
+                continue;
+            };
+            let Ok(home) = workspace.engagement_home_receipt(&chat) else {
+                continue;
+            };
+            let target = home
+                .line_branch_id
+                .unwrap_or_else(|| workspace.mainline().to_owned());
+            self.set_engagement_target(&chat, target);
         }
-    }
-
-    /// The stream ref token for `ws_id`, minted by an open placement's
-    /// workspace impl (`None` when the placement is not open).
-    fn workstream_target(&self, instance_id: &str, ws_id: &str) -> Option<String> {
-        self.targets
-            .get(instance_id)
-            .map(|inst| inst.workstream_ref(ws_id))
-    }
-
-    /// The mainline token of the placement owning `chat`'s live engagement.
-    fn chat_mainline(&self, chat: &str) -> Option<String> {
-        self.live_engagement_target_id(chat)
-            .and_then(|iid| self.targets.get(iid))
-            .map(|inst| inst.mainline().to_string())
     }
 
     /// Re-home a chat's engagement onto a shared ref — joining a workstream
@@ -165,10 +230,13 @@ impl Workbench {
     /// Create the native shared workstream line under an open managed target.
     pub fn create_workstream_ref(
         &self,
-        target_id: &str,
+        storage_id: &str,
         workstream_id: &str,
     ) -> std::io::Result<()> {
-        self.create_target_workstream_ref(target_id, workstream_id)
+        self.workspace_by_storage_id(storage_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "workspace missing"))?
+            .create_named_workstream(workstream_id, None)
+            .map_err(crate::io)
     }
 
     /// Append a workstream declaration to the library log, apply it to the in-memory
@@ -206,42 +274,19 @@ impl Workbench {
         self.library_has_workstream(workstream_id)
     }
 
-    /// Fold one workstream's state from the durable log.
-    pub fn workstream_state(&self, workstream_id: &str) -> Option<WorkstreamState> {
-        self.store_ref().fold::<WorkstreamState>(workstream_id).ok()
-    }
-
-    /// Fold one workstream's member chat ids.
-    pub fn workstream_members(&self, workstream_id: &str) -> Vec<String> {
-        self.workstream_state(workstream_id)
-            .map(|state| state.members.into_iter().collect())
-            .unwrap_or_default()
-    }
-
-    /// All active named streams in one placement that currently claim `chat`. The
-    /// per-stream reducers own their own membership logs, so a placement-level move
-    /// must inspect every sibling before it can preserve the one-target rule.
-    fn active_workstream_memberships(&self, instance_id: &str, chat: &str) -> Vec<String> {
-        self.workstreams_in(instance_id)
-            .into_iter()
-            .filter_map(|record| {
-                self.workstream_state(&record.id).and_then(|state| {
-                    (state.phase == WorkstreamPhase::Active && state.members.contains(chat))
-                        .then(|| record.id.clone())
-                })
-            })
-            .collect()
-    }
-
-    /// Admit a workstream reducer command.
-    pub fn admit_workstream(
-        &mut self,
+    fn workstream_workspace(
+        &self,
         workstream_id: &str,
-        command: WorkstreamCommand,
-    ) -> Result<(), AdmitError> {
-        self.store_mut()
-            .admit::<WorkstreamState>(workstream_id, command)
-            .map(|_| ())
+    ) -> Option<&dyn gaugedesk_workspace::Workspace> {
+        let root = self.library_workstream_root(workstream_id)?;
+        self.workspace_by_storage_id(&root.workspace_id)
+    }
+
+    /// WhippleScript-authoritative member chat ids.
+    pub fn workstream_members(&self, workstream_id: &str) -> Vec<String> {
+        self.workstream_workspace(workstream_id)
+            .and_then(|workspace| workspace.workstream_members(workstream_id).ok())
+            .unwrap_or_default()
     }
 
     /// The managed target id that owns a chat's live candidate workspace.
@@ -259,27 +304,33 @@ impl Workbench {
         self.library_chat_placement(chat_id)
     }
 
-    /// Promote a workstream ref into its managed target mainline.
+    /// Promote a workstream ref into project collaboration Main.
     pub fn promote_workstream_ref_to_main(
         &self,
         workstream_id: &str,
-        target_id: &str,
+        storage_id: &str,
     ) -> std::io::Result<MergeOutcome> {
-        self.promote_target_workstream_ref_to_main(workstream_id, target_id)
+        self.workspace_by_storage_id(storage_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "workspace missing"))?
+            .promote_workstream_to_main(workstream_id)
+            .map_err(crate::io)
     }
 
     /// Refresh every live chat still homed to a target's implicit Main after that
     /// mainline advances. Promotion updates the managed target store; without this
     /// reconciliation, existing Main chat worktrees keep their old cut and make a
     /// successful promotion look like a no-op in the workbench.
-    fn sync_mainline_members(&self, target_id: &str) -> Vec<String> {
-        let Some(mainline) = self.targets.get(target_id).map(|target| target.mainline()) else {
+    fn sync_mainline_members(&self, storage_id: &str) -> Vec<String> {
+        let Some(mainline) = self
+            .workspace_by_storage_id(storage_id)
+            .map(|workspace| workspace.mainline())
+        else {
             return Vec::new();
         };
         self.engagements
             .iter()
             .filter(|(chat_id, engagement)| {
-                self.engagement_target_id(chat_id) == Some(target_id)
+                self.engagement_target_id(chat_id) == Some(storage_id)
                     && engagement.target() == mainline
             })
             .map(|(chat_id, engagement)| {
@@ -287,22 +338,6 @@ impl Workbench {
                 chat_id.clone()
             })
             .collect()
-    }
-
-    /// Record the verified reducer path for a successful workstream promotion.
-    pub fn admit_workstream_promotion(&mut self, workstream_id: &str) -> Result<(), AdmitError> {
-        let scope = format!("ws-merge-{workstream_id}");
-        for command in [
-            MergeCommand::StartMerge,
-            MergeCommand::WorkspaceClean,
-            MergeCommand::PolicyAdmit,
-            MergeCommand::AdvanceStandingRef,
-            MergeCommand::AdmitBoundaryIntegration,
-            MergeCommand::IntegrateToMainline,
-        ] {
-            self.store_mut().admit::<MergeState>(&scope, command)?;
-        }
-        Ok(())
     }
 }
 
@@ -317,37 +352,40 @@ pub async fn create_workstream(
     Json(body): Json<CreateWorkstreamBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let target = match wb.resolve_placement_target(&iid, Some(&body.target_id)) {
-        Ok(target) => target,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-    };
-    if target.adapter_family != "whipplescript-v1" {
+    let Some(project_id) = wb.placement_project_id(&iid).map(str::to_owned) else {
         return (
-            StatusCode::CONFLICT,
-            "this target adapter does not support shared managed lines",
+            StatusCode::BAD_REQUEST,
+            "workstream creator is not a project placement",
         )
             .into_response();
+    };
+    if let Some(target_id) = body.target_id.as_deref() {
+        if let Err(error) = wb.resolve_placement_target(&iid, Some(target_id)) {
+            return (StatusCode::BAD_REQUEST, error).into_response();
+        }
     }
-    let storage_target_id = target.id.as_str();
+    let Some(collaboration) = wb
+        .library
+        .project_collaboration_workspaces
+        .get(&project_id)
+        .cloned()
+    else {
+        return (
+            StatusCode::CONFLICT,
+            "project collaboration workspace is unavailable",
+        )
+            .into_response();
+    };
     let ws_id = gen_id("ws");
-    if let Err(e) = wb.create_workstream_ref(storage_target_id, &ws_id) {
-        let status = if e.kind() == std::io::ErrorKind::NotFound {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        return (status, format!("{e}")).into_response();
-    }
-    let home = wb.authority().as_str().to_string();
-    if let Err(e) = wb.admit_workstream(
-        &ws_id,
-        WorkstreamCommand::CreateWorkstream {
-            name: body.name.clone(),
-            home: home.clone(),
-            creator: home,
-        },
-    ) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response();
+    let Some(workspace) = wb.workspace_by_storage_id(&collaboration.workspace_id) else {
+        return (
+            StatusCode::CONFLICT,
+            "project collaboration workspace is not open",
+        )
+            .into_response();
+    };
+    if let Err(e) = workspace.create_named_workstream(&ws_id, Some(&body.name)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response();
     }
     let record = WorkstreamRecord {
         schema: crate::library::LIBRARY_RECORD_SCHEMA,
@@ -365,8 +403,10 @@ pub async fn create_workstream(
         workstream_id: ws_id.clone(),
         op: RecordOp::Upsert,
         placement_id: iid,
-        target_id: target.id.clone(),
-        adapter_family: target.adapter_family,
+        project_id,
+        workspace_id: collaboration.workspace_id,
+        target_id: String::new(),
+        adapter_family: String::new(),
     });
     // Re-stamp the record's position so nav ordering is stable (mirrors create_chat_in).
     wb.restamp_workstream_position(&ws_id, pos);
@@ -392,120 +432,122 @@ pub async fn list_workstreams(
 /// One workstream's projection: name + status + member chat ids (folded from the
 /// reducer). Shared by the list route and the workspace tree.
 pub fn workstream_json(wb: &Workbench, rec: &WorkstreamRecord) -> serde_json::Value {
-    let state = wb.workstream_state(&rec.id);
-    let status = match state.as_ref().map(|s| s.phase) {
-        Some(WorkstreamPhase::Archived) => "archived",
-        Some(WorkstreamPhase::Active) => "active",
-        _ => "active",
-    };
-    let members: Vec<String> = state
-        .map(|s| s.members.into_iter().collect())
-        .unwrap_or_default();
     let root = wb
         .workstream_root(&rec.id)
-        .expect("validated workstream has a target root");
-    let workspace_root = format!(
-        "{}::{}::{}",
-        root.placement_id, root.target_id, root.adapter_family
-    );
+        .expect("validated workstream has a collaboration root");
+    let topology = wb
+        .workspace_by_storage_id(&root.workspace_id)
+        .and_then(|workspace| workspace.workstream(&rec.id).ok().flatten());
+    let status = collaboration_projection(rec, topology.as_ref().map(|row| row.status));
+    let members = wb.workstream_members(&rec.id);
+    let promotion_manifest = wb
+        .workstream_promotion_manifests(&rec.id)
+        .ok()
+        .and_then(|manifests| manifests.last().cloned());
+    let target_settlement = wb.latest_workstream_target_settlement(&rec.id);
+    let settlement_members = target_settlement
+        .as_ref()
+        .and_then(|state| {
+            state.declaration.as_ref().map(|declaration| {
+                declaration.members.iter().map(|member| json!({
+                "member_id": member.member_id,
+                "target_id": member.target_id,
+                "act": member.act,
+                "phase": state.members.get(&member.member_id).map(|member| settlement_member_projection(member.phase)),
+            })).collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
     json!({
         "id": rec.id,
         "name": rec.name,
         "placement_id": rec.instance_id,
-        "workspace_root": workspace_root,
-        "target_id": root.target_id,
-        "adapter_family": root.adapter_family,
+        "project_id": root.project_id,
+        "workspace_root": root.workspace_id,
+        "target_id": serde_json::Value::Null,
+        "adapter_family": "whipplescript-project-v1",
         "status": status,
+        "collaboration": status,
         "members": members,
+        "expected_stream_cut": topology.as_ref().and_then(|row| row.expected_line_cut.clone()),
+        "expected_main_cut": topology.as_ref().and_then(|row| row.expected_main_cut.clone()),
+        "promotion_receipt": topology.and_then(|row| row.boundary_receipt(&root.workspace_id)),
+        "promotion_manifest_ref": promotion_manifest.as_ref().map(|manifest| manifest.id.clone()),
+        "promotion_targets": promotion_manifest.as_ref().map(|manifest| manifest.partitions.iter().map(|partition| partition.target_id.clone()).collect::<Vec<_>>()).unwrap_or_default(),
+        "target_settlement": target_settlement_projection(target_settlement.as_ref().map(|state| state.phase)),
+        "target_settlement_declaration": target_settlement
+            .as_ref().and_then(|state| state.declaration.as_ref().map(|declaration| declaration.declaration_id.clone())),
+        "target_settlement_members": settlement_members,
     })
 }
 
 // ---- POST /workstreams/:id/join ------------------------------------------
 
 /// Transfer a chat onto a workstream's main — it now greedily auto-syncs there.
-/// Membership is single-target: joining this line removes the chat from every other
-/// active named line in the placement before its target is changed (ADR 0087).
+/// Membership is project topology: joining this line removes the branch from
+/// its prior named line in the same collaboration workspace. Target selection
+/// and placement do not participate in workstream identity.
 pub async fn join_workstream(
     State(wb): State<SharedWorkbench>,
     Path(ws_id): Path<String>,
     Json(body): Json<MemberBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let Some(rec) = wb.workstream(&ws_id) else {
+    if !wb.has_workstream(&ws_id) {
         return (StatusCode::NOT_FOUND, "no such workstream").into_response();
-    };
+    }
     let Some(root) = wb.workstream_root(&ws_id) else {
         return (StatusCode::CONFLICT, "workstream target root is unresolved").into_response();
     };
-    // Exact-root only: placement, target, and adapter family must all match.
-    if wb.chat_placement_id(&body.chat) != Some(rec.instance_id.as_str()) {
+    if wb.library_project_of_chat(&body.chat).as_deref() != Some(root.project_id.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
-            "chat is not in this workstream's placement",
+            "chat is not in this workstream's project",
         )
             .into_response();
     }
-    let Some(binding) = wb.library_chat_target_binding(&body.chat) else {
-        return (StatusCode::CONFLICT, "chat target is unresolved").into_response();
+    let Some(workspace) = wb.workspace_by_storage_id(&root.workspace_id) else {
+        return (
+            StatusCode::CONFLICT,
+            "project collaboration workspace is unavailable",
+        )
+            .into_response();
     };
-    if binding.target_id != root.target_id {
-        return (
-            StatusCode::BAD_REQUEST,
-            "chat is not on this workstream's target",
-        )
-            .into_response();
-    }
-    if wb
-        .workstream_state(&ws_id)
-        .map(|state| state.phase != WorkstreamPhase::Active)
-        .unwrap_or(true)
-    {
+    let Some(topology) = workspace.workstream(&ws_id).ok().flatten() else {
+        return (StatusCode::CONFLICT, "workstream topology is unavailable").into_response();
+    };
+    if topology.status != StreamStatus::Active {
         return (StatusCode::CONFLICT, "workstream is not active").into_response();
     }
-    let Some(storage_target_id) = wb
-        .managed_target_storage_id(&root.target_id)
-        .map(str::to_owned)
-    else {
-        return (StatusCode::CONFLICT, "work target storage is unavailable").into_response();
-    };
-    let Some(destination) = wb.workstream_target(&storage_target_id, &ws_id) else {
+    if wb.engagement_rehome_blocked(&body.chat) {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "workstream workspace is unavailable",
+            StatusCode::CONFLICT,
+            "chat has active or unsettled workspace changes; settle or discard them before moving",
         )
             .into_response();
+    }
+    let transfer = match workspace.transfer_engagement_to_workstream(&body.chat, &ws_id) {
+        Ok(outcome) => outcome,
+        Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
     };
-    if let Err(error) = wb.rehome_engagement(&body.chat, &destination) {
+    if !matches!(transfer, WorkstreamTransferOutcome::Joined { .. }) {
+        return (
+            StatusCode::CONFLICT,
+            format!("WhippleScript workstream transfer refused: {transfer:?}"),
+        )
+            .into_response();
+    }
+    if let Err(error) = wb.rehome_engagement(&body.chat, &topology.line_branch_id) {
+        if let Some(workspace) = wb.workspace_by_storage_id(&root.workspace_id) {
+            let _ = workspace.leave_engagement_workstream(&body.chat);
+        }
         return (StatusCode::CONFLICT, error).into_response();
     }
-    // Snapshot every old membership while holding the one workbench lock. Leaving the
-    // prior lines first makes the requested join a placement-level transfer rather than
-    // two independent memberships that happen to point at different refs.
-    let prior: Vec<String> = wb
-        .active_workstream_memberships(&rec.instance_id, &body.chat)
-        .into_iter()
-        .filter(|id| id != &ws_id)
-        .collect();
-    for prior_id in &prior {
-        if let Err(e) = wb.admit_workstream(
-            prior_id,
-            WorkstreamCommand::LeaveWorkstream {
-                chat: body.chat.clone(),
-            },
-        ) {
-            return (StatusCode::CONFLICT, format!("{e:?}")).into_response();
-        }
-    }
-    if let Err(e) = wb.admit_workstream(
-        &ws_id,
-        WorkstreamCommand::JoinWorkstream {
-            chat: body.chat.clone(),
-        },
-    ) {
-        return (StatusCode::CONFLICT, format!("{e:?}")).into_response();
-    }
-    for prior_id in prior {
-        wb.notify_library_changed("workstream", &prior_id, "upsert");
+    if let WorkstreamTransferOutcome::Joined {
+        left_stream_id: Some(prior),
+    } = transfer
+    {
+        wb.notify_library_changed("workstream", &prior, "upsert");
     }
     wb.notify_library_changed("workstream", &ws_id, "upsert");
     wb.notify_library_changed("chat", &body.chat, "upsert");
@@ -523,48 +565,60 @@ pub async fn leave_workstream(
     Json(body): Json<MemberBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let Some(rec) = wb.workstream(&ws_id) else {
+    if !wb.has_workstream(&ws_id) {
         return (StatusCode::NOT_FOUND, "no such workstream").into_response();
+    }
+    let Some(root) = wb.workstream_root(&ws_id) else {
+        return (
+            StatusCode::CONFLICT,
+            "workstream collaboration root is unresolved",
+        )
+            .into_response();
     };
-    if wb.chat_placement_id(&body.chat) != Some(rec.instance_id.as_str()) {
+    if wb.library_project_of_chat(&body.chat).as_deref() != Some(root.project_id.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
-            "chat is not in this workstream's placement",
+            "chat is not in this workstream's project",
         )
             .into_response();
     }
-    let memberships = wb.active_workstream_memberships(&rec.instance_id, &body.chat);
-    if !memberships.iter().any(|id| id == &ws_id) {
+    let Some(workspace) = wb.workspace_by_storage_id(&root.workspace_id) else {
+        return (
+            StatusCode::CONFLICT,
+            "project collaboration workspace is unavailable",
+        )
+            .into_response();
+    };
+    let home = match workspace.engagement_home_receipt(&body.chat) {
+        Ok(home) => home,
+        Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+    };
+    if home.stream_id.as_deref() != Some(ws_id.as_str()) {
         return (
             StatusCode::CONFLICT,
             "chat is not a member of this active workstream",
         )
             .into_response();
     }
-    let Some(mainline) = wb.chat_mainline(&body.chat) else {
+    if wb.engagement_rehome_blocked(&body.chat) {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "chat workspace is unavailable",
+            StatusCode::CONFLICT,
+            "chat has active or unsettled workspace changes; settle or discard them before moving",
         )
             .into_response();
-    };
+    }
+    let mainline = workspace.mainline().to_owned();
+    if let Err(error) = workspace.leave_engagement_workstream(&body.chat) {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
     if let Err(error) = wb.rehome_engagement(&body.chat, &mainline) {
+        if let Some(workspace) = wb.workspace_by_storage_id(&root.workspace_id) {
+            let _ = workspace.transfer_engagement_to_workstream(&body.chat, &ws_id);
+        }
         return (StatusCode::CONFLICT, error).into_response();
     }
-    for membership_id in &memberships {
-        if let Err(e) = wb.admit_workstream(
-            membership_id,
-            WorkstreamCommand::LeaveWorkstream {
-                chat: body.chat.clone(),
-            },
-        ) {
-            return (StatusCode::CONFLICT, format!("{e:?}")).into_response();
-        }
-    }
-    for membership_id in memberships {
-        wb.notify_library_changed("workstream", &membership_id, "upsert");
-    }
     wb.notify_library_changed("chat", &body.chat, "upsert");
+    wb.notify_library_changed("workstream", &ws_id, "upsert");
     (StatusCode::OK, Json(json!({ "left": body.chat }))).into_response()
 }
 
@@ -580,6 +634,9 @@ fn archive_active_workstream(
     rec: &WorkstreamRecord,
 ) -> Result<Vec<String>, String> {
     let ws_id = &rec.id;
+    let root = wb
+        .workstream_root(ws_id)
+        .ok_or_else(|| "workstream collaboration root is unresolved".to_owned())?;
     // The members to re-home, read from the reducer before it empties them. Refuse
     // the whole operation before changing membership when any chat still owns a
     // candidate; archive is not an implicit discard command.
@@ -591,28 +648,19 @@ fn archive_active_workstream(
             ));
         }
     }
+    let workspace = wb
+        .workspace_by_storage_id(&root.workspace_id)
+        .ok_or_else(|| "project collaboration workspace is unavailable".to_owned())?;
+    let mainline = workspace.mainline().to_owned();
+    workspace
+        .archive_workstream(ws_id)
+        .map_err(|error| error.to_string())?;
+    // WhippleScript has already made archive terminal and atomically re-homed
+    // topology. Materialization is forward-only recovery from that fact.
     for chat in &members {
-        let target = wb
-            .chat_mainline(chat)
-            .ok_or_else(|| format!("chat {chat} workspace is unavailable"))?;
-        wb.rehome_engagement(chat, &target)?;
-    }
-    wb.admit_workstream(ws_id, WorkstreamCommand::ArchiveWorkstream)
-        .map_err(|e| format!("{e:?}"))?;
-    for chat in &members {
-        let sibling_memberships: Vec<String> = wb
-            .active_workstream_memberships(&rec.instance_id, chat)
-            .into_iter()
-            .filter(|id| id != ws_id)
-            .collect();
-        for sibling_id in &sibling_memberships {
-            wb.admit_workstream(
-                sibling_id,
-                WorkstreamCommand::LeaveWorkstream { chat: chat.clone() },
-            )
-            .map_err(|e| format!("{e:?}"))?;
-            wb.notify_library_changed("workstream", sibling_id, "upsert");
-        }
+        wb.rehome_engagement(chat, &mainline).map_err(|error| {
+            format!("workstream archived; chat {chat} still needs Main rematerialization: {error}")
+        })?;
     }
     wb.notify_library_changed("workstream", ws_id, "upsert");
     for chat in &members {
@@ -645,15 +693,17 @@ pub async fn archive_workstream(
 pub async fn promote_workstream(
     State(wb): State<SharedWorkbench>,
     Path(ws_id): Path<String>,
+    body: Option<Json<PromoteWorkstreamBody>>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let Some(rec) = wb.workstream(&ws_id) else {
+    if !wb.has_workstream(&ws_id) {
         return (StatusCode::NOT_FOUND, "no such workstream").into_response();
-    };
+    }
     // A clean line may be promoted only when every member is settled. Otherwise the
     // subsequent retirement would have to discard or transplant a private candidate.
-    for chat in wb.workstream_members(&ws_id) {
-        if wb.engagement_rehome_blocked(&chat) {
+    let promotion_members = wb.workstream_members(&ws_id);
+    for chat in &promotion_members {
+        if wb.engagement_rehome_blocked(chat) {
             return (
                 StatusCode::CONFLICT,
                 format!("chat {chat} has active or unsettled workspace changes; settle or discard them before promoting"),
@@ -661,49 +711,335 @@ pub async fn promote_workstream(
                 .into_response();
         }
     }
-    // The real merge: workstream/<id>/main -> main, in the managed target store.
+    // The real boundary is one exact project-collaboration Main CAS under
+    // WhippleScript's durable reservation. Native targets are untouched.
     let Some(root) = wb.workstream_root(&ws_id) else {
-        return (StatusCode::CONFLICT, "workstream target root is unresolved").into_response();
+        return (
+            StatusCode::CONFLICT,
+            "workstream collaboration root is unresolved",
+        )
+            .into_response();
     };
-    let Some(storage_target_id) = wb
-        .managed_target_storage_id(&root.target_id)
-        .map(str::to_owned)
-    else {
-        return (StatusCode::CONFLICT, "work target storage is unavailable").into_response();
+    let Some(workspace) = wb.workspace_by_storage_id(&root.workspace_id) else {
+        return (
+            StatusCode::CONFLICT,
+            "project collaboration workspace is unavailable",
+        )
+            .into_response();
     };
-    let outcome = match wb.promote_workstream_ref_to_main(&ws_id, &storage_target_id) {
+    let topology_status = workspace
+        .workstream(&ws_id)
+        .ok()
+        .flatten()
+        .map(|workstream| workstream.status)
+        .unwrap_or(StreamStatus::Archived);
+    let recovering_after_cas = matches!(
+        topology_status,
+        StreamStatus::RefAdvanced | StreamStatus::Archived
+    );
+    let requested = body
+        .map(|Json(body)| body.settlement_members)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|member| RequestedSettlementMember {
+            target_id: member.target_id,
+            act: member.act,
+        })
+        .collect::<Vec<_>>();
+    let reservation_id = gen_id("promotion");
+    let reservation = match workspace.reserve_workstream_promotion_boundary(&ws_id, &reservation_id)
+    {
+        Ok(reservation) => reservation,
+        Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+    };
+    clear_promotion_conflict(&mut wb, &ws_id);
+    let stored_reservation_id = reservation.reservation_id.clone();
+    let manifest = match wb.build_workstream_promotion_manifest(&ws_id, &reservation) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            if let Some(workspace) = wb.workspace_by_storage_id(&root.workspace_id) {
+                let _ =
+                    workspace.release_workstream_promotion_boundary(&ws_id, &stored_reservation_id);
+            }
+            return (StatusCode::CONFLICT, error).into_response();
+        }
+    };
+
+    let existing_settlement = wb
+        .latest_workstream_target_settlement(&ws_id)
+        .filter(|state| {
+            state
+                .declaration
+                .as_ref()
+                .and_then(|declaration| declaration.promotion_manifest_ref.as_deref())
+                == Some(manifest.id.as_str())
+        });
+    let mut settlement = if let Some(existing) = existing_settlement {
+        Some(existing)
+    } else if requested.is_empty() {
+        None
+    } else if recovering_after_cas {
+        return (
+            StatusCode::CONFLICT,
+            "collaboration Main already advanced; create a later settlement from the accepted manifest",
+        )
+            .into_response();
+    } else {
+        let declared = match wb.create_workstream_target_settlement(&manifest, requested) {
+            Ok(state) => state,
+            Err(error) => {
+                if let Some(workspace) = wb.workspace_by_storage_id(&root.workspace_id) {
+                    let _ = workspace
+                        .release_workstream_promotion_boundary(&ws_id, &stored_reservation_id);
+                }
+                return (StatusCode::CONFLICT, error).into_response();
+            }
+        };
+        let declaration_id = declared
+            .declaration
+            .as_ref()
+            .map(|declaration| declaration.declaration_id.clone())
+            .expect("declared settlement has an identity");
+        let preflight = match wb.preflight_target_settlement(&declaration_id) {
+            Ok(state) => state,
+            Err(error) => {
+                if let Some(workspace) = wb.workspace_by_storage_id(&root.workspace_id) {
+                    let _ = workspace
+                        .release_workstream_promotion_boundary(&ws_id, &stored_reservation_id);
+                }
+                return (StatusCode::CONFLICT, error).into_response();
+            }
+        };
+        if preflight.phase != SettlementPhase::Ready {
+            if let Some(workspace) = wb.workspace_by_storage_id(&root.workspace_id) {
+                let _ =
+                    workspace.release_workstream_promotion_boundary(&ws_id, &stored_reservation_id);
+            }
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "combined-preflight-refused",
+                    "manifest": manifest,
+                    "target_settlement": preflight,
+                })),
+            )
+                .into_response();
+        }
+        Some(preflight)
+    };
+
+    let outcome = match wb
+        .workspace_by_storage_id(&root.workspace_id)
+        .expect("reserved workspace remains open")
+        .promote_workstream_boundary(&ws_id, &root.workspace_id, &stored_reservation_id)
+    {
         Ok(outcome) => outcome,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     };
-    if outcome == MergeOutcome::Conflict {
+    let (receipt, rehomed) = match outcome {
+        gaugedesk_workspace::WorkstreamPromotionOutcome::Conflicted { paths } => {
+            record_promotion_conflict(&mut wb, &ws_id, &paths);
+            if let Some(state) = settlement.as_ref() {
+                if let Some(declaration) = state.declaration.as_ref() {
+                    let _ = wb.cancel_target_settlement(
+                        &declaration.declaration_id,
+                        "collaboration promotion conflicted before target effects",
+                    );
+                }
+            }
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "workstream-conflict",
+                    "message": "workstream conflicts with project collaboration Main",
+                    "paths": paths,
+                })),
+            )
+                .into_response();
+        }
+        gaugedesk_workspace::WorkstreamPromotionOutcome::Refused(reason) => {
+            if let Some(state) = settlement.as_ref() {
+                if let Some(declaration) = state.declaration.as_ref() {
+                    let _ = wb.cancel_target_settlement(
+                        &declaration.declaration_id,
+                        "collaboration promotion was refused before target effects",
+                    );
+                }
+            }
+            return (StatusCode::CONFLICT, Json(json!({ "error": reason }))).into_response();
+        }
+        gaugedesk_workspace::WorkstreamPromotionOutcome::Promoted {
+            receipt,
+            rehomed_chat_ids,
+        } => (receipt, rehomed_chat_ids),
+    };
+    let mainline = wb
+        .workspace_by_storage_id(&root.workspace_id)
+        .map(|workspace| workspace.mainline().to_owned())
+        .unwrap_or_else(|| "main".to_owned());
+    let members = if rehomed.is_empty() {
+        promotion_members
+    } else {
+        rehomed
+    };
+    for chat in &members {
+        if let Err(error) = wb.rehome_engagement(chat, &mainline) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "promotion-landed-close-incomplete",
+                    "message": format!("project Main advanced; chat {chat} still needs re-home: {error}"),
+                })),
+            )
+                .into_response();
+        }
+    }
+    let _ = wb.store_mut().append_record(
+        &ws_id,
+        "workstream_promotion_receipt",
+        &serde_json::to_string(&receipt).unwrap_or_default(),
+    );
+    let mainline_chats = wb.sync_mainline_members(&root.workspace_id);
+    for chat_id in mainline_chats {
+        wb.notify_library_changed("chat", &chat_id, "upsert");
+    }
+    wb.notify_library_changed("workstream", &ws_id, "upsert");
+    if let Some(ready) = settlement.take() {
+        let declaration = ready
+            .declaration
+            .as_ref()
+            .expect("ready settlement has a declaration");
+        let declaration_id = declaration.declaration_id.clone();
+        let member_ids = declaration
+            .members
+            .iter()
+            .filter(|member| {
+                ready.members[&member.member_id].phase == SettlementMemberPhase::PreflightPassed
+            })
+            .map(|member| member.member_id.clone())
+            .collect::<Vec<String>>();
+        let mut latest = ready;
+        for member_id in member_ids {
+            match wb.execute_settlement_member(&declaration_id, &member_id) {
+                Ok(state) => latest = state,
+                Err(_) => {
+                    latest = wb
+                        .store_ref()
+                        .fold::<TargetSettlementState>(&format!(
+                            "target-settlement::{declaration_id}"
+                        ))
+                        .unwrap_or(latest);
+                }
+            }
+        }
+        settlement = Some(latest);
+    }
+    let target_settlement_projection =
+        target_settlement_projection(settlement.as_ref().map(|state| state.phase));
+    (
+        StatusCode::OK,
+        Json(json!({
+            "promoted": ws_id,
+            "collaboration": "promoted",
+            "target_settlement": target_settlement_projection,
+            "promotion_manifest": manifest,
+            "receipt": receipt,
+            "archived": true,
+        })),
+    )
+        .into_response()
+}
+
+/// Create a fresh settlement declaration against an immutable manifest from an
+/// already accepted collaboration promotion. This never rewrites the promotion
+/// receipt and does not execute effects until the member action is invoked.
+pub async fn create_workstream_settlement(
+    State(wb): State<SharedWorkbench>,
+    Path(ws_id): Path<String>,
+    Json(body): Json<CreateWorkstreamSettlementBody>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(root) = wb.workstream_root(&ws_id) else {
+        return (StatusCode::NOT_FOUND, "no such workstream").into_response();
+    };
+    let promotion_receipt = wb
+        .workspace_by_storage_id(&root.workspace_id)
+        .and_then(|workspace| workspace.workstream(&ws_id).ok().flatten())
+        .and_then(|workstream| {
+            (workstream.status == StreamStatus::Archived)
+                .then(|| workstream.boundary_receipt(&root.workspace_id))
+                .flatten()
+        });
+    let Some(promotion_receipt) = promotion_receipt else {
         return (
             StatusCode::CONFLICT,
-            "workstream conflicts with the mainline — resolve before promoting",
+            "later settlement requires an archived promoted collaboration manifest",
+        )
+            .into_response();
+    };
+    let manifest =
+        match wb.workstream_promotion_manifest(&ws_id, body.promotion_manifest_ref.as_deref()) {
+            Ok(manifest) => manifest,
+            Err(error) => return (StatusCode::NOT_FOUND, error).into_response(),
+        };
+    if manifest.reservation_id != promotion_receipt.reservation_id
+        || manifest.expected_line_cut != promotion_receipt.expected_stream_cut
+        || manifest.expected_main_cut != promotion_receipt.expected_main_cut
+        || manifest.proposed_main_cut != promotion_receipt.proposed_main_cut
+    {
+        return (
+            StatusCode::CONFLICT,
+            "promotion manifest does not match the accepted collaboration receipt",
         )
             .into_response();
     }
-    // Record the integration through the verified reducer on the workstream's own merge
-    // scope: clean -> advanced, then the boundary-gated advanced -> integrated.
-    if let Err(e) = wb.admit_workstream_promotion(&ws_id) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response();
+    if body.members.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "settlement must request at least one target act",
+        )
+            .into_response();
     }
-    // A clean integration completes this named line. Archive it only after the merge
-    // and its boundary evidence both succeed, which re-homes every member to Main and
-    // removes the retired line from the active navigation projection. A conflict above
-    // returns before this point, leaving the line and all of its members intact.
-    if let Err(error) = archive_active_workstream(&mut wb, &rec) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    let requested = body
+        .members
+        .into_iter()
+        .map(|member| RequestedSettlementMember {
+            target_id: member.target_id,
+            act: member.act,
+        })
+        .collect();
+    let declared = match wb.create_detached_workstream_target_settlement(&manifest, requested) {
+        Ok(state) => state,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let declaration_id = declared
+        .declaration
+        .as_ref()
+        .map(|declaration| declaration.declaration_id.clone())
+        .expect("declaration has identity");
+    match wb.preflight_target_settlement(&declaration_id) {
+        Ok(state) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "promotion_manifest": manifest,
+                "target_settlement": state,
+            })),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::CONFLICT, error).into_response(),
     }
-    // Promotion advanced the target's mainline and archive re-homed its former
-    // members. Reconcile every open Main chat so the result is visible immediately.
-    let mainline_chats = wb.sync_mainline_members(&storage_target_id);
-    for chat_id in mainline_chats {
-        wb.refresh_work_target_basis_from_chat(&chat_id);
-        wb.notify_library_changed("chat", &chat_id, "upsert");
+}
+
+pub async fn list_workstream_promotion_manifests(
+    State(wb): State<SharedWorkbench>,
+    Path(ws_id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    if !wb.has_workstream(&ws_id) {
+        return (StatusCode::NOT_FOUND, "no such workstream").into_response();
     }
-    (
-        StatusCode::OK,
-        Json(json!({ "promoted": ws_id, "phase": "Integrated", "archived": true })),
-    )
-        .into_response()
+    match wb.workstream_promotion_manifests(&ws_id) {
+        Ok(manifests) => Json(json!({ "manifests": manifests })).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
 }

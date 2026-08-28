@@ -491,12 +491,33 @@ impl ChatWorkspace for ExternalCandidate {
         Ok((bytes.len() <= max_bytes).then(|| String::from_utf8_lossy(&bytes).into_owned()))
     }
 
+    fn read_file_bytes_capped(&self, rel: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        let bytes = std::fs::read(safe_path(&self.candidate, rel)?).map_err(WorkspaceError::io)?;
+        Ok((bytes.len() <= max_bytes).then_some(bytes))
+    }
+
     fn write_file(&self, rel: &str, content: &str) -> Result<()> {
         let path = safe_path(&self.candidate, rel)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(WorkspaceError::io)?;
         }
         std::fs::write(path, content).map_err(WorkspaceError::io)
+    }
+
+    fn write_file_bytes(&self, rel: &str, content: &[u8]) -> Result<()> {
+        let path = safe_path(&self.candidate, rel)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(WorkspaceError::io)?;
+        }
+        std::fs::write(path, content).map_err(WorkspaceError::io)
+    }
+
+    fn remove_file(&self, rel: &str) -> Result<()> {
+        match std::fs::remove_file(safe_path(&self.candidate, rel)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WorkspaceError::io(error)),
+        }
     }
 
     fn current_cut(&self) -> Result<Option<String>> {

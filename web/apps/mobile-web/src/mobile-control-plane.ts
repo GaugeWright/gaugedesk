@@ -50,6 +50,7 @@ export const MOBILE_CONTROL_PLANE_INVENTORY = {
     removePlacement: "command",
     createChatUnderArchetype: "command",
     createChatUnderPlacement: "command",
+    reviseChatTargets: "command",
     useArchetype: "command",
     createEngagement: "command",
     forkChat: "command",
@@ -59,6 +60,15 @@ export const MOBILE_CONTROL_PLANE_INVENTORY = {
     joinWorkstream: "command",
     leaveWorkstream: "command",
     promoteWorkstream: "command",
+    settleWorkstreamTarget: "command",
+    settleChatTargets: "command",
+    getTargetSettlement: "projection",
+    queryTargetSettlementMember: "command",
+    retryTargetSettlementMember: "command",
+    supersedeTargetSettlementMember: "command",
+    compensateTargetSettlement: "command",
+    abandonTargetSettlement: "command",
+    cancelTargetSettlement: "command",
     archiveWorkstream: "command",
     runTask: "command",
     stopTurn: "command",
@@ -228,9 +238,13 @@ export class MobileControlPlane implements FacetBrowserApi {
         pid: ProjectId,
         placementId: PlacementId,
         title: string,
-        targetId: WorkTargetId,
+        targetIds: readonly WorkTargetId[],
     ): Promise<EngagementId> {
-        return workbenchClient.createChatUnderPlacement(this.workbenchTransport(), pid, placementId, title, targetId);
+        return workbenchClient.createChatUnderPlacement(this.workbenchTransport(), pid, placementId, title, targetIds);
+    }
+
+    async reviseChatTargets(id: EngagementId, targets: readonly { targetId: WorkTargetId; participation: "read-only" | "writable" }[]): Promise<void> {
+        await workbenchClient.reviseChatTargets(this.workbenchTransport(), id, targets);
     }
 
     useArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId> {
@@ -253,8 +267,8 @@ export class MobileControlPlane implements FacetBrowserApi {
         return workbenchClient.deleteChat(this.workbenchTransport(), id);
     }
 
-    createWorkstream(placementId: PlacementId, name: string, targetId: WorkTargetId): Promise<WorkstreamNode> {
-        return workbenchClient.createWorkstream(this.workbenchTransport(), placementId, name, targetId);
+    createWorkstream(placementId: PlacementId, name: string): Promise<WorkstreamNode> {
+        return workbenchClient.createWorkstream(this.workbenchTransport(), placementId, name);
     }
 
     joinWorkstream(ws: WorkstreamId, chat: EngagementId): Promise<void> {
@@ -265,8 +279,49 @@ export class MobileControlPlane implements FacetBrowserApi {
         return workbenchClient.leaveWorkstream(this.workbenchTransport(), ws, chat);
     }
 
-    promoteWorkstream(ws: WorkstreamId): Promise<void> {
-        return workbenchClient.promoteWorkstream(this.workbenchTransport(), ws);
+    async promoteWorkstream(ws: WorkstreamId): Promise<void> {
+        await workbenchClient.promoteWorkstream(this.workbenchTransport(), ws);
+    }
+
+    async settleWorkstreamTarget(
+        ws: WorkstreamId,
+        target: WorkTargetId,
+        act: "apply" | "publish" | "release",
+        promotionManifestRef?: string,
+    ): Promise<void> {
+        await workbenchClient.settleWorkstreamTarget(this.workbenchTransport(), ws, target, act, promotionManifestRef);
+    }
+
+    async settleChatTargets(chat: EngagementId, members: readonly { target_id: WorkTargetId; act: "apply" | "publish" | "release" }[]): Promise<void> {
+        await workbenchClient.settleChatTargets(this.workbenchTransport(), chat, members);
+    }
+
+    async getTargetSettlement(declarationId: string): Promise<void> {
+        await workbenchClient.getTargetSettlement(this.workbenchTransport(), declarationId);
+    }
+
+    async queryTargetSettlementMember(declarationId: string, memberId: string): Promise<void> {
+        await workbenchClient.queryTargetSettlementMember(this.workbenchTransport(), declarationId, memberId);
+    }
+
+    async retryTargetSettlementMember(declarationId: string, memberId: string): Promise<void> {
+        await workbenchClient.retryTargetSettlementMember(this.workbenchTransport(), declarationId, memberId);
+    }
+
+    async supersedeTargetSettlementMember(declarationId: string, memberId: string, laterDeclarationId: string, laterMemberId: string): Promise<void> {
+        await workbenchClient.supersedeTargetSettlementMember(this.workbenchTransport(), declarationId, memberId, laterDeclarationId, laterMemberId);
+    }
+
+    async compensateTargetSettlement(declarationId: string, receiptRefs: readonly string[], reconciliationComplete: boolean): Promise<void> {
+        await workbenchClient.compensateTargetSettlement(this.workbenchTransport(), declarationId, receiptRefs, reconciliationComplete);
+    }
+
+    async abandonTargetSettlement(declarationId: string, reason: string): Promise<void> {
+        await workbenchClient.abandonTargetSettlement(this.workbenchTransport(), declarationId, reason);
+    }
+
+    async cancelTargetSettlement(declarationId: string, reason: string): Promise<void> {
+        await workbenchClient.cancelTargetSettlement(this.workbenchTransport(), declarationId, reason);
     }
 
     archiveWorkstream(ws: WorkstreamId): Promise<void> {

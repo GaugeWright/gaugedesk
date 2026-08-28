@@ -122,6 +122,25 @@ fn read_locator(targets_root: &Path, handle: &str) -> Result<ProtectedLocator, S
     Ok(locator)
 }
 
+pub(crate) fn protected_target_root(
+    targets_root: &Path,
+    target: &WorkTargetRecord,
+) -> Result<PathBuf, String> {
+    match target.kind {
+        WorkTargetKind::Managed => Ok(targets_root.join(&target.id)),
+        WorkTargetKind::ExternalVcs | WorkTargetKind::ExternalFolder => {
+            let locator = read_locator(targets_root, &target.locator_handle)?;
+            if locator.kind != target.kind {
+                return Err(format!(
+                    "protected locator kind does not match target {}",
+                    target.id
+                ));
+            }
+            Ok(locator.path)
+        }
+    }
+}
+
 pub(crate) fn open_external_workspace(
     targets_root: &Path,
     target: &WorkTargetRecord,
@@ -172,8 +191,14 @@ impl Workbench {
             .get(target_id)
             .ok_or_else(|| "no such work target".to_owned())?;
         let basis = chat_id
-            .and_then(|chat_id| self.library.chat_targets.get(chat_id))
-            .map(|binding| binding.basis.clone())
+            .and_then(|chat_id| self.library.chat_target_basis(chat_id, target_id))
+            .map(str::to_owned)
+            .or_else(|| {
+                chat_id
+                    .and_then(|chat_id| self.library.chat_targets.get(chat_id))
+                    .filter(|binding| binding.target_id == target_id)
+                    .map(|binding| binding.basis.clone())
+            })
             .or_else(|| target.current_basis.clone())
             .ok_or_else(|| "work target has no exact basis".to_owned())?;
         let record = TargetActRecord {
@@ -209,29 +234,58 @@ impl Workbench {
     }
 
     pub(crate) fn available_target_acts(&self, chat_id: &str) -> Vec<TargetActKind> {
-        let Some(binding) = self.library.chat_targets.get(chat_id) else {
-            return Vec::new();
-        };
+        let target_set = self.library.current_target_set(chat_id);
+        let compatibility = self.library.chat_targets.get(chat_id);
+        let ceilings = target_set
+            .map(|target_set| {
+                target_set
+                    .members
+                    .iter()
+                    .map(|member| (&member.capability_ceiling, member.participation))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                compatibility
+                    .map(|binding| {
+                        vec![(
+                            &binding.capabilities,
+                            crate::library::TargetParticipationMode::Writable,
+                        )]
+                    })
+                    .unwrap_or_default()
+            });
         let mut acts = Vec::new();
-        if binding.capabilities.read {
+        if ceilings.iter().any(|(capabilities, _)| capabilities.read) {
             acts.push(TargetActKind::Read);
         }
-        if binding.capabilities.propose {
+        if ceilings.iter().any(|(capabilities, participation)| {
+            *participation == crate::library::TargetParticipationMode::Writable
+                && capabilities.propose
+        }) {
             acts.push(TargetActKind::Propose);
         }
-        if binding.capabilities.apply {
+        if ceilings.iter().any(|(capabilities, participation)| {
+            *participation == crate::library::TargetParticipationMode::Writable
+                && capabilities.apply
+        }) {
             acts.push(TargetActKind::Apply);
         }
-        if binding.capabilities.publish {
+        if ceilings.iter().any(|(capabilities, participation)| {
+            *participation == crate::library::TargetParticipationMode::Writable
+                && capabilities.publish
+        }) {
             acts.push(TargetActKind::Publish);
         }
-        if binding.capabilities.release {
+        if ceilings.iter().any(|(capabilities, participation)| {
+            *participation == crate::library::TargetParticipationMode::Writable
+                && capabilities.release
+        }) {
             acts.push(TargetActKind::Release);
         }
         acts
     }
 
-    fn attach_external_target(
+    pub(crate) fn attach_external_target(
         &mut self,
         project_id: &str,
         body: AttachTargetBody,
@@ -326,6 +380,11 @@ impl Workbench {
             status: WorkTargetStatus::Available,
         };
         self.targets.insert(target_id.clone(), Box::new(workspace));
+        if let Err(error) = self.ensure_collaboration_target_partition(project_id, &target_id) {
+            self.targets.remove(&target_id);
+            remove_locator(&self.targets_dir(), &target.locator_handle);
+            return Err(error);
+        }
         self.write_work_target_record(target.clone());
         let placement_ids = self
             .library
@@ -486,7 +545,168 @@ mod tests {
     use crate::{open_workbench, DEFAULT_PLACEMENT, DEFAULT_PROJECT};
 
     #[test]
-    fn folder_attach_keeps_locator_protected_and_refuses_stale_write() {
+    fn readable_target_without_propose_starts_as_read_only_member() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("reference.txt"), "standing basis\n").unwrap();
+        let workbench = open_workbench(root.path()).unwrap();
+        let mut workbench = workbench.lock_unpoisoned();
+        let target = workbench
+            .attach_external_target(
+                DEFAULT_PROJECT,
+                AttachTargetBody {
+                    name: "Reference folder".to_owned(),
+                    kind: WorkTargetKind::ExternalFolder,
+                    path: source.path().to_path_buf(),
+                    path_scope: whole_target_scope(),
+                },
+            )
+            .unwrap();
+        workbench
+            .library
+            .work_targets
+            .get_mut(&target.id)
+            .unwrap()
+            .capabilities
+            .propose = false;
+
+        let chat = workbench
+            .create_chat_in_instance_on_target(
+                DEFAULT_PLACEMENT,
+                "read the reference",
+                Some(&target.id),
+            )
+            .unwrap();
+        let members = &workbench
+            .library
+            .current_target_set(chat["id"].as_str().unwrap())
+            .unwrap()
+            .members;
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0].participation,
+            crate::library::TargetParticipationMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn initial_chat_refuses_two_ids_for_the_same_physical_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("shared.txt"), "one authority\n").unwrap();
+        let workbench = open_workbench(root.path()).unwrap();
+        let mut workbench = workbench.lock_unpoisoned();
+        let mut target_ids = Vec::new();
+        for name in ["First name", "Second name"] {
+            target_ids.push(
+                workbench
+                    .attach_external_target(
+                        DEFAULT_PROJECT,
+                        AttachTargetBody {
+                            name: name.to_owned(),
+                            kind: WorkTargetKind::ExternalFolder,
+                            path: source.path().to_path_buf(),
+                            path_scope: whole_target_scope(),
+                        },
+                    )
+                    .unwrap()
+                    .id,
+            );
+        }
+        let error = workbench
+            .create_chat_in_instance_on_targets(DEFAULT_PLACEMENT, "ambiguous", &target_ids)
+            .unwrap_err();
+        assert!(error.contains("overlapping physical scopes"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_chat_refuses_hard_link_aliases_across_distinct_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("shared.txt"), "one inode\n").unwrap();
+        std::fs::hard_link(
+            first.path().join("shared.txt"),
+            second.path().join("alias.txt"),
+        )
+        .unwrap();
+        let workbench = open_workbench(root.path()).unwrap();
+        let mut workbench = workbench.lock_unpoisoned();
+        let mut target_ids = Vec::new();
+        for (name, path) in [("First", first.path()), ("Second", second.path())] {
+            target_ids.push(
+                workbench
+                    .attach_external_target(
+                        DEFAULT_PROJECT,
+                        AttachTargetBody {
+                            name: name.to_owned(),
+                            kind: WorkTargetKind::ExternalFolder,
+                            path: path.to_path_buf(),
+                            path_scope: whole_target_scope(),
+                        },
+                    )
+                    .unwrap()
+                    .id,
+            );
+        }
+        let error = workbench
+            .create_chat_in_instance_on_targets(DEFAULT_PLACEMENT, "hard-link alias", &target_ids)
+            .unwrap_err();
+        assert!(error.contains("overlapping physical scopes"), "{error}");
+    }
+
+    #[test]
+    fn multi_target_context_requires_one_writable_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let workbench = open_workbench(root.path()).unwrap();
+        let mut workbench = workbench.lock_unpoisoned();
+        let attached = workbench
+            .attach_external_target(
+                DEFAULT_PROJECT,
+                AttachTargetBody {
+                    name: "Context destination".to_owned(),
+                    kind: WorkTargetKind::ExternalFolder,
+                    path: source.path().to_path_buf(),
+                    path_scope: whole_target_scope(),
+                },
+            )
+            .unwrap();
+        let default_target =
+            workbench.library.placement_targets[DEFAULT_PLACEMENT].target_ids[0].clone();
+        let chat = workbench
+            .create_chat_in_instance_on_targets(
+                DEFAULT_PLACEMENT,
+                "routed context",
+                &[default_target, attached.id.clone()],
+            )
+            .unwrap();
+        let chat_id = chat["id"].as_str().unwrap();
+        let files = [("context.txt".to_owned(), "target-scoped".to_owned())];
+        let ambiguous = workbench
+            .ingest_upload_into_engagement(chat_id, &files, None)
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            ambiguous.contains("select one writable target_id"),
+            "{ambiguous}"
+        );
+        workbench
+            .ingest_upload_into_engagement(chat_id, &files, Some(&attached.id))
+            .unwrap()
+            .unwrap();
+        let encoded = crate::library::target_id_path_v1(&attached.id).unwrap();
+        assert_eq!(
+            workbench.engagements[chat_id]
+                .read_file(&format!("targets/{encoded}/context.txt"))
+                .unwrap(),
+            "target-scoped"
+        );
+    }
+
+    #[test]
+    fn folder_attach_keeps_locator_protected_and_collaboration_merge_does_not_apply() {
         let root = tempfile::tempdir().unwrap();
         let source = tempfile::tempdir().unwrap();
         std::fs::write(source.path().join("work.txt"), "basis\n").unwrap();
@@ -521,8 +741,11 @@ mod tests {
                     && act.act == TargetActKind::Read
                     && act.status == TargetActStatus::Completed
             }));
+            let candidate_path = workbench.engagement_workspace_path(&chat_id, "work.txt");
             let candidate = workbench.engagements.get(&chat_id).unwrap();
-            candidate.write_file("work.txt", "candidate\n").unwrap();
+            candidate
+                .write_file(&candidate_path, "candidate\n")
+                .unwrap();
             candidate.commit_turn("candidate").unwrap();
             assert_eq!(
                 std::fs::read_to_string(source.path().join("work.txt")).unwrap(),
@@ -531,7 +754,8 @@ mod tests {
             std::fs::write(source.path().join("work.txt"), "concurrent\n").unwrap();
             assert_eq!(
                 candidate.merge_into_main().unwrap(),
-                gaugedesk_workspace::MergeOutcome::Conflict
+                gaugedesk_workspace::MergeOutcome::Clean,
+                "collaboration acceptance is separate from native target settlement"
             );
             (target.id, chat_id, target.locator_handle)
         };

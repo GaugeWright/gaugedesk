@@ -13,9 +13,16 @@ const stream = (id: string, workspaceRoot: string): WorkstreamNode => ({
     id: id as WorkstreamId,
     name: id,
     placementId: workspaceRoot as PlacementId,
+    projectId: null,
     workspaceRoot: root(workspaceRoot),
     targetId: "target:test" as never,
     status: "active",
+    collaboration: "active",
+    promotionManifestRef: null,
+    promotionTargets: [],
+    targetSettlement: "not-requested",
+    targetSettlementDeclaration: null,
+    targetSettlementMembers: [],
     members: [],
 });
 const chat = (workspaceRoot: string, workstream: string | null, rehomeBlocked = false) => ({

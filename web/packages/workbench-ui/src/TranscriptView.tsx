@@ -26,7 +26,7 @@ import {
     type FilterPrefs,
 } from "./transcript-filter";
 import { friendlyToolVerb, toolTargetOpensViewer } from "./tool-verb";
-import { isBoilerplateResult, toolDetail, toolHeaderTarget } from "./tool-detail";
+import { isBoilerplateResult, partitionedToolTarget, toolDetail, toolHeaderTarget } from "./tool-detail";
 
 // Markdown and its GFM parser load only when conversational prose is present;
 // the empty panel and tool/status-only transcripts keep the initial bundle lean.
@@ -108,6 +108,7 @@ export function ToolLineView(props: {
     // The collapsed line's target: for grep/find this is the pattern, not the
     // directory the server's extraction picked (toolHeaderTarget recovers it).
     const headerTarget = () => toolHeaderTarget(tool().name, tool().args, tool().target);
+    const partition = () => headerTarget() ? partitionedToolTarget(headerTarget()!) : null;
     const [open, setOpen] = createSignal(Boolean(props.defaultOpen) && hasDetail());
     const toggle = () => hasDetail() && setOpen((v) => !v);
     const mark = () => {
@@ -136,7 +137,10 @@ export function ToolLineView(props: {
                                     props.onOpen(target());
                                 }}
                             >
-                                {target()}
+                                <Show when={partition()?.targetRoot}>
+                                    {(root) => <span class="tool-target-root">Target {root()} · </span>}
+                                </Show>
+                                {partition()?.relativePath ?? target()}
                             </button>
                         ) : (
                             // A command / query is not navigable: show it as inline

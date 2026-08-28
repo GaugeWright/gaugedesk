@@ -51,6 +51,7 @@ pub mod run;
 pub mod runtime_session;
 pub mod signature;
 pub mod taint;
+pub mod target_settlement;
 pub mod workstream;
 
 /// A `decide` rejection. A rejected command produces no events and no state

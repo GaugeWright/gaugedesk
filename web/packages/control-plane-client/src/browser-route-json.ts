@@ -172,8 +172,8 @@ export function browserRouteJson(
             body: body !== undefined ? JSON.stringify(body) : undefined,
         });
         if (res.status === 409) {
-            const r = (await res.json()) as { rejected?: string; command_status?: string };
-            throw new Rejected(r.rejected ?? "unknown", r.command_status);
+            const r = (await res.json()) as { rejected?: string; error?: string; message?: string; command_status?: string };
+            throw new Rejected(r.rejected ?? r.error ?? r.message ?? "unknown", r.command_status);
         }
         if (res.status === TURN_STOPPED_STATUS) throw new TurnStopped();
         if (!res.ok) throw new Error(await routeError(method, path, res));

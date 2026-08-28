@@ -154,6 +154,18 @@ describe("browserRouteJson error surfacing", () => {
         await expect(json("POST", "/scopes/s/run", {})).rejects.toThrowError(Rejected);
     });
 
+    it("preserves a structured fork refusal so the client can offer a destination retry", async () => {
+        stubFetch(
+            new Response(JSON.stringify({ error: "historical-home-closed" }), {
+                status: 409,
+                headers: { "content-type": "application/json" },
+            }),
+        );
+        const json = browserRouteJson("http://cp");
+        await expect(json("POST", "/chats/c/fork", { destination: { kind: "inherit" } }))
+            .rejects.toMatchObject({ reason: "historical-home-closed" });
+    });
+
     it("carries the command-receipt status, which is what separates ran from running", async () => {
         // A caller retrying under a stable key has to tell "it already happened"
         // from "it might be happening" (ADR 0137 §3). The reason string conflates

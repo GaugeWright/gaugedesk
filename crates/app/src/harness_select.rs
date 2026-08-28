@@ -144,13 +144,43 @@ impl ScriptedFakeFactory {
         if task.contains("[no-write]") {
             return Ok(());
         }
-        let note = worktree.join("agent-note.txt");
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&note)
-            .map_err(|e| format!("fake agent open: {e}"))?;
-        writeln!(f, "agent-note for task: {task}").map_err(|e| format!("fake agent write: {e}"))?;
+        let target_roots =
+            std::fs::read_to_string(worktree.join(".gaugedesk-runtime/target-set.json"))
+                .ok()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                .and_then(|manifest| {
+                    manifest["targets"].as_array().map(|targets| {
+                        let writable = targets
+                            .iter()
+                            .filter(|target| target["participation"] == "writable")
+                            .filter_map(|target| target["root"].as_str().map(str::to_owned))
+                            .collect::<Vec<_>>();
+                        if task.contains("[all-writable]") {
+                            writable
+                        } else {
+                            writable.into_iter().take(1).collect()
+                        }
+                    })
+                })
+                .filter(|roots| !roots.is_empty())
+                .unwrap_or_else(|| vec![String::new()]);
+        for target_root in target_roots {
+            let note = if target_root.is_empty() {
+                worktree.join("agent-note.txt")
+            } else {
+                worktree.join(target_root).join("agent-note.txt")
+            };
+            if let Some(parent) = note.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("fake agent mkdir: {e}"))?;
+            }
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&note)
+                .map_err(|e| format!("fake agent open: {e}"))?;
+            writeln!(f, "agent-note for task: {task}")
+                .map_err(|e| format!("fake agent write: {e}"))?;
+        }
         Ok(())
     }
 }

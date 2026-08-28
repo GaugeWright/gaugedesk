@@ -49,6 +49,7 @@ export type TargetVcsPosture = "managed" | "external-vcs" | "unversioned";
 export type WorkTargetStatus = "available" | "unavailable" | "retired";
 export type TargetActKind = "read" | "propose" | "apply" | "publish" | "release";
 export type TargetConcurrency = "serialized" | "native-vcs" | "compare-before-write-weak";
+export type TargetParticipationMode = "read-only" | "writable";
 
 export interface TargetCapabilities {
     readonly read: boolean;
@@ -78,6 +79,21 @@ export interface WorkTargetNode {
     readonly concurrency: TargetConcurrency;
 }
 
+/** One stable member of a chat's revisioned target set. This is the client-facing
+ * projection of execution scope; display labels and array order are not identity. */
+export interface ChatTargetMember {
+    readonly targetId: WorkTargetId;
+    readonly root: string;
+    readonly name: string;
+    readonly kind: WorkTargetKind;
+    readonly adapter: string;
+    readonly adapterFamily: string;
+    readonly basis: string;
+    readonly pathScope: readonly string[];
+    readonly capabilityCeiling: TargetCapabilities;
+    readonly participation: TargetParticipationMode;
+}
+
 /** A chat (engagement) leaf in the nav tree. */
 export interface ChatNode {
     readonly id: EngagementId;
@@ -91,12 +107,17 @@ export interface ChatNode {
     readonly placement: PlacementId | null;
     /** The immutable workspace root used for workstream admission. */
     readonly workspaceRoot: WorkspaceRootId;
-    readonly targetId: WorkTargetId;
-    readonly targetBasis: string;
-    readonly targetKind: WorkTargetKind;
-    readonly targetAdapter: string;
+    /** Complete non-empty execution scope. */
+    readonly targets: readonly ChatTargetMember[];
+    readonly targetSetRevision: number;
+    readonly collaborationWorkspaceId: string | null;
+    /** Compatibility view only. Present exactly when the target set has one member. */
+    readonly targetId: WorkTargetId | null;
+    readonly targetBasis: string | null;
+    readonly targetKind: WorkTargetKind | null;
+    readonly targetAdapter: string | null;
     readonly targetPathScope: readonly string[];
-    readonly targetCapabilities: TargetCapabilities;
+    readonly targetCapabilities: TargetCapabilities | null;
     readonly candidateRevision: string;
     readonly availableActs: readonly TargetActKind[];
     /** Per-chat status for the nav gem (WS-H b/c), folded from the chat's merge
@@ -114,13 +135,46 @@ export interface WorkstreamNode {
     readonly id: WorkstreamId;
     readonly name: string;
     readonly placementId: PlacementId;
+    readonly projectId: ProjectId | null;
     /** Exact immutable root eligible member chats must share. */
     readonly workspaceRoot: WorkspaceRootId;
-    readonly targetId: WorkTargetId;
-    readonly status: "active" | "archived";
+    /** Compatibility hint for legacy edit workstreams. Project workstreams are not target-rooted. */
+    readonly targetId: WorkTargetId | null;
+    readonly status: CollaborationStatus;
+    readonly collaboration: CollaborationStatus;
+    readonly promotionManifestRef: string | null;
+    readonly promotionTargets: readonly WorkTargetId[];
+    readonly targetSettlement: TargetSettlementStatus;
+    readonly targetSettlementDeclaration: string | null;
+    readonly targetSettlementMembers: readonly {
+        memberId: string;
+        targetId: WorkTargetId;
+        act: TargetActKind;
+        phase: SettlementMemberStatus | null;
+    }[];
     /** The chat ids currently homed to this workstream. */
     readonly members: EngagementId[];
 }
+
+export type CollaborationStatus = "active" | "promoting" | "conflicted" | "promoted";
+export type TargetSettlementStatus =
+    | "not-requested"
+    | "preflighting"
+    | "applying"
+    | "completed"
+    | "partially-applied"
+    | "reconciliation-required"
+    | "compensated"
+    | "abandoned-partial";
+export type SettlementMemberStatus =
+    | "pending"
+    | "preflight-passed"
+    | "started"
+    | "succeeded"
+    | "failed"
+    | "unknown"
+    | "cancelled-before-start"
+    | "superseded-before-start";
 /** An **archetype** (library method) with its edit chats (ADR 0035). Its edit chats can
  *  collaborate on the method in a workstream too (WS-F). */
 export interface ArchetypeNode {
@@ -398,10 +452,13 @@ export interface RecentChat {
     /** The chat's placement (its home instance). */
     readonly placement: PlacementId | null;
     readonly workspaceRoot: WorkspaceRootId;
-    readonly targetId: WorkTargetId;
-    readonly targetBasis: string;
-    readonly targetKind: WorkTargetKind;
-    readonly targetAdapter: string;
+    readonly targets: readonly ChatTargetMember[];
+    readonly targetSetRevision: number;
+    readonly collaborationWorkspaceId: string | null;
+    readonly targetId: WorkTargetId | null;
+    readonly targetBasis: string | null;
+    readonly targetKind: WorkTargetKind | null;
+    readonly targetAdapter: string | null;
     readonly candidateRevision: string;
     readonly availableActs: readonly TargetActKind[];
     /** Per-chat nav-gem status (WS-H b/c); see {@link ChatNode}. */
@@ -558,12 +615,15 @@ type RawChat = {
     workstream?: string | null;
     placement?: string | null;
     workspace_root: string;
-    target_id: string;
-    target_basis: string;
-    target_kind: WorkTargetKind;
-    target_adapter: string;
-    target_path_scope: string[];
-    target_capabilities: TargetCapabilities;
+    target_id?: string | null;
+    target_basis?: string | null;
+    target_kind?: WorkTargetKind | null;
+    target_adapter?: string | null;
+    target_path_scope?: string[] | null;
+    target_capabilities?: TargetCapabilities | null;
+    target_set_revision?: number;
+    targets?: unknown[];
+    collaboration_workspace_id?: string | null;
     candidate_revision: string;
     available_acts: TargetActKind[];
     changes?: boolean;
@@ -571,40 +631,140 @@ type RawChat = {
     rehome_blocked?: boolean;
 };
 
-const parseChat = (c: RawChat): ChatNode => ({
+function parseChatTargetMember(raw: unknown, field: string): ChatTargetMember {
+    const o = (raw ?? {}) as Record<string, unknown>;
+    const participation = o.participation;
+    if (participation !== "read-only" && participation !== "writable") {
+        throw new Error(`workspace: expected ${field}.participation`);
+    }
+    return {
+        targetId: workTargetId(requiredString(o.target_id, `${field}.target_id`)),
+        root: requiredString(o.root, `${field}.root`),
+        name: requiredString(o.name, `${field}.name`),
+        kind: parseTargetKind(o.kind, `${field}.kind`),
+        adapter: requiredString(o.adapter, `${field}.adapter`),
+        adapterFamily: requiredString(o.adapter_family, `${field}.adapter_family`),
+        basis: requiredString(o.basis, `${field}.basis`),
+        pathScope: stringList(o.path_scope, `${field}.path_scope`),
+        capabilityCeiling: parseTargetCapabilities(o.capability_ceiling, `${field}.capability_ceiling`),
+        participation,
+    };
+}
+
+function parseChatTargets(c: RawChat, field: string): ChatTargetMember[] {
+    const members = valueList(c.targets ?? [], `${field}.targets`).map((raw, index) =>
+        parseChatTargetMember(raw, `${field}.targets[${index}]`));
+    if (members.length > 0) return members;
+    // Additive migration compatibility for a pre-MTARGET workspace projection.
+    if (!c.target_id) throw new Error(`workspace: expected non-empty ${field}.targets`);
+    return [{
+        targetId: workTargetId(c.target_id),
+        root: `targets/${c.target_id}`,
+        name: c.target_id,
+        kind: parseTargetKind(c.target_kind, `${field}.target_kind`),
+        adapter: requiredString(c.target_adapter, `${field}.target_adapter`),
+        adapterFamily: requiredString(c.target_adapter, `${field}.target_adapter`),
+        basis: requiredString(c.target_basis, `${field}.target_basis`),
+        pathScope: stringList(c.target_path_scope, `${field}.target_path_scope`),
+        capabilityCeiling: parseTargetCapabilities(c.target_capabilities, `${field}.target_capabilities`),
+        participation: "writable",
+    }];
+}
+
+const parseChat = (c: RawChat): ChatNode => {
+    const targets = parseChatTargets(c, "chat");
+    const singular = targets.length === 1 ? targets[0] : null;
+    return ({
     id: engagementId(c.id),
     title: c.title,
     kind: c.kind === "edit" ? "edit" : "work",
     workstream: c.workstream ? workstreamId(c.workstream) : null,
     placement: c.placement ? (c.placement as PlacementId) : null,
     workspaceRoot: requiredString(c.workspace_root, "chat.workspace_root") as WorkspaceRootId,
-    targetId: workTargetId(requiredString(c.target_id, "chat.target_id")),
-    targetBasis: requiredString(c.target_basis, "chat.target_basis"),
-    targetKind: parseTargetKind(c.target_kind, "chat.target_kind"),
-    targetAdapter: requiredString(c.target_adapter, "chat.target_adapter"),
-    targetPathScope: stringList(c.target_path_scope, "chat.target_path_scope"),
-    targetCapabilities: parseTargetCapabilities(c.target_capabilities, "chat.target_capabilities"),
+    targets,
+    targetSetRevision: typeof c.target_set_revision === "number" ? c.target_set_revision : 0,
+    collaborationWorkspaceId: c.collaboration_workspace_id ?? null,
+    targetId: singular?.targetId ?? null,
+    targetBasis: singular?.basis ?? null,
+    targetKind: singular?.kind ?? null,
+    targetAdapter: singular?.adapter ?? null,
+    targetPathScope: singular?.pathScope ?? [],
+    targetCapabilities: singular?.capabilityCeiling ?? null,
     candidateRevision: requiredString(c.candidate_revision, "chat.candidate_revision"),
     availableActs: parseTargetActs(c.available_acts, "chat.available_acts"),
     conflict: c.conflict ?? false,
     rehomeBlocked: c.rehome_blocked ?? true,
-});
+    });
+};
+
+function collaborationStatus(value: unknown): CollaborationStatus {
+    if (value === "active" || value === "promoting" || value === "conflicted" || value === "promoted") return value;
+    throw new Error(`workstream: bad collaboration status ${String(value)}`);
+}
+
+function targetSettlementStatus(value: unknown): TargetSettlementStatus {
+    if (
+        value === "not-requested"
+        || value === "preflighting"
+        || value === "applying"
+        || value === "completed"
+        || value === "partially-applied"
+        || value === "reconciliation-required"
+        || value === "compensated"
+        || value === "abandoned-partial"
+    ) return value;
+    throw new Error(`workstream: bad target settlement status ${String(value)}`);
+}
+
+function settlementMemberStatus(value: unknown): SettlementMemberStatus | null {
+    if (value === null || value === undefined) return null;
+    if (
+        value === "pending"
+        || value === "preflight-passed"
+        || value === "started"
+        || value === "succeeded"
+        || value === "failed"
+        || value === "unknown"
+        || value === "cancelled-before-start"
+        || value === "superseded-before-start"
+    ) return value;
+    throw new Error(`workstream: bad target settlement member status ${String(value)}`);
+}
 
 export const parseWorkstream = (w: {
     id: string;
     name: string;
     placement_id: string;
+    project_id?: string | null;
     workspace_root: string;
-    target_id: string;
-    status?: string;
+    target_id?: string | null;
+    status?: CollaborationStatus;
+    collaboration?: CollaborationStatus;
+    promotion_manifest_ref?: string | null;
+    promotion_targets?: string[];
+    target_settlement?: TargetSettlementStatus;
+    target_settlement_declaration?: string | null;
+    target_settlement_members?: { member_id: string; target_id: string; act: TargetActKind; phase?: SettlementMemberStatus | null }[];
     members?: string[];
 }): WorkstreamNode => ({
     id: workstreamId(w.id),
     name: w.name,
     placementId: w.placement_id as PlacementId,
+    projectId: w.project_id ? (w.project_id as ProjectId) : null,
     workspaceRoot: requiredString(w.workspace_root, "workstream.workspace_root") as WorkspaceRootId,
-    targetId: workTargetId(requiredString(w.target_id, "workstream.target_id")),
-    status: w.status === "archived" ? "archived" : "active",
+    targetId: w.target_id ? workTargetId(w.target_id) : null,
+    status: collaborationStatus(w.status ?? w.collaboration ?? "active"),
+    collaboration: collaborationStatus(w.collaboration ?? w.status ?? "active"),
+    promotionManifestRef: w.promotion_manifest_ref ?? null,
+    promotionTargets: (w.promotion_targets ?? []).map(workTargetId),
+    targetSettlement: targetSettlementStatus(w.target_settlement ?? "not-requested"),
+    targetSettlementDeclaration: w.target_settlement_declaration ?? null,
+    targetSettlementMembers: (w.target_settlement_members ?? []).map((member) => ({
+        memberId: member.member_id,
+        targetId: workTargetId(member.target_id),
+        act: member.act,
+        phase: settlementMemberStatus(member.phase),
+    })),
     members: (w.members ?? []).map(engagementId),
 });
 
@@ -648,7 +808,7 @@ export function parseWorkTarget(raw: unknown): WorkTargetNode {
  *  `/projections/library/workspace` carriage value) into the branded {@link Workspace}. */
 export function parseWorkspace(raw: unknown): Workspace {
     const o = (raw ?? {}) as {
-        archetypes?: { id: string; name: string; kind?: AgentKind; panel_profile?: PanelPublicProfile | null; instance_id?: string; authoring_target_id: string; is_default: boolean; forked_from?: string | null; forked_from_name?: string | null; chats: RawChat[]; workstreams?: { id: string; name: string; placement_id: string; workspace_root: string; target_id: string; status?: string; members?: string[] }[] }[];
+        archetypes?: { id: string; name: string; kind?: AgentKind; panel_profile?: PanelPublicProfile | null; instance_id?: string; authoring_target_id: string; is_default: boolean; forked_from?: string | null; forked_from_name?: string | null; chats: RawChat[]; workstreams?: Parameters<typeof parseWorkstream>[0][] }[];
         projects?: {
             id: string;
             home_id?: string;
@@ -672,11 +832,11 @@ export function parseWorkspace(raw: unknown): Workspace {
                 deployments?: { id: string; deployment_id: string; edge_origin: string; active_release_id?: string | null; status: PublicDeploymentBindingSummary["status"] }[];
                 target_ids: string[];
                 chats: RawChat[];
-                workstreams?: { id: string; name: string; placement_id: string; workspace_root: string; target_id: string; status?: string; members?: string[] }[];
+                workstreams?: Parameters<typeof parseWorkstream>[0][];
             }[];
         }[];
         recent?: (RawChat & { archetype: string })[];
-        workstreams?: { id: string; name: string; placement_id: string; workspace_root: string; target_id: string; status?: string; members?: string[] }[];
+        workstreams?: Parameters<typeof parseWorkstream>[0][];
         work_targets: unknown[];
         personal_placement?: string | null;
     };
@@ -726,7 +886,10 @@ export function parseWorkspace(raw: unknown): Workspace {
                 workstreams: (pl.workstreams ?? []).map(parseWorkstream),
             })),
         })),
-        recent: (o.recent ?? []).map((c) => ({
+        recent: (o.recent ?? []).map((c) => {
+            const targets = parseChatTargets(c, "recent");
+            const singular = targets.length === 1 ? targets[0] : null;
+            return ({
             id: engagementId(c.id),
             title: c.title,
             archetype: c.archetype,
@@ -734,15 +897,19 @@ export function parseWorkspace(raw: unknown): Workspace {
             workstream: c.workstream ? workstreamId(c.workstream) : null,
             placement: c.placement ? (c.placement as PlacementId) : null,
             workspaceRoot: requiredString(c.workspace_root, "recent.workspace_root") as WorkspaceRootId,
-            targetId: workTargetId(requiredString(c.target_id, "recent.target_id")),
-            targetBasis: requiredString(c.target_basis, "recent.target_basis"),
-            targetKind: parseTargetKind(c.target_kind, "recent.target_kind"),
-            targetAdapter: requiredString(c.target_adapter, "recent.target_adapter"),
+            targets,
+            targetSetRevision: typeof c.target_set_revision === "number" ? c.target_set_revision : 0,
+            collaborationWorkspaceId: c.collaboration_workspace_id ?? null,
+            targetId: singular?.targetId ?? null,
+            targetBasis: singular?.basis ?? null,
+            targetKind: singular?.kind ?? null,
+            targetAdapter: singular?.adapter ?? null,
             candidateRevision: requiredString(c.candidate_revision, "recent.candidate_revision"),
             availableActs: parseTargetActs(c.available_acts, "recent.available_acts"),
                 conflict: c.conflict ?? false,
             rehomeBlocked: c.rehome_blocked ?? true,
-        })),
+            });
+        }),
         workstreams: (o.workstreams ?? []).map(parseWorkstream),
         workTargets: valueList(o.work_targets, "work_targets").map(parseWorkTarget),
         personalPlacement: o.personal_placement ? (o.personal_placement as PlacementId) : null,

@@ -365,8 +365,8 @@ async fn member_turn_auto_syncs_to_siblings_without_touching_mainline() {
         .unwrap()
         .iter()
         .find(|item| item["id"] == ws_id)
-        .expect("promoted stream remains as durable archived history");
-    assert_eq!(promoted["status"], "archived");
+        .expect("promoted stream remains as durable terminal history");
+    assert_eq!(promoted["status"], "promoted");
     assert_eq!(promoted["members"].as_array().unwrap().len(), 0);
 }
 

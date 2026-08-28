@@ -90,6 +90,13 @@ export function toolHeaderTarget(
     return serverTarget || undefined;
 }
 
+export function partitionedToolTarget(target: string): { targetRoot: string | null; relativePath: string } {
+    const match = target.match(/^targets\/([^/]+)\/(.+)$/);
+    return match
+        ? { targetRoot: match[1], relativePath: match[2] }
+        : { targetRoot: null, relativePath: target };
+}
+
 /** Tool result text that merely confirms the action — "wrote 1 file", "File
  *  created successfully", a bare "ok" — restating what the ✓ and the header
  *  already say. The expanded detail strips these so a disclosure reveals real

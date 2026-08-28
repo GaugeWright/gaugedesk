@@ -14,13 +14,13 @@
 
 import { expect, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { aliceCP } from "../ports.mjs";
 import { mutationHeaders } from "./idempotency";
 
-const { Given, When, Then, Before } = createBdd();
+const { Given, When, Then, Before, After } = createBdd();
 
 // Per-scenario clean slate. The whole suite shares ONE control plane, run serially,
 // so without this the append-only store accumulates every prior scenario's projects,
@@ -82,6 +82,32 @@ function freshProjectName(): string {
 // placement" targets the same placement.
 let concProject = "";
 let exportDestination = "";
+let multiTargetProject = "";
+let multiTargetProjectId = "";
+let multiTargetChatId = "";
+let multiTargetTargetRoots = new Map<string, string>();
+let multiTargetDirectory = "";
+let multiTargetWorkstreamId = "";
+let multiTargetWorkstreamChatId = "";
+let historicalForkChatId = "";
+let historicalForkEntry = 0;
+let historicalForkRefusal: { status: number; body: string } | null = null;
+
+After(async () => {
+    if (multiTargetDirectory) {
+        await rm(multiTargetDirectory, { recursive: true, force: true });
+    }
+    multiTargetDirectory = "";
+    multiTargetProject = "";
+    multiTargetProjectId = "";
+    multiTargetChatId = "";
+    multiTargetTargetRoots = new Map();
+    multiTargetWorkstreamId = "";
+    multiTargetWorkstreamChatId = "";
+    historicalForkChatId = "";
+    historicalForkEntry = 0;
+    historicalForkRefusal = null;
+});
 
 /** Create a project, place the (default) archetype on it, and return the project
  *  group locator — the placement under it is what work chats are rooted on. */
@@ -123,6 +149,298 @@ async function ensureArchetypeLens(page: import("@playwright/test").Page, name: 
 Given("the workbench is open", async ({ page }) => {
     await page.goto("/");
     await expect(page.locator(".facet.active", { hasText: "Projects" })).toBeVisible();
+});
+
+Given("a project with two eligible work targets", async ({ page, request }) => {
+    multiTargetProject = freshProjectName();
+    const created = await request.post(`${aliceCP}/projects`, {
+        headers: mutationHeaders(),
+        data: { name: multiTargetProject },
+    });
+    if (!created.ok()) throw new Error(`project creation failed: ${created.status()} ${await created.text()}`);
+    const project = await created.json() as { id: string };
+    multiTargetProjectId = project.id;
+    const targetDirectory = await mkdtemp(join(tmpdir(), "gaugedesk-e2e-target-"));
+    multiTargetDirectory = targetDirectory;
+    const attached = await request.post(`${aliceCP}/projects/${encodeURIComponent(project.id)}/targets`, {
+        headers: mutationHeaders(),
+        data: {
+            name: "Reference target",
+            kind: "external-folder",
+            path: targetDirectory,
+            path_scope: ["."],
+        },
+    });
+    if (!attached.ok()) throw new Error(`target attachment failed: ${attached.status()} ${await attached.text()}`);
+    await page.goto("/");
+    await expect(page.locator("[data-project]", { hasText: multiTargetProject })).toBeVisible();
+});
+
+When("I start a chat in that multi-target project", async ({ page }) => {
+    await page
+        .locator("[data-project]", { hasText: multiTargetProject })
+        .locator("[data-create='new-project-chat']")
+        .click();
+});
+
+Then("the target picker requires an explicit selection", async ({ page }) => {
+    const picker = page.locator("[data-target-picker]");
+    await expect(picker).toBeVisible();
+    await expect(picker.locator("[data-target-choice]")).toHaveCount(2);
+    await expect(picker.locator("[data-target-choice][aria-pressed='true']")).toHaveCount(0);
+    await expect(picker.locator("[data-create-multi-target-chat]")).toBeDisabled();
+});
+
+When("I select every target and start the chat", async ({ page, request }) => {
+    const picker = page.locator("[data-target-picker]");
+    for (const choice of await picker.locator("[data-target-choice]").all()) await choice.click();
+    await picker.locator("[data-create-multi-target-chat]").click();
+    const row = page.locator("[data-project]", { hasText: multiTargetProject }).locator("[data-chat]").first();
+    await expect(row).toBeVisible();
+    multiTargetChatId = (await row.getAttribute("data-chat")) ?? "";
+    const workspace = await request.get(`${aliceCP}/workspace`);
+    const projection = await workspace.json() as {
+        projects: { id: string; placements: { chats: { id: string; targets: { target_id: string; root: string }[] }[] }[] }[];
+    };
+    const chat = projection.projects
+        .find((project) => project.id === multiTargetProjectId)?.placements
+        .flatMap((placement) => placement.chats)
+        .find((candidate) => candidate.id === multiTargetChatId);
+    multiTargetTargetRoots = new Map((chat?.targets ?? []).map((target) => [target.target_id, target.root]));
+});
+
+Then("the chat shows both selected targets", async ({ page }) => {
+    await expect(page.locator("[data-chat-targets='2']")).toBeVisible();
+});
+
+Then("Files shows two target partitions", async ({ page }) => {
+    await expect(page.locator("[data-target-partitions] [data-target-id]")).toHaveCount(2);
+});
+
+When("I change the Reference target to read-only", async ({ page }) => {
+    const row = page.locator(`[data-chat='${multiTargetChatId}']`).first();
+    await row.click({ button: "right" });
+    await page.locator(".menu-item", { hasText: "change targets…" }).click();
+    const picker = page.locator("[data-target-picker]");
+    const reference = picker.locator("[data-target-choice]", { hasText: "Reference target" });
+    // Initial participation is writable. The revision picker cycles writable →
+    // absent → read-only, making the requested authority change explicit.
+    await reference.click();
+    await reference.click();
+    await picker.getByRole("button", { name: /^Save 2 targets$/ }).click();
+    await expect(picker).toHaveCount(0);
+});
+
+Then("the Reference target is visibly read-only", async ({ page }) => {
+    await expect(
+        page.locator(`[data-chat='${multiTargetChatId}'] [data-chat-target-count]`),
+    ).toContainText("Reference target (read-only)");
+});
+
+Then("a direct save to the read-only target is refused", async ({ request }) => {
+    const workspace = await request.get(`${aliceCP}/workspace`);
+    const projection = await workspace.json() as {
+        work_targets: { id: string; name: string }[];
+    };
+    const targetId = projection.work_targets.find((target) => target.name === "Reference target")?.id;
+    const root = targetId ? multiTargetTargetRoots.get(targetId) : undefined;
+    if (!root) throw new Error("Reference target root is unavailable");
+    const response = await request.put(
+        `${aliceCP}/chats/${encodeURIComponent(multiTargetChatId)}/file?path=${encodeURIComponent(`${root}/forbidden.txt`)}`,
+        { headers: mutationHeaders(), data: "must not be written" },
+    );
+    expect(response.status()).toBe(403);
+    expect(await response.text()).toContain("read-only");
+});
+
+Given("Personal has two eligible work targets", async ({ page, request }) => {
+    const workspace = await request.get(`${aliceCP}/workspace`);
+    const projection = await workspace.json() as {
+        projects: { id: string; is_personal: boolean }[];
+    };
+    const personal = projection.projects.find((project) => project.is_personal);
+    if (!personal) throw new Error("Personal project is unavailable");
+    multiTargetDirectory = await mkdtemp(join(tmpdir(), "gaugedesk-e2e-personal-target-"));
+    const attached = await request.post(`${aliceCP}/projects/${encodeURIComponent(personal.id)}/targets`, {
+        headers: mutationHeaders(),
+        data: {
+            name: "Personal reference",
+            kind: "external-folder",
+            path: multiTargetDirectory,
+            path_scope: ["."],
+        },
+    });
+    if (!attached.ok()) throw new Error(`Personal target attachment failed: ${attached.status()} ${await attached.text()}`);
+    await page.goto("/");
+});
+
+When("I submit the empty-state composer", async ({ page }) => {
+    const composer = page.locator("[data-empty-chat-composer] textarea[aria-label='Message']");
+    await composer.fill("work across my selected files");
+    await sendDraft(composer);
+});
+
+Then("quick start asks for an explicit target set", async ({ page }) => {
+    const picker = page.locator("[data-quick-target-picker]");
+    await expect(picker).toBeVisible();
+    await expect(picker.locator("[data-quick-target-choice]")).toHaveCount(2);
+    await expect(picker.locator("[data-quick-target-choice][aria-pressed='true']")).toHaveCount(0);
+    await expect(picker.locator("[data-confirm-quick-targets]")).toBeDisabled();
+});
+
+Given("two placements have chats in one project workstream", async ({ page, request }) => {
+    const workspaceResponse = await request.get(`${aliceCP}/workspace`);
+    const workspace = await workspaceResponse.json() as {
+        archetypes: { id: string }[];
+        projects: {
+            id: string;
+            targets: { id: string }[];
+            placements: { placement_id: string }[];
+        }[];
+    };
+    const project = workspace.projects.find((candidate) => candidate.id === multiTargetProjectId);
+    const firstPlacement = project?.placements[0]?.placement_id;
+    const archetype = workspace.archetypes[0]?.id;
+    if (!project || !firstPlacement || !archetype) throw new Error("project topology is unavailable");
+    const placed = await request.post(`${aliceCP}/projects/${encodeURIComponent(project.id)}/placements`, {
+        headers: mutationHeaders(),
+        data: { agent_id: archetype },
+    });
+    if (!placed.ok()) throw new Error(`second placement failed: ${placed.status()} ${await placed.text()}`);
+    const secondPlacement = (await placed.json() as { instance_id: string }).instance_id;
+    const targetIds = project.targets.map((target) => target.id);
+    const createChat = async (placement: string, title: string) => {
+        const created = await request.post(
+            `${aliceCP}/projects/${encodeURIComponent(project.id)}/placements/${encodeURIComponent(placement)}/chats`,
+            { headers: mutationHeaders(), data: { title, target_ids: targetIds } },
+        );
+        if (!created.ok()) throw new Error(`chat creation failed: ${created.status()} ${await created.text()}`);
+        return (await created.json() as { id: string }).id;
+    };
+    const firstChat = await createChat(firstPlacement, "First placement chat");
+    multiTargetWorkstreamChatId = firstChat;
+    const secondChat = await createChat(secondPlacement, "Second placement chat");
+    const createdWorkstream = await request.post(`${aliceCP}/placements/${encodeURIComponent(firstPlacement)}/workstreams`, {
+        headers: mutationHeaders(),
+        data: { name: "Project-wide line" },
+    });
+    if (!createdWorkstream.ok()) throw new Error(`workstream creation failed: ${createdWorkstream.status()} ${await createdWorkstream.text()}`);
+    multiTargetWorkstreamId = (await createdWorkstream.json() as { id: string }).id;
+    for (const chat of [firstChat, secondChat]) {
+        const joined = await request.post(`${aliceCP}/workstreams/${encodeURIComponent(multiTargetWorkstreamId)}/join`, {
+            headers: mutationHeaders(),
+            data: { chat },
+        });
+        if (!joined.ok()) throw new Error(`workstream join failed: ${joined.status()} ${await joined.text()}`);
+    }
+    const topologyResponse = await request.get(`${aliceCP}/placements/${encodeURIComponent(secondPlacement)}/workstreams`);
+    const topologyBody = await topologyResponse.text();
+    const topology = JSON.parse(topologyBody) as { workstreams: { id: string; members: string[] }[] };
+    const members = topology.workstreams.find((candidate) => candidate.id === multiTargetWorkstreamId)?.members ?? [];
+    if (members.length !== 2) throw new Error(`project workstream lost members before rendering: ${topologyBody}`);
+    await page.goto("/");
+});
+
+Then("the project workstream groups both chats", async ({ page }) => {
+    const project = page.locator("[data-project]", { hasText: multiTargetProject });
+    const group = project.locator(".ws-group", {
+        has: page.locator(".ws-label-name", { hasText: /^Project-wide line$/ }),
+    });
+    await expect(group).toBeVisible();
+    await expect(group.locator(".ws-members [data-chat]")).toHaveCount(2);
+});
+
+When("I promote collaboration and start a later target settlement", async ({ page, request }) => {
+    const task = await request.post(`${aliceCP}/chats/${encodeURIComponent(multiTargetWorkstreamChatId)}/task`, {
+        headers: mutationHeaders(),
+        data: { prompt: "update each selected target [all-writable]" },
+    });
+    if (!task.ok()) throw new Error(`multi-target task failed: ${task.status()} ${await task.text()}`);
+    const promoted = await request.post(`${aliceCP}/workstreams/${encodeURIComponent(multiTargetWorkstreamId)}/promote`, {
+        headers: mutationHeaders(),
+        data: { settlement_members: [] },
+    });
+    if (!promoted.ok()) throw new Error(`promotion failed: ${promoted.status()} ${await promoted.text()}`);
+    const workspace = await request.get(`${aliceCP}/workspace`);
+    const projection = await workspace.json() as { projects: { id: string; targets: { id: string; capabilities: { apply: boolean } }[] }[] };
+    const target = projection.projects.find((project) => project.id === multiTargetProjectId)?.targets.find((candidate) => candidate.capabilities.apply);
+    if (!target) throw new Error("no applicable target is available");
+    const settlement = await request.post(`${aliceCP}/workstreams/${encodeURIComponent(multiTargetWorkstreamId)}/settlements`, {
+        headers: mutationHeaders(),
+        data: { members: [{ target_id: target.id, act: "apply" }] },
+    });
+    if (!settlement.ok()) throw new Error(`settlement declaration failed: ${settlement.status()} ${await settlement.text()}`);
+    await page.reload();
+});
+
+Then("promotion and settlement are projected separately with recovery actions", async ({ page }) => {
+    const promoted = page.locator(`[data-promoted-workstream='${multiTargetWorkstreamId}']`);
+    await expect(promoted.locator("[data-collaboration-status='promoted']")).toBeVisible();
+    await expect(promoted.locator("[data-settlement-status='preflighting']")).toBeVisible();
+    await expect(promoted.locator("[data-settlement-recovery]")).toBeVisible();
+    await expect(promoted.getByRole("button", { name: "Refresh diagnostics" })).toBeVisible();
+    await expect(promoted.getByRole("button", { name: "Cancel pending" })).toBeVisible();
+    await expect(promoted.getByRole("button", { name: "Supersede…" })).toBeVisible();
+});
+
+Given("a chat has a fork point on a workstream that is later archived", async ({ request }) => {
+    const workspaceResponse = await request.get(`${aliceCP}/workspace`);
+    const workspace = await workspaceResponse.json() as {
+        projects: { is_personal: boolean; id: string; placements: { placement_id: string; target_ids: string[] }[] }[];
+    };
+    const personal = workspace.projects.find((project) => project.is_personal);
+    const placement = personal?.placements[0];
+    const target = placement?.target_ids[0];
+    if (!personal || !placement || !target) throw new Error("Personal topology is unavailable");
+    const chatResponse = await request.post(
+        `${aliceCP}/projects/${encodeURIComponent(personal.id)}/placements/${encodeURIComponent(placement.placement_id)}/chats`,
+        { headers: mutationHeaders(), data: { title: "Historical fork", target_ids: [target] } },
+    );
+    if (!chatResponse.ok()) throw new Error(`chat creation failed: ${chatResponse.status()} ${await chatResponse.text()}`);
+    historicalForkChatId = (await chatResponse.json() as { id: string }).id;
+    const workstreamResponse = await request.post(`${aliceCP}/placements/${encodeURIComponent(placement.placement_id)}/workstreams`, {
+        headers: mutationHeaders(),
+        data: { name: "Historical home" },
+    });
+    if (!workstreamResponse.ok()) throw new Error(`workstream creation failed: ${workstreamResponse.status()} ${await workstreamResponse.text()}`);
+    const workstream = (await workstreamResponse.json() as { id: string }).id;
+    const joined = await request.post(`${aliceCP}/workstreams/${encodeURIComponent(workstream)}/join`, {
+        headers: mutationHeaders(),
+        data: { chat: historicalForkChatId },
+    });
+    if (!joined.ok()) throw new Error(`workstream join failed: ${joined.status()} ${await joined.text()}`);
+    const task = await request.post(`${aliceCP}/chats/${encodeURIComponent(historicalForkChatId)}/task`, {
+        headers: mutationHeaders(),
+        data: { prompt: "[no-write] establish a durable fork point" },
+    });
+    if (!task.ok()) throw new Error(`task failed: ${task.status()} ${await task.text()}`);
+    const transcriptResponse = await request.get(`${aliceCP}/chats/${encodeURIComponent(historicalForkChatId)}/transcript`);
+    const transcript = await transcriptResponse.json() as { type: string; entry_id?: number; forkable?: boolean }[];
+    historicalForkEntry = transcript.findLast((entry) => entry.type === "assistant" && entry.forkable)?.entry_id ?? 0;
+    if (!historicalForkEntry) throw new Error("durable assistant fork point was not projected");
+    const archived = await request.post(`${aliceCP}/workstreams/${encodeURIComponent(workstream)}/archive`, {
+        headers: mutationHeaders(),
+    });
+    if (!archived.ok()) throw new Error(`workstream archive failed: ${archived.status()} ${await archived.text()}`);
+});
+
+When("I fork at that point without choosing a replacement home", async ({ request }) => {
+    const response = await request.post(
+        `${aliceCP}/chats/${encodeURIComponent(historicalForkChatId)}/fork/${historicalForkEntry}`,
+        { headers: mutationHeaders(), data: { destination: { kind: "inherit" } } },
+    );
+    historicalForkRefusal = { status: response.status(), body: await response.text() };
+});
+
+Then("the archived home is refused and an explicit Main retry succeeds", async ({ request }) => {
+    expect(historicalForkRefusal?.status).toBe(409);
+    expect(historicalForkRefusal?.body).toContain("historical-home-closed");
+    const retry = await request.post(
+        `${aliceCP}/chats/${encodeURIComponent(historicalForkChatId)}/fork/${historicalForkEntry}`,
+        { headers: mutationHeaders(), data: { destination: { kind: "main" } } },
+    );
+    expect(retry.status()).toBe(201);
+    expect(await retry.text()).toContain('"admitted_home"');
 });
 
 Then("the empty chat composer is ready", async ({ page }) => {

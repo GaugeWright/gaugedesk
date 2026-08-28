@@ -13,7 +13,7 @@
 //! - **instance** = an archetype authoring root or a placement declaration.
 //! - **work target** = the independently-authoritative files a chat changes.
 //! - **project** = a grouping of placements and ordinary work targets.
-//! - **chat** = an engagement binding a placement/archetype to a target and exact basis.
+//! - **chat** = an engagement binding a placement/archetype to an immutable target-set revision.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -633,13 +633,157 @@ pub struct ChatTargetBindingRecord {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// Whether a selected target may receive candidate writes from the chat. This
+/// is independent from the target's capability ceiling: `Writable` still does
+/// not grant an apply, publish, or release act to any turn.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TargetParticipationMode {
+    ReadOnly,
+    Writable,
+}
+
+/// The stable half of one member in an immutable chat target-set revision
+/// (ADR 0150). Exact bases, candidate cuts, and evaluated grants belong to the
+/// per-turn snapshot instead of this declaration.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChatTargetSetMemberRecord {
+    pub target_id: String,
+    pub adapter_family: String,
+    pub path_scope: Vec<String>,
+    pub capability_ceiling: TargetCapabilities,
+    pub participation: TargetParticipationMode,
+}
+
+/// One immutable, non-empty target selection for a work chat. Revision zero is
+/// the exact lossless migration of the former singular `chat_target` record.
+/// Later revisions append; they never edit or tombstone an earlier revision.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChatTargetSetRevisionRecord {
+    pub chat_id: String,
+    pub revision: u64,
+    pub members: Vec<ChatTargetSetMemberRecord>,
+    #[serde(default)]
+    pub created_position: i64,
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Exact native basis a chat must continue to propose against for one target.
+/// This is separate from the stable target-set declaration: ordinary chats may
+/// follow the target's admitted current basis, while a historical point fork
+/// pins the basis captured at that boundary until an explicit reconciliation
+/// writes a successor record.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChatTargetBasisRecord {
+    pub chat_id: String,
+    pub target_id: String,
+    pub basis: String,
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// One Home-local collaboration workspace per project (ADR 0151). This is not
+/// a work target and its Main ref never claims that a native target settled.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProjectCollaborationWorkspaceRecord {
+    pub project_id: String,
+    pub workspace_id: String,
+    pub home_id: HomeId,
+    pub substrate: String,
+    pub host_contract_revision: String,
+    pub host_contract_digest: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    #[serde(default = "record_schema_v1")]
+    pub schema: u32,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Collision-safe target-root encoding from ADR 0150. Stable IDs are encoded
+/// from their canonical UTF-8 bytes using unpadded lowercase RFC 4648 base32.
+pub fn target_id_path_v1(target_id: &str) -> Result<String, String> {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let bytes = target_id.as_bytes();
+    if bytes.is_empty() {
+        return Err("target-id-path-v1 refuses an empty stable target id".to_owned());
+    }
+    if bytes.len() > 128 {
+        return Err("target-id-path-v1 refuses stable target ids longer than 128 bytes".to_owned());
+    }
+    let mut encoded = String::with_capacity(2 + bytes.len().div_ceil(5) * 8);
+    encoded.push_str("t-");
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+    for byte in bytes {
+        buffer = (buffer << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            encoded.push(ALPHABET[((buffer >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        encoded.push(ALPHABET[((buffer << (5 - bits)) & 31) as usize] as char);
+    }
+    Ok(encoded)
+}
+
+fn validate_target_set_revision(record: &ChatTargetSetRevisionRecord) -> Result<(), String> {
+    if record.chat_id.is_empty() {
+        return Err("a target-set revision must name its chat".to_owned());
+    }
+    if record.members.is_empty() {
+        return Err(format!(
+            "chat {} target-set revision {} is empty",
+            record.chat_id, record.revision
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for member in &record.members {
+        target_id_path_v1(&member.target_id)?;
+        if !ids.insert(member.target_id.as_str()) {
+            return Err(format!(
+                "chat {} target-set revision {} repeats stable target id {}",
+                record.chat_id, record.revision, member.target_id
+            ));
+        }
+        if member.adapter_family.is_empty() {
+            return Err(format!("target {} has no adapter family", member.target_id));
+        }
+        if member.participation == TargetParticipationMode::Writable
+            && !member.capability_ceiling.propose
+        {
+            return Err(format!(
+                "writable target {} has no propose capability ceiling",
+                member.target_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Target-scoped root for a named workstream.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WorkstreamRootRecord {
     pub workstream_id: String,
     pub op: RecordOp,
+    /// Compatibility creator placement. Work workstreams are scoped by the
+    /// project collaboration workspace below, never by this placement.
     pub placement_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub workspace_id: String,
+    /// Non-empty only for the archetype-authoring compatibility case.
+    #[serde(default)]
     pub target_id: String,
+    #[serde(default)]
     pub adapter_family: String,
     /// The record-shape schema version that wrote this record (DR-0054 Phase
     /// B). Absent on records predating the stamp = version 1, the implicit
@@ -718,7 +862,12 @@ pub struct Library {
     pub workstreams: BTreeMap<String, WorkstreamRecord>,
     pub work_targets: BTreeMap<String, WorkTargetRecord>,
     pub placement_targets: BTreeMap<String, PlacementTargetsRecord>,
+    /// Legacy singular bindings remain readable until every state root has an
+    /// exact revision-zero migration. New work uses `chat_target_sets`.
     pub chat_targets: BTreeMap<String, ChatTargetBindingRecord>,
+    pub chat_target_sets: BTreeMap<String, BTreeMap<u64, ChatTargetSetRevisionRecord>>,
+    pub chat_target_bases: BTreeMap<String, BTreeMap<String, ChatTargetBasisRecord>>,
+    pub project_collaboration_workspaces: BTreeMap<String, ProjectCollaborationWorkspaceRecord>,
     pub workstream_roots: BTreeMap<String, WorkstreamRootRecord>,
 }
 
@@ -783,6 +932,42 @@ impl Library {
             guard_record_schema("chat_target", &r.chat_id, r.schema)?;
             fold_one(&mut lib.chat_targets, &r.chat_id.clone(), r.op, r);
         }
+        for row in store.records(LIBRARY_SCOPE, "chat_target_set")? {
+            let r: ChatTargetSetRevisionRecord = serde_json::from_str(&row)?;
+            guard_record_schema("chat_target_set", &r.chat_id, r.schema)?;
+            validate_target_set_revision(&r).map_err(AdmitError::Codec)?;
+            let revisions = lib.chat_target_sets.entry(r.chat_id.clone()).or_default();
+            if let Some(existing) = revisions.get(&r.revision) {
+                if existing != &r {
+                    return Err(AdmitError::Codec(format!(
+                        "chat target-set {} revision {} was rewritten; revisions are immutable",
+                        r.chat_id, r.revision
+                    )));
+                }
+            } else {
+                revisions.insert(r.revision, r);
+            }
+        }
+        for row in store.records(LIBRARY_SCOPE, "chat_target_basis")? {
+            let r: ChatTargetBasisRecord = serde_json::from_str(&row)?;
+            guard_record_schema("chat_target_basis", &r.chat_id, r.schema)?;
+            if r.chat_id.is_empty() || r.target_id.is_empty() || r.basis.is_empty() {
+                return Err(AdmitError::Codec(
+                    "chat target basis requires chat, target, and exact basis".to_owned(),
+                ));
+            }
+            lib.apply_chat_target_basis(r);
+        }
+        for row in store.records(LIBRARY_SCOPE, "project_collaboration_workspace")? {
+            let r: ProjectCollaborationWorkspaceRecord = serde_json::from_str(&row)?;
+            guard_record_schema("project_collaboration_workspace", &r.project_id, r.schema)?;
+            fold_one(
+                &mut lib.project_collaboration_workspaces,
+                &r.project_id.clone(),
+                r.op,
+                r,
+            );
+        }
         for row in store.records(LIBRARY_SCOPE, "workstream_root")? {
             let r: WorkstreamRootRecord = serde_json::from_str(&row)?;
             guard_record_schema("workstream_root", &r.workstream_id, r.schema)?;
@@ -845,6 +1030,45 @@ impl Library {
     pub fn apply_chat_target(&mut self, r: ChatTargetBindingRecord) {
         fold_one(&mut self.chat_targets, &r.chat_id.clone(), r.op, r);
     }
+    pub fn apply_chat_target_set(&mut self, r: ChatTargetSetRevisionRecord) -> Result<(), String> {
+        validate_target_set_revision(&r)?;
+        let revisions = self.chat_target_sets.entry(r.chat_id.clone()).or_default();
+        if let Some(existing) = revisions.get(&r.revision) {
+            if existing != &r {
+                return Err(format!(
+                    "chat target-set {} revision {} was rewritten; revisions are immutable",
+                    r.chat_id, r.revision
+                ));
+            }
+            return Ok(());
+        }
+        revisions.insert(r.revision, r);
+        Ok(())
+    }
+    pub fn apply_chat_target_basis(&mut self, r: ChatTargetBasisRecord) {
+        self.chat_target_bases
+            .entry(r.chat_id.clone())
+            .or_default()
+            .insert(r.target_id.clone(), r);
+    }
+
+    pub fn chat_target_basis(&self, chat_id: &str, target_id: &str) -> Option<&str> {
+        self.chat_target_bases
+            .get(chat_id)
+            .and_then(|targets| targets.get(target_id))
+            .map(|record| record.basis.as_str())
+    }
+    pub fn apply_project_collaboration_workspace(
+        &mut self,
+        r: ProjectCollaborationWorkspaceRecord,
+    ) {
+        fold_one(
+            &mut self.project_collaboration_workspaces,
+            &r.project_id.clone(),
+            r.op,
+            r,
+        );
+    }
     pub fn apply_workstream_root(&mut self, r: WorkstreamRootRecord) {
         fold_one(
             &mut self.workstream_roots,
@@ -855,9 +1079,32 @@ impl Library {
     }
 
     pub fn target_for_chat(&self, chat_id: &str) -> Option<&WorkTargetRecord> {
-        self.chat_targets
+        let current = self.current_target_set(chat_id);
+        match current {
+            Some(set) if set.members.len() == 1 => self.work_targets.get(&set.members[0].target_id),
+            Some(_) => None,
+            None => self
+                .chat_targets
+                .get(chat_id)
+                .and_then(|binding| self.work_targets.get(&binding.target_id)),
+        }
+    }
+
+    pub fn current_target_set(&self, chat_id: &str) -> Option<&ChatTargetSetRevisionRecord> {
+        self.chat_target_sets
             .get(chat_id)
-            .and_then(|binding| self.work_targets.get(&binding.target_id))
+            .and_then(|revisions| revisions.last_key_value().map(|(_, record)| record))
+    }
+
+    pub fn targets_for_chat(&self, chat_id: &str) -> Vec<&WorkTargetRecord> {
+        match self.current_target_set(chat_id) {
+            Some(set) => set
+                .members
+                .iter()
+                .filter_map(|member| self.work_targets.get(&member.target_id))
+                .collect(),
+            None => self.target_for_chat(chat_id).into_iter().collect(),
+        }
     }
 
     pub fn targets_for_project(&self, project_id: &str) -> Vec<&WorkTargetRecord> {
@@ -1262,6 +1509,119 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
         assert_eq!(value["schema"], 1);
         assert_eq!(value["future_field"], serde_json::json!({"nested": true}));
+    }
+
+    #[test]
+    fn target_id_path_v1_is_unpadded_lowercase_and_collision_safe() {
+        assert_eq!(target_id_path_v1("f").unwrap(), "t-my");
+        assert_eq!(target_id_path_v1("foo").unwrap(), "t-mzxw6");
+        assert_eq!(target_id_path_v1("foobar").unwrap(), "t-mzxw6ytboi");
+        assert_ne!(
+            target_id_path_v1("frontend/api").unwrap(),
+            target_id_path_v1("frontend-api").unwrap()
+        );
+        let hostile = target_id_path_v1("../AUX/\0/é").unwrap();
+        assert!(hostile.starts_with("t-"));
+        assert!(hostile
+            .chars()
+            .skip(2)
+            .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)));
+        assert!(target_id_path_v1("").is_err());
+        assert!(target_id_path_v1(&"x".repeat(129)).is_err());
+    }
+
+    fn target_set(
+        chat_id: &str,
+        revision: u64,
+        target_ids: &[&str],
+    ) -> ChatTargetSetRevisionRecord {
+        ChatTargetSetRevisionRecord {
+            chat_id: chat_id.to_owned(),
+            revision,
+            members: target_ids
+                .iter()
+                .map(|target_id| ChatTargetSetMemberRecord {
+                    target_id: (*target_id).to_owned(),
+                    adapter_family: "whipplescript-v1".to_owned(),
+                    path_scope: vec!["".to_owned()],
+                    capability_ceiling: TargetCapabilities::managed_default(),
+                    participation: TargetParticipationMode::Writable,
+                })
+                .collect(),
+            created_position: revision as i64,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn target_set_revisions_are_nonempty_unique_and_immutable() {
+        let mut lib = Library::default();
+        lib.apply_chat_target_set(target_set("chat-1", 0, &["frontend"]))
+            .unwrap();
+        lib.apply_chat_target_set(target_set("chat-1", 1, &["frontend", "api"]))
+            .unwrap();
+        assert_eq!(lib.current_target_set("chat-1").unwrap().revision, 1);
+        assert_eq!(lib.current_target_set("chat-1").unwrap().members.len(), 2);
+
+        assert!(lib
+            .apply_chat_target_set(target_set("chat-1", 2, &[]))
+            .unwrap_err()
+            .contains("empty"));
+        assert!(lib
+            .apply_chat_target_set(target_set("chat-1", 2, &["api", "api"]))
+            .unwrap_err()
+            .contains("repeats"));
+
+        let mut rewritten = target_set("chat-1", 1, &["frontend", "api"]);
+        rewritten.members[0].participation = TargetParticipationMode::ReadOnly;
+        assert!(lib
+            .apply_chat_target_set(rewritten)
+            .unwrap_err()
+            .contains("immutable"));
+    }
+
+    #[test]
+    fn rebuild_fails_closed_on_a_rewritten_target_set_revision() {
+        let mut store = Store::open_in_memory().unwrap();
+        let original = target_set("chat-1", 0, &["frontend"]);
+        let mut rewritten = original.clone();
+        rewritten.members[0].target_id = "api".to_owned();
+        for record in [original, rewritten] {
+            store
+                .append_record(
+                    LIBRARY_SCOPE,
+                    "chat_target_set",
+                    &serde_json::to_string(&record).unwrap(),
+                )
+                .unwrap();
+        }
+        let error = match Library::rebuild(&store) {
+            Ok(_) => panic!("rewriting an immutable target-set revision must fail"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:?}").contains("immutable"));
+    }
+
+    #[test]
+    fn project_collaboration_workspace_is_distinct_from_work_targets() {
+        let mut lib = Library::default();
+        lib.apply_project_collaboration_workspace(ProjectCollaborationWorkspaceRecord {
+            project_id: "project-1".to_owned(),
+            workspace_id: "workspace-project-1".to_owned(),
+            home_id: HomeId::new("home-1"),
+            substrate: "whipplescript".to_owned(),
+            host_contract_revision: crate::workstream_host_contract::REVISION.to_owned(),
+            host_contract_digest: crate::workstream_host_contract::DIGEST.to_owned(),
+            op: RecordOp::Upsert,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+        assert_eq!(
+            lib.project_collaboration_workspaces["project-1"].workspace_id,
+            "workspace-project-1"
+        );
+        assert!(lib.work_targets.is_empty());
     }
 
     fn agent(store: &mut Store, id: &str, op: RecordOp, name: &str) {

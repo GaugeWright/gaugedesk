@@ -53,6 +53,15 @@ use crate::{
 
 /// The record kind under which resource metadata is stored in an engagement scope.
 const RESOURCE_KIND: &str = "resource";
+
+fn is_target_payload_path(path: &str) -> bool {
+    path != gaugedesk_boundary::definition::CONFIG_PATH
+        && path != gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT
+        && !path.starts_with(&format!(
+            "{}/",
+            gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT
+        ))
+}
 /// The record kind under which a turn's resource **reads** are durably accumulated
 /// (engagement-scoped taint, `taint::EngagementReads`).
 const READ_KIND: &str = "read";
@@ -629,6 +638,10 @@ pub(crate) struct ContextBody {
     /// Absolute path to a **folder** or a **single file** (UX-1) of context to open into
     /// the engagement.
     path: String,
+    /// Required when a work chat has more than one writable target. Context is
+    /// candidate content and therefore must resolve to one exact target authority.
+    #[serde(default)]
+    target_id: Option<String>,
     /// **SECAUD-5**: optional data classification for the ingested source
     /// (`public` | `internal` | `pii` | `regulated`). Unknown / omitted => the
     /// fail-closed default `regulated`, so a missing or typo'd label never *under*-protects.
@@ -689,11 +702,14 @@ pub(crate) async fn post_context(
         )
             .into_response();
     }
-    let (n, commit) = match wb.ingest_context_into_engagement(&id, std::path::Path::new(&body.path))
-    {
+    let (n, commit) = match wb.ingest_context_into_engagement(
+        &id,
+        std::path::Path::new(&body.path),
+        body.target_id.as_deref(),
+    ) {
         Some(Ok(out)) => out,
         None => return (StatusCode::NOT_FOUND, "no such engagement").into_response(),
-        Some(Err(e)) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+        Some(Err(e)) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     // A minted context must be owned by the authority the agent will act-for,
     // or the information-flow envelope denies the very read this ingest exists
@@ -736,6 +752,9 @@ pub(crate) struct UploadedFile {
 pub(crate) struct ContextUploadBody {
     /// The uploaded files (name + text content) to open into the engagement.
     files: Vec<UploadedFile>,
+    /// Required when a work chat has more than one writable target.
+    #[serde(default)]
+    target_id: Option<String>,
     /// SECAUD-5: optional data classification for the ingested source.
     #[serde(default)]
     classification: Option<String>,
@@ -765,10 +784,11 @@ pub(crate) async fn post_context_upload(
         .into_iter()
         .map(|f| (f.name, f.content))
         .collect();
-    let (n, commit) = match wb.ingest_upload_into_engagement(&id, &files) {
+    let (n, commit) = match wb.ingest_upload_into_engagement(&id, &files, body.target_id.as_deref())
+    {
         Some(Ok(out)) => out,
         None => return (StatusCode::NOT_FOUND, "no such engagement").into_response(),
-        Some(Err(e)) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+        Some(Err(e)) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     // A minted context must be owned by the authority the agent will act-for,
     // or the information-flow envelope denies the very read this ingest exists
@@ -864,7 +884,7 @@ pub(crate) async fn get_resource_content(
             Some(Ok(entries)) => {
                 let manifest = entries
                     .into_iter()
-                    .filter(|e| !e.is_dir)
+                    .filter(|e| !e.is_dir && is_target_payload_path(&e.path))
                     .map(|e| e.path)
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -1183,7 +1203,7 @@ pub(crate) async fn post_resource_export_to_disk(
             None => return (StatusCode::NOT_FOUND, "no such engagement").into_response(),
             Some(Ok(entries)) => entries
                 .into_iter()
-                .filter(|e| !e.is_dir)
+                .filter(|e| !e.is_dir && is_target_payload_path(&e.path))
                 .map(|e| e.path)
                 .collect(),
             Some(Err(e)) => {

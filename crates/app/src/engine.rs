@@ -129,7 +129,6 @@ pub(crate) fn bind_turn_interrupt(id: &str, interrupt: InterruptHandle) {
 /// separate read would be a race — free when checked, taken by the time it was
 /// acted on. Stop read it too, to tell its two refusals apart; it has only one
 /// refusal now, so this is left to the tests that assert the invariant itself.
-#[cfg(test)]
 pub(crate) fn turn_is_live(id: &str) -> bool {
     running_turns().lock_unpoisoned().contains_key(id)
 }
@@ -219,33 +218,6 @@ use crate::stream::ServerEvent;
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
 
 impl Workbench {
-    fn record_completed_target_apply(&mut self, id: &str) {
-        self.refresh_work_target_basis_from_chat(id);
-        let Some(binding) = self.library_chat_target_binding(id) else {
-            return;
-        };
-        let candidate = self
-            .engagements
-            .get(id)
-            .and_then(|engagement| engagement.current_cut().ok())
-            .flatten();
-        let resulting_revision = self
-            .library
-            .work_targets
-            .get(&binding.target_id)
-            .and_then(|target| target.current_basis.clone());
-        let _ = self.record_target_act(
-            Some(id),
-            &binding.target_id,
-            crate::target_adapter::TargetActKind::Apply,
-            candidate,
-            Vec::new(),
-            resulting_revision,
-            crate::target_adapter::TargetActStatus::Completed,
-            None,
-        );
-    }
-
     /// Place a chat's runtime in a *different* trust authority: register its
     /// **remote** harness alongside the local sessions (`WORKBENCH-REMOTE-1`). A
     /// chat is local or remote, never both, so an existing local session under the
@@ -390,6 +362,70 @@ pub(crate) struct TurnBoundaryRecord {
     pub(crate) runtime_after: gaugedesk_harness::RuntimePosition,
     pub(crate) reads_before: Vec<String>,
     pub(crate) reads_after: Vec<String>,
+    /// ADR 0151's application-level historical vector.  Old boundaries lack
+    /// this field and are intentionally not exact multi-target fork points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fork_snapshot: Option<TurnForkSnapshot>,
+}
+
+/// Stable target facts admitted before a turn starts.  Candidate cuts are the
+/// before/after collaboration branch cuts on [`TurnForkSnapshot`]; member bases
+/// remain native-target facts and therefore do not move when collaboration does.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct TurnTargetMemberSnapshot {
+    pub(crate) target_id: String,
+    pub(crate) native_basis: String,
+    pub(crate) adapter_family: String,
+    pub(crate) path_scope: Vec<String>,
+    pub(crate) capabilities: crate::library::TargetCapabilities,
+    pub(crate) participation: crate::library::TargetParticipationMode,
+}
+
+/// Read-only coordinates for settlement evidence visible at a turn boundary.
+/// The scope and inclusive position make the historical fold reproducible;
+/// receipt handles are presentation/evidence only and carry no lane permit,
+/// operation id, or coordinator command authority.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct VisibleSettlementSnapshot {
+    pub(crate) settlement_scope: String,
+    pub(crate) position: i64,
+    pub(crate) receipt_handles: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct TurnForkSnapshot {
+    pub(crate) target_set_revision: u64,
+    pub(crate) targets: Vec<TurnTargetMemberSnapshot>,
+    pub(crate) collaboration_workspace_id: String,
+    pub(crate) historical_home: whipplescript_store::workstreams::BranchHomeReceiptV1,
+    pub(crate) governance_epoch: u64,
+    pub(crate) governance_envelope_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) process_declaration: Option<crate::target_change_set::TurnProcessDeclaration>,
+    #[serde(default)]
+    pub(crate) visible_settlement_handles: Vec<String>,
+    #[serde(default)]
+    pub(crate) visible_settlements: Vec<VisibleSettlementSnapshot>,
+    #[serde(default)]
+    pub(crate) before_taint_evidence_digest: String,
+    #[serde(default)]
+    pub(crate) after_taint_evidence_digest: String,
+    #[serde(default)]
+    pub(crate) before_collaboration_cut: String,
+    #[serde(default)]
+    pub(crate) after_collaboration_cut: String,
+}
+
+pub(crate) fn taint_evidence_digest(reads: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"gaugedesk.turn-taint-evidence.v1\0");
+    for read in reads {
+        hasher.update((read.len() as u64).to_be_bytes());
+        hasher.update(read.as_bytes());
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 const RUNTIME_EVIDENCE_POINTER_KIND: &str = "runtime_evidence_pointer";
@@ -613,6 +649,43 @@ fn target_writable_roots(worktree: &Path, path_scope: &[String]) -> Vec<std::pat
         .collect()
 }
 
+fn chat_writable_roots(wb: &Workbench, chat_id: &str, worktree: &Path) -> Vec<std::path::PathBuf> {
+    let is_project_chat = wb
+        .library
+        .chats
+        .get(chat_id)
+        .and_then(|chat| wb.library.instances.get(&chat.instance_id))
+        .is_some_and(|instance| instance.kind == crate::library::InstanceKind::Using);
+    if is_project_chat {
+        return wb
+            .library
+            .current_target_set(chat_id)
+            .into_iter()
+            .flat_map(|set| set.members.iter())
+            .filter(|member| {
+                member.participation == crate::library::TargetParticipationMode::Writable
+            })
+            .flat_map(|member| {
+                let root = crate::library::target_id_path_v1(&member.target_id)
+                    .map(|encoded| worktree.join("targets").join(encoded))
+                    .ok();
+                member.path_scope.iter().filter_map(move |scope| {
+                    root.as_ref().map(|root| {
+                        if scope.is_empty() || scope == "." {
+                            root.clone()
+                        } else {
+                            root.join(scope)
+                        }
+                    })
+                })
+            })
+            .collect();
+    }
+    wb.library_chat_target_binding(chat_id)
+        .map(|binding| target_writable_roots(worktree, &binding.path_scope))
+        .unwrap_or_default()
+}
+
 /// The result of one tasked turn.
 #[derive(Debug, serde::Serialize)]
 pub struct TaskResult {
@@ -766,7 +839,7 @@ pub fn run_task_streaming<G: EgressGate>(
     sink: &mut dyn FnMut(&Observation),
 ) -> Result<TaskResult, EngineError> {
     run_task_streaming_billed(
-        store, engagement, scope, harness, gate, task, images, sink, None, None, "",
+        store, engagement, scope, harness, gate, task, images, sink, None, None, "", None,
     )
 }
 
@@ -785,6 +858,7 @@ fn run_task_streaming_billed<G: EgressGate>(
     // Context the model sees ahead of the task but the transcript does not record
     // as user text — currently answers to questions this agent asked (ADR 0113).
     prompt_prefix: &str,
+    mut fork_snapshot: Option<TurnForkSnapshot>,
 ) -> Result<TaskResult, EngineError> {
     // Observability span (RF-A8): scope + task size only — never the task text or
     // any content (those are protected; the span is operational metadata). The
@@ -838,6 +912,12 @@ fn run_task_streaming_billed<G: EgressGate>(
         &ServerEvent::User {
             text: task.to_string(),
         },
+    )?;
+    crate::target_change_set::admit_turn_process_declaration(
+        store,
+        scope,
+        user_entry_id,
+        &mut fork_snapshot,
     )?;
     debug_assert_eq!(
         managed_billing_scope.is_some(),
@@ -1062,6 +1142,12 @@ fn run_task_streaming_billed<G: EgressGate>(
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        let fork_snapshot = fork_snapshot.map(|mut snapshot| {
+            snapshot.before_collaboration_cut = before_workspace_cut.0.clone();
+            snapshot.after_collaboration_cut = after_workspace_cut.0.clone();
+            snapshot.after_taint_evidence_digest = taint_evidence_digest(&reads_after);
+            snapshot
+        });
         let boundary = TurnBoundaryRecord {
             user_entry_id,
             assistant_entry_id,
@@ -1071,6 +1157,7 @@ fn run_task_streaming_billed<G: EgressGate>(
             runtime_after,
             reads_before,
             reads_after,
+            fork_snapshot,
         };
         let payload =
             serde_json::to_string(&boundary).map_err(gaugedesk_store::AdmitError::Json)?;
@@ -1691,6 +1778,13 @@ fn run_claimed_engagement_turn(
         // minimal base policy for the seam's sake. Provider resolution and the
         // fail-closed credential precheck are real-run policy, skipped here as
         // before.
+        let process_declaration = wb.lock_unpoisoned().prepare_turn_process_declaration(
+            id,
+            factory.kind(),
+            package_version_ref.as_deref(),
+            0,
+            None,
+        )?;
         let spec = HarnessSpec {
             chat_id: id.to_string(),
             worktree: worktree.to_path_buf(),
@@ -1702,6 +1796,10 @@ fn run_claimed_engagement_turn(
             provider_binding_ref: None,
             credential_ref: None,
             placement_ceiling_ref: None,
+            workspace_targets: process_declaration
+                .as_ref()
+                .map(|process| process.harness_bindings())
+                .unwrap_or_default(),
             runtime_placement_id: None,
             provider: None,
             model: None,
@@ -1728,6 +1826,7 @@ fn run_claimed_engagement_turn(
             None,
             None,
             runtime_command_id,
+            process_declaration,
         )?
     } else {
         // The private composition may override the authored provider/model. Public
@@ -1932,12 +2031,12 @@ fn run_claimed_engagement_turn(
         // subtrees fail before filesystem execution (INV-24).
         let sandbox_policy = {
             use gaugedesk_harness::sandbox::Network;
-            let path_scope = wb
-                .lock_unpoisoned()
-                .library_chat_target_binding(id)
-                .map(|binding| binding.path_scope)
-                .ok_or_else(|| "chat target binding is unavailable".to_owned())?;
-            let writable = target_writable_roots(worktree, &path_scope);
+            let writable = chat_writable_roots(&wb.lock_unpoisoned(), id, worktree);
+            if writable.is_empty() {
+                return Err("chat has no admitted writable target root"
+                    .to_owned()
+                    .into());
+            }
             // Network egress posture (RF-B3, CORE-5) is a **per-project** choice. A
             // non-isolated project reaches ONLY the model endpoints (Filtered, enforced
             // by the host-filtering egress proxy) **where the host can enforce that**;
@@ -2008,6 +2107,7 @@ fn run_claimed_engagement_turn(
                 .map_err(|error| error.to_string())?,
         };
         let runtime_placement_id;
+        let mut process_declaration;
         let policy_epoch = {
             let mut g = wb.lock_unpoisoned();
             runtime_placement_id = g.library_placement_of_chat(id);
@@ -2055,6 +2155,13 @@ fn run_claimed_engagement_turn(
                 // The directory supplies the role the IdP does not carry (RBAC-5).
                 |idp| org.with_directory_role(idp.claims(&actor), actor.as_str()),
             );
+            process_declaration = g.prepare_turn_process_declaration(
+                id,
+                factory.kind(),
+                package_version_ref.as_deref(),
+                0,
+                None,
+            )?;
             g.compile_whipple_policy(PolicyCompilationInput {
                 chat_id: id.to_owned(),
                 project_id,
@@ -2076,9 +2183,16 @@ fn run_claimed_engagement_turn(
                 command_network: sandbox_policy.network
                     != gaugedesk_harness::sandbox::Network::Deny,
                 resources,
+                target_bindings: process_declaration
+                    .as_ref()
+                    .map(|process| process.bindings.clone())
+                    .unwrap_or_default(),
                 advancement_scopes,
             })?
         };
+        if let Some(process) = process_declaration.as_mut() {
+            process.bind_governance(policy_epoch.epoch, &policy_epoch.signed_envelope);
+        }
         let spec = HarnessSpec {
             chat_id: id.to_string(),
             worktree: worktree.to_path_buf(),
@@ -2090,6 +2204,10 @@ fn run_claimed_engagement_turn(
             provider_binding_ref: Some(policy_epoch.provider_binding_ref),
             credential_ref: Some(policy_epoch.credential_ref),
             placement_ceiling_ref: Some(policy_epoch.placement_ceiling_ref),
+            workspace_targets: process_declaration
+                .as_ref()
+                .map(|process| process.harness_bindings())
+                .unwrap_or_default(),
             runtime_placement_id,
             // Pin the codex endpoint by default (the authed OAuth provider) so a bare
             // model name can't silently resolve to an unauthenticated provider. Resolved
@@ -2129,6 +2247,7 @@ fn run_claimed_engagement_turn(
                 .as_ref()
                 .map(|_| resolved_funding_ref.as_str()),
             runtime_command_id,
+            process_declaration,
         );
         // A real harness reports a turn Stop cut short as its stream dying —
         // either an `io` error or a `Failed` phase — and neither says who ended
@@ -2168,7 +2287,15 @@ fn run_claimed_engagement_turn(
     // and certified checks before an auto-advance policy can settle it.
     {
         let mut g = wb.lock_unpoisoned();
-        if let Some(binding) = g.library_chat_target_binding(id) {
+        let project_chat = g
+            .library
+            .chats
+            .get(id)
+            .and_then(|chat| g.library.instances.get(&chat.instance_id))
+            .is_some_and(|instance| instance.kind == crate::library::InstanceKind::Using);
+        if project_chat {
+            let _ = g.record_target_change_set(id, &result)?;
+        } else if let Some(binding) = g.library_chat_target_binding(id) {
             let checks = result
                 .guarantee_outcomes
                 .iter()
@@ -2266,14 +2393,6 @@ impl Workbench {
         sender: &broadcast::Sender<ServerEvent>,
         contribution_by: Option<&str>,
     ) {
-        use gaugedesk_core::workstream::{WorkstreamCommand, WorkstreamState};
-        if !self
-            .library_chat_target_binding(id)
-            .and_then(|binding| self.library.work_targets.get(&binding.target_id))
-            .is_some_and(|target| target.kind == crate::library::WorkTargetKind::Managed)
-        {
-            return;
-        }
         let Some(target) = self.engagements.get(id).map(|e| e.target().to_string()) else {
             return;
         };
@@ -2282,8 +2401,8 @@ impl Workbench {
         let ws_id = self
             .engagement_index
             .get(id)
-            .and_then(|iid| self.targets.get(iid))
-            .and_then(|inst| inst.workstream_id_of(&target));
+            .and_then(|storage_id| self.workspace_by_storage_id(storage_id))
+            .and_then(|workspace| workspace.workstream_id_of(&target));
         let store = &mut self.store;
         let engagements = &mut self.engagements;
 
@@ -2296,30 +2415,8 @@ impl Workbench {
         {
             return;
         }
-        if let Some(ref ws_id) = ws_id {
-            // Named-line membership + attribution. Main is implicit and therefore has
-            // no duplicate membership record to admit.
-            let by = contribution_by
-                .filter(|authority| !authority.trim().is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    gaugedesk_core::determine_scope_authority(id)
-                        .as_str()
-                        .to_string()
-                });
-            if store
-                .admit::<WorkstreamState>(
-                    ws_id,
-                    WorkstreamCommand::Contribute {
-                        chat: id.to_string(),
-                        by,
-                    },
-                )
-                .is_err()
-            {
-                return;
-            }
-        }
+        // WhippleScript's branch-home topology is the contribution gate. There
+        // is intentionally no GaugeDesk membership reducer to admit in parallel.
         // Auto-admit the clean merge into the stream main.
         if store
             .admit::<MergeState>(id, MergeCommand::PolicyAdmit)
@@ -2363,6 +2460,19 @@ impl Workbench {
             }
             .into(),
         });
+        if let (Some(workstream_id), Some(actor)) = (ws_id.as_deref(), contribution_by) {
+            let evidence = serde_json::json!({
+                "schema": "gaugedesk.workstream-contribution.v1",
+                "chat_id": id,
+                "actor": actor,
+                "line": target,
+            });
+            let _ = store.append_record(
+                workstream_id,
+                "workstream_contribution",
+                &evidence.to_string(),
+            );
+        }
 
         // Sibling auto-pull: every other member of the same stream picks the work up. A
         // sibling conflict aborts cleanly (its worktree is unchanged) and surfaces on its
@@ -2377,7 +2487,8 @@ impl Workbench {
                 let _ = se.sync_from_main();
             }
         }
-        self.record_completed_target_apply(id);
+        // This advanced a collaboration line only. Native target settlement is
+        // a separate receipt-driven lifecycle and must never be inferred here.
     }
 
     // Legacy mainline-only advancement rules remain a no-op after the shared-line
@@ -2388,13 +2499,6 @@ impl Workbench {
         sender: &broadcast::Sender<ServerEvent>,
         guarantee_outcomes: &[gaugedesk_harness::GuaranteeOutcome],
     ) {
-        if !self
-            .library_chat_target_binding(id)
-            .and_then(|binding| self.library.work_targets.get(&binding.target_id))
-            .is_some_and(|target| target.kind == crate::library::WorkTargetKind::Managed)
-        {
-            return;
-        }
         let Some(target) = self.engagements.get(id).map(|e| e.target().to_string()) else {
             return;
         };
@@ -2402,8 +2506,8 @@ impl Workbench {
         let is_member = self
             .engagement_index
             .get(id)
-            .and_then(|iid| self.targets.get(iid))
-            .and_then(|inst| inst.workstream_id_of(&target))
+            .and_then(|storage_id| self.workspace_by_storage_id(storage_id))
+            .and_then(|workspace| workspace.workstream_id_of(&target))
             .is_some();
         if is_member {
             return;
@@ -2510,7 +2614,7 @@ impl Workbench {
             record_transcript(store, id, &advanced);
             let _ = sender.send(advanced);
         }
-        self.record_completed_target_apply(id);
+        // Accepted collaboration Main is not an authenticated native-target receipt.
     }
 }
 
@@ -2554,9 +2658,10 @@ fn drive_persistent_turn(
     managed_billing_scope: Option<&str>,
     managed_funding_ref: Option<&str>,
     runtime_command_id: Option<&str>,
+    process_declaration: Option<crate::target_change_set::TurnProcessDeclaration>,
 ) -> Result<TaskResult, EngineError> {
     // 1. Check out this turn's resources under a brief lock, then drop it.
-    let (mut store, engagement, harness, persistent, answers) = {
+    let (mut store, engagement, harness, persistent, answers, fork_snapshot) = {
         let mut g = wb.lock_unpoisoned();
         let engagement = g
             .engagements
@@ -2593,7 +2698,20 @@ fn drive_persistent_turn(
         // (ADR 0113 §1). Taken under the same brief lock, and marked delivered as
         // they are taken, so the agent is told each answer exactly once.
         let answers = crate::agent_question::answers_context(&g.take_undelivered_answers(id));
-        (store, engagement, harness, persistent, answers)
+        let fork_snapshot = g.turn_fork_snapshot(
+            id,
+            spec.policy_epoch,
+            spec.signed_policy_envelope.as_deref(),
+            process_declaration,
+        )?;
+        (
+            store,
+            engagement,
+            harness,
+            persistent,
+            answers,
+            fork_snapshot,
+        )
     };
 
     // 2. Run the turn holding only this chat's harness. A second turn on the same
@@ -2629,6 +2747,7 @@ fn drive_persistent_turn(
             managed_billing_scope,
             managed_funding_ref,
             &answers,
+            fork_snapshot,
         );
         // The claim is released by its guard when the turn returns, not here: the
         // bookkeeping below is still part of this turn, and freeing the chat before
@@ -3561,6 +3680,7 @@ mod tests {
             Some(crate::account::ACCOUNT_SCOPE),
             Some("gaugedesk:managed-plan:v1:test"),
             "",
+            None,
         )
         .unwrap();
 

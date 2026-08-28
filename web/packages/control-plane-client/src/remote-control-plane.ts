@@ -12,7 +12,13 @@ import type {
     FileEntry,
     MergeAction,
     MergeState,
+    PlacementId,
+    ProjectId,
     StreamEvent,
+    TargetActKind,
+    WorkTargetId,
+    WorkstreamId,
+    WorkstreamNode,
     Workspace,
 } from "./control-plane-domain";
 import { newIdempotencyKey, type RouteJson } from "./control-plane-transport";
@@ -149,6 +155,87 @@ export class RemoteControlPlane implements ControlPlane {
      * admission first; this never turns a directory pointer into access. */
     getWorkspace(): Promise<Workspace> {
         return workbench.getWorkspace(this.transport());
+    }
+
+    createChatUnderPlacement(
+        project: ProjectId,
+        placement: PlacementId,
+        title: string,
+        targets: readonly WorkTargetId[],
+    ): Promise<EngagementId> {
+        return workbench.createChatUnderPlacement(this.transport(), project, placement, title, targets);
+    }
+
+    reviseChatTargets(
+        chat: EngagementId,
+        targets: readonly { targetId: WorkTargetId; participation: "read-only" | "writable" }[],
+    ): Promise<unknown> {
+        return workbench.reviseChatTargets(this.transport(), chat, targets);
+    }
+
+    forkChat(
+        chat: EngagementId,
+        destination?: workbench.ForkDestination,
+    ): Promise<EngagementId> {
+        return workbench.forkChat(this.transport(), chat, destination);
+    }
+
+    createWorkstream(placement: PlacementId, name: string): Promise<WorkstreamNode> {
+        return workbench.createWorkstream(this.transport(), placement, name);
+    }
+
+    promoteWorkstream(workstream: WorkstreamId): Promise<workbench.WorkstreamPromotionResult> {
+        return workbench.promoteWorkstream(this.transport(), workstream);
+    }
+
+    settleWorkstreamTarget(
+        workstream: WorkstreamId,
+        target: WorkTargetId,
+        act: TargetActKind,
+        promotionManifestRef?: string,
+    ): Promise<unknown> {
+        return workbench.settleWorkstreamTarget(
+            this.transport(),
+            workstream,
+            target,
+            act,
+            promotionManifestRef,
+        );
+    }
+
+    settleChatTargets(
+        chat: EngagementId,
+        members: readonly workbench.WorkstreamSettlementRequest[],
+    ): Promise<unknown> {
+        return workbench.settleChatTargets(this.transport(), chat, members);
+    }
+
+    getTargetSettlement(declarationId: string): Promise<unknown> {
+        return workbench.getTargetSettlement(this.transport(), declarationId);
+    }
+
+    queryTargetSettlementMember(declarationId: string, memberId: string): Promise<unknown> {
+        return workbench.queryTargetSettlementMember(this.transport(), declarationId, memberId);
+    }
+
+    retryTargetSettlementMember(declarationId: string, memberId: string): Promise<unknown> {
+        return workbench.retryTargetSettlementMember(this.transport(), declarationId, memberId);
+    }
+
+    supersedeTargetSettlementMember(declarationId: string, memberId: string, laterDeclarationId: string, laterMemberId: string): Promise<unknown> {
+        return workbench.supersedeTargetSettlementMember(this.transport(), declarationId, memberId, laterDeclarationId, laterMemberId);
+    }
+
+    compensateTargetSettlement(declarationId: string, receiptRefs: readonly string[], reconciliationComplete: boolean): Promise<unknown> {
+        return workbench.compensateTargetSettlement(this.transport(), declarationId, receiptRefs, reconciliationComplete);
+    }
+
+    abandonTargetSettlement(declarationId: string, reason: string): Promise<unknown> {
+        return workbench.abandonTargetSettlement(this.transport(), declarationId, reason);
+    }
+
+    cancelTargetSettlement(declarationId: string, reason: string): Promise<unknown> {
+        return workbench.cancelTargetSettlement(this.transport(), declarationId, reason);
     }
 
     /** A Home-local, count-only notification projection. The caller must admit

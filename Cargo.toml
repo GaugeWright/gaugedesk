@@ -26,3 +26,13 @@ license = "AGPL-3.0-only"
 # Local crates keep full debuggability: panics and the debugger still work here.
 [profile.dev.package."*"]
 debug = false
+
+# MTARGET-1: GaugeDesk consumes the exact public projection of the landed
+# WhippleScript workstream-host contract. The contract checker below binds this
+# source revision to the published contract revision and digest; no project
+# workstream feature may compile against the older crates.io release.
+[patch.crates-io]
+whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "47e16505666a54d472f804a990139a111e6cf32b" }
+whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "47e16505666a54d472f804a990139a111e6cf32b" }
+whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "47e16505666a54d472f804a990139a111e6cf32b" }
+whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "47e16505666a54d472f804a990139a111e6cf32b" }
