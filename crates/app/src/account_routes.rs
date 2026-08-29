@@ -798,7 +798,7 @@ pub async fn post_library_sync_publish(State(wb): State<SharedWorkbench>) -> imp
     })
     .await;
     let generation = match head {
-        Ok(Ok(Some(entry))) => match entry.generation.checked_add(1) {
+        Ok(Ok(Some(record))) => match record.entry.generation.checked_add(1) {
             Some(generation) => generation,
             None => {
                 return (StatusCode::CONFLICT, "directory generation is exhausted").into_response()
@@ -890,8 +890,8 @@ async fn retract_published_entry(
     let generation = match current {
         // Never published, or already retracted — nothing to do (idempotent).
         None => return Ok(false),
-        Some(entry) if entry.retracted => return Ok(false),
-        Some(entry) => match entry.generation.checked_add(1) {
+        Some(record) if record.entry.retracted => return Ok(false),
+        Some(record) => match record.entry.generation.checked_add(1) {
             Some(generation) => generation,
             None => return Err("directory generation is exhausted".to_string()),
         },
@@ -925,28 +925,53 @@ pub async fn post_library_sync_pull(State(wb): State<SharedWorkbench>) -> impl I
         crate::directory_sync::fetch(&crate::net_http::HttpClient::new(), &base, &root)
     })
     .await;
-    let entry = match fetched {
+    let record = match fetched {
         // A retracted entry (ADR 0153) carries no sealed blob to open — nothing to merge.
-        Ok(Ok(Some(e))) if e.retracted => {
-            return (StatusCode::OK, Json(json!({ "found": false, "merged": 0 }))).into_response()
-        }
-        Ok(Ok(Some(e))) => e,
-        Ok(Ok(None)) => {
-            return (StatusCode::OK, Json(json!({ "found": false, "merged": 0 }))).into_response()
-        }
+        Ok(Ok(Some(r))) if r.entry.retracted => return nothing_pulled(),
+        Ok(Ok(Some(r))) => r,
+        Ok(Ok(None)) => return nothing_pulled(),
         Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, e).into_response(),
         Err(_) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, "fetch task panicked").into_response()
         }
     };
-    match wb.lock_unpoisoned().library_sync_apply(&entry) {
-        Ok(merged) => (
-            StatusCode::OK,
-            Json(json!({ "found": true, "merged": merged })),
-        )
-            .into_response(),
+    match wb.lock_unpoisoned().library_sync_apply(&record) {
+        Ok(merge) => {
+            // Degrading is correct; degrading *silently* is how a device stops
+            // learning any relay-only Home with nothing anywhere saying so. The
+            // reason is structural — which check declined — never the payload.
+            if let Some(reason) = merge.declined {
+                eprintln!("[library-sync] project routes were not merged: {reason}");
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "found": true,
+                    "merged": merge.merged,
+                    "routes_verified": merge.routes_verified,
+                    "declined": merge.declined,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, e).into_response(),
     }
+}
+
+/// The pull answer when there is nothing to merge — never published, or
+/// retracted. Same shape as a merge so a caller never has to branch on which
+/// fields are present.
+fn nothing_pulled() -> axum::response::Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "found": false,
+            "merged": 0,
+            "routes_verified": false,
+            "declined": null,
+        })),
+    )
+        .into_response()
 }
 
 /// Whether a first-run user must connect an LLM credential before the runtime

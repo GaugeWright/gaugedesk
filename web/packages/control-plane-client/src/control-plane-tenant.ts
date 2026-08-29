@@ -138,6 +138,15 @@ export async function accountPublishLibrarySync(json: RouteJson): Promise<void> 
 export interface LibrarySyncPullResult {
     readonly found: boolean;
     readonly merged: number;
+    /** Whether the record's project→Home routes were verified against the root
+     * key the desktop itself holds, and therefore merged. Never infer this from
+     * anything else: an account may legitimately publish no routes at all. */
+    readonly routesVerified: boolean;
+    /** Why routing was declined, when it was — the structural reason, never the
+     * payload. Present so a degradation is visible; degrading is correct,
+     * degrading silently is how a device quietly stops learning any relay-only
+     * Home with nothing anywhere saying so. */
+    readonly declined: string | null;
 }
 
 /** Pull and merge the latest root-signed sealed account projection. */
@@ -150,6 +159,8 @@ export async function accountPullLibrarySync(
         merged: typeof value?.merged === "number" && Number.isFinite(value.merged)
             ? Math.max(0, Math.floor(value.merged))
             : 0,
+        routesVerified: value?.routes_verified === true,
+        declined: typeof value?.declined === "string" && value.declined ? value.declined : null,
     };
 }
 

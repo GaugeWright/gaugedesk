@@ -81,14 +81,36 @@ describe("control-plane-tenant (ADR 0077 §7/§9)", () => {
         await accountPublishLibrarySync(publish.json);
         expect(publish.calls).toEqual([["POST", "/account/library-sync", undefined]]);
 
-        const pull = fakeJson({ found: true, merged: 3.8 });
+        const pull = fakeJson({ found: true, merged: 3.8, routes_verified: true });
         await expect(accountPullLibrarySync(pull.json)).resolves.toEqual({
             found: true,
             merged: 3,
+            routesVerified: true,
+            declined: null,
         });
         expect(pull.calls).toEqual([["POST", "/account/library-sync/pull", undefined]]);
         await expect(accountPullLibrarySync(fakeJson({ merged: "many" }).json))
-            .resolves.toEqual({ found: false, merged: 0 });
+            .resolves.toEqual({ found: false, merged: 0, routesVerified: false, declined: null });
+
+        // A pull that merged the sealed half but refused the routing reports
+        // both facts. Absent `routes_verified` reads as unverified, never as
+        // verified-by-omission: a desktop older than this field is one that
+        // merged routes without checking them.
+        await expect(
+            accountPullLibrarySync(
+                fakeJson({
+                    found: true,
+                    merged: 2,
+                    routes_verified: false,
+                    declined: "the directory served a record with no root signature",
+                }).json,
+            ),
+        ).resolves.toEqual({
+            found: true,
+            merged: 2,
+            routesVerified: false,
+            declined: "the directory served a record with no root signature",
+        });
     });
 
     it("lists tenants and flags the personal one", async () => {

@@ -17,7 +17,7 @@
 //! person via OIDC and holds no sovereign keypair, so it does not publish). The facility flag in
 //! the person's account scope says whether sync is on.
 
-use gaugedesk_core::signature::SigningKey;
+use gaugedesk_core::signature::{Signature, SigningKey};
 pub use gaugedesk_directory_protocol::{
     put_verifies, signing_bytes, DirectoryEntry, SignedDirectoryPut,
 };
@@ -80,6 +80,113 @@ pub fn publish(http: &HttpClient, base: &str, put: &SignedDirectoryPut) -> Resul
     }
 }
 
+/// A directory read, carrying whatever authentication the wire gave it.
+///
+/// The signature is optional because two wire shapes are still served (see
+/// [`fetch`]) — not because it is optional to check. A record read as a bare
+/// [`DirectoryEntry`] has nothing to check *against*, which is a degradation of
+/// what its routing may be used for and never a licence to use it anyway; that
+/// is [`route_trust`]'s job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedRecord {
+    pub entry: DirectoryEntry,
+    /// The account root's signature over [`signing_bytes`] of `entry`, when the
+    /// directory served the whole [`SignedDirectoryPut`].
+    pub signature: Option<Signature>,
+}
+
+impl FetchedRecord {
+    /// Reassemble the signed put this record was read from, so it can be handed
+    /// to the one verifier ([`put_verifies`]) the directory host and the edge
+    /// Worker also run. `None` for the bare-entry shape.
+    fn as_signed_put(&self) -> Option<SignedDirectoryPut> {
+        Some(SignedDirectoryPut {
+            entry: self.entry.clone(),
+            signature: self.signature.clone()?,
+        })
+    }
+}
+
+/// What a fetched record's **cleartext** routing may be trusted for.
+///
+/// The sealed blob authenticates itself — it opens only under the account key,
+/// so a foreign or tampered blob simply fails to open. `directory.home_routes`
+/// has no such property: it sits outside the seal, and a route carries a
+/// `home_fingerprint`, which is a *pinning instruction* (ADR 0131 §3). It is
+/// therefore the one part of a directory read a hostile directory could use, and
+/// the only part that needs the root signature checked before it is believed.
+///
+/// The posture is the browser's, deliberately (`resolve-home-routes.ts`):
+/// **degrade, never fail closed.** A directory too old to serve the signature, a
+/// record that will not verify — each means *no signed routes*, which is an
+/// ordinary state and not a broken account. The one condition that is not a
+/// degradation is a record signed by a *different* root, because that is the
+/// substitution the check exists to catch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteTrust {
+    /// The record carried a root signature, the signature holds, and the root it
+    /// names is the one this device itself holds. Its routes may be merged.
+    Signed,
+    /// Nothing verifiable was available, so the routing is dropped and the rest
+    /// of the record still merges. The reason is structural — which check
+    /// declined, never what it was carrying — because degrading *silently* is
+    /// how a device can quietly stop learning any relay-only Home with nothing
+    /// anywhere saying so.
+    Degraded(&'static str),
+    /// The record is signed by a different account root than the one this device
+    /// holds. This is an alarm rather than a degradation: a self-consistent
+    /// signature under an attacker's own root verifies perfectly, so the
+    /// comparison against the key we hold — not the signature — is what binds
+    /// the record to *this* account. The routing is still only dropped: a
+    /// substitution must not also take away the reachability the person had.
+    RootMismatch,
+}
+
+impl RouteTrust {
+    /// Why routing was declined, when it was. `None` when it was accepted.
+    pub fn declined(&self) -> Option<&'static str> {
+        match self {
+            RouteTrust::Signed => None,
+            RouteTrust::Degraded(reason) => Some(reason),
+            RouteTrust::RootMismatch => {
+                Some("the directory record is signed by a different account root than this device")
+            }
+        }
+    }
+}
+
+/// Decide what `record`'s routing may be used for, against the account root
+/// pubkey this device holds.
+///
+/// This is the desktop's answer to ADR 0132, and it is the stronger one that
+/// ADR 0132 §4 already anticipates: a browser has no authenticated channel to
+/// the root key and so pins it on first sight, while this machine *holds* the
+/// root key it publishes under, so it compares against the key itself rather
+/// than against a remembered one. There is no first sight to trust and nothing
+/// to store.
+///
+/// Verify first, then compare, exactly as `signed-routes.ts` does — the two
+/// implementations are meant to read the same way. [`put_verifies`] checks the
+/// signature against the root the entry *names*, which proves only
+/// self-consistency; the comparison is what makes it mean something.
+pub fn route_trust(record: &FetchedRecord, root_pubkey: &str) -> RouteTrust {
+    if root_pubkey.is_empty() {
+        return RouteTrust::Degraded(
+            "this device holds no account root to check the record against",
+        );
+    }
+    let Some(put) = record.as_signed_put() else {
+        return RouteTrust::Degraded("the directory served a record with no root signature");
+    };
+    if !put_verifies(&put) {
+        return RouteTrust::Degraded("the directory record failed root-signature verification");
+    }
+    if record.entry.directory.root_pubkey != root_pubkey {
+        return RouteTrust::RootMismatch;
+    }
+    RouteTrust::Signed
+}
+
 /// Fetch the readable record + opaque sealed blob for `root` (`GET {base}/directory/:root`).
 /// `Ok(None)` when the directory has nothing for `root` (404). The blob stays sealed — the caller
 /// opens it with [`crate::account::open_account_blob`] under the account key.
@@ -88,36 +195,44 @@ pub fn publish(http: &HttpClient, base: &str, put: &SignedDirectoryPut) -> Resul
 /// for this route and is moving to the whole [`SignedDirectoryPut`], because a
 /// reader that cannot see the signature cannot verify anything — which is
 /// exactly why a browser silently degraded to endpoint-only reachability
-/// (ADR 0131 §3). This machine authenticates by the sealed blob opening under
-/// its own account key rather than by that signature, so either shape serves it;
-/// accepting both is what lets the service move without stranding a desktop
-/// built before the change.
+/// (ADR 0131 §3). Both shapes are still accepted, so the service can move
+/// without stranding a desktop built before the change; what the caller gets is
+/// a [`FetchedRecord`] that says which shape arrived, so the half of a record
+/// that only a signature can authenticate is not used when there is none.
 ///
 /// The two are unambiguous: a put has no `directory`/`sealed_blob` at the top
 /// level and an entry has no `entry`/`signature`, so neither parses as the
 /// other.
-pub fn fetch(http: &HttpClient, base: &str, root: &str) -> Result<Option<DirectoryEntry>, String> {
+pub fn fetch(http: &HttpClient, base: &str, root: &str) -> Result<Option<FetchedRecord>, String> {
     let url = format!("{}/directory/{}", base.trim_end_matches('/'), root);
     let (status, body) = http.get_string_headers(&url, &[])?;
     match status {
-        200..=299 => Ok(Some(parse_fetched_entry(&body)?)),
+        200..=299 => Ok(Some(parse_fetched_record(&body)?)),
         // A **retracted** root is served `410 Gone` (ADR 0153) with the empty retraction entry
         // as its body — it discloses nothing beyond the already-public root, so returning it to
         // the caller is safe and lets the owner read the generation (to re-publish and re-appear)
         // and the `retracted` flag (to treat a re-retraction as idempotent). A public reader
         // still sees `410`; this client authenticates by the sealed blob opening, not the status.
-        410 => Ok(Some(parse_fetched_entry(&body)?)),
+        410 => Ok(Some(parse_fetched_record(&body)?)),
         // No record yet — not a failure.
         404 => Ok(None),
         _ => Err(format!("directory fetch HTTP {status}: {body}")),
     }
 }
 
-fn parse_fetched_entry(body: &str) -> Result<DirectoryEntry, String> {
+fn parse_fetched_record(body: &str) -> Result<FetchedRecord, String> {
     if let Ok(put) = serde_json::from_str::<SignedDirectoryPut>(body) {
-        return Ok(put.entry);
+        return Ok(FetchedRecord {
+            entry: put.entry,
+            signature: Some(put.signature),
+        });
     }
-    serde_json::from_str(body).map_err(|e| format!("parse entry: {e}"))
+    serde_json::from_str(body)
+        .map(|entry| FetchedRecord {
+            entry,
+            signature: None,
+        })
+        .map_err(|e| format!("parse entry: {e}"))
 }
 
 impl crate::Workbench {
@@ -145,7 +260,13 @@ impl crate::Workbench {
         let signing_key = crate::key_store::FileKeyStore::new(self.root_path().join("keys"))
             .signing_key(self.authority());
         let acct = Account::rebuild(self.store_ref()).ok()?;
-        let home_routes = acct.home_routes.values().cloned().map(Into::into).collect();
+        let home_routes = acct
+            .home_routes
+            .values()
+            .filter(|record| republishable(record))
+            .cloned()
+            .map(Into::into)
+            .collect();
         signed_put(
             &signing_key,
             self.account_key(),
@@ -174,13 +295,28 @@ impl crate::Workbench {
         signed_retract(&signing_key, generation)
     }
 
-    /// Merge a fetched directory entry's sealed blob into the local account scope (the pull half):
-    /// open it under this account's key and upsert its devices/settings/credentials (latest-wins
-    /// fold). Returns how many records merged; errors if the blob does not open (a foreign key).
-    pub fn library_sync_apply(&mut self, entry: &DirectoryEntry) -> Result<usize, String> {
+    /// Merge a fetched directory record into the local account scope (the pull half).
+    ///
+    /// Two halves with two different authentications, and they are not
+    /// interchangeable. The **sealed blob** — devices, credentials, homes,
+    /// settings — opens only under this account's key, so a foreign or tampered
+    /// blob simply fails to open and the whole pull errors. The **project→Home
+    /// routes** ride in the record's cleartext, covered by neither the seal nor
+    /// (on the legacy wire shape) anything at all, so they are merged only when
+    /// [`route_trust`] says the record was signed by the root this device holds.
+    ///
+    /// Declining the routing never fails the pull: the blob half stands on its
+    /// own authentication, and per ADR 0132 §3 reachability degrades rather than
+    /// failing closed into unusability.
+    pub fn library_sync_apply(
+        &mut self,
+        record: &FetchedRecord,
+    ) -> Result<LibrarySyncMerge, String> {
         use crate::account::{open_account_blob, ACCOUNT_SCOPE};
+        let entry = &record.entry;
         let blob = open_account_blob(self.account_key(), &entry.sealed_blob)
             .ok_or_else(|| "sealed blob did not open under this account key".to_string())?;
+        let trust = route_trust(record, &self.library_sync_root());
         let mut n = 0usize;
         for d in &blob.devices {
             if self
@@ -206,7 +342,10 @@ impl crate::Workbench {
                 n += 1;
             }
         }
-        for route in &entry.directory.home_routes {
+        for route in trust_admits_routes(&trust, &entry.directory.home_routes)
+            .iter()
+            .filter(|route| authorship_holds(route))
+        {
             let record = crate::account::HomeRouteRecord {
                 id: route.project.clone(),
                 op: crate::account::RecordOp::Upsert,
@@ -237,8 +376,74 @@ impl crate::Workbench {
                 n += 1;
             }
         }
-        Ok(n)
+        Ok(LibrarySyncMerge {
+            merged: n,
+            routes_verified: trust == RouteTrust::Signed,
+            declined: trust.declined(),
+        })
     }
+}
+
+/// What a pull merged, and what it declined.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LibrarySyncMerge {
+    /// How many account records were written.
+    pub merged: usize,
+    /// Whether the record's project→Home routes were verified and merged. A
+    /// caller must not infer this from a route carrying a relay locator, because
+    /// an account may legitimately have none.
+    pub routes_verified: bool,
+    /// Why routing was declined, when it was — the structural reason, never the
+    /// payload. `None` when it was accepted.
+    pub declined: Option<&'static str>,
+}
+
+/// The routes a given [`RouteTrust`] admits: all of them, or none.
+fn trust_admits_routes<'a>(
+    trust: &RouteTrust,
+    routes: &'a [crate::home::OpaqueHomeRoute],
+) -> &'a [crate::home::OpaqueHomeRoute] {
+    match trust {
+        RouteTrust::Signed => routes,
+        _ => &[],
+    }
+}
+
+/// Whether a route that **claims** a third-party author actually proves it.
+///
+/// A route with no authorship fields is this account root's own word — its own
+/// Home's, or one carried out of a record this same root already signed — and
+/// needs nothing further. A **shared** route (ADR 0131 §1, DESK-5d) is different:
+/// the serving Home is the author and this account root only carries the proof
+/// to its other clients, so an unproven claim must never be taken on the account
+/// root's authority. This is the same rule the federation handoff already applies
+/// at its own ingest (`federation.rs`, `HandoffMsgKind::Route`).
+fn authorship_holds(route: &crate::home::OpaqueHomeRoute) -> bool {
+    let claims_an_author = !route.author_authority.is_empty()
+        || !route.author_root_pubkey.is_empty()
+        || route.author_signature.is_some();
+    !claims_an_author || crate::home::shared_home_route_verifies(route)
+}
+
+/// Whether this device may re-sign `record` into its next directory publish.
+///
+/// A publish is a snapshot of `acct.home_routes`, so every route a device holds
+/// is re-attested under the account root each time it publishes. That is correct
+/// for a route this Home authored and for one that arrived inside a record this
+/// account's own root had already signed — both are the root restating something
+/// it is entitled to say, and it is how a person's second device keeps their
+/// first device's routes alive in the directory.
+///
+/// It is not correct for a shared route whose author proof does not hold:
+/// re-signing one would convert an unverifiable third-party claim into something
+/// bearing this account's own root signature — laundering, on the one wire field
+/// that carries a certificate pin. The check is [`authorship_holds`], applied at
+/// *both* ends deliberately. Ingest alone would leave routes merged before this
+/// gate existed to be re-attested on the next publish; publish alone would leave
+/// the device holding, and serving to its own federation and pool, a route it
+/// refuses to stand behind.
+fn republishable(record: &crate::account::HomeRouteRecord) -> bool {
+    authorship_holds(&crate::home::OpaqueHomeRoute::from(record.clone()))
 }
 
 /// Canonical public blind-directory origin. Development and hermetic tests may
@@ -340,22 +545,269 @@ mod tests {
     /// The read shape is moving from a bare entry to the whole signed put,
     /// because a reader that cannot see the signature cannot verify anything.
     /// This machine must keep working across that change in either direction —
-    /// a desktop older than the service, and a service older than the desktop.
+    /// a desktop older than the service, and a service older than the desktop —
+    /// and, on the newer shape, must **keep** the signature rather than dropping
+    /// it on the floor, because a signature that never reaches the caller is the
+    /// same as no signature at all.
     #[test]
     fn a_fetched_record_parses_whether_or_not_it_carries_its_signature() {
         let put = signed_put(&key(), AKEY, &seeded_account(), 1, vec![], vec![]).expect("seals");
 
         let whole = serde_json::to_string(&put).expect("serializes");
-        let from_put = parse_fetched_entry(&whole).expect("a signed put is readable");
-        assert_eq!(from_put, put.entry);
+        let from_put = parse_fetched_record(&whole).expect("a signed put is readable");
+        assert_eq!(from_put.entry, put.entry);
+        assert_eq!(
+            from_put.signature.as_ref(),
+            Some(&put.signature),
+            "the signature must survive the read or nothing downstream can check it"
+        );
 
         let bare = serde_json::to_string(&put.entry).expect("serializes");
-        let from_entry = parse_fetched_entry(&bare).expect("a bare entry is readable");
-        assert_eq!(from_entry, put.entry);
+        let from_entry = parse_fetched_record(&bare).expect("a bare entry is readable");
+        assert_eq!(from_entry.entry, put.entry);
+        assert_eq!(from_entry.signature, None, "a bare entry carries no proof");
 
         // Neither shape is mistaken for the other, and neither is mistaken for
         // something that is simply not a directory read.
-        assert!(parse_fetched_entry("{\"nope\":1}").is_err());
+        assert!(parse_fetched_record("{\"nope\":1}").is_err());
+    }
+
+    /// The whole point of keeping the signature: a self-consistent record signed
+    /// by an *attacker's own* root verifies perfectly, so verification alone is
+    /// worthless. What binds a record to this account is the comparison against
+    /// the root key this device holds (ADR 0132 §4 — enrollment supersedes the
+    /// browser's trust-on-first-use pin wherever the key is actually held).
+    #[test]
+    fn routing_is_trusted_only_under_the_root_key_this_device_holds() {
+        let mine = key();
+        let root = mine.public_key().as_str().to_string();
+        let put = signed_put(&mine, AKEY, &seeded_account(), 1, vec![], vec![]).expect("seals");
+        let signed = FetchedRecord {
+            entry: put.entry.clone(),
+            signature: Some(put.signature.clone()),
+        };
+        assert_eq!(route_trust(&signed, &root), RouteTrust::Signed);
+        assert_eq!(route_trust(&signed, &root).declined(), None);
+
+        // The legacy wire shape: nothing to check, so nothing is believed. This
+        // is a degradation and not an alarm — a directory older than this client
+        // is an ordinary state.
+        let unsigned = FetchedRecord {
+            entry: put.entry.clone(),
+            signature: None,
+        };
+        assert!(matches!(
+            route_trust(&unsigned, &root),
+            RouteTrust::Degraded(_)
+        ));
+
+        // Tampered bytes under a real signature.
+        let mut tampered = signed.clone();
+        tampered.entry.directory.home_routes.push(hostile_route());
+        assert!(matches!(
+            route_trust(&tampered, &root),
+            RouteTrust::Degraded(_)
+        ));
+
+        // The attack this closes: a hostile directory serves its own perfectly
+        // valid record. `put_verifies` is satisfied; the comparison is not.
+        let attacker = SigningKey::from_seed(&[9u8; 32]).unwrap();
+        let forged = signed_put(&attacker, AKEY, &seeded_account(), 1, vec![], vec![])
+            .expect("an attacker seals their own record just as validly");
+        assert!(put_verifies(&forged), "self-consistency proves nothing");
+        let forged = FetchedRecord {
+            entry: forged.entry,
+            signature: Some(forged.signature),
+        };
+        assert_eq!(route_trust(&forged, &root), RouteTrust::RootMismatch);
+        assert!(route_trust(&forged, &root).declined().is_some());
+
+        // A device with no root of its own has nothing to compare against, and
+        // says so rather than accepting whatever arrived.
+        assert!(matches!(route_trust(&signed, ""), RouteTrust::Degraded(_)));
+    }
+
+    fn hostile_route() -> crate::home::OpaqueHomeRoute {
+        crate::home::OpaqueHomeRoute {
+            project: "project-forged".into(),
+            home_id: gaugedesk_core::ids::HomeId::new("home:attacker"),
+            endpoint: "https://attacker.example".into(),
+            relay: Some(crate::home::OpaqueRelayLocator {
+                endpoint: "wss://attacker.example".into(),
+                handle: "a".repeat(43),
+                proof: "b".repeat(43),
+                route_epoch: 1,
+                // The cert the client would pin — the reason routing may not be
+                // taken on a directory's word (ADR 0131 §3).
+                home_fingerprint: "c".repeat(64),
+            }),
+            author_authority: String::new(),
+            author_root_pubkey: String::new(),
+            author_signature: None,
+        }
+    }
+
+    /// End to end through the pull: the sealed half authenticates itself and is
+    /// always merged, the cleartext routing is merged only under this device's
+    /// own root, and a refusal degrades rather than failing the pull.
+    #[test]
+    fn a_pull_merges_the_sealed_half_always_and_routes_only_when_verified() {
+        use crate::account::ACCOUNT_SCOPE;
+        use crate::LockUnpoisoned;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(dir.path()).unwrap();
+        let mut guard = shared.lock_unpoisoned();
+
+        let root_key = crate::key_store::FileKeyStore::new(guard.root_path().join("keys"))
+            .signing_key(guard.authority());
+        assert_eq!(
+            root_key.public_key().as_str(),
+            guard.library_sync_root(),
+            "the key a publish signs with and the key a pull checks against are one key"
+        );
+
+        let entry = DirectoryEntry {
+            generation: 1,
+            directory: directory_record(
+                root_key.public_key().as_str(),
+                &seeded_account(),
+                vec![],
+                vec![hostile_route()],
+            ),
+            sealed_blob: seal_account_blob(guard.account_key(), &seeded_account())
+                .expect("seals under this workbench's own account key"),
+            retracted: false,
+        };
+        let routes = |guard: &crate::Workbench| {
+            Account::rebuild(guard.store_ref())
+                .unwrap()
+                .home_routes
+                .len()
+        };
+
+        // Unsigned: the legacy shape a hostile directory can also produce at
+        // will. The blob still merges; the routing does not.
+        let merged = guard
+            .library_sync_apply(&FetchedRecord {
+                entry: entry.clone(),
+                signature: None,
+            })
+            .expect("the blob opens, so the pull succeeds");
+        assert!(merged.merged > 0, "the sealed half is merged regardless");
+        assert!(!merged.routes_verified);
+        assert!(merged.declined.is_some(), "and it says why");
+        assert_eq!(routes(&guard), 0, "no route may enter unverified");
+
+        // Signed by someone else's root: an alarm, and still not a failure —
+        // a substitution must not take away the reachability the person had.
+        let attacker = SigningKey::from_seed(&[9u8; 32]).unwrap();
+        let mut foreign = entry.clone();
+        foreign.directory.root_pubkey = attacker.public_key().as_str().to_string();
+        let foreign = gaugedesk_directory_protocol::sign_entry(foreign, &attacker).unwrap();
+        let merged = guard
+            .library_sync_apply(&FetchedRecord {
+                entry: foreign.entry,
+                signature: Some(foreign.signature),
+            })
+            .expect("a foreign signature does not fail the pull");
+        assert!(!merged.routes_verified);
+        assert_eq!(routes(&guard), 0);
+
+        // Signed by the root this device itself holds: the routes land — but a
+        // route inside it that *claims* a third-party author and cannot prove it
+        // still does not, because this root's signature is not standing behind a
+        // claim it was never in a position to make.
+        let mut with_unproven = entry.clone();
+        let mut unproven = hostile_route();
+        unproven.project = "project-unproven".into();
+        unproven.author_authority = "root-p256:someone-else".into();
+        unproven.author_root_pubkey = "root-p256:someone-else".into();
+        with_unproven.directory.home_routes.push(unproven);
+        let entry = with_unproven;
+
+        let mine = gaugedesk_directory_protocol::sign_entry(entry, &root_key).unwrap();
+        let merged = guard
+            .library_sync_apply(&FetchedRecord {
+                entry: mine.entry,
+                signature: Some(mine.signature),
+            })
+            .expect("merges");
+        assert!(merged.routes_verified);
+        assert_eq!(merged.declined, None);
+        assert_eq!(
+            routes(&guard),
+            1,
+            "the verified route is merged and the unproven claim is not"
+        );
+        assert!(guard
+            .store_ref()
+            .records(ACCOUNT_SCOPE, "home_route")
+            .is_ok());
+    }
+
+    /// A publish re-signs the whole route set under the account root, so what a
+    /// device may carry forward is a question about that signature, not about
+    /// the route's origin. A route claiming a third-party author must still
+    /// prove it, or this root would be attesting to a claim it cannot make.
+    #[test]
+    fn a_publish_re_signs_only_routes_this_root_may_speak_for() {
+        use crate::account::{HomeRouteRecord, RecordOp};
+
+        let own = HomeRouteRecord {
+            id: "project-own".into(),
+            op: RecordOp::Upsert,
+            home_id: gaugedesk_core::ids::HomeId::new("home:mine"),
+            endpoint: "https://mine.example".into(),
+            relay: None,
+            author_authority: String::new(),
+            author_root_pubkey: String::new(),
+            author_signature: None,
+        };
+        assert!(
+            republishable(&own),
+            "an unattested route is this account's own word — its own Home's, or              one carried out of a record this same root already signed"
+        );
+
+        // A shared route (ADR 0131 §1, DESK-5d): the serving Home is the author
+        // and this root only carries the proof onward.
+        let serving = SigningKey::from_seed(&[5u8; 32]).unwrap();
+        let shared = crate::home::sign_home_route(
+            "root-p256:serving",
+            crate::home::OpaqueHomeRoute {
+                project: "project-shared".into(),
+                home_id: gaugedesk_core::ids::HomeId::new("home:theirs"),
+                endpoint: "https://theirs.example".into(),
+                relay: None,
+                author_authority: String::new(),
+                author_root_pubkey: String::new(),
+                author_signature: None,
+            },
+            &serving,
+        )
+        .unwrap();
+        let carried = HomeRouteRecord {
+            id: shared.project.clone(),
+            op: RecordOp::Upsert,
+            home_id: shared.home_id.clone(),
+            endpoint: shared.endpoint.clone(),
+            relay: shared.relay.clone(),
+            author_authority: shared.author_authority.clone(),
+            author_root_pubkey: shared.author_root_pubkey.clone(),
+            author_signature: shared.author_signature.clone(),
+        };
+        assert!(republishable(&carried), "a proof that holds travels");
+
+        // The laundering case: an author is claimed and the proof does not hold.
+        // Re-signing it would put this account's root behind a third-party claim
+        // on the one wire field that carries a certificate pin.
+        let mut broken = carried.clone();
+        broken.endpoint = "https://attacker.example".into();
+        assert!(!republishable(&broken));
+
+        let mut unproven = carried;
+        unproven.author_signature = None;
+        assert!(!republishable(&unproven));
     }
 
     #[test]
