@@ -56,6 +56,28 @@ import {
 import type { AccountPanelApi } from "./account-api";
 import { SettingsSurface, type SettingsModel, type SettingsRoom } from "./SettingsSurface";
 
+/** What a library-sync pull actually did.
+ *
+ * A pull has two halves that can succeed separately: the sealed account blob,
+ * which authenticates itself by opening under the account key, and the
+ * project→Home routes, which are merged only from a record the account's own
+ * root signed (DESK-5h). So "merged 3 records" can be true while the routing was
+ * refused, and this is the only surface a person would ever learn that from.
+ *
+ * The tick is withheld rather than the count, because the count is honest and
+ * the tick is the claim that everything the pull was for happened.
+ */
+export function librarySyncPullLabel(result: {
+    found: boolean;
+    merged: number;
+    declined?: string | null;
+}): string {
+    if (!result.found) return "nothing published to pull yet";
+    const merged = `merged ${result.merged} record${result.merged === 1 ? "" : "s"}`;
+    const declined = result.declined?.trim();
+    return declined ? `${merged} — project routes were not merged: ${declined}` : `${merged} ✓`;
+}
+
 /** Enrollment time is account evidence, not presence. Legacy records honestly
  * report that their original join time was not recorded. */
 export function deviceAddedLabel(enrolledAt: number): string {
@@ -567,12 +589,8 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                     await props.api.accountPublishLibrarySync();
                     return "published ✓";
                 }),
-                pullLibrary: () => void act("pull", async () => {
-                    const result = await props.api.accountPullLibrarySync();
-                    return result.found
-                        ? `merged ${result.merged} record${result.merged === 1 ? "" : "s"} ✓`
-                        : "nothing published to pull yet";
-                }),
+                pullLibrary: () => void act("pull", async () =>
+                    librarySyncPullLabel(await props.api.accountPullLibrarySync())),
 
                 setAttention: (signal: AttentionSignal, level: AttentionLevel) =>
                     void quietly("update attention", async () => {

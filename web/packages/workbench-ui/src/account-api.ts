@@ -55,7 +55,17 @@ export interface AccountPanelApi {
     }): Promise<AccountFacility>;
     accountDetachFacility(id: string): Promise<void>;
     accountPublishLibrarySync(): Promise<void>;
-    accountPullLibrarySync(): Promise<{ found: boolean; merged: number }>;
+    accountPullLibrarySync(): Promise<{
+        found: boolean;
+        merged: number;
+        /** Why the record's project→Home routes were not merged, when they were
+         * not — the structural reason, never the payload. `null` when they were.
+         * A pull can succeed at its sealed half and still refuse the routing
+         * (DESK-5h), and the panel is the only place a person would ever see
+         * that; degrading silently is how a device stops learning any
+         * relay-only Home with nothing anywhere saying so. */
+        declined?: string | null;
+    }>;
     /** Desktop → Hub account sign-in (ADR 0123, LOGIN-4). Optional: only the
      * co-resident desktop control plane custodies a Hub session; compositions
      * without these methods simply do not render the account-session section. */

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
     deviceAddedLabel,
     expiresSoon,
+    librarySyncPullLabel,
     managedInferenceWriteAvailable,
     signInMethodLabel,
 } from "./SettingsPanel";
@@ -48,5 +49,36 @@ describe("credential expiry warning", () => {
         expect(expiresSoon(null, now)).toBe(false);
         expect(expiresSoon(undefined, now)).toBe(false);
         expect(expiresSoon(Number.NaN, now)).toBe(false);
+    });
+});
+
+describe("library-sync pull copy", () => {
+    it("ticks only when the whole pull happened", () => {
+        expect(librarySyncPullLabel({ found: true, merged: 3, declined: null }))
+            .toBe("merged 3 records ✓");
+        expect(librarySyncPullLabel({ found: true, merged: 1 })).toBe("merged 1 record ✓");
+        expect(librarySyncPullLabel({ found: false, merged: 0 }))
+            .toBe("nothing published to pull yet");
+    });
+
+    // The whole reason this copy exists: the sealed half can merge while the
+    // routing is refused, and a person told "merged 3 records ✓" has no way to
+    // find out that their relay-only Homes stopped arriving.
+    it("keeps the count but withholds the tick when routing was refused", () => {
+        expect(
+            librarySyncPullLabel({
+                found: true,
+                merged: 3,
+                declined: "the directory served a record with no root signature",
+            }),
+        ).toBe(
+            "merged 3 records — project routes were not merged: " +
+                "the directory served a record with no root signature",
+        );
+    });
+
+    it("reads an empty reason as no reason rather than as a dangling clause", () => {
+        expect(librarySyncPullLabel({ found: true, merged: 2, declined: "  " }))
+            .toBe("merged 2 records ✓");
     });
 });
