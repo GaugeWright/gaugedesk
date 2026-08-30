@@ -324,6 +324,70 @@ async fn a_project_home_relocates_to_a_paired_peer_with_its_log() {
     assert!(inc2["incoming"].as_array().unwrap().is_empty());
 }
 
+/// ADR 0156 §1: a transport failure *after* the offer is on the wire does not say
+/// whether the target got it — and the old path resolved that ambiguity by
+/// assuming failure, then deleted the pending state that would have let anything
+/// notice it had guessed wrong. Target home, origin home, no record of a question.
+///
+/// The offer now stays offered and is recorded as in doubt. `INV-13` keeps the
+/// origin home either way, so waiting costs nothing that guessing would have
+/// saved, and the evidence a reconcile needs survives.
+#[tokio::test]
+async fn an_offer_whose_reply_is_lost_stays_in_doubt_rather_than_rolling_back() {
+    let (broker, relay) = start_broker().await;
+    let (alice, alice_wb, _ra) = instance("alice", &broker);
+    let (bob, _bob_wb, _rb) = instance("bob", &broker);
+
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    {
+        let mut g = alice_wb.lock().unwrap();
+        g.store_mut()
+            .append_record(
+                "library",
+                "project",
+                r#"{"id":"engagement-1","op":"upsert","name":"Acme","is_default":false,"home_id":"home:alice","network_isolated":false}"#,
+            )
+            .unwrap();
+        g.store_mut()
+            .append_record("project_log::engagement-1", "event", r#"{"ev":"created"}"#)
+            .unwrap();
+        g.rebuild_library();
+    }
+
+    // Take the rendezvous away. The offer cannot cross, and from alice's side this
+    // is indistinguishable from an offer that crossed and whose reply was lost —
+    // which is exactly why it may not be resolved by assumption.
+    drop(relay);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (status, body) = post(
+        &alice,
+        "/federation/handoff/relocate",
+        json!({ "project": "engagement-1", "peer": "bob" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "the send failed: {body}");
+    assert_eq!(
+        body["in_doubt"], true,
+        "and the failure is reported as unresolved, not as a rollback: {body}"
+    );
+
+    // The load-bearing assertion. Before ADR 0156 this read `draft` — alice had
+    // aborted, so a target that had in fact committed would have left two Homes
+    // serving one project with nothing anywhere recording a question.
+    let (_, after) = get(&alice, "/federation/handoff/status?project=engagement-1").await;
+    assert_eq!(
+        after["phase"], "offered",
+        "the handoff stays offered, because whether it landed is still unknown: {after}"
+    );
+    assert_eq!(
+        after["home_origin"], true,
+        "and INV-13 keeps alice home meanwhile, so waiting costs nothing: {after}"
+    );
+}
+
 #[tokio::test]
 async fn origin_cancel_removes_the_targets_pending_offer() {
     let (broker, _relay) = start_broker().await;

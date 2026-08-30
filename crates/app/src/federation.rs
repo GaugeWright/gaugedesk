@@ -2537,6 +2537,11 @@ enum HandoffMsgKind {
     /// serving Home → operator: a root-signed reachability update for the
     /// shared project. It changes no handoff state.
     Route,
+    /// origin → target: *do you hold this project?* (ADR 0156 §2). Read-only —
+    /// it changes no state on either side. The origin asks when a handoff was
+    /// left in doubt by a lost message, because it is the party that cares and
+    /// the only one that knows it is uncertain.
+    Status,
 }
 
 /// A handoff message as it travels the TLS leg: the kind, the project, the log
@@ -3085,7 +3090,9 @@ fn pending_outgoing_peer(store: &Store, project: &str) -> Option<String> {
             continue;
         }
         match value.get("op").and_then(|v| v.as_str()) {
-            Some("offer") => {
+            // `in_doubt` is an offer whose outcome we do not know, so it is
+            // unresolved in exactly the same way (ADR 0156 §1).
+            Some("offer") | Some("in_doubt") => {
                 peer = value
                     .get("peer")
                     .and_then(|v| v.as_str())
@@ -3096,6 +3103,43 @@ fn pending_outgoing_peer(store: &Store, project: &str) -> Option<String> {
         }
     }
     peer
+}
+
+/// Every project this authority offered to `peer` and has not seen resolved —
+/// the questions a reconcile asks (ADR 0156 §2).
+///
+/// It includes offers still awaiting the target's consent as well as ones left in
+/// doubt, because the two are indistinguishable from here: that is the whole
+/// reason to ask rather than to assume.
+fn unresolved_outgoing(store: &Store, peer: &str) -> Vec<String> {
+    let mut by_project: BTreeMap<String, bool> = BTreeMap::new();
+    for payload in store
+        .records(HANDOFF_OUTGOING_SCOPE, "event")
+        .unwrap_or_default()
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if value.get("peer").and_then(|v| v.as_str()) != Some(peer) {
+            continue;
+        }
+        let Some(project) = value.get("project").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        match value.get("op").and_then(|v| v.as_str()) {
+            Some("offer") | Some("in_doubt") => {
+                by_project.insert(project.to_owned(), true);
+            }
+            Some("resolved") => {
+                by_project.insert(project.to_owned(), false);
+            }
+            _ => {}
+        }
+    }
+    by_project
+        .into_iter()
+        .filter_map(|(project, unresolved)| unresolved.then_some(project))
+        .collect()
 }
 
 /// Peers this authority will **auto-accept** handoffs from (standing pre-auth). Folded
@@ -3182,6 +3226,56 @@ fn handoff_oneshot_take(store: &mut Store, source: &str, project: &str) -> bool 
 
 /// The pending incoming handoffs (offers recorded but not yet accepted/declined),
 /// folded latest-wins per project: an `offer` record opens it, a `resolved` closes it.
+/// Record that this authority has finished with an incoming offer, and **which
+/// way** (ADR 0156 §4).
+///
+/// The outcome is what makes a later "I do not hold it" answerable rather than
+/// ambiguous: a target that never saw the offer and one that held the project and
+/// relocated it onward otherwise say the same thing, and acting alike on those two
+/// would let an origin resume a project that has moved somewhere else.
+fn resolve_incoming_handoff(store: &mut Store, project: &str, outcome: &str) {
+    let _ = store.append_record(
+        HANDOFF_INCOMING_SCOPE,
+        "event",
+        &serde_json::json!({ "op": "resolved", "project": project, "outcome": outcome })
+            .to_string(),
+    );
+}
+
+/// What became of an incoming offer for `project`, from this authority's own record.
+///
+/// `None` means never seen — which is the one negative safe to act on, because it
+/// says the offer never landed here at all. A resolution written before outcomes
+/// were kept reads as `Some("unknown")` and is deliberately not actionable
+/// (ADR 0156 §5): guessing is what this decision exists to stop.
+fn incoming_handoff_outcome(store: &Store, project: &str) -> Option<String> {
+    let mut outcome = None;
+    for payload in store
+        .records(HANDOFF_INCOMING_SCOPE, "event")
+        .unwrap_or_default()
+    {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if v.get("project").and_then(|p| p.as_str()) != Some(project) {
+            continue;
+        }
+        match v.get("op").and_then(|o| o.as_str()) {
+            Some("offer") => outcome = Some("pending".to_string()),
+            Some("resolved") => {
+                outcome = Some(
+                    v.get("outcome")
+                        .and_then(|o| o.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                )
+            }
+            _ => {}
+        }
+    }
+    outcome
+}
+
 fn pending_incoming(store: &Store) -> Vec<serde_json::Value> {
     let mut by_project: BTreeMap<String, Option<serde_json::Value>> = BTreeMap::new();
     for payload in store
@@ -3208,6 +3302,152 @@ fn pending_incoming(store: &Store) -> Vec<serde_json::Value> {
     by_project.into_values().flatten().collect()
 }
 
+/// Resolve every handoff this authority left unresolved with `peer`, by asking
+/// (ADR 0156 §2). Runs where the pairing is already supervised, so it needs no
+/// scheduler of its own.
+///
+/// **Only ever toward releasing** (§3). Releasing on a false negative costs
+/// reachability, which is visible and recoverable; claiming on a false positive
+/// costs a second Home for live work, which diverges two logs and is not. So the
+/// table below acts on exactly two answers and leaves every other in doubt:
+///
+/// - the target **holds** it → this authority commits its side and releases, which
+///   is what the lost `Committed` would have done;
+/// - the target has **never seen** it → the offer did not land, so it is cancelled
+///   and this authority stays home, which it never left;
+/// - anything else — still pending consent, declined but resolved before outcomes
+///   were recorded, held once and relocated onward, or simply unreachable — stays in
+///   doubt and visible (§5).
+#[derive(Debug, PartialEq, Eq)]
+enum InDoubtResolution {
+    /// The peer holds it. Commit this side and release, which is what the lost
+    /// `Committed` would have done.
+    Release(HomeId),
+    /// The offer did not land, or was refused. Cancel it; this authority returns
+    /// to a state `INV-13` never let it leave.
+    CancelOffer,
+    /// The answer does not settle it. Stay in doubt and visible (§5).
+    Unsettled,
+}
+
+/// Read a `Status` verdict as a resolution (ADR 0156 §3–§5).
+///
+/// Separated from the sending so the safety rule is a table that can be checked
+/// rather than a claim about a network path. Every branch that is not certain
+/// resolves to [`InDoubtResolution::Unsettled`], because the defect this decision
+/// corrects was resolving an unknown by assumption.
+fn resolve_from_status(verdict: &serde_json::Value) -> InDoubtResolution {
+    let holds = verdict
+        .get("holds")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if holds {
+        // Releasing without knowing where to is not releasing, it is losing.
+        return verdict
+            .get("home")
+            .and_then(|value| value.as_str())
+            .and_then(|value| HomeId::parse(value).ok())
+            .map_or(InDoubtResolution::Unsettled, InDoubtResolution::Release);
+    }
+    match verdict.get("outcome").and_then(|v| v.as_str()) {
+        // Never seen there: the offer did not land.
+        None => InDoubtResolution::CancelOffer,
+        // The peer said no, and said so unambiguously.
+        Some("declined") | Some("cancelled") | Some("failed") => InDoubtResolution::CancelOffer,
+        // Still awaiting the person. Cancelling here would revoke a live offer.
+        Some("pending") => InDoubtResolution::Unsettled,
+        // `committed` with `holds` false means it was taken and has since moved
+        // on; `unknown` is a resolution recorded before outcomes were kept. Both
+        // are exactly the ambiguity §3 refuses to resolve by claiming.
+        _ => InDoubtResolution::Unsettled,
+    }
+}
+
+async fn resolve_handoffs_in_doubt(wb: &SharedWorkbench, peer: &AuthorityId) {
+    let questions = {
+        let guard = wb.lock_unpoisoned();
+        let Some(fed) = guard.federation_ref() else {
+            return;
+        };
+        if fed.grant_for(peer.as_str()).is_none() {
+            return;
+        }
+        let root = federation_root_signing_key(&guard);
+        let me = fed.authority.clone();
+        let home = guard.federation_home_id();
+        let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
+        let projects = unresolved_outgoing(guard.store_ref(), peer.as_str());
+        projects
+            .into_iter()
+            .map(|project| {
+                (
+                    fed.broker_addr.clone(),
+                    me.clone(),
+                    home.clone(),
+                    subkey.clone(),
+                    delegation.clone(),
+                    fed.pins_arc(),
+                    project,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for (broker, me, home, subkey, delegation, pins, project) in questions {
+        let asked = send_handoff(
+            &broker,
+            &me,
+            &home,
+            &subkey,
+            &delegation,
+            peer,
+            pins,
+            HandoffMsgKind::Status,
+            &project,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        )
+        .await;
+        let Ok(verdict) = asked else {
+            // Unreachable is not an answer. It stays in doubt (§5).
+            continue;
+        };
+        let mut guard = wb.lock_unpoisoned();
+        match resolve_from_status(&verdict) {
+            InDoubtResolution::Release(target_home) => {
+                let _ = apply_handoff(guard.store_mut(), &project, HandoffCommand::SyncLog);
+                if commit_handoff_and_rebind(&mut guard, &project, target_home).is_ok() {
+                    let _ = record_outgoing_handoff(
+                        guard.store_mut(),
+                        "resolved",
+                        &project,
+                        peer.as_str(),
+                    );
+                    if let Err(error) = guard.remove_project_credential_key(&project) {
+                        tracing::error!(
+                            %project, %error,
+                            "handoff resolved in doubt but former Home could not remove its project credential key"
+                        );
+                    }
+                    record_participants(guard.store_mut(), &project, peer.as_str(), me.as_str());
+                    tracing::info!(%project, %peer, "handoff in doubt resolved: the peer holds it");
+                }
+            }
+            InDoubtResolution::CancelOffer => {
+                let _ = apply_handoff(guard.store_mut(), &project, HandoffCommand::AbortHandoff);
+                let _ =
+                    record_outgoing_handoff(guard.store_mut(), "resolved", &project, peer.as_str());
+                tracing::info!(%project, %peer, "handoff in doubt resolved: the offer did not stand");
+            }
+            InDoubtResolution::Unsettled => tracing::debug!(
+                %project, %peer,
+                "handoff still in doubt: the peer's answer does not settle it"
+            ),
+        }
+    }
+}
+
 /// The per-peer **handoff receiver loop**: park on the broker for offers `peer → me`,
 /// complete the cert-pinned TLS handshake as the server, and commit each verified
 /// relocation. Spawned when a pair is accepted.
@@ -3228,6 +3468,10 @@ pub async fn run_handoff_receiver(wb: SharedWorkbench, peer: AuthorityId) {
         if !still_paired {
             return;
         }
+        // Reconnect is when the answer is available, and this loop is already the
+        // per-peer supervisor, so the reconcile rides it rather than adding a
+        // schedule of its own (ADR 0156 §2).
+        resolve_handoffs_in_doubt(&wb, &peer).await;
         let token = handoff_inbox_token(peer.as_str(), me.as_str());
         if let Err(e) = handoff_receive_once(&wb, &broker, &identity, &token).await {
             tracing::debug!("handoff receiver {peer}→{me}: {e}; retrying");
@@ -3553,18 +3797,32 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                         && offer["source"].as_str() == Some(wire.source.as_str())
                 });
             if pending {
-                let _ = guard.store_mut().append_record(
-                    HANDOFF_INCOMING_SCOPE,
-                    "event",
-                    &serde_json::json!({
-                        "op": "resolved",
-                        "project": wire.project,
-                    })
-                    .to_string(),
-                );
+                resolve_incoming_handoff(guard.store_mut(), &wire.project, "cancelled");
             }
             (
                 serde_json::json!({ "ok": pending, "cancelled": pending }),
+                false,
+            )
+        }
+        HandoffMsgKind::Status => {
+            // Read-only, and answers only for the project it names (ADR 0156 §6).
+            // `holds` is the one positive the asker may act on; the outcome is what
+            // makes a *negative* answerable rather than ambiguous (§4).
+            let holds = guard
+                .library
+                .projects
+                .get(&wire.project)
+                .is_some_and(|project| project.home_id == *guard.home_id());
+            let outcome = incoming_handoff_outcome(guard.store_ref(), &wire.project);
+            (
+                serde_json::json!({
+                    "ok": true,
+                    "holds": holds,
+                    "home": holds.then(|| guard.federation_home_id()),
+                    // `null` is "never seen", which is the only negative safe to
+                    // act on: the offer did not land here.
+                    "outcome": outcome,
+                }),
                 false,
             )
         }
@@ -3835,12 +4093,21 @@ async fn drive_relocate(
             }
         }
         Err(e) => {
+            // The offer is already on the wire, so this error does not say whether
+            // the target got it (ADR 0156 §1). Aborting here is right only if it
+            // did not, and *deletes the state that would let anything notice* if it
+            // did — the target home, this authority home, and no record of a
+            // question. So the handoff is recorded as in doubt and left offered:
+            // `INV-13` keeps this authority home either way, so waiting costs
+            // nothing that guessing would have saved.
             let mut guard = wb.lock_unpoisoned();
-            let _ = record_outgoing_handoff(guard.store_mut(), "resolved", project, peer.as_str());
-            let _ = apply_handoff(guard.store_mut(), project, HandoffCommand::AbortHandoff);
+            let _ = record_outgoing_handoff(guard.store_mut(), "in_doubt", project, peer.as_str());
             (
                 StatusCode::BAD_GATEWAY,
-                serde_json::json!({ "error": format!("handoff transport failed: {e}") }),
+                serde_json::json!({
+                    "error": format!("handoff transport failed: {e}"),
+                    "in_doubt": true,
+                }),
             )
         }
     }
@@ -5380,10 +5647,10 @@ pub async fn post_handoff_accept(
             // host = this authority (consented), operator = the origin.
             record_participants(guard.store_mut(), &req.project, &me, &req.source);
         }
-        let _ = guard.store_mut().append_record(
-            HANDOFF_INCOMING_SCOPE,
-            "event",
-            &serde_json::json!({ "op": "resolved", "project": req.project }).to_string(),
+        resolve_incoming_handoff(
+            guard.store_mut(),
+            &req.project,
+            if committed { "committed" } else { "failed" },
         );
         if committed {
             guard.rebuild_library(); // the relocated project now appears in our library
@@ -5419,11 +5686,7 @@ pub async fn post_handoff_decline(
             )
                 .into_response();
         }
-        let _ = guard.store_mut().append_record(
-            HANDOFF_INCOMING_SCOPE,
-            "event",
-            &serde_json::json!({ "op": "resolved", "project": req.project }).to_string(),
-        );
+        resolve_incoming_handoff(guard.store_mut(), &req.project, "declined");
         handoff_notify_material(&guard, &req.source)
     };
     notify_origin(notify, HandoffMsgKind::Declined, &req.project).await;
@@ -5486,10 +5749,10 @@ pub async fn post_handoff_accept_all(
             if committed {
                 record_participants(guard.store_mut(), &project, &me, &source);
             }
-            let _ = guard.store_mut().append_record(
-                HANDOFF_INCOMING_SCOPE,
-                "event",
-                &serde_json::json!({ "op": "resolved", "project": project }).to_string(),
+            resolve_incoming_handoff(
+                guard.store_mut(),
+                &project,
+                if committed { "committed" } else { "failed" },
             );
             if committed {
                 notifies.push((handoff_notify_material(&guard, &source), project.clone()));
@@ -6016,7 +6279,7 @@ mod erasure_tests {
     /// tombstones the payload. (`decide_erasure` is the post-verification decision.)
     #[test]
     fn term_gates_auto_erase_else_queues() {
-        let mut store = Store::open_in_memory().unwrap();
+        let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
         let eng = "engagement-1";
         put_resource(&mut store, eng, "r1");
 
@@ -6067,7 +6330,7 @@ mod bridge_roster_tests {
     #[test]
     fn roster_survives_restart_and_revoke_is_durable() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::open_in_memory().unwrap();
+        let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
         let auth = AuthorityId::new("local-user");
         let broker = "ws://127.0.0.1:7900".to_string();
 
@@ -6102,7 +6365,7 @@ mod multiparty_join_tests {
 
     #[test]
     fn joins_accumulate_independently_revocable_operators() {
-        let mut store = Store::open_in_memory().unwrap();
+        let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
         record_operator_participant(&mut store, "project", "host", "operator-a");
         record_operator_participant(&mut store, "project", "host", "operator-b");
 
@@ -6133,7 +6396,7 @@ mod multiparty_join_tests {
 
     #[test]
     fn pending_invitation_preserves_join_disposition() {
-        let mut store = Store::open_in_memory().unwrap();
+        let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
         let expiry = now_secs() + 60;
         record_pending_invite(
             &mut store,
@@ -6787,7 +7050,7 @@ mod run_place_floor_tests {
     use std::collections::BTreeSet;
 
     fn store_with_policy(policy: Option<PlacementPolicy>) -> Store {
-        let mut store = Store::open_in_memory().unwrap();
+        let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
         if let Some(p) = policy {
             store
                 .append_record(
@@ -6990,5 +7253,155 @@ mod invite_refusal_tests {
         let unconfigured =
             serde_json::json!({ "ok": false, "reason": "federation not configured" });
         assert_eq!(refusal_status(&unconfigured), StatusCode::BAD_GATEWAY);
+    }
+}
+
+#[cfg(test)]
+mod handoff_in_doubt_tests {
+    use super::{
+        incoming_handoff_outcome, pending_outgoing_peer, record_outgoing_handoff,
+        resolve_from_status, resolve_incoming_handoff, unresolved_outgoing, InDoubtResolution,
+        HANDOFF_INCOMING_SCOPE,
+    };
+    use gaugedesk_core::ids::HomeId;
+
+    /// ADR 0156 §3: a reconcile may move a Home toward *releasing* a project and
+    /// never toward *claiming* one. Releasing on a false negative costs
+    /// reachability, which is visible and recoverable; claiming on a false
+    /// positive costs a second Home for live work, which diverges two logs and is
+    /// not. The table is checked here rather than asserted about a network path.
+    #[test]
+    fn an_in_doubt_handoff_resolves_only_where_the_answer_is_certain() {
+        use serde_json::json;
+
+        // The lost `Committed`, recovered: the peer holds it, and says where.
+        assert_eq!(
+            resolve_from_status(&json!({ "holds": true, "home": "home:bob" })),
+            InDoubtResolution::Release(HomeId::new("home:bob")),
+        );
+        // Releasing without knowing where to is not releasing, it is losing.
+        for blind in [
+            json!({ "holds": true }),
+            json!({ "holds": true, "home": "" }),
+        ] {
+            assert_eq!(
+                resolve_from_status(&blind),
+                InDoubtResolution::Unsettled,
+                "a release needs somewhere to release *to*: {blind}"
+            );
+        }
+
+        // Never seen there, so the offer did not land. Cancelling returns this
+        // authority to a state `INV-13` never let it leave — not a claim.
+        assert_eq!(
+            resolve_from_status(&json!({ "holds": false })),
+            InDoubtResolution::CancelOffer,
+        );
+        // The peer said no, and said so unambiguously.
+        for said_no in ["declined", "cancelled", "failed"] {
+            assert_eq!(
+                resolve_from_status(&json!({ "holds": false, "outcome": said_no })),
+                InDoubtResolution::CancelOffer,
+                "an unambiguous refusal settles it: {said_no}"
+            );
+        }
+
+        // Still awaiting the person. Cancelling would revoke a live offer out
+        // from under a decision nobody has made yet.
+        assert_eq!(
+            resolve_from_status(&json!({ "holds": false, "outcome": "pending" })),
+            InDoubtResolution::Unsettled,
+        );
+        // The two ambiguities, and the whole reason §4 records an outcome at all.
+        // `committed` with `holds` false means it was taken and has since moved
+        // on, so cancelling would resume a project that lives somewhere else;
+        // `unknown` is a resolution written before outcomes were kept.
+        for ambiguous in ["committed", "unknown", "something-a-newer-peer-invented"] {
+            assert_eq!(
+                resolve_from_status(&json!({ "holds": false, "outcome": ambiguous })),
+                InDoubtResolution::Unsettled,
+                "a claim must never follow from an ambiguous no: {ambiguous}"
+            );
+        }
+    }
+
+    /// §1: a handoff left in doubt is still a question, so it is still asked.
+    /// Before this, the transport-error path recorded `resolved`, which is what
+    /// made the unrecoverable window unrecoverable — it deleted the evidence.
+    #[test]
+    fn an_in_doubt_offer_stays_unresolved_and_is_scoped_to_its_peer() {
+        let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
+        record_outgoing_handoff(&mut store, "in_doubt", "project-lost", "bob").unwrap();
+        record_outgoing_handoff(&mut store, "offer", "project-pending", "bob").unwrap();
+        record_outgoing_handoff(&mut store, "offer", "project-done", "bob").unwrap();
+        record_outgoing_handoff(&mut store, "resolved", "project-done", "bob").unwrap();
+        record_outgoing_handoff(&mut store, "in_doubt", "project-elsewhere", "carol").unwrap();
+
+        assert_eq!(
+            unresolved_outgoing(&store, "bob"),
+            vec!["project-lost".to_string(), "project-pending".to_string()],
+            "an offer in doubt is unresolved exactly as a pending one is"
+        );
+        assert_eq!(
+            unresolved_outgoing(&store, "carol"),
+            vec!["project-elsewhere".to_string()],
+            "questions are asked of the peer they concern"
+        );
+        assert_eq!(
+            pending_outgoing_peer(&store, "project-lost"),
+            Some("bob".to_string()),
+            "and the offer still names its peer, so there is someone to ask"
+        );
+        assert_eq!(pending_outgoing_peer(&store, "project-done"), None);
+    }
+
+    /// §4: the target records *which way* it resolved, because "I do not hold it"
+    /// is otherwise the same answer from a peer that never saw the offer and from
+    /// one that held the project and relocated it onward.
+    #[test]
+    fn a_target_can_say_which_way_it_resolved_and_admits_when_it_cannot() {
+        let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
+        assert_eq!(
+            incoming_handoff_outcome(&store, "project-unheard-of"),
+            None,
+            "never seen is the one negative safe to act on, so it must be distinct"
+        );
+
+        store
+            .append_record(
+                HANDOFF_INCOMING_SCOPE,
+                "event",
+                &serde_json::json!({ "op": "offer", "project": "project" }).to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            incoming_handoff_outcome(&store, "project"),
+            Some("pending".to_string())
+        );
+
+        resolve_incoming_handoff(&mut store, "project", "declined");
+        assert_eq!(
+            incoming_handoff_outcome(&store, "project"),
+            Some("declined".to_string())
+        );
+
+        // A resolution written before outcomes were kept reads as `unknown`, which
+        // resolves to nothing. Reading it as a refusal would be the same guess
+        // this decision exists to stop, made against older data.
+        store
+            .append_record(
+                HANDOFF_INCOMING_SCOPE,
+                "event",
+                &serde_json::json!({ "op": "resolved", "project": "project-legacy" }).to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            incoming_handoff_outcome(&store, "project-legacy"),
+            Some("unknown".to_string())
+        );
+        assert_eq!(
+            resolve_from_status(&serde_json::json!({ "holds": false, "outcome": "unknown" })),
+            InDoubtResolution::Unsettled,
+        );
     }
 }
