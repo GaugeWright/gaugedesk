@@ -70,7 +70,19 @@ function controlPlaneOperation<M extends ManagementRoute["method"], P extends st
     return { method, path };
 }
 
-const managementRoutes = {
+/** Every route each Environment answers, written out per Environment.
+ *
+ * The repetition is load-bearing and must stay. `scripts/check-client-calls.mjs`
+ * matches the literal paths a client asks for against the routes the control
+ * plane actually serves, and it is textual by design — "cheap enough to run on
+ * every commit and blunt enough that nobody has to maintain it". Deriving these
+ * paths from the Environment name reads better and takes all of them out of
+ * that check's sight, so a client asking for a path nobody serves would once
+ * again compile, typecheck, ship, and fail when a person clicks the thing.
+ *
+ * Adding an Environment means adding a block here. `managementRouteNames` and
+ * its test are what stop that block from being quietly incomplete. */
+export const managementRoutes = {
     hub: {
         session: controlPlaneOperation("POST", "/environments/hub/sessions"),
         document: controlPlaneOperation("GET", "/environments/hub/documents/:id"),
@@ -101,7 +113,22 @@ const managementRoutes = {
     },
 } as const;
 
-type CommonManagementRoute = "session" | "document" | "command" | "changes" | "agentRead" | "agentSend" | "review";
+type CommonManagementRoute =
+    | "session" | "document" | "command" | "changes" | "review"
+    | "agentRead" | "agentSend";
+
+/** The operations every Environment must declare. Exported so a test can hold
+ * the table to it: a kind added with a route missing fails there rather than at
+ * the moment someone presses the control it belongs to. */
+export const managementRouteNames: readonly CommonManagementRoute[] = [
+    "session", "document", "command", "changes", "review",
+    "agentRead", "agentSend",
+];
+
+/** The Environments this client can address. Exported for the same reason. */
+export const managementEnvironmentKinds: readonly ManagementEnvironmentKind[] = [
+    "hub", "administration", "vend",
+];
 
 function managementRoute(
     environment: ManagementEnvironmentKind,
@@ -135,10 +162,26 @@ export async function proposeManagementDocumentChange(
     input: { readonly session: ManagementEnvironmentSession; readonly documentId: string; readonly baseRevision: string; readonly content: unknown; readonly client: ManagementEnvironmentClient },
     idempotencyKey: string,
 ): Promise<ManagementEnvironmentReceipt> {
-    if (input.session.environment !== "administration") {
-        throw new Error("literal document changes are available only in Administration");
+    // The session already states, per document, whether its literal form may be
+    // edited. Refusing by Environment name was a proxy for that fact, and a
+    // coarser one: it admitted every document in Administration and no document
+    // anywhere else, while the grant marks exactly four Administration documents
+    // editable. The grant is server-declared, so this refuses the same cases and
+    // the ones the name check could not see.
+    //
+    // A fail-fast guard, not the authority: the serving side owns enforcement,
+    // and a client cannot hold that for it.
+    const grant = input.session.documents.find((document) => document.id === input.documentId);
+    if (!grant?.editable) {
+        throw new Error(`Document ${input.documentId} is not editable in this session.`);
     }
-    const route = managementRoutes.administration.propose;
+    const routes = managementRoutes[input.session.environment];
+    if (!("propose" in routes)) {
+        throw new Error(
+            `The ${input.session.environment} control plane serves no literal-change route.`,
+        );
+    }
+    const route = routes.propose;
     const value = await json(route.method, route.path, {
         session_id: input.session.id, environment: input.session.environment, scope: input.session.scope,
         document_id: input.documentId, base_revision: input.baseRevision, content: input.content, client: input.client,

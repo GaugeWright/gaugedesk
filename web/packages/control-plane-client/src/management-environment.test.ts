@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { RouteJson, RouteOptions } from "./control-plane-transport";
-import { listManagementChanges, openManagementEnvironment, proposeManagementDocumentChange, readManagementDocument, reviewManagementChange, submitManagementCommand, type ManagementCommandEnvelope, type ManagementEnvironmentSession } from "./management-environment";
+import { managementEnvironmentKinds, managementRouteNames, managementRoutes, listManagementChanges, openManagementEnvironment, proposeManagementDocumentChange, readManagementDocument, reviewManagementChange, submitManagementCommand, type ManagementCommandEnvelope, type ManagementEnvironmentSession } from "./management-environment";
 
 function fakeJson(response: unknown): { json: RouteJson; calls: [string, string, unknown?, RouteOptions?][] } {
     const calls: [string, string, unknown?, RouteOptions?][] = [];
@@ -59,20 +59,55 @@ describe("management Environment client", () => {
             ],
         ]);
     });
-    it("refuses an unserved Hub or Vend literal-change route before transport", async () => {
+    it("refuses a literal change to a document the session did not mark editable", async () => {
         const route = fakeJson({ receipt: { id: "never" } });
-        const hubSession = { ...session, environment: "hub" as const };
         await expect(proposeManagementDocumentChange(
             route.json,
             {
-                session: hubSession,
-                documentId: "account",
+                session,
+                documentId: "machines",
                 baseRevision: "7",
                 content: {},
                 client: "edit",
             },
-            "edit-unsupported",
-        )).rejects.toThrow("available only in Administration");
+            "edit-ungranted",
+        )).rejects.toThrow("not editable in this session");
+        expect(route.calls).toEqual([]);
+    });
+    it("declares every common route for every Environment it can address", () => {
+        // The route table is written out per Environment so that the textual
+        // client-calls check can see the paths. This is what stops a block
+        // added for a new Environment from being quietly incomplete.
+        for (const environment of managementEnvironmentKinds) {
+            const routes = managementRoutes[environment] as Record<string, { path: string }>;
+            for (const name of managementRouteNames) {
+                expect(routes[name]?.path).toMatch(
+                    new RegExp(`^/environments/${environment}/`),
+                );
+            }
+        }
+    });
+    it("refuses a document the grant marks read-only, which the Environment name could not see", async () => {
+        const route = fakeJson({ receipt: { id: "never" } });
+        const readOnly: ManagementEnvironmentSession = {
+            ...session,
+            documents: [{ ...session.documents[0]!, editable: false }],
+        };
+        await expect(proposeManagementDocumentChange(
+            route.json,
+            { session: readOnly, documentId: "access", baseRevision: "7", content: {}, client: "edit" },
+            "edit-readonly",
+        )).rejects.toThrow("not editable in this session");
+        expect(route.calls).toEqual([]);
+    });
+    it("refuses a literal change where the control plane serves no such route", async () => {
+        const route = fakeJson({ receipt: { id: "never" } });
+        const hub: ManagementEnvironmentSession = { ...session, environment: "hub" };
+        await expect(proposeManagementDocumentChange(
+            route.json,
+            { session: hub, documentId: "access", baseRevision: "7", content: {}, client: "edit" },
+            "edit-unserved",
+        )).rejects.toThrow("serves no literal-change route");
         expect(route.calls).toEqual([]);
     });
     it("lists and reviews changes through the same scoped session", async () => {
