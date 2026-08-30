@@ -81,4 +81,16 @@ describe("library-sync pull copy", () => {
         expect(librarySyncPullLabel({ found: true, merged: 2, declined: "  " }))
             .toBe("merged 2 records ✓");
     });
+
+    // A snapshot retracts by omission (ADR 0154), so a pull removes as well as
+    // adds. Folding a removal into the merge count would say the opposite of
+    // what happened.
+    it("counts a retraction as its own clause, never as a merge", () => {
+        expect(librarySyncPullLabel({ found: true, merged: 4, retracted: 1 }))
+            .toBe("merged 4 records, retracted 1 stale route ✓");
+        expect(librarySyncPullLabel({ found: true, merged: 0, retracted: 2 }))
+            .toBe("merged 0 records, retracted 2 stale routes ✓");
+        expect(librarySyncPullLabel({ found: true, merged: 4, retracted: 0 }))
+            .toBe("merged 4 records ✓");
+    });
 });

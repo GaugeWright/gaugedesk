@@ -316,7 +316,6 @@ impl crate::Workbench {
         let entry = &record.entry;
         let blob = open_account_blob(self.account_key(), &entry.sealed_blob)
             .ok_or_else(|| "sealed blob did not open under this account key".to_string())?;
-        let trust = route_trust(record, &self.library_sync_root());
         let mut n = 0usize;
         for d in &blob.devices {
             if self
@@ -342,27 +341,8 @@ impl crate::Workbench {
                 n += 1;
             }
         }
-        for route in trust_admits_routes(&trust, &entry.directory.home_routes)
-            .iter()
-            .filter(|route| authorship_holds(route))
-        {
-            let record = crate::account::HomeRouteRecord {
-                id: route.project.clone(),
-                op: crate::account::RecordOp::Upsert,
-                home_id: route.home_id.clone(),
-                endpoint: route.endpoint.clone(),
-                relay: route.relay.clone(),
-                author_authority: route.author_authority.clone(),
-                author_root_pubkey: route.author_root_pubkey.clone(),
-                author_signature: route.author_signature.clone(),
-            };
-            if self
-                .write_account_record_in(ACCOUNT_SCOPE, "home_route", &record.id, &record)
-                .is_ok()
-            {
-                n += 1;
-            }
-        }
+        let routes = self.library_sync_reconcile_routes(record);
+        n += routes.written - routes.retracted;
         for (id, value) in &blob.settings {
             let rec = crate::account::SettingRecord {
                 id: id.clone(),
@@ -378,17 +358,136 @@ impl crate::Workbench {
         }
         Ok(LibrarySyncMerge {
             merged: n,
-            routes_verified: trust == RouteTrust::Signed,
-            declined: trust.declined(),
+            retracted: routes.retracted,
+            routes_verified: routes.declined.is_none(),
+            declined: routes.declined,
         })
     }
+
+    /// Reconcile this device's project→Home routes against a verified directory
+    /// record (ADR 0154).
+    ///
+    /// **The record is a snapshot, not an addition.** Every other field it
+    /// carries — device pubkeys, placement pointers, the sealed blob — is a
+    /// whole-value replacement at each generation, and routes now read the same
+    /// way. So presence upserts *and absence retracts*, which is what makes
+    /// ADR 0131 §7's departure real: a Home that stops serving a project drops
+    /// the route from its next snapshot, and every device folds it away.
+    ///
+    /// Absence is only allowed to mean that over the class the record is actually
+    /// authority for — **a route naming a Home other than this one and claiming no
+    /// author** (§2). The other two classes are deliberately exempt:
+    ///
+    /// - A route naming *this* Home is this Home's to author (§3). A pulled record
+    ///   may neither create nor resurrect one, or a device pulling its own stale
+    ///   record would undo its own departure.
+    /// - A route carrying a proven third-party author is merged but never retracted
+    ///   by absence (§4). Its retraction travels the federation channel that
+    ///   delivered it, and letting a stale record retract it would make the two
+    ///   channels race with the directory sometimes winning on older news.
+    ///
+    /// An unverified record reconciles nothing at all (§5). Fail-open is the safe
+    /// direction here: not retracting costs a stale locator, retracting on an
+    /// attacker's word costs a person the reachability they had.
+    pub fn library_sync_reconcile_routes(&mut self, record: &FetchedRecord) -> RouteReconcile {
+        use crate::account::ACCOUNT_SCOPE;
+        let trust = route_trust(record, &self.library_sync_root());
+        if trust != RouteTrust::Signed {
+            return RouteReconcile {
+                declined: trust.declined(),
+                ..RouteReconcile::default()
+            };
+        }
+        let this_home = self.home_id().clone();
+        let mut reconcile = RouteReconcile::default();
+
+        // What the record *validly* states, which is not the same as what it
+        // lists: a route whose author claim does not hold is not an assertion
+        // this device can read, so it neither merges nor keeps a local route
+        // alive by being mentioned.
+        let mut stated = std::collections::BTreeSet::new();
+        for route in &record.entry.directory.home_routes {
+            if !authorship_holds(route) {
+                continue;
+            }
+            stated.insert(route.project.clone());
+            if route.home_id == this_home {
+                continue;
+            }
+            let merged = crate::account::HomeRouteRecord {
+                id: route.project.clone(),
+                op: crate::account::RecordOp::Upsert,
+                home_id: route.home_id.clone(),
+                endpoint: route.endpoint.clone(),
+                relay: route.relay.clone(),
+                author_authority: route.author_authority.clone(),
+                author_root_pubkey: route.author_root_pubkey.clone(),
+                author_signature: route.author_signature.clone(),
+            };
+            if self
+                .write_account_record_in(ACCOUNT_SCOPE, "home_route", &merged.id, &merged)
+                .is_ok()
+            {
+                reconcile.written += 1;
+            }
+        }
+
+        let departed: Vec<crate::account::HomeRouteRecord> = Account::rebuild(self.store_ref())
+            .map(|account| account.home_routes)
+            .unwrap_or_default()
+            .into_values()
+            .filter(|held| directory_owns(held, &this_home) && !stated.contains(&held.id))
+            .collect();
+        for held in departed {
+            let tombstone = crate::account::HomeRouteRecord {
+                op: crate::account::RecordOp::Tombstone,
+                ..held
+            };
+            if self
+                .write_account_record_in(ACCOUNT_SCOPE, "home_route", &tombstone.id, &tombstone)
+                .is_ok()
+            {
+                reconcile.written += 1;
+                reconcile.retracted += 1;
+            }
+        }
+        reconcile
+    }
+}
+
+/// What a route reconcile did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RouteReconcile {
+    /// Records written — merges plus tombstones.
+    pub written: usize,
+    /// Routes the record's silence retracted (ADR 0154 §2).
+    pub retracted: usize,
+    /// Why nothing was reconciled, when nothing was. `None` on a verified record.
+    pub declined: Option<&'static str>,
+}
+
+/// Whether the directory record is authority for `held` — the one class whose
+/// absence from a verified record retracts it (ADR 0154 §2). A route naming this
+/// Home is ours to author (§3); a route proving a third-party author belongs to
+/// the channel that delivered it (§4).
+fn directory_owns(
+    held: &crate::account::HomeRouteRecord,
+    this_home: &gaugedesk_core::ids::HomeId,
+) -> bool {
+    held.home_id != *this_home
+        && !claims_an_author(&crate::home::OpaqueHomeRoute::from(held.clone()))
 }
 
 /// What a pull merged, and what it declined.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LibrarySyncMerge {
-    /// How many account records were written.
+    /// How many account records the record added or updated. Tombstones are not
+    /// counted here — a retraction is not a thing merged.
     pub merged: usize,
+    /// Routes the record's silence retracted (ADR 0154 §2). Reported separately
+    /// because a person reading "merged 5 records" would otherwise be told a
+    /// removal was an addition.
+    pub retracted: usize,
     /// Whether the record's project→Home routes were verified and merged. A
     /// caller must not infer this from a route carrying a relay locator, because
     /// an account may legitimately have none.
@@ -396,17 +495,6 @@ pub struct LibrarySyncMerge {
     /// Why routing was declined, when it was — the structural reason, never the
     /// payload. `None` when it was accepted.
     pub declined: Option<&'static str>,
-}
-
-/// The routes a given [`RouteTrust`] admits: all of them, or none.
-fn trust_admits_routes<'a>(
-    trust: &RouteTrust,
-    routes: &'a [crate::home::OpaqueHomeRoute],
-) -> &'a [crate::home::OpaqueHomeRoute] {
-    match trust {
-        RouteTrust::Signed => routes,
-        _ => &[],
-    }
 }
 
 /// Whether a route that **claims** a third-party author actually proves it.
@@ -419,10 +507,14 @@ fn trust_admits_routes<'a>(
 /// root's authority. This is the same rule the federation handoff already applies
 /// at its own ingest (`federation.rs`, `HandoffMsgKind::Route`).
 fn authorship_holds(route: &crate::home::OpaqueHomeRoute) -> bool {
-    let claims_an_author = !route.author_authority.is_empty()
+    !claims_an_author(route) || crate::home::shared_home_route_verifies(route)
+}
+
+/// Whether a route asserts that someone other than this account root authored it.
+fn claims_an_author(route: &crate::home::OpaqueHomeRoute) -> bool {
+    !route.author_authority.is_empty()
         || !route.author_root_pubkey.is_empty()
-        || route.author_signature.is_some();
-    !claims_an_author || crate::home::shared_home_route_verifies(route)
+        || route.author_signature.is_some()
 }
 
 /// Whether this device may re-sign `record` into its next directory publish.
@@ -744,6 +836,220 @@ mod tests {
             .store_ref()
             .records(ACCOUNT_SCOPE, "home_route")
             .is_ok());
+    }
+
+    /// ADR 0154: the record is a snapshot of the routes it owns, so its silence
+    /// retracts them. This is what makes ADR 0131 §7's departure real — a Home
+    /// that stops serving a project drops the route from its next snapshot, and
+    /// every device that already pulled it folds the stale locator away.
+    #[test]
+    fn a_verified_records_silence_retracts_the_routes_it_owns() {
+        use crate::LockUnpoisoned;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(dir.path()).unwrap();
+        let mut guard = shared.lock_unpoisoned();
+        let root_key = crate::key_store::FileKeyStore::new(guard.root_path().join("keys"))
+            .signing_key(guard.authority());
+
+        // A sibling device's Home serves two projects, and this device learns
+        // both from the account's own signed record.
+        let sibling = |project: &str| crate::home::OpaqueHomeRoute {
+            project: project.into(),
+            home_id: gaugedesk_core::ids::HomeId::new("home:sibling"),
+            endpoint: "https://sibling.example".into(),
+            ..hostile_route()
+        };
+        let entry = |routes: Vec<crate::home::OpaqueHomeRoute>| DirectoryEntry {
+            generation: 1,
+            directory: directory_record(
+                root_key.public_key().as_str(),
+                &seeded_account(),
+                vec![],
+                routes,
+            ),
+            sealed_blob: String::new(),
+            retracted: false,
+        };
+        // The same record with and without the proof that makes it mean anything.
+        let unsigned = |routes: Vec<crate::home::OpaqueHomeRoute>| FetchedRecord {
+            entry: entry(routes),
+            signature: None,
+        };
+        let signed = |routes: Vec<crate::home::OpaqueHomeRoute>| {
+            let put = gaugedesk_directory_protocol::sign_entry(entry(routes), &root_key).unwrap();
+            FetchedRecord {
+                entry: put.entry,
+                signature: Some(put.signature),
+            }
+        };
+        let held = |guard: &crate::Workbench| -> Vec<String> {
+            let mut ids: Vec<String> = Account::rebuild(guard.store_ref())
+                .unwrap()
+                .home_routes
+                .into_keys()
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        let merged = guard.library_sync_reconcile_routes(&signed(vec![
+            sibling("project-kept"),
+            sibling("project-relocated"),
+        ]));
+        assert_eq!(merged.retracted, 0);
+        assert_eq!(held(&guard), vec!["project-kept", "project-relocated"]);
+
+        // The sibling relocates one project. Its next snapshot simply does not
+        // mention it, and that silence is the retraction.
+        let gone = guard.library_sync_reconcile_routes(&signed(vec![sibling("project-kept")]));
+        assert_eq!(gone.retracted, 1);
+        assert_eq!(
+            held(&guard),
+            vec!["project-kept"],
+            "a relocated project must not keep a live pointer at its former Home"
+        );
+
+        // §5: an unverified record retracts nothing. Fail-open is the safe
+        // direction — not retracting costs a stale locator, retracting on an
+        // attacker's word costs the person reachability they had.
+        let unverified = guard.library_sync_reconcile_routes(&unsigned(vec![]));
+        assert!(unverified.declined.is_some());
+        assert_eq!(unverified.retracted, 0);
+        assert_eq!(held(&guard), vec!["project-kept"]);
+    }
+
+    /// §3 and §4: the classes the directory is *not* authority for. Getting
+    /// either wrong is worse than the gap this closes — one undoes a Home's own
+    /// departure, the other lets a stale record win a race against the channel
+    /// that actually delivers a shared route's retraction.
+    #[test]
+    fn a_record_governs_neither_this_homes_own_routes_nor_a_proven_authors() {
+        use crate::account::{HomeRouteRecord, RecordOp, ACCOUNT_SCOPE};
+        use crate::LockUnpoisoned;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(dir.path()).unwrap();
+        let mut guard = shared.lock_unpoisoned();
+        let root_key = crate::key_store::FileKeyStore::new(guard.root_path().join("keys"))
+            .signing_key(guard.authority());
+        let this_home = guard.home_id().clone();
+
+        // This Home serves a project of its own.
+        let own = HomeRouteRecord {
+            id: "project-own".into(),
+            op: RecordOp::Upsert,
+            home_id: this_home.clone(),
+            endpoint: "https://mine.example".into(),
+            relay: None,
+            author_authority: String::new(),
+            author_root_pubkey: String::new(),
+            author_signature: None,
+        };
+        guard
+            .write_account_record_in(ACCOUNT_SCOPE, "home_route", &own.id, &own)
+            .unwrap();
+
+        // A shared project on someone else's Home, delivered by the federation
+        // handoff under that Home's own governance root.
+        let serving = SigningKey::from_seed(&[5u8; 32]).unwrap();
+        let shared_route = crate::home::sign_home_route(
+            "root-p256:serving",
+            crate::home::OpaqueHomeRoute {
+                project: "project-shared".into(),
+                home_id: gaugedesk_core::ids::HomeId::new("home:theirs"),
+                endpoint: "https://theirs.example".into(),
+                relay: None,
+                author_authority: String::new(),
+                author_root_pubkey: String::new(),
+                author_signature: None,
+            },
+            &serving,
+        )
+        .unwrap();
+        let carried = HomeRouteRecord {
+            id: shared_route.project.clone(),
+            op: RecordOp::Upsert,
+            home_id: shared_route.home_id.clone(),
+            endpoint: shared_route.endpoint.clone(),
+            relay: None,
+            author_authority: shared_route.author_authority.clone(),
+            author_root_pubkey: shared_route.author_root_pubkey.clone(),
+            author_signature: shared_route.author_signature.clone(),
+        };
+        guard
+            .write_account_record_in(ACCOUNT_SCOPE, "home_route", &carried.id, &carried)
+            .unwrap();
+
+        // An empty but perfectly valid record for this account: it mentions
+        // neither, and must retract neither.
+        let empty = gaugedesk_directory_protocol::sign_entry(
+            DirectoryEntry {
+                generation: 1,
+                directory: directory_record(
+                    root_key.public_key().as_str(),
+                    &seeded_account(),
+                    vec![],
+                    vec![],
+                ),
+                sealed_blob: String::new(),
+                retracted: false,
+            },
+            &root_key,
+        )
+        .unwrap();
+        let reconcile = guard.library_sync_reconcile_routes(&FetchedRecord {
+            entry: empty.entry,
+            signature: Some(empty.signature),
+        });
+        assert_eq!(
+            reconcile.retracted, 0,
+            "the record owns neither this Home's routes nor a proven author's"
+        );
+        let ids: Vec<String> = Account::rebuild(guard.store_ref())
+            .unwrap()
+            .home_routes
+            .into_keys()
+            .collect();
+        assert!(ids.contains(&"project-own".to_string()));
+        assert!(ids.contains(&"project-shared".to_string()));
+
+        // §3, the other half: a record may not *resurrect* a route naming this
+        // Home either, or a device pulling its own stale record would undo its
+        // own departure — the failure §7 exists to fix, arriving by a new door.
+        let departed = HomeRouteRecord {
+            op: RecordOp::Tombstone,
+            ..own.clone()
+        };
+        guard
+            .write_account_record_in(ACCOUNT_SCOPE, "home_route", &departed.id, &departed)
+            .unwrap();
+        let stale = gaugedesk_directory_protocol::sign_entry(
+            DirectoryEntry {
+                generation: 2,
+                directory: directory_record(
+                    root_key.public_key().as_str(),
+                    &seeded_account(),
+                    vec![],
+                    vec![crate::home::OpaqueHomeRoute::from(own)],
+                ),
+                sealed_blob: String::new(),
+                retracted: false,
+            },
+            &root_key,
+        )
+        .unwrap();
+        guard.library_sync_reconcile_routes(&FetchedRecord {
+            entry: stale.entry,
+            signature: Some(stale.signature),
+        });
+        assert!(
+            !Account::rebuild(guard.store_ref())
+                .unwrap()
+                .home_routes
+                .contains_key("project-own"),
+            "this Home's own departure survives its own stale record"
+        );
     }
 
     /// A publish re-signs the whole route set under the account root, so what a

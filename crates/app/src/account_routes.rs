@@ -797,14 +797,14 @@ pub async fn post_library_sync_publish(State(wb): State<SharedWorkbench>) -> imp
         crate::directory_sync::fetch(&crate::net_http::HttpClient::new(), &head_base, &root)
     })
     .await;
-    let generation = match head {
+    let (generation, head) = match head {
         Ok(Ok(Some(record))) => match record.entry.generation.checked_add(1) {
-            Some(generation) => generation,
+            Some(generation) => (generation, Some(record)),
             None => {
                 return (StatusCode::CONFLICT, "directory generation is exhausted").into_response()
             }
         },
-        Ok(Ok(None)) => 1,
+        Ok(Ok(None)) => (1, None),
         Ok(Err(error)) => return (StatusCode::BAD_GATEWAY, error).into_response(),
         Err(_) => {
             return (
@@ -814,6 +814,20 @@ pub async fn post_library_sync_publish(State(wb): State<SharedWorkbench>) -> imp
                 .into_response()
         }
     };
+    // Read the head before overwriting it (ADR 0154 §6). The record is a
+    // snapshot of the routes it owns, so a publish written blind lets the
+    // least-informed device erase what a better-informed one published — and the
+    // generation fence makes that durable rather than transient. A retracted head
+    // states nothing about routing, so there is nothing there to reconcile against.
+    let reconciled = match head {
+        Some(record) if !record.entry.retracted => {
+            wb.lock_unpoisoned().library_sync_reconcile_routes(&record)
+        }
+        _ => crate::directory_sync::RouteReconcile::default(),
+    };
+    if let Some(reason) = reconciled.declined {
+        eprintln!("[library-sync] published without reconciling against the head: {reason}");
+    }
     let put = wb.lock_unpoisoned().library_sync_signed_put(generation);
     let Some(put) = put else {
         return (
@@ -838,7 +852,11 @@ pub async fn post_library_sync_publish(State(wb): State<SharedWorkbench>) -> imp
             let announced = crate::account_signin::announce_directory_root(&wb).await;
             (
                 StatusCode::OK,
-                Json(json!({ "published": true, "announced": announced })),
+                Json(json!({
+                    "published": true,
+                    "announced": announced,
+                    "retracted_routes": reconciled.retracted,
+                })),
             )
                 .into_response()
         }
@@ -948,6 +966,7 @@ pub async fn post_library_sync_pull(State(wb): State<SharedWorkbench>) -> impl I
                 Json(json!({
                     "found": true,
                     "merged": merge.merged,
+                    "retracted": merge.retracted,
                     "routes_verified": merge.routes_verified,
                     "declined": merge.declined,
                 })),
@@ -967,6 +986,7 @@ fn nothing_pulled() -> axum::response::Response {
         Json(json!({
             "found": false,
             "merged": 0,
+            "retracted": 0,
             "routes_verified": false,
             "declined": null,
         })),

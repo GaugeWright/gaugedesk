@@ -85,12 +85,19 @@ describe("control-plane-tenant (ADR 0077 §7/§9)", () => {
         await expect(accountPullLibrarySync(pull.json)).resolves.toEqual({
             found: true,
             merged: 3,
+            retracted: 0,
             routesVerified: true,
             declined: null,
         });
         expect(pull.calls).toEqual([["POST", "/account/library-sync/pull", undefined]]);
         await expect(accountPullLibrarySync(fakeJson({ merged: "many" }).json))
-            .resolves.toEqual({ found: false, merged: 0, routesVerified: false, declined: null });
+            .resolves.toEqual({
+                found: false,
+                merged: 0,
+                retracted: 0,
+                routesVerified: false,
+                declined: null,
+            });
 
         // A pull that merged the sealed half but refused the routing reports
         // both facts. Absent `routes_verified` reads as unverified, never as
@@ -108,8 +115,23 @@ describe("control-plane-tenant (ADR 0077 §7/§9)", () => {
         ).resolves.toEqual({
             found: true,
             merged: 2,
+            retracted: 0,
             routesVerified: false,
             declined: "the directory served a record with no root signature",
+        });
+
+        // A snapshot retracts by omission (ADR 0154), so a pull can remove a
+        // stale locator. That is a removal and is counted as one.
+        await expect(
+            accountPullLibrarySync(
+                fakeJson({ found: true, merged: 1, retracted: 2, routes_verified: true }).json,
+            ),
+        ).resolves.toEqual({
+            found: true,
+            merged: 1,
+            retracted: 2,
+            routesVerified: true,
+            declined: null,
         });
     });
 

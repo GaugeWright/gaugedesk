@@ -138,6 +138,10 @@ export async function accountPublishLibrarySync(json: RouteJson): Promise<void> 
 export interface LibrarySyncPullResult {
     readonly found: boolean;
     readonly merged: number;
+    /** Routes the record's silence retracted (ADR 0154). A snapshot retracts by
+     * omission, so a pull can legitimately remove a stale locator — which is a
+     * removal, and must not be reported as something merged. */
+    readonly retracted: number;
     /** Whether the record's project→Home routes were verified against the root
      * key the desktop itself holds, and therefore merged. Never infer this from
      * anything else: an account may legitimately publish no routes at all. */
@@ -149,6 +153,10 @@ export interface LibrarySyncPullResult {
     readonly declined: string | null;
 }
 
+function count(value: unknown): number {
+    return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
 /** Pull and merge the latest root-signed sealed account projection. */
 export async function accountPullLibrarySync(
     json: RouteJson,
@@ -156,9 +164,8 @@ export async function accountPullLibrarySync(
     const value = (await json("POST", "/account/library-sync/pull")) as Record<string, unknown>;
     return {
         found: value?.found === true,
-        merged: typeof value?.merged === "number" && Number.isFinite(value.merged)
-            ? Math.max(0, Math.floor(value.merged))
-            : 0,
+        merged: count(value?.merged),
+        retracted: count(value?.retracted),
         routesVerified: value?.routes_verified === true,
         declined: typeof value?.declined === "string" && value.declined ? value.declined : null,
     };

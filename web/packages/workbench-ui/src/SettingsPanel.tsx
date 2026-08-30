@@ -66,16 +66,26 @@ import { SettingsSurface, type SettingsModel, type SettingsRoom } from "./Settin
  *
  * The tick is withheld rather than the count, because the count is honest and
  * the tick is the claim that everything the pull was for happened.
+ *
+ * A retraction is reported as its own clause rather than folded into the merge
+ * count: the record is a snapshot and its silence retracts (ADR 0154), so a pull
+ * legitimately removes stale locators, and calling a removal a merge would tell a
+ * person the opposite of what happened.
  */
 export function librarySyncPullLabel(result: {
     found: boolean;
     merged: number;
+    retracted?: number;
     declined?: string | null;
 }): string {
     if (!result.found) return "nothing published to pull yet";
-    const merged = `merged ${result.merged} record${result.merged === 1 ? "" : "s"}`;
+    const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+    const retracted = result.retracted ?? 0;
+    const did = retracted
+        ? `merged ${plural(result.merged, "record")}, retracted ${plural(retracted, "stale route")}`
+        : `merged ${plural(result.merged, "record")}`;
     const declined = result.declined?.trim();
-    return declined ? `${merged} — project routes were not merged: ${declined}` : `${merged} ✓`;
+    return declined ? `${did} — project routes were not merged: ${declined}` : `${did} ✓`;
 }
 
 /** Enrollment time is account evidence, not presence. Legacy records honestly

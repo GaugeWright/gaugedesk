@@ -58,6 +58,10 @@ export interface AccountPanelApi {
     accountPullLibrarySync(): Promise<{
         found: boolean;
         merged: number;
+        /** Routes the record's silence retracted (ADR 0154). A pull can remove a
+         * stale locator as well as add one, and a removal reported as a merge
+         * would tell a person the opposite of what happened. */
+        retracted?: number;
         /** Why the record's project→Home routes were not merged, when they were
          * not — the structural reason, never the payload. `null` when they were.
          * A pull can succeed at its sealed half and still refuse the routing
