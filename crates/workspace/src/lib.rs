@@ -1116,12 +1116,23 @@ impl Engagement {
     }
 
     fn project_branch(&self, vcs: &mut NativeWorkspaceVcs) -> Result<()> {
-        sync_out_with_roots(
+        self.project_branch_observing(vcs, None)
+    }
+
+    /// [`Self::project_branch`] restricted to what a paired import saw — see
+    /// [`sync_out_with_roots_observing`].
+    fn project_branch_observing(
+        &self,
+        vcs: &mut NativeWorkspaceVcs,
+        observed: Option<&BTreeSet<String>>,
+    ) -> Result<()> {
+        sync_out_with_roots_observing(
             vcs,
             &self.store_root,
             &self.branch,
             &self.path,
             self.sparse_roots.as_ref(),
+            observed,
         )
     }
 
@@ -1269,20 +1280,29 @@ impl Engagement {
         // the writer after `import_diff` let another turn scan while this turn
         // was materializing the new head, so the scanner could hash a file in
         // the middle of replacement and receive a false content-moved conflict.
+        //
+        // Holding the writer does not make this turn the only *writer of the
+        // worktree*: the files a turn produces are written outside it, so a
+        // sibling turn's file can land after this turn's import scan and before
+        // its projection. The projection is therefore told what the scan saw
+        // and sweeps only that, so a file that arrived in the window survives
+        // to be imported by the turn that wrote it. Sweeping it instead put the
+        // bytes in quarantine and nothing in the manifest, and that turn's work
+        // was lost from the branch.
         let writer = workspace_writer(&self.store_root, &self.branch);
         let _writing = writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut vcs = self.store()?;
-        if let Some(cut) = sync_in_with_roots_under_writer(
+        let scan = sync_in_with_roots_under_writer(
             &mut vcs,
             &self.store_root,
             &self.branch,
             &self.path,
             self.sparse_roots.as_ref(),
-        )? {
-            self.project_branch(&mut vcs)?;
+        )?;
+        self.project_branch_observing(&mut vcs, Some(&scan.observed))?;
+        if let Some(cut) = scan.cut {
             return Ok(Some(RevisionId(cut)));
         }
-        self.project_branch(&mut vcs)?;
         let cut_id = fresh_cut_id("turn-boundary");
         let cut = vcs
             .cut_at_quiescence(&self.branch, &cut_id, &now_at())?
@@ -1750,7 +1770,20 @@ fn sync_in_with_roots(
     }
     let writer = workspace_writer(store_root, branch);
     let _writing = writer.lock().unwrap_or_else(PoisonError::into_inner);
-    sync_in_with_roots_under_writer(vcs, store_root, branch, root, sparse_roots)
+    Ok(sync_in_with_roots_under_writer(vcs, store_root, branch, root, sparse_roots)?.cut)
+}
+
+/// What one import saw and what it minted.
+///
+/// `observed` is every worktree path the import's scan actually walked, which
+/// is the only honest answer to "was this file here when we looked?". A
+/// projection paired with this import may sweep what the scan declined; it may
+/// not sweep what the scan never saw, because that is work that arrived after
+/// the scan and belongs to the *next* import.
+struct ImportScan {
+    /// The cut this import minted, or `None` when nothing changed.
+    cut: Option<String>,
+    observed: BTreeSet<String>,
 }
 
 /// `sync_in_with_roots` with the per-branch writer already held by a caller
@@ -1761,9 +1794,15 @@ fn sync_in_with_roots_under_writer(
     branch: &str,
     root: &Path,
     sparse_roots: Option<&BTreeSet<String>>,
-) -> Result<Option<String>> {
+) -> Result<ImportScan> {
     if !root.is_dir() {
-        return Ok(None);
+        // No scan happened, so nothing was observed. A paired projection must
+        // then sweep nothing, which is the safe direction: an un-imported file
+        // survives to be imported next time.
+        return Ok(ImportScan {
+            cut: None,
+            observed: BTreeSet::new(),
+        });
     }
     let scratch = load_scratch(vcs, store_root, branch);
     let import = whipplescript_store::materialize::import_scratch(
@@ -1772,6 +1811,13 @@ fn sync_in_with_roots_under_writer(
         vcs.content_store(),
         scan_stamp(),
     )?;
+    // The scan's refreshed cache holds one entry per file it walked, so its
+    // keys ARE the observation. (`materialize`'s scratch keys differ from
+    // manifest keys only by a leading `/`, which manifests do not carry, so
+    // these compare directly against `walk_tree`'s worktree-relative paths.
+    // Any key that did not round-trip simply reads as unobserved, which only
+    // ever preserves a file.)
+    let observed: BTreeSet<String> = import.cache.entries.keys().cloned().collect();
     let manifest = vcs.manifest(branch)?.unwrap_or_default();
     let mut changed = import.changed;
     let selected = |path: &str| {
@@ -1791,13 +1837,19 @@ fn sync_in_with_roots_under_writer(
         .collect();
     if changed.is_empty() && removed.is_empty() {
         persist_scratch(store_root, branch, &import.cache)?;
-        return Ok(None);
+        return Ok(ImportScan {
+            cut: None,
+            observed,
+        });
     }
     let cut_id = fresh_cut_id("turn");
     match vcs.import_diff(branch, &changed, &removed, &cut_id, &now_at())? {
         VcsWriteOutcome::Written { cut_id, .. } => {
             persist_scratch(store_root, branch, &import.cache)?;
-            Ok(Some(cut_id))
+            Ok(ImportScan {
+                cut: Some(cut_id),
+                observed,
+            })
         }
         other => Err(WorkspaceError::msg(format!(
             "worktree import on `{branch}` refused: {other:?}"
@@ -1829,6 +1881,29 @@ fn sync_out_with_roots(
     root: &Path,
     sparse_roots: Option<&BTreeSet<String>>,
 ) -> Result<()> {
+    sync_out_with_roots_observing(vcs, store_root, branch, root, sparse_roots, None)
+}
+
+/// `sync_out_with_roots`, told what the import it is paired with actually saw.
+///
+/// `observed: None` means there is no paired import — a restore, a revert, a
+/// narrowed sparse view — and every unmanifested file is swept, as before.
+///
+/// `observed: Some(seen)` means an import scanned this worktree moments ago
+/// under the same writer hold, and only files that scan *saw* may be swept. A
+/// file that lands between another writer's scan and this projection is not
+/// history the manifest declined; it is a second writer's work that no import
+/// has looked at yet. Sweeping it quarantined the bytes but never put them in
+/// the manifest, so that writer's work was lost from the branch — the whole
+/// point of the paired form.
+fn sync_out_with_roots_observing(
+    vcs: &mut NativeWorkspaceVcs,
+    store_root: &Path,
+    branch: &str,
+    root: &Path,
+    sparse_roots: Option<&BTreeSet<String>>,
+    observed: Option<&BTreeSet<String>>,
+) -> Result<()> {
     let full_manifest = vcs
         .manifest(branch)?
         .ok_or_else(|| WorkspaceError::msg(format!("no line `{branch}` to materialize")))?;
@@ -1857,7 +1932,10 @@ fn sync_out_with_roots(
     let unmanifested: Vec<&FileEntry> = on_disk
         .iter()
         .filter(|entry| {
-            !entry.is_dir && !manifest.contains_key(&entry.path) && !is_chat_local_path(&entry.path)
+            !entry.is_dir
+                && !manifest.contains_key(&entry.path)
+                && !is_chat_local_path(&entry.path)
+                && observed.is_none_or(|seen| seen.contains(&entry.path))
         })
         .collect();
     if !unmanifested.is_empty() {
@@ -3341,6 +3419,78 @@ mod tests {
             "rejection must not mutate old state"
         );
         assert!(worktrees.join("chat/.git").exists());
+    }
+
+    /// The window the concurrent-importer test below hits by luck, driven
+    /// deterministically: a file that lands **after** an import's scan and
+    /// **before** the projection paired with it must survive that projection.
+    ///
+    /// Only the projection half of a turn quarantines, and it used to sweep
+    /// every unmanifested file on disk. A sibling turn's write landing in that
+    /// window is unmanifested for exactly one reason — no import has looked at
+    /// it yet — so sweeping it moved the bytes to quarantine and left the
+    /// manifest without them. The sibling then scanned an empty tree and
+    /// imported nothing, and its work was gone from the branch. That is a lost
+    /// update, not a quarantine.
+    ///
+    /// The second half is the point: the file must not merely survive on disk,
+    /// it must reach the manifest on the next import.
+    #[test]
+    fn a_file_landing_after_the_import_scan_survives_the_paired_projection() {
+        let (_directory, instance) = instance();
+        let chat = instance.create_engagement("racer").expect("chat");
+        chat.write_file("settled.md", "settled").expect("seed");
+        chat.commit_turn("settle").expect("settle");
+
+        let mut vcs = chat.store().expect("store");
+        // One turn's import scan: it sees only what is on disk right now.
+        let scan = sync_in_with_roots_under_writer(
+            &mut vcs,
+            &chat.store_root,
+            &chat.branch,
+            &chat.path,
+            chat.sparse_roots.as_ref(),
+        )
+        .expect("import");
+        assert!(
+            !scan.observed.contains("late.md"),
+            "the scan cannot have seen a file that does not exist yet"
+        );
+
+        // A sibling turn writes between that scan and this turn's projection.
+        std::fs::write(chat.path.join("late.md"), "a sibling turn's work").expect("late write");
+
+        chat.project_branch_observing(&mut vcs, Some(&scan.observed))
+            .expect("project");
+
+        assert_eq!(
+            std::fs::read_to_string(chat.path.join("late.md"))
+                .ok()
+                .as_deref(),
+            Some("a sibling turn's work"),
+            "the projection swept a file its own import never scanned"
+        );
+
+        // And the sibling's own import lands it, which is the property the
+        // survival exists to serve.
+        let landed = sync_in_with_roots_under_writer(
+            &mut vcs,
+            &chat.store_root,
+            &chat.branch,
+            &chat.path,
+            chat.sparse_roots.as_ref(),
+        )
+        .expect("sibling import");
+        assert!(landed.cut.is_some(), "the late file was a real change");
+        let manifest = vcs
+            .manifest(&chat.branch)
+            .expect("manifest")
+            .unwrap_or_default();
+        assert!(
+            manifest.contains_key("late.md"),
+            "the late file never reached the manifest: {:?}",
+            manifest.keys().collect::<Vec<_>>()
+        );
     }
 
     /// Several turns importing into ONE branch must all land, and none may lose
