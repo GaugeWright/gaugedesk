@@ -3594,14 +3594,28 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                 author_root_pubkey: route.author_root_pubkey.clone(),
                 author_signature: route.author_signature.clone(),
             };
-            let ok = guard
-                .write_account_record_in(
-                    crate::account::ACCOUNT_SCOPE,
-                    "home_route",
-                    &record.id,
-                    &record,
-                )
-                .is_ok();
+            // Re-delivery must not churn (ADR 0155 §6). A serving Home re-sends
+            // a retraction for as long as the grant lives, because it cannot
+            // know whether the first one landed; writing an identical record
+            // each time would turn an append-only log into a heartbeat.
+            let account = crate::account::Account::rebuild(guard.store_ref()).unwrap_or_default();
+            let already = match record.op {
+                crate::account::RecordOp::Tombstone => {
+                    account.departed_home_routes.get(&record.id) == Some(&record)
+                }
+                crate::account::RecordOp::Upsert => {
+                    account.home_routes.get(&record.id) == Some(&record)
+                }
+            };
+            let ok = already
+                || guard
+                    .write_account_record_in(
+                        crate::account::ACCOUNT_SCOPE,
+                        "home_route",
+                        &record.id,
+                        &record,
+                    )
+                    .is_ok();
             (serde_json::json!({ "ok": ok }), false)
         }
     };
@@ -5854,14 +5868,31 @@ fn distribute_home_routes(
         let me = fed.authority.clone();
         let home = guard.federation_home_id();
         let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
-        let routes = crate::account::Account::rebuild(guard.store_ref())
-            .map(|account| account.home_routes)
-            .unwrap_or_default();
+        let account = crate::account::Account::rebuild(guard.store_ref()).unwrap_or_default();
+        // A retraction re-sends from the *retained* departures as well as the
+        // live set (ADR 0155 §2). Sending only from the live set is what made a
+        // retraction fire-once: both callers send before tombstoning locally,
+        // and the tombstone then folds the record out of the set the retractor
+        // iterates, so a delivery that failed was not deferred but forgotten.
+        // Re-sending is self-limiting — the peer filter below drops anyone
+        // without a live grant, and a grant is exactly the span over which a
+        // retraction could still matter to them.
+        let mut routes = account.home_routes;
+        if retract {
+            for (project, departed) in account.departed_home_routes {
+                routes.entry(project).or_insert(departed);
+            }
+        }
         let mut deliveries = Vec::new();
         for record in routes.into_values().filter(|record| {
-            if record.op != crate::account::RecordOp::Upsert
-                || record.home_id != *guard.home_id()
-                || (record.endpoint.is_empty() && record.relay.is_none())
+            if record.home_id != *guard.home_id() {
+                return false;
+            }
+            // A departure carries no reachability by definition, so the
+            // liveness shape is required of a live route only.
+            if !retract
+                && (record.op != crate::account::RecordOp::Upsert
+                    || (record.endpoint.is_empty() && record.relay.is_none()))
             {
                 return false;
             }
@@ -5874,6 +5905,8 @@ fn distribute_home_routes(
                 return record.id == project && served;
             }
             if retract {
+                // A retained departure is by definition no longer served, so
+                // `!served` admits it on the ordinary path without a special case.
                 retract_all || !served
             } else {
                 served

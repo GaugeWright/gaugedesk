@@ -343,6 +343,13 @@ pub struct Account {
     pub credentials: BTreeMap<String, CredentialRecord>,
     pub homes: BTreeMap<String, RegisteredHomeRecord>,
     pub home_routes: BTreeMap<String, HomeRouteRecord>,
+    /// The routes currently *retracted*, keyed the same way and holding the
+    /// tombstone record itself — its Home id, and for a shared route its author
+    /// proof (ADR 0155 §1). A later upsert for the same project removes it, so
+    /// this is "retracted now", never "ever retracted". A serving Home re-sends
+    /// from it (§2) and a recipient republishes the proven ones (§3); neither
+    /// was possible while a tombstone's only effect was to vanish.
+    pub departed_home_routes: BTreeMap<String, HomeRouteRecord>,
     /// Absent until a root-holding client publishes it, which is the ordinary
     /// state for an account that has never enabled library sync.
     pub directory: Option<AccountDirectoryRecord>,
@@ -406,6 +413,19 @@ impl Account {
         }
         for row in store.records(scope, "home_route")? {
             let r: HomeRouteRecord = serde_json::from_str(&row)?;
+            // Departure is retained rather than discarded (ADR 0155 §1). The
+            // live fold below is unchanged, so every existing reader sees
+            // exactly what it saw before; what is new is being able to answer
+            // *what has been retracted*, which nothing could answer while the
+            // tombstone's only effect was to remove the record.
+            match r.op {
+                RecordOp::Tombstone => {
+                    acct.departed_home_routes.insert(r.id.clone(), r.clone());
+                }
+                RecordOp::Upsert => {
+                    acct.departed_home_routes.remove(&r.id);
+                }
+            }
             fold(&mut acct.home_routes, r.id.clone(), r.op, r);
         }
         let mut directory = BTreeMap::new();
@@ -1774,6 +1794,59 @@ pub fn directory_record(
 mod tests {
     use super::*;
     use crate::LockUnpoisoned;
+
+    /// ADR 0155 §1: departure is retained rather than discarded. A tombstone's
+    /// only effect used to be that the record vanished, which is why a serving
+    /// Home could not re-send a retraction it had already applied locally, and
+    /// why a recipient could never carry one to its other devices.
+    #[test]
+    fn a_departure_is_retained_beside_the_live_route_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(dir.path()).unwrap();
+        let mut guard = shared.lock_unpoisoned();
+
+        let live = HomeRouteRecord {
+            id: "project".into(),
+            op: RecordOp::Upsert,
+            home_id: gaugedesk_core::ids::HomeId::new("home:theirs"),
+            endpoint: "https://theirs.example".into(),
+            relay: None,
+            author_authority: String::new(),
+            author_root_pubkey: String::new(),
+            author_signature: None,
+        };
+        guard
+            .write_account_record_in(ACCOUNT_SCOPE, "home_route", &live.id, &live)
+            .unwrap();
+        let account = Account::rebuild(guard.store_ref()).unwrap();
+        assert!(account.home_routes.contains_key("project"));
+        assert!(account.departed_home_routes.is_empty());
+
+        // The live fold keeps its exact previous meaning — the route leaves
+        // `home_routes` — and the departure is now answerable as well.
+        let departed = HomeRouteRecord {
+            op: RecordOp::Tombstone,
+            ..live.clone()
+        };
+        guard
+            .write_account_record_in(ACCOUNT_SCOPE, "home_route", &departed.id, &departed)
+            .unwrap();
+        let account = Account::rebuild(guard.store_ref()).unwrap();
+        assert!(!account.home_routes.contains_key("project"));
+        assert_eq!(account.departed_home_routes.get("project"), Some(&departed));
+
+        // "Retracted now", never "ever retracted": a re-grant supersedes it by
+        // position order, exactly as any later record does.
+        guard
+            .write_account_record_in(ACCOUNT_SCOPE, "home_route", &live.id, &live)
+            .unwrap();
+        let account = Account::rebuild(guard.store_ref()).unwrap();
+        assert!(account.home_routes.contains_key("project"));
+        assert!(
+            !account.departed_home_routes.contains_key("project"),
+            "a project that came back is not still departed"
+        );
+    }
 
     /// A fixed account key for the sealing tests (stands in for the seed-derived key the
     /// [`Workbench::account_key`] resolver hands the sealing primitives at runtime).

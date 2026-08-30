@@ -260,10 +260,18 @@ impl crate::Workbench {
         let signing_key = crate::key_store::FileKeyStore::new(self.root_path().join("keys"))
             .signing_key(self.authority());
         let acct = Account::rebuild(self.store_ref()).ok()?;
+        // Live routes this root may speak for, plus the retractions it may
+        // carry onward (ADR 0155 §3). A retraction is a signed statement with
+        // the same standing as the route it retracts, and travels the same way.
         let home_routes = acct
             .home_routes
             .values()
             .filter(|record| republishable(record))
+            .chain(
+                acct.departed_home_routes
+                    .values()
+                    .filter(|record| publishable_retraction(record)),
+            )
             .cloned()
             .map(Into::into)
             .collect();
@@ -416,7 +424,16 @@ impl crate::Workbench {
             }
             let merged = crate::account::HomeRouteRecord {
                 id: route.project.clone(),
-                op: crate::account::RecordOp::Upsert,
+                // A proven author, no endpoint, no relay: that is a retraction,
+                // and it is the same shape the federation channel already reads
+                // as one (ADR 0155 §4). Folding it as a live route would state
+                // something no author ever said — a route with no way to reach
+                // what it names.
+                op: if is_retraction_shape(route) {
+                    crate::account::RecordOp::Tombstone
+                } else {
+                    crate::account::RecordOp::Upsert
+                },
                 home_id: route.home_id.clone(),
                 endpoint: route.endpoint.clone(),
                 relay: route.relay.clone(),
@@ -424,11 +441,15 @@ impl crate::Workbench {
                 author_root_pubkey: route.author_root_pubkey.clone(),
                 author_signature: route.author_signature.clone(),
             };
+            let carried_retraction = merged.op == crate::account::RecordOp::Tombstone;
             if self
                 .write_account_record_in(ACCOUNT_SCOPE, "home_route", &merged.id, &merged)
                 .is_ok()
             {
                 reconcile.written += 1;
+                if carried_retraction {
+                    reconcile.retracted += 1;
+                }
             }
         }
 
@@ -515,6 +536,27 @@ fn claims_an_author(route: &crate::home::OpaqueHomeRoute) -> bool {
     !route.author_authority.is_empty()
         || !route.author_root_pubkey.is_empty()
         || route.author_signature.is_some()
+}
+
+/// Whether a route *is* a retraction: it names a project and a Home and offers no
+/// way to reach either. This is what the federation channel signs when a Home
+/// departs, and `home_route_signing_bytes` covers both fields, so the shape can be
+/// neither forged nor stripped back into a live route.
+fn is_retraction_shape(route: &crate::home::OpaqueHomeRoute) -> bool {
+    route.endpoint.is_empty() && route.relay.is_none()
+}
+
+/// Whether a retained tombstone may be published into the directory snapshot
+/// (ADR 0155 §3, §5).
+///
+/// Only a **proven third-party** retraction travels. A Home's own departure is
+/// already published by absence under ADR 0154 §2 and needs no explicit statement;
+/// putting one on the wire would say the same thing twice, and say it in the one
+/// form this root has no standing to author. So the tombstone must claim an author
+/// and that claim must hold — the same test its live counterpart passes.
+fn publishable_retraction(record: &crate::account::HomeRouteRecord) -> bool {
+    let route = crate::home::OpaqueHomeRoute::from(record.clone());
+    claims_an_author(&route) && is_retraction_shape(&route) && authorship_holds(&route)
 }
 
 /// Whether this device may re-sign `record` into its next directory publish.
@@ -836,6 +878,163 @@ mod tests {
             .store_ref()
             .records(ACCOUNT_SCOPE, "home_route")
             .is_ok());
+    }
+
+    /// ADR 0155: a retraction is a signed statement with the same standing as the
+    /// route it retracts, so it is retained and republished exactly like one.
+    /// Before this, a recipient's tombstone folded out of the projection and had
+    /// nowhere to live, so the retraction reached no other device — ever.
+    #[test]
+    fn a_proven_retraction_is_carried_onward_and_applied_as_one() {
+        use crate::account::{RecordOp, ACCOUNT_SCOPE};
+        use crate::LockUnpoisoned;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(dir.path()).unwrap();
+        let mut guard = shared.lock_unpoisoned();
+        let root_key = crate::key_store::FileKeyStore::new(guard.root_path().join("keys"))
+            .signing_key(guard.authority());
+
+        // Exactly what a serving Home signs when it departs a shared project:
+        // the route, with its reachability cleared, under its own governance root.
+        let serving = SigningKey::from_seed(&[5u8; 32]).unwrap();
+        let retraction = crate::home::sign_home_route(
+            "root-p256:serving",
+            crate::home::OpaqueHomeRoute {
+                project: "project-shared".into(),
+                home_id: gaugedesk_core::ids::HomeId::new("home:theirs"),
+                endpoint: String::new(),
+                relay: None,
+                author_authority: String::new(),
+                author_root_pubkey: String::new(),
+                author_signature: None,
+            },
+            &serving,
+        )
+        .unwrap();
+        assert!(
+            crate::home::shared_home_route_verifies(&retraction),
+            "the retraction proves itself, so it can travel a channel that trusts nobody"
+        );
+
+        // It arrives in a record this account's own root signed, as it would
+        // from a sibling device that received it over the federation channel.
+        let entry = DirectoryEntry {
+            generation: 1,
+            directory: directory_record(
+                root_key.public_key().as_str(),
+                &seeded_account(),
+                vec![],
+                vec![retraction.clone()],
+            ),
+            sealed_blob: String::new(),
+            retracted: false,
+        };
+        let put = gaugedesk_directory_protocol::sign_entry(entry, &root_key).unwrap();
+        let applied = guard.library_sync_reconcile_routes(&FetchedRecord {
+            entry: put.entry,
+            signature: Some(put.signature),
+        });
+
+        // §4: it folds as a retraction, not as a live route with nowhere to go.
+        assert_eq!(applied.retracted, 1);
+        let account = Account::rebuild(guard.store_ref()).unwrap();
+        assert!(
+            !account.home_routes.contains_key("project-shared"),
+            "a proven retraction removes the route it names"
+        );
+
+        // §1: and the departure is *retained*, which is what gives it somewhere
+        // to live between arriving and being carried onward.
+        let held = account
+            .departed_home_routes
+            .get("project-shared")
+            .expect("the departure is retained, not discarded");
+        assert_eq!(held.op, RecordOp::Tombstone);
+        assert!(crate::home::shared_home_route_verifies(
+            &crate::home::OpaqueHomeRoute::from(held.clone())
+        ));
+
+        // §3: the next publish carries it, so this account's other devices learn
+        // it — the path that did not exist at all before.
+        guard
+            .write_account_record_in(
+                ACCOUNT_SCOPE,
+                "facility",
+                "library-sync",
+                &serde_json::json!({
+                    "id": "library-sync",
+                    "op": "upsert",
+                    "kind": "library_sync",
+                    "status": "active",
+                }),
+            )
+            .unwrap();
+        let published = guard
+            .library_sync_signed_put(1)
+            .expect("library sync is active, so the publish is built");
+        let carried = published
+            .entry
+            .directory
+            .home_routes
+            .iter()
+            .find(|route| route.project == "project-shared")
+            .expect("the retraction is published alongside live routes");
+        assert!(
+            is_retraction_shape(carried),
+            "and it travels as a retraction"
+        );
+        assert!(
+            crate::home::shared_home_route_verifies(carried),
+            "still under its own author's signature, which the recipient checks"
+        );
+    }
+
+    /// §5: a Home's own departure is already published by absence (ADR 0154 §2).
+    /// Putting it on the wire would say the same thing twice, in the one form
+    /// this root has no standing to author.
+    #[test]
+    fn an_unattested_departure_stays_off_the_wire() {
+        use crate::account::{HomeRouteRecord, RecordOp, ACCOUNT_SCOPE};
+
+        let departed = HomeRouteRecord {
+            id: "project-own".into(),
+            op: RecordOp::Tombstone,
+            home_id: gaugedesk_core::ids::HomeId::new("home:mine"),
+            // `author_home_routes` keeps the departed route's reachability on the
+            // tombstone, so this is not even retraction-shaped.
+            endpoint: "https://mine.example".into(),
+            relay: None,
+            author_authority: String::new(),
+            author_root_pubkey: String::new(),
+            author_signature: None,
+        };
+        assert!(!publishable_retraction(&departed));
+
+        let bare = HomeRouteRecord {
+            endpoint: String::new(),
+            ..departed
+        };
+        assert!(
+            !publishable_retraction(&bare),
+            "retraction-shaped is not enough — an unattested one is absence's job"
+        );
+
+        // And a claimed author that does not hold may not be carried either, for
+        // the same reason its live counterpart may not: this root would be
+        // signing a statement it was never in a position to make.
+        let forged = HomeRouteRecord {
+            id: "project-forged".into(),
+            op: RecordOp::Tombstone,
+            home_id: gaugedesk_core::ids::HomeId::new("home:theirs"),
+            endpoint: String::new(),
+            relay: None,
+            author_authority: "root-p256:someone-else".into(),
+            author_root_pubkey: "root-p256:someone-else".into(),
+            author_signature: None,
+        };
+        assert!(!publishable_retraction(&forged));
+        let _ = ACCOUNT_SCOPE;
     }
 
     /// ADR 0154: the record is a snapshot of the routes it owns, so its silence
