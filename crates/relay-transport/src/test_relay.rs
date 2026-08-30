@@ -56,11 +56,15 @@ struct Route {
 struct RelayState {
     next_id: u64,
     routes: HashMap<String, Route>,
+    /// While set, one-shot legs are refused and any already-parked one-shot leg
+    /// is evicted. See [`TestRelay::disrupt_one_shot`].
+    disrupt_one_shot: bool,
 }
 
 /// A loopback-only WSS relay. Dropping it aborts the listener task.
 pub struct TestRelay {
     endpoint: String,
+    state: Arc<Mutex<RelayState>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -69,10 +73,52 @@ impl TestRelay {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let endpoint = format!("ws://{address}");
+        let state = Arc::new(Mutex::new(RelayState::default()));
+        let served = Arc::clone(&state);
         let task = tokio::spawn(async move {
-            let _ = serve(listener).await;
+            let _ = serve_with(listener, served).await;
         });
-        Ok(Self { endpoint, task })
+        Ok(Self {
+            endpoint,
+            state,
+            task,
+        })
+    }
+
+    /// Stop carrying **one-shot** legs, and evict any that are parked.
+    ///
+    /// One-shot legs are the request/response messages a control plane sends
+    /// peer-to-peer — a handoff offer, its reply, a shared-route update. Durable
+    /// legs (a Home's parked relay leg and the clients tunnelling to it) are
+    /// untouched, so this severs peer messaging without taking the fabric down.
+    ///
+    /// It exists because a protocol's interesting failures are the ones where a
+    /// *single* message is lost while everything else keeps working, and until
+    /// now a test could only take the whole broker away — which is a different
+    /// failure, and one both parties can see. Evicting parked legs as well as
+    /// refusing new ones is what makes the disruption observable promptly rather
+    /// than at the far end of the thirty-second wait.
+    pub async fn disrupt_one_shot(&self) {
+        let mut guard = self.state.lock().await;
+        guard.disrupt_one_shot = true;
+        let parked: Vec<String> = guard
+            .routes
+            .iter()
+            .filter(|(_, route)| route.family == Family::OneShot && route.pending.is_some())
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        for handle in parked {
+            if let Some(route) = guard.routes.get_mut(&handle) {
+                if let Some(mut pending) = route.pending.take() {
+                    let _ = refuse(&mut pending.socket, "relay one-shot legs are disrupted").await;
+                }
+            }
+        }
+    }
+
+    /// Carry one-shot legs again. A peer that was retrying reconnects on its own.
+    pub async fn restore_one_shot(&self) {
+        self.state.lock().await.disrupt_one_shot = false;
     }
 
     pub fn endpoint(&self) -> &str {
@@ -88,7 +134,10 @@ impl Drop for TestRelay {
 
 /// Serve the hermetic WSS relay forever on an already-bound listener.
 pub async fn serve(listener: TcpListener) -> std::io::Result<()> {
-    let state = Arc::new(Mutex::new(RelayState::default()));
+    serve_with(listener, Arc::new(Mutex::new(RelayState::default()))).await
+}
+
+async fn serve_with(listener: TcpListener, state: Arc<Mutex<RelayState>>) -> std::io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let state = Arc::clone(&state);
@@ -140,6 +189,10 @@ async fn accept_leg(stream: TcpStream, state: Arc<Mutex<RelayState>>) -> std::io
 
     let pair = {
         let mut guard = state.lock().await;
+        if guard.disrupt_one_shot && family(handshake.role) == Family::OneShot {
+            drop(guard);
+            return refuse(&mut socket, "relay one-shot legs are disrupted").await;
+        }
         let id = guard.next_id;
         guard.next_id = guard.next_id.wrapping_add(1);
         match admit(&mut guard.routes, handle, handshake) {

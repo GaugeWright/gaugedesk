@@ -324,6 +324,100 @@ async fn a_project_home_relocates_to_a_paired_peer_with_its_log() {
     assert!(inc2["incoming"].as_array().unwrap().is_empty());
 }
 
+/// ADR 0156 §2–§3, end to end: the target commits, its `Committed` never arrives,
+/// and the origin resolves the handoff by **asking** on reconnect.
+///
+/// This is the window FED-13 was opened for, and it needed a relay that can lose a
+/// *single* message while everything else keeps working — taking the whole broker
+/// away is a different failure, and one both sides can see.
+#[tokio::test]
+async fn a_lost_commit_notice_is_resolved_by_asking_the_peer_on_reconnect() {
+    let (broker, relay) = start_broker().await;
+    let (alice, alice_wb, _ra) = instance("alice", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
+
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    {
+        let mut g = alice_wb.lock().unwrap();
+        g.store_mut()
+            .append_record(
+                "library",
+                "project",
+                r#"{"id":"engagement-1","op":"upsert","name":"Acme","is_default":false,"home_id":"home:alice","network_isolated":false}"#,
+            )
+            .unwrap();
+        g.store_mut()
+            .append_record("project_log::engagement-1", "event", r#"{"ev":"created"}"#)
+            .unwrap();
+        g.rebuild_library();
+    }
+
+    // The offer crosses and lands pending bob's consent; alice stays home.
+    let (status, body) = post(
+        &alice,
+        "/federation/handoff/relocate",
+        json!({ "project": "engagement-1", "peer": "bob" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["phase"], "offered");
+
+    // Lose exactly the reply. Peer messaging is severed; the fabric is untouched.
+    relay.disrupt_one_shot().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (sa, ba) = post(
+        &bob,
+        "/federation/handoff/accept",
+        json!({ "project": "engagement-1", "source": "alice" }),
+    )
+    .await;
+    assert_eq!(sa, StatusCode::OK, "bob commits regardless: {ba}");
+    assert_eq!(ba["home_target"], true, "bob is home");
+
+    // The disagreement, made real: bob is home and alice does not know.
+    let (_, mid) = get(&alice, "/federation/handoff/status?project=engagement-1").await;
+    assert_eq!(
+        mid["home_origin"], true,
+        "alice still believes it is home — two Homes for one project: {mid}"
+    );
+
+    // Reconnect. Alice's receiver loop asks before it parks again.
+    relay.restore_one_shot().await;
+    let resolved = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (_, s) = get(&alice, "/federation/handoff/status?project=engagement-1").await;
+            if s["home_origin"] == false {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect(
+        "alice must resolve the handoff by asking, not wait for a message that will never come",
+    );
+
+    assert_eq!(
+        resolved["phase"], "committed",
+        "alice commits its side from the answer: {resolved}"
+    );
+    assert_eq!(
+        resolved["home_origin"], false,
+        "and releases the project it had already given away: {resolved}"
+    );
+    assert!(
+        bob_wb
+            .lock()
+            .unwrap()
+            .project_home_id("engagement-1")
+            .is_some(),
+        "bob keeps it throughout — the resolution only ever moved alice toward releasing"
+    );
+}
+
 /// ADR 0156 §1: a transport failure *after* the offer is on the wire does not say
 /// whether the target got it — and the old path resolved that ambiguity by
 /// assuming failure, then deleted the pending state that would have let anything
