@@ -91,7 +91,7 @@ export {
     MANAGED_PLAN_PREFIX,
 } from "./deployment-funding";
 export type { FundingDraft, FundingFields, FundingMode } from "./deployment-funding";
-export { EnvironmentDocumentView } from "./EnvironmentDocumentView";
+export { BUILTIN_COMPONENTS, EnvironmentDocumentView } from "./EnvironmentDocumentView";
 export type {
     EnvironmentComplexView,
     EnvironmentComplexViewProps,
@@ -105,6 +105,21 @@ export {
     parseEnvironmentView,
     resolveDocumentPath,
 } from "./environment-view";
+export {
+    TOKENWRIGHT_COMMANDS,
+    TOKENWRIGHT_HELP_SOURCES,
+    TOKENWRIGHT_MANIFEST,
+    TOKENWRIGHT_SCHEMAS,
+    TOKENWRIGHT_VIEW_SOURCES,
+    tokenwrightViewRegistry,
+} from "./tokenwright-environment";
+export type { TokenWrightCommandDeclaration } from "./tokenwright-environment";
+export {
+    setTokenWrightDesired,
+    tokenwrightCommandsFrom,
+    tokenwrightRegistryFor,
+} from "./tokenwright-box";
+export type { TokenWrightCommandBinding } from "./tokenwright-box";
 export type {
     EnvironmentDocumentBinding,
     EnvironmentManifest,

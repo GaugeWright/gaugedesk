@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "id": "tokenwright.inference",
+      "path": "inference.json",
+      "schema": "gw://schemas/tokenwright/inference/v1",
+      "view": "views/inference.mdx",
+      "help": "help/inference.md"
+    },
+    {
+      "id": "tokenwright.posture",
+      "path": "posture.json",
+      "schema": "gw://schemas/tokenwright/posture/v1",
+      "view": "views/posture.mdx",
+      "help": "help/posture.md"
+    },
+    {
+      "id": "tokenwright.access",
+      "path": "access.json",
+      "schema": "gw://schemas/tokenwright/access/v1",
+      "view": "views/access.mdx",
+      "help": "help/access.md"
+    }
+  ]
+}

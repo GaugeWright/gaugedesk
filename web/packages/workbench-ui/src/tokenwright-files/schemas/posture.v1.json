@@ -1,0 +1,395 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gw://schemas/tokenwright/posture/v1",
+  "title": "TokenWright server posture projection",
+  "description": "What this box looks like to an attacker who has not yet got in. Read-only, secret-free: no key material, no authorized_keys content, no credential. The box reports its own posture, so this is evidence for an operator, not proof against a compromised host.",
+  "type": "object",
+  "required": [
+    "checked_at",
+    "summary",
+    "findings",
+    "network",
+    "access",
+    "updates",
+    "storage",
+    "services",
+    "audit"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "checked_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "critical",
+        "warning",
+        "advisory",
+        "checks_passed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "critical": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "warning": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "advisory": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "checks_passed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "findings": {
+      "description": "Only actual problems. A clean box has an empty array, which is why checks_passed is reported separately \u2014 an empty list must not be ambiguous between 'nothing wrong' and 'nothing checked'.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "severity",
+          "title",
+          "remediation"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^POSTURE-[A-Z0-9-]+$"
+          },
+          "severity": {
+            "enum": [
+              "critical",
+              "warning",
+              "advisory"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "remediation": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string",
+            "description": "What the finding is about \u2014 a listener address, a unit name. Lets a check confirm the finding actually covers the thing it should."
+          }
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "required": [
+        "listeners",
+        "firewall",
+        "wireguard"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "listeners": {
+          "description": "Every listening socket on the box. Two exposures are legitimate: `loopback` for the engine and the management surface, and `wireguard` for the model surface offered to the operator's own tools. `private` or `public` means something is reachable from an ordinary network and is always a finding.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "address",
+              "process",
+              "exposure",
+              "expected"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "address": {
+                "type": "string"
+              },
+              "process": {
+                "type": "string"
+              },
+              "exposure": {
+                "enum": [
+                  "loopback",
+                  "wireguard",
+                  "private",
+                  "public"
+                ]
+              },
+              "expected": {
+                "type": "boolean",
+                "description": "Whether the package put this listener here."
+              }
+            }
+          }
+        },
+        "firewall": {
+          "type": "object",
+          "required": [
+            "backend",
+            "active",
+            "default_incoming",
+            "allow_rules"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "backend": {
+              "type": "string"
+            },
+            "active": {
+              "type": "boolean"
+            },
+            "default_incoming": {
+              "enum": [
+                "deny",
+                "reject",
+                "allow",
+                "unknown"
+              ]
+            },
+            "allow_rules": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Inbound allow rules beyond the WireGuard listen port. The relay leg needs none: it dials out."
+            }
+          }
+        },
+        "wireguard": {
+          "type": "object",
+          "description": "The direct model-surface path, for the operator's own OpenAI-compatible tools. Off by default; GaugeDesk uses the relay and needs none of this.",
+          "required": [
+            "enabled",
+            "interface",
+            "listen_port",
+            "peers",
+            "public_key"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "interface": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "listen_port": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "peers": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Configured peers. Each is a device the operator added."
+            },
+            "public_key": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "The box's WireGuard public key. Not a secret \u2014 it is what a peer needs."
+            }
+          }
+        }
+      }
+    },
+    "access": {
+      "type": "object",
+      "required": [
+        "ssh"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "ssh": {
+          "type": "object",
+          "required": [
+            "installed",
+            "running",
+            "port",
+            "password_authentication",
+            "permit_root_login"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "installed": {
+              "type": "boolean"
+            },
+            "running": {
+              "type": "boolean"
+            },
+            "port": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "password_authentication": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "permit_root_login": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "updates": {
+      "type": "object",
+      "required": [
+        "unattended_upgrades",
+        "security_updates_pending",
+        "reboot_required",
+        "engine_pin",
+        "engine_installed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "unattended_upgrades": {
+          "type": "boolean"
+        },
+        "security_updates_pending": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reboot_required": {
+          "type": "boolean"
+        },
+        "engine_pin": {
+          "type": "string",
+          "description": "The FreeToken version this package pins."
+        },
+        "engine_installed": {
+          "type": "string"
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "required": [
+        "state_root_encrypted",
+        "weights_verified",
+        "weights_format"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state_root_encrypted": {
+          "type": "boolean",
+          "description": "Whether the box's state root sits on an encrypted volume. Matters for a stolen disk, not for a live compromise."
+        },
+        "weights_verified": {
+          "type": "boolean",
+          "description": "Whether every model on the box matched its recorded digest at last check."
+        },
+        "weights_format": {
+          "enum": [
+            "safetensors",
+            "mixed",
+            "pickle"
+          ],
+          "description": "pickle or mixed means at least one model deserializes executable code on load."
+        }
+      }
+    },
+    "services": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "unit",
+          "state",
+          "user",
+          "no_new_privileges",
+          "protect_system",
+          "network_restricted"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "unit": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "inactive",
+              "failed"
+            ]
+          },
+          "user": {
+            "type": "string"
+          },
+          "no_new_privileges": {
+            "type": "boolean"
+          },
+          "protect_system": {
+            "type": "string"
+          },
+          "network_restricted": {
+            "type": "boolean",
+            "description": "IPAddressDeny=any with localhost allowed."
+          }
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "description": "The box's own command trail, and how much of it has been put somewhere the box cannot reach. Chaining detects an edit; anchoring is what makes the detection survive the box being the one that edited.",
+      "required": [
+        "entries",
+        "head",
+        "chain_verified",
+        "anchored_count",
+        "last_anchored_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "head": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Hex SHA-256 of the newest entry. Null for an empty log."
+        },
+        "chain_verified": {
+          "type": "boolean",
+          "description": "Whether every link held at the last walk."
+        },
+        "anchored_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Entries covered by a head the paired Home has already recorded. Never more than `entries`."
+        },
+        "last_anchored_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

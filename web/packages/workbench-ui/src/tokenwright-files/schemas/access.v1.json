@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gw://schemas/tokenwright/access/v1",
+  "title": "TokenWright access projection",
+  "description": "How this box is reached and who holds a key to it. Admin-gated: a list of key names and where the box answers is reconnaissance. Secret-free with exactly one deliberate exception, `reveal`, described on that field.",
+  "type": "object",
+  "required": ["desired", "pairing", "relay", "direct", "keys", "reveal"],
+  "additionalProperties": false,
+  "properties": {
+    "desired": {
+      "description": "The keys this box should hold, by name. The box mints what is missing and revokes what is dropped. Names, never values.",
+      "type": "object",
+      "required": ["keys"],
+      "additionalProperties": false,
+      "properties": {
+        "keys": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "One name per client that uses this box. Per-client so that revoking an editor's key does not also cut off the paired Home."
+        }
+      }
+    },
+    "pairing": {
+      "description": "The Home this box serves. There is no state field here and no `unpaired` value: an unpaired box does not answer the management surface at all, so a document that could be read is by construction a document from a paired box.",
+      "type": "object",
+      "required": ["home", "paired_at", "fingerprint"],
+      "additionalProperties": false,
+      "properties": {
+        "home": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The Home that claimed this box. One at a time \u2014 a second Home does not pair alongside the first, it claims a box that has been unpaired."
+        },
+        "paired_at": { "type": "string", "format": "date-time" },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "The box's own certificate fingerprint, pinned by the Home when it claimed the box. Not a secret: it is what the Home compares against, and a change is an alarm rather than an update. Projected for comparison by eye only \u2014 the Home pins what the transport presented, never a field the box authors about itself."
+        }
+      }
+    },
+    "relay": {
+      "description": "The path GaugeDesk uses. The box dials out; nothing here is an address anyone can connect to.",
+      "type": "object",
+      "required": ["status", "endpoint", "route_epoch", "last_connected_at"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "enum": ["parked", "dialing", "down"] },
+        "endpoint": { "type": "string" },
+        "route_epoch": { "type": "integer", "minimum": 1 },
+        "last_connected_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "direct": {
+      "description": "The WireGuard path, for the operator's own OpenAI-compatible tools. GaugeDesk never uses it.",
+      "type": "object",
+      "required": ["enabled", "base_url"],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "base_url": { "type": ["string", "null"], "description": "What to paste into a tool. Null when direct access is off." }
+      }
+    },
+    "keys": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "prefix", "created_at", "last_used_at", "state"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "prefix": { "type": "string", "description": "First few characters, enough to match a key against a client's configuration and not enough to use." },
+          "created_at": { "type": "string", "format": "date-time" },
+          "last_used_at": { "type": ["string", "null"], "format": "date-time", "description": "Null means never used, which for an old key is worth noticing." },
+          "state": { "enum": ["active", "revoked"] }
+        }
+      }
+    },
+    "reveal": {
+      "description": "The one place a secret appears, and it is deliberate. A key is useless if its value is never shown, so a freshly minted key is carried here until the operator acknowledges it, after which it is null forever. It is held rather than cleared on read, so reading a document has no side effect and the value cannot be missed. This crosses the management surface, which is end-to-end encrypted to a principal already holding administrative capability over the box.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["key_id", "secret"],
+          "additionalProperties": false,
+          "properties": {
+            "key_id": { "type": "string" },
+            "secret": { "type": "string" }
+          }
+        }
+      ]
+    }
+  }
+}

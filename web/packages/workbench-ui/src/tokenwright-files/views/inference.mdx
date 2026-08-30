@@ -1,0 +1,53 @@
+# Inference
+
+<Notice text="The engine is reached through the relay leg this box dials out to. Nothing about it is published to the network." />
+
+<Grid columns="3"><Field label="Engine" value="engine.name" /><Field label="Version" value="engine.version" /><Field label="Status" value="engine.status" /><Field label="Listening on" value="engine.listen" /><Field label="Uptime" value="engine.uptime" /><Metric label="Restarts" value="engine.restarts" /></Grid>
+
+<Grid columns="1"><Field label="Last error" value="engine.last_error" /></Grid>
+
+## Model
+
+The engine reconciles toward the requested model. To change it, open this
+document's literal JSON and edit the `desired` block — the view shows state and
+runs controls, it has no editable fields of its own. That edit enters the same
+admission path as the controls below.
+
+<Grid columns="3"><Field label="Requested" value="desired.model" /><Field label="Autostart" value="desired.autostart" /><Field label="Direct access" value="desired.direct_access" /><Field label="Loaded" value="model.id" /><Field label="Quantization" value="model.quantization" /><Metric label="Context length" value="model.context_length" /><Metric label="Weights (MiB)" value="model.size_mib" /><Field label="Loaded at" value="model.loaded_at" /></Grid>
+
+<Grid columns="1"><Field label="Declared" value="desired.models" /></Grid>
+
+A box holds the models it was told to hold. Adding an id and applying fetches
+it; removing one does not delete anything — the model becomes `orphaned` and
+waits for a prune, because a list is a poor place to lose several hundred
+gigabytes to a typo.
+
+<Table value="models" columns="id,size_mib,quantization,state,digest_verified" />
+
+<Grid columns="3"><Metric label="Disk free (MiB)" value="storage.disk_free_mib" /><Metric label="Disk total (MiB)" value="storage.disk_total_mib" /><Metric label="Reclaimable (MiB)" value="storage.orphaned_mib" /></Grid>
+
+<Grid columns="2"><Command id="tokenwright.models.reconcile" label="Fetch declared models" /><Command id="tokenwright.models.prune" label="Free orphaned models" /></Grid>
+
+## Hardware
+
+<Grid columns="3"><Field label="GPU" value="hardware.gpu" /><Field label="Driver" value="hardware.driver" /><Field label="CUDA" value="hardware.cuda" /><Metric label="VRAM used (MiB)" value="hardware.vram_used_mib" /><Metric label="VRAM total (MiB)" value="hardware.vram_total_mib" /><Metric label="System RAM (MiB)" value="hardware.ram_total_mib" /></Grid>
+
+## Throughput
+
+There is no queue. The engine admits up to its concurrency limit and rejects
+beyond it, so a rising rejection count means the box is under-sized rather than
+merely busy — latency stays honest instead of absorbing the overload silently.
+
+<Grid columns="4"><Metric label="Tokens/sec" value="throughput.tokens_per_second" /><Metric label="Active" value="throughput.active_requests" /><Metric label="Concurrency limit" value="throughput.max_concurrent" /><Metric label="Rejected (overload)" value="throughput.rejected_overload_total" /></Grid>
+
+<Grid columns="1"><Metric label="Requests served" value="throughput.requests_total" /></Grid>
+
+## Control
+
+<Grid columns="3"><Command id="tokenwright.engine.start" label="Start engine" /><Command id="tokenwright.engine.stop" label="Stop engine" /><Command id="tokenwright.engine.restart" label="Restart engine" /><Command id="tokenwright.model.reconcile" label="Apply requested model" /><Command id="tokenwright.model.unload" label="Unload model" /><Command id="tokenwright.engine.update" label="Update engine" /></Grid>
+
+## Recent activity
+
+<Notice tone="warning" text="Lifecycle events only. Request and response content never enters this document." />
+
+<Table value="events" columns="at,level,message" />

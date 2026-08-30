@@ -1,0 +1,57 @@
+# Server posture
+
+<Notice text="What this box looks like to an attacker who has not got in yet. The box reports on itself, so this is evidence for you rather than proof against a compromised host." />
+
+<Grid columns="4"><Metric label="Critical" value="summary.critical" /><Metric label="Warning" value="summary.warning" /><Metric label="Advisory" value="summary.advisory" /><Metric label="Checks passed" value="summary.checks_passed" /></Grid>
+
+<Grid columns="1"><Field label="Last checked" value="checked_at" /></Grid>
+
+## Findings
+
+<Table value="findings" columns="severity,id,title,remediation" />
+
+## Listening sockets
+
+The management surface is offered over the relay leg only, which dials out. The
+model surface is the only thing that listens, on loopback and — when direct
+access is on — the WireGuard interface. `private` or `public` on any row means
+something is reachable that should not be.
+
+<Table value="network.listeners" columns="address,process,exposure,expected" />
+
+<Grid columns="4"><Field label="Firewall" value="network.firewall.backend" /><Field label="Active" value="network.firewall.active" /><Field label="Default incoming" value="network.firewall.default_incoming" /><Metric label="Inbound allow rules" value="network.firewall.allow_rules" /></Grid>
+
+## Direct model access
+
+WireGuard carries the model surface to your own tools, which speak an
+OpenAI-compatible URL and not the relay. GaugeDesk does not use this path.
+
+<Grid columns="3"><Field label="Enabled" value="network.wireguard.enabled" /><Field label="Interface" value="network.wireguard.interface" /><Field label="Listen port" value="network.wireguard.listen_port" /><Metric label="Peers" value="network.wireguard.peers" /><Field label="Public key" value="network.wireguard.public_key" /></Grid>
+
+<Grid columns="2"><Command id="tokenwright.wireguard.enable" label="Enable direct access" /><Command id="tokenwright.wireguard.disable" label="Disable direct access" /></Grid>
+
+## Remote access
+
+<Grid columns="3"><Field label="SSH running" value="access.ssh.running" /><Field label="Port" value="access.ssh.port" /><Field label="Password auth" value="access.ssh.password_authentication" /><Field label="Root login" value="access.ssh.permit_root_login" /></Grid>
+
+## Patching
+
+<Grid columns="3"><Field label="Unattended upgrades" value="updates.unattended_upgrades" /><Metric label="Security updates pending" value="updates.security_updates_pending" /><Field label="Reboot required" value="updates.reboot_required" /><Field label="Engine pin" value="updates.engine_pin" /><Field label="Engine installed" value="updates.engine_installed" /></Grid>
+
+## Storage and weights
+
+<Grid columns="3"><Field label="State root encrypted" value="storage.state_root_encrypted" /><Field label="Weights match digests" value="storage.weights_verified" /><Field label="Weights format" value="storage.weights_format" /></Grid>
+
+## Command trail
+
+Every admitted command is chained to the one before it, and the head is reported
+to the paired Home. Chaining catches an edit; the Home holding an earlier head is
+what makes that catch survive the box being the editor.
+
+<Grid columns="3"><Metric label="Entries" value="audit.entries" /><Metric label="Anchored off-box" value="audit.anchored_count" /><Field label="Chain verified" value="audit.chain_verified" /><Field label="Last anchored" value="audit.last_anchored_at" /><Field label="Head" value="audit.head" /></Grid>
+
+## Services
+
+<Table value="services" columns="unit,state,user,no_new_privileges,protect_system,network_restricted" />
+
+<Command id="tokenwright.posture.rescan" label="Re-check now" />

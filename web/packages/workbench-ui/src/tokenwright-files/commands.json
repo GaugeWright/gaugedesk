@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "note": "The command set this box's Home advertises through authenticated discovery. The View may reference these ids; referencing one grants nothing. The Home owns authorization, base/freshness checks, idempotency, and the receipt. A command absent from discovery for the current session renders as an inert 'Unavailable in this session' control.",
+  "commands": [
+    {
+      "id": "tokenwright.engine.start",
+      "label": "Start engine",
+      "effect": "Starts the engine.",
+      "idempotent": true,
+      "refuses_when": "status is running or updating"
+    },
+    {
+      "id": "tokenwright.engine.stop",
+      "label": "Stop engine",
+      "effect": "Stops the engine. In-flight requests fail; none are queued across the boundary.",
+      "idempotent": true,
+      "refuses_when": "status is stopped"
+    },
+    {
+      "id": "tokenwright.engine.restart",
+      "label": "Restart engine",
+      "effect": "Stops and starts the unit in one admitted action.",
+      "idempotent": false,
+      "refuses_when": "status is updating"
+    },
+    {
+      "id": "tokenwright.model.reconcile",
+      "label": "Apply requested model",
+      "effect": "Loads desired.model, unloading the current one first. Long-running; status becomes starting.",
+      "idempotent": true,
+      "refuses_when": "desired.model is already loaded, or is not present in models"
+    },
+    {
+      "id": "tokenwright.model.unload",
+      "label": "Unload model",
+      "effect": "Frees VRAM and sets desired.model to null.",
+      "idempotent": true,
+      "refuses_when": "no model is loaded"
+    },
+    {
+      "id": "tokenwright.engine.update",
+      "label": "Update engine",
+      "effect": "Starts tokenwright-update.service, which installs the pinned version and restarts the engine. The pin is fixed by the package and cannot be passed in.",
+      "idempotent": true,
+      "refuses_when": "the installed version already matches the pin"
+    },
+    {
+      "id": "tokenwright.posture.rescan",
+      "label": "Re-check now",
+      "effect": "Starts tokenwright-posture-scan.service, which re-runs every check and writes the result the supervisor projects.",
+      "idempotent": true,
+      "refuses_when": "a check is already running"
+    },
+    {
+      "id": "tokenwright.wireguard.enable",
+      "label": "Enable direct access",
+      "effect": "Sets desired.direct_access and brings up tokenwright-wg.service. Survives reboot. GaugeDesk does not use this path.",
+      "idempotent": true,
+      "refuses_when": "already enabled"
+    },
+    {
+      "id": "tokenwright.wireguard.disable",
+      "label": "Disable direct access",
+      "effect": "Clears desired.direct_access and takes tokenwright-wg.service down. Tools using it lose access; the relay path is unaffected.",
+      "idempotent": true,
+      "refuses_when": "already disabled"
+    },
+    {
+      "id": "tokenwright.models.reconcile",
+      "label": "Fetch declared models",
+      "effect": "Downloads every id in desired.models the box does not hold, verifying each against its recorded digest. Long-running.",
+      "idempotent": true,
+      "refuses_when": "every declared model is already present, or free disk would not hold what is missing"
+    },
+    {
+      "id": "tokenwright.models.prune",
+      "label": "Free orphaned models",
+      "effect": "Deletes every model dropped from desired.models. Nothing else is touched, and no argument selects what goes.",
+      "idempotent": true,
+      "refuses_when": "no model is orphaned"
+    },
+    {
+      "id": "tokenwright.key.acknowledge",
+      "label": "I have saved it",
+      "effect": "Clears the revealed secret. The value is not recoverable afterwards by any means.",
+      "idempotent": true,
+      "refuses_when": "no secret is pending"
+    },
+    {
+      "id": "tokenwright.unpair",
+      "label": "Unpair this box",
+      "effect": "Forgets the Home this box serves, revokes every key including the Home's own, and returns the box to its unpaired state. A fresh claim code is minted and printed on the box's console only; no route returns it, so whoever claims the box next has to be standing next to it.",
+      "idempotent": true,
+      "refuses_when": "nothing \u2014 an unpaired box does not answer the management surface at all, so this cannot be issued a second time"
+    }
+  ]
+}

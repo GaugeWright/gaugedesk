@@ -1,0 +1,326 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gw://schemas/tokenwright/inference/v1",
+  "title": "TokenWright inference projection",
+  "description": "Read-only projection of one TokenWright box's inference engine, except for the `desired` block. Secret-free by construction: no credential, token, endpoint outside loopback, prompt, completion, or request body may appear in any field.",
+  "type": "object",
+  "required": [
+    "desired",
+    "engine",
+    "model",
+    "models",
+    "hardware",
+    "storage",
+    "throughput",
+    "events"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "desired": {
+      "description": "The box's desired state, and the only editable block. The box reconciles toward it, including at boot \u2014 systemd's enablement state is not a second source of truth. A command that sets one of these fields writes it here and then reconciles, so a button and a literal edit cannot diverge.",
+      "type": "object",
+      "required": [
+        "model",
+        "models",
+        "autostart",
+        "direct_access"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Model id the engine should hold loaded. Null means unload. Must be one of `models` \u2014 a box cannot be asked to load something it was never asked to hold."
+        },
+        "autostart": {
+          "type": "boolean",
+          "description": "Whether the engine starts with the machine. The supervisor always does."
+        },
+        "direct_access": {
+          "type": "boolean",
+          "description": "Whether the WireGuard model surface is brought up. GaugeDesk never uses that path; this is for the operator's own tools."
+        },
+        "models": {
+          "type": "array",
+          "description": "The models this box should hold. The box downloads what is missing. Removing an id does not delete anything: the model becomes `orphaned` and is freed only by an explicit prune, because a declarative list is a poor place to lose four hundred gigabytes by a typo.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "engine": {
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "status",
+        "listen",
+        "uptime",
+        "restarts",
+        "last_error"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "const": "FreeToken"
+        },
+        "version": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "starting",
+            "stopped",
+            "failed",
+            "updating"
+          ],
+          "description": "When stopped or failed, `model` is null throughout and `throughput` is zeroed \u2014 engine facts cross a process boundary, so the document says the engine is down rather than showing stale values as live. `hardware` stays live; the supervisor reads it and does not need the engine."
+        },
+        "listen": {
+          "type": "string",
+          "description": "Loopback bind address of the engine itself. A non-loopback value is a defect, not a configuration; the WireGuard model surface is a separate listener reported in the posture document.",
+          "pattern": "^(127\\.0\\.0\\.1|\\[::1\\]):[0-9]{1,5}$"
+        },
+        "uptime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Human-readable, e.g. \"3d 14h\". Null when not running."
+        },
+        "restarts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Last lifecycle failure. Never a request-scoped error, which could carry content."
+        }
+      }
+    },
+    "model": {
+      "description": "The currently loaded model. All fields null when none is loaded.",
+      "type": "object",
+      "required": [
+        "id",
+        "quantization",
+        "context_length",
+        "size_mib",
+        "loaded_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quantization": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_length": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "size_mib": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "loaded_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "models": {
+      "description": "Models present on this box.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "size_mib",
+          "quantization",
+          "state",
+          "digest_verified"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "size_mib": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "quantization": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "loaded",
+              "available",
+              "downloading",
+              "incomplete",
+              "orphaned",
+              "quarantined"
+            ],
+            "description": "`orphaned` was dropped from desired.models and still occupies disk. `quarantined` failed its digest and will not be loaded."
+          },
+          "digest_verified": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the file matched its recorded digest at last check. Null while downloading."
+          }
+        }
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "required": [
+        "gpu",
+        "driver",
+        "cuda",
+        "vram_used_mib",
+        "vram_total_mib",
+        "ram_total_mib"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "gpu": {
+          "type": "string"
+        },
+        "driver": {
+          "type": "string"
+        },
+        "cuda": {
+          "type": "string"
+        },
+        "vram_used_mib": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "vram_total_mib": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ram_total_mib": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "throughput": {
+      "description": "Counts and rates only, never per-request detail. There is no queue by design: the engine admits up to max_concurrent and rejects beyond it at the API. rejected_overload_total is therefore a first-class signal, not an error count \u2014 a box that never rejects is under-loaded and one that rejects constantly is under-sized.",
+      "type": "object",
+      "required": [
+        "tokens_per_second",
+        "active_requests",
+        "max_concurrent",
+        "rejected_overload_total",
+        "requests_total"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "tokens_per_second": {
+          "type": "number",
+          "minimum": 0
+        },
+        "active_requests": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Concurrent generations admitted. Beyond this the API rejects rather than queues."
+        },
+        "rejected_overload_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Requests refused for being over max_concurrent."
+        },
+        "requests_total": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "events": {
+      "description": "Engine lifecycle events only \u2014 start, stop, model load/unload, update, hardware fault. A request-scoped log line may never be projected here: it can carry prompt or completion text.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "at",
+          "level",
+          "message"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "level": {
+            "enum": [
+              "info",
+              "warn",
+              "error"
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "description": "Capacity for model weights. Without this a download that fills the volume is invisible until something else fails.",
+      "required": [
+        "disk_total_mib",
+        "disk_free_mib",
+        "orphaned_mib"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "disk_total_mib": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "disk_free_mib": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "orphaned_mib": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Reclaimable by pruning orphans."
+        }
+      }
+    }
+  }
+}

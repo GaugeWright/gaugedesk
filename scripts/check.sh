@@ -54,6 +54,9 @@ run_contracts() {
     echo "== WhippleScript workstream host contract =="
     node scripts/check-whipplescript-workstream-contract.mjs
 
+    echo "== TokenWright Environment bundle =="
+    node scripts/check-tokenwright-environment.mjs
+
     # The updater endpoint is compiled into every shipped binary and cannot be
     # corrected for a client that already has it, so its mistakes are permanent
     # in the field and silent at build time. In particular an endpoint missing

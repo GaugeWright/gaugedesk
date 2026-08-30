@@ -1,0 +1,54 @@
+# Access
+
+<Notice tone="warning" text="This page names every key that can reach the box and where it answers. It is available only to a principal with administrative capability over the box." />
+
+## Pairing
+
+This box serves one Home, and pairing is the root of every other authorisation
+on it. The fingerprint is what the Home pinned when it claimed the box; it does
+not change, and a Home reporting a different one is an alarm rather than an
+update.
+
+<Grid columns="3"><Field label="Home" value="pairing.home" /><Field label="Paired" value="pairing.paired_at" /><Field label="Fingerprint" value="pairing.fingerprint" /></Grid>
+
+Unpairing forgets the Home, revokes every key including this one, and prints a
+new claim code on the box's console. Nothing returns that code over the network,
+so whoever claims the box next has to be standing next to it — which is the
+point, and is also why losing the Home without unpairing first means a trip to
+the box.
+
+<Command id="tokenwright.unpair" label="Unpair this box" />
+
+## Keys
+
+One key per client, so that revoking an editor's configuration does not also cut
+off the paired Home. Declare the names you want; the box mints what is missing
+and revokes what you remove.
+
+<Grid columns="1"><Field label="Declared" value="desired.keys" /></Grid>
+
+<Table value="keys" columns="name,prefix,state,created_at,last_used_at" />
+
+A key that has never been used, long after it was created, is either a client
+that was never configured or one that stopped. Both are worth removing.
+
+## A newly minted key
+
+A key is shown once. It stays here until you acknowledge it — reading this page
+does not consume it, and nothing else will ever show it again.
+
+<Grid columns="2"><Field label="Key" value="reveal.key_id" /><Field label="Secret" value="reveal.secret" /></Grid>
+
+<Command id="tokenwright.key.acknowledge" label="I have saved it" />
+
+## Where the box answers
+
+<Grid columns="2"><Field label="Relay" value="relay.status" /><Field label="Endpoint" value="relay.endpoint" /><Metric label="Route epoch" value="relay.route_epoch" /><Field label="Last connected" value="relay.last_connected_at" /></Grid>
+
+The relay is how GaugeDesk reaches the box, and the box dials out to it — the
+endpoint above is not an address anything can connect to.
+
+<Grid columns="2"><Field label="Direct access" value="direct.enabled" /><Field label="Base URL" value="direct.base_url" /></Grid>
+
+The base URL is what to paste into a tool that speaks an OpenAI-compatible
+endpoint. It is reachable only over WireGuard, and a key is still required.

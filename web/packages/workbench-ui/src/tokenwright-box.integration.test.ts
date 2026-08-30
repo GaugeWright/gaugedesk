@@ -1,0 +1,192 @@
+/** The client against a real TokenWright box.
+ *
+ * Everything else about this integration is checked against fixtures, which
+ * proves the shapes agree with what this repository *believes* the box sends.
+ * This drives an actual supervisor over HTTP, so a disagreement between the two
+ * repositories fails here rather than the first time an operator opens the panel.
+ *
+ * Skipped unless a TokenWright checkout is present, since that repository is not
+ * a dependency of this one. `TOKENWRIGHT_ROOT` overrides the default location.
+ */
+
+import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+    browserRouteJson,
+    openManagementEnvironment,
+    proposeManagementDocumentChange,
+    readManagementDocument,
+    submitManagementCommand,
+    type ManagementEnvironmentSession,
+} from "@gaugewright/control-plane-client";
+import { TOKENWRIGHT_MANIFEST, TOKENWRIGHT_SCHEMAS } from "./tokenwright-environment";
+import { tokenwrightCommandsFrom } from "./tokenwright-box";
+
+const ROOT = process.env.TOKENWRIGHT_ROOT ?? "/home/jack/code/TokenWright";
+const available = existsSync(join(ROOT, "src", "tokenwright", "__main__.py"));
+const port = 18999;
+const base = `http://127.0.0.1:${port}`;
+
+let box: ChildProcess | undefined;
+let state = "";
+let key = "";
+let session: ManagementEnvironmentSession;
+
+/** The real browser transport, pointed at the box.
+ *
+ * Deliberately not a hand-rolled `fetch` wrapper. The point of this test is that
+ * the client this repository ships reaches a real box, and a transport written
+ * for the test would be the one thing in the path that nobody ships. */
+const json = browserRouteJson(base, { bearer: () => key || null });
+
+async function run(command: string, args: readonly string[]): Promise<string> {
+    return await new Promise((resolve, reject) => {
+        const child = spawn(command, [...args], {
+            cwd: ROOT, env: { ...process.env, PYTHONPATH: "src" },
+        });
+        let out = "";
+        child.stdout.on("data", (chunk) => { out += String(chunk); });
+        child.stderr.on("data", (chunk) => { out += String(chunk); });
+        child.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(out))));
+    });
+}
+
+describe.skipIf(!available)("the client against a real TokenWright box", () => {
+    beforeAll(async () => {
+        state = await mkdtemp(join(tmpdir(), "tokenwright-it-"));
+        const printed = await run("python3", [
+            "-m", "tokenwright", "--state-root", state, "--schemas", "schemas",
+            "--no-systemd", "--print-claim-code",
+        ]);
+        const code = /([0-9A-Z]{4}(?:-[0-9A-Z]{4}){4})/u.exec(printed)?.[1];
+        if (!code) throw new Error(`no claim code in: ${printed}`);
+
+        box = spawn("python3", [
+            "-m", "tokenwright", "--state-root", state, "--schemas", "schemas",
+            "--loopback-port", String(port), "--no-systemd",
+        ], { cwd: ROOT, env: { ...process.env, PYTHONPATH: "src" } });
+
+        // An unpaired box refuses `/v1/models` with 409, and the transport
+        // raises on that — which is the signal that it is listening.
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+            try {
+                await json("GET", "/v1/models");
+                break;
+            } catch (error) {
+                if ((error as { status?: number }).status !== undefined) break;
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+        }
+
+        // Derive the claim proof the way the box does. The Home computes this;
+        // it never sends the code itself.
+        const proof = await run("python3", [
+            "-c", `from tokenwright.pairing import proof_for; print(proof_for(${JSON.stringify(code)}))`,
+        ]);
+        const claim = await json("POST", "/pair/claim", {
+            proof: proof.trim(),
+            home: { id: "home_integration", key: "home-root-key" },
+        }) as { key: { secret: string }; paired: { fingerprint: string } };
+        key = claim.key.secret;
+        expect(claim.paired.fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/u);
+
+        session = await openManagementEnvironment(json, "tokenwright");
+    }, 60_000);
+
+    afterAll(async () => {
+        box?.kill("SIGTERM");
+        if (state) await rm(state, { recursive: true, force: true });
+    });
+
+    it("opens a session the client can read", () => {
+        expect(session.environment).toBe("tokenwright");
+        expect(session.actor).toBe("paired-home");
+        expect(session.capabilities).toContain("AdministerBox");
+    });
+
+    it("grants exactly the documents this repository carries a View for", () => {
+        // The two repositories agreeing on the document set is the thing that
+        // silently rots. A box adding a document nobody carries a View for
+        // renders as generic JSON; one removing a document leaves a dead entry.
+        const granted = session.documents.map((document) => document.id).sort();
+        const carried = TOKENWRIGHT_MANIFEST.documents.map((document) => document.id).sort();
+        expect(granted).toEqual(carried);
+    });
+
+    it("serves documents the carried schemas admit", async () => {
+        for (const binding of TOKENWRIGHT_MANIFEST.documents) {
+            const document = await readManagementDocument(json, session, binding.id);
+            expect(document.schema, binding.id).toBe(binding.schema);
+            const validate = TOKENWRIGHT_SCHEMAS[binding.schema]!;
+            // If this fails, the panel would fall back to generic JSON in front
+            // of an operator, and the reason would not be visible anywhere.
+            expect(validate(document.content), `${binding.id} against ${binding.schema}`).toBe(true);
+        }
+    });
+
+    it("runs a granted command end to end", async () => {
+        const inference = await readManagementDocument(json, session, "tokenwright.inference");
+        const receipt = await submitManagementCommand(json, {
+            session_id: session.id, environment: "tokenwright", scope: session.scope,
+            document_id: "tokenwright.inference",
+            command_id: "tokenwright.posture.rescan",
+            base_revision: inference.revision, payload: {}, client: "browser",
+        }, "integration-1");
+        // A rescan cannot start without systemd, so the box refuses it —
+        // deliberately, and as a receipt rather than an error.
+        expect(["applied", "rejected"]).toContain(receipt.status);
+    });
+
+    it("refuses a command against a stale revision, as a conflict receipt", async () => {
+        const receipt = await submitManagementCommand(json, {
+            session_id: session.id, environment: "tokenwright", scope: session.scope,
+            document_id: "tokenwright.inference",
+            command_id: "tokenwright.engine.restart",
+            base_revision: "definitely-not-current", payload: {}, client: "browser",
+        }, "integration-2");
+        expect(receipt.status).toBe("conflict");
+    });
+
+    it("declares a key by literal edit and reads the reveal back", async () => {
+        const access = await readManagementDocument(json, session, "tokenwright.access");
+        const content = access.content as { desired: { keys: string[] } };
+        await proposeManagementDocumentChange(json, {
+            session, documentId: "tokenwright.access", baseRevision: access.revision,
+            content: { ...content, desired: { keys: ["paired-home", "workstation-editor"] } },
+            client: "edit",
+        }, "integration-3");
+
+        const after = await readManagementDocument(json, session, "tokenwright.access");
+        const value = after.content as {
+            keys: readonly { name: string; prefix: string; state: string }[];
+            reveal: { key_id: string; secret: string } | null;
+        };
+        expect(value.keys.map((entry) => entry.name)).toContain("workstation-editor");
+        expect(value.reveal).not.toBeNull();
+        // The single deliberate secret in any document, and it matches the
+        // prefix the same document projects for that key.
+        const minted = value.keys.find((entry) => entry.name === "workstation-editor")!;
+        expect(value.reveal!.secret.startsWith(minted.prefix)).toBe(true);
+    });
+
+    it("binds the box's own grant into runnable controls", async () => {
+        const inference = await readManagementDocument(json, session, "tokenwright.inference");
+        const commands = tokenwrightCommandsFrom({
+            json, session, revisionOf: () => inference.revision,
+        });
+        // Every command the live grant carries is bound, and nothing else.
+        const granted = session.documents.flatMap((document) => document.commands).sort();
+        expect(Object.keys(commands).sort()).toEqual(granted);
+        expect(granted.length).toBeGreaterThan(0);
+        expect(commands["tokenwright.unpair"]?.label).toBe("Unpair this box");
+    });
+
+    it("refuses the model surface without a key", async () => {
+        const anonymous = browserRouteJson(base, { bearer: () => null });
+        await expect(anonymous("GET", "/v1/models")).rejects.toThrow();
+    });
+});

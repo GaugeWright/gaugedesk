@@ -1,6 +1,6 @@
 import type { RouteJson } from "./control-plane-transport";
 
-export type ManagementEnvironmentKind = "hub" | "administration" | "vend";
+export type ManagementEnvironmentKind = "hub" | "administration" | "vend" | "tokenwright";
 export type ManagementEnvironmentClient = "browser" | "edit" | "agent" | "cli";
 export interface ManagementEnvironmentScope { readonly kind: "person" | "tenant" | "provider-tenant"; readonly id: string; }
 export interface ManagementDocumentGrant {
@@ -111,23 +111,57 @@ export const managementRoutes = {
         agentSend: controlPlaneOperation("POST", "/environments/vend/agent/messages"),
         review: controlPlaneOperation("POST", "/environments/vend/changes/:id/review"),
     },
+    /** A TokenWright box, reached over the relay leg it dials out to.
+     *
+     * The only Environment whose control plane is not this product. It serves
+     * `propose` because selecting a model is a literal edit to a `desired`
+     * block: its commands take no parameters at all, and the View vocabulary
+     * cannot bind one, so an edit is the only way to say which model to load.
+     *
+     * `audit` is TokenWright's own: the box chains every admitted command and
+     * reports its signed head to the Home, and this route is how the entries
+     * behind an anchor are read back. Without it the anchors could never be
+     * tested, and an unfalsifiable record is not evidence. */
+    tokenwright: {
+        session: controlPlaneOperation("POST", "/environments/tokenwright/sessions"),
+        document: controlPlaneOperation("GET", "/environments/tokenwright/documents/:id"),
+        command: controlPlaneOperation("POST", "/environments/tokenwright/commands"),
+        changes: controlPlaneOperation("GET", "/environments/tokenwright/changes"),
+        review: controlPlaneOperation("POST", "/environments/tokenwright/changes/:id/review"),
+        propose: controlPlaneOperation("POST", "/environments/tokenwright/changes"),
+        audit: controlPlaneOperation("GET", "/environments/tokenwright/audit"),
+    },
 } as const;
 
 type CommonManagementRoute =
-    | "session" | "document" | "command" | "changes" | "review"
-    | "agentRead" | "agentSend";
+    | "session" | "document" | "command" | "changes" | "review";
+
+/** The agent pair, which not every Environment serves.
+ *
+ * Hub, Administration, and Vend each run a bounded agent on the control plane
+ * that serves them. A TokenWright box does not: it is a model server, and the
+ * only things it answers are its two surfaces. Declaring agent routes it does
+ * not serve would put a control on the page that fails when pressed, which is
+ * the bug this whole route table exists to make impossible. */
+type AgentManagementRoute = "agentRead" | "agentSend";
 
 /** The operations every Environment must declare. Exported so a test can hold
  * the table to it: a kind added with a route missing fails there rather than at
  * the moment someone presses the control it belongs to. */
 export const managementRouteNames: readonly CommonManagementRoute[] = [
     "session", "document", "command", "changes", "review",
-    "agentRead", "agentSend",
+];
+
+/** The Environments whose control plane runs an agent. Exported so a test can
+ * hold the table to it from both sides: a kind here missing either route, and a
+ * kind not here declaring one. */
+export const managementAgentEnvironments: readonly ManagementEnvironmentKind[] = [
+    "hub", "administration", "vend",
 ];
 
 /** The Environments this client can address. Exported for the same reason. */
 export const managementEnvironmentKinds: readonly ManagementEnvironmentKind[] = [
-    "hub", "administration", "vend",
+    "hub", "administration", "vend", "tokenwright",
 ];
 
 function managementRoute(
@@ -135,6 +169,21 @@ function managementRoute(
     route: CommonManagementRoute,
 ): ManagementRoute {
     return managementRoutes[environment][route];
+}
+
+/** The agent route for an Environment that has one. Refuses by name rather than
+ * returning undefined, so an Environment with no agent says so instead of
+ * sending a request to `undefined`. */
+function managementAgentRoute(
+    environment: ManagementEnvironmentKind,
+    route: AgentManagementRoute,
+): ManagementRoute {
+    const routes = managementRoutes[environment] as Partial<Record<AgentManagementRoute, ManagementRoute>>;
+    const found = routes[route];
+    if (!found) {
+        throw new Error(`The ${environment} control plane runs no agent.`);
+    }
+    return found;
 }
 
 function bindRoute(route: ManagementRoute, id: string): string {
@@ -201,7 +250,7 @@ export async function sendManagementAgentMessage(
     session: ManagementEnvironmentSession,
     message: string,
 ): Promise<ManagementAgentTurn> {
-    const route = managementRoute(session.environment, "agentSend");
+    const route = managementAgentRoute(session.environment, "agentSend");
     const value = await json(route.method, route.path, {
         session_id: session.id,
         scope: session.scope,
@@ -215,7 +264,7 @@ export async function listManagementAgentMessages(
     session: ManagementEnvironmentSession,
 ): Promise<readonly ManagementAgentMessage[]> {
     const query = new URLSearchParams({ session: session.id, scope: session.scope.id });
-    const route = managementRoute(session.environment, "agentRead");
+    const route = managementAgentRoute(session.environment, "agentRead");
     const value = await json(route.method, `${route.path}?${query}`);
     return (value as { transcript: readonly ManagementAgentMessage[] }).transcript;
 }

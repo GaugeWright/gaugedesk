@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { RouteJson, RouteOptions } from "./control-plane-transport";
-import { managementEnvironmentKinds, managementRouteNames, managementRoutes, listManagementChanges, openManagementEnvironment, proposeManagementDocumentChange, readManagementDocument, reviewManagementChange, submitManagementCommand, type ManagementCommandEnvelope, type ManagementEnvironmentSession } from "./management-environment";
+import { managementAgentEnvironments, managementEnvironmentKinds, managementRouteNames, managementRoutes, listManagementChanges, openManagementEnvironment, proposeManagementDocumentChange, readManagementDocument, reviewManagementChange, sendManagementAgentMessage, submitManagementCommand, type ManagementCommandEnvelope, type ManagementEnvironmentSession } from "./management-environment";
 
 function fakeJson(response: unknown): { json: RouteJson; calls: [string, string, unknown?, RouteOptions?][] } {
     const calls: [string, string, unknown?, RouteOptions?][] = [];
@@ -86,6 +86,55 @@ describe("management Environment client", () => {
                 );
             }
         }
+    });
+    it("declares the agent pair for exactly the Environments that run an agent", () => {
+        // A TokenWright box runs no agent -- it is a model server, and the only
+        // things it answers are its two surfaces. Declaring routes it does not
+        // serve would put a control on the page that fails when pressed, which
+        // is the bug this route table exists to make impossible.
+        for (const environment of managementEnvironmentKinds) {
+            const routes = managementRoutes[environment] as Record<string, { path: string } | undefined>;
+            const expected = managementAgentEnvironments.includes(environment);
+            expect(Boolean(routes.agentRead), `${environment} agentRead`).toBe(expected);
+            expect(Boolean(routes.agentSend), `${environment} agentSend`).toBe(expected);
+        }
+    });
+    it("refuses to send an agent message to an Environment that runs no agent", async () => {
+        const route = fakeJson({ turn: { message: "never", proposals: [] } });
+        const boxSession: ManagementEnvironmentSession = { ...session, environment: "tokenwright" };
+        await expect(sendManagementAgentMessage(route.json, boxSession, "hello"))
+            .rejects.toThrow(/runs no agent/u);
+        expect(route.calls).toHaveLength(0);
+    });
+    it("serves TokenWright the two routes its box needs beyond the common set", () => {
+        // `propose` because selecting a model is a literal edit to a `desired`
+        // block -- TokenWright's commands take no parameters at all, so an edit
+        // is the only way to say which model to load. `audit` because the box
+        // reports a signed head to this Home, and the entries behind an anchor
+        // have to be readable for the anchor to be worth anything.
+        expect(managementRoutes.tokenwright.propose.path)
+            .toBe("/environments/tokenwright/changes");
+        expect(managementRoutes.tokenwright.audit.path)
+            .toBe("/environments/tokenwright/audit");
+    });
+    it("lets a TokenWright document be proposed when the grant marks it editable", async () => {
+        const route = fakeJson({ receipt: { id: "receipt:tokenwright" } });
+        const boxSession: ManagementEnvironmentSession = {
+            ...session,
+            environment: "tokenwright",
+            documents: [{
+                id: "tokenwright.inference", path: "inference.json",
+                schema: "gw://schemas/tokenwright/inference/v1",
+                revision: "rev-1", freshness: "live", readable: true, editable: true,
+                commands: [],
+            }],
+        };
+        await proposeManagementDocumentChange(route.json, {
+            session: boxSession, documentId: "tokenwright.inference",
+            baseRevision: "rev-1", content: { desired: { model: "qwen3-coder-30b" } },
+            client: "edit",
+        }, "idem-1");
+        expect(route.calls[0]?.[1]).toBe("/environments/tokenwright/changes");
     });
     it("refuses a document the grant marks read-only, which the Environment name could not see", async () => {
         const route = fakeJson({ receipt: { id: "never" } });

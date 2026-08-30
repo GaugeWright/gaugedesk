@@ -37,7 +37,12 @@ export interface EnvironmentViewRegistry {
     readonly internalRoot?: string;
 }
 
-const BUILTIN_COMPONENTS = new Set(["Field", "Table", "Metric", "Notice", "Command", "Tabs", "Grid"]);
+/** The components a View may use without the registry supplying one.
+ *
+ * Exported so a bundle carried from another repository can be held to it
+ * by a test rather than by a second copy of the list, which would drift. */
+export const BUILTIN_COMPONENTS: ReadonlySet<string> =
+    new Set(["Field", "Table", "Metric", "Notice", "Command", "Tabs", "Grid"]);
 
 function display(value: unknown): string {
     if (value === null) return "None";
