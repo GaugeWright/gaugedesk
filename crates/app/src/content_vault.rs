@@ -83,18 +83,52 @@ pub(crate) fn configured_content_vault(
     // KEK selection is creds-only: a hosted deployment sets GAUGEDESK_CONTENT_KEK_ID
     // + the AZURE_* Crypto User SP creds to use the KMS; dev uses the local KEK.
     //
-    // The erasure ledger (SOC 2 finding 4.7 / DR-0086) is default-wired to a co-located
-    // local file. That local backend is durable only for the desktop / self-hosted
-    // path: it lives on the same data root as the wrapped-DEK files, so a whole-disk
-    // backup restore that resurrects an erased scope's DEK also rolls the ledger back.
-    // A HOSTED deployment MUST inject an OUT-OF-BAND backend (R2 object-lock) via
-    // [`ContentVault::with_ledger`] so the record of an erasure cannot be undone by a
-    // data-disk restore — that injection is the ops step, not built here.
+    // The erasure ledger (SOC 2 finding 4.7 / DR-0086) is selected by config, like the
+    // KEK above: a hosted deployment sets GAUGEDESK_ERASURE_LEDGER_ORIGIN to record
+    // erasures OUT-OF-BAND through the edge Worker's object-locked R2 store, so the
+    // record cannot be rolled back by a data-disk restore; a desktop / self-hosted
+    // deployment sets nothing and uses the co-located local file.
     Ok(Some(Arc::new(
-        ContentVault::new(root.join("content-keys"), content_keywrap(root)?).with_ledger(Box::new(
-            LocalFileErasureLedger::new(root.join("content-keys").join("erased.ledger")),
-        )),
+        ContentVault::new(root.join("content-keys"), content_keywrap(root)?)
+            .with_ledger(configured_erasure_ledger(root)),
     )))
+}
+
+/// Select the erasure-ledger backend (SOC 2 finding 4.7 / DR-0086). Creds-driven, like
+/// the KEK selection above. `GAUGEDESK_ERASURE_LEDGER_ORIGIN` (with a **required**
+/// `GAUGEDESK_ERASURE_LEDGER_TOKEN`) records erasures out-of-band through the edge
+/// Worker's object-locked R2 store, so a whole-disk restore of the Hub cannot un-erase;
+/// with neither set, a desktop / self-hosted deployment uses the co-located local file.
+/// A hosted deployment (web-account mode) that leaves the origin unset is the 4.7 gap and
+/// is warned about loudly rather than silently accepted.
+fn configured_erasure_ledger(root: &Path) -> Box<dyn ErasureLedger> {
+    let local = || LocalFileErasureLedger::new(root.join("content-keys").join("erased.ledger"));
+    let nonempty = |suffix: &str| {
+        gaugedesk_env::var(suffix)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let Some(origin) = nonempty("ERASURE_LEDGER_ORIGIN") else {
+        if crate::workbench_auth::web_account_mode() {
+            tracing::warn!(
+                "content-vault: hosted deployment has no out-of-band erasure ledger \
+                 (GAUGEDESK_ERASURE_LEDGER_ORIGIN unset); an erasure would not survive a \
+                 data-disk restore (finding 4.7)"
+            );
+        }
+        return Box::new(local());
+    };
+    match nonempty("ERASURE_LEDGER_TOKEN") {
+        Some(token) => Box::new(EdgeErasureLedger::new(&origin, token, local())),
+        None => {
+            tracing::error!(
+                "content-vault: GAUGEDESK_ERASURE_LEDGER_ORIGIN is set but \
+                 GAUGEDESK_ERASURE_LEDGER_TOKEN is missing; falling back to the local ledger, \
+                 which does NOT survive a data-disk restore (finding 4.7)"
+            );
+            Box::new(local())
+        }
+    }
 }
 
 /// Whether an operator has explicitly opted out of at-rest content encryption.
@@ -457,6 +491,125 @@ impl ErasureLedger for LocalFileErasureLedger {
     }
 }
 
+/// An [`ErasureLedger`] that records out-of-band, through the edge Worker's
+/// object-locked R2 store (SOC 2 finding 4.7 / DR-0086), so an erasure survives a
+/// whole-disk restore of the hosted Hub. It is a **composite** over a co-located
+/// [`LocalFileErasureLedger`]:
+///
+/// - `record` writes the local queue immediately (fast, under the workbench lock),
+///   then pushes to the edge on a **detached thread** — `crypto_erase` can run on a
+///   runtime worker while holding the lock, so it must never block on network I/O.
+///   A failed/slow push is logged; the local queue plus the open-time retry in
+///   `recorded` backstop it.
+/// - `recorded` (open-time sweep, off any lock) fetches the edge list — the
+///   restore-proof source of truth — retries pushing any local-only id, and returns
+///   the **union** so the sweep re-erases everything either side knows about. If the
+///   edge is unreachable at open it falls back to the local queue (the residual gap:
+///   a disk restore *and* an unreachable edge at that boot).
+///
+/// The ledger transmits only opaque key-ids (`sha256_hex(scope)`), never a raw scope.
+pub struct EdgeErasureLedger {
+    url: String,
+    token: String,
+    local: LocalFileErasureLedger,
+}
+
+impl EdgeErasureLedger {
+    /// `origin` is the edge Worker origin (e.g. `https://edge.gaugewright.com`); the
+    /// route path is appended. `local` is the co-located write-through queue.
+    pub fn new(origin: &str, token: String, local: LocalFileErasureLedger) -> Self {
+        Self {
+            url: format!("{}/internal/erasure-ledger", origin.trim_end_matches('/')),
+            token,
+            local,
+        }
+    }
+
+    fn auth(&self) -> Vec<(String, String)> {
+        vec![(
+            "Authorization".to_string(),
+            format!("Bearer {}", self.token),
+        )]
+    }
+
+    /// POST one key-id to the edge ledger. Blocking; callers that hold a lock run it
+    /// off-thread.
+    fn push(url: &str, auth: &[(String, String)], key_id: &str) -> Result<(), String> {
+        let body = serde_json::json!({ "key_id": key_id }).to_string();
+        let (status, resp) =
+            crate::net_http::HttpClient::new().post_json_headers(url, auth, &body)?;
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(format!("edge erasure-ledger record HTTP {status}: {resp}"))
+        }
+    }
+
+    fn fetch(&self) -> Result<Vec<String>, String> {
+        let (status, resp) =
+            crate::net_http::HttpClient::new().get_string_headers(&self.url, &self.auth())?;
+        if !(200..300).contains(&status) {
+            return Err(format!("edge erasure-ledger list HTTP {status}: {resp}"));
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&resp).map_err(|e| format!("parse: {e}"))?;
+        let ids = parsed
+            .get("key_ids")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "edge erasure-ledger response missing key_ids".to_string())?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        Ok(ids)
+    }
+}
+
+impl ErasureLedger for EdgeErasureLedger {
+    fn record(&self, key_id: &str) -> std::io::Result<()> {
+        // Local queue first: immediate, and durable enough to retry from on the next
+        // open even if the edge push below never lands.
+        self.local.record(key_id)?;
+        let (url, auth, key_id) = (self.url.clone(), self.auth(), key_id.to_string());
+        std::thread::spawn(move || {
+            if let Err(err) = Self::push(&url, &auth, &key_id) {
+                tracing::warn!(
+                    %err,
+                    "content-vault: out-of-band erasure record failed; queued locally, \
+                     will retry on next open (finding 4.7)"
+                );
+            }
+        });
+        Ok(())
+    }
+
+    fn recorded(&self) -> std::io::Result<Vec<String>> {
+        let local = self.local.recorded()?;
+        match self.fetch() {
+            Ok(edge) => {
+                let auth = self.auth();
+                let edge_set: BTreeSet<&String> = edge.iter().collect();
+                // Retry the queue: push any locally-recorded id the edge has not got.
+                for id in &local {
+                    if !edge_set.contains(id) {
+                        let _ = Self::push(&self.url, &auth, id);
+                    }
+                }
+                let mut all: BTreeSet<String> = edge.into_iter().collect();
+                all.extend(local);
+                Ok(all.into_iter().collect())
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "content-vault: out-of-band erasure ledger unreachable on open; \
+                     re-erasing from local records only (finding 4.7)"
+                );
+                Ok(local)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,6 +869,32 @@ mod tests {
             None,
             "eng-a stays erased"
         );
+    }
+
+    #[test]
+    fn edge_ledger_keeps_a_local_queue_and_falls_back_when_the_edge_is_unreachable() {
+        // SOC 2 finding 4.7: the out-of-band ledger is a composite. `record` must write
+        // the local queue immediately (so nothing is lost when the edge push fails), and
+        // `recorded` must fall back to that queue when the edge is unreachable so the
+        // open-time sweep still runs.
+        let dir = tempfile::tempdir().unwrap();
+        let local = LocalFileErasureLedger::new(dir.path().join("erased.ledger"));
+        // Nothing is listening here, so both the detached push and the `recorded` fetch
+        // fail fast (connection refused) — exercising the local-only fallback path.
+        let ledger = EdgeErasureLedger::new("http://127.0.0.1:1", "test-token".into(), local);
+        let key_id = "a".repeat(64);
+
+        ledger.record(&key_id).unwrap();
+        // The local queue holds it even though the edge is down.
+        assert_eq!(
+            LocalFileErasureLedger::new(dir.path().join("erased.ledger"))
+                .recorded()
+                .unwrap(),
+            vec![key_id.clone()],
+        );
+        // `recorded` cannot reach the edge, so it returns the local queue rather than
+        // erroring — the sweep re-erases what it can.
+        assert_eq!(ledger.recorded().unwrap(), vec![key_id]);
     }
 
     #[test]
