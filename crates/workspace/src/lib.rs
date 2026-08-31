@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use whipplescript_store::branches::{CreateBranchOutcome, RetargetOutcome, MAINLINE_BRANCH_ID};
 use whipplescript_store::content::ContentBlobs;
@@ -411,6 +411,14 @@ impl Instance {
     /// advances survive and genuine both-touched divergence escalates.
     /// A peer with no shared history is refused honestly.
     pub fn pull_from(&self, source: &PeerSource) -> Result<MergeOutcome> {
+        // A pull adopts the peer's state into mainline, which is the line every
+        // chat folds into. Held for the whole verb — the shared base is read to
+        // pick a fork point and swapped at the end, and a fold landing between
+        // those two moments is a pull that merged against a state that no
+        // longer exists. The transport line is created here and named after the
+        // clock, so nothing else can be holding it.
+        let writers = workspace_writers(&self.store_root, &[MAINLINE_BRANCH_ID]);
+        let _holding = hold_writers(&writers);
         let peer = NativeWorkspaceVcs::open(
             source.0.join("branches.sqlite"),
             source.0.join("content.sqlite"),
@@ -1136,6 +1144,54 @@ impl Engagement {
         Ok(SidesScan { branch, repo })
     }
 
+    /// [`Self::import_sides`] for a caller already holding the writers for both
+    /// sides. Taking them again here would deadlock against itself.
+    fn import_sides_under_writer(&self, vcs: &mut NativeWorkspaceVcs) -> Result<SidesScan> {
+        let branch = sync_in_with_roots_under_writer(
+            vcs,
+            &self.store_root,
+            &self.branch,
+            &self.path,
+            self.sparse_roots.as_ref(),
+        )?
+        .observed;
+        let repo = if self.target == MAINLINE_BRANCH_ID {
+            Some(
+                sync_in_with_roots_under_writer(
+                    vcs,
+                    &self.store_root,
+                    MAINLINE_BRANCH_ID,
+                    &self.repo,
+                    None,
+                )?
+                .observed,
+            )
+        } else {
+            None
+        };
+        Ok(SidesScan { branch, repo })
+    }
+
+    /// [`Self::import_branch`] for a caller already holding this branch's writer.
+    fn import_branch_under_writer(&self, vcs: &mut NativeWorkspaceVcs) -> Result<ImportScan> {
+        sync_in_with_roots_under_writer(
+            vcs,
+            &self.store_root,
+            &self.branch,
+            &self.path,
+            self.sparse_roots.as_ref(),
+        )
+    }
+
+    /// The writers this chat must hold to move its own head against its target:
+    /// both, because a fold swaps the target's head and then its own, and
+    /// holding one of a pair is holding neither.
+    fn line_writers(&self, also: &[&str]) -> Vec<Arc<Mutex<()>>> {
+        let mut branches = vec![self.branch.as_str(), self.target.as_str()];
+        branches.extend_from_slice(also);
+        workspace_writers(&self.store_root, &branches)
+    }
+
     /// Project the branch head into this chat's worktree, sweeping what
     /// `observed` allows — see [`sync_out_with_roots_observing`].
     ///
@@ -1201,13 +1257,15 @@ impl Engagement {
         if roots.is_empty() {
             return Err(WorkspaceError::msg("a chat sparse view cannot be empty"));
         }
+        let writers = workspace_writers(&self.store_root, &[self.branch.as_str()]);
+        let _holding = hold_writers(&writers);
         let mut vcs = self.store()?;
         // Preserve any pending work in the old admitted view before changing
         // what this handle may import. The scan walks the whole worktree, not
         // just the old view, so narrowing still clears the partitions this
         // checkout is dropping — and a file that arrives while it runs is not
         // one of them.
-        let scan = self.import_branch(&mut vcs)?;
+        let scan = self.import_branch_under_writer(&mut vcs)?;
         sync_out_with_roots_observing(
             &mut vcs,
             &self.store_root,
@@ -1222,6 +1280,11 @@ impl Engagement {
 
     pub fn set_target(&mut self, target: impl Into<String>) -> Result<()> {
         let target = target.into();
+        // Retargeting rewrites which line this one folds into, so it is held
+        // against both the old target and the new one — a fold reading a parent
+        // that changes under it is the same race by another name.
+        let writers = self.line_writers(&[target.as_str()]);
+        let _holding = hold_writers(&writers);
         let mut vcs = self.store()?;
         match vcs.retarget(&self.branch, &target, &now_at())? {
             RetargetOutcome::Retargeted(_) => {
@@ -1248,8 +1311,14 @@ impl Engagement {
             return Ok(());
         }
 
+        // Retarget, restore, and the rollback retarget all move this line
+        // between two targets, so all three targets' writers are held for the
+        // whole verb — including the rollback, which must not find a head that
+        // moved while the restore it is undoing was failing.
+        let writers = self.line_writers(&[target.as_str()]);
+        let _holding = hold_writers(&writers);
         let mut vcs = self.store()?;
-        self.import_sides(&mut vcs)?;
+        self.import_sides_under_writer(&mut vcs)?;
         let pending = vcs
             .diff_against(&self.branch, Some(&self.target), 1)?
             .ok_or_else(|| WorkspaceError::msg(format!("no branch `{}`", self.branch)))?;
@@ -1285,7 +1354,7 @@ impl Engagement {
             }
             None => {
                 clear_worktree(&self.path)?;
-                self.import_branch(&mut vcs).map(|_| ())
+                self.import_branch_under_writer(&mut vcs).map(|_| ())
             }
         };
         if let Err(error) = restored {
@@ -1356,6 +1425,9 @@ impl Engagement {
     }
 
     pub fn revert_to_main(&self) -> Result<()> {
+        // Restoring reads the target's head and swaps this line's onto it.
+        let writers = self.line_writers(&[]);
+        let _holding = hold_writers(&writers);
         let mut vcs = self.store()?;
         let target = vcs
             .get_branch(&self.target)?
@@ -1371,7 +1443,7 @@ impl Engagement {
                 // Virgin target: revert means "empty tree" — import the
                 // cleared worktree as this branch's own cut.
                 clear_worktree(&self.path)?;
-                self.import_branch(&mut vcs)?;
+                self.import_branch_under_writer(&mut vcs)?;
             }
         }
         // Unpaired: a revert means "the target's tree, whatever is here now".
@@ -1400,6 +1472,14 @@ impl Engagement {
     /// because it adopted the content, ours because the line rebased onto
     /// the merge cut (folding anything the target had that we lacked).
     pub fn merge_into_main(&self) -> Result<MergeOutcome> {
+        // A fold is a read-modify-write across TWO heads — it advances the
+        // target and then rebases this line onto the merge cut — so it holds
+        // both writers for the whole verb, import through projection. Held
+        // across, this is the same indivisible shape `commit_turn` has; split,
+        // the swaps race a sibling turn or another chat's fold and the loser's
+        // fold dies on a head that moved under it.
+        let writers = self.line_writers(&[]);
+        let _holding = hold_writers(&writers);
         let mut vcs = self.store()?;
         // Both refreshes are paired with the import that just spoke for their
         // own tree, so each sweeps only what that import saw. A chat merges
@@ -1407,7 +1487,7 @@ impl Engagement {
         // alongside live turns writing files — and a sibling turn's write
         // landing after this import is work no import has considered yet, not
         // content the merge decided against.
-        let sides = self.import_sides(&mut vcs)?;
+        let sides = self.import_sides_under_writer(&mut vcs)?;
         match vcs.merge_keeping(&self.branch, &fresh_cut_id("keep"), &now_at())? {
             VcsMergeOutcome::Landed { .. } | VcsMergeOutcome::Adopted { .. } => {
                 if let Some(repo) = &sides.repo {
@@ -1430,8 +1510,12 @@ impl Engagement {
     /// Fold the target's advance into this line (whip's rebase-down
     /// reconcile at quiescence), then refresh the worktree.
     pub fn sync_from_main(&self) -> Result<MergeOutcome> {
+        // Rebasing this line reads the target's head and swaps this one's, so
+        // it holds both for the same reason a fold does.
+        let writers = self.line_writers(&[]);
+        let _holding = hold_writers(&writers);
         let mut vcs = self.store()?;
-        let sides = self.import_sides(&mut vcs)?;
+        let sides = self.import_sides_under_writer(&mut vcs)?;
         match vcs.reconcile_branch(&self.branch, true, &fresh_cut_id("sync"), &now_at())? {
             ReconcileOutcome::Rebased { .. } | ReconcileOutcome::UpToDate => {
                 self.project_branch_observing(&mut vcs, Some(&sides.branch))?;
@@ -1574,8 +1658,14 @@ impl Engagement {
     ) -> Result<SaveFileOutcome> {
         use whipplescript_store::vcs::SaveWithBaseOutcome;
         self.ensure_selected_path(relative)?;
+        // The save IS the cut (SUB-6 §12.1), so it is a head swap like any
+        // other and races a turn importing the same line. A person editing a
+        // file while an agent works on it is the ordinary case here, not a
+        // corner one.
+        let writers = workspace_writers(&self.store_root, &[self.branch.as_str()]);
+        let _holding = hold_writers(&writers);
         let mut vcs = self.store()?;
-        self.import_branch(&mut vcs)?;
+        self.import_branch_under_writer(&mut vcs)?;
         let base_cut = match base {
             SaveBase::Cut(cut) => Some(cut.to_owned()),
             SaveBase::Content(body) => {
@@ -1780,13 +1870,53 @@ fn persist_scratch(store_root: &Path, branch: &str, cache: &StatCache) -> Result
 /// concurrently and only genuine same-branch writers wait. Held across the whole
 /// read-modify-write — scan, delta, head read, swap — because splitting it is the
 /// bug. Nothing this function calls re-enters it, so the plain mutex cannot
-/// deadlock against itself, and no caller holds it.
+/// deadlock against itself.
+///
+/// A caller may hold more than one, but only through [`workspace_writers`],
+/// which fixes the order. Nothing takes a writer while already holding one by
+/// any other route: every verb that runs inside a hold uses an `_under_writer`
+/// import instead of a locking one.
 fn workspace_writer(store_root: &Path, branch: &str) -> Arc<Mutex<()>> {
     static WRITERS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let key = format!("{}\u{0}{branch}", store_root.display());
     let writers = WRITERS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = writers.lock().unwrap_or_else(PoisonError::into_inner);
     Arc::clone(guard.entry(key).or_default())
+}
+
+/// The writers for every branch a verb will write, in the order to take them.
+///
+/// One branch was never enough. A fold advances its target's head and then its
+/// own — two compare-and-swaps on two branches — and holding only the first
+/// leaves the second racing. Where the fold verbs held nothing at all, a chat
+/// folding beside its own turns, or two chats folding into one target, lost the
+/// swap and died with `Conflict("... head moved during the merge; retry")`.
+/// That is the failure this whole mechanism exists to prevent, one layer above
+/// where it was first met.
+///
+/// Two locks is where deadlock becomes possible, so the order is not the
+/// caller's to choose: the set is sorted and deduplicated here. Every caller
+/// wanting an overlapping pair therefore asks in the same sequence, so one of
+/// them takes both and the other waits at the first — there is no cycle to
+/// close. Sorting also makes the *set* the caller's only decision, which is the
+/// part it actually knows.
+fn workspace_writers(store_root: &Path, branches: &[&str]) -> Vec<Arc<Mutex<()>>> {
+    let mut names: Vec<&str> = branches.to_vec();
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|branch| workspace_writer(store_root, branch))
+        .collect()
+}
+
+/// Take every writer in `writers`, in the order [`workspace_writers`] fixed.
+/// The guards release in reverse when the returned vector drops.
+fn hold_writers(writers: &[Arc<Mutex<()>>]) -> Vec<MutexGuard<'_, ()>> {
+    writers
+        .iter()
+        .map(|writer| writer.lock().unwrap_or_else(PoisonError::into_inner))
+        .collect()
 }
 
 /// Scan the worktree and commit what changed as ONE cut on the branch.
@@ -3490,6 +3620,171 @@ mod tests {
             "rejection must not mutate old state"
         );
         assert!(worktrees.join("chat/.git").exists());
+    }
+
+    /// A fold is a read-modify-write across two heads, and it used to hold
+    /// neither. `merge_keeping` advances the target's head and then rebases the
+    /// line onto the merge cut; a sibling turn importing the same line between
+    /// those swaps made one of them stale, and the fold died on
+    /// `Conflict("branch head moved during the merge; retry")`.
+    ///
+    /// That is a refusal rather than a lost update, which is why it survived
+    /// SUB-7: the work was still on disk, the turn just failed. It is the same
+    /// defect the per-branch writer was introduced for on `sync_in`, one layer
+    /// up ([ADR 0138](../../specs/decisions/0138-a-chat-runs-one-turn-at-a-time.md)
+    /// §7), and it made this window untestable through its own verb — the fold
+    /// could not survive the pressure needed to force it.
+    #[test]
+    fn a_fold_racing_live_turns_on_its_own_line_is_not_refused() {
+        const WRITERS: usize = 4;
+        const ROUNDS: usize = 12;
+        let (_directory, instance) = instance();
+        instance.seed_main(&[("base.md", "base")]).expect("seed");
+        // One id, so one branch and one worktree: turns on a single chat, with
+        // that chat's own fold running beside them.
+        let folder = instance.create_engagement("folded").expect("engagement");
+        let writers: Vec<Engagement> = (0..WRITERS)
+            .map(|_| instance.create_engagement("folded").expect("engagement"))
+            .collect();
+
+        let settling = std::sync::atomic::AtomicUsize::new(WRITERS);
+        let barrier = std::sync::Barrier::new(WRITERS + 1);
+        let folds = std::thread::scope(|scope| {
+            let folding = {
+                let (barrier, folder, settling) = (&barrier, &folder, &settling);
+                scope.spawn(move || {
+                    // Stop at the first refusal rather than spinning on it: a
+                    // fold that fails costs nothing to retry, so a broken
+                    // build would otherwise loop as fast as it can fail.
+                    let mut folds = Vec::new();
+                    barrier.wait();
+                    while settling.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                        let outcome = folder.merge_into_main();
+                        let clean = matches!(outcome, Ok(MergeOutcome::Clean));
+                        folds.push(outcome);
+                        if !clean {
+                            return folds;
+                        }
+                    }
+                    // One last fold, so the turns that settled after the final
+                    // loop pass are carried too.
+                    folds.push(folder.merge_into_main());
+                    folds
+                })
+            };
+            let handles: Vec<_> = writers
+                .iter()
+                .enumerate()
+                .map(|(index, engagement)| {
+                    let (barrier, settling) = (&barrier, &settling);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for round in 0..ROUNDS {
+                            engagement
+                                .write_file(
+                                    &format!("fold-{index}-{round}.md"),
+                                    &format!("body {index} {round}"),
+                                )
+                                .expect("seed");
+                            engagement.commit_turn("turn").expect("turn");
+                        }
+                        settling.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("writer thread");
+            }
+            folding.join().expect("folding thread")
+        });
+
+        assert!(!folds.is_empty(), "the folder never got to fold");
+        for (index, outcome) in folds.iter().enumerate() {
+            assert!(
+                matches!(outcome, Ok(MergeOutcome::Clean)),
+                "fold {index} of {} was refused: {outcome:?}",
+                folds.len()
+            );
+        }
+
+        // The refusal is the defect, but the reason it matters is that a
+        // refused fold is a turn's work that never reached the target.
+        let vcs = folder.store().expect("store");
+        let manifest = vcs
+            .manifest(MAINLINE_BRANCH_ID)
+            .expect("manifest")
+            .unwrap_or_default();
+        let missing: Vec<String> = (0..WRITERS)
+            .flat_map(|index| (0..ROUNDS).map(move |round| format!("fold-{index}-{round}.md")))
+            .filter(|path| !manifest.contains_key(path))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} settled file(s) never reached the target: {missing:?}",
+            missing.len()
+        );
+    }
+
+    /// The other side of the same swap: several chats folding into ONE target
+    /// contend on that target's head, not on each other's lines. Every fold
+    /// advances mainline, so without the target's writer all but one lose the
+    /// compare-and-swap — and two chats merging into one line at once is the
+    /// ordinary case, not a corner one.
+    #[test]
+    fn concurrent_folds_into_one_target_are_serialized_not_refused() {
+        const CHATS: usize = 6;
+        let (_directory, instance) = instance();
+        instance.seed_main(&[("base.md", "base")]).expect("seed");
+        let chats: Vec<Engagement> = (0..CHATS)
+            .map(|index| {
+                let chat = instance
+                    .create_engagement(&format!("chat-{index}"))
+                    .expect("engagement");
+                chat.write_file(&format!("from-{index}.md"), &format!("body {index}"))
+                    .expect("seed");
+                chat.commit_turn("turn").expect("turn");
+                chat
+            })
+            .collect();
+
+        let barrier = std::sync::Barrier::new(CHATS);
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chats
+                .iter()
+                .map(|chat| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        chat.merge_into_main()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("folding thread"))
+                .collect()
+        });
+
+        for (index, outcome) in outcomes.iter().enumerate() {
+            assert!(
+                matches!(outcome, Ok(MergeOutcome::Clean)),
+                "chat {index}'s fold was refused: {outcome:?}"
+            );
+        }
+
+        let vcs = chats[0].store().expect("store");
+        let manifest = vcs
+            .manifest(MAINLINE_BRANCH_ID)
+            .expect("manifest")
+            .unwrap_or_default();
+        for index in 0..CHATS {
+            let path = format!("from-{index}.md");
+            assert!(
+                manifest.contains_key(&path),
+                "`{path}` never reached the target: {:?}",
+                manifest.keys().collect::<Vec<_>>()
+            );
+        }
     }
 
     /// The fold verbs have `commit_turn`'s window one step further out, and it
