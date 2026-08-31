@@ -324,6 +324,123 @@ async fn a_project_home_relocates_to_a_paired_peer_with_its_log() {
     assert!(inc2["incoming"].as_array().unwrap().is_empty());
 }
 
+/// ADR 0155 §2, end to end: a serving Home re-sends a retraction whose delivery
+/// was lost, for as long as the peer's grant lives.
+///
+/// Before that decision the retraction was **fire-once**. Both callers send it
+/// while the record is still an upsert and tombstone locally straight after, and
+/// the tombstone folded the record out of the very set the retractor iterates —
+/// so a send that failed was not deferred but forgotten, and the operator kept a
+/// live pointer at a Home that had stopped serving the project.
+///
+/// The retained departure is what gives the retraction somewhere to live between
+/// failing and being re-sent.
+#[tokio::test]
+async fn a_lost_route_retraction_is_re_sent_while_the_grant_lives() {
+    let (broker, relay) = start_broker().await;
+    let (alice, alice_wb, _ra) = instance("alice", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
+
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // alice serves a project bob operates on.
+    {
+        let mut g = alice_wb.lock().unwrap();
+        let home = g.home_id().as_str().to_owned();
+        g.store_mut()
+            .append_record(
+                "library",
+                "project",
+                &json!({ "id": "shared-1", "op": "upsert", "name": "Shared", "is_default": false,
+                         "home_id": home, "network_isolated": false })
+                .to_string(),
+            )
+            .unwrap();
+        g.rebuild_library();
+    }
+    declare_operator(&alice_wb, "shared-1", "alice", "bob");
+
+    let leg = |epoch: u64| gaugedesk_relay_transport::RelayRoute {
+        endpoint: "wss://relay.example".to_owned(),
+        handle: "h".repeat(43),
+        epoch,
+        proof: gaugedesk_relay_transport::RouteProof::new([2u8; 32]),
+        previous_proof: None,
+        home_fingerprint: [0xABu8; 32],
+    };
+    let held_by_bob = |project: &str| {
+        let g = bob_wb.lock().unwrap();
+        gaugedesk_app::account::Account::rebuild(g.store_ref())
+            .unwrap()
+            .home_routes
+            .contains_key(project)
+    };
+
+    // alice authors and distributes the route; bob learns where the work lives.
+    gaugedesk_app::home_reachability::republish(&alice_wb, &leg(1));
+    let learned = tokio::time::timeout(Duration::from_secs(10), async {
+        while !held_by_bob("shared-1") {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        learned.is_ok(),
+        "bob must first hold the route this test retracts"
+    );
+
+    // alice stops serving it, and the retraction cannot cross.
+    relay.disrupt_one_shot().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    {
+        let mut g = alice_wb.lock().unwrap();
+        let home = g.home_id().as_str().to_owned();
+        g.store_mut()
+            .append_record(
+                "library",
+                "project",
+                &json!({ "id": "shared-1", "op": "tombstone", "name": "Shared", "is_default": false,
+                         "home_id": home, "network_isolated": false })
+                .to_string(),
+            )
+            .unwrap();
+        g.rebuild_library();
+    }
+    gaugedesk_app::home_reachability::republish(&alice_wb, &leg(2));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        held_by_bob("shared-1"),
+        "the retraction was genuinely lost — otherwise this test proves nothing"
+    );
+
+    // alice's own view has moved on: the route is departed, and retained.
+    {
+        let g = alice_wb.lock().unwrap();
+        let account = gaugedesk_app::account::Account::rebuild(g.store_ref()).unwrap();
+        assert!(!account.home_routes.contains_key("shared-1"));
+        assert!(
+            account.departed_home_routes.contains_key("shared-1"),
+            "the departure is retained, which is what it can be re-sent from"
+        );
+    }
+
+    // The next reachability reconcile re-sends it, and bob folds the stale
+    // locator away rather than dialing a Home that stopped serving the project.
+    relay.restore_one_shot().await;
+    gaugedesk_app::home_reachability::republish(&alice_wb, &leg(3));
+    let retracted = tokio::time::timeout(Duration::from_secs(10), async {
+        while held_by_bob("shared-1") {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        retracted.is_ok(),
+        "a retraction whose delivery failed must be re-sent while the grant lives"
+    );
+}
+
 /// ADR 0156 §2–§3, end to end: the target commits, its `Committed` never arrives,
 /// and the origin resolves the handoff by **asking** on reconnect.
 ///
