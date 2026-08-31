@@ -3349,6 +3349,16 @@ fn resolve_from_status(verdict: &serde_json::Value) -> InDoubtResolution {
             .and_then(|value| HomeId::parse(value).ok())
             .map_or(InDoubtResolution::Unsettled, InDoubtResolution::Release);
     }
+    // Arrived and undecided is not a negative. Cancelling here aborts an offer
+    // that is still legitimately in flight, which is what §5 means by surfacing
+    // rather than guessing.
+    if verdict
+        .get("pending")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return InDoubtResolution::Unsettled;
+    }
     match verdict.get("outcome").and_then(|v| v.as_str()) {
         // Never seen there: the offer did not land.
         None => InDoubtResolution::CancelOffer,
@@ -3814,6 +3824,15 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                 .get(&wire.project)
                 .is_some_and(|project| project.home_id == *guard.home_id());
             let outcome = incoming_handoff_outcome(guard.store_ref(), &wire.project);
+            // An offer that arrived and is still awaiting consent has resolved to
+            // nothing, so it records no outcome — and a bare `null` outcome reads
+            // as "never seen", which is the one negative the asker may act on.
+            // Those are different facts, and §4 exists to keep them apart: an
+            // offer still in flight was cancelled out from under itself because
+            // "not resolved yet" and "never arrived" answered identically.
+            let pending = pending_incoming(guard.store_ref()).iter().any(|entry| {
+                entry.get("project").and_then(|p| p.as_str()) == Some(wire.project.as_str())
+            });
             (
                 serde_json::json!({
                     "ok": true,
@@ -3822,6 +3841,8 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                     // `null` is "never seen", which is the only negative safe to
                     // act on: the offer did not land here.
                     "outcome": outcome,
+                    // Arrived and undecided. Not a negative at all (§5).
+                    "pending": pending,
                 }),
                 false,
             )
@@ -7403,5 +7424,57 @@ mod handoff_in_doubt_tests {
             resolve_from_status(&serde_json::json!({ "holds": false, "outcome": "unknown" })),
             InDoubtResolution::Unsettled,
         );
+    }
+
+    /// ADR 0156 §4/§5: a target that has the offer and has not decided yet is not
+    /// answering a negative at all.
+    ///
+    /// §4 requires the target to record the outcome of each handoff it
+    /// *resolves*. A pending offer has resolved nothing, so it records no
+    /// outcome — and a bare absent outcome was read as "never seen there", the
+    /// one negative the asker may act on. The reconcile therefore cancelled
+    /// offers that were still legitimately in flight, aborting a handoff out
+    /// from under its own `relocate` while that call was still awaiting the
+    /// peer. `desktop-federation` caught it in production as a `202` whose body
+    /// already read `aborted`.
+    #[test]
+    fn a_pending_offer_is_unsettled_not_cancelled() {
+        let pending = serde_json::json!({ "holds": false, "outcome": null, "pending": true });
+        assert!(matches!(
+            resolve_from_status(&pending),
+            InDoubtResolution::Unsettled
+        ));
+    }
+
+    /// The negative that remains actionable: nothing pending and nothing
+    /// recorded still means the offer did not land.
+    #[test]
+    fn an_absent_offer_still_cancels() {
+        let never_seen = serde_json::json!({ "holds": false, "outcome": null, "pending": false });
+        assert!(matches!(
+            resolve_from_status(&never_seen),
+            InDoubtResolution::CancelOffer
+        ));
+        // A verdict from a peer that predates the flag reads as before.
+        let older_peer = serde_json::json!({ "holds": false, "outcome": null });
+        assert!(matches!(
+            resolve_from_status(&older_peer),
+            InDoubtResolution::CancelOffer
+        ));
+    }
+
+    /// Pending never outranks holding: §3 still forbids claiming, and a peer
+    /// that holds the project is released to regardless.
+    #[test]
+    fn holding_outranks_pending() {
+        let holds = serde_json::json!({
+            "holds": true,
+            "home": "home:cloud:0123456789abcdef0123456789abcdef",
+            "pending": true,
+        });
+        assert!(matches!(
+            resolve_from_status(&holds),
+            InDoubtResolution::Release(_)
+        ));
     }
 }
