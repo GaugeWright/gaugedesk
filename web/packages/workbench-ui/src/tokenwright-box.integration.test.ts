@@ -12,6 +12,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -22,26 +23,47 @@ import {
     readManagementDocument,
     submitManagementCommand,
     type ManagementEnvironmentSession,
+    type RouteJson,
 } from "@gaugewright/control-plane-client";
 import { TOKENWRIGHT_MANIFEST, TOKENWRIGHT_SCHEMAS } from "./tokenwright-environment";
 import { tokenwrightCommandsFrom } from "./tokenwright-box";
 
 const ROOT = process.env.TOKENWRIGHT_ROOT ?? "/home/jack/code/TokenWright";
 const available = existsSync(join(ROOT, "src", "tokenwright", "__main__.py"));
-const port = 18999;
-const base = `http://127.0.0.1:${port}`;
 
 let box: ChildProcess | undefined;
 let state = "";
 let key = "";
+let base = "";
 let session: ManagementEnvironmentSession;
+/** The real browser transport, pointed at the box once its port is known. */
+let json: RouteJson;
 
-/** The real browser transport, pointed at the box.
+/**
+ * A port the operating system says is free, rather than one this file picked.
  *
- * Deliberately not a hand-rolled `fetch` wrapper. The point of this test is that
- * the client this repository ships reaches a real box, and a transport written
- * for the test would be the one thing in the path that nobody ships. */
-const json = browserRouteJson(base, { bearer: () => key || null });
+ * A fixed port made the box shared rather than owned. The state root is already
+ * per-run, so two runs on one machine each started a box and then both spoke to
+ * whichever won the bind — pairing against it, reading a revision from it, and
+ * having the *other* run's command move that revision on. The visible symptom
+ * was a `conflict` receipt where the test expected `applied` or `rejected`, and
+ * the invisible one is worse: a run that passes while exercising a process it
+ * did not start.
+ */
+async function ownPort(): Promise<number> {
+    return await new Promise((resolve, reject) => {
+        const server = createServer();
+        server.on("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+            const address = server.address();
+            const chosen = typeof address === "object" && address ? address.port : 0;
+            server.close(() =>
+                chosen ? resolve(chosen) : reject(new Error("no loopback port was assigned")),
+            );
+        });
+    });
+}
+
 
 async function run(command: string, args: readonly string[]): Promise<string> {
     return await new Promise((resolve, reject) => {
@@ -57,6 +79,13 @@ async function run(command: string, args: readonly string[]): Promise<string> {
 
 describe.skipIf(!available)("the client against a real TokenWright box", () => {
     beforeAll(async () => {
+        const port = await ownPort();
+        base = `http://127.0.0.1:${port}`;
+        // Deliberately not a hand-rolled `fetch` wrapper. The point of this test
+        // is that the client this repository ships reaches a real box, and a
+        // transport written for the test would be the one thing in the path that
+        // nobody ships.
+        json = browserRouteJson(base, { bearer: () => key || null });
         state = await mkdtemp(join(tmpdir(), "tokenwright-it-"));
         const printed = await run("python3", [
             "-m", "tokenwright", "--state-root", state, "--schemas", "schemas",
