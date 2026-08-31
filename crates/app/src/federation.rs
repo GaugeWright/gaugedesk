@@ -3105,6 +3105,54 @@ fn pending_outgoing_peer(store: &Store, project: &str) -> Option<String> {
     peer
 }
 
+/// Offers this process is sending right now.
+///
+/// ADR 0156 §1 defines *in doubt* as what a transport failure **after** the
+/// offer went out records. An offer still on its way out is neither resolved
+/// nor in doubt — it is in flight, and asking about it races its own arrival:
+/// the target answers "I do not hold it" because it has not received it yet,
+/// which §4 requires be distinguished from never having seen it and cannot be.
+/// The reconcile then cancelled the handoff out from under the `relocate` that
+/// was still awaiting the peer.
+///
+/// Deliberately process-local and not durable. A crash mid-send must leave the
+/// `offer` reconcilable — that is why `unresolved_outgoing` counts it at all —
+/// and an empty set after restart is exactly that.
+static SENDING_OFFERS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+> = std::sync::OnceLock::new();
+
+fn sending_offers() -> &'static std::sync::Mutex<std::collections::BTreeSet<(String, String)>> {
+    SENDING_OFFERS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+/// Marks an offer in flight for as long as it is held.
+struct OfferInFlight(String, String);
+
+impl OfferInFlight {
+    fn mark(peer: &str, project: &str) -> Self {
+        if let Ok(mut set) = sending_offers().lock() {
+            set.insert((peer.to_owned(), project.to_owned()));
+        }
+        Self(peer.to_owned(), project.to_owned())
+    }
+}
+
+impl Drop for OfferInFlight {
+    fn drop(&mut self) {
+        if let Ok(mut set) = sending_offers().lock() {
+            set.remove(&(self.0.clone(), self.1.clone()));
+        }
+    }
+}
+
+fn offer_is_in_flight(peer: &str, project: &str) -> bool {
+    sending_offers()
+        .lock()
+        .map(|set| set.contains(&(peer.to_owned(), project.to_owned())))
+        .unwrap_or(false)
+}
+
 /// Every project this authority offered to `peer` and has not seen resolved —
 /// the questions a reconcile asks (ADR 0156 §2).
 ///
@@ -3386,7 +3434,10 @@ async fn resolve_handoffs_in_doubt(wb: &SharedWorkbench, peer: &AuthorityId) {
         let me = fed.authority.clone();
         let home = guard.federation_home_id();
         let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
-        let projects = unresolved_outgoing(guard.store_ref(), peer.as_str());
+        let projects: Vec<String> = unresolved_outgoing(guard.store_ref(), peer.as_str())
+            .into_iter()
+            .filter(|project| !offer_is_in_flight(peer.as_str(), project))
+            .collect();
         projects
             .into_iter()
             .map(|project| {
@@ -4046,6 +4097,9 @@ async fn drive_relocate(
             );
         }
     }
+    // Held across the send and dropped on every exit from it, so a reconcile
+    // cannot ask about an offer that has not arrived yet (ADR 0156 §1).
+    let _in_flight = OfferInFlight::mark(peer.as_str(), project);
     match send_handoff(
         &broker,
         &me,
@@ -7489,5 +7543,42 @@ mod handoff_in_doubt_tests {
             resolve_from_status(&holds),
             InDoubtResolution::Release(_)
         ));
+    }
+
+    /// ADR 0156 §1: *in doubt* is what a transport failure **after** the offer
+    /// went out records. An offer still on its way out is neither resolved nor
+    /// in doubt, and asking about it races its own arrival — the target answers
+    /// "I do not hold it" because it has not received it yet, which §4 requires
+    /// be distinguished from never having seen it and cannot be. The reconcile
+    /// then cancelled the handoff out from under the `relocate` still awaiting
+    /// the peer, which `desktop-federation` saw as a `202` already reading
+    /// `aborted`.
+    #[test]
+    fn an_offer_this_process_is_sending_is_not_reconciled() {
+        assert!(!super::offer_is_in_flight("bob", "engagement-1"));
+        {
+            let _held = super::OfferInFlight::mark("bob", "engagement-1");
+            assert!(super::offer_is_in_flight("bob", "engagement-1"));
+            // Scoped to the exact peer and project it names.
+            assert!(!super::offer_is_in_flight("carol", "engagement-1"));
+            assert!(!super::offer_is_in_flight("bob", "engagement-2"));
+        }
+        // Dropped on every exit from the send, including an early return.
+        assert!(!super::offer_is_in_flight("bob", "engagement-1"));
+    }
+
+    /// The flight marker is process-local on purpose. A crash mid-send must
+    /// leave the `offer` reconcilable — that is why `unresolved_outgoing`
+    /// counts a bare offer at all — and an empty set after restart is exactly
+    /// that, so the durable question survives while the live race does not.
+    #[test]
+    fn a_bare_offer_is_still_a_question_after_restart() {
+        let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
+        record_outgoing_handoff(&mut store, "offer", "project-mid-send", "bob").unwrap();
+        assert!(!super::offer_is_in_flight("bob", "project-mid-send"));
+        assert_eq!(
+            unresolved_outgoing(&store, "bob"),
+            vec!["project-mid-send".to_string()],
+        );
     }
 }
