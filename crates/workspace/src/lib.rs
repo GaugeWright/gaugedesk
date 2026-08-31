@@ -915,7 +915,7 @@ impl Instance {
         reservation_id: &str,
     ) -> Result<WorkstreamPromotionOutcome> {
         let mut vcs = self.store()?;
-        sync_in(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
+        let main = sync_in(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
         let at = now_at();
         let mut streams = self.workstreams()?;
         let mut stream = streams
@@ -1060,7 +1060,13 @@ impl Instance {
                 )))
             }
         }
-        sync_out(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
+        sync_out_observing(
+            &mut vcs,
+            &self.store_root,
+            MAINLINE_BRANCH_ID,
+            &self.repo,
+            &main.observed,
+        )?;
         let row = streams
             .get_stream(id)?
             .ok_or_else(|| WorkspaceError::msg("closed workstream disappeared"))?;
@@ -1075,6 +1081,14 @@ impl Instance {
                 .collect(),
         })
     }
+}
+
+/// What one [`Engagement::import_sides`] observed, per disk tree. `repo` is
+/// `Some` exactly when mainline's repo is this chat's target tree and was
+/// therefore imported.
+struct SidesScan {
+    branch: BTreeSet<String>,
+    repo: Option<BTreeSet<String>>,
 }
 
 #[derive(Clone)]
@@ -1101,26 +1115,34 @@ impl Engagement {
 
     /// Import the worktree (and mainline's repo, when it is the target's
     /// disk tree) so store-level verbs see what's actually on disk.
-    fn import_sides(&self, vcs: &mut NativeWorkspaceVcs) -> Result<()> {
-        sync_in_with_roots(
+    ///
+    /// Two disk trees means two independent imports, each speaking only for the
+    /// tree it walked, so the observations stay apart: a verb that projects both
+    /// pairs each projection with its own.
+    fn import_sides(&self, vcs: &mut NativeWorkspaceVcs) -> Result<SidesScan> {
+        let branch = sync_in_with_roots(
             vcs,
             &self.store_root,
             &self.branch,
             &self.path,
             self.sparse_roots.as_ref(),
-        )?;
-        if self.target == MAINLINE_BRANCH_ID {
-            sync_in(vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
-        }
-        Ok(())
+        )?
+        .observed;
+        let repo = if self.target == MAINLINE_BRANCH_ID {
+            Some(sync_in(vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?.observed)
+        } else {
+            None
+        };
+        Ok(SidesScan { branch, repo })
     }
 
-    fn project_branch(&self, vcs: &mut NativeWorkspaceVcs) -> Result<()> {
-        self.project_branch_observing(vcs, None)
-    }
-
-    /// [`Self::project_branch`] restricted to what a paired import saw — see
-    /// [`sync_out_with_roots_observing`].
+    /// Project the branch head into this chat's worktree, sweeping what
+    /// `observed` allows — see [`sync_out_with_roots_observing`].
+    ///
+    /// There is deliberately no unpaired convenience form. Every caller states
+    /// its answer to "what may this clear?", because a projection that silently
+    /// defaults to sweeping everything is exactly how a sibling turn's work got
+    /// quarantined instead of imported.
     fn project_branch_observing(
         &self,
         vcs: &mut NativeWorkspaceVcs,
@@ -1136,7 +1158,7 @@ impl Engagement {
         )
     }
 
-    fn import_branch(&self, vcs: &mut NativeWorkspaceVcs) -> Result<Option<String>> {
+    fn import_branch(&self, vcs: &mut NativeWorkspaceVcs) -> Result<ImportScan> {
         sync_in_with_roots(
             vcs,
             &self.store_root,
@@ -1181,14 +1203,18 @@ impl Engagement {
         }
         let mut vcs = self.store()?;
         // Preserve any pending work in the old admitted view before changing
-        // what this handle may import.
-        self.import_branch(&mut vcs)?;
-        sync_out_with_roots(
+        // what this handle may import. The scan walks the whole worktree, not
+        // just the old view, so narrowing still clears the partitions this
+        // checkout is dropping — and a file that arrives while it runs is not
+        // one of them.
+        let scan = self.import_branch(&mut vcs)?;
+        sync_out_with_roots_observing(
             &mut vcs,
             &self.store_root,
             &self.branch,
             &self.path,
             Some(roots),
+            Some(&scan.observed),
         )?;
         self.sparse_roots = Some(roots.clone());
         Ok(())
@@ -1267,7 +1293,10 @@ impl Engagement {
             return Err(error);
         }
 
-        self.project_branch(&mut vcs)?;
+        // Unpaired: a rehome rematerializes the destination's tree wholesale,
+        // and it already refused above if this chat had pending work. Clearing
+        // what the destination does not name is the act, not a side effect.
+        self.project_branch_observing(&mut vcs, None)?;
         for (path, body) in local_overlays {
             self.write_file(&path, &body)?;
         }
@@ -1345,7 +1374,10 @@ impl Engagement {
                 self.import_branch(&mut vcs)?;
             }
         }
-        self.project_branch(&mut vcs)
+        // Unpaired: a revert means "the target's tree, whatever is here now".
+        // Discarding is the whole verb, so it clears everything the restored
+        // manifest does not name — into quarantine, as always.
+        self.project_branch_observing(&mut vcs, None)
     }
 
     pub fn merge_probe(&self) -> Result<MergeOutcome> {
@@ -1369,13 +1401,25 @@ impl Engagement {
     /// the merge cut (folding anything the target had that we lacked).
     pub fn merge_into_main(&self) -> Result<MergeOutcome> {
         let mut vcs = self.store()?;
-        self.import_sides(&mut vcs)?;
+        // Both refreshes are paired with the import that just spoke for their
+        // own tree, so each sweeps only what that import saw. A chat merges
+        // every clean turn for its whole life, which puts these projections
+        // alongside live turns writing files — and a sibling turn's write
+        // landing after this import is work no import has considered yet, not
+        // content the merge decided against.
+        let sides = self.import_sides(&mut vcs)?;
         match vcs.merge_keeping(&self.branch, &fresh_cut_id("keep"), &now_at())? {
             VcsMergeOutcome::Landed { .. } | VcsMergeOutcome::Adopted { .. } => {
-                if self.target == MAINLINE_BRANCH_ID {
-                    sync_out(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
+                if let Some(repo) = &sides.repo {
+                    sync_out_observing(
+                        &mut vcs,
+                        &self.store_root,
+                        MAINLINE_BRANCH_ID,
+                        &self.repo,
+                        repo,
+                    )?;
                 }
-                self.project_branch(&mut vcs)?;
+                self.project_branch_observing(&mut vcs, Some(&sides.branch))?;
                 Ok(MergeOutcome::Clean)
             }
             VcsMergeOutcome::Conflicted { .. } => Ok(MergeOutcome::Conflict),
@@ -1387,10 +1431,10 @@ impl Engagement {
     /// reconcile at quiescence), then refresh the worktree.
     pub fn sync_from_main(&self) -> Result<MergeOutcome> {
         let mut vcs = self.store()?;
-        self.import_sides(&mut vcs)?;
+        let sides = self.import_sides(&mut vcs)?;
         match vcs.reconcile_branch(&self.branch, true, &fresh_cut_id("sync"), &now_at())? {
             ReconcileOutcome::Rebased { .. } | ReconcileOutcome::UpToDate => {
-                self.project_branch(&mut vcs)?;
+                self.project_branch_observing(&mut vcs, Some(&sides.branch))?;
                 Ok(MergeOutcome::Clean)
             }
             ReconcileOutcome::Conflicts { .. } => Ok(MergeOutcome::Conflict),
@@ -1754,7 +1798,7 @@ fn sync_in(
     store_root: &Path,
     branch: &str,
     root: &Path,
-) -> Result<Option<String>> {
+) -> Result<ImportScan> {
     sync_in_with_roots(vcs, store_root, branch, root, None)
 }
 
@@ -1764,13 +1808,13 @@ fn sync_in_with_roots(
     branch: &str,
     root: &Path,
     sparse_roots: Option<&BTreeSet<String>>,
-) -> Result<Option<String>> {
+) -> Result<ImportScan> {
     if !root.is_dir() {
-        return Ok(None);
+        return Ok(ImportScan::unscanned());
     }
     let writer = workspace_writer(store_root, branch);
     let _writing = writer.lock().unwrap_or_else(PoisonError::into_inner);
-    Ok(sync_in_with_roots_under_writer(vcs, store_root, branch, root, sparse_roots)?.cut)
+    sync_in_with_roots_under_writer(vcs, store_root, branch, root, sparse_roots)
 }
 
 /// What one import saw and what it minted.
@@ -1780,10 +1824,31 @@ fn sync_in_with_roots(
 /// projection paired with this import may sweep what the scan declined; it may
 /// not sweep what the scan never saw, because that is work that arrived after
 /// the scan and belongs to the *next* import.
+///
+/// The pairing does not have to be tight. `commit_turn` holds the branch writer
+/// across its import and its projection, so its observation is exactly current;
+/// the fold verbs (`merge_into_main`, `sync_from_main`, `replace_sparse_roots`,
+/// workstream promotion) release the writer in between and project against an
+/// observation that is minutes old. That is still sound, because staleness only
+/// ever *shrinks* the swept set: a path the scan saw is a path that was really
+/// there, and everything that arrived since reads as unobserved and survives.
+/// An observation cannot authorize sweeping a file it does not name, so an old
+/// one is a weaker licence to sweep, never a wrong one.
 struct ImportScan {
     /// The cut this import minted, or `None` when nothing changed.
     cut: Option<String>,
     observed: BTreeSet<String>,
+}
+
+impl ImportScan {
+    /// No scan happened — there was no worktree to walk. A projection paired
+    /// with this sweeps nothing, which is the safe direction.
+    fn unscanned() -> Self {
+        Self {
+            cut: None,
+            observed: BTreeSet::new(),
+        }
+    }
 }
 
 /// `sync_in_with_roots` with the per-branch writer already held by a caller
@@ -1796,13 +1861,7 @@ fn sync_in_with_roots_under_writer(
     sparse_roots: Option<&BTreeSet<String>>,
 ) -> Result<ImportScan> {
     if !root.is_dir() {
-        // No scan happened, so nothing was observed. A paired projection must
-        // then sweep nothing, which is the safe direction: an un-imported file
-        // survives to be imported next time.
-        return Ok(ImportScan {
-            cut: None,
-            observed: BTreeSet::new(),
-        });
+        return Ok(ImportScan::unscanned());
     }
     let scratch = load_scratch(vcs, store_root, branch);
     let import = whipplescript_store::materialize::import_scratch(
@@ -1872,6 +1931,18 @@ fn sync_out(
     root: &Path,
 ) -> Result<()> {
     sync_out_with_roots(vcs, store_root, branch, root, None)
+}
+
+/// [`sync_out`] told what the import it is paired with saw — see
+/// [`sync_out_with_roots_observing`].
+fn sync_out_observing(
+    vcs: &mut NativeWorkspaceVcs,
+    store_root: &Path,
+    branch: &str,
+    root: &Path,
+    observed: &BTreeSet<String>,
+) -> Result<()> {
+    sync_out_with_roots_observing(vcs, store_root, branch, root, None, Some(observed))
 }
 
 fn sync_out_with_roots(
@@ -3419,6 +3490,136 @@ mod tests {
             "rejection must not mutate old state"
         );
         assert!(worktrees.join("chat/.git").exists());
+    }
+
+    /// The fold verbs have `commit_turn`'s window one step further out, and it
+    /// is the same loss: `merge_into_main` imports both sides, merges, and then
+    /// refreshes both disk trees. A sibling turn's write landing after that
+    /// import is unmanifested for one reason only — no import has considered it
+    /// — so sweeping it put the bytes in quarantine and nothing in the manifest.
+    ///
+    /// Unlike `commit_turn`, this verb releases the branch writer between its
+    /// import and its projections, so the observation it projects against is
+    /// deliberately stale. That is the property under test: a stale observation
+    /// must still sweep what the merge really removed, and must not sweep what
+    /// arrived after it was taken.
+    #[test]
+    fn a_merge_refreshes_both_trees_without_sweeping_what_its_import_missed() {
+        let (_directory, instance) = instance();
+        instance
+            .seed_main(&[("kept.md", "kept"), ("dropped.md", "dropped by the merge")])
+            .expect("seed");
+        let chat = instance.create_engagement("folder").expect("chat");
+        // The chat's own settled delta, and a target-side deletion the merge
+        // has to carry out to both trees.
+        chat.write_file("mine.md", "my work").expect("write");
+        std::fs::remove_file(chat.path.join("dropped.md")).expect("delete");
+        chat.commit_turn("settle").expect("settle");
+
+        let mut vcs = chat.store().expect("store");
+        let sides = chat.import_sides(&mut vcs).expect("import both sides");
+        let repo_observed = sides
+            .repo
+            .clone()
+            .expect("a mainline-targeted chat imports the repo");
+        assert!(
+            repo_observed.contains("kept.md") && repo_observed.contains("dropped.md"),
+            "the repo scan saw the target tree as it stood: {repo_observed:?}"
+        );
+
+        // Two sibling writes land after that import — one in each tree.
+        std::fs::write(chat.path.join("late-chat.md"), "a sibling turn's work").expect("late");
+        std::fs::write(instance.repo().join("late-repo.md"), "unsynced target work")
+            .expect("late repo");
+
+        match vcs
+            .merge_keeping(&chat.branch, &fresh_cut_id("keep"), &now_at())
+            .expect("merge")
+        {
+            VcsMergeOutcome::Landed { .. } | VcsMergeOutcome::Adopted { .. } => {}
+            other => panic!("merge did not land: {other:?}"),
+        }
+        sync_out_observing(
+            &mut vcs,
+            &chat.store_root,
+            MAINLINE_BRANCH_ID,
+            instance.repo(),
+            &repo_observed,
+        )
+        .expect("refresh the target tree");
+        chat.project_branch_observing(&mut vcs, Some(&sides.branch))
+            .expect("refresh the chat tree");
+
+        // The stale observation is still a licence to remove what the merge
+        // removed: `dropped.md` was on disk when the repo was scanned.
+        assert!(
+            !instance.repo().join("dropped.md").exists(),
+            "the merge's deletion did not reach the target tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(instance.repo().join("mine.md")).ok(),
+            Some("my work".to_owned()),
+            "the merged delta did not reach the target tree"
+        );
+
+        // And it is not a licence to remove what it never saw, in either tree.
+        assert_eq!(
+            std::fs::read_to_string(chat.path.join("late-chat.md")).ok(),
+            Some("a sibling turn's work".to_owned()),
+            "the chat refresh swept a file its own import never scanned"
+        );
+        assert_eq!(
+            std::fs::read_to_string(instance.repo().join("late-repo.md")).ok(),
+            Some("unsynced target work".to_owned()),
+            "the target refresh swept a file its own import never scanned"
+        );
+    }
+
+    /// Narrowing a sparse view is now paired with its own import (ADR 0159 §3
+    /// corrects ADR 0157 §3, which had listed it as unpaired), so this pins the
+    /// half that pairing must not change: clearing the partitions this checkout
+    /// stops selecting is the act, and they are swept because the import saw
+    /// them. What pairing adds — a file arriving mid-narrowing surviving — needs
+    /// a writer racing the verb and is covered at the seam above.
+    #[test]
+    fn narrowing_a_sparse_view_still_drops_the_partitions_it_stops_selecting() {
+        let (_directory, instance) = instance();
+        instance
+            .seed_main(&[("keep/a.md", "a"), ("drop/b.md", "b")])
+            .expect("seed");
+        let both: BTreeSet<String> = ["keep".to_owned(), "drop".to_owned()].into_iter().collect();
+        let mut chat = instance
+            .create_engagement_subset("narrowing", MAINLINE_BRANCH_ID, &both)
+            .expect("chat");
+        assert!(
+            chat.path.join("drop/b.md").exists(),
+            "both partitions start out"
+        );
+
+        let narrowed: BTreeSet<String> = ["keep".to_owned()].into_iter().collect();
+        chat.replace_sparse_roots(&narrowed).expect("narrow");
+
+        assert!(
+            !chat.path.join("drop/b.md").exists(),
+            "narrowing must drop the partition this checkout no longer selects"
+        );
+        assert!(
+            chat.path.join("keep/a.md").exists(),
+            "the kept partition stays"
+        );
+
+        // The manifest keeps the omitted partition — narrowing is a view
+        // change, never a deletion — so it is still recoverable.
+        let vcs = chat.store().expect("store");
+        let manifest = vcs
+            .manifest(&chat.branch)
+            .expect("manifest")
+            .unwrap_or_default();
+        assert!(
+            manifest.contains_key("drop/b.md"),
+            "an omitted partition must not be read as a deletion: {:?}",
+            manifest.keys().collect::<Vec<_>>()
+        );
     }
 
     /// The window the concurrent-importer test below hits by luck, driven
