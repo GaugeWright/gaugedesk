@@ -1318,6 +1318,7 @@ impl Workbench {
             base_url,
             execution_classes,
         )
+        .map(|_reference| ())
     }
 
     pub fn upsert_account_credential_in_with_policy(
@@ -1327,11 +1328,18 @@ impl Workbench {
         sealed_token: String,
         base_url: String,
         execution_classes: BTreeSet<ModelExecutionClass>,
-    ) -> Result<(), AdmitError> {
+    ) -> Result<String, AdmitError> {
+        // The version advances on every upsert, so the reference a caller must
+        // quote is only knowable here. Returning it is what stops every caller
+        // reconstructing both the format and the version and drifting off one
+        // or the other — which is exactly how the local model broker came to
+        // refuse a correctly linked credential.
         let version = credentials_in_scope(self.store_ref(), scope)
             .get(&provider)
             .map(|record| record.version.saturating_add(1))
             .unwrap_or(1);
+        let reference =
+            canonical_credential_ref("account", self.authority().as_str(), &provider, version);
         let record = CredentialRecord {
             authentication: authentication_for_provider(&provider),
             id: provider,
@@ -1342,7 +1350,8 @@ impl Workbench {
             status: CredentialStatus::Active,
             execution_classes,
         };
-        self.write_account_record_in(scope, "credential", &record.id, &record)
+        self.write_account_record_in(scope, "credential", &record.id, &record)?;
+        Ok(reference)
     }
 
     /// Tombstone one account credential (default scope).

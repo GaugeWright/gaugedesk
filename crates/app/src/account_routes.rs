@@ -1697,15 +1697,19 @@ pub async fn post_credential(
     let execution_classes = body
         .execution_classes
         .unwrap_or_else(|| wb.default_model_execution_classes());
-    if let Err(e) = wb.upsert_account_credential_in_with_policy(
+    // Hand back the reference the caller must quote. Nothing else exposes it,
+    // and it depends on a version only the upsert knows, so without this every
+    // caller reconstructs the format *and* guesses the version.
+    let credential_ref = match wb.upsert_account_credential_in_with_policy(
         &scope,
         provider.clone(),
         sealed,
         base_url,
         execution_classes.clone(),
     ) {
-        return err_response(e);
-    }
+        Ok(reference) => reference,
+        Err(e) => return err_response(e),
+    };
     // Advance the onboarding checklist (ADR 0075 Phase 2). Best-effort — the
     // credential is already saved; the provider name is not a secret.
     wb.advance_onboarding("credential", &json!({ "provider": provider }).to_string());
@@ -1714,6 +1718,7 @@ pub async fn post_credential(
         Json(json!({
             "provider": provider,
             "linked": true,
+            "credential_ref": credential_ref,
             "execution_classes": execution_classes,
         })),
     )
