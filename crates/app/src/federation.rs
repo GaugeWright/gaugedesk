@@ -4076,6 +4076,19 @@ async fn drive_relocate(
             if committed {
                 let _ =
                     record_outgoing_handoff(guard.store_mut(), "resolved", project, peer.as_str());
+                // The target also *pushes* `Committed`, and that receiver commits this
+                // side too. Both are correct and they race: whichever arrives second
+                // finds the handoff already terminal, `SyncLog` is refused from
+                // `Committed`, and the commit below then failed `STATE_BEFORE_HOME`
+                // and answered `502` for a relocation that had entirely succeeded.
+                // Pre-authorized peers commit fast enough to lose it reliably, which
+                // is how `desktop-federation` caught it.
+                //
+                // Already committed is this call's own goal, so report it.
+                let already = load_handoff(guard.store_ref(), project);
+                if already.phase == HandoffPhase::Committed {
+                    return (StatusCode::OK, handoff_state_json(project, &already));
+                }
                 // Peer committed immediately (pre-auth / one-shot); origin commits its side.
                 let _ = apply_handoff(guard.store_mut(), project, HandoffCommand::SyncLog);
                 let target_home = verdict
