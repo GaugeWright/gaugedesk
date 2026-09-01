@@ -14,13 +14,14 @@
  */
 
 import { TurnStopped, TURN_STOPPED_STATUS } from "./control-plane-domain";
-import type { RouteJson } from "./control-plane-transport";
+import type { RouteJson, RouteOptions } from "./control-plane-transport";
 
 /** The `BrowserTunnel` facade, as a structural type so a test can stand one in
  * without loading wasm. Method names match the exported binding exactly. */
 export interface TunnelFacade {
     receiveFrame(frame: Uint8Array): void;
-    sendRequest(method: string, path: string, body?: string): void;
+    sendRequest(method: string, path: string, body?: string,
+                headers?: Record<string, string>): void;
     takeOutgoing(): Uint8Array;
     pollStatus(): number | undefined;
     takeBody(): string;
@@ -37,6 +38,20 @@ export interface TunnelSocket {
     onClose(handler: () => void): void;
 }
 
+/** Extra headers for one call, assembled the way the direct transport does.
+ *
+ * A carried surface may demand one: TokenWright admits nothing without
+ * `Authorization`, so a tunnel that sent no headers could reach a box, claim it,
+ * and then never use it. */
+function headersFor(bearer: (() => string | null) | undefined,
+                    options?: RouteOptions): Record<string, string> | undefined {
+    const headers: Record<string, string> = {};
+    const token = bearer?.();
+    if (token) headers.authorization = `Bearer ${token}`;
+    if (options?.idempotencyKey) headers["idempotency-key"] = options.idempotencyKey;
+    return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
 export interface TunnelRouteOptions {
     /** Open the pinned tunnel and its carrier. Async because the wasm module
      * loads on demand, so nothing is fetched until a relay-only Home is opened. */
@@ -47,6 +62,10 @@ export interface TunnelRouteOptions {
     readonly now?: () => number;
     /** Yield between pumps; a test drives it synchronously. */
     readonly tick?: () => Promise<void>;
+    /** The credential the carried surface requires, read per call so a rotated
+     * key is used without rebuilding the route. Shaped like `browserRouteJson`'s
+     * so the two transports are configured the same way. */
+    readonly bearer?: () => string | null;
 }
 
 class TunnelClosed extends Error {}
@@ -96,13 +115,18 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
         method: string,
         path: string,
         body?: unknown,
+        routeOptions?: RouteOptions,
     ) => {
         // One at a time: the tunnel carries a single stream, so interleaving two
         // requests would splice their frames together.
         const run = queue.then(async () => {
             if (closed) throw new Error("the Home tunnel closed");
             const { tunnel, socket } = await ensure();
-            tunnel.sendRequest(method, path, body === undefined ? undefined : JSON.stringify(body));
+            tunnel.sendRequest(
+                method, path,
+                body === undefined ? undefined : JSON.stringify(body),
+                headersFor(options.bearer, routeOptions),
+            );
             const deadline = now() + timeoutMs;
             for (;;) {
                 // Not before the relay has spliced this leg. Ciphertext written

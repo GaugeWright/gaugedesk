@@ -144,14 +144,34 @@ impl BrowserTunnel {
 
     /// Queue a request. It is encrypted on the next [`Self::take_outgoing`], so
     /// a caller may send before the handshake completes.
+    /// `headers` is a plain object of extra request headers, or `undefined`.
+    ///
+    /// It exists because a carried surface may require one. A TokenWright box
+    /// admits nothing without `Authorization`, so a tunnel that could not send
+    /// a header could reach that box, claim it, and then never use it — which
+    /// is exactly what happened before this took an argument. The client
+    /// underneath has always accepted headers; only this binding dropped them.
     #[wasm_bindgen(js_name = sendRequest)]
     pub fn send_request(
         &mut self,
         method: &str,
         path: &str,
         body: Option<String>,
+        headers: Option<js_sys::Object>,
     ) -> Result<(), JsValue> {
-        let mut headers = std::collections::BTreeMap::new();
+        let mut headers_map = std::collections::BTreeMap::new();
+        if let Some(extra) = headers {
+            for entry in js_sys::Object::entries(&extra).iter() {
+                let pair: js_sys::Array = entry.into();
+                let (name, value) = (pair.get(0).as_string(), pair.get(1).as_string());
+                if let (Some(name), Some(value)) = (name, value) {
+                    // Lowercased because HTTP header names are case-insensitive
+                    // and the map below is not.
+                    headers_map.insert(name.to_ascii_lowercase(), value);
+                }
+            }
+        }
+        let mut headers = headers_map;
         if body.is_some() {
             headers.insert("content-type".to_owned(), "application/json".to_owned());
         }

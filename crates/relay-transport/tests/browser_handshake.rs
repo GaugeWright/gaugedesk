@@ -60,6 +60,7 @@ fn browser_entropy_varies_between_sessions() {
 }
 
 use gaugedesk_relay_transport::browser::BrowserTunnel;
+use wasm_bindgen::JsValue;
 
 /// The facade JavaScript actually holds: it must reject a malformed pin rather
 /// than start a session that can never verify.
@@ -94,7 +95,7 @@ fn a_queued_request_produces_ciphertext_to_send() {
     let mut tunnel = BrowserTunnel::new(&"ab".repeat(32)).expect("tunnel");
     assert!(tunnel.is_handshaking());
     tunnel
-        .send_request("POST", "/home/admissions", None)
+        .send_request("POST", "/home/admissions", None, None)
         .expect("queue");
     let frame = tunnel.take_outgoing().expect("outgoing");
     assert!(
@@ -103,4 +104,30 @@ fn a_queued_request_produces_ciphertext_to_send() {
     );
     assert_eq!(frame[0], 0, "framed as a relay DATA record");
     assert_eq!(tunnel.poll_status().expect("poll"), None, "no reply yet");
+}
+
+/// `sendRequest` must carry the headers a surface requires.
+///
+/// A TokenWright box admits nothing without `Authorization`, so a binding that
+/// silently dropped one would let a page reach a box, claim it, and then be
+/// refused on every call after — which is what happened before this argument
+/// existed. The ciphertext is opaque here, so this asserts what this layer can
+/// actually see: that a header object is accepted and encrypted without error,
+/// and that a non-string value is skipped rather than panicking on a page that
+/// hands us `{authorization: null}`.
+#[wasm_bindgen_test]
+fn a_request_carries_the_headers_it_was_given() {
+    let mut tunnel = BrowserTunnel::new(&"ab".repeat(32)).expect("tunnel");
+    let headers = js_sys::Object::new();
+    js_sys::Reflect::set(&headers, &"Authorization".into(), &"Bearer secret".into()).expect("set");
+    js_sys::Reflect::set(&headers, &"Idempotency-Key".into(), &"key-1".into()).expect("set");
+    js_sys::Reflect::set(&headers, &"X-Ignored".into(), &JsValue::NULL).expect("set");
+
+    tunnel
+        .send_request("GET", "/v1/documents", None, Some(headers))
+        .expect("queue with headers");
+
+    let frame = tunnel.take_outgoing().expect("outgoing");
+    assert!(!frame.is_empty(), "a headed request must produce bytes");
+    assert_eq!(frame[0], 0, "framed as a relay DATA record");
 }

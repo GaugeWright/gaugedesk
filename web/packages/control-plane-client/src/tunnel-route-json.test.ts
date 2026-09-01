@@ -8,16 +8,19 @@ function fakeTunnel(
     replies: Array<{ status: number; body: string }>,
     afterPumps = 2,
     paired = true,
-): TunnelFacade & { sent: string[] } {
+): TunnelFacade & { sent: string[]; headers: Array<Record<string, string> | undefined> } {
     let pumps = 0;
     const sent: string[] = [];
+    const headers: Array<Record<string, string> | undefined> = [];
     return {
         sent,
+        headers,
         isPaired: () => paired,
         receiveFrame: () => undefined,
-        sendRequest: (method, path, body) => {
+        sendRequest: (method, path, body, extra) => {
             pumps = 0;
             sent.push(`${method} ${path} ${body ?? ""}`.trim());
+            headers.push(extra);
         },
         takeOutgoing: () => (pumps === 0 ? new Uint8Array([0, 1, 2]) : new Uint8Array()),
         pollStatus: () => {
@@ -61,6 +64,60 @@ describe("routeJson over the tunnel (DESK-7)", () => {
         });
         expect(tunnel.sent).toEqual(["POST /home/admissions"]);
         expect(frames.length).toBeGreaterThan(0);
+    });
+
+    it("carries a bearer, because a carried surface may admit nothing without one", async () => {
+        // A TokenWright box requires `Authorization` on every request. Before
+        // this, a browser could reach one, claim it, and then never use it —
+        // the binding built a header map holding only `content-type`.
+        const tunnel = fakeTunnel([{ status: 200, body: "{}" }]);
+        const { socket } = fakeSocket();
+        const json = tunnelRouteJson({
+            open: async () => ({ tunnel, socket }),
+            tick: async () => undefined,
+            bearer: () => "tw_secret",
+        });
+        await json("GET", "/v1/models");
+        expect(tunnel.headers[0]).toEqual({ authorization: "Bearer tw_secret" });
+    });
+
+    it("reads the bearer per call, so a rotated key is used without rebuilding", async () => {
+        const tunnel = fakeTunnel([{ status: 200, body: "{}" }, { status: 200, body: "{}" }]);
+        const { socket } = fakeSocket();
+        let key = "first";
+        const json = tunnelRouteJson({
+            open: async () => ({ tunnel, socket }),
+            tick: async () => undefined,
+            bearer: () => key,
+        });
+        await json("GET", "/a");
+        key = "second";
+        await json("GET", "/b");
+        expect(tunnel.headers.map((h) => h?.authorization))
+            .toEqual(["Bearer first", "Bearer second"]);
+    });
+
+    it("carries an idempotency key, which it previously dropped on the floor", async () => {
+        // The route took no `RouteOptions` at all, so a command's key never
+        // crossed the tunnel — and a replayed command would have done the work
+        // twice on any surface that de-duplicates by it.
+        const tunnel = fakeTunnel([{ status: 200, body: "{}" }]);
+        const { socket } = fakeSocket();
+        const json = tunnelRouteJson({
+            open: async () => ({ tunnel, socket }),
+            tick: async () => undefined,
+        });
+        await json("POST", "/commands", { a: 1 }, { idempotencyKey: "idem-1" });
+        expect(tunnel.headers[0]).toEqual({ "idempotency-key": "idem-1" });
+    });
+
+    it("sends no header block when there is nothing to say", async () => {
+        const tunnel = fakeTunnel([{ status: 200, body: "{}" }]);
+        const { socket } = fakeSocket();
+        const json = tunnelRouteJson({
+            open: async () => ({ tunnel, socket }), tick: async () => undefined });
+        await json("GET", "/v1/models");
+        expect(tunnel.headers[0]).toBeUndefined();
     });
 
     it("raises the Home's refusal rather than returning it as a value", async () => {

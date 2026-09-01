@@ -123,7 +123,7 @@ async fn a_browser_admits_to_a_relay_only_home() {
         .expect("send handshake");
 
     tunnel
-        .send_request("POST", "/home/admissions", None)
+        .send_request("POST", "/home/admissions", None, None)
         .expect("queue the admission");
 
     for _ in 0..400 {
