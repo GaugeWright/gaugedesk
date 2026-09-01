@@ -120,6 +120,15 @@ export {
     tokenwrightRegistryFor,
 } from "./tokenwright-box";
 export type { TokenWrightCommandBinding } from "./tokenwright-box";
+export { connectTokenWrightBox, IDLE as TOKENWRIGHT_CONNECT_IDLE } from "./tokenwright-connect";
+export type {
+    ConnectDependencies as TokenWrightConnectDependencies,
+    OpenedBoxTransport as TokenWrightBoxTransport,
+    TokenWrightConnectPhase,
+    TokenWrightConnectState,
+} from "./tokenwright-connect";
+export { TokenWrightConnectPanel } from "./TokenWrightConnectPanel";
+export type { TokenWrightConnectPanelProps } from "./TokenWrightConnectPanel";
 export type {
     EnvironmentDocumentBinding,
     EnvironmentManifest,
