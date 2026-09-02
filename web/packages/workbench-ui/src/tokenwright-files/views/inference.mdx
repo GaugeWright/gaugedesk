@@ -2,9 +2,20 @@
 
 <Notice text="The engine is reached through the relay leg this box dials out to. Nothing about it is published to the network." />
 
-<Grid columns="3"><Field label="Engine" value="engine.name" /><Field label="Version" value="engine.version" /><Field label="Status" value="engine.status" /><Field label="Listening on" value="engine.listen" /><Field label="Uptime" value="engine.uptime" /><Metric label="Restarts" value="engine.restarts" /></Grid>
+<Grid columns="3"><Field label="Engine" value="engine.name" /><Field label="Requested engine" value="desired.engine" /><Field label="Version" value="engine.version" /><Field label="Status" value="engine.status" /><Field label="Listening on" value="engine.listen" /><Field label="Uptime" value="engine.uptime" /><Metric label="Restarts" value="engine.restarts" /></Grid>
 
 <Grid columns="1"><Field label="Last error" value="engine.last_error" /></Grid>
+
+**Engine** is what answered; **requested engine** is what this box was told to
+run. They differ while a change is reconciling, and they differ *persistently*
+when the requested engine will not start — which is the case worth seeing, since
+a box that quietly kept running the old one would look like a change that
+worked.
+
+To swap engines, edit `desired.engine` in this document's literal JSON and then
+restart the engine below. A box runs one at a time: two would contend for the
+same GPU and the same port, and "which one served this request" is not a
+question these documents could answer honestly.
 
 ## Model
 

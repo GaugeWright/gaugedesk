@@ -23,7 +23,8 @@
         "model",
         "models",
         "autostart",
-        "direct_access"
+        "direct_access",
+        "engine"
       ],
       "additionalProperties": false,
       "properties": {
@@ -48,6 +49,15 @@
           "items": {
             "type": "string"
           }
+        },
+        "engine": {
+          "type": "string",
+          "enum": [
+            "freetoken",
+            "vllm",
+            "sglang"
+          ],
+          "description": "Which inference engine this box should run. Changing it restarts the engine unit and nothing else \u2014 the supervisor, the pairing, and the audit trail are untouched, because the engine is a separate unit precisely so that swapping it is not a box-level event. A box holds one engine at a time: two would contend for the same GPU and the same port, and 'which one served this request' is not a question the documents could answer honestly."
         }
       }
     },
@@ -65,7 +75,8 @@
       "additionalProperties": false,
       "properties": {
         "name": {
-          "const": "FreeToken"
+          "type": "string",
+          "description": "The engine actually running, as it names itself \u2014 'FreeToken', 'vLLM', 'SGLang'. Observed, not configured: `desired.engine` is what an operator sets, and these disagree while a change is reconciling, which is exactly when an operator needs to see both."
         },
         "version": {
           "type": "string"

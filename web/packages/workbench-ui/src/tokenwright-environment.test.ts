@@ -12,8 +12,14 @@ import {
 
 /** A document with every block the inference schema requires. */
 const inferenceDocument = {
-    desired: { model: null, models: [], autostart: true, direct_access: false },
+    desired: {
+        model: null, models: [], autostart: true, direct_access: false,
+        engine: "freetoken",
+    },
     engine: {
+        // What answered, which is not always what `desired.engine` asked for —
+        // they differ while a change reconciles, and persistently when the
+        // requested engine will not start.
         name: "FreeToken", version: "0.3.2", status: "running",
         listen: "127.0.0.1:8721", uptime: "3d 14h", restarts: 1, last_error: null,
     },
