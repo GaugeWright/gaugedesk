@@ -15,8 +15,8 @@
  *
  * - {@link listBoxes} returns what is public — the relay endpoint, the
  *   certificate pin, when it was paired — which is everything a row needs.
- * - {@link recordPairedBox} sends the capabilities *up*, once, and nothing
- *   sends them back down.
+ * - {@link claimBox} hands the Home a pairing string; the capabilities are
+ *   obtained, sealed, and used without ever entering a page.
  *
  * Reaching a box therefore happens through the runtime holding the seal, the
  * same way every other provider's token is used by the thing that has it rather
@@ -24,7 +24,6 @@
  */
 
 import type { RouteJson } from "./control-plane-transport";
-import type { TokenWrightConnection } from "./tokenwright-pairing";
 
 /** A paired box as the account will describe it: no capability, ever. */
 export interface StoredBox {
@@ -63,33 +62,28 @@ export async function listBoxes(json: RouteJson): Promise<readonly StoredBox[]> 
 }
 
 /**
- * Seal a box that was just claimed.
+ * Claim a box and have the Home seal what it hands over.
  *
- * **This is the only moment the route exists anywhere but on the box.** A claim
- * that succeeded and was not recorded has spent a single-use code and lost the
- * box — recovering it means unpairing in person — so a caller must treat a
- * failure here as that severe rather than as a save it can retry later from
- * memory it no longer has.
+ * The browser sends the pairing string and nothing comes back but the public
+ * description. It does not parse the string, derive a rendezvous, dial a relay,
+ * or pin a certificate — the Home does all of that, because the Home is what
+ * holds the credential afterwards.
+ *
+ * That is a correction, not a simplification. A page used to run this journey
+ * over the wasm tunnel, which exists to reach **a Home that is not publicly
+ * addressable** (ADR 0130) and is keyed by Home id everywhere it is used. A box
+ * is not a Home; it is a peer of one, like every other provider.
  */
-export async function recordPairedBox(
-    json: RouteJson,
-    connection: TokenWrightConnection,
-): Promise<StoredBox> {
-    const answer = (await json("POST", "/account/boxes", {
-        fingerprint: connection.fingerprint,
-        route: connection.route,
-        key: connection.key,
-        relay_endpoint: connection.relayEndpoint,
-        paired_at: connection.pairedAt,
-        home_id: connection.homeId,
-        key_id: connection.keyId,
+export async function claimBox(json: RouteJson, pairingString: string): Promise<StoredBox> {
+    const answer = (await json("POST", "/account/boxes/claim", {
+        pairing_string: pairingString,
     })) as Record<string, unknown>;
     return {
-        fingerprint: text(answer?.fingerprint) || connection.fingerprint,
-        relayEndpoint: text(answer?.relay_endpoint) || connection.relayEndpoint,
-        pairedAt: connection.pairedAt,
-        homeId: connection.homeId,
-        keyId: connection.keyId,
+        fingerprint: text(answer?.fingerprint),
+        relayEndpoint: text(answer?.relay_endpoint),
+        pairedAt: text(answer?.paired_at),
+        homeId: text(answer?.home_id),
+        keyId: text(answer?.key_id),
         sealed: answer?.sealed === true,
     };
 }

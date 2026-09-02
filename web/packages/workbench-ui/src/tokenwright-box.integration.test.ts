@@ -22,12 +22,8 @@ import {
     proposeManagementDocumentChange,
     readManagementDocument,
     submitManagementCommand,
-    claimProof,
-    claimTokenWrightBox,
-    parseTokenWrightInvite,
     type ManagementEnvironmentSession,
     type RouteJson,
-    type TokenWrightConnection,
 } from "@gaugewright/control-plane-client";
 import { TOKENWRIGHT_MANIFEST, TOKENWRIGHT_SCHEMAS } from "./tokenwright-environment";
 import { tokenwrightCommandsFrom } from "./tokenwright-box";
@@ -41,7 +37,6 @@ let key = "";
 let base = "";
 let session: ManagementEnvironmentSession;
 let invitePrinted = "";
-let connection: TokenWrightConnection;
 /** The real browser transport, pointed at the box once its port is known. */
 let json: RouteJson;
 
@@ -112,7 +107,8 @@ describe.skipIf(!available)("the client against a real TokenWright box", () => {
         ]);
         invitePrinted = /(tw1_[A-Za-z0-9_-]+)/u.exec(printed)?.[1] ?? "";
         if (!invitePrinted) throw new Error(`no pairing string in: ${printed}`);
-        const code = parseTokenWrightInvite(invitePrinted).claimCode;
+        const code = /([0-9A-Z]{4}(?:-[0-9A-Z]{4}){4})/u.exec(printed)?.[1];
+        if (!code) throw new Error(`no claim code in: ${printed}`);
 
         box = spawn("python3", [
             "-m", "tokenwright", "--state-root", state, "--schemas", "schemas",
@@ -131,20 +127,22 @@ describe.skipIf(!available)("the client against a real TokenWright box", () => {
             }
         }
 
-        // Claimed with the code this repository ships, not by shelling out to
-        // the box's Python for the proof. The derivation running here is the one
-        // an operator's browser runs, so a disagreement between the two
-        // repositories fails in this line rather than in the field.
-        //
-        // The proof is still cross-checked against the box's own function
-        // below, because agreeing with ourselves is not the property under test.
-        const invite = parseTokenWrightInvite(invitePrinted);
-        connection = await claimTokenWrightBox({
-            json, invite, homeId: "home_integration", homeKey: "home-root-key",
-        });
-        key = connection.key;
-        expect(connection.fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/u);
-        void code;
+        // Claiming is bootstrap, and bootstrap is the Home's work now: nothing
+        // this package ships derives a claim proof any more, because nothing in
+        // a browser should be dialling a box. The Rust side owns that
+        // derivation and cross-checks it against the box's own
+        // (`crates/app/src/tokenwright.rs`), so here the box computes its own
+        // proof and this test gets on with what it is for — proving the shipped
+        // *client* reaches a real box.
+        const proof = await run("python3", [
+            "-c", `from tokenwright.pairing import proof_for; print(proof_for(${JSON.stringify(code)}))`,
+        ]);
+        const claim = await json("POST", "/pair/claim", {
+            proof: proof.trim(),
+            home: { id: "home_integration", key: "home-root-key" },
+        }) as { key: { secret: string }; paired: { fingerprint: string } };
+        key = claim.key.secret;
+        expect(claim.paired.fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/u);
 
         session = await openManagementEnvironment(json, "tokenwright");
     }, 60_000);
@@ -152,54 +150,6 @@ describe.skipIf(!available)("the client against a real TokenWright box", () => {
     afterAll(async () => {
         box?.kill("SIGTERM");
         if (state) await rm(state, { recursive: true, force: true });
-    });
-
-    it("derives the claim proof the same bytes the box does", async () => {
-        // The one property that cannot be checked by agreeing with ourselves.
-        // If these drift, the box refuses a proof it cannot explain and the
-        // relay pairs two legs that then fail to authenticate — a failure with
-        // no good symptom on either side.
-        const code = parseTokenWrightInvite(invitePrinted).claimCode;
-        const theirs = await run("python3", [
-            "-c", `from tokenwright.pairing import proof_for; print(proof_for(${JSON.stringify(code)}))`,
-        ]);
-        expect(await claimProof(code)).toBe(theirs.trim());
-    });
-
-    it("carries a pairing string a person can paste, not three fields", async () => {
-        // A Home needs the relay endpoint, the pin, and the code before it can
-        // open a tunnel at all. Shipping them separately is three chances to
-        // copy one wrong, and every failure looks the same: no tunnel.
-        const invite = parseTokenWrightInvite(invitePrinted);
-        expect(invite.relayEndpoint).toBe("wss://relay.invalid/r");
-        expect(invite.fingerprint).toBe(connection.fingerprint);
-        expect(invite.claimCode).toMatch(/^[0-9A-Z]{4}(?:-[0-9A-Z]{4}){4}$/u);
-    });
-
-    it("hands over a durable route, because the claim code is now spent", async () => {
-        // The address used to claim a box is dead within the hour. Every
-        // reconnect for the life of the box uses this one, and the box sends it
-        // exactly once — nothing can derive or recover it.
-        expect(connection.route).toMatch(/^[A-Za-z0-9_-]{43}$/u);
-        const claimHandle = /([0-9A-Z]{4}(?:-[0-9A-Z]{4}){4})/u.exec(invitePrinted);
-        void claimHandle;
-        const again = await run("python3", [
-            "-c",
-            "import json,sys;"
-            + `sys.path.insert(0, 'src');`
-            + `print(json.load(open(${JSON.stringify(state + "/pairing.json")}))["paired"]["route"])`,
-        ]);
-        // The box parks on exactly what it told this client to dial.
-        expect(again.trim()).toBe(connection.route);
-    });
-
-    it("refuses to claim a box twice", async () => {
-        // A claim code is single-use. A second claim must be refused rather than
-        // quietly re-pairing the box to whoever asked last.
-        await expect(claimTokenWrightBox({
-            json, invite: parseTokenWrightInvite(invitePrinted),
-            homeId: "home_other", homeKey: "other-key",
-        })).rejects.toThrow();
     });
 
     it("opens a session the client can read", () => {

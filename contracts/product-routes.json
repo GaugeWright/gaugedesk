@@ -3450,17 +3450,17 @@
       }
     },
     {
-      "id": "account.boxes.pair",
+      "id": "account.boxes.claim",
       "jurisdiction": "hosted-person-account",
       "transport": "http-json",
       "method": "POST",
-      "path": "/account/boxes",
+      "path": "/account/boxes/claim",
       "producer": "gaugedesk-app account_routes",
-      "consumer": "recordPairedBox via @gaugewright/control-plane-client",
+      "consumer": "claimBox via @gaugewright/control-plane-client",
       "authentication": "valid-account-session-cookie-or-bearer",
       "scope": "authenticated-person-account",
-      "capability": "seal-own-paired-box",
-      "requestSchema": "rust:gaugedesk-app/account_routes/PairBoxBody",
+      "capability": "claim-and-seal-own-box",
+      "requestSchema": "rust:gaugedesk-app/account_routes/ClaimBoxBody",
       "responseSchema": "gw://schemas/account/box-pair/v1",
       "sideEffect": "mutation",
       "risk": "critical",
@@ -3471,13 +3471,13 @@
       },
       "evidence": {
         "contract": [
-          "crates/app/tests/account.rs#a_paired_box_is_sealed_and_neither_capability_comes_back"
+          "crates/app/tests/tokenwright_box.rs#the_home_dials_a_box_and_claims_it"
         ],
         "authority": [
           "crates/app/tests/account.rs#a_box_belongs_to_one_person_and_rides_their_erase"
         ],
         "journey": [
-          "crates/app/tests/account.rs#a_paired_box_is_sealed_and_neither_capability_comes_back"
+          "crates/app/tests/tokenwright_box.rs#the_home_dials_a_box_and_claims_it"
         ],
         "deployed": [],
         "property": [
@@ -3507,13 +3507,13 @@
       },
       "evidence": {
         "contract": [
-          "crates/app/tests/account.rs#a_paired_box_is_sealed_and_neither_capability_comes_back"
+          "crates/app/tests/tokenwright_box.rs#the_home_dials_a_box_and_claims_it"
         ],
         "authority": [
           "crates/app/tests/account.rs#a_box_belongs_to_one_person_and_rides_their_erase"
         ],
         "journey": [
-          "crates/app/tests/account.rs#a_paired_box_is_sealed_and_neither_capability_comes_back"
+          "crates/app/tests/tokenwright_box.rs#the_home_dials_a_box_and_claims_it"
         ],
         "deployed": [],
         "property": [

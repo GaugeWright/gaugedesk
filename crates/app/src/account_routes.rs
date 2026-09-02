@@ -203,8 +203,10 @@ fn shared_runtime_credential_routes() -> Router<SharedWorkbench> {
         .route("/account/credentials/{provider}", delete(delete_credential))
         // A paired TokenWright box: an OpenAI-compatible endpoint the person
         // owns, sealed exactly like every other provider credential.
-        .route("/account/boxes", get(get_boxes).post(post_box))
+        .route("/account/boxes", get(get_boxes))
         .route("/account/boxes/{fingerprint}", delete(delete_box))
+        // Claiming happens *here*, not in the browser. See `crate::tokenwright`.
+        .route("/account/boxes/claim", post(post_box_claim))
         // First-run gate signal (ADR 0075 Phase 0): whether the default runtime
         // actually needs an LLM credential. False under the scripted fake agent
         // (dev/e2e), so the first-run overlay never blocks a no-credential test.
@@ -1781,84 +1783,6 @@ pub async fn get_boxes(State(wb): State<SharedWorkbench>, headers: HeaderMap) ->
     }
 }
 
-#[derive(Deserialize)]
-pub struct PairBoxBody {
-    /// `sha256:<hex>` or bare hex. The box's identity.
-    fingerprint: String,
-    /// Base64url of the 32-byte rendezvous token. Secret.
-    route: String,
-    /// The key the box minted for this Home. Secret.
-    key: String,
-    /// Non-secret.
-    relay_endpoint: String,
-    #[serde(default)]
-    paired_at: String,
-    #[serde(default)]
-    home_id: String,
-    #[serde(default)]
-    key_id: String,
-}
-
-/// Record a box just claimed, sealing what it handed over.
-///
-/// This is the *only* moment the route exists anywhere outside the box. A claim
-/// that succeeded and was not stored has spent a single-use code and lost the
-/// box, so a caller must treat a non-200 here as exactly that severe.
-pub async fn post_box(
-    State(wb): State<SharedWorkbench>,
-    headers: HeaderMap,
-    Json(body): Json<PairBoxBody>,
-) -> impl IntoResponse {
-    let Some(fingerprint) = box_fingerprint(&body.fingerprint) else {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "fingerprint must be a SHA-256 digest",
-        )
-            .into_response();
-    };
-    if body.route.trim().is_empty() || body.key.is_empty() {
-        // Both, together. A box recorded with one of them is a box that lists
-        // and cannot be reached, which is worse than one that never listed.
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "route and key are both required",
-        )
-            .into_response();
-    }
-    if body.relay_endpoint.trim().is_empty() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "relay_endpoint is required",
-        )
-            .into_response();
-    }
-    let mut wb = wb.lock_unpoisoned();
-    let scope = wb.account_scope_for(net_http::bearer(&headers));
-    let material = crate::account::BoxMaterial {
-        route: body.route,
-        key: body.key,
-    };
-    let facts = crate::account::PairedBoxFacts {
-        fingerprint: fingerprint.clone(),
-        relay_endpoint: body.relay_endpoint.clone(),
-        paired_at: body.paired_at,
-        home_id: body.home_id,
-        key_id: body.key_id,
-    };
-    if let Err(e) = wb.upsert_account_box_in(&scope, facts, &material) {
-        return err_response(e);
-    }
-    (
-        StatusCode::OK,
-        Json(json!({
-            "fingerprint": format!("sha256:{fingerprint}"),
-            "relay_endpoint": body.relay_endpoint,
-            "sealed": true,
-        })),
-    )
-        .into_response()
-}
-
 /// Forget a box. The box itself is untouched and still serves the Home that
 /// claimed it; this discards the only copy of how to reach it.
 pub async fn delete_box(
@@ -1879,6 +1803,103 @@ pub async fn delete_box(
         Ok(()) => (StatusCode::OK, Json(json!({ "forgotten": true }))).into_response(),
         Err(e) => err_response(e),
     }
+}
+
+#[derive(Deserialize)]
+pub struct ClaimBoxBody {
+    /// The pairing string printed on the box. A bearer capability for an
+    /// unclaimed box, and the reason this route exists rather than a page
+    /// dialling for itself.
+    pairing_string: String,
+}
+
+/// Claim a box and seal what it hands over, without either capability ever
+/// reaching the browser.
+///
+/// This replaces a journey the page used to run — parse, derive, dial, pin,
+/// claim, store — with one call, because every step of it belongs to whoever
+/// holds the credential afterwards. The wasm tunnel the page was using exists
+/// to reach a Home that is not publicly addressable (ADR 0130); a box is not a
+/// Home, it is a peer of one.
+pub async fn post_box_claim(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Json(body): Json<ClaimBoxBody>,
+) -> impl IntoResponse {
+    let invite = match crate::tokenwright::parse_invite(&body.pairing_string) {
+        Ok(invite) => invite,
+        // 422 rather than 400: the request was well-formed, the string in it was
+        // not, and the message names which part to look at.
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+
+    // The Home's own identity, so the box records who claimed it. Read before
+    // dialling and the lock released: the claim is a network round trip and
+    // holding the workbench across it would stall every other request.
+    let (scope, home_id, home_key) = {
+        let wb = wb.lock_unpoisoned();
+        let scope = wb.account_scope_for(net_http::bearer(&headers));
+        (scope, wb.authority().as_str().to_owned(), wb.account_key())
+    };
+    // A stable per-account value the box pins as "the Home that claimed me".
+    //
+    // **Deterministic on purpose.** The box pins this key at claim and refuses a
+    // later claim presenting a different one, so anything freshly random here —
+    // sealing, for instance, which uses a new nonce every call — would make
+    // re-pairing an already-paired box impossible to explain.
+    //
+    // Derived rather than the account key itself: a value handed to a box must
+    // not be one that opens anything here, and a one-way derivation is what
+    // makes that true even if the box is compromised.
+    let pinned_home_key = crate::tokenwright::home_key_for(home_key);
+
+    let claimed = match crate::tokenwright::claim(&invite, &home_id, &pinned_home_key).await {
+        Ok(claimed) => claimed,
+        Err(error) => return (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    };
+
+    // Sealed before anything is reported. A claim that succeeded and was not
+    // stored has spent a single-use code and lost the box: its route is sent
+    // exactly once and cannot be reissued.
+    let fingerprint = claimed.fingerprint.trim_start_matches("sha256:").to_owned();
+    let facts = crate::account::PairedBoxFacts {
+        fingerprint: fingerprint.clone(),
+        relay_endpoint: claimed.relay_endpoint.clone(),
+        paired_at: claimed.paired_at.clone(),
+        home_id: claimed.home_id.clone(),
+        key_id: claimed.key_id.clone(),
+    };
+    let material = crate::account::BoxMaterial {
+        route: claimed.route.clone(),
+        key: claimed.key.clone(),
+    };
+    {
+        let mut wb = wb.lock_unpoisoned();
+        if let Err(e) = wb.upsert_account_box_in(&scope, facts, &material) {
+            // The box is claimed and this is the only copy of its route. Say
+            // exactly that, rather than a storage error that reads as "nothing
+            // happened" — the recovery is unpairing the box in person.
+            tracing::error!(error = ?e, "a claimed box could not be sealed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the box was claimed but could not be saved; it must be unpaired on the box                  itself before it can be claimed again",
+            )
+                .into_response();
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "fingerprint": claimed.fingerprint,
+            "relay_endpoint": claimed.relay_endpoint,
+            "paired_at": claimed.paired_at,
+            "home_id": claimed.home_id,
+            "key_id": claimed.key_id,
+            "sealed": true,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]

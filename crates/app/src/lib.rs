@@ -101,6 +101,7 @@ pub(crate) mod target_change_set;
 pub(crate) mod target_settlement;
 pub mod tenancy;
 pub mod throttle;
+pub mod tokenwright;
 pub mod turn_summary;
 pub mod workbench_auth;
 pub mod workbench_state;

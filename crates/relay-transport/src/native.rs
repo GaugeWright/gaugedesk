@@ -759,6 +759,41 @@ pub async fn bind_client_loopback(
     Ok((address, task))
 }
 
+/// Wrap an ordered byte stream in a TLS client session **pinned** to one
+/// end-entity certificate.
+///
+/// The same verifier the browser tunnel uses, on the native side. It exists
+/// because the browser is not the only client that needs to reach something
+/// whose identity is a fingerprint rather than a chain: a Home reaching a peer
+/// it holds a pin for — a TokenWright box, say — needs exactly this, and
+/// without it the only implementation of "pinned client" in the tree was the
+/// wasm one, which is how a page ended up dialling things a Home should dial.
+///
+/// No chain is built, no name is checked, and no validity window is consulted,
+/// because the route carries the pin (ADR 0041). A certificate that does not
+/// match fails the handshake, so the stream never carries application bytes.
+pub async fn connect_pinned<S>(
+    stream: S,
+    expected: CertFingerprint,
+) -> std::io::Result<tokio_rustls::client::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(wire::PinnedVerifier::new(expected, provider.clone()));
+    let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| other(format!("tls client versions: {error}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    let name = tokio_rustls::rustls::pki_types::ServerName::try_from(PIN_SNI)
+        .map_err(|error| other(format!("tls server name: {error}")))?;
+    TlsConnector::from(Arc::new(config))
+        .connect(name, stream)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
