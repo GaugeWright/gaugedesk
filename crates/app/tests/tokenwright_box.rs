@@ -189,3 +189,113 @@ async fn a_box_that_is_not_there_fails_rather_than_hanging() {
     .expect_err("nothing is parked on that route");
     assert!(!error.to_string().is_empty());
 }
+
+// --- carrying the box's own surface -----------------------------------------
+
+/// A box that reports what it was asked, so a test can assert what crossed
+/// rather than only that something did.
+async fn park_an_echoing_box(endpoint: &str, token: [u8; 32], identity: &TlsIdentity) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("stub");
+    let address = listener.local_addr().expect("stub addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 16384];
+                let read = stream.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let mut lines = request.split("\r\n");
+                let start = lines.next().unwrap_or_default().to_owned();
+                let mut authorization = String::new();
+                let mut idempotency = String::new();
+                for line in lines.clone() {
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(rest) = lower.strip_prefix("authorization: ") {
+                        authorization = rest.trim().to_owned();
+                    }
+                    if let Some(rest) = lower.strip_prefix("idempotency-key: ") {
+                        idempotency = rest.trim().to_owned();
+                    }
+                }
+                let body = serde_json::json!({
+                    "start": start,
+                    "authorization": authorization,
+                    "idempotency": idempotency,
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    let derived =
+        gaugedesk_relay_transport::one_shot_websocket_route(endpoint, token).expect("route");
+    let config = HomeRelayConfig {
+        endpoint: endpoint.to_owned(),
+        handle: derived.handle.clone(),
+        proof: derived.proof.to_base64url(),
+        previous_proof: None,
+        route_epoch: derived.epoch,
+    };
+    let route = config.relay_route(identity).expect("route");
+    let parked = identity.clone();
+    tokio::spawn(async move {
+        let _ = serve_home_forever(route, address, parked).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+}
+
+#[tokio::test]
+async fn the_home_carries_a_request_to_the_box_under_the_sealed_key() {
+    // The point of the whole inversion: the page never holds the key, and the
+    // box still sees one.
+    let relay = TestRelay::bind().await.expect("relay");
+    let identity = TlsIdentity::generate().expect("identity");
+    let token = [9u8; 32];
+    park_an_echoing_box(relay.endpoint(), token, &identity).await;
+
+    let pin = format!("sha256:{}", hex::encode(identity.fingerprint()));
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert(
+        "Authorization".to_owned(),
+        "Bearer sealed-box-key".to_owned(),
+    );
+    headers.insert("Idempotency-Key".to_owned(), "once-only".to_owned());
+
+    let (status, body) = request(
+        relay.endpoint(),
+        token,
+        pin_bytes(&pin).expect("pin"),
+        "GET",
+        "/environments/tokenwright/documents/tokenwright.inference?session=sess_1",
+        &headers,
+        None,
+    )
+    .await
+    .expect("carried");
+
+    assert_eq!(status, 200);
+    let seen: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(seen["authorization"], "bearer sealed-box-key");
+    // The query has to survive: a document read names its session there, and a
+    // proxy that dropped it would turn every read into "open a session first".
+    assert!(
+        seen["start"]
+            .as_str()
+            .expect("start line")
+            .contains("?session=sess_1"),
+        "the query must cross: {}",
+        seen["start"],
+    );
+    // And the idempotency key, or every retry of a command performs the work a
+    // second time.
+    assert_eq!(seen["idempotency"], "once-only");
+}

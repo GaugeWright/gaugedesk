@@ -2586,6 +2586,42 @@
       }
     },
     {
+      "id": "account.boxes.surface.read",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/account/boxes/:fingerprint/surface/{*path}",
+      "producer": "gaugedesk-app account_routes",
+      "consumer": "the management-environment client through boxRouteJson — paths are computed from the box surface, so demand is held by check-tokenwright-carried-surface.mjs against the TokenWright peer routes rather than by a literal call site",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "carry-to-own-box",
+      "requestSchema": "http/empty",
+      "responseSchema": "http/opaque-box-surface-response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/e2e/authenticated-account-session.mjs#production-authenticated-account-bootstrap"
+        ],
+        "authority": [
+          "web/e2e/authenticated-account-session.mjs#account-bootstrap-cookie-authority-properties"
+        ],
+        "journey": [
+          "web/e2e/authenticated-account-session.mjs#production-authenticated-account-bootstrap"
+        ],
+        "deployed": [],
+        "property": [
+          "web/e2e/authenticated-account-session.mjs#account-bootstrap-cookie-authority-properties"
+        ]
+      }
+    },
+    {
       "id": "account.boxes.list",
       "jurisdiction": "hosted-person-account",
       "transport": "http-json",
@@ -3482,6 +3518,42 @@
         "deployed": [],
         "property": [
           "crates/app/tests/account.rs#a_box_belongs_to_one_person_and_rides_their_erase"
+        ]
+      }
+    },
+    {
+      "id": "account.boxes.surface.submit",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/account/boxes/:fingerprint/surface/{*path}",
+      "producer": "gaugedesk-app account_routes",
+      "consumer": "the management-environment client through boxRouteJson — paths are computed from the box surface, so demand is held by check-tokenwright-carried-surface.mjs against the TokenWright peer routes rather than by a literal call site",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "carry-to-own-box",
+      "requestSchema": "http/opaque-box-surface-body",
+      "responseSchema": "http/opaque-box-surface-response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/tokenwright_box.rs#the_home_carries_a_request_to_the_box_under_the_sealed_key"
+        ],
+        "authority": [
+          "crates/app/tests/account.rs#the_home_carries_only_the_declared_surface"
+        ],
+        "journey": [
+          "crates/app/tests/tokenwright_box.rs#the_home_carries_a_request_to_the_box_under_the_sealed_key"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/tests/account.rs#the_home_carries_only_the_declared_surface"
         ]
       }
     },

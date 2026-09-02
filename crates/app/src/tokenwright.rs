@@ -405,6 +405,61 @@ pub async fn claim(invite: &Invite, home_id: &str, home_key: &str) -> Result<Cla
     })
 }
 
+/// The box surface this Home will carry, and nothing else.
+///
+/// A proxy that forwarded whatever path it was handed would be a way for a page
+/// to reach every route a box serves — including its model surface and its
+/// pairing route — under the Home's sealed credential. So the carried set is an
+/// allowlist, and it is the *same* set `contracts/peer-route-providers.json`
+/// declares: that file already had to name these operations for
+/// `check-client-calls` to work, so making it the allowlist turns a document
+/// into an enforcement point rather than adding a second list to keep in step.
+///
+/// `:id` matches exactly one path segment. There is no wildcard: a box's
+/// document ids and change ids are single segments, and admitting a `*` here
+/// would let one carried route reach an arbitrary depth of the box's surface.
+pub const CARRIED_SURFACE: &[(&str, &str)] = &[
+    ("POST", "/environments/tokenwright/sessions"),
+    ("GET", "/environments/tokenwright/documents/:id"),
+    ("POST", "/environments/tokenwright/commands"),
+    ("POST", "/environments/tokenwright/changes"),
+    ("GET", "/environments/tokenwright/changes"),
+    ("POST", "/environments/tokenwright/changes/:id/review"),
+    ("GET", "/environments/tokenwright/audit"),
+];
+
+/// Whether the Home will carry this request to a box.
+pub fn carries(method: &str, path: &str) -> bool {
+    // The query string is not matched. It is forwarded, and it is the box's to
+    // interpret — but a path is what selects a route, and matching on anything
+    // after `?` would let a caller smuggle one route past a check for another.
+    let path = path.split('?').next().unwrap_or(path);
+    CARRIED_SURFACE.iter().any(|(allowed_method, pattern)| {
+        if !method.eq_ignore_ascii_case(allowed_method) {
+            return false;
+        }
+        let mut actual = path.split('/');
+        let mut expected = pattern.split('/');
+        loop {
+            match (actual.next(), expected.next()) {
+                (None, None) => return true,
+                (Some(a), Some(e)) => {
+                    if e == ":id" {
+                        // One segment, and a non-empty one: `documents//x` must
+                        // not satisfy `documents/:id`.
+                        if a.is_empty() {
+                            return false;
+                        }
+                    } else if a != e {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +623,68 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
         assert_eq!(split_response(raw).expect("split"), (200, b"{}".to_vec()));
         assert!(split_response(b"no headers here").is_err());
+    }
+}
+
+#[cfg(test)]
+mod carried {
+    use super::*;
+
+    #[test]
+    fn every_declared_operation_is_carried() {
+        for (method, path) in CARRIED_SURFACE {
+            let concrete = path.replace(":id", "tokenwright.inference");
+            assert!(carries(method, &concrete), "{method} {concrete}");
+        }
+    }
+
+    #[test]
+    fn nothing_else_is() {
+        // The two that matter most: a box's model surface would run inference
+        // under the Home's key with no accounting, and its pairing route is the
+        // one thing an *unclaimed* box answers.
+        for (method, path) in [
+            ("POST", "/v1/chat/completions"),
+            ("GET", "/v1/models"),
+            ("POST", "/pair/claim"),
+            ("GET", "/environments/tokenwright/keys"),
+            ("DELETE", "/environments/tokenwright/documents/x"),
+            ("GET", "/environments/hub/documents/x"),
+        ] {
+            assert!(
+                !carries(method, path),
+                "{method} {path} must not be carried"
+            );
+        }
+    }
+
+    #[test]
+    fn a_segment_is_one_segment() {
+        // Admitting a `/` inside `:id` would let one carried route reach an
+        // arbitrary depth of the box's surface.
+        assert!(carries("GET", "/environments/tokenwright/documents/a"));
+        assert!(!carries("GET", "/environments/tokenwright/documents/a/b"));
+        assert!(!carries("GET", "/environments/tokenwright/documents/"));
+        assert!(!carries("GET", "/environments/tokenwright/documents"));
+    }
+
+    #[test]
+    fn the_method_is_part_of_the_match() {
+        assert!(carries("GET", "/environments/tokenwright/changes"));
+        assert!(carries("POST", "/environments/tokenwright/changes"));
+        assert!(!carries("DELETE", "/environments/tokenwright/changes"));
+        assert!(!carries("POST", "/environments/tokenwright/audit"));
+    }
+
+    #[test]
+    fn a_query_string_cannot_smuggle_one_route_past_a_check_for_another() {
+        assert!(carries(
+            "GET",
+            "/environments/tokenwright/documents/x?session=sess_1"
+        ));
+        assert!(!carries(
+            "GET",
+            "/v1/models?x=/environments/tokenwright/audit"
+        ));
     }
 }

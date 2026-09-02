@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { claimBox, forgetBox, listBoxes } from "./tokenwright-box-store";
+import { boxRouteJson, claimBox, forgetBox, listBoxes } from "./tokenwright-box-store";
 import type { RouteJson } from "./control-plane-transport";
 
 /** A pairing string the box produced. The only thing a browser ever holds. */
@@ -112,5 +112,55 @@ describe("forgetting a box", () => {
             `/account/boxes/${"ab".repeat(32)}`,
             `/account/boxes/${"ab".repeat(32)}`,
         ]);
+    });
+});
+
+describe("reaching a box through the Home", () => {
+    it("prefixes the box's own path and rewrites nothing else", async () => {
+        // A proxy that understood the surface would be a second copy of it in
+        // this repository, drifting from the box that owns it.
+        const calls: Array<[string, string, unknown, unknown]> = [];
+        const json: RouteJson = async (method, path, body, options) => {
+            calls.push([method, path, body, options]);
+            return null;
+        };
+        const carried = boxRouteJson(json, FINGERPRINT);
+
+        await carried("POST", "/environments/tokenwright/sessions", { scope: null });
+        await carried("GET", "/environments/tokenwright/documents/tokenwright.inference");
+        await carried(
+            "POST",
+            "/environments/tokenwright/commands",
+            { command_id: "x" },
+            { idempotencyKey: "once" },
+        );
+
+        const bare = "ab".repeat(32);
+        expect(calls.map(([method, path]) => `${method} ${path}`)).toEqual([
+            `POST /account/boxes/${bare}/surface/environments/tokenwright/sessions`,
+            `GET /account/boxes/${bare}/surface/environments/tokenwright/documents/tokenwright.inference`,
+            `POST /account/boxes/${bare}/surface/environments/tokenwright/commands`,
+        ]);
+        // Body and options pass through untouched — the idempotency key
+        // especially, or every retry of a command performs the work twice.
+        expect(calls[0]![2]).toEqual({ scope: null });
+        expect(calls[2]![3]).toEqual({ idempotencyKey: "once" });
+    });
+
+    it("takes a fingerprint in either spelling", async () => {
+        const seen: string[] = [];
+        const json: RouteJson = async (_method, path) => { seen.push(path); return null; };
+        await boxRouteJson(json, FINGERPRINT)("GET", "/environments/tokenwright/audit");
+        await boxRouteJson(json, "ab".repeat(32))("GET", "/environments/tokenwright/audit");
+        expect(new Set(seen).size).toBe(1);
+    });
+
+    it("carries a path given without a leading slash", async () => {
+        const seen: string[] = [];
+        const json: RouteJson = async (_method, path) => { seen.push(path); return null; };
+        await boxRouteJson(json, FINGERPRINT)("GET", "environments/tokenwright/audit");
+        expect(seen[0]).toBe(
+            `/account/boxes/${"ab".repeat(32)}/surface/environments/tokenwright/audit`,
+        );
     });
 });

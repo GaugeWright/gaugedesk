@@ -9,8 +9,9 @@
 //! [`crate::account::resolve_token`] API the local runtime uses.
 
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    body::Bytes,
+    extract::{OriginalUri, Path, State},
+    http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
@@ -207,6 +208,16 @@ fn shared_runtime_credential_routes() -> Router<SharedWorkbench> {
         .route("/account/boxes/{fingerprint}", delete(delete_box))
         // Claiming happens *here*, not in the browser. See `crate::tokenwright`.
         .route("/account/boxes/claim", post(post_box_claim))
+        // The box's own surface, carried. See `carry_to_box`.
+        //
+        // `get`/`post` rather than `any`: the carried surface uses only those
+        // two, so the router refuses the rest before the allowlist is even
+        // consulted — and a route registered with `any` is invisible to
+        // `check-client-calls`, which reads method helpers by name.
+        .route(
+            "/account/boxes/{fingerprint}/surface/{*path}",
+            get(carry_to_box).post(carry_to_box),
+        )
         // First-run gate signal (ADR 0075 Phase 0): whether the default runtime
         // actually needs an LLM credential. False under the scripted fake agent
         // (dev/e2e), so the first-run overlay never blocks a no-credential test.
@@ -1900,6 +1911,127 @@ pub async fn post_box_claim(
         })),
     )
         .into_response()
+}
+
+/// Carry one request to a box, over a leg this Home dials.
+///
+/// The Home is a courier, not a second implementation of the box's surface: it
+/// forwards the method, path, query and body it was given and returns the status
+/// and body it got back. That is deliberate — a box's control plane is not ours
+/// (ADR 0158), and a proxy that understood the surface would be a copy of it
+/// here, drifting.
+///
+/// Three things it does *not* forward, each on purpose:
+///
+/// - **The caller's `Authorization`.** The box's key is sealed in this account
+///   and injected here. A caller cannot supply one, and cannot learn one: the
+///   header a page sends authenticates it to *this* Home and stops at this
+///   function.
+/// - **Any path outside [`carries`].** A courier that carried whatever it was
+///   handed would be a way to reach a box's model surface, and its pairing
+///   route, under a credential the caller never had.
+/// - **Hop-by-hop headers.** Only the few that mean something to the box travel.
+async fn carry_to_box(
+    State(wb): State<SharedWorkbench>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    Path((fingerprint, path)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(fingerprint) = box_fingerprint(&fingerprint) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fingerprint must be a SHA-256 digest",
+        )
+            .into_response();
+    };
+    let target = format!("/{}", path.trim_start_matches('/'));
+    if !crate::tokenwright::carries(method.as_str(), &target) {
+        // 404 rather than 403: a caller learns that this Home does not carry
+        // that route, not whether the box happens to serve it.
+        return (StatusCode::NOT_FOUND, "this Home does not carry that route").into_response();
+    }
+
+    // Read the sealed material and release the lock before any network work.
+    // The dial is a round trip; holding the workbench across it would stall
+    // every other request against this Home.
+    let (endpoint, material) = {
+        let wb = wb.lock_unpoisoned();
+        let scope = wb.account_scope_for(net_http::bearer(&headers));
+        let Ok(records) = wb.account_boxes_in(&scope) else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "reading boxes").into_response();
+        };
+        let Some(record) = records.into_iter().find(|record| record.id == fingerprint) else {
+            return (StatusCode::NOT_FOUND, "no such box").into_response();
+        };
+        match wb.resolve_account_box_in(&scope, &fingerprint) {
+            Some(material) => (record.relay_endpoint, material),
+            // Recorded but unopenable. Worth its own answer: the box is listed,
+            // so "no such box" would send someone looking for a pairing they
+            // can see.
+            None => {
+                return (
+                    StatusCode::CONFLICT,
+                    "this box's stored credential cannot be opened; it must be paired again",
+                )
+                    .into_response()
+            }
+        }
+    };
+
+    let (Ok(route), Ok(pin)) = (
+        crate::tokenwright::route_bytes(&material.route),
+        crate::tokenwright::pin_bytes(&fingerprint),
+    ) else {
+        return (StatusCode::CONFLICT, "this box's stored route is unusable").into_response();
+    };
+
+    let mut carried = std::collections::BTreeMap::new();
+    carried.insert(
+        "Authorization".to_owned(),
+        format!("Bearer {}", material.key),
+    );
+    // The one caller header that must survive: a command's idempotency key is
+    // what makes a retry perform the work once, and dropping it here would turn
+    // every retry into a second execution.
+    if let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+        carried.insert("Idempotency-Key".to_owned(), key.to_owned());
+    }
+
+    let with_query = match uri.query() {
+        Some(query) if !query.is_empty() => format!("{target}?{query}"),
+        _ => target,
+    };
+    let body = (!body.is_empty()).then(|| body.to_vec());
+
+    match crate::tokenwright::request(
+        &endpoint,
+        route,
+        pin,
+        method.as_str(),
+        &with_query,
+        &carried,
+        body.as_deref(),
+    )
+    .await
+    {
+        Ok((status, answer)) => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            // The box's own status and bytes. A 409 conflict on a stale
+            // revision has to arrive as a 409, or the client's optimistic
+            // concurrency has nothing to react to.
+            (
+                status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                answer,
+            )
+                .into_response()
+        }
+        // 502: this Home is fine and the box is not reachable from it. A 500
+        // would say the fault is here.
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

@@ -56,6 +56,7 @@ run_contracts() {
 
     echo "== TokenWright Environment bundle =="
     node scripts/check-tokenwright-environment.mjs
+    node scripts/check-tokenwright-carried-surface.mjs
 
     # The updater endpoint is compiled into every shipped binary and cannot be
     # corrected for a client that already has it, so its mistakes are permanent

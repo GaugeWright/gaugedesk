@@ -275,7 +275,7 @@ fn seal_a_box(wb: &Arc<Mutex<Workbench>>, fingerprint: &str) -> String {
         &scope,
         gaugedesk_app::account::PairedBoxFacts {
             fingerprint: bare.clone(),
-            relay_endpoint: "wss://relay.example".to_owned(),
+            relay_endpoint: "ws://127.0.0.1:1".to_owned(),
             paired_at: "2026-09-01T20:00:00Z".to_owned(),
             home_id: "home_a".to_owned(),
             key_id: "key_c30f".to_owned(),
@@ -304,7 +304,7 @@ async fn a_paired_box_is_listed_without_either_capability() {
     assert!(!raw.contains("\"route\""), "no route field at all");
     assert!(!raw.contains("\"key\""), "no key field at all");
     assert_eq!(body["boxes"][0]["fingerprint"], PIN);
-    assert_eq!(body["boxes"][0]["relay_endpoint"], "wss://relay.example");
+    assert_eq!(body["boxes"][0]["relay_endpoint"], "ws://127.0.0.1:1");
     assert_eq!(body["boxes"][0]["key_id"], "key_c30f");
 }
 
@@ -355,7 +355,7 @@ async fn re_pairing_replaces_the_material_rather_than_keeping_both() {
             &scope,
             gaugedesk_app::account::PairedBoxFacts {
                 fingerprint: bare.clone(),
-                relay_endpoint: "wss://relay.example".to_owned(),
+                relay_endpoint: "ws://127.0.0.1:1".to_owned(),
                 paired_at: String::new(),
                 home_id: "home_a".to_owned(),
                 key_id: "key_new".to_owned(),
@@ -445,4 +445,70 @@ async fn a_box_belongs_to_one_person_and_rides_their_erase() {
         wb.resolve_account_box_in(&someone_else, &bare).is_none(),
         "and must not be able to unseal it"
     );
+}
+
+#[tokio::test]
+async fn the_home_carries_only_the_declared_surface() {
+    // A courier that carried whatever it was handed would be a way to reach a
+    // box's model surface — inference under the Home's key, unaccounted — and
+    // its pairing route, using a credential the caller never had.
+    let (_dir, app, shared) = workbench_with_handle();
+    let bare = seal_a_box(&shared, PIN);
+
+    for (method, path) in [
+        ("POST", "v1/chat/completions"),
+        ("GET", "v1/models"),
+        ("POST", "pair/claim"),
+        // Refused by the router rather than the allowlist: the carried surface
+        // is GET and POST only, so a DELETE never reaches the handler. Two
+        // refusals for one rule is the point, not a redundancy.
+        ("DELETE", "environments/tokenwright/documents/x"),
+        ("GET", "environments/tokenwright/documents/a/b"),
+    ] {
+        let (status, _) = send(
+            &app,
+            method,
+            &format!("/account/boxes/{bare}/surface/{path}"),
+            if method == "GET" { None } else { Some("{}") },
+        )
+        .await;
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path} must not be carried, got {status}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn carrying_to_a_box_that_is_not_paired_is_not_a_bad_gateway() {
+    // "No such box" and "the box did not answer" send a person to different
+    // places, so they must not share a status.
+    let (_dir, app, _shared) = workbench_with_handle();
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!(
+            "/account/boxes/{}/surface/environments/tokenwright/audit",
+            PIN.trim_start_matches("sha256:")
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_box_that_cannot_be_reached_reports_the_box_not_this_home() {
+    // The Home is fine; the box is not there. A 500 would say the fault is
+    // here and send someone to read this Home's logs.
+    let (_dir, app, shared) = workbench_with_handle();
+    let bare = seal_a_box(&shared, PIN);
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/account/boxes/{bare}/surface/environments/tokenwright/audit"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
 }

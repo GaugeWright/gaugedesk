@@ -95,6 +95,39 @@ export async function claimBox(json: RouteJson, pairingString: string): Promise<
  * this account's only copy of how to reach it, and nothing can reissue that.
  */
 export async function forgetBox(json: RouteJson, fingerprint: string): Promise<void> {
-    const bare = fingerprint.replace(/^sha256:/, "");
+    const bare = encodeURIComponent(fingerprint.replace(/^sha256:/, ""));
     await json("DELETE", `/account/boxes/${encodeURIComponent(bare)}`);
+}
+
+/**
+ * A `RouteJson` that reaches one box **through the Home**.
+ *
+ * The existing management functions take a transport and do not care what it
+ * is, so `openManagementEnvironment(boxRouteJson(json, fingerprint),
+ * "tokenwright")` works unchanged. That is the whole point of the shape: what
+ * changed is which side of the wire holds the credential, not the surface.
+ *
+ * It replaces a tunnel the page opened for itself. A page cannot dial a box any
+ * more — the box's key is sealed in the account, and the wasm tunnel it used to
+ * borrow exists to reach a Home that is not publicly addressable (ADR 0130),
+ * which a box is not.
+ *
+ * The Home carries only the operations the peer contract declares, so a path
+ * this repository has not declared returns 404 from the Home rather than
+ * reaching the box. That is deliberate: the alternative is a courier that would
+ * carry a page's request to a box's model surface under a key the page never
+ * had.
+ */
+export function boxRouteJson(json: RouteJson, fingerprint: string): RouteJson {
+    const bare = encodeURIComponent(fingerprint.replace(/^sha256:/, ""));
+    return (method, path, body, options) => {
+        // The box's path, prefixed. Nothing is rewritten: a proxy that
+        // understood the surface would be a second copy of it here.
+        // The literal `/` before the dynamic part is not styling: the contract
+        // checks read these template literals textually, and a `${…}` appended
+        // straight onto `surface` reads as part of that segment rather than as
+        // the path it is.
+        const suffix = path.startsWith("/") ? path.slice(1) : path;
+        return json(method, `/account/boxes/${bare}/surface/${suffix}`, body, options);
+    };
 }
