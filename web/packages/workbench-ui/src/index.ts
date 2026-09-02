@@ -120,6 +120,14 @@ export {
     tokenwrightRegistryFor,
 } from "./tokenwright-box";
 export type { TokenWrightCommandBinding } from "./tokenwright-box";
+export { TokenWrightBoxesSection } from "./TokenWrightBoxesSection";
+export type { TokenWrightBoxesSectionProps } from "./TokenWrightBoxesSection";
+export { tokenwrightProviderRow } from "./tokenwright-provider";
+export type {
+    TokenWrightObservation,
+    TokenWrightProviderRow,
+    TokenWrightReachability,
+} from "./tokenwright-provider";
 export type {
     EnvironmentDocumentBinding,
     EnvironmentManifest,

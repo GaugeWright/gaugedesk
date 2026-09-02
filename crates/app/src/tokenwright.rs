@@ -267,13 +267,70 @@ pub async fn request(
         .await
         .map_err(|error| BoxError(format!("writing to the box: {error}")))?;
 
+    read_response(&mut tls).await
+}
+
+/// Read one HTTP response: headers, then exactly the body it declares.
+///
+/// **Not `read_to_end`.** A real box closes its connection without sending a
+/// TLS `close_notify`, and rustls reports that as an error — so reading until
+/// EOF failed on a complete response that had already arrived. It passed
+/// against a test harness because that harness proxies plain TCP through
+/// `serve_home_forever`, which shuts its TLS down politely; the box terminates
+/// its own.
+///
+/// Reading by declared length is the right answer regardless: it does not
+/// depend on the peer closing at all, so it is correct whether the box hangs up
+/// or holds the connection open.
+async fn read_response<S>(stream: &mut S) -> Result<(u16, Vec<u8>), BoxError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     let mut raw = Vec::new();
-    // `Connection: close` above is what ends this read. Parsing framing well
-    // enough to keep the leg alive would buy nothing: the leg is per request.
-    tls.read_to_end(&mut raw)
-        .await
-        .map_err(|error| BoxError(format!("reading from the box: {error}")))?;
-    split_response(&raw)
+    let mut chunk = [0u8; 8192];
+    loop {
+        // Complete already? Stop, rather than waiting on a close that may not
+        // come and may not be clean when it does.
+        if let Some(complete) = complete_response(&raw) {
+            return Ok(complete);
+        }
+        let read = match stream.read(&mut chunk).await {
+            Ok(0) => 0,
+            Ok(read) => read,
+            // An unexpected EOF *is* the end of the message here. It is only an
+            // error if what arrived was incomplete, which the check below
+            // decides on the bytes rather than on how the peer hung up.
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+            Err(error) => return Err(BoxError(format!("reading from the box: {error}"))),
+        };
+        if read == 0 {
+            return match complete_response(&raw) {
+                Some(complete) => Ok(complete),
+                None if raw.is_empty() => fail("the box closed without answering"),
+                // No declared length and the peer is gone: everything after the
+                // headers is the body, which is what a `Connection: close`
+                // response means.
+                None => split_response(&raw),
+            };
+        }
+        raw.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// The response, if all of it has arrived. `None` while more is needed.
+fn complete_response(raw: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let declared = head.split("\r\n").find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())?
+    })?;
+    let body = &raw[split + 4..];
+    (body.len() >= declared).then(|| {
+        let (status, _) = split_response(raw).ok()?;
+        Some((status, body[..declared].to_vec()))
+    })?
 }
 
 fn split_response(raw: &[u8]) -> Result<(u16, Vec<u8>), BoxError> {
@@ -617,13 +674,6 @@ mod tests {
         assert!(pin_bytes("sha256:short").is_err());
         assert!(pin_bytes("not-hex").is_err());
     }
-
-    #[test]
-    fn a_response_is_split_at_its_headers() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-        assert_eq!(split_response(raw).expect("split"), (200, b"{}".to_vec()));
-        assert!(split_response(b"no headers here").is_err());
-    }
 }
 
 #[cfg(test)]
@@ -686,5 +736,69 @@ mod carried {
             "GET",
             "/v1/models?x=/environments/tokenwright/audit"
         ));
+    }
+}
+
+#[cfg(test)]
+mod responses {
+    use super::*;
+
+    /// A real box closes without a TLS `close_notify`, and rustls reports that
+    /// as an error. Reading to EOF therefore failed on a *complete* response
+    /// that had already arrived — and it passed against a test harness, because
+    /// that harness proxies plain TCP through `serve_home_forever`, which shuts
+    /// its TLS down politely. The box terminates its own.
+    ///
+    /// It cost a real box: the claim succeeded, the answer was unreadable, and
+    /// nothing was sealed — which spends a single-use code and leaves a box
+    /// paired to a Home with no record of it.
+    #[tokio::test]
+    async fn a_complete_response_is_read_without_waiting_for_a_close() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"ok\":true}\r\n";
+        // A reader that never ends: if the loop waited for EOF it would hang
+        // here rather than return, which is the failure in its purest form.
+        struct Endless(std::io::Cursor<Vec<u8>>);
+        impl tokio::io::AsyncRead for Endless {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let mut chunk = [0u8; 8];
+                let read = std::io::Read::read(&mut self.0, &mut chunk).unwrap_or(0);
+                if read == 0 {
+                    // Never ready again, and never EOF.
+                    return std::task::Poll::Pending;
+                }
+                buf.put_slice(&chunk[..read]);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut reader = Endless(std::io::Cursor::new(raw.to_vec()));
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_response(&mut reader),
+        )
+        .await
+        .expect("must not wait for a close that is not coming")
+        .expect("response");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"{\"ok\":true}\r\n");
+    }
+
+    #[test]
+    fn a_response_is_split_at_its_headers() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        assert_eq!(split_response(raw).expect("split"), (200, b"{}".to_vec()));
+        assert!(split_response(b"no headers here").is_err());
+    }
+
+    #[test]
+    fn a_partial_response_is_not_mistaken_for_a_whole_one() {
+        // Headers arrived, the body has not. Returning here would hand a caller
+        // a truncated document that parses as far as it goes.
+        let partial = b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n{\"half\":";
+        assert!(complete_response(partial).is_none());
+        assert!(complete_response(b"HTTP/1.1 200 OK\r\nContent-Le").is_none());
     }
 }

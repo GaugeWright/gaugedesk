@@ -2247,3 +2247,73 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
     background: var(--panel); font-size: var(--fs-code, var(--fs-body));
     white-space: pre-wrap; word-break: break-word; }
 .quarantine-actions { display: flex; gap: 8px; }
+
+/* --- TokenWright boxes on Provider Connections ------------------------------
+   A box is an OpenAI-compatible endpoint the person owns, so it sits with the
+   other provider connections rather than under Project Hosts (it runs no Home)
+   or as a GaugeApp (its control plane is not ours). Rows stay one line: a
+   person may own several boxes and each may hold many models. */
+.tokenwright-providers { display: flex; flex-direction: column; gap: 10px; }
+.tokenwright-providers__header { display: flex; align-items: baseline;
+    justify-content: space-between; gap: 12px; }
+.tokenwright-providers__header h3 { font-size: var(--fs-title); margin: 0;
+    font-weight: 650; }
+.tokenwright-providers__add { background: none; border: 1px solid var(--edge);
+    border-radius: 6px; padding: 4px 10px; color: var(--ink);
+    font-size: var(--fs-ui); cursor: pointer; }
+.tokenwright-providers__add:hover { border-color: var(--accent); }
+.tokenwright-providers__empty,
+.tokenwright-providers__note { color: var(--muted); font-size: var(--fs-small);
+    line-height: 1.5; margin: 0; max-width: 68ch; }
+.tokenwright-providers__list { list-style: none; margin: 0; padding: 0;
+    display: flex; flex-direction: column; }
+.tokenwright-providers__row { display: flex; align-items: center; gap: 8px;
+    padding: 6px 0; border-bottom: 1px solid var(--edge);
+    font-size: var(--fs-ui); min-width: 0; }
+.tokenwright-providers__dot { width: 7px; height: 7px; border-radius: 50%;
+    flex: none; background: var(--muted); }
+/* Colour is the fast read, never the only one — every state is also in the
+   row's own words, which is what a screen reader and a monochrome display get. */
+.tokenwright-providers__row[data-reachability="connected"] .tokenwright-providers__dot {
+    background: #3fb950; }
+.tokenwright-providers__row[data-reachability="stale"] .tokenwright-providers__dot {
+    background: #d29922; }
+.tokenwright-providers__row[data-reachability="unreachable"] .tokenwright-providers__dot {
+    background: #f85149; }
+.tokenwright-providers__id { font-family: var(--mono), monospace;
+    font-size: var(--fs-small); color: var(--muted); flex: none; }
+.tokenwright-providers__summary { flex: 1; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+.tokenwright-providers__forget { background: none; border: none; padding: 0;
+    color: var(--muted); font-size: var(--fs-small); cursor: pointer;
+    text-decoration: underline; flex: none; }
+.tokenwright-providers__forget:hover { color: #f85149; }
+
+/* --- adding a box ---------------------------------------------------------
+   The pairing string is a bearer capability for an unclaimed box and this is
+   the one place it is on screen, often while someone reads it off another
+   machine. Masked by default; the reveal is deliberate.
+
+   There are no rules here for showing the relay and pin before dialling, or for
+   printing an unsaved route to write down. Both belonged to a panel that parsed
+   the string and claimed the box itself; the Home does that now, so the page has
+   neither to show. */
+.tokenwright-connect { display: flex; flex-direction: column; gap: 8px;
+    padding: 12px; border: 1px solid var(--edge); border-radius: 8px; }
+.tokenwright-connect__label { font-size: var(--fs-small); color: var(--muted); }
+.tokenwright-connect__field { display: flex; gap: 6px; }
+.tokenwright-connect__input { flex: 1; min-width: 0; background: var(--bg);
+    border: 1px solid var(--edge); border-radius: 6px; padding: 6px 8px;
+    color: var(--ink); font-family: var(--mono), monospace;
+    font-size: var(--fs-small); }
+.tokenwright-connect__reveal { background: none; border: 1px solid var(--edge);
+    border-radius: 6px; padding: 0 10px; color: var(--muted);
+    font-size: var(--fs-small); cursor: pointer; }
+.tokenwright-connect__message { font-size: var(--fs-small); margin: 0;
+    line-height: 1.5; color: var(--muted); }
+.tokenwright-connect__message[data-phase="failed"] { color: #f85149; }
+.tokenwright-connect__message[data-phase="connected"] { color: #3fb950; }
+.tokenwright-connect__submit { align-self: flex-start; background: var(--accent);
+    border: none; border-radius: 6px; padding: 5px 14px; color: #fff;
+    font-size: var(--fs-ui); cursor: pointer; }
+.tokenwright-connect__submit:disabled { opacity: 0.5; cursor: default; }
