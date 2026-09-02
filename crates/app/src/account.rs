@@ -179,6 +179,78 @@ pub struct SettingRecord {
     pub value: String,
 }
 
+/// A paired TokenWright box, sealed the way every other provider credential is.
+///
+/// A box is an OpenAI-compatible endpoint the person owns, so it belongs beside
+/// the other provider connections rather than under Project Hosts (it runs no
+/// Home) — but it needs its own record, because what a box hands over is not a
+/// token.
+///
+/// Pairing yields **two** capabilities and they are useless apart:
+///
+/// - the **key**, a bearer credential for the box's surfaces; and
+/// - the **route**, 32 bytes of rendezvous on a blind relay. The box sends it
+///   exactly once, in the claim response, and nothing can derive or recover it.
+///   Losing it means the box must be unpaired by someone standing next to it.
+///
+/// So they are sealed as one blob rather than two fields. Half a credential is
+/// not a lesser credential here; it is an unreachable box, and splitting them
+/// would let one be erased while the other survived to look usable.
+///
+/// `relay_endpoint` and `fingerprint` stay plaintext beside the seal because
+/// neither is secret — the endpoint is a public address, and the fingerprint is
+/// a hash of a certificate the box presents to anyone who reaches it. Keeping
+/// them readable is what lets the account list boxes without unsealing anything.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BoxRecord {
+    /// The box's certificate fingerprint, hex, without the `sha256:` prefix.
+    ///
+    /// Its identity is the certificate because that is the one thing about a box
+    /// that is stable, public, and not reissued: the key rotates, the route
+    /// changes on every re-pair, and the Home id says who claimed it rather than
+    /// which box it is.
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    /// Hex `SEC-4` ciphertext of `{"route": "...", "key": "..."}`.
+    #[serde(default)]
+    pub sealed_material: String,
+    /// **Non-secret.** Where the box parks its leg.
+    #[serde(default)]
+    pub relay_endpoint: String,
+    /// **Non-secret.** RFC 3339, as the box reported it at claim.
+    #[serde(default)]
+    pub paired_at: String,
+    /// **Non-secret.** Which Home claimed it, and the id of the key it minted —
+    /// the id, never the secret.
+    #[serde(default)]
+    pub home_id: String,
+    #[serde(default)]
+    pub key_id: String,
+}
+
+/// The non-secret half of a pairing: everything that may be listed.
+///
+/// Separate from [`BoxMaterial`] on purpose. The two halves are handled
+/// differently at every step — one is sealed and never returned, the other is
+/// stored plainly and shown — so a signature that took them as one bag of
+/// arguments would be a signature where mixing them up is a rename away.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairedBoxFacts {
+    pub fingerprint: String,
+    pub relay_endpoint: String,
+    pub paired_at: String,
+    pub home_id: String,
+    pub key_id: String,
+}
+
+/// The two capabilities a box hands over, together.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BoxMaterial {
+    pub route: String,
+    pub key: String,
+}
+
 /// A linked provider credential (`id` = provider, e.g. `openai`). The token is stored
 /// **only** as `SEC-4` ciphertext (hex); the plaintext never lives at rest here.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -281,6 +353,11 @@ pub struct RegisteredHomeRecord {
 /// and stating that here is the point, because a reader who mistook this for an
 /// authenticated value would be trusting it for more than it can carry.
 pub const DIRECTORY_RECORD_KIND: &str = "account_directory";
+/// Record kind for a paired TokenWright box. Written into the person's own
+/// account scope, so `crypto_erase_content` covers it without naming it — an
+/// erase that had to enumerate kinds would silently miss every kind added after
+/// it was written.
+pub const BOX_RECORD_KIND: &str = "tokenwright_box";
 /// Latest-wins: one account, one root, one directory.
 pub const DIRECTORY_RECORD_ID: &str = "directory";
 
@@ -341,6 +418,8 @@ pub struct Account {
     pub refresh_sessions: BTreeMap<String, RefreshRecord>,
     pub settings: BTreeMap<String, SettingRecord>,
     pub credentials: BTreeMap<String, CredentialRecord>,
+    /// Paired TokenWright boxes, keyed by certificate fingerprint.
+    pub boxes: BTreeMap<String, BoxRecord>,
     pub homes: BTreeMap<String, RegisteredHomeRecord>,
     pub home_routes: BTreeMap<String, HomeRouteRecord>,
     /// The routes currently *retracted*, keyed the same way and holding the
@@ -406,6 +485,10 @@ impl Account {
         for row in store.records(scope, "credential")? {
             let r: CredentialRecord = serde_json::from_str(&row)?;
             fold(&mut acct.credentials, r.id.clone(), r.op, r);
+        }
+        for row in store.records(scope, BOX_RECORD_KIND)? {
+            let r: BoxRecord = serde_json::from_str(&row)?;
+            fold(&mut acct.boxes, r.id.clone(), r.op, r);
         }
         for row in store.records(scope, "home")? {
             let r: RegisteredHomeRecord = serde_json::from_str(&row)?;
@@ -1354,6 +1437,84 @@ impl Workbench {
         Ok(reference)
     }
 
+    // --- paired TokenWright boxes ----------------------------------------
+
+    /// Seal a paired box's two capabilities and record it in `scope`.
+    ///
+    /// Re-pairing the same box replaces the record. That is correct rather than
+    /// merely convenient: a second claim mints a new key *and* moves the box to
+    /// a new route, so the previous material names an address nothing is
+    /// listening on. Keeping it would preserve a credential that cannot work.
+    pub fn upsert_account_box_in(
+        &mut self,
+        scope: &str,
+        facts: PairedBoxFacts,
+        material: &BoxMaterial,
+    ) -> Result<(), AdmitError> {
+        let plain = serde_json::to_string(material).unwrap_or_default();
+        let Some(sealed_material) = seal_token(self.account_key(), &plain) else {
+            return Err(AdmitError::Codec("seal failed".to_owned()));
+        };
+        let record = BoxRecord {
+            id: facts.fingerprint,
+            op: RecordOp::Upsert,
+            sealed_material,
+            relay_endpoint: facts.relay_endpoint,
+            paired_at: facts.paired_at,
+            home_id: facts.home_id,
+            key_id: facts.key_id,
+        };
+        self.write_account_record_in(scope, BOX_RECORD_KIND, &record.id.clone(), &record)
+    }
+
+    /// Forget a box.
+    ///
+    /// A tombstone, not a revocation: unlike a provider token there is nothing
+    /// to keep naming. The box itself is untouched and still serves the Home
+    /// that claimed it — forgetting here only discards this account's copy of
+    /// how to reach it, and that copy is the only one. Reaching the box again
+    /// after this means unpairing it in person.
+    pub fn tombstone_account_box_in(
+        &mut self,
+        scope: &str,
+        fingerprint: String,
+    ) -> Result<(), AdmitError> {
+        let record = BoxRecord {
+            id: fingerprint,
+            op: RecordOp::Tombstone,
+            sealed_material: String::new(),
+            relay_endpoint: String::new(),
+            paired_at: String::new(),
+            home_id: String::new(),
+            key_id: String::new(),
+        };
+        self.write_account_record_in(scope, BOX_RECORD_KIND, &record.id.clone(), &record)
+    }
+
+    /// Unseal a box's route and key for the runtime's own use.
+    ///
+    /// **Never reachable over HTTP, by construction: no route calls this.** The
+    /// browser gets the projection in [`Self::account_boxes_in`], which carries
+    /// the endpoint and the fingerprint and neither capability. That asymmetry
+    /// is the entire point of sealing — a person's own browser is exactly the
+    /// place these bytes must not be copied to, because a browser is the thing
+    /// most likely to be shared, synced, or extended by something the person
+    /// did not audit.
+    pub fn resolve_account_box_in(&self, scope: &str, fingerprint: &str) -> Option<BoxMaterial> {
+        let account = Account::rebuild_in(self.store_ref(), scope).ok()?;
+        let record = account.boxes.get(fingerprint)?;
+        let plain = unseal_token(self.account_key(), &record.sealed_material)?;
+        serde_json::from_str(&plain).ok()
+    }
+
+    /// Every paired box in `scope`, without unsealing anything.
+    pub fn account_boxes_in(&self, scope: &str) -> Result<Vec<BoxRecord>, AdmitError> {
+        Ok(Account::rebuild_in(self.store_ref(), scope)?
+            .boxes
+            .into_values()
+            .collect())
+    }
+
     /// Tombstone one account credential (default scope).
     pub fn tombstone_account_credential(&mut self, provider: String) -> Result<(), AdmitError> {
         self.tombstone_account_credential_in(ACCOUNT_SCOPE, provider)
@@ -1658,9 +1819,15 @@ impl Workbench {
             }
         }
 
-        // Finally, crypto-erase the account scope itself: devices, settings,
-        // credentials, homes, home-routes, and the tenant_ref switcher entries all
-        // become permanently unrecoverable — the intended "account gone" state.
+        // Finally, crypto-erase the account scope itself. Everything written
+        // under it becomes permanently unrecoverable — devices, settings,
+        // credentials, paired boxes, homes, home-routes, and the tenant_ref
+        // switcher entries — which is the intended "account gone" state.
+        //
+        // It erases the *scope*, not a list of kinds, and that is what makes it
+        // correct as kinds are added. The list above is illustration; a kind
+        // written into this scope is covered whether or not anyone remembered
+        // to name it here.
         if !self.crypto_erase_content(account_scope) && self.content_encryption_enabled() {
             tracing::warn!(
                 scope = %account_scope,

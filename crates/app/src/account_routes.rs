@@ -201,6 +201,10 @@ fn shared_runtime_credential_routes() -> Router<SharedWorkbench> {
             get(get_credentials).post(post_credential),
         )
         .route("/account/credentials/{provider}", delete(delete_credential))
+        // A paired TokenWright box: an OpenAI-compatible endpoint the person
+        // owns, sealed exactly like every other provider credential.
+        .route("/account/boxes", get(get_boxes).post(post_box))
+        .route("/account/boxes/{fingerprint}", delete(delete_box))
         // First-run gate signal (ADR 0075 Phase 0): whether the default runtime
         // actually needs an LLM credential. False under the scripted fake agent
         // (dev/e2e), so the first-run overlay never blocks a no-credential test.
@@ -1723,6 +1727,158 @@ pub async fn post_credential(
         })),
     )
         .into_response()
+}
+
+// --- paired TokenWright boxes ------------------------------------------------
+
+/// Normalise a fingerprint to the bare hex the record is keyed by.
+///
+/// The box's documents spell it `sha256:<hex>` and the wasm tunnel wants the
+/// bare hex, so both spellings arrive here. Storing whichever one showed up
+/// would key one box two ways, and the second pairing would look like a second
+/// box that also happens to shadow the first.
+fn box_fingerprint(value: &str) -> Option<String> {
+    let hex = value.trim().strip_prefix("sha256:").unwrap_or(value.trim());
+    let hex = hex.to_ascii_lowercase();
+    if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(hex)
+    } else {
+        None
+    }
+}
+
+/// Every paired box, carrying no capability.
+///
+/// The endpoint and the fingerprint are here because neither is secret — one is
+/// a public address, the other a hash of a certificate the box presents to
+/// anyone who reaches it. The route and the key are not here and there is no
+/// parameter that adds them: a person's own browser is exactly where these
+/// bytes must not be copied, which is what sealing them was for.
+pub async fn get_boxes(State(wb): State<SharedWorkbench>, headers: HeaderMap) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    match wb.account_boxes_in(&scope) {
+        Ok(records) => {
+            let boxes: Vec<serde_json::Value> = records
+                .iter()
+                .map(|record| {
+                    json!({
+                        "fingerprint": format!("sha256:{}", record.id),
+                        "relay_endpoint": record.relay_endpoint,
+                        "paired_at": record.paired_at,
+                        "home_id": record.home_id,
+                        "key_id": record.key_id,
+                        // Whether material is held at all. A record whose seal
+                        // failed to open would otherwise read as a usable box
+                        // right up until something tried to reach it.
+                        "sealed": !record.sealed_material.is_empty(),
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(json!({ "boxes": boxes }))).into_response()
+        }
+        Err(e) => err_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PairBoxBody {
+    /// `sha256:<hex>` or bare hex. The box's identity.
+    fingerprint: String,
+    /// Base64url of the 32-byte rendezvous token. Secret.
+    route: String,
+    /// The key the box minted for this Home. Secret.
+    key: String,
+    /// Non-secret.
+    relay_endpoint: String,
+    #[serde(default)]
+    paired_at: String,
+    #[serde(default)]
+    home_id: String,
+    #[serde(default)]
+    key_id: String,
+}
+
+/// Record a box just claimed, sealing what it handed over.
+///
+/// This is the *only* moment the route exists anywhere outside the box. A claim
+/// that succeeded and was not stored has spent a single-use code and lost the
+/// box, so a caller must treat a non-200 here as exactly that severe.
+pub async fn post_box(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Json(body): Json<PairBoxBody>,
+) -> impl IntoResponse {
+    let Some(fingerprint) = box_fingerprint(&body.fingerprint) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fingerprint must be a SHA-256 digest",
+        )
+            .into_response();
+    };
+    if body.route.trim().is_empty() || body.key.is_empty() {
+        // Both, together. A box recorded with one of them is a box that lists
+        // and cannot be reached, which is worse than one that never listed.
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route and key are both required",
+        )
+            .into_response();
+    }
+    if body.relay_endpoint.trim().is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "relay_endpoint is required",
+        )
+            .into_response();
+    }
+    let mut wb = wb.lock_unpoisoned();
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    let material = crate::account::BoxMaterial {
+        route: body.route,
+        key: body.key,
+    };
+    let facts = crate::account::PairedBoxFacts {
+        fingerprint: fingerprint.clone(),
+        relay_endpoint: body.relay_endpoint.clone(),
+        paired_at: body.paired_at,
+        home_id: body.home_id,
+        key_id: body.key_id,
+    };
+    if let Err(e) = wb.upsert_account_box_in(&scope, facts, &material) {
+        return err_response(e);
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "fingerprint": format!("sha256:{fingerprint}"),
+            "relay_endpoint": body.relay_endpoint,
+            "sealed": true,
+        })),
+    )
+        .into_response()
+}
+
+/// Forget a box. The box itself is untouched and still serves the Home that
+/// claimed it; this discards the only copy of how to reach it.
+pub async fn delete_box(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Path(fingerprint): Path<String>,
+) -> impl IntoResponse {
+    let Some(fingerprint) = box_fingerprint(&fingerprint) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fingerprint must be a SHA-256 digest",
+        )
+            .into_response();
+    };
+    let mut wb = wb.lock_unpoisoned();
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    match wb.tombstone_account_box_in(&scope, fingerprint) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "forgotten": true }))).into_response(),
+        Err(e) => err_response(e),
+    }
 }
 
 #[derive(Deserialize)]

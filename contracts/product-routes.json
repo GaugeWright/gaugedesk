@@ -2586,6 +2586,42 @@
       }
     },
     {
+      "id": "account.boxes.list",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/account/boxes",
+      "producer": "gaugedesk-app account_routes",
+      "consumer": "listBoxes via @gaugewright/control-plane-client",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "read-own-box-metadata",
+      "requestSchema": "http/empty",
+      "responseSchema": "gw://schemas/account/box-metadata-list/v1",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/e2e/authenticated-account-session.mjs#production-authenticated-account-bootstrap"
+        ],
+        "authority": [
+          "web/e2e/authenticated-account-session.mjs#account-bootstrap-cookie-authority-properties"
+        ],
+        "journey": [
+          "web/e2e/authenticated-account-session.mjs#production-authenticated-account-bootstrap"
+        ],
+        "deployed": [],
+        "property": [
+          "web/e2e/authenticated-account-session.mjs#account-bootstrap-cookie-authority-properties"
+        ]
+      }
+    },
+    {
       "id": "account.credentials.list",
       "jurisdiction": "hosted-person-account",
       "transport": "http-json",
@@ -3410,6 +3446,78 @@
         "deployed": [],
         "property": [
           "crates/app/src/directory_sync.rs#the_directory_record_carries_no_secrets_and_the_blob_round_trips"
+        ]
+      }
+    },
+    {
+      "id": "account.boxes.pair",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/account/boxes",
+      "producer": "gaugedesk-app account_routes",
+      "consumer": "recordPairedBox via @gaugewright/control-plane-client",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "seal-own-paired-box",
+      "requestSchema": "rust:gaugedesk-app/account_routes/PairBoxBody",
+      "responseSchema": "gw://schemas/account/box-pair/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account.rs#a_paired_box_is_sealed_and_neither_capability_comes_back"
+        ],
+        "authority": [
+          "crates/app/tests/account.rs#a_box_belongs_to_one_person_and_rides_their_erase"
+        ],
+        "journey": [
+          "crates/app/tests/account.rs#a_paired_box_is_sealed_and_neither_capability_comes_back"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/tests/account.rs#a_box_belongs_to_one_person_and_rides_their_erase"
+        ]
+      }
+    },
+    {
+      "id": "account.boxes.forget",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "DELETE",
+      "path": "/account/boxes/:fingerprint",
+      "producer": "gaugedesk-app account_routes",
+      "consumer": "forgetBox via @gaugewright/control-plane-client",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "forget-own-paired-box",
+      "requestSchema": "http/path-fingerprint",
+      "responseSchema": "gw://schemas/account/box-pair/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account.rs#a_paired_box_is_sealed_and_neither_capability_comes_back"
+        ],
+        "authority": [
+          "crates/app/tests/account.rs#a_box_belongs_to_one_person_and_rides_their_erase"
+        ],
+        "journey": [
+          "crates/app/tests/account.rs#a_paired_box_is_sealed_and_neither_capability_comes_back"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/tests/account.rs#a_box_belongs_to_one_person_and_rides_their_erase"
         ]
       }
     },

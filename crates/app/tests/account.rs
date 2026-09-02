@@ -18,11 +18,24 @@ use gaugedesk_store::Store;
 use gaugedesk_workspace::Instance;
 
 fn workbench() -> (tempfile::TempDir, Router) {
+    let (dir, router, _shared) = workbench_with_handle();
+    (dir, router)
+}
+
+/// The same fixture, keeping the workbench itself.
+///
+/// Sealing is an *asymmetry* — the runtime can open what HTTP will not return —
+/// and a test that only drives the router can see one half of it.
+fn workbench_with_handle() -> (tempfile::TempDir, Router, Arc<Mutex<Workbench>>) {
     let dir = tempfile::tempdir().unwrap();
     let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
     let store = Store::open_in_memory().unwrap();
-    let wb = Workbench::with_target("inst-test", instance, store);
-    (dir, open_control_plane(Arc::new(Mutex::new(wb))))
+    let wb = Arc::new(Mutex::new(Workbench::with_target(
+        "inst-test",
+        instance,
+        store,
+    )));
+    (dir, open_control_plane(Arc::clone(&wb)), wb)
 }
 
 async fn send(app: &Router, method: &str, uri: &str, body: Option<&str>) -> (StatusCode, Value) {
@@ -237,5 +250,184 @@ async fn unregistering_the_selected_home_clears_the_selection() {
     assert!(
         body["selected_home"].is_null(),
         "the selection outlived the Home it named: {body}",
+    );
+}
+
+// --- paired TokenWright boxes ------------------------------------------------
+
+const PIN: &str = "sha256:019f0246c6d3c7ee43c26869ba1a4c5821d115e5a6d7d0570da60bf4f544b75d";
+const ROUTE: &str = "F8E0l3whZo41YL6B8yzSJAQdF8E0l3whZo41YL6B8yw";
+const BOX_KEY: &str = "tw_box_key_do_not_leak";
+
+fn pair_body(fingerprint: &str) -> String {
+    format!(
+        r#"{{"fingerprint":"{fingerprint}","route":"{ROUTE}","key":"{BOX_KEY}",
+            "relay_endpoint":"wss://relay.example","paired_at":"2026-09-01T20:00:00Z",
+            "home_id":"home_a","key_id":"key_c30f"}}"#
+    )
+}
+
+#[tokio::test]
+async fn a_paired_box_is_sealed_and_neither_capability_comes_back() {
+    let (_dir, app) = workbench();
+
+    let (s, body) = send(&app, "POST", "/account/boxes", Some(&pair_body(PIN))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["sealed"], true);
+
+    // The list carries what is public — the endpoint and the pin — and neither
+    // capability. A person's own browser is exactly where these must not be.
+    let (s, body) = send(&app, "GET", "/account/boxes", None).await;
+    assert_eq!(s, StatusCode::OK);
+    let raw = body.to_string();
+    assert!(!raw.contains(ROUTE), "the route must never be returned");
+    assert!(!raw.contains(BOX_KEY), "the key must never be returned");
+    assert!(!raw.contains("\"route\""), "no route field at all");
+    assert!(!raw.contains("\"key\""), "no key field at all");
+    assert_eq!(body["boxes"][0]["fingerprint"], PIN);
+    assert_eq!(body["boxes"][0]["relay_endpoint"], "wss://relay.example");
+    assert_eq!(body["boxes"][0]["key_id"], "key_c30f");
+}
+
+#[tokio::test]
+async fn the_runtime_can_open_what_the_browser_cannot() {
+    // The asymmetry is the whole point of sealing: the material exists and is
+    // usable, just not over HTTP.
+    let (_dir, app, shared) = workbench_with_handle();
+    let (s, _) = send(&app, "POST", "/account/boxes", Some(&pair_body(PIN))).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let wb = shared.lock().unwrap();
+    let scope = wb.account_scope_for(None);
+    let material = wb
+        .resolve_account_box_in(&scope, PIN.trim_start_matches("sha256:"))
+        .expect("the runtime must be able to unseal it");
+    assert_eq!(material.route, ROUTE);
+    assert_eq!(material.key, BOX_KEY);
+}
+
+#[tokio::test]
+async fn a_box_is_keyed_by_its_certificate_however_the_pin_is_spelled() {
+    // The box's documents say `sha256:<hex>`; the wasm tunnel wants bare hex.
+    // Keying one box two ways would make a re-pair look like a second box that
+    // also happens to shadow the first.
+    let (_dir, app) = workbench();
+    let bare = PIN.trim_start_matches("sha256:");
+    let (s, _) = send(&app, "POST", "/account/boxes", Some(&pair_body(PIN))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = send(&app, "POST", "/account/boxes", Some(&pair_body(bare))).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (_s, body) = send(&app, "GET", "/account/boxes", None).await;
+    assert_eq!(
+        body["boxes"].as_array().unwrap().len(),
+        1,
+        "one box, however its pin was spelled"
+    );
+}
+
+#[tokio::test]
+async fn re_pairing_replaces_the_material_rather_than_keeping_both() {
+    // A second claim mints a new key *and* moves the box to a new route, so the
+    // previous material names an address nothing is listening on.
+    let (_dir, app, shared) = workbench_with_handle();
+    send(&app, "POST", "/account/boxes", Some(&pair_body(PIN))).await;
+    let second = format!(
+        r#"{{"fingerprint":"{PIN}","route":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "key":"tw_second_key","relay_endpoint":"wss://relay.example"}}"#
+    );
+    let (s, _) = send(&app, "POST", "/account/boxes", Some(&second)).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let wb = shared.lock().unwrap();
+    let scope = wb.account_scope_for(None);
+    let material = wb
+        .resolve_account_box_in(&scope, PIN.trim_start_matches("sha256:"))
+        .expect("material");
+    assert_eq!(material.key, "tw_second_key");
+    assert_ne!(material.route, ROUTE, "the dead route must not survive");
+}
+
+#[tokio::test]
+async fn half_a_box_is_refused() {
+    // A box recorded with one capability lists and cannot be reached, which is
+    // worse than one that never listed.
+    let (_dir, app) = workbench();
+    for body in [
+        format!(r#"{{"fingerprint":"{PIN}","route":"","key":"k","relay_endpoint":"wss://r"}}"#),
+        format!(
+            r#"{{"fingerprint":"{PIN}","route":"{ROUTE}","key":"","relay_endpoint":"wss://r"}}"#
+        ),
+        format!(r#"{{"fingerprint":"{PIN}","route":"{ROUTE}","key":"k","relay_endpoint":""}}"#),
+        format!(
+            r#"{{"fingerprint":"not-a-digest","route":"{ROUTE}","key":"k","relay_endpoint":"wss://r"}}"#
+        ),
+    ] {
+        let (s, _) = send(&app, "POST", "/account/boxes", Some(&body)).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "refused: {body}");
+    }
+    let (_s, body) = send(&app, "GET", "/account/boxes", None).await;
+    assert_eq!(body["boxes"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn forgetting_a_box_discards_the_material_too() {
+    // Forgetting must not leave openable bytes behind: the record is what an
+    // erase covers, and a tombstone that kept the seal would be a credential
+    // the person believes they deleted.
+    let (_dir, app, shared) = workbench_with_handle();
+    send(&app, "POST", "/account/boxes", Some(&pair_body(PIN))).await;
+    let bare = PIN.trim_start_matches("sha256:");
+
+    let (s, body) = send(&app, "DELETE", &format!("/account/boxes/{bare}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["forgotten"], true);
+
+    let (_s, body) = send(&app, "GET", "/account/boxes", None).await;
+    assert_eq!(body["boxes"].as_array().unwrap().len(), 0);
+
+    let wb = shared.lock().unwrap();
+    let scope = wb.account_scope_for(None);
+    assert!(
+        wb.resolve_account_box_in(&scope, bare).is_none(),
+        "a forgotten box must not still unseal"
+    );
+}
+
+#[tokio::test]
+async fn a_box_belongs_to_one_person_and_rides_their_erase() {
+    // Two properties in one, because they are the same fact.
+    //
+    // INV-1: a person reads only their own boxes. And the mechanism that makes
+    // that true — the record living in *that person's* account scope — is the
+    // same mechanism that makes account erasure cover it, because the erase
+    // destroys the scope's content key rather than a list of record kinds. A
+    // box written anywhere else would be both readable by the wrong person and
+    // left behind by their erase.
+    let (_dir, app, shared) = workbench_with_handle();
+    let (s, _) = send(&app, "POST", "/account/boxes", Some(&pair_body(PIN))).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let wb = shared.lock().unwrap();
+    let mine = wb.account_scope_for(None);
+    let bare = PIN.trim_start_matches("sha256:");
+
+    assert_eq!(wb.account_boxes_in(&mine).expect("mine").len(), 1);
+    assert!(wb.resolve_account_box_in(&mine, bare).is_some());
+
+    let someone_else = gaugedesk_app::account::account_scope("person_other");
+    assert_ne!(
+        someone_else, mine,
+        "the fixture must not collapse the scopes"
+    );
+    assert!(
+        wb.account_boxes_in(&someone_else)
+            .expect("theirs")
+            .is_empty(),
+        "another person's scope must not see this box"
+    );
+    assert!(
+        wb.resolve_account_box_in(&someone_else, bare).is_none(),
+        "and must not be able to unseal it"
     );
 }

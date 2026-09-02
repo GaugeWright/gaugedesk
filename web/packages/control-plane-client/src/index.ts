@@ -18,6 +18,7 @@ export * from "./home-pool";
 export * from "./tunnel-module";
 export * from "./tunnel-route-json";
 export * from "./tokenwright-pairing";
+export * from "./tokenwright-box-store";
 export * from "./tokenwright-transport";
 export * from "./home-routing";
 export * from "./signed-routes";
