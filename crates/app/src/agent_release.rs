@@ -805,6 +805,14 @@ impl Workbench {
                     provider: spec.provider.provider.clone(),
                     model: spec.provider.model.clone(),
                     base_url: spec.provider.base_url.clone(),
+                    // WhippleScript custody admits only `credential:<name>`
+                    // here, so the class travels in its canonical spelling.
+                    // The public session runtime must present exactly this
+                    // string when it resolves the binding, while the closure's
+                    // `credential_class` below stays the raw class the edge
+                    // compares against the deployment config. The runtime
+                    // derives one from the other with the same rule;
+                    // `envelope_names_the_canonical_class_ref` pins this side.
                     credential_ref: crate::account::canonical_credential_class_ref(
                         &spec.provider.credential_class,
                     ),
@@ -2636,6 +2644,78 @@ mod publisher_tests {
                 .keys()
                 .any(|id| id.starts_with("panel-preview-instance-")),
             "the transient instance is gone before the preview is returned",
+        );
+    }
+
+    /// The public session runtime resolves the provider binding by presenting a
+    /// credential id and requiring the signed envelope's binding to carry the
+    /// same string (`VerifiedEnvelope::resolve_provider_binding`). The closure
+    /// carries the raw class, which the edge compares against the deployment
+    /// config; the envelope carries the canonical `credential:` form, which is
+    /// the only spelling WhippleScript custody admits. The runtime bridges the
+    /// two by deriving the canonical form from the class with this exact rule,
+    /// so the rule is pinned here as a literal — a release whose halves the
+    /// runtime cannot reconcile passes every validator and refuses its first
+    /// turn with "provider binding has no exact realization in the verified
+    /// policy epoch", which is what every Panel release built after
+    /// 2026-08-27 did until the runtime learned the derivation.
+    #[test]
+    fn envelope_names_the_canonical_class_ref() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let mut guard = workbench.lock_unpoisoned();
+        // The managed metered-gateway profile every production Panel runs on,
+        // so the literal pinned below is the one the runtime meets in practice.
+        let route = crate::managed_inference::metered_route("gpt-5.6-terra");
+        let profile = crate::library::PanelPublicProfile {
+            provider: ProviderPolicy {
+                provider: crate::managed_inference::METERED_GATEWAY_PROVIDER.to_owned(),
+                model: route.model,
+                base_url: route.base_url,
+                credential_class: "managed-openai".to_owned(),
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+            ..crate::library::PanelPublicProfile::default()
+        };
+        guard
+            .seed_panel_placement("inst-envelope-agreement", profile)
+            .unwrap();
+
+        let (release, _) = guard
+            .build_panel_preview_release("inst-envelope-agreement-agent", None, 1_800_000_000_000)
+            .unwrap();
+
+        let host_policy = &release.payload.host_policy;
+        // A signed envelope is the policy content itself with an `attestation`
+        // block added (`SignedEnvelope::to_json`), so the bindings sit at the
+        // top level — which is also where the runtime reads them.
+        let policy: serde_json::Value = serde_json::from_str(&host_policy.signed_envelope).unwrap();
+        assert!(policy["attestation"]["signature"].is_string());
+        let binding = &policy["provider_bindings"][host_policy.provider_binding_ref.as_str()];
+        assert_eq!(host_policy.credential_class, "managed-openai");
+        assert_eq!(
+            binding["credential_ref"].as_str(),
+            Some("credential:gaugedesk/class/6d616e616765642d6f70656e6169"),
+            "the runtime derives this literal from the closure's class; \
+             change both sides together (whipplescript worker `credentialIdForHostPolicy`)",
+        );
+        assert_eq!(
+            binding["credential_ref"].as_str(),
+            Some(
+                crate::account::canonical_credential_class_ref(&host_policy.credential_class)
+                    .as_str()
+            ),
+        );
+        assert!(
+            policy["placements"][host_policy.placement_ref.as_str()]["provider_bindings"]
+                .as_array()
+                .is_some_and(|bindings| {
+                    bindings
+                        .iter()
+                        .any(|b| b.as_str() == Some(host_policy.provider_binding_ref.as_str()))
+                }),
+            "the closure's placement must list the closure's binding",
         );
     }
 

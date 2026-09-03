@@ -681,6 +681,77 @@ describe("EdgeSessionApi", () => {
         vi.useRealTimers();
     });
 
+    /** The live failure of 2026-09-03. A freshly published deployment answered
+     *  every first turn with a bare "502", and the reason — the runtime's host
+     *  policy refusing the provider binding — was in the terminal body the
+     *  whole time, dropped here. A number is not a diagnosis. */
+    it("carries the runtime's reason when a turn fails", async () => {
+        const sockets: FakeWebSocket[] = [];
+        vi.stubGlobal("fetch", vi.fn());
+        vi.stubGlobal(
+            "WebSocket",
+            class extends FakeWebSocket {
+                constructor(url: string) {
+                    super(url);
+                    sockets.push(this);
+                }
+            },
+        );
+        const api = new EdgeSessionApi(
+            "https://panels.gaugewright.com/d/theory-a",
+            "sess_0123456789abcdef0123456789abcdef" as EngagementId,
+            "resume-capability",
+            "connection-capability",
+            Date.now() + 15 * 60 * 1000,
+            null,
+            false,
+        );
+        const ready = api.ready();
+        sockets[0]!.emit("open");
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "session_ready",
+                snapshot: { cursor: 0, transcript: [], files: [] },
+            }),
+        });
+        await ready;
+
+        const turn = api.runEmbedTurn("ignored" as EngagementId, "hello");
+        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(1));
+        const sent = JSON.parse(sockets[0]!.sent[0]!) as { request_id: string };
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "error",
+                sequence: 1,
+                request_id: sent.request_id,
+                status: 502,
+                body: {
+                    error: "turn rejected: host policy rejected input: provider binding has no exact realization in the verified policy epoch",
+                    outcome: "failed",
+                },
+            }),
+        });
+        await expect(turn).rejects.toThrow(
+            "public turn failed: 502: turn rejected: host policy rejected input: provider binding has no exact realization in the verified policy epoch",
+        );
+
+        // A terminal with no reason still names the status alone.
+        const bare = api.runEmbedTurn("ignored" as EngagementId, "again");
+        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(2));
+        const second = JSON.parse(sockets[0]!.sent[1]!) as { request_id: string };
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "turn_terminal",
+                sequence: 2,
+                request_id: second.request_id,
+                status: 502,
+                body: { outcome: "failed" },
+            }),
+        });
+        await expect(bare).rejects.toThrow(/^public turn failed: 502$/);
+        api.dispose();
+    });
+
     /** The live failure of 2026-08-20. A deployment cutover ends live sessions,
      *  and a tab open across one held a capability for a session that no longer
      *  existed. The state probe answered 401, which this client read as

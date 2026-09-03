@@ -633,7 +633,17 @@ export class EdgeSessionApi implements EmbedSessionApi {
                 }
                 pending.resolve(message.body);
             } else {
-                pending.reject(new Error(`public turn failed: ${status}`));
+                // The runtime says why in the terminal body — a policy
+                // refusal, a provider failure, a missing credential. A bare
+                // status hides all of them behind one number, and the person
+                // reading it cannot tell a broken deployment from a broken
+                // network.
+                const body = message.body as { error?: unknown } | undefined;
+                const reason =
+                    body && typeof body.error === "string" && body.error.trim()
+                        ? `: ${body.error.trim()}`
+                        : "";
+                pending.reject(new Error(`public turn failed: ${status}${reason}`));
             }
         }
         return typeof message.type === "string" ? message.type : null;
