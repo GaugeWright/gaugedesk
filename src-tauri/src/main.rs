@@ -136,6 +136,8 @@ fn main() {
             if let Some(script) = webview_org_cp_script(org_cp.as_deref()) {
                 window = window.initialization_script(script);
             }
+            // Browser-style zoom: Ctrl +/-/0 and Ctrl+wheel, remembered across restarts.
+            window = window.initialization_script(ZOOM_HOTKEYS);
             window.build()?;
 
             // FED-7: an OS-delivered `gaugewright://` link arrives here — on cold start (the link
@@ -156,6 +158,86 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running gaugewright desktop");
 }
+
+/// Browser-style zoom for the webview: Ctrl and `-`/`=`/`+`/`0`, Ctrl+wheel, and the
+/// chosen level remembered across restarts.
+///
+/// A webview is not a browser and arrives with none of this. Tauri offers
+/// `zoomHotkeysEnabled`, but where it is a polyfill rather than a native setting it
+/// gets the wheel wrong twice. It binds the *legacy* `mousewheel` alias, and a real
+/// wheel over this webview does not deliver one — measured on WebKitGTK, a trusted
+/// Ctrl+wheel produces `wheel` events (`deltaMode` 0, `deltaY` ±159) and no
+/// `mousewheel` at all, so the polyfill's wheel half never fires. And it cancels the
+/// event's default so the page does not scroll underneath the zoom, but registers the
+/// listener with no options — a window-level wheel listener is **passive by default**,
+/// so that cancel is discarded. Hence the shell owns the whole gesture rather than
+/// correcting half of it, on every platform, which is also what lets one zoom level be
+/// remembered instead of reset to 100% on every launch.
+///
+/// It steps a browser-like ladder rather than a fixed increment, treats one wheel notch
+/// as one step without guessing a delta threshold, and reads its level back from
+/// `localStorage` at document-start on every load — so a reload cannot leave the
+/// counter disagreeing with the applied zoom.
+const ZOOM_HOTKEYS: &str = r#"try {
+  var KEY = 'gw.zoom';
+  var LADDER = [0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
+  var HUNDRED = 5;
+  var index = HUNDRED;
+
+  function apply(remember) {
+    var value = LADDER[index];
+    try {
+      window.__TAURI_INTERNALS__.invoke('plugin:webview|set_webview_zoom', { value: value });
+    } catch (e) {}
+    if (remember) {
+      try { window.localStorage.setItem(KEY, String(value)); } catch (e) {}
+    }
+  }
+
+  function step(direction) {
+    var next = Math.min(Math.max(index + direction, 0), LADDER.length - 1);
+    if (next === index) return;
+    index = next;
+    apply(true);
+  }
+
+  var stored = NaN;
+  try { stored = parseFloat(window.localStorage.getItem(KEY)); } catch (e) {}
+  if (isFinite(stored) && stored > 0) {
+    for (var i = 0; i < LADDER.length; i++) {
+      if (Math.abs(LADDER[i] - stored) < Math.abs(LADDER[index] - stored)) index = i;
+    }
+    if (index !== HUNDRED) apply(false);
+  }
+
+  window.addEventListener('keydown', function (event) {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+    if (event.key === '-') step(-1);
+    else if (event.key === '=' || event.key === '+') step(1);
+    else if (event.key === '0') { if (index !== HUNDRED) { index = HUNDRED; apply(true); } }
+    else return;
+    event.preventDefault();
+  }, { capture: true });
+
+  var accumulated = 0;
+  var previous = -Infinity;
+  window.addEventListener('wheel', function (event) {
+    if (!event.ctrlKey || !event.deltaY) return;
+    event.preventDefault();
+    // The first event of a gesture always steps, whatever its magnitude: how much
+    // delta one notch is worth is device- and platform-specific, and a threshold
+    // guessed too high is a wheel that silently does nothing. Only the rest of a
+    // continuous stream — a trackpad pinch, a spun wheel — has to accumulate, which
+    // is what stops one gesture becoming a dozen steps.
+    var fresh = event.timeStamp - previous > 120;
+    previous = event.timeStamp;
+    if (fresh) { accumulated = 0; step(event.deltaY < 0 ? 1 : -1); return; }
+    accumulated += event.deltaY;
+    var notch = event.deltaMode === 0 ? 50 : 1;
+    if (accumulated <= -notch) { accumulated = 0; step(1); }
+    else if (accumulated >= notch) { accumulated = 0; step(-1); }
+  }, { passive: false, capture: true });
+} catch (e) {}"#;
 
 fn open_control_plane_root() -> std::path::PathBuf {
     // Delegate to the workspace resolver (GAUGEDESK_ROOT → OS app-data dir →
@@ -249,7 +331,7 @@ fn deep_link_dispatch_script(url: &str) -> Option<String> {
 mod tests {
     use super::{
         cp_launch_decision, deep_link_dispatch_script, deep_link_from_argv,
-        external_open_allowed, local_cp_bind, webview_org_cp_script,
+        external_open_allowed, local_cp_bind, webview_org_cp_script, ZOOM_HOTKEYS,
     };
 
     #[test]
@@ -348,6 +430,41 @@ mod tests {
         assert!(script.contains("setItem('gw.cp'"));
         // The embedded double-quotes are backslash-escaped, not left to close the literal early.
         assert!(script.contains("x\\\"+alert(1)+\\\"y"));
+    }
+
+    #[test]
+    fn zoom_hotkeys_bind_both_gestures_without_a_passive_listener() {
+        // The wheel listener's OPTIONS are the load-bearing part: registered without
+        // `{ passive: false }` it is passive, its preventDefault is discarded, and
+        // Ctrl+wheel zooms while the page scrolls under it.
+        assert!(ZOOM_HOTKEYS.contains("{ passive: false, capture: true }"));
+        // The standard event, not the legacy `mousewheel` alias: a real wheel over
+        // this webview delivers only `wheel`, so binding the alias is binding nothing.
+        assert!(ZOOM_HOTKEYS.contains("'wheel'"));
+        assert!(!ZOOM_HOTKEYS.contains("mousewheel"));
+        // Guarded on ctrlKey, so an ordinary wheel still scrolls the page.
+        assert!(ZOOM_HOTKEYS.contains("if (!event.ctrlKey || !event.deltaY) return;"));
+        // A notch steps on arrival rather than against a guessed delta threshold —
+        // guessing high is a wheel that silently does nothing on some device.
+        assert!(ZOOM_HOTKEYS.contains("if (fresh) { accumulated = 0; step("));
+        // Every key a browser binds, including the shifted `+`.
+        for key in ["'-'", "'='", "'+'", "'0'"] {
+            assert!(ZOOM_HOTKEYS.contains(key), "unbound zoom key: {key}");
+        }
+    }
+
+    #[test]
+    fn zoom_survives_a_restart_by_reading_its_level_back_at_document_start() {
+        // Persistence is the whole reason the level is stored rather than held in a
+        // page-scope counter: it is written on every step and read back before the
+        // document parses, so a relaunch — and a reload — reopens at the same zoom.
+        assert!(ZOOM_HOTKEYS.contains("window.localStorage.setItem(KEY"));
+        assert!(ZOOM_HOTKEYS.contains("window.localStorage.getItem(KEY)"));
+        // Under the same `gw.` namespace the enterprise endpoint seed already uses.
+        assert!(ZOOM_HOTKEYS.contains("var KEY = 'gw.zoom';"));
+        // Storage can throw outright (WebKit refuses it in some contexts), and a
+        // shell that fails to boot its window over a zoom preference is a bad trade.
+        assert!(ZOOM_HOTKEYS.starts_with("try {") && ZOOM_HOTKEYS.ends_with("} catch (e) {}"));
     }
 
     #[test]

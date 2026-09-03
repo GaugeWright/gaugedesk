@@ -8,6 +8,11 @@
 #   scripts/check.sh web
 #   scripts/check.sh contracts
 #
+# `all` runs every section even when one of them fails and names the failures
+# together at the end, so a red `dependencies` — an advisory about the world,
+# not about the diff — can no longer decide whether the bar says anything about
+# the change under test. See run_all.
+#
 # The set spans what used to be three workflows: the private Tier-0 lane
 # (architecture, license boundary, contracts, canaries, client calls, spec
 # audit), the Tier-1 loopback integration tests, and the public mirror's Rust
@@ -34,6 +39,13 @@
 # landed a call to a crate the shell does not depend on, and nothing noticed for
 # a week because only `release.yml` ever built it.
 set -euo pipefail
+
+# `all` runs each section as a child invocation of this same script (see
+# run_all), so resolve this file absolutely before the cd can make a relative
+# $0 stale. The children are launched through $BASH rather than by executing the
+# path, so the run does not depend on this file's mode bit and each child is the
+# same interpreter as the parent.
+self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 cd "$(dirname "$0")/.."
 
 section="${1:-all}"
@@ -249,10 +261,21 @@ run_web() {
 # network and the advisory database rather than the toolchain, and because the
 # security-baseline schedule runs exactly this and nothing else.
 #
-# All three lockfiles are audited by name rather than by discovery, so that a
-# fourth is a decision someone makes here rather than something that silently
-# starts or stops being covered. `.cargo/audit.toml` carries the triage record
-# for anything formally risk-accepted.
+# The three Cargo lockfiles are audited by name; the four npm trees below are
+# discovered with `find`. This comment used to claim the by-name policy for both
+# halves, on the reasoning that a further lockfile should be a decision someone
+# makes here rather than something that silently starts or stops being covered
+# — while the npm half had discovered them all along, and discovery is what
+# caught GHSA-6gmq-8vp8-gcm6 in `ee/sidecar/saml-verify`, a fourth tree the
+# claimed policy had never named (#551).
+#
+# What actually makes a new lockfile a decision is neither idiom but
+# `check-build-coverage.mjs` in the `contracts` section: it enumerates every
+# lockfile git tracks, reads this file for which ones it covers and how, and
+# fails on the difference. So both halves are backstopped, and the choice
+# between naming and discovery is free to be what suits each.
+# `.cargo/audit.toml` carries the triage record for anything formally
+# risk-accepted.
 run_dependencies() {
     echo "== production dependency advisories =="
     command -v cargo-audit >/dev/null || {
@@ -415,12 +438,84 @@ run_mobile() {
     echo "   pull request. To close the gap locally: sudo apt-get install -y $missing" >&2
 }
 
+# `all` asks the desktop and mobile sections for best-effort prerequisites
+# through a second word. Anything else — including a mistyped flag — is a direct
+# invocation, which is the enforced gate and refuses to skip.
+prerequisite_policy() {
+    if [ "${1:-}" = best-effort ]; then echo best-effort; else echo required; fi
+}
+
+# `all` runs every section and reports the failures together, rather than
+# stopping at the first one. Under `set -e` a sequence of calls meant that the
+# earliest section to fail decided how much of the bar ran at all, and the
+# sections are independent — nothing here produces an input for anything below
+# it. So a developer whose `dependencies` section failed got a red bar and no
+# answer about the change under test, because `rust` and `web` never started.
+# That is the wrong trade for `dependencies` in particular, which is a statement
+# about the world rather than about the diff: an advisory published overnight
+# against a transitive dependency stops the whole bar from saying anything about
+# the code. It runs last here for that reason, and it is not the only section
+# whose failure has nothing to do with what the developer changed.
+#
+# The CI gates already behave this way — ci.yml and ci.public.yml run the
+# sections as separate jobs, so a red `dependencies` there does not stop `rust`
+# and `web` from reporting. This makes the local bar match the gate it mirrors.
+#
+# Each section runs as a child invocation rather than as a function call because
+# `set -e` is suppressed inside any command whose status is tested, and the
+# suppression reaches into a subshell and survives an explicit `set -e` within
+# it. A section collected in-process with `|| rc=$?` would therefore keep
+# running past its first failed command and report the status of its last one —
+# which is worse than the masking this replaces, because it reports a pass. A
+# separate process has its own errexit and none of that state.
+run_all() {
+    local failed=()
+    local lane rc
+
+    # Ctrl-C used to stop the bar as a side effect of errexit seeing the
+    # interrupted section's nonzero status. Collecting that status instead would
+    # send the run on to the next section and make a developer interrupt a long
+    # run once per section, so say what to do with a signal rather than leaving
+    # it to what bash does with one it received while waiting on a child.
+    trap 'echo >&2; echo "== gaugedesk green bar INTERRUPTED (all) ==" >&2; exit 130' INT TERM
+
+    for lane in contracts rust web desktop mobile windows dependencies; do
+        rc=0
+        case "$lane" in
+            desktop|mobile) "$BASH" "$self" "$lane" best-effort || rc=$? ;;
+            *) "$BASH" "$self" "$lane" || rc=$? ;;
+        esac
+
+        # The other half of the same case: the signal reached only the child,
+        # so this shell has no trap to run and would otherwise record an
+        # interrupted section as a failed one and carry on.
+        if [ "$rc" -ge 128 ]; then
+            echo >&2
+            echo "== gaugedesk green bar INTERRUPTED (all) during: $lane ==" >&2
+            exit "$rc"
+        fi
+
+        [ "$rc" -eq 0 ] || failed+=("$lane")
+    done
+
+    [ ${#failed[@]} -eq 0 ] && return 0
+
+    echo
+    echo "== gaugedesk green bar FAILED (all) ==" >&2
+    echo "these sections failed; every other section still ran, so the output above is" >&2
+    echo "complete for each one:" >&2
+    for lane in "${failed[@]}"; do
+        echo "  - $lane    (re-run alone: scripts/check.sh $lane)" >&2
+    done
+    exit 1
+}
+
 case "$section" in
-    all) run_contracts; run_dependencies; run_rust; run_web; run_desktop best-effort; run_mobile best-effort; run_windows ;;
+    all) run_all ;;
     contracts) run_contracts ;;
     dependencies) run_dependencies ;;
-    desktop) run_desktop ;;
-    mobile) run_mobile ;;
+    desktop) run_desktop "$(prerequisite_policy "${2:-}")" ;;
+    mobile) run_mobile "$(prerequisite_policy "${2:-}")" ;;
     rust) run_rust ;;
     web) run_web ;;
     windows) run_windows ;;
