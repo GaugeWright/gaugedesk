@@ -168,17 +168,27 @@ describe("selecting a model, which is a literal edit", () => {
         engine: { name: "FreeToken", status: "running" },
     };
 
-    it("sends the whole document back with only desired changed", async () => {
-        // The box refuses a body that alters any projected field rather than
-        // applying it partially, so a trimmed document would be rejected.
+    it("sends ONLY the editable block, never a projected field", async () => {
+        // The bug this replaces: the whole document went back with `desired`
+        // swapped, which echoed live projections — relay and direct status,
+        // and every key's `last_used_at` — straight back at the box. The box
+        // compares what the client SENT against what it now holds, so any
+        // projection that moved in the window between read and write turned a
+        // perfectly ordinary edit into a 422. `last_used_at` is stamped at
+        // whole-second granularity, so it fired when an edit happened to
+        // straddle a second boundary and passed otherwise.
+        //
+        // Sending only `desired` makes that race structurally impossible
+        // rather than rare, which is why this asserts on the ABSENCE of the
+        // other keys and not merely on `desired` being right.
         const route = fakeJson({ receipt: { id: "rcpt_2", status: "applied" } });
         await setTokenWrightDesired(route.json, {
             session, documentId: "tokenwright.inference", baseRevision: "rev-1",
-            content, desired: { ...content.desired, model: "qwen3-coder-30b" },
+            desired: { ...content.desired, model: "qwen3-coder-30b" },
         }, "key-1");
         const body = route.calls[0]?.[2] as { content: Record<string, unknown> };
         expect(route.calls[0]?.[1]).toBe("/environments/tokenwright/changes");
-        expect(body.content.engine).toEqual(content.engine);
+        expect(Object.keys(body.content)).toEqual(["desired"]);
         expect((body.content.desired as Record<string, unknown>).model).toBe("qwen3-coder-30b");
     });
 
@@ -190,7 +200,7 @@ describe("selecting a model, which is a literal edit", () => {
         const route = fakeJson({ receipt: {} });
         await expect(setTokenWrightDesired(route.json, {
             session: readOnly, documentId: "tokenwright.inference", baseRevision: "rev-1",
-            content, desired: content.desired,
+            desired: content.desired,
         })).rejects.toThrow(/not editable/u);
         expect(route.calls).toHaveLength(0);
     });

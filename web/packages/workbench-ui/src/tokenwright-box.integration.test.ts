@@ -203,10 +203,17 @@ describe.skipIf(!available)("the client against a real TokenWright box", () => {
 
     it("declares a key by literal edit and reads the reveal back", async () => {
         const access = await readManagementDocument(json, session, "tokenwright.access");
-        const content = access.content as { desired: { keys: string[] } };
+        // Only the editable block. Spreading the read document back in here is
+        // what made this test flaky: `tokenwright.access` projects live relay
+        // and direct status, and every key's `last_used_at`, which the box
+        // stamps at whole-second granularity. Cross a second boundary between
+        // this read and the write below — which authenticating the write can
+        // itself cause — and the echoed projection no longer matches what the
+        // box holds, so a correct edit takes a 422 `projected_field`. It
+        // passed or failed on where the wall clock happened to be.
         await proposeManagementDocumentChange(json, {
             session, documentId: "tokenwright.access", baseRevision: access.revision,
-            content: { ...content, desired: { keys: ["paired-home", "workstation-editor"] } },
+            content: { desired: { keys: ["paired-home", "workstation-editor"] } },
             client: "edit",
         }, "integration-3");
 

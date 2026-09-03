@@ -107,21 +107,36 @@ export async function setTokenWrightDesired(
         readonly session: ManagementEnvironmentSession;
         readonly documentId: string;
         readonly baseRevision: string;
-        readonly content: Record<string, unknown>;
         readonly desired: Record<string, unknown>;
     },
     idempotencyKey?: string,
 ): Promise<ManagementEnvironmentReceipt> {
-    // The whole document goes back with only `desired` changed. The box refuses
-    // a body that alters any projected field rather than applying it partially,
-    // so sending a trimmed document would be rejected, not helpfully merged.
+    // ONLY the editable block goes back. This used to send the whole document
+    // with `desired` swapped, on the belief that "the box refuses a body that
+    // alters any projected field, so a trimmed document would be rejected".
+    // That belief was wrong, and it was the source of an intermittent 422.
+    //
+    // The box compares the projected fields THE CLIENT SENT against current —
+    // it iterates the request body, not the stored document — so a body
+    // carrying only `desired` is accepted and never enters the comparison.
+    // Echoing them back opts into a race instead: `tokenwright.access`
+    // projects live relay and direct status, and every key's `last_used_at`,
+    // which the box stamps at whole-second granularity. Read the document,
+    // cross a second boundary while a key is in use, send the projection back,
+    // and it no longer matches what the box now holds — 422 `projected_field`
+    // on an edit that was never stale in any sense the operator would
+    // recognise. Staleness is `base_revision`'s job and it is already checked.
+    //
+    // TokenWright pins the trimmed body in `tests/test_documents.py`
+    // (`test_a_body_carrying_only_the_editable_block_is_accepted`), so this
+    // cannot start failing silently if that contract is ever tightened.
     return proposeManagementDocumentChange(
         json,
         {
             session: input.session,
             documentId: input.documentId,
             baseRevision: input.baseRevision,
-            content: { ...input.content, desired: input.desired },
+            content: { desired: input.desired },
             client: "edit",
         },
         idempotencyKey ?? defaultKey(),
