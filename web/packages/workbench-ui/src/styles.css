@@ -1239,15 +1239,6 @@ input {
 .composer-menu-item > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-menu-item small { flex: 0 0 auto; color: var(--muted); font-size: var(--fs-label);
     text-transform: uppercase; letter-spacing: 0.05em; }
-/* Free-text model entry (ADR 0083) belongs with the models it competes with, not
-   as a second control in the rail. */
-.composer-menu-custom { display: grid; gap: 4px; margin-top: 4px; padding: 6px 7px 4px;
-    border-top: 1px solid var(--edge); color: var(--muted); font-size: var(--fs-label);
-    text-transform: uppercase; letter-spacing: 0.05em; }
-.composer-menu-custom input { min-width: 0; padding: 4px 6px; border: 1px solid var(--edge);
-    border-radius: 5px; background: var(--bg); color: var(--ink);
-    font: 400 var(--fs-ui) var(--ui); text-transform: none; letter-spacing: normal; }
-.composer-menu-custom input:focus { outline: none; border-color: var(--accent); }
 /* Inside the compact expander the two settings become labelled rows. */
 .composer-menu-anchor.row { display: grid; grid-template-columns: auto minmax(0, 1fr);
     align-items: center; gap: 8px; padding: 2px 3px; }
@@ -2061,6 +2052,10 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 }
 .admin-invite { display: flex; gap: 6px; align-items: center; }
 .admin-invite input, .admin-invite select { width: auto; flex: 1; }
+/* The add-credential row wraps: an endpoint credential carries a URL, a key and
+   its first model id, which is more than one line at the panel's width. */
+.admin-invite[data-add-credential] { flex-wrap: wrap; }
+.admin-invite[data-add-credential] input { flex: 1 1 160px; min-width: 0; }
 /* Labeled variant: fields stack label-over-control; the action aligns to the
    control baseline, not the label cap-height. */
 .admin-invite.managed-plan-row { align-items: flex-end; gap: 8px; }

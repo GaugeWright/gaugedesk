@@ -148,8 +148,9 @@ const PROVIDERS: SettingsModel["models"]["providers"] = [
         // The name says aggregator to someone who already knows; the note says which
         // model ids to expect, which is the thing that trips a first-time linker.
         note: "routes to many vendors; name models as vendor/model",
+        declaresModels: true,
     },
-    { pin: "openai-generic", label: "OpenAI-compatible endpoint", auth: "endpoint" },
+    { pin: "openai-generic", label: "OpenAI-compatible endpoint", auth: "endpoint", declaresModels: true },
 ];
 
 const PROVIDER_LABEL = new Map(PROVIDERS.map((p) => [p.pin, p.label]));
@@ -181,6 +182,11 @@ export interface SettingsPanelProps {
     readonly onEnrollDevice: () => void;
     readonly onPairParty: () => void;
     readonly onClose: () => void;
+    /** Something the account holds changed here — a credential linked or removed,
+     *  a model declared, the picker's enabled set edited. The composition re-reads
+     *  what it projects from the account (the composer's picker, first of all),
+     *  which otherwise learns of the change only on its next chat switch. */
+    readonly onChanged?: () => void;
     /** Which room to land in. Whoever opened Settings usually knows what for — an
      *  in-chat "no model attached" refusal means Model access, not the first tab. */
     readonly initialRoom?: SettingsRoom;
@@ -195,7 +201,10 @@ export interface SettingsPanelProps {
 export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
     const [room, setRoom] = createSignal<SettingsRoom>(props.initialRoom ?? "account");
     const [tick, setTick] = createSignal(0);
-    const refresh = () => setTick((t) => t + 1);
+    const refresh = () => {
+        setTick((t) => t + 1);
+        props.onChanged?.();
+    };
     const [status, setStatus] = createSignal("");
 
     // Projection reads settle to undefined on failure instead of erroring the resource:
@@ -261,7 +270,9 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
     const quietly = async (describe: string, run: () => Promise<void>) => {
         try {
             await run();
-            if (!disposed) setStatus("");
+            if (disposed) return;
+            setStatus("");
+            props.onChanged?.();
         } catch (e) {
             if (disposed) return;
             setStatus(`could not ${describe} — ${e instanceof Error ? e.message : String(e)}`);
@@ -529,12 +540,26 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                         return "sign-in cancelled";
                     });
                 },
-                linkKey: ({ pin, token, endpoint }) => void act(`link ${pin}`, async () => {
+                linkKey: ({ pin, token, endpoint, model }) => void act(`link ${pin}`, async () => {
                     if (!token) throw new Error("paste a token first");
                     if (providerTakesEndpoint(pin) && !endpoint?.trim()) {
                         throw new Error("enter the endpoint URL first");
                     }
+                    // A provider with no shipped catalog reaches nothing until a model
+                    // is declared, so the first one arrives with the credential rather
+                    // than waiting to be found under the row's "add models".
+                    const firstModel = model?.trim() ?? "";
+                    if (providerTakesCustomModel(pin) && !firstModel) {
+                        throw new Error("enter a model id first");
+                    }
                     await props.api.accountLinkCredential(pin, token, endpoint?.trim() || undefined);
+                    if (firstModel) {
+                        const declared = declaredModels();
+                        await writeDeclaredModels(
+                            withDeclaredModels(declared, pin, [...declaredModelsFor(declared, pin), firstModel]),
+                        );
+                        await refetchSettings();
+                    }
                 }),
                 removeCredential: (id) => void act(`remove ${id}`, () => props.api.accountUnlinkCredential(id)),
                 addEndpointModel: (credentialId, modelId) => void act("add the model", async () => {

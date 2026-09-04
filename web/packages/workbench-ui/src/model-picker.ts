@@ -63,14 +63,14 @@ const PROVIDER_LABEL: Record<string, string> = {
     openrouter: "OpenRouter",
 };
 
-/** Providers whose model id is entered free-text rather than picked from the catalog,
- *  because GaugeDesk ships no catalog for them: `openai-generic`, whose endpoint it
- *  cannot list (ADR 0083), and `openrouter`, whose listing is too large and too
- *  short-lived to snapshot honestly (ADR 0145). The composer offers a text field for
- *  these alongside whatever rows the operator has declared.
+/** Providers whose model ids are the operator's to declare rather than picked from a
+ *  shipped catalog: `openai-generic`, whose endpoint GaugeDesk cannot list (ADR 0083),
+ *  and `openrouter`, whose listing is too large and too short-lived to snapshot
+ *  honestly (ADR 0145). Their ids are declared in Settings → Model access — never
+ *  typed into the composer, which only picks from what is declared.
  *
  *  This is NOT the same question as [`providerTakesEndpoint`]: OpenRouter takes a
- *  free-text model on a host GaugeDesk already knows. */
+ *  declared model on a host GaugeDesk already knows. */
 export function providerTakesCustomModel(provider: string): boolean {
     return provider === "openai-generic" || provider === "openrouter";
 }
@@ -175,26 +175,31 @@ export interface ModelOption {
     readonly thinking: readonly string[];
 }
 
-/** The "Default" (no per-chat override) option — always first. */
+/** The "Default" (no per-chat override) option — the shape of the picker's
+ *  first row; its label is always the resolved default's name. */
 export const DEFAULT_OPTION: ModelOption = { id: "", provider: "", label: "Default", thinking: ["off"] };
 
-/** The engine's resolved no-pin default, as reported by `/account/default-model`. */
+/** The engine's resolved no-pin default, as reported by `/account/default-model`.
+ *  Both null when nothing resolves — no credential linked, or several with no
+ *  Codex sign-in among them to prefer — and `model` alone null when the
+ *  resolved provider has no default model (an endpoint with nothing declared). */
 export interface ResolvedDefault {
-    readonly provider: string;
+    readonly provider: string | null;
     readonly model: string | null;
 }
 
-/** The picker's first row. When the engine's resolved no-pin default is known,
- *  name it — "GPT-5.5 (default)" — so the row says what will actually run; a
- *  blind "Default" is only the fallback while that's unknown (or the resolved
- *  provider has no default model). The value stays empty: picking it still
- *  means "no per-chat override", not a pin. */
+/** The picker's first row: the engine's resolved no-pin default, named —
+ *  "GPT-5.5 (default)" — so the row says what will actually run. The value
+ *  stays empty: picking it means "no per-chat override", not a pin. `null`
+ *  when no default resolves: a row that said "Default" then named a turn the
+ *  engine could not run, so the picker asks for a model instead
+ *  (`ComposerModelBar`'s "Select model"). */
 export function defaultOption(
     resolvedDefault?: ResolvedDefault | null,
     catalog: readonly CatalogModel[] = MODEL_CATALOG,
-): ModelOption {
+): ModelOption | null {
     const id = resolvedDefault?.model;
-    if (!id) return DEFAULT_OPTION;
+    if (!id) return null;
     const m = catalog.find((c) => c.provider === resolvedDefault?.provider && c.id === id);
     return { ...DEFAULT_OPTION, label: `${m?.name ?? id} (default)` };
 }
@@ -202,9 +207,10 @@ export function defaultOption(
 /**
  * The picker options for the linked accounts and the operator's enabled-set preference:
  * `enabled` null/empty → the default-visible subset; otherwise exactly the enabled models.
- * Always leads with the default row (named when `resolvedDefault` is known), and keeps a
+ * Leads with the default row when one resolves (see `defaultOption`), and keeps a
  * `pinned` model present even if it's filtered out
  * (so the `<select>` reflects the chat's real config rather than snapping to the first row).
+ * Empty when nothing is reachable at all — the composer then offers the way to add one.
  */
 export function modelOptions(
     linkedAccountProviders: readonly string[],
@@ -222,7 +228,7 @@ export function modelOptions(
         const found = all.find((m) => m.id === pinned.id && m.provider === pinned.provider);
         if (found) visible.push(found);
         else if (providerTakesCustomModel(pinned.provider)) {
-            // A free-text model (openai-generic, openrouter) has no catalog entry; keep the
+            // An undeclared model (openai-generic, openrouter) has no catalog entry; keep the
             // pin visible so the `<select>` reflects the chat's real config rather than
             // snapping away.
             visible.push({
@@ -237,8 +243,9 @@ export function modelOptions(
         }
     }
 
+    const lead = defaultOption(resolvedDefault, catalog);
     return [
-        defaultOption(resolvedDefault, catalog),
+        ...(lead ? [lead] : []),
         ...visible.map((m) => ({ id: m.id, provider: m.provider, label: m.label, thinking: m.thinking })),
     ];
 }

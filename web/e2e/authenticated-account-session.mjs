@@ -164,6 +164,10 @@ async function clientCall(page, staticOrigin, name, args = []) {
     });
 }
 
+function isNullableString(value) {
+    return value === null || typeof value === "string";
+}
+
 function handoffChallenge(verifier) {
     return createHash("sha256").update(verifier).digest("base64url");
 }
@@ -417,7 +421,10 @@ try {
         || typeof bootstrap.managedInference?.usage !== "object"
         || typeof bootstrap.codex?.linked !== "boolean"
         || typeof bootstrap.onboarding?.credentialRequired !== "boolean"
-        || typeof bootstrap.defaultModel?.provider !== "string"
+        // Both null when nothing resolves (a fresh account links nothing yet);
+        // a string provider with a null model where the provider has no default.
+        || !isNullableString(bootstrap.defaultModel?.provider)
+        || !isNullableString(bootstrap.defaultModel?.model)
     ) {
         throw new Error(
             `production account bootstrap was malformed: ${JSON.stringify(bootstrap)}`,

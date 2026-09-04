@@ -571,8 +571,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // quick-start composer (same component, same commands — ADR 0112 doctrine),
     // so the linked providers load before any chat exists and still refresh on
     // every chat switch.
-    const [linkedCreds] = createResource(() => selected() ?? "startup", () => api.accountCredentials().catch(() => []));
-    const [codexCred] = createResource(() => selected() ?? "startup", () => api.codexStatus().catch(() => null));
+    const [linkedCreds, { refetch: refetchLinkedCreds }] = createResource(() => selected() ?? "startup", () => api.accountCredentials().catch(() => []));
+    const [codexCred, { refetch: refetchCodexCred }] = createResource(() => selected() ?? "startup", () => api.codexStatus().catch(() => null));
     // First-run credential gate (ADR 0075 Phase 0): a startup-time (not selection-
     // keyed) read of whether *any* LLM credential is linked. `undefined` while
     // loading — we never flash the welcome before we know. `refetch*` re-check
@@ -600,7 +600,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         credentialRequired() === true && hasAnyCredential() === false && !firstRunDismissed();
     // The operator's curated "which models show" preference (managed in the Account panel,
     // persisted in the account-settings KV). `null` = never curated → default-visible subset.
-    const [acctSettings] = createResource(() => selected() ?? "startup", () => api.accountSettings().catch((): Record<string, string> => ({})));
+    const [acctSettings, { refetch: refetchAcctSettings }] = createResource(() => selected() ?? "startup", () => api.accountSettings().catch((): Record<string, string> => ({})));
     const linkedAccounts = createMemo(() => {
         const ps = (linkedCreds() ?? []).filter((c) => c.linked).map((c) => c.provider);
         if (codexCred()?.linked) ps.push("openai-codex");
@@ -616,10 +616,23 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         catalogWithEndpointModels(parseEndpointModels(acctSettings()?.[ENDPOINT_MODELS_SETTING])),
     );
     // The engine's resolved no-pin default (provider + model), so the picker's
-    // first row names what "Default" actually runs. Startup-time server truth (it
-    // changes only with host config); a failed probe degrades to the blind
-    // "Default" label rather than blocking the picker.
-    const [resolvedDefault] = createResource(() => api.defaultModel().catch(() => null));
+    // first row names what "Default" actually runs. It follows the linked
+    // credentials, so it is re-read with them; a failed probe degrades to no
+    // default row ("Select model") rather than blocking the picker.
+    const [resolvedDefault, { refetch: refetchResolvedDefault }] = createResource(() => api.defaultModel().catch(() => null));
+    // Everything the composer projects from the account, re-read after Settings
+    // or the first-run overlay changes it. Keyed resources refresh on a chat
+    // switch by themselves; a credential linked with a chat open never caused
+    // one, which is how a freshly linked endpoint left the picker unchanged.
+    const refreshModelAccess = () => {
+        void refetchLinkedCreds();
+        void refetchCodexCred();
+        void refetchAcctSettings();
+        void refetchResolvedDefault();
+    };
+    // A pulse the composer bumps to open Settings at Model access when nothing
+    // is pickable: "Add a model…" opens where one comes from.
+    const [modelsRequest, setModelsRequest] = createSignal(0);
     // With no chat open, the same picker pins the model/effort the FIRST message
     // will run with — held here, applied to the new chat's config by
     // startNewChat, then cleared. The composer is one component either way.
@@ -653,17 +666,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const effortLevels = createMemo(() =>
         thinkingLevelsFor(linkedAccounts(), paneModel().id, paneModel().provider, modelCatalog()));
     const showEffort = createMemo(() => effortLevels().some((l) => l !== "off"));
-    // openai-generic (ADR 0083) has no catalog — its model id is free-text. Offer the
-    // entry when such an account is linked; typing one pins `openai-generic:<id>`.
-    const showCustomModel = createMemo(() => linkedAccounts().includes("openai-generic"));
-    const [customModel, setCustomModel] = createSignal("");
-    async function pinCustomModel(value: string) {
-        const id = value.trim();
-        if (!id) return;
-        await pickModel(`openai-generic:${id}`);
-        setCustomModel("");
-    }
-
     // Pin a model for this chat: the picker's option value is `provider:id` (empty =
     // Default → clear the override). Writes `model`+`provider`, preserving every other key.
     // With no chat open, the choice is held as the pending pin for the chat the
@@ -1632,6 +1634,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 version={clientBuild.version}
                 hubUrl={props.hubUrl}
                 openAccount={accountRequest}
+                openModels={modelsRequest}
+                onAccountChanged={refreshModelAccess}
                 openInvite={inviteDeepLink}
                 onSignOut={signOutAccount}
                 environmentAction={props.environmentAction}
@@ -1650,13 +1654,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             effort={selected() ? chatThinking() : pendingThinking()}
             onPickEffort={(level) => void pickThinking(level)}
             stacked={stacked}
-            customModel={showCustomModel()
-                ? {
-                    value: customModel(),
-                    onInput: setCustomModel,
-                    onCommit: (value) => void pinCustomModel(value),
-                }
-                : undefined}
+            onAddModel={() => setModelsRequest((n) => n + 1)}
         />
     );
 
@@ -2558,6 +2556,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     onConnected={() => {
                         void refetchStartupCreds();
                         void refetchStartupCodex();
+                        refreshModelAccess();
                     }}
                     onDismiss={() => setFirstRunDismissed(true)}
                 />

@@ -1664,7 +1664,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         return this.runtimeAccountJson().then((json) => accountClient.onboardingStatus(json));
     }
 
-    defaultModel(): Promise<{ provider: string; model: string | null }> {
+    defaultModel(): Promise<{ provider: string | null; model: string | null }> {
         return this.runtimeAccountJson().then((json) => accountClient.defaultModel(json));
     }
 

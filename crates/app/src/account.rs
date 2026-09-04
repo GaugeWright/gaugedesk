@@ -633,6 +633,49 @@ pub fn project_scope(project_id: &str) -> String {
 /// Fold the sealed `credential` records held in an arbitrary `scope` (latest-wins by
 /// provider id) — the scope-parametric core under both the account store and the
 /// project-scope override (`LLM-2`).
+/// The account setting holding the operator's declared model ids for the
+/// providers GaugeDesk ships no catalog for (ADR 0083, ADR 0148). Written by
+/// the picker's Settings room as a JSON object keyed by provider; a bare JSON
+/// array is the pre-OpenRouter form and reads as `openai-generic`'s list.
+pub(crate) const ENDPOINT_MODELS_SETTING: &str = "model_picker.endpoint_models";
+
+/// Whether `provider`'s model ids are the operator's to declare rather than
+/// shipped in a catalog: an OpenAI-compatible endpoint GaugeDesk cannot list,
+/// and OpenRouter, whose listing is too large and short-lived to snapshot.
+pub(crate) fn provider_declares_models(provider: &str) -> bool {
+    matches!(provider, "openai-generic" | "openrouter")
+}
+
+/// The declared ids for `provider` from the raw setting value: trimmed,
+/// non-empty, deduped, in declared order. Absent, blank, or malformed → none,
+/// so an unreadable value never becomes a model the engine cannot bind.
+pub(crate) fn declared_models(raw: Option<&str>, provider: &str) -> Vec<String> {
+    let Some(raw) = raw.filter(|raw| !raw.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let ids = match &parsed {
+        // The legacy form: one flat array, which was only ever openai-generic's.
+        serde_json::Value::Array(ids) if provider == "openai-generic" => ids.as_slice(),
+        serde_json::Value::Object(by_provider) => match by_provider.get(provider) {
+            Some(serde_json::Value::Array(ids)) => ids.as_slice(),
+            _ => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for id in ids.iter().filter_map(serde_json::Value::as_str) {
+        let id = id.trim();
+        if id.is_empty() || out.iter().any(|seen| seen == id) {
+            continue;
+        }
+        out.push(id.to_owned());
+    }
+    out
+}
+
 pub fn credentials_in_scope(store: &Store, scope: &str) -> BTreeMap<String, CredentialRecord> {
     let mut map = BTreeMap::new();
     if let Ok(rows) = store.records(scope, "credential") {
@@ -1149,6 +1192,73 @@ impl Workbench {
             .into_values()
             .map(|setting| (setting.id, setting.value))
             .collect())
+    }
+
+    /// Every provider with a credential admitted for `class` in `scope` — keyed
+    /// and OAuth alike, in store order. This is the set a no-pin turn may fall
+    /// back on (see [`crate::engine::resolve_default_provider`]); unlike
+    /// [`account_credential_providers_in`](Self::account_credential_providers_in)
+    /// it keeps the OAuth rows, because a Codex sign-in is exactly the credential
+    /// the fallback prefers.
+    pub(crate) fn linked_providers_in_class(
+        &self,
+        scope: &str,
+        class: ModelExecutionClass,
+    ) -> Vec<String> {
+        credentials_in_scope(self.store_ref(), scope)
+            .into_iter()
+            .filter(|(_, record)| record.admits(class))
+            .map(|(provider, _)| provider)
+            .collect()
+    }
+
+    /// The providers a chat's turn could run on with no pin: the actor's
+    /// account credentials plus the chat's project credentials, which the
+    /// nearest-scope-wins resolver would select just the same.
+    pub(crate) fn linked_providers_for_chat_in_class(
+        &self,
+        chat_id: &str,
+        actor: &str,
+        class: ModelExecutionClass,
+    ) -> Vec<String> {
+        let mut providers =
+            self.linked_providers_in_class(&self.account_scope_for_actor(actor), class);
+        if let Some(project_id) = self.library_project_of_chat(chat_id) {
+            for provider in self.linked_providers_in_class(&project_scope(&project_id), class) {
+                if !providers.contains(&provider) {
+                    providers.push(provider);
+                }
+            }
+        }
+        providers
+    }
+
+    /// The model a no-pin turn runs on a provider GaugeDesk ships no catalog
+    /// for: the first id the operator declared for it in Settings, read from
+    /// the account setting the picker writes. `None` for every other provider
+    /// (their defaults are the runtime's) and when nothing is declared, which
+    /// the picker then reports as "select a model" rather than inventing one.
+    pub(crate) fn declared_default_model_in(&self, scope: &str, provider: &str) -> Option<String> {
+        if !provider_declares_models(provider) {
+            return None;
+        }
+        let settings = self.account_settings_in(scope).ok()?;
+        declared_models(
+            settings.get(ENDPOINT_MODELS_SETTING).map(String::as_str),
+            provider,
+        )
+        .into_iter()
+        .next()
+    }
+
+    /// [`declared_default_model_in`](Self::declared_default_model_in) for the
+    /// actor behind a turn.
+    pub(crate) fn declared_default_model_for_actor(
+        &self,
+        actor: &str,
+        provider: &str,
+    ) -> Option<String> {
+        self.declared_default_model_in(&self.account_scope_for_actor(actor), provider)
     }
 
     /// Provider ids linked as sealed local account credentials (default scope).
@@ -1968,6 +2078,35 @@ pub fn directory_record(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declared_models_read_both_stored_forms_and_refuse_the_rest() {
+        use super::declared_models;
+        // The per-provider object the Settings room writes today.
+        let stored = r#"{"openai-generic":[" llama-3.3-70b ","llama-3.3-70b","","qwen-3"],"openrouter":["openai/gpt-5"]}"#;
+        assert_eq!(
+            declared_models(Some(stored), "openai-generic"),
+            vec!["llama-3.3-70b".to_owned(), "qwen-3".to_owned()]
+        );
+        assert_eq!(
+            declared_models(Some(stored), "openrouter"),
+            vec!["openai/gpt-5".to_owned()]
+        );
+        assert!(declared_models(Some(stored), "anthropic").is_empty());
+        // The pre-OpenRouter flat array was only ever openai-generic's list.
+        assert_eq!(
+            declared_models(Some(r#"["llama-3.3-70b"]"#), "openai-generic"),
+            vec!["llama-3.3-70b".to_owned()]
+        );
+        assert!(declared_models(Some(r#"["llama-3.3-70b"]"#), "openrouter").is_empty());
+        // Absent, blank, or unreadable declares nothing rather than something.
+        assert!(declared_models(None, "openai-generic").is_empty());
+        assert!(declared_models(Some("  "), "openai-generic").is_empty());
+        assert!(declared_models(Some("not json"), "openai-generic").is_empty());
+        assert!(
+            declared_models(Some(r#"{"openai-generic":"llama"}"#), "openai-generic").is_empty()
+        );
+    }
+
     use super::*;
     use crate::LockUnpoisoned;
 

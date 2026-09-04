@@ -43,17 +43,14 @@ export interface ComposerModelBarProps {
     /** The pinned level, or `""` for the model's own default. */
     readonly effort?: string;
     readonly onPickEffort?: (level: string) => void;
-    /** Free-text model entry for endpoint-configurable providers (ADR 0083). It
-     *  lives inside the model menu rather than as a second top-level control —
-     *  it is the same decision, taken a different way. */
-    readonly customModel?: {
-        readonly value: string;
-        readonly onInput: (value: string) => void;
-        readonly onCommit: (value: string) => void;
-    };
     /** Stacked rows instead of an inline pair — how the narrow rail's expander
      *  menu presents the same two controls. */
     readonly stacked?: boolean;
+    /** Where a model comes from when there is none to pick: opens Settings at
+     *  Model access. Offered only when `options` is empty — nothing linked, or
+     *  an endpoint with nothing declared — because then the menu would
+     *  otherwise be a list with no rows. */
+    readonly onAddModel?: () => void;
 }
 
 export function ComposerModelBar(props: ComposerModelBarProps): JSX.Element {
@@ -66,8 +63,12 @@ export function ComposerModelBar(props: ComposerModelBarProps): JSX.Element {
         props.options.find((option) => (option.id ? modelKey(option) : "") === props.value);
     return (
         <div class="composer-models" classList={{ stacked: props.stacked }}>
+            {/* "Select model" rather than "Default model" when nothing is
+                selected: the options lead with the resolved default when one
+                exists, so an unmatched empty value means there is no default
+                to fall back on and the next turn needs a choice. */}
             <ComposerMenuButton
-                label={selected()?.label ?? "Default model"}
+                label={selected()?.label ?? "Select model"}
                 title="Model for this chat — overrides the Agent's default for this conversation only"
                 testAttr="model"
                 stacked={props.stacked}
@@ -99,22 +100,19 @@ export function ComposerModelBar(props: ComposerModelBarProps): JSX.Element {
                                 );
                             }}
                         </For>
-                        <Show when={props.customModel}>
-                            <label class="composer-menu-custom">
-                                <span>Custom model id</span>
-                                <input
-                                    data-custom-model
-                                    aria-label="Custom model id for this chat"
-                                    placeholder="e.g. llama-3.3-70b"
-                                    value={props.customModel!.value}
-                                    onInput={(event) => props.customModel!.onInput(event.currentTarget.value)}
-                                    onKeyDown={(event) => {
-                                        if (event.key !== "Enter") return;
-                                        props.customModel!.onCommit(event.currentTarget.value);
-                                        close();
-                                    }}
-                                />
-                            </label>
+                        <Show when={props.options.length === 0 && props.onAddModel}>
+                            <button
+                                class="composer-menu-item foot"
+                                type="button"
+                                role="menuitem"
+                                data-add-model
+                                onClick={() => {
+                                    props.onAddModel!();
+                                    close();
+                                }}
+                            >
+                                <span>Add a model…</span>
+                            </button>
                         </Show>
                     </>
                 )}

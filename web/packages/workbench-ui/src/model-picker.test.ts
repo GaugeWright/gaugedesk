@@ -36,25 +36,37 @@ const CAT: CatalogModel[] = [
 ];
 
 describe("model-picker", () => {
-    it("nothing linked → no pickable models, picker is just Default", () => {
+    it("nothing linked → no pickable models and an empty picker", () => {
         expect(pickableModels([], CAT)).toEqual([]);
-        expect(modelOptions([], null, undefined, CAT).map((o) => o.label)).toEqual(["Default"]);
+        // No default row either: with nothing linked there is nothing a no-pin
+        // turn could run, and a "Default" row would name exactly that.
+        expect(modelOptions([], null, undefined, CAT)).toEqual([]);
     });
 
-    it("the default row is named after the engine's resolved default when known", () => {
+    it("the default row is named after the engine's resolved default, and absent without one", () => {
         // Known to the catalog → the display name; the value stays empty (no pin).
         const named = defaultOption({ provider: "openai-codex", model: "gpt-5.5" }, CAT);
-        expect(named.label).toBe("GPT-5.5 (default)");
-        expect(named.id).toBe("");
-        expect(named.provider).toBe("");
-        // Absent from the catalog → the raw id still beats a blind "Default".
-        expect(defaultOption({ provider: "openai-codex", model: "gpt-9" }, CAT).label).toBe("gpt-9 (default)");
-        // Unknown / no default model → the blind fallback.
-        expect(defaultOption(null, CAT).label).toBe("Default");
-        expect(defaultOption({ provider: "openai", model: null }, CAT).label).toBe("Default");
+        expect(named?.label).toBe("GPT-5.5 (default)");
+        expect(named?.id).toBe("");
+        expect(named?.provider).toBe("");
+        // Absent from the catalog → the raw id still beats no name.
+        expect(defaultOption({ provider: "openai-codex", model: "gpt-9" }, CAT)?.label).toBe("gpt-9 (default)");
+        // Unknown / no default model → no row: the composer asks for a model.
+        expect(defaultOption(null, CAT)).toBeNull();
+        expect(defaultOption({ provider: null, model: null }, CAT)).toBeNull();
+        expect(defaultOption({ provider: "openai", model: null }, CAT)).toBeNull();
         // modelOptions threads it into the first row.
         const labels = modelOptions([], null, undefined, CAT, { provider: "openai-codex", model: "gpt-5.5" });
         expect(labels[0].label).toBe("GPT-5.5 (default)");
+        // A declared endpoint model as the resolved default is named by its id.
+        const endpoint = modelOptions(
+            ["openai-generic"],
+            null,
+            undefined,
+            catalogWithEndpointModels({ "openai-generic": ["llama-3.3-70b"] }, CAT),
+            { provider: "openai-generic", model: "llama-3.3-70b" },
+        );
+        expect(endpoint.map((o) => o.label)).toEqual(["llama-3.3-70b (default)", "llama-3.3-70b"]);
     });
 
     it("codex linked → its primary set plus the OpenAI set as secondary, all pinned to openai-codex", () => {
@@ -91,8 +103,9 @@ describe("model-picker", () => {
 
     it("an enabled-set overrides the default and is honoured exactly", () => {
         const enabled = new Set([modelKey({ id: "gpt-4o", provider: "openai-codex" })]);
-        const labels = modelOptions(["openai-codex"], enabled, undefined, CAT).map((o) => o.label);
-        expect(labels).toEqual(["Default", "GPT-4o"]); // only the enabled one (+ Default)
+        const codexDefault = { provider: "openai-codex", model: "gpt-5.5" };
+        const labels = modelOptions(["openai-codex"], enabled, undefined, CAT, codexDefault).map((o) => o.label);
+        expect(labels).toEqual(["GPT-5.5 (default)", "GPT-4o"]); // only the enabled one (+ the default)
     });
 
     it("a pinned model stays selectable even when filtered out of the default set", () => {
@@ -113,9 +126,10 @@ describe("model-picker", () => {
         expect(isDefaultVisible(codexGpt)).toBe(true);
     });
 
-    it("an explicit empty enabled set shows only Default (operator disabled everything)", () => {
-        const labels = modelOptions(["openai-codex"], new Set(), undefined, CAT).map((o) => o.label);
-        expect(labels).toEqual(["Default"]);
+    it("an explicit empty enabled set shows only the default (operator disabled everything)", () => {
+        const codexDefault = { provider: "openai-codex", model: "gpt-5.5" };
+        const labels = modelOptions(["openai-codex"], new Set(), undefined, CAT, codexDefault).map((o) => o.label);
+        expect(labels).toEqual(["GPT-5.5 (default)"]);
     });
 
     it("parse/serialize the enabled-set preference round-trips; absent/bad → null", () => {
@@ -153,7 +167,7 @@ describe("openai-generic custom model (ADR 0083)", () => {
         );
         // No catalog rows for openai-generic, but the pinned custom model survives so the
         // <select> reflects the chat's real config (label = the raw id).
-        expect(opts.map((o) => o.label)).toEqual(["Default", "llama-3.3-70b"]);
+        expect(opts.map((o) => o.label)).toEqual(["llama-3.3-70b"]);
         const pinned = opts.find((o) => o.provider === "openai-generic");
         expect(pinned).toMatchObject({ id: "llama-3.3-70b", provider: "openai-generic" });
     });
@@ -191,8 +205,7 @@ describe("openrouter fixed-host aggregator (ADR 0148)", () => {
         // turns over weekly, so a linked account with nothing declared contributes
         // nothing rather than a stale menu.
         expect(MODEL_CATALOG.some((m) => m.provider === "openrouter")).toBe(false);
-        expect(modelOptions(["openrouter"], null, undefined, MODEL_CATALOG).map((o) => o.label))
-            .toEqual(["Default"]);
+        expect(modelOptions(["openrouter"], null, undefined, MODEL_CATALOG)).toEqual([]);
     });
 
     it("contributes the operator's declared routes when the account is linked", () => {
@@ -217,7 +230,7 @@ describe("openrouter fixed-host aggregator (ADR 0148)", () => {
             { id: "meta-llama/llama-4-maverick", provider: "openrouter" },
             CAT,
         );
-        expect(opts.map((o) => o.label)).toEqual(["Default", "meta-llama/llama-4-maverick"]);
+        expect(opts.map((o) => o.label)).toEqual(["meta-llama/llama-4-maverick"]);
     });
 });
 
@@ -261,7 +274,7 @@ describe("declared models are keyed by provider", () => {
         ]);
         // A linked endpoint account must not inherit the OpenRouter routes.
         const endpointOnly = modelOptions(["openai-generic"], null, undefined, catalog);
-        expect(endpointOnly.map((o) => o.id)).toEqual(["", "llama-3.3-70b"]);
+        expect(endpointOnly.map((o) => o.id)).toEqual(["llama-3.3-70b"]);
     });
 
     it("refuses an unreadable value rather than inventing models", () => {

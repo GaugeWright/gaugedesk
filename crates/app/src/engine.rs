@@ -550,16 +550,42 @@ fn default_external_tools() -> BTreeSet<String> {
 /// conservative per provider; it is the allowlist the per-host egress proxy will
 /// enforce once that routing lands (until then it records intent and flips the
 /// posture to allow). An unknown provider falls back to the OpenAI/codex set.
-/// Resolve a private turn's provider: a non-empty managed-Home override wins
-/// over the chat's `.agent-config.json` provider, which wins over the Codex
-/// OAuth default. Public releases do not execute through this engine.
-pub(crate) fn resolve_turn_provider(
+/// The provider a turn runs when nothing pins one: the host override, then the
+/// chat's configured provider, then whatever the linked credentials make
+/// unambiguous — a Codex sign-in wins (it is the one provider with a shipped
+/// default model), else the sole linked provider. Two keyed providers and no
+/// Codex is a real choice, so it resolves to nothing and the picker asks for
+/// one rather than guessing. Shared by the turn path and
+/// `/account/default-model`, so the picker's "default" row names what a turn
+/// would actually run.
+pub(crate) fn resolve_default_provider(
     host_override: Option<String>,
     config_provider: Option<String>,
-) -> String {
+    linked_providers: &[String],
+) -> Option<String> {
     host_override
         .filter(|s| !s.is_empty())
         .or(config_provider.filter(|s| !s.is_empty()))
+        .or_else(|| {
+            if linked_providers.iter().any(|p| p == "openai-codex") {
+                return Some("openai-codex".to_owned());
+            }
+            match linked_providers {
+                [only] => Some(only.clone()),
+                _ => None,
+            }
+        })
+}
+
+/// [`resolve_default_provider`] for a turn that has to run on *something*:
+/// with nothing resolvable the historical Codex fallback stands, so the turn
+/// fails on the missing Codex credential exactly as it always did.
+pub(crate) fn resolve_turn_provider(
+    host_override: Option<String>,
+    config_provider: Option<String>,
+    linked_providers: &[String],
+) -> String {
+    resolve_default_provider(host_override, config_provider, linked_providers)
         .unwrap_or_else(|| "openai-codex".to_string())
 }
 
@@ -1573,9 +1599,17 @@ pub fn isolated_turn_descriptor(
     }
     let config = AgentConfig::from_json(&guard.effective_agent_config_for_chat(chat_id)?)
         .unwrap_or_default();
-    let provider = resolve_turn_provider(gaugedesk_env::var("MODEL_PROVIDER"), config.provider);
-    let model = resolve_turn_model(gaugedesk_env::var("MODEL"), config.model);
     let class = guard.model_execution_class();
+    let linked = guard.linked_providers_for_chat_in_class(chat_id, actor, class);
+    let provider = resolve_turn_provider(
+        gaugedesk_env::var("MODEL_PROVIDER"),
+        config.provider,
+        &linked,
+    );
+    // A provider with no shipped catalog runs the operator's first declared
+    // model when the chat pins none — the same id the picker names as default.
+    let model = resolve_turn_model(gaugedesk_env::var("MODEL"), config.model)
+        .or_else(|| guard.declared_default_model_for_actor(actor, &provider));
     let base_url_override = if provider == "openai-generic" {
         guard.credential_base_url_for_chat_in_class(chat_id, &provider, actor, class)
     } else {
@@ -1831,11 +1865,19 @@ fn run_claimed_engagement_turn(
     } else {
         // The private composition may override the authored provider/model. Public
         // releases do not execute through this GaugeDesk engine.
-        let provider = resolve_turn_provider(
-            gaugedesk_env::var("MODEL_PROVIDER"),
-            config.provider.clone(),
-        );
-        let effective_execution_class = wb.lock_unpoisoned().model_execution_class();
+        let (provider, effective_execution_class) = {
+            let g = wb.lock_unpoisoned();
+            let class = g.model_execution_class();
+            let linked = g.linked_providers_for_chat_in_class(id, actor.as_str(), class);
+            (
+                resolve_turn_provider(
+                    gaugedesk_env::var("MODEL_PROVIDER"),
+                    config.provider.clone(),
+                    &linked,
+                ),
+                class,
+            )
+        };
         if provider == "openai-codex"
             && effective_execution_class == crate::account::ModelExecutionClass::LocalInteractive
         {
@@ -1930,7 +1972,13 @@ fn run_claimed_engagement_turn(
             )
         };
         stop_checkpoint(id)?;
-        let model = resolve_turn_model(gaugedesk_env::var("MODEL"), config.model.clone());
+        // A provider with no shipped catalog runs the operator's first declared
+        // model when the chat pins none — the same id the picker names as default.
+        let model =
+            resolve_turn_model(gaugedesk_env::var("MODEL"), config.model.clone()).or_else(|| {
+                wb.lock_unpoisoned()
+                    .declared_default_model_for_actor(actor.as_str(), &provider)
+            });
         // openai-generic (ADR 0083) carries its endpoint with the linked credential;
         // resolve it nearest-scope-wins so the descriptor derives the admitted host
         // from the same base_url the request will use. Other providers ignore it.
@@ -3083,22 +3131,55 @@ mod tests {
     // `openai-codex` still egresses via the gateway); absent the override the chat's config wins.
     #[test]
     fn host_override_wins_then_config_then_default() {
+        let linked = |providers: &[&str]| -> Vec<String> {
+            providers.iter().map(|p| (*p).to_owned()).collect()
+        };
         // Host override beats everything (the SERVE-2 membrane).
         assert_eq!(
             resolve_turn_provider(
                 Some("cloudflare-ai-gateway".into()),
-                Some("anthropic".into())
+                Some("anthropic".into()),
+                &linked(&["openai-codex"]),
             ),
             "cloudflare-ai-gateway"
         );
         // No override ⇒ the chat's configured provider.
         assert_eq!(
-            resolve_turn_provider(None, Some("anthropic".into())),
+            resolve_turn_provider(None, Some("anthropic".into()), &linked(&["openai-codex"])),
             "anthropic"
         );
         // Neither ⇒ the codex OAuth default. An empty override/config is ignored, not honored.
         assert_eq!(
-            resolve_turn_provider(Some(String::new()), None),
+            resolve_turn_provider(Some(String::new()), None, &[]),
+            "openai-codex"
+        );
+        // Nothing linked resolves to no default at all — the picker asks for a
+        // model — while the turn path still falls back to Codex so it fails on
+        // the missing credential rather than on a provider it invented.
+        assert_eq!(resolve_default_provider(None, None, &[]), None);
+        // A Codex sign-in wins whatever else is linked: it is the one provider
+        // with a shipped default model.
+        assert_eq!(
+            resolve_default_provider(None, None, &linked(&["anthropic", "openai-codex"]))
+                .as_deref(),
+            Some("openai-codex")
+        );
+        // The sole linked credential is what a no-pin turn runs on.
+        assert_eq!(
+            resolve_default_provider(None, None, &linked(&["openai-generic"])).as_deref(),
+            Some("openai-generic")
+        );
+        assert_eq!(
+            resolve_turn_provider(None, None, &linked(&["openai-generic"])),
+            "openai-generic"
+        );
+        // Two keyed providers and no Codex is a real choice, not a guess.
+        assert_eq!(
+            resolve_default_provider(None, None, &linked(&["anthropic", "openai"])),
+            None
+        );
+        assert_eq!(
+            resolve_turn_provider(None, None, &linked(&["anthropic", "openai"])),
             "openai-codex"
         );
         // Model: override wins, else config, else None (provider default).

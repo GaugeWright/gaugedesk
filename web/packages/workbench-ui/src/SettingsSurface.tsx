@@ -69,6 +69,12 @@ export interface SettingsModel {
             /** How adding it works: signed into through the browser, a pasted key, or a
              *  user-configured endpoint. The add form follows this. */
             readonly auth: "account" | "key" | "endpoint";
+            /** Whether its model ids are the operator's to declare (no shipped
+             *  catalog). The add form then asks for the first one with the
+             *  credential, because a credential with no model reaches nothing —
+             *  the picker stayed empty after linking an endpoint until the
+             *  operator found the "add models" expander on their own. */
+            readonly declaresModels?: boolean;
             /** Only what the reader cannot infer. "Anthropic serves the Claude catalog"
              *  is the definition, not a fact; Codex *also* serving the OpenAI catalog is. */
             readonly note?: string;
@@ -176,7 +182,7 @@ export interface SettingsActions {
     readonly hubDismissSignIn?: () => void;
     readonly hubSignOut?: () => void;
     readonly acceptInvitation?: (tenantId: string) => void;
-    readonly linkKey?: (input: { pin: string; token: string; endpoint?: string }) => void;
+    readonly linkKey?: (input: { pin: string; token: string; endpoint?: string; model?: string }) => void;
     readonly addEndpointModel?: (credentialId: string, modelId: string) => void;
     readonly removeEndpointModel?: (credentialId: string, modelId: string) => void;
     readonly signInToProvider?: (pin: string) => void;
@@ -232,6 +238,8 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
     const [provider, setProvider] = createSignal("");
     const [token, setToken] = createSignal("");
     const [endpoint, setEndpoint] = createSignal("");
+    // The first model id for a provider that declares its own (the add form).
+    const [firstModel, setFirstModel] = createSignal("");
     const [newModel, setNewModel] = createSignal("");
     const [openCredential, setOpenCredential] = createSignal<string | null>(null);
     const [adding, setAdding] = createSignal(false);
@@ -636,7 +644,7 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
                                 <Show
                                     when={adding()}
                                     fallback={<button type="button" class="tree-action" data-add-credential-open
-                                        onClick={() => { setProvider(props.model.models.providers[0]?.pin ?? ""); setToken(""); setEndpoint(""); setAdding(true); }}
+                                        onClick={() => { setProvider(props.model.models.providers[0]?.pin ?? ""); setToken(""); setEndpoint(""); setFirstModel(""); setAdding(true); }}
                                     >add a credential</button>}
                                 >
                                     <div class="admin-invite" data-add-credential>
@@ -668,8 +676,22 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
                                             </Show>
                                             <input data-account-token type="password" value={token()} onInput={(e) => setToken(e.currentTarget.value)}
                                                 placeholder="paste API key / token" />
+                                            <Show when={chosen()?.declaresModels}>
+                                                <input data-account-model value={firstModel()} onInput={(e) => setFirstModel(e.currentTarget.value)}
+                                                    placeholder={provider() === "openrouter"
+                                                        ? "route id, e.g. anthropic/claude-sonnet-4.5"
+                                                        : "model id, e.g. llama-3.3-70b-instruct"} />
+                                            </Show>
                                             <button type="button" class="tree-action" data-account-link
-                                                onClick={() => { props.actions?.linkKey?.({ pin: provider(), token: token(), endpoint: endpoint() || undefined }); setAdding(false); }}
+                                                onClick={() => {
+                                                    props.actions?.linkKey?.({
+                                                        pin: provider(),
+                                                        token: token(),
+                                                        endpoint: endpoint() || undefined,
+                                                        model: chosen()?.declaresModels ? firstModel() || undefined : undefined,
+                                                    });
+                                                    setAdding(false);
+                                                }}
                                             >add</button>
                                         </Show>
                                         <button type="button" class="tree-action" onClick={() => setAdding(false)}>cancel</button>

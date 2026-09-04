@@ -150,6 +150,59 @@ async fn linked_credential_is_sealed_and_token_never_leaves() {
 }
 
 #[tokio::test]
+async fn default_model_follows_the_linked_credentials() {
+    let (_dir, app) = workbench();
+
+    // Nothing linked: no default to name. The picker asks for a model rather
+    // than reporting the Codex fallback no credential could run.
+    let (s, body) = send(&app, "GET", "/account/default-model", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["provider"], Value::Null);
+    assert_eq!(body["model"], Value::Null);
+
+    // One OpenAI-compatible endpoint linked: it is the default provider, but an
+    // endpoint has no model until the operator declares one.
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(r#"{"provider":"openai-generic","token":"sk-local","base_url":"http://127.0.0.1:11434/v1"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_s, body) = send(&app, "GET", "/account/default-model", None).await;
+    assert_eq!(body["provider"], "openai-generic");
+    assert_eq!(body["model"], Value::Null);
+
+    // The first declared model is what a no-pin turn runs, so it is what the
+    // picker names.
+    let (s, _) = send(
+        &app,
+        "PUT",
+        "/account/settings/model_picker.endpoint_models",
+        Some(r#"{"value":"{\"openai-generic\":[\"llama-3.3-70b\",\"qwen-3\"]}"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_s, body) = send(&app, "GET", "/account/default-model", None).await;
+    assert_eq!(body["provider"], "openai-generic");
+    assert_eq!(body["model"], "llama-3.3-70b");
+
+    // A second keyed provider makes the choice real, so nothing is assumed.
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(r#"{"provider":"anthropic","token":"sk-ant-test"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_s, body) = send(&app, "GET", "/account/default-model", None).await;
+    assert_eq!(body["provider"], Value::Null);
+    assert_eq!(body["model"], Value::Null);
+}
+
+#[tokio::test]
 async fn oauth_credential_stays_out_of_the_generic_credential_list() {
     let (_dir, app) = workbench();
 

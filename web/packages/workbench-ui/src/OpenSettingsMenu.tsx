@@ -80,6 +80,13 @@ export function SettingsMenu(props: {
     /** A monotonically increasing counter; each increment opens Settings at the Account
      *  room. Lets another surface (e.g. an in-chat "no model" prompt) open settings. */
     openAccount?: Accessor<number>;
+    /** The same pulse for the Model access room: the composer's "Add a model…"
+     *  when nothing is pickable opens where a model comes from. */
+    openModels?: Accessor<number>;
+    /** Settings changed something the account holds (a credential, a declared
+     *  model, the picker's enabled set); the composition re-reads what it
+     *  projects from the account. */
+    onAccountChanged?: () => void;
     /** FED-7: an OS-delivered `gaugewright://invite` deep link. Each non-empty value opens the
      *  Devices modal seeded with that link, so its consent preview renders immediately. */
     openInvite?: Accessor<string>;
@@ -200,6 +207,17 @@ export function SettingsMenu(props: {
         ),
     );
 
+    createEffect(
+        on(
+            () => props.openModels?.() ?? 0,
+            () => {
+                setMenuOpen(false);
+                openSettingsAt("models");
+            },
+            { defer: true },
+        ),
+    );
+
     // FED-7: open the Devices modal, seeded with the deep-linked invite, when one arrives
     // (defer so a value present at mount never auto-pops the modal).
     createEffect(
@@ -274,6 +292,7 @@ export function SettingsMenu(props: {
                             setSettingsOpen(false);
                             setDevicesOpen(true);
                         }}
+                        onChanged={props.onAccountChanged}
                         onClose={() => setSettingsOpen(false)}
                     />
                 </SettingsModalBoundary>

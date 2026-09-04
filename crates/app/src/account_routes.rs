@@ -1025,20 +1025,37 @@ pub async fn get_onboarding_status() -> impl IntoResponse {
         .into_response()
 }
 
-/// The model a turn runs when the chat pins nothing — the picker's "Default"
-/// row, named. Resolves exactly as a turn would: the host override / codex-OAuth
-/// provider precedence with an empty chat config, then that provider's own
-/// default model. `model` is null when the resolved provider has no default
-/// (it requires an explicit pin). Exposed so the picker can *name* the default
-/// instead of showing a blind "Default" (LLM-1, ADR 0062).
-pub async fn get_default_model() -> impl IntoResponse {
-    let provider = crate::engine::resolve_turn_provider(gaugedesk_env::var("MODEL_PROVIDER"), None);
-    let model =
-        crate::engine::resolve_turn_model(gaugedesk_env::var("MODEL"), None).or_else(|| {
-            gaugedesk_whip_runtime::native_provider_descriptor(&provider, None, None)
-                .ok()
-                .map(|d| d.model)
-        });
+/// The model a turn runs when the chat pins nothing — the picker's "default"
+/// row, named. Resolves exactly as a turn would: the host override, then what
+/// the linked credentials make unambiguous (a Codex sign-in, else the sole
+/// linked provider — [`crate::engine::resolve_default_provider`]), then that
+/// provider's own default model, then the first model the operator declared
+/// for a provider that ships no catalog. Both are null when nothing resolves:
+/// the picker then asks for a model instead of naming one the engine could
+/// not run, which is what it did while this answered from the Codex fallback
+/// alone (LLM-1, ADR 0062).
+pub async fn get_default_model(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    let class = wb.model_execution_class();
+    let linked = wb.linked_providers_in_class(&scope, class);
+    let provider = crate::engine::resolve_default_provider(
+        gaugedesk_env::var("MODEL_PROVIDER"),
+        None,
+        &linked,
+    );
+    let model = provider.as_deref().and_then(|provider| {
+        crate::engine::resolve_turn_model(gaugedesk_env::var("MODEL"), None)
+            .or_else(|| {
+                gaugedesk_whip_runtime::native_provider_descriptor(provider, None, None)
+                    .ok()
+                    .map(|d| d.model)
+            })
+            .or_else(|| wb.declared_default_model_in(&scope, provider))
+    });
     (
         StatusCode::OK,
         Json(json!({ "provider": provider, "model": model })),

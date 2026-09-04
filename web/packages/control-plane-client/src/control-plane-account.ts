@@ -560,16 +560,18 @@ export async function onboardingStatus(json: RouteJson): Promise<{ credentialReq
 }
 
 /** The model a turn runs when the chat pins nothing (LLM-1): the engine's resolved
- *  no-pin default. `model` is null when the resolved provider has no default model
- *  (it then requires an explicit pin). Lets the picker name its "Default" row. */
+ *  no-pin default, which follows the linked credentials. Both null when nothing
+ *  resolves; `model` alone null when the resolved provider has no default model
+ *  (it then requires an explicit pin). Lets the picker name its default row, or
+ *  ask for a model when there is none. */
 export async function defaultModel(
     json: RouteJson,
-): Promise<{ provider: string; model: string | null }> {
+): Promise<{ provider: string | null; model: string | null }> {
     const o = (await json("GET", "/account/default-model")) as {
-        provider?: string;
+        provider?: string | null;
         model?: string | null;
     };
-    return { provider: o.provider ?? "", model: o.model ?? null };
+    return { provider: o.provider ?? null, model: o.model ?? null };
 }
 
 /** Start the codex OAuth link; returns the authorize URL to open in a browser. The
