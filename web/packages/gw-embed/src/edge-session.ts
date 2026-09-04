@@ -71,6 +71,40 @@ const RECONNECT_BASE_MS = 100;
  * blip invisible while a persistent refusal settles into a slow poll. */
 const RECONNECT_CEILING_MS = 30_000;
 
+/**
+ * What the visitor reads when the runtime refuses or fails a turn.
+ *
+ * The edge answers a refused reservation with a status and one sentence
+ * written for the publisher — "session spend ceiling is exhausted" — and on
+ * 2026-09-04 a visitor met exactly that, sixteen turns into a survey, as a
+ * red "402". The status names an accounting rule, the sentence names the
+ * publisher's ceiling, and neither tells the person what happened to their
+ * conversation or what they can do about it. Each refusal the edge can make
+ * on purpose is translated here into that; anything else keeps the status
+ * and the runtime's reason, because for an unexpected failure the diagnosis
+ * is the useful part.
+ */
+export function describeTurnFailure(status: number, reason: string | undefined): string {
+    const said = (reason ?? "").toLowerCase();
+    if (said.includes("session spend ceiling")) {
+        return "This conversation has reached its spending limit. Start a new chat to continue.";
+    }
+    if (said.includes("deployment spend ceiling")) {
+        return "This assistant has reached its spending limit for now. Please try again later.";
+    }
+    if (said.includes("visitor turn quota")) {
+        return "This conversation has reached its message limit. Start a new chat to continue.";
+    }
+    if (said.includes("session has expired")) {
+        return "This conversation has expired. Start a new chat to continue.";
+    }
+    if (said.includes("deployment is paused")) {
+        return "This assistant is paused right now. Please try again later.";
+    }
+    const detail = reason ? `${status}: ${reason}` : String(status);
+    return `The reply could not be completed (${detail}).`;
+}
+
 /** One canonical, cursor-resumable WebSocket to the engagement's Session DO. */
 export class EdgeSessionApi implements EmbedSessionApi {
     private socket: WebSocket | null = null;
@@ -641,9 +675,9 @@ export class EdgeSessionApi implements EmbedSessionApi {
                 const body = message.body as { error?: unknown } | undefined;
                 const reason =
                     body && typeof body.error === "string" && body.error.trim()
-                        ? `: ${body.error.trim()}`
-                        : "";
-                pending.reject(new Error(`public turn failed: ${status}${reason}`));
+                        ? body.error.trim()
+                        : undefined;
+                pending.reject(new Error(describeTurnFailure(status, reason)));
             }
         }
         return typeof message.type === "string" ? message.type : null;

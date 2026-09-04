@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { EngagementId, StreamEvent } from "@gaugewright/control-plane-client";
-import { EdgeSessionApi } from "./edge-session";
+import { describeTurnFailure, EdgeSessionApi } from "./edge-session";
 import type { LatencyObservation } from "./latency";
 
 class FakeWebSocket {
@@ -732,7 +732,7 @@ describe("EdgeSessionApi", () => {
             }),
         });
         await expect(turn).rejects.toThrow(
-            "public turn failed: 502: turn rejected: host policy rejected input: provider binding has no exact realization in the verified policy epoch",
+            "The reply could not be completed (502: turn rejected: host policy rejected input: provider binding has no exact realization in the verified policy epoch).",
         );
 
         // A terminal with no reason still names the status alone.
@@ -748,8 +748,52 @@ describe("EdgeSessionApi", () => {
                 body: { outcome: "failed" },
             }),
         });
-        await expect(bare).rejects.toThrow(/^public turn failed: 502$/);
+        await expect(bare).rejects.toThrow(/^The reply could not be completed \(502\)\.$/);
+
+        // The live failure of 2026-09-04. Sixteen turns into a survey the edge
+        // refused the seventeenth reservation with "402: session spend ceiling
+        // is exhausted", which the visitor read as a red number. A deliberate
+        // refusal is told to the person in their terms — what happened to the
+        // conversation, and what they can do next.
+        const capped = api.runEmbedTurn("ignored" as EngagementId, "and again");
+        await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(3));
+        const third = JSON.parse(sockets[0]!.sent[2]!) as { request_id: string };
+        sockets[0]!.emit("message", {
+            data: JSON.stringify({
+                type: "error",
+                sequence: 3,
+                request_id: third.request_id,
+                status: 402,
+                body: { error: "session spend ceiling is exhausted" },
+            }),
+        });
+        await expect(capped).rejects.toThrow(
+            "This conversation has reached its spending limit. Start a new chat to continue.",
+        );
         api.dispose();
+    });
+
+    /** Every refusal the edge makes on purpose reads as a sentence about the
+     *  visitor's conversation; anything else keeps the diagnosis. */
+    it("translates each deliberate edge refusal for the visitor", () => {
+        expect(describeTurnFailure(402, "deployment spend ceiling is exhausted")).toBe(
+            "This assistant has reached its spending limit for now. Please try again later.",
+        );
+        expect(describeTurnFailure(429, "visitor turn quota is exhausted")).toBe(
+            "This conversation has reached its message limit. Start a new chat to continue.",
+        );
+        expect(describeTurnFailure(410, "session has expired")).toBe(
+            "This conversation has expired. Start a new chat to continue.",
+        );
+        expect(describeTurnFailure(503, "deployment is paused")).toBe(
+            "This assistant is paused right now. Please try again later.",
+        );
+        expect(describeTurnFailure(502, "managed gateway transport failed")).toBe(
+            "The reply could not be completed (502: managed gateway transport failed).",
+        );
+        expect(describeTurnFailure(500, undefined)).toBe(
+            "The reply could not be completed (500).",
+        );
     });
 
     /** The live failure of 2026-08-20. A deployment cutover ends live sessions,
