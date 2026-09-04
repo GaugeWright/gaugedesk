@@ -238,6 +238,15 @@ export type { ToolGroup, ToolId } from "./tool-verb";
 export { groupChatsByWorkstream, hasWorkstreams } from "./workstream-grouping";
 export type { ChatLike, GroupedChats, WorkstreamGroup } from "./workstream-grouping";
 export { Workspace } from "./Workspace";
+export { Deliverables, saveToBrowser } from "./Deliverables";
+export {
+    DELIVERABLE_ROOT,
+    deliverablesIn,
+    isDeliverablePath,
+    mediaTypeFor,
+    newDeliverables,
+    type Deliverable,
+} from "./deliverables";
 export { WorkbenchShell, createWorkbenchShellState } from "./WorkbenchShell";
 export type {
     WorkbenchShellOptions,

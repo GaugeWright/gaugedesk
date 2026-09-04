@@ -434,6 +434,24 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     box-shadow: 0 2px 10px rgb(0 0 0 / 25%); }
 .jump-latest:hover { color: var(--accent); }
 .jump-latest .icon { width: 16px; height: 16px; }
+/* Deliverables (ADR 0163): what the agent wrote for the visitor, offered from the
+   chat. The double rule is the one frame the composition system grants a live
+   panel's contents; the download is an engraved label, not a filled button. */
+.deliverables { margin: 10px 10px 4px; padding: 10px 12px; border-top: 3px double var(--edge);
+    border-bottom: 3px double var(--edge); }
+.deliverables-caption { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 6px; }
+.deliverable { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 4px 0; }
+.deliverable.fresh .deliverable-name::after { content: " · new"; color: var(--muted); font-size: 12px; }
+.deliverable-name { font-family: var(--font-mono, ui-monospace, monospace); font-size: 13px;
+    overflow-wrap: anywhere; }
+.deliverable-download { background: none; border: 1px solid var(--edge); border-radius: 3px;
+    padding: 4px 12px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--ink); cursor: pointer; }
+.deliverable-download:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.deliverable-download:disabled { opacity: 0.6; cursor: default; }
+.deliverables-failure { margin-top: 6px; color: var(--danger, #b3261e); font-size: 12px; }
 .turn-activity { display: flex; align-items: center; gap: 7px; padding: 7px 10px;
     color: var(--muted); font-size: var(--fs-ui); }
 .turn-activity-dots { display: inline-flex; align-items: center; gap: 3px; }

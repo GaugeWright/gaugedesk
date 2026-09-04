@@ -87,6 +87,8 @@ function fixtureApi(): EmbedSessionApi {
     // it the turn goes straight from thinking to streaming, which is what a
     // tool-less deployment actually does.
     const fixtureTool = params.get("tool");
+    const fixtureDeliverable = params.get("deliverable") === "1";
+    const FIXTURE_DELIVERABLE = "deliverable/oai-readout.html";
     return {
         getTurnActivity: () => observation,
         subscribeTurnActivity: (listener: (value: TurnObservation) => void) => {
@@ -152,11 +154,25 @@ function fixtureApi(): EmbedSessionApi {
         runTask: () => new Promise<never>(() => undefined),
         mergeCommand: async (_id: EngagementId, _action: MergeAction) =>
             emptyMerge,
-        getFile: async () => "",
+        // `?deliverable=1` rehearses a session whose agent wrote a report for
+        // the visitor (ADR 0163): the card after the transcript offers it, and
+        // the download fetches this HTML through the same `getFile` seam the
+        // real projection answers.
+        getFile: async (_id: EngagementId, path: string) =>
+            fixtureDeliverable && path === FIXTURE_DELIVERABLE
+                ? "<!doctype html><title>Your readout</title><h1>Your readout</h1><p>Fixture report.</p>"
+                : "",
         putFile: async () => {
             throw new Error("fixture files are read-only");
         },
-        getTree: async () => [] as FileEntry[],
+        getTree: async () =>
+            (fixtureDeliverable
+                ? [
+                      { path: "oai/flow.md", isDir: false },
+                      { path: "record/oai-record.json", isDir: false },
+                      { path: FIXTURE_DELIVERABLE, isDir: false },
+                  ]
+                : []) as FileEntry[],
         embedMyChats: async () => [],
         embedAudience: params.get("audience") !== "anonymous",
         embedNewChat: async () => {

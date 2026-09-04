@@ -27,6 +27,7 @@
     "./ConfigEditor": "./src/ConfigEditor.tsx",
     "./ConnectionBanner": "./src/ConnectionBanner.tsx",
     "./ContentViewer": "./src/ContentViewer.tsx",
+    "./Deliverables": "./src/Deliverables.tsx",
     "./EnvironmentDocumentView": "./src/EnvironmentDocumentView.tsx",
     "./environment-view": "./src/environment-view.ts",
     "./ContextMenu": "./src/ContextMenu.tsx",

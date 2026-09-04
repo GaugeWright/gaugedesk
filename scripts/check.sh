@@ -42,17 +42,29 @@ set -euo pipefail
 
 # `all` runs each section as a child invocation of this same script (see
 # run_all), so resolve this file absolutely before the cd can make a relative
-# $0 stale. The children are launched through $BASH rather than by executing the
-# path, so the run does not depend on this file's mode bit and each child is the
-# same interpreter as the parent.
-self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-cd "$(dirname "$0")/.."
+# path stale. The children are launched through $BASH rather than by executing
+# the path, so the run does not depend on this file's mode bit and each child is
+# the same interpreter as the parent.
+#
+# $BASH_SOURCE rather than $0 because this file is also sourced — see the guard
+# above the dispatch — and under a source $0 is the sourcing script. Executed,
+# the two are the same thing.
+self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 section="${1:-all}"
 
 run_contracts() {
     echo "== agent guide =="
     node scripts/check-agent-guide.mjs
+
+    # This script's own composition. `all` running every section and reporting
+    # the failures together is a property with no line number — it shows only in
+    # what a failing run still manages to say — and reverting it leaves every
+    # section working and every gate green. It is checked here because
+    # `contracts` is a required context and this needs nothing but bash.
+    echo "== check composition =="
+    node --test scripts/check-lanes.test.mjs
 
     echo "== architecture boundaries =="
     python3 scripts/architecture-check.py
@@ -445,6 +457,17 @@ prerequisite_policy() {
     if [ "${1:-}" = best-effort ]; then echo best-effort; else echo required; fi
 }
 
+# How `all` runs one section, named rather than inlined because it is the seam
+# `scripts/check-lanes.test.mjs` replaces. Sourcing this file defines the
+# sections and stops before the dispatch, so the test can override this one
+# function and drive the real `run_all` against sections whose outcomes it
+# chooses — the shell counterpart of `check-build-coverage.mjs` exporting
+# `analyze` and running `main` only when invoked directly, and of
+# `run-production-wiring-canaries.mjs` taking a `spawnImpl`.
+lane_runner() {
+    "$BASH" "$self" "$@"
+}
+
 # `all` runs every section and reports the failures together, rather than
 # stopping at the first one. Under `set -e` a sequence of calls meant that the
 # earliest section to fail decided how much of the bar ran at all, and the
@@ -482,8 +505,8 @@ run_all() {
     for lane in contracts rust web desktop mobile windows dependencies; do
         rc=0
         case "$lane" in
-            desktop|mobile) "$BASH" "$self" "$lane" best-effort || rc=$? ;;
-            *) "$BASH" "$self" "$lane" || rc=$? ;;
+            desktop|mobile) lane_runner "$lane" best-effort || rc=$? ;;
+            *) lane_runner "$lane" || rc=$? ;;
         esac
 
         # The other half of the same case: the signal reached only the child,
@@ -510,16 +533,33 @@ run_all() {
     exit 1
 }
 
-case "$section" in
-    all) run_all ;;
-    contracts) run_contracts ;;
-    dependencies) run_dependencies ;;
-    desktop) run_desktop "$(prerequisite_policy "${2:-}")" ;;
-    mobile) run_mobile "$(prerequisite_policy "${2:-}")" ;;
-    rust) run_rust ;;
-    web) run_web ;;
-    windows) run_windows ;;
-    *) echo "usage: scripts/check.sh [all|contracts|dependencies|desktop|mobile|rust|web|windows]" >&2; exit 2 ;;
-esac
+# Which section a request names, and what runs it. A function rather than a bare
+# `case` for the same reason `lane_runner` is a function: it is reachable from a
+# source, so `scripts/check-lanes.test.mjs` can assert that `all` reaches
+# `run_all` — and would notice `all` being reverted to the sequence of calls
+# that #553 replaced, which every other test here would sit through happily.
+dispatch() {
+    case "${1:-all}" in
+        all) run_all ;;
+        contracts) run_contracts ;;
+        dependencies) run_dependencies ;;
+        desktop) run_desktop "$(prerequisite_policy "${2:-}")" ;;
+        mobile) run_mobile "$(prerequisite_policy "${2:-}")" ;;
+        rust) run_rust ;;
+        web) run_web ;;
+        windows) run_windows ;;
+        *) echo "usage: scripts/check.sh [all|contracts|dependencies|desktop|mobile|rust|web|windows]" >&2; exit 2 ;;
+    esac
+}
+
+# Sourced rather than executed: define the sections and stop. What a caller
+# wants from a source is `dispatch`, `run_all` and the seam above it; running a
+# section is not. `scripts/check-lanes.test.mjs` is the caller, and this line is
+# what lets it test the real composition rather than a copy of it.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
+
+dispatch "$section" "${2:-}"
 
 echo "== gaugedesk green bar PASSED ($section) =="
