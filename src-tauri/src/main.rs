@@ -45,6 +45,17 @@ fn external_open_allowed(url: &str) -> Result<(), String> {
 }
 
 fn main() {
+    // Must run before Tauri builds the webview: WebKitGTK reads the variable when
+    // its web process starts, and nothing re-reads it afterwards.
+    #[cfg(target_os = "linux")]
+    if let Some(value) = webkit_dmabuf_override(
+        std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER")
+            .ok()
+            .as_deref(),
+        std::path::Path::new("/sys/module/nvidia").exists(),
+    ) {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", value);
+    }
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![restart_app, open_external])
         // LOGIN-7: the system-browser opener behind `open_external`. Sign-in and
@@ -311,6 +322,26 @@ fn forward_deep_link(app: &tauri::AppHandle, url: &str) {
 /// The first `gaugewright://` URL in a process argv (FED-7): on Linux/Windows a deep link
 /// launches a second instance with the URL as an argument, which single-instance forwards to the
 /// running app. Pure in its input → unit-testable without a process.
+/// Linux: WebKitGTK (2.4x+) renders the web process into GBM/DMA-BUF buffers by
+/// default. Under the proprietary NVIDIA driver that buffer allocation fails
+/// (`DRM_IOCTL_MODE_CREATE_DUMB: Permission denied` — the client is not DRM
+/// authenticated, and Mesa has no GBM backend for the device), the web process
+/// draws nothing, and the window stays a solid blank sheet while the control
+/// plane runs fine underneath it. `WEBKIT_DISABLE_DMABUF_RENDERER=1` selects
+/// WebKit's other compositing path and the workbench appears.
+///
+/// The override applies only when the proprietary module is loaded (nouveau,
+/// Mesa on Intel/AMD, and software rendering keep the default path) and never
+/// overrides a value the operator set explicitly — `0` is an honest way to turn
+/// the workaround off once a driver fixes it.
+fn webkit_dmabuf_override(explicit: Option<&str>, nvidia_loaded: bool) -> Option<&'static str> {
+    match explicit {
+        Some(v) if !v.trim().is_empty() => None,
+        _ if nvidia_loaded => Some("1"),
+        _ => None,
+    }
+}
+
 fn deep_link_from_argv(argv: &[String]) -> Option<String> {
     argv.iter()
         .find(|a| a.starts_with("gaugewright://"))
@@ -330,9 +361,21 @@ fn deep_link_dispatch_script(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cp_launch_decision, deep_link_dispatch_script, deep_link_from_argv,
-        external_open_allowed, local_cp_bind, webview_org_cp_script, ZOOM_HOTKEYS,
+        cp_launch_decision, deep_link_dispatch_script, deep_link_from_argv, external_open_allowed,
+        local_cp_bind, webkit_dmabuf_override, webview_org_cp_script, ZOOM_HOTKEYS,
     };
+
+    #[test]
+    fn nvidia_proprietary_disables_the_dmabuf_renderer_unless_the_operator_chose() {
+        // The blank-window case: proprietary module loaded, nothing set → disable.
+        assert_eq!(webkit_dmabuf_override(None, true), Some("1"));
+        assert_eq!(webkit_dmabuf_override(Some(""), true), Some("1"));
+        // An explicit operator value wins either way, including turning it back on.
+        assert_eq!(webkit_dmabuf_override(Some("0"), true), None);
+        assert_eq!(webkit_dmabuf_override(Some("1"), true), None);
+        // Every other driver keeps WebKit's default path.
+        assert_eq!(webkit_dmabuf_override(None, false), None);
+    }
 
     #[test]
     fn external_open_allows_exactly_the_web_schemes() {
