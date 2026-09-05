@@ -944,6 +944,8 @@ fn remove_legacy_human_authority(source: &str) -> String {
 mod target_set_migration_tests {
     use super::*;
     use crate::LockUnpoisoned;
+    use whipplescript_store::vcs::NativeWorkspaceVcs;
+    use whipplescript_store::workstreams::{ReleaseBoundaryOutcome, WorkstreamStore, Workstreams};
 
     #[test]
     fn persisted_v102_workspace_pin_migrates_once_and_unknown_pins_write_nothing() {
@@ -1295,6 +1297,122 @@ mod target_set_migration_tests {
             reopened.library.workstreams["recover-stream"].extra["promotion_recovery"]["status"],
             "cancelled-before-advance"
         );
+    }
+
+    #[test]
+    fn startup_resumes_interrupted_pre_cas_cleanup_before_and_after_line_release() {
+        for line_released_before_crash in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let workbench = crate::open_workbench(root.path()).unwrap();
+            {
+                let mut workbench = workbench.lock_unpoisoned();
+                let collaboration =
+                    workbench.library.project_collaboration_workspaces[DEFAULT_PROJECT].clone();
+                workbench
+                    .workspace_by_storage_id(&collaboration.workspace_id)
+                    .unwrap()
+                    .create_named_workstream("recover-stream", Some("Recover"))
+                    .unwrap();
+                workbench.write_workstream_record(WorkstreamRecord {
+                    id: "recover-stream".into(),
+                    op: RecordOp::Upsert,
+                    instance_id: DEFAULT_PLACEMENT.into(),
+                    name: "Recover".into(),
+                    created_position: 0,
+                    schema: LIBRARY_RECORD_SCHEMA,
+                    extra: Default::default(),
+                });
+                workbench.write_workstream_root_record(WorkstreamRootRecord {
+                    workstream_id: "recover-stream".into(),
+                    op: RecordOp::Upsert,
+                    placement_id: DEFAULT_PLACEMENT.into(),
+                    project_id: DEFAULT_PROJECT.into(),
+                    workspace_id: collaboration.workspace_id.clone(),
+                    target_id: String::new(),
+                    adapter_family: String::new(),
+                    schema: LIBRARY_RECORD_SCHEMA,
+                    extra: Default::default(),
+                });
+                let reservation = workbench
+                    .workspace_by_storage_id(&collaboration.workspace_id)
+                    .unwrap()
+                    .reserve_workstream_promotion_boundary("recover-stream", "reservation-crash")
+                    .unwrap();
+
+                // Reproduce the two durable crash cuts inside WhippleScript's
+                // cancellation sequence. Topology first records that the
+                // cancellation was admitted and retains the exact token. The
+                // process may then die either before releasing the line lock,
+                // or after releasing it but before acknowledging the token.
+                let workspace_dir = collaboration_workspaces_dir(&workbench.targets_dir())
+                    .join(&collaboration.workspace_id);
+                let store_root = workspace_dir.join(".repo.whipplescript");
+                let mut streams =
+                    WorkstreamStore::open(store_root.join("workstreams.sqlite")).unwrap();
+                assert_eq!(
+                    streams
+                        .release_boundary(
+                            "recover-stream",
+                            "reservation-crash",
+                            "crash-after-topology-release",
+                        )
+                        .unwrap(),
+                    ReleaseBoundaryOutcome::Released
+                );
+                if line_released_before_crash {
+                    let mut vcs = NativeWorkspaceVcs::open(
+                        store_root.join("branches.sqlite"),
+                        store_root.join("content.sqlite"),
+                    )
+                    .unwrap();
+                    assert!(vcs
+                        .release_branch_head_reservation(
+                            &reservation.line_branch_id,
+                            "reservation-crash",
+                        )
+                        .unwrap());
+                }
+                let interrupted = streams.get_stream("recover-stream").unwrap().unwrap();
+                assert_eq!(
+                    interrupted.status,
+                    whipplescript_store::workstreams::StreamStatus::Active
+                );
+                assert_eq!(
+                    interrupted.reservation_id.as_deref(),
+                    Some("reservation-crash")
+                );
+            }
+            drop(workbench);
+
+            let reopened = crate::open_workbench(root.path()).unwrap();
+            let reopened = reopened.lock_unpoisoned();
+            let collaboration = &reopened.library.project_collaboration_workspaces[DEFAULT_PROJECT];
+            let workspace = reopened
+                .workspace_by_storage_id(&collaboration.workspace_id)
+                .unwrap();
+            let recovered = workspace.workstream("recover-stream").unwrap().unwrap();
+            assert_eq!(
+                recovered.status,
+                whipplescript_store::workstreams::StreamStatus::Active
+            );
+            assert_eq!(
+                recovered.reservation_id, None,
+                "startup must finish the exact pending cleanup token (line already released: {line_released_before_crash})"
+            );
+            assert_eq!(
+                reopened.library.workstreams["recover-stream"].extra["promotion_recovery"]
+                    ["status"],
+                "completed-interrupted-cleanup"
+            );
+
+            let fresh = workspace
+                .reserve_workstream_promotion_boundary("recover-stream", "reservation-fresh")
+                .unwrap();
+            assert_eq!(fresh.reservation_id, "reservation-fresh");
+            workspace
+                .release_workstream_promotion_boundary("recover-stream", "reservation-fresh")
+                .unwrap();
+        }
     }
 }
 
@@ -1949,8 +2067,11 @@ fn seed_empty_collaboration_workspaces(
 /// Recover a promotion whose durable WhippleScript boundary survived a Home
 /// restart. A bare reservation does not prove that manifest construction or a
 /// combined target-settlement preflight completed, so startup cancels it before
-/// Main moves and records the repair. Once the ref is durably advanced, startup
-/// may only close forward by archiving/re-homing the line.
+/// Main moves and records the repair. An Active row that still owns a
+/// reservation is WhippleScript's durable marker that this cancellation was
+/// admitted but its two-store cleanup was interrupted; resume that exact token
+/// before allowing later work. Once the ref is durably advanced, startup may
+/// only close forward by archiving/re-homing the line.
 fn recover_project_workstream_promotions(
     store: &mut Store,
     library: &mut crate::library::Library,
@@ -1977,12 +2098,14 @@ fn recover_project_workstream_promotions(
             continue;
         };
         use whipplescript_store::workstreams::StreamStatus;
-        if !matches!(
-            row.status,
-            StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced
-        ) {
-            continue;
-        }
+        let cleanup_recovery_status = match row.status {
+            StreamStatus::BoundaryReserved => Some("cancelled-before-advance"),
+            StreamStatus::Active if row.reservation_id.is_some() => {
+                Some("completed-interrupted-cleanup")
+            }
+            StreamStatus::RefAdvanced => None,
+            StreamStatus::Active | StreamStatus::Archived => continue,
+        };
         let reservation_id = row.reservation_id.as_deref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1992,7 +2115,7 @@ fn recover_project_workstream_promotions(
                 ),
             )
         })?;
-        if row.status == StreamStatus::BoundaryReserved {
+        if let Some(recovery_status) = cleanup_recovery_status {
             workspace
                 .release_workstream_promotion_boundary(&workstream.id, reservation_id)
                 .map_err(io)?;
@@ -2000,7 +2123,7 @@ fn recover_project_workstream_promotions(
             repaired.extra.insert(
                 "promotion_recovery".to_owned(),
                 serde_json::json!({
-                    "status": "cancelled-before-advance",
+                    "status": recovery_status,
                     "reservation_id": reservation_id,
                 }),
             );
