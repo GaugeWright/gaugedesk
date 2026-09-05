@@ -419,10 +419,40 @@ fn migrate_project_workspaces_and_target_sets(
     let mut records: Vec<(&'static str, String)> = Vec::new();
 
     for project in library.projects.values() {
-        if library
-            .project_collaboration_workspaces
-            .contains_key(&project.id)
-        {
+        if let Some(existing) = library.project_collaboration_workspaces.get(&project.id) {
+            if existing.host_contract_revision == crate::workstream_host_contract::REVISION
+                && existing.host_contract_digest == crate::workstream_host_contract::DIGEST
+            {
+                continue;
+            }
+            if existing.host_contract_revision
+                != crate::workstream_host_contract::MIGRATABLE_PREVIOUS_REVISION
+                || existing.host_contract_digest
+                    != crate::workstream_host_contract::MIGRATABLE_PREVIOUS_DIGEST
+            {
+                return Err(invalid_data(format!(
+                    "project {} collaboration workspace has unsupported WhippleScript contract pin {} / {}; upgrade through a supported GaugeDesk release or repair/reset this pre-release state root",
+                    project.id,
+                    existing.host_contract_revision,
+                    existing.host_contract_digest
+                )));
+            }
+            if existing.home_id != project.home_id
+                || existing.substrate != "whipplescript"
+                || existing.workspace_id.is_empty()
+            {
+                return Err(invalid_data(format!(
+                    "project {} collaboration workspace cannot migrate its WhippleScript contract pin because its Home, substrate, or workspace identity is invalid",
+                    project.id
+                )));
+            }
+            let mut migrated = existing.clone();
+            migrated.host_contract_revision = crate::workstream_host_contract::REVISION.to_owned();
+            migrated.host_contract_digest = crate::workstream_host_contract::DIGEST.to_owned();
+            records.push((
+                "project_collaboration_workspace",
+                serde_json::to_string(&migrated).map_err(io)?,
+            ));
             continue;
         }
         if project.home_id.as_str().is_empty() {
@@ -914,6 +944,90 @@ fn remove_legacy_human_authority(source: &str) -> String {
 mod target_set_migration_tests {
     use super::*;
     use crate::LockUnpoisoned;
+
+    #[test]
+    fn persisted_v102_workspace_pin_migrates_once_and_unknown_pins_write_nothing() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project = ProjectRecord {
+            id: "project-contract".to_owned(),
+            op: RecordOp::Upsert,
+            name: "Contract migration".to_owned(),
+            is_default: false,
+            home_id: gaugedesk_core::ids::HomeId::new("home-contract"),
+            network_isolated: false,
+            run_purpose: None,
+            deployment_mode: None,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        };
+        let previous = ProjectCollaborationWorkspaceRecord {
+            project_id: project.id.clone(),
+            workspace_id: "workspace-contract".to_owned(),
+            home_id: project.home_id.clone(),
+            substrate: "whipplescript".to_owned(),
+            host_contract_revision: crate::workstream_host_contract::MIGRATABLE_PREVIOUS_REVISION
+                .to_owned(),
+            host_contract_digest: crate::workstream_host_contract::MIGRATABLE_PREVIOUS_DIGEST
+                .to_owned(),
+            op: RecordOp::Upsert,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: [("preserved".to_owned(), serde_json::Value::Bool(true))]
+                .into_iter()
+                .collect(),
+        };
+        let project_json = serde_json::to_string(&project).unwrap();
+        let workspace_json = serde_json::to_string(&previous).unwrap();
+        store
+            .append_records_atomically(&[
+                (LIBRARY_SCOPE, "project", project_json.as_str()),
+                (
+                    LIBRARY_SCOPE,
+                    "project_collaboration_workspace",
+                    workspace_json.as_str(),
+                ),
+            ])
+            .unwrap();
+
+        let library = crate::library::Library::rebuild(&store).unwrap();
+        assert!(migrate_project_workspaces_and_target_sets(&mut store, &library).unwrap());
+        let migrated = crate::library::Library::rebuild(&store).unwrap();
+        let workspace = &migrated.project_collaboration_workspaces[&project.id];
+        assert_eq!(workspace.workspace_id, previous.workspace_id);
+        assert_eq!(workspace.home_id, previous.home_id);
+        assert_eq!(workspace.extra, previous.extra);
+        assert_eq!(
+            workspace.host_contract_revision,
+            crate::workstream_host_contract::REVISION
+        );
+        assert_eq!(
+            workspace.host_contract_digest,
+            crate::workstream_host_contract::DIGEST
+        );
+        assert!(!migrate_project_workspaces_and_target_sets(&mut store, &migrated).unwrap());
+
+        let mut unsupported = migrated;
+        let workspace = unsupported
+            .project_collaboration_workspaces
+            .get_mut(&project.id)
+            .unwrap();
+        workspace.host_contract_digest = "unsupported".to_owned();
+        let before = store
+            .records(LIBRARY_SCOPE, "project_collaboration_workspace")
+            .unwrap()
+            .len();
+        let error =
+            migrate_project_workspaces_and_target_sets(&mut store, &unsupported).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported WhippleScript contract pin"));
+        assert_eq!(
+            store
+                .records(LIBRARY_SCOPE, "project_collaboration_workspace")
+                .unwrap()
+                .len(),
+            before
+        );
+    }
 
     #[test]
     fn singular_binding_migrates_once_to_revision_zero_and_a_distinct_project_workspace() {
