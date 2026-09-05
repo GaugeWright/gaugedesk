@@ -121,6 +121,9 @@ export {
 } from "./tokenwright-box";
 export type { TokenWrightCommandBinding } from "./tokenwright-box";
 export { TokenWrightBoxesSection } from "./TokenWrightBoxesSection";
+export { TokenWrightBoxPanel } from "./TokenWrightBoxPanel";
+export type { TokenWrightBoxPanelProps } from "./TokenWrightBoxPanel";
+export * as tokenwrightPanel from "./tokenwright-panel";
 export type { TokenWrightBoxesSectionProps } from "./TokenWrightBoxesSection";
 export { tokenwrightProviderRow } from "./tokenwright-provider";
 export type {

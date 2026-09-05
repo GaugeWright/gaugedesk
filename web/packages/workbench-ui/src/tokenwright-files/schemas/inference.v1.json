@@ -12,6 +12,7 @@
     "hardware",
     "storage",
     "throughput",
+    "serving",
     "events"
   ],
   "additionalProperties": false,
@@ -330,6 +331,54 @@
           "type": "integer",
           "minimum": 0,
           "description": "Reclaimable by pruning orphans."
+        }
+      }
+    },
+    "serving": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "The served engine's own scheduler state, normalised into a shared vocabulary \u2014 or null for an embedded engine and while the engine is down. The box maps a fixed set of fields across engines and curates the rest into `native`; it does not expose the engine's raw metrics.",
+      "additionalProperties": false,
+      "required": [
+        "kv_cache_used_pct",
+        "running",
+        "queued",
+        "native"
+      ],
+      "properties": {
+        "kv_cache_used_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Percent of the KV-cache block pool in use. Null if the engine does not report it."
+        },
+        "running": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Requests the engine is decoding right now."
+        },
+        "queued": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Requests admitted by the box and waiting for the engine to schedule them."
+        },
+        "native": {
+          "type": "object",
+          "description": "Engine-specific metrics that do not map to a shared field, as a curated label->number bag. Empty when the engine has none worth showing.",
+          "additionalProperties": {
+            "type": "number"
+          }
         }
       }
     }

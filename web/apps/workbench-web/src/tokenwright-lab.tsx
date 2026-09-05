@@ -1,158 +1,152 @@
 /**
- * Prototype bench for **Your boxes** on Provider Connections.
+ * Bench for `TokenWrightBoxPanel` — the surface an operator works in.
  *
- * It runs the real component against the real stylesheet, so what is agreed
- * here is what ships. Served in development only (`/tokenwright-lab.html`); no
- * shipped bundle names this entry.
+ * Served in development only (`/tokenwright-lab.html`); no shipped bundle names
+ * this entry. Two modes:
  *
- * Two modes, and the difference between them is the point of the bench:
- *
- * - **fixtures** — one row per state, because the states are the design
- *   question. A box that is quiet and a box that is gone must not read alike.
- * - **live** — pointed at a real GaugeDesk control plane on loopback. Adding a
- *   box runs the actual journey: the *Home* parses the pairing string, dials
- *   the relay, pins the certificate, claims, and seals. This page sends one
- *   string and holds no capability at any point, which is exactly what it must
- *   be possible to see.
+ * - **fixtures** (default): a canned Home returning three documents, so the
+ *   panel renders every state — a loaded model, orphaned weights, a critical
+ *   posture finding, a revealed key — with no relay in the path. This is the
+ *   mode for judging the UI itself.
+ * - **live** (`?home=<base>`): the real transport against a control plane on
+ *   that origin, which the preview server proxies to.
  */
-import { createSignal, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
-import {
-    TokenWrightBoxesSection,
-    type TokenWrightObservation,
-} from "@gaugewright/workbench-ui";
-import {
-    browserRouteJson,
-    type RouteJson,
-    type StoredBox,
-} from "@gaugewright/control-plane-client";
+import { TokenWrightBoxPanel } from "@gaugewright/workbench-ui";
+import { browserRouteJson, type RouteJson } from "@gaugewright/control-plane-client";
 import "@gaugewright/workbench-ui/styles.css";
 
-const MINUTE = 60_000;
-const NOW = Date.now();
+const params = new URLSearchParams(location.search);
+const liveBase = params.get("home");
 
-/** One fixture per state a row can be in. */
-const FIXTURES: readonly (StoredBox & { readonly seen: TokenWrightObservation })[] = [
-    {
-        fingerprint: `sha256:${"ab".repeat(32)}`, relayEndpoint: "wss://relay.gaugewright.com",
-        pairedAt: "2026-08-30T09:00:00Z", homeId: "home_a", keyId: "key_c30f", sealed: true,
-        seen: { lastSeen: NOW - 4_000, models: ["tinyllama", "qwen2.5-7b", "llama-3.1-8b", "phi-4"] },
-    },
-    {
-        fingerprint: `sha256:${"cd".repeat(32)}`, relayEndpoint: "wss://relay.gaugewright.com",
-        pairedAt: "2026-08-12T14:00:00Z", homeId: "home_a", keyId: "key_44af", sealed: true,
-        seen: { lastSeen: NOW - 22 * MINUTE, models: ["deepseek-v3.1-terminus"] },
-    },
-    {
-        fingerprint: `sha256:${"ef".repeat(32)}`, relayEndpoint: "wss://relay.gaugewright.com",
-        pairedAt: "2026-07-02T11:00:00Z", homeId: "home_a", keyId: "key_9b21", sealed: true,
-        seen: { lastSeen: NOW - 5 * 60 * MINUTE, models: ["mistral-small"] },
-    },
-    {
-        fingerprint: `sha256:${"01".repeat(32)}`, relayEndpoint: "wss://relay.gaugewright.com",
-        pairedAt: "2026-09-01T08:00:00Z", homeId: "home_a", keyId: "key_7e30", sealed: true,
-        seen: { lastSeen: NOW - 30_000, models: [] },
-    },
-    {
-        fingerprint: `sha256:${"23".repeat(32)}`, relayEndpoint: "wss://relay.gaugewright.com",
-        pairedAt: "2026-09-01T21:00:00Z", homeId: "home_a", keyId: "key_0c58", sealed: true,
-        seen: {},
-    },
-    {
-        // Recorded, unopenable. Listed and unreachable, and not because the box
-        // is off — so it must not read as "not answering".
-        fingerprint: `sha256:${"45".repeat(32)}`, relayEndpoint: "wss://relay.gaugewright.com",
-        pairedAt: "2026-06-14T10:00:00Z", homeId: "home_a", keyId: "key_5f77", sealed: false,
-        seen: { lastSeen: NOW - 9 * 60 * MINUTE, models: ["gemma-2-9b"] },
-    },
-];
-
-const observations: Record<string, TokenWrightObservation> = Object.fromEntries(
-    FIXTURES.map((fixture) => [fixture.fingerprint, fixture.seen]),
-);
-
-/** A stand-in Home that answers the three box routes from the fixtures, so the
- *  bench exercises the *component* without a control plane running. */
+/** A Home that answers the three box routes from fixtures, so the panel can be
+ *  judged without a relay. Mutable where a control would change state, so
+ *  pressing a button visibly does something. */
 function fixtureHome(): RouteJson {
-    let held = [...FIXTURES.map(({ seen: _seen, ...box }) => box)];
-    return async (method, path) => {
-        if (method === "GET" && path === "/account/boxes") return { boxes: held.map(toWire) };
-        if (method === "POST" && path === "/account/boxes/claim") {
-            // The Home is what would fail here, and it would fail with a
-            // sentence. Standing in for that rather than succeeding is the
-            // honest fixture: a bench that always paired would agree with
-            // nothing.
-            throw new Error(
-                "No Home is running. Start one and switch this bench to live to"
-                + " claim a real box.",
-            );
+    const inference = {
+        desired: { model: "tinyllama", models: ["tinyllama", "qwen2.5-7b", "llama-3.1-8b"], autostart: true, direct_access: false, engine: "freetoken" },
+        engine: { name: "FreeToken", version: "0.3.2", status: "running", listen: "127.0.0.1:8721", uptime: "3d 14h", restarts: 1, last_error: null as string | null },
+        model: { id: "tinyllama", quantization: "q4_k_m", context_length: 2048, size_mib: 608, loaded_at: new Date(Date.now() - 3.6e6).toISOString() },
+        models: [
+            { id: "tinyllama", size_mib: 608, quantization: "q4_k_m", state: "loaded", digest_verified: true },
+            { id: "qwen2.5-7b", size_mib: 4470, quantization: "q4_k_m", state: "available", digest_verified: true },
+            { id: "phi-4", size_mib: 8900, quantization: "q8_0", state: "orphaned", digest_verified: true },
+        ],
+        hardware: { gpu: "NVIDIA GeForce RTX 5090", driver: "580.65.06", cuda: "13.0", vram_used_mib: 22140, vram_total_mib: 32607, ram_total_mib: 196608 },
+        storage: { disk_total_mib: 3814697, disk_free_mib: 1201203, orphaned_mib: 8900 },
+        throughput: { tokens_per_second: 41.7, active_requests: 1, max_concurrent: 4, rejected_overload_total: 3, requests_total: 18422 },
+        serving: null as null | { kv_cache_used_pct: number | null; running: number | null; queued: number | null; native: Record<string, number> },
+        events: [
+            { at: new Date(Date.now() - 12000).toISOString(), level: "info", message: "generation complete (1.7s, 214 tokens)" },
+            { at: new Date(Date.now() - 300000).toISOString(), level: "warn", message: "concurrency limit reached; one request rejected" },
+            { at: new Date(Date.now() - 3.6e6).toISOString(), level: "info", message: "loaded tinyllama (q4_k_m, 608 MiB)" },
+        ],
+    };
+    const posture = {
+        checked_at: new Date(Date.now() - 90000).toISOString(),
+        summary: { critical: 1, warning: 1, advisory: 2, checks_passed: 14 },
+        findings: [
+            { id: "POSTURE-FIREWALL-INACTIVE", severity: "critical", title: "The firewall is not running", remediation: "Enable it. Default-deny inbound is what makes the zero-listener arrangement hold when something else opens a port by accident." },
+            { id: "POSTURE-UNATTENDED-UPGRADES-OFF", severity: "warning", title: "Unattended security upgrades are disabled", remediation: "Enable unattended-upgrades. 0 security updates are already pending." },
+            { id: "POSTURE-STATE-ROOT-PLAINTEXT", severity: "advisory", title: "The box's state root is not on an encrypted volume", remediation: "Move the state root onto a LUKS volume if the box can be physically removed." },
+            { id: "POSTURE-AUDIT-UNANCHORED", severity: "advisory", title: "3 trail entries are not yet covered by an anchor the Home holds", remediation: "They are anchored on the next relay reconnect." },
+        ],
+        network: { listeners: [], firewall: { backend: "ufw", active: false, default_incoming: "deny", allow_rules: 1 }, wireguard: { enabled: false, interface: null, listen_port: null, peers: 0, public_key: null } },
+        services: [
+            { unit: "tokenwright.service", state: "active", user: "tokenwright", no_new_privileges: true, protect_system: "strict", network_restricted: false },
+            { unit: "tokenwright-engine.service", state: "active", user: "tokenwright-engine", no_new_privileges: true, protect_system: "strict", network_restricted: true },
+        ],
+        audit: { entries: 1284, head: "3f9c2a…", chain_verified: true, anchored_count: 1281, last_anchored_at: new Date(Date.now() - 240000).toISOString() },
+    };
+    const access = {
+        pairing: { home: "local-user", paired_at: new Date(Date.now() - 6.9e7).toISOString(), fingerprint: "sha256:cfc34f343d1c496594c82f5a3956cf5b9a67057187bf73164245d684d129e1ee" },
+        relay: { status: "parked", endpoint: "wss://relay.gaugewright.com", route_epoch: 4, last_connected_at: new Date(Date.now() - 30000).toISOString() },
+        direct: { enabled: false, base_url: null as string | null },
+        keys: [
+            { id: "key_1c93", name: "paired-home", prefix: "tw_Nsq", created_at: new Date(Date.now() - 6.9e7).toISOString(), last_used_at: new Date(Date.now() - 4000).toISOString(), state: "active" },
+            { id: "key_7e30", name: "workbench-web", prefix: "tw_H2k", created_at: new Date(Date.now() - 8.6e6).toISOString(), last_used_at: new Date(Date.now() - 900000).toISOString(), state: "active" },
+        ],
+        reveal: null as null | { key: string; secret: string },
+    };
+    const revisions: Record<string, number> = { "tokenwright.inference": 1, "tokenwright.posture": 1, "tokenwright.access": 1 };
+    const rev = (id: string) => `rev${revisions[id]}${"0".repeat(60)}`.slice(0, 64);
+    const content = (id: string): unknown =>
+        id === "tokenwright.inference" ? inference : id === "tokenwright.posture" ? posture : access;
+
+    const boxes = [{ fingerprint: access.pairing.fingerprint, relay_endpoint: access.relay.endpoint, paired_at: access.pairing.paired_at, home_id: "local-user", key_id: "key_1c93", sealed: true }];
+
+    /** Bring the running engine in line with the requested one, the way a
+     *  restart does — including the served-engine sparseness a real box shows. */
+    function realiseEngine(): void {
+        const wanted = inference.desired.engine;
+        const served = wanted !== "freetoken";
+        inference.engine.name = ({ freetoken: "FreeToken", vllm: "vLLM", sglang: "SGLang" } as Record<string, string>)[wanted] ?? wanted;
+        inference.engine.version = served ? (wanted === "vllm" ? "0.28.0" : "0.5.10") : "0.3.2";
+        const id = inference.desired.model;
+        inference.model = served
+            ? { id, quantization: null, context_length: null, size_mib: null, loaded_at: null } as unknown as typeof inference.model
+            : { id, quantization: "q4_k_m", context_length: 2048, size_mib: 608, loaded_at: new Date().toISOString() } as typeof inference.model;
+        // A served engine reports its scheduler state; an embedded one has none.
+        inference.serving = served
+            ? {
+                kv_cache_used_pct: wanted === "vllm" ? 63 : 41,
+                running: 3, queued: wanted === "vllm" ? 1 : 0,
+                native: wanted === "vllm"
+                    ? { "Preemptions": 4, "Prefix-cache hit rate": 0.55 }
+                    : { "Radix-cache hit rate": 0.31, "Generation throughput (tok/s)": 118.4 },
+              }
+            : null;
+    }
+
+    return async (method, path, body) => {
+        await new Promise((r) => setTimeout(r, 120));
+        if (method === "GET" && path === "/account/boxes") return { boxes };
+        const m = /\/surface\/environments\/tokenwright\/(\w+)/.exec(path);
+        if (!m) throw new Error(`fixture has no route for ${method} ${path}`);
+        const surface = m[1]!;
+        if (surface === "sessions") {
+            return { session: {
+                id: "sess_key_1c93", environment: "tokenwright", scope: { kind: "box", id: "self" },
+                actor: "paired-home", capabilities: ["AdministerBox", "RunTurn"],
+                documents: [
+                    { id: "tokenwright.inference", readable: true, editable: true, freshness: "live", commands: ["tokenwright.engine.stop", "tokenwright.engine.restart", "tokenwright.engine.update", "tokenwright.model.reconcile", "tokenwright.model.unload", "tokenwright.models.reconcile", "tokenwright.models.prune"] },
+                    { id: "tokenwright.posture", readable: true, editable: false, freshness: "live", commands: ["tokenwright.posture.rescan", "tokenwright.wireguard.enable", "tokenwright.wireguard.disable"] },
+                    { id: "tokenwright.access", readable: true, editable: true, freshness: "live", commands: ["tokenwright.key.acknowledge", "tokenwright.unpair"] },
+                ],
+            } };
         }
-        const forgotten = /^\/account\/boxes\/([0-9a-f]{64})$/u.exec(path);
-        if (method === "DELETE" && forgotten) {
-            held = held.filter((box) => !box.fingerprint.endsWith(forgotten[1]!));
-            return { forgotten: true };
+        if (surface === "documents") {
+            const id = /documents\/([\w.]+)/.exec(path)![1]!;
+            return { document: { id, schema: `gw://schemas/tokenwright/${id.split(".")[1]}/v1`, revision: rev(id), content: content(id) } };
         }
-        throw new Error(`the bench does not answer ${method} ${path}`);
+        if (surface === "commands") {
+            const b = body as { command_id: string; document_id: string };
+            // Make the controls visibly change fixture state, the way a box would.
+            if (b.command_id === "tokenwright.engine.stop") { inference.engine.status = "stopped" as typeof inference.engine.status; }
+            if (b.command_id === "tokenwright.engine.restart" || b.command_id === "tokenwright.engine.start" || b.command_id === "tokenwright.model.reconcile") {
+                // A restart realises the requested engine — and a served engine
+                // reports the model id only, so the box's own driver leaves the
+                // rest null. This is what makes the served path visible in the
+                // bench: switch to vLLM, restart, watch the Model card go sparse.
+                realiseEngine();
+                inference.engine.status = "running" as typeof inference.engine.status;
+            }
+            if (b.command_id === "tokenwright.model.unload") { inference.model = { id: null, quantization: null, context_length: null, size_mib: null, loaded_at: null } as unknown as typeof inference.model; }
+            if (b.command_id === "tokenwright.models.prune") { inference.models = inference.models.filter((x) => x.state !== "orphaned"); inference.storage.orphaned_mib = 0; }
+            revisions[b.document_id] = (revisions[b.document_id] ?? 1) + 1;
+            return { receipt: { id: "rcpt_demo", command_id: b.command_id, status: "applied", at: new Date().toISOString(), detail: null } };
+        }
+        if (surface === "changes") {
+            const b = body as { content: { desired: typeof inference.desired } };
+            inference.desired = { ...inference.desired, ...b.content.desired };
+            revisions["tokenwright.inference"] = (revisions["tokenwright.inference"] ?? 1) + 1;
+            return { receipt: { id: "rcpt_demo", command_id: "literal.edit", status: "applied", at: new Date().toISOString(), detail: "tokenwright.inference" }, revision: rev("tokenwright.inference") };
+        }
+        throw new Error(`fixture has no route for ${method} ${path}`);
     };
 }
 
-function toWire(box: StoredBox): Record<string, unknown> {
-    return {
-        fingerprint: box.fingerprint,
-        relay_endpoint: box.relayEndpoint,
-        paired_at: box.pairedAt,
-        home_id: box.homeId,
-        key_id: box.keyId,
-        sealed: box.sealed,
-    };
-}
-
-function Bench(): JSX.Element {
-    const [live, setLive] = createSignal(false);
-    const fixtures = fixtureHome();
-    // The real transport. `?home=` points the bench at a control plane on
-    // another port; without it, this origin — which is what the shipped app
-    // does, since the page is served by the Home it talks to.
-    const base = new URLSearchParams(location.search).get("home") ?? "";
-    const home = browserRouteJson(base);
-
-    return (
-        <div class="lab">
-            <header class="lab-head">
-                <h1>Your boxes — Provider Connections</h1>
-                <p>
-                    A TokenWright box is an OpenAI-compatible endpoint the person owns.
-                    It is not a Project Host (it runs no Home) and not a GaugeApp (its
-                    read models come from the box), so it sits with the other provider
-                    connections in Account Settings.
-                </p>
-                <p class="lab-note">
-                    Every box operation goes to the Home. Adding one sends a pairing
-                    string and gets back a description — the Home parses it, dials the
-                    relay, pins the certificate, claims, and seals. This page never
-                    holds the box's route or key, and the list it reads has nowhere to
-                    put them.
-                </p>
-                <label class="lab-actions">
-                    <input type="checkbox" checked={live()}
-                           onChange={(event) => setLive(event.currentTarget.checked)} />
-                    Live — talk to a real control plane on this origin
-                </label>
-            </header>
-
-            <div class="lab-stage">
-                <Show
-                    when={live()}
-                    fallback={
-                        <TokenWrightBoxesSection json={fixtures} observations={observations} />
-                    }
-                >
-                    <TokenWrightBoxesSection json={home} />
-                </Show>
-            </div>
-        </div>
-    );
-}
+const home = liveBase !== null ? browserRouteJson(liveBase) : fixtureHome();
 
 const mount = document.getElementById("root");
-if (mount) render(() => <Bench />, mount);
+if (mount) render(() => <TokenWrightBoxPanel json={home} />, mount);

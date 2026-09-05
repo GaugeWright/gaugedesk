@@ -34,6 +34,9 @@ const inferenceDocument = {
         tokens_per_second: 0, active_requests: 0, max_concurrent: 4,
         rejected_overload_total: 0, requests_total: 0,
     },
+    // Null: this fixture is an embedded (FreeToken) box; a served engine
+    // carries a populated block. Required either way by the schema.
+    serving: null,
     events: [],
 };
 
