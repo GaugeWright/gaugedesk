@@ -130,7 +130,12 @@ export interface FacetBrowserApi {
     retryTargetSettlementMember(declarationId: string, memberId: string): Promise<void>;
     getTargetSettlement(declarationId: string): Promise<void>;
     supersedeTargetSettlementMember(declarationId: string, memberId: string, laterDeclarationId: string, laterMemberId: string): Promise<void>;
-    compensateTargetSettlement(declarationId: string, receiptRefs: readonly string[], reconciliationComplete: boolean): Promise<void>;
+    compensateTargetSettlement(declarationId: string, receiptLinks: readonly {
+        original_receipt_ref: string;
+        compensation_declaration_id: string;
+        compensation_member_id: string;
+        compensation_receipt_ref: string;
+    }[]): Promise<void>;
     abandonTargetSettlement(declarationId: string, reason: string): Promise<void>;
     cancelTargetSettlement(declarationId: string, reason: string): Promise<void>;
     archiveWorkstream(ws: WorkstreamId): Promise<void>;
@@ -1612,17 +1617,24 @@ export function FacetBrowser(props: {
                                             () => props.api.getTargetSettlement(declarationId()),
                                             "refreshed durable settlement diagnostics",
                                         )}>Refresh diagnostics</button>
-                                        <Show when={workstream.targetSettlement === "partially-applied" || workstream.targetSettlement === "reconciliation-required"}>
+                                        <Show when={workstream.targetSettlement === "partially-applied"}>
                                             <button type="button" onClick={() => {
-                                                const receipts = window.prompt("Authenticated compensation receipt references, separated by commas");
-                                                if (receipts === null) return;
-                                                const refs = receipts.split(",").map((value) => value.trim()).filter(Boolean);
-                                                if (refs.length === 0) return;
+                                                const raw = window.prompt("Forward-repair links, one per line: original receipt | later declaration | later member | later receipt");
+                                                if (raw === null) return;
+                                                const links = raw.split("\n").map((line) => line.split("|").map((value) => value.trim())).filter((parts) => parts.some(Boolean));
+                                                if (links.length === 0 || links.some((parts) => parts.length !== 4 || parts.some((part) => !part))) return;
                                                 void withRefresh(
-                                                    () => props.api.compensateTargetSettlement(declarationId(), refs, workstream.targetSettlement !== "reconciliation-required"),
-                                                    "recorded forward compensation receipts",
+                                                    () => props.api.compensateTargetSettlement(declarationId(), links.map((parts) => ({
+                                                        original_receipt_ref: parts[0]!,
+                                                        compensation_declaration_id: parts[1]!,
+                                                        compensation_member_id: parts[2]!,
+                                                        compensation_receipt_ref: parts[3]!,
+                                                    }))),
+                                                    "recorded authenticated forward-repair links",
                                                 );
                                             }}>Record compensation…</button>
+                                        </Show>
+                                        <Show when={workstream.targetSettlement === "partially-applied" || workstream.targetSettlement === "reconciliation-required"}>
                                             <button type="button" onClick={() => {
                                                 const reason = window.prompt("Why is this partial settlement being abandoned?");
                                                 if (!reason?.trim()) return;

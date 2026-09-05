@@ -64,7 +64,7 @@ run_contracts() {
     # section working and every gate green. It is checked here because
     # `contracts` is a required context and this needs nothing but bash.
     echo "== check composition =="
-    node --test scripts/check-lanes.test.mjs
+    node --test scripts/check-lanes.test.mjs scripts/check-live-fabric.test.mjs
 
     echo "== architecture boundaries =="
     python3 scripts/architecture-check.py
@@ -559,6 +559,11 @@ dispatch() {
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
     return 0
 fi
+
+# Before any section: a development fabric serving THIS checkout is watching
+# and running binaries from the tree the lanes below are about to rebuild.
+# Neither can see the other, so nothing else was ever going to report it.
+node scripts/check-live-fabric.mjs
 
 dispatch "$section" "${2:-}"
 

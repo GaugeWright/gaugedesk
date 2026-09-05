@@ -44,6 +44,36 @@ fn digest(value: impl AsRef<[u8]>) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(value.as_ref())))
 }
 
+impl WorkstreamPromotionManifest {
+    pub(crate) fn change_set(
+        &self,
+        placement_id: String,
+        candidates: Vec<TargetCandidateSnapshot>,
+        refresh_native_bases: bool,
+    ) -> Result<TargetChangeSetDeclaration, String> {
+        let id = format!(
+            "promotion-change-set:{}",
+            digest(
+                serde_json::to_vec(&(&self.id, refresh_native_bases, &candidates))
+                    .map_err(|error| error.to_string())?
+            )
+        );
+        Ok(TargetChangeSetDeclaration {
+            schema: "gaugedesk.target-change-set.v1".to_owned(),
+            id,
+            chat_id: self.workstream_id.clone(),
+            run_ref: self.id.clone(),
+            project_id: self.project_id.clone(),
+            placement_id,
+            package_version_ref: String::new(),
+            target_set_revision: 0,
+            turn_process_declaration_id: format!("promotion-process:{}", self.id),
+            candidate_snapshots: candidates,
+            requested_acts: Vec::new(),
+        })
+    }
+}
+
 impl Workbench {
     pub(crate) fn workstream_promotion_manifests(
         &self,
@@ -279,13 +309,11 @@ impl Workbench {
                 );
             }
         }
-        let id = format!(
-            "promotion-change-set:{}",
-            digest(
-                serde_json::to_vec(&(&manifest.id, refresh_native_bases, &candidates))
-                    .map_err(|error| error.to_string())?
-            )
-        );
+        let placement_id = self
+            .workstream(&manifest.workstream_id)
+            .map(|workstream| workstream.instance_id)
+            .ok_or_else(|| "workstream declaration is unavailable".to_owned())?;
+        let declaration = manifest.change_set(placement_id, candidates, refresh_native_bases)?;
         if let Some(existing) = self
             .store_ref()
             .records(&manifest.workstream_id, TARGET_CHANGE_SET_DECLARATION_KIND)
@@ -297,27 +325,13 @@ impl Workbench {
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .find(|declaration| declaration.id == id)
+            .find(|existing| existing.id == declaration.id)
         {
+            if existing != declaration {
+                return Err("promotion change-set identity has incompatible evidence".to_owned());
+            }
             return Ok(existing);
         }
-        let placement_id = self
-            .workstream(&manifest.workstream_id)
-            .map(|workstream| workstream.instance_id)
-            .ok_or_else(|| "workstream declaration is unavailable".to_owned())?;
-        let declaration = TargetChangeSetDeclaration {
-            schema: "gaugedesk.target-change-set.v1".to_owned(),
-            id,
-            chat_id: manifest.workstream_id.clone(),
-            run_ref: manifest.id.clone(),
-            project_id: manifest.project_id.clone(),
-            placement_id,
-            package_version_ref: String::new(),
-            target_set_revision: 0,
-            turn_process_declaration_id: format!("promotion-process:{}", manifest.id),
-            candidate_snapshots: candidates,
-            requested_acts: Vec::new(),
-        };
         self.store_mut()
             .append_record(
                 &manifest.workstream_id,
@@ -326,6 +340,51 @@ impl Workbench {
             )
             .map_err(|error| format!("{error:?}"))?;
         Ok(declaration)
+    }
+
+    /// A manifest reference confers no authority on an unrelated change set.
+    /// Detached settlement may refresh only the native bases and their fresh
+    /// admission handles, never the promoted candidate substance or provenance.
+    pub(crate) fn validate_promotion_change_set(
+        &self,
+        source: &TargetChangeSetDeclaration,
+        manifest_ref: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(manifest_ref) = manifest_ref else {
+            return Ok(());
+        };
+        let manifest = self.workstream_promotion_manifest(&source.chat_id, Some(manifest_ref))?;
+        let placement_id = self
+            .workstream(&manifest.workstream_id)
+            .map(|workstream| workstream.instance_id)
+            .ok_or_else(|| "promotion manifest workstream declaration is unavailable".to_owned())?;
+        if *source
+            == manifest.change_set(placement_id.clone(), manifest.partitions.clone(), false)?
+        {
+            return Ok(());
+        }
+        if source.candidate_snapshots.len() == manifest.partitions.len() {
+            let mut detached = manifest.partitions.clone();
+            for (candidate, recorded) in detached.iter_mut().zip(&source.candidate_snapshots) {
+                // Use the immutable admitted basis, not today's target head:
+                // query/replay must remain valid after the effect advances it.
+                if recorded.native_basis.is_empty() {
+                    return Err("promotion manifest detached basis is empty".to_owned());
+                }
+                candidate.native_basis = recorded.native_basis.clone();
+                candidate.policy_decision_handles.insert(
+                    0,
+                    format!(
+                        "detached-candidate-admission:{}:{}",
+                        manifest.id, candidate.native_basis
+                    ),
+                );
+            }
+            if *source == manifest.change_set(placement_id, detached, true)? {
+                return Ok(());
+            }
+        }
+        Err("settlement change set does not match its exact promotion manifest".to_owned())
     }
 
     pub(crate) fn create_workstream_target_settlement(
@@ -585,6 +644,15 @@ mod tests {
         assert_eq!(topology.status, StreamStatus::Active);
         assert_eq!(topology.expected_line_cut, None);
         assert_eq!(topology.expected_main_cut, None);
+        assert_eq!(topology.reservation_id, None, "cleanup was acknowledged");
+        let fresh = workbench.collaboration_workspaces[&workspace_id]
+            .reserve_workstream_promotion_boundary(&workstream_id, "reservation:after-refusal")
+            .expect("a failed combined preflight must not strand the next promotion");
+        assert_eq!(fresh.reservation_id, "reservation:after-refusal");
+        assert_eq!(fresh.expected_main_cut, reservation.expected_main_cut);
+        workbench.collaboration_workspaces[&workspace_id]
+            .release_workstream_promotion_boundary(&workstream_id, &fresh.reservation_id)
+            .expect("release fresh reservation");
     }
 
     #[test]
@@ -640,6 +708,172 @@ mod tests {
         );
         drop(probe);
         target.remove_engagement(&probe_id).expect("cleanup");
+    }
+
+    #[test]
+    fn promotion_settlement_refuses_an_unrelated_candidate_before_declaring_work() {
+        let root = tempfile::tempdir().expect("root");
+        let shared = open_workbench(root.path()).expect("workbench");
+        let mut workbench = shared.lock_unpoisoned();
+        let (workstream_id, workspace_id, _, target_id) = seeded_workstream(&mut workbench);
+        let reservation = workbench.collaboration_workspaces[&workspace_id]
+            .reserve_workstream_promotion_boundary(&workstream_id, "reservation:binding")
+            .expect("reserve");
+        let manifest = workbench
+            .build_workstream_promotion_manifest(&workstream_id, &reservation)
+            .expect("manifest");
+        let mut unrelated = workbench
+            .ensure_promotion_change_set(&manifest, false)
+            .expect("source");
+        unrelated.candidate_snapshots[0].candidate_digest = "sha256:unrelated".into();
+        unrelated.id = format!(
+            "promotion-change-set:{}",
+            digest(
+                serde_json::to_vec(&(&manifest.id, false, &unrelated.candidate_snapshots)).unwrap()
+            )
+        );
+        workbench
+            .store_mut()
+            .append_record(
+                &workstream_id,
+                TARGET_CHANGE_SET_DECLARATION_KIND,
+                &serde_json::to_string(&unrelated).unwrap(),
+            )
+            .unwrap();
+        let events_before = workbench.store_ref().events(&workstream_id).unwrap();
+        let lane_scope = format!("target-settlement-lane::{target_id}");
+        let lane_before = workbench.store_ref().events(&lane_scope).unwrap();
+        let result = workbench.create_target_settlement(
+            &workstream_id,
+            &unrelated.id,
+            Some(manifest.id),
+            vec![RequestedSettlementMember {
+                target_id,
+                act: TargetActKind::Apply,
+            }],
+        );
+        assert!(
+            result.is_err(),
+            "an unrelated candidate borrowed a genuine manifest: {result:?}"
+        );
+        assert_eq!(
+            workbench.store_ref().events(&workstream_id).unwrap(),
+            events_before
+        );
+        assert_eq!(
+            workbench.store_ref().events(&lane_scope).unwrap(),
+            lane_before
+        );
+    }
+
+    #[test]
+    fn promotion_source_validation_preserves_all_candidate_and_declaration_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = open_workbench(root.path()).unwrap();
+        let mut workbench = shared.lock_unpoisoned();
+        let (workstream_id, workspace_id, _, _) = seeded_workstream(&mut workbench);
+        let reservation = workbench.collaboration_workspaces[&workspace_id]
+            .reserve_workstream_promotion_boundary(&workstream_id, "reservation:evidence")
+            .unwrap();
+        let manifest = workbench
+            .build_workstream_promotion_manifest(&workstream_id, &reservation)
+            .unwrap();
+        type Mutation = (&'static str, fn(&mut TargetChangeSetDeclaration));
+        let mutations: &[Mutation] = &[
+            ("schema", |source| source.schema.push('x')),
+            ("chat", |source| source.chat_id.push('x')),
+            ("run", |source| source.run_ref.push('x')),
+            ("project", |source| source.project_id.push('x')),
+            ("placement", |source| source.placement_id.push('x')),
+            ("package", |source| source.package_version_ref.push('x')),
+            ("target revision", |source| source.target_set_revision += 1),
+            ("process", |source| {
+                source.turn_process_declaration_id.push('x')
+            }),
+            ("omitted partition", |source| {
+                source.candidate_snapshots.clear()
+            }),
+            ("extra partition", |source| {
+                source
+                    .candidate_snapshots
+                    .push(source.candidate_snapshots[0].clone())
+            }),
+            ("target", |source| {
+                source.candidate_snapshots[0].target_id.push('x')
+            }),
+            ("basis without fresh admission", |source| {
+                source.candidate_snapshots[0].native_basis.push('x')
+            }),
+            ("workspace", |source| {
+                source.candidate_snapshots[0]
+                    .candidate_workspace_id
+                    .push('x')
+            }),
+            ("line", |source| {
+                source.candidate_snapshots[0].candidate_line_ref.push('x')
+            }),
+            ("identity", |source| {
+                source.candidate_snapshots[0].candidate_identity.push('x')
+            }),
+            ("cut", |source| {
+                source.candidate_snapshots[0].candidate_cut.push('x')
+            }),
+            ("digest", |source| {
+                source.candidate_snapshots[0].candidate_digest.push('x')
+            }),
+            ("scope", |source| {
+                source.candidate_snapshots[0].path_scope.clear()
+            }),
+            ("adapter", |source| {
+                source.candidate_snapshots[0].adapter_family.push('x')
+            }),
+            ("paths", |source| {
+                source.candidate_snapshots[0].changed_paths.clear()
+            }),
+            ("checks", |source| {
+                source.candidate_snapshots[0]
+                    .checks
+                    .push("forged=held".into())
+            }),
+            ("policy", |source| {
+                source.candidate_snapshots[0]
+                    .policy_decision_handles
+                    .clear()
+            }),
+        ];
+        for detached in [false, true] {
+            let source = workbench
+                .ensure_promotion_change_set(&manifest, detached)
+                .unwrap();
+            workbench
+                .validate_promotion_change_set(&source, Some(&manifest.id))
+                .unwrap();
+            for (name, mutate) in mutations {
+                let mut changed = source.clone();
+                mutate(&mut changed);
+                // Even an internally consistent digest cannot replace exact
+                // manifest provenance with caller-chosen candidate evidence.
+                changed.id = manifest
+                    .change_set(
+                        changed.placement_id.clone(),
+                        changed.candidate_snapshots.clone(),
+                        detached,
+                    )
+                    .unwrap()
+                    .id;
+                assert!(
+                    workbench
+                        .validate_promotion_change_set(&changed, Some(&manifest.id))
+                        .is_err(),
+                    "accepted altered {name}, detached={detached}"
+                );
+            }
+            let mut wrong_id = source;
+            wrong_id.id.push('x');
+            assert!(workbench
+                .validate_promotion_change_set(&wrong_id, Some(&manifest.id))
+                .is_err());
+        }
     }
 
     #[test]

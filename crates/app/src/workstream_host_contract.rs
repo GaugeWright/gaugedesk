@@ -2,5 +2,5 @@
 //! is allowed to consume. `scripts/check-whipplescript-workstream-contract.mjs`
 //! binds these runtime values to the public Git dependency and the pin manifest.
 
-pub const REVISION: &str = "whipplescript-workstream-host/v1.0.0";
-pub const DIGEST: &str = "7766b8cb9a824ae43c7523fd92295dca21f26e7c9abf156f5a46663ce9b1b0f7";
+pub const REVISION: &str = "whipplescript-workstream-host/v1.0.2";
+pub const DIGEST: &str = "a6ac1ea8be061c728c89dd2b4b005f206e604a151260ae329f34bd1bdbcdc5b0";

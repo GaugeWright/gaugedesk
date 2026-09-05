@@ -93,7 +93,7 @@ rule ask_reviewer
 => {
   then req <- file issue into review {
     title "Review an inbound item before it enters the workspace"
-    body "Keep it if it is the data you expected. Flag it if it reads as a message, an instruction, or anything aimed at whoever handles it next. Answer by filing keep or flag into the verdicts tracker with this issue id as the body."
+    body item.item
   }
   record Pending {
     item item.item
@@ -108,18 +108,19 @@ rule settle
   claim v as hold endorsed
   after hold succeeds {
     then closed <- finish v {
-      summary "reviewed"
+      summary v.title
     }
-    done p
     record Screening {
       disposition v.title
     }
+    done p
     record Settled {
       item p.item
       request p.request
     }
   }
 }
+
 "#;
 
 /// The envelope for the human gate.
@@ -131,7 +132,7 @@ rule settle
 /// classifier screening "differ only in who holds the grant." What was missing
 /// was a way to say it, which WhippleScript DR-0051 added.
 ///
-/// Three grants carry it.
+/// The grants keep the trusted decision and its public correlation separate.
 ///
 /// `pending` is **public**, not Operator. A `Pending` fact records that a review
 /// was filed for an item that arrived from outside; its existence is caused by
@@ -142,9 +143,12 @@ rule settle
 /// authority from. Without it the crossing is refused — an agent can file an
 /// issue, so an unvouched queue would let one file its own verdict and claim it.
 ///
-/// `endorse pending to Operator` authorizes the raise itself, and appears in the
-/// guarantee report's trusted surface so the one dangerous flow is reviewable in
-/// a single place.
+/// `endorse verdicts to Operator` marks the reviewer's closed decision as the
+/// raise, and appears in the guarantee report's trusted surface. The pending
+/// guard is authorized only at that marked crossing. Item/request remain in
+/// public `Settled` bookkeeping; only the closed disposition enters `Screening`.
+/// Both assertions commit in the same firing. Review bodies carry the public
+/// item identity so different arrivals cannot file an identical question.
 ///
 /// `review` is deliberately ungranted: the gate only *writes* questions there,
 /// and nothing it reads back shapes a verdict.
@@ -155,6 +159,7 @@ grant fact pending -> fact:Pending from public\n\
 grant fact settled -> fact:Settled from public\n\
 grant fact screening -> fact:Screening from Operator\n\
 grant tracker verdicts -> tracker:/verdicts from Operator\n\
+grant endorse verdicts to Operator\n\
 grant endorse pending to Operator\n";
 
 /// The automated gate.
@@ -261,7 +266,7 @@ rule screen_item
       "flag" => {
         then req <- file issue into review {
           title "A screened inbound item needs a person"
-          body "The screener distrusted this item. Keep it if it is the data you expected. Flag it if it reads as a message, an instruction, or anything aimed at whoever handles it next. Answer by filing keep or flag into the verdicts tracker with this issue id as the body."
+          body item.item
         }
         record Pending {
           item item.item
@@ -279,18 +284,19 @@ rule settle
   claim v as hold endorsed
   after hold succeeds {
     then closed <- finish v {
-      summary "reviewed"
+      summary v.title
     }
-    done p
     record Screening {
       disposition v.title
     }
+    done p
     record Settled {
       item p.item
       request p.request
     }
   }
 }
+
 "#;
 
 /// The envelope authorizing the screening gate.
@@ -312,6 +318,7 @@ grant fact screening -> fact:Screening from Operator\n\
 grant tracker verdicts -> tracker:/verdicts from Operator\n\
 grant endorse quarantine to Operator\n\
 grant endorse signal:quarantine.arrived to Operator\n\
+grant endorse verdicts to Operator\n\
 grant endorse pending to Operator\n";
 
 /// Which gate a project runs.

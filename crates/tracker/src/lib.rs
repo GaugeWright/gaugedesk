@@ -130,6 +130,7 @@ impl WhipTrackerHandle {
             source_hash: "onboarding-v1",
             ir_hash: "onboarding-v1",
             compiler_version: env!("CARGO_PKG_VERSION"),
+            ir_snapshot: None,
         })?;
         let instance_id = kernel.create_instance(&version, "{}")?;
         fs::write(&marker, &instance_id)?;

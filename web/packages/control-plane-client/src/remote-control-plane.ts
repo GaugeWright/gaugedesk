@@ -226,8 +226,8 @@ export class RemoteControlPlane implements ControlPlane {
         return workbench.supersedeTargetSettlementMember(this.transport(), declarationId, memberId, laterDeclarationId, laterMemberId);
     }
 
-    compensateTargetSettlement(declarationId: string, receiptRefs: readonly string[], reconciliationComplete: boolean): Promise<unknown> {
-        return workbench.compensateTargetSettlement(this.transport(), declarationId, receiptRefs, reconciliationComplete);
+    compensateTargetSettlement(declarationId: string, receiptLinks: readonly workbench.CompensationReceiptLink[]): Promise<unknown> {
+        return workbench.compensateTargetSettlement(this.transport(), declarationId, receiptLinks);
     }
 
     abandonTargetSettlement(declarationId: string, reason: string): Promise<unknown> {

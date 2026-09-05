@@ -630,6 +630,55 @@ async fn archived_historical_home_requires_an_explicit_current_destination() {
     assert_eq!(admission["admitted_home"]["stream_id"], current_stream);
 }
 
+#[test]
+fn old_v1_home_receipt_survives_a_persisted_turn_fork_snapshot() {
+    // A synthetic snapshot in the old pinned contract's serialized shape. The
+    // upstream old-runtime fixture proves the handle itself is replay-stable;
+    // this consumer test proves GaugeDesk neither widens nor re-keys it while
+    // persisting the larger product snapshot around it.
+    let old = serde_json::json!({
+        "target_set_revision": 3,
+        "targets": [{
+            "target_id": "target-a", "native_basis": "basis-a",
+            "adapter_family": "native", "path_scope": ["src/**"],
+            "capabilities": {"read":true,"propose":true,"apply":false,"publish":false,"release":false},
+            "participation": "read-only"
+        }],
+        "collaboration_workspace_id": "project-workspace",
+        "historical_home": {
+            "schema": "branch_home_receipt_v1",
+            "branch_id": "chat",
+            "stream_id": "stream",
+            "line_branch_id": "line",
+            "stream_status": "active",
+            "authority_position": 4,
+            "evidence_handle": "sha256:b7608a5ba433150b04c865429e999035",
+            "recorded_at": "2026-09-01T00:00:00Z"
+        },
+        "governance_epoch": 8,
+        "governance_envelope_digest": "sha256:policy",
+        "visible_settlement_handles": [], "visible_settlements": [],
+        "before_taint_evidence_digest": "sha256:before",
+        "after_taint_evidence_digest": "sha256:after",
+        "before_collaboration_cut": "cut-before",
+        "after_collaboration_cut": "cut-after"
+    });
+    let snapshot: crate::engine::TurnForkSnapshot =
+        serde_json::from_value(old.clone()).expect("old v1 snapshot remains readable");
+    assert_eq!(serde_json::to_value(&snapshot).unwrap(), old);
+    assert_eq!(snapshot.historical_home.authority_position, 4);
+    assert_eq!(
+        snapshot.historical_home.evidence_handle,
+        "sha256:b7608a5ba433150b04c865429e999035"
+    );
+    assert_eq!(snapshot.targets[0].target_id, "target-a");
+    assert_eq!(snapshot.targets[0].native_basis, "basis-a");
+    let replay: crate::engine::TurnForkSnapshot =
+        serde_json::from_str(&serde_json::to_string(&snapshot).expect("persist old snapshot"))
+            .expect("reopen old snapshot");
+    assert_eq!(replay, snapshot);
+}
+
 #[tokio::test]
 async fn explicit_resource_access_request_approve_revoke_routes() {
     // CORE-3: the multi-party request → approve → grant → revoke lifecycle over HTTP.

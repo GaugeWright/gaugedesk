@@ -164,6 +164,27 @@ pub struct AuthenticatedTargetReceipt {
     pub failure_reason: Option<String>,
 }
 
+/// A forward-repair receipt and the exact successful effect it compensates.
+/// The shell authenticates and resolves both settlements; the reducer keeps
+/// the one-to-one linkage durable and refuses partial or duplicate coverage.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CompensationReceiptLink {
+    pub original_receipt_ref: String,
+    pub compensation_declaration_id: String,
+    pub compensation_member_id: String,
+    pub compensation_receipt_ref: String,
+}
+
+impl CompensationReceiptLink {
+    fn valid(&self) -> bool {
+        valid_identity(&self.original_receipt_ref)
+            && valid_identity(&self.compensation_declaration_id)
+            && valid_identity(&self.compensation_member_id)
+            && valid_identity(&self.compensation_receipt_ref)
+            && self.original_receipt_ref != self.compensation_receipt_ref
+    }
+}
+
 impl AuthenticatedTargetReceipt {
     fn exact_for(&self, member: &SettlementMemberDeclaration) -> bool {
         if self.member_id != member.member_id
@@ -258,6 +279,8 @@ pub struct TargetSettlementState {
     pub started_effects: u32,
     pub terminal_reason: Option<String>,
     pub compensation_receipt_refs: Vec<String>,
+    #[serde(default)]
+    pub compensation_receipt_links: Vec<CompensationReceiptLink>,
     pub history_events: u64,
 }
 
@@ -298,8 +321,7 @@ pub enum TargetSettlementCommand {
         later_member_ref: String,
     },
     MarkCompensated {
-        receipt_refs: Vec<String>,
-        reconciliation_complete: bool,
+        receipt_links: Vec<CompensationReceiptLink>,
     },
     AbandonPartial {
         reason: String,
@@ -350,6 +372,9 @@ pub enum TargetSettlementEvent {
     CoordinatorPhaseChanged(SettlementPhase),
     CoordinatorCompensated {
         receipt_refs: Vec<String>,
+    },
+    CoordinatorCompensatedV2 {
+        receipt_links: Vec<CompensationReceiptLink>,
     },
     CoordinatorAbandonedPartial {
         reason: String,
@@ -630,20 +655,47 @@ pub fn decide(
                 E::CoordinatorPhaseChanged(phase),
             ])
         }
-        C::MarkCompensated {
-            receipt_refs,
-            reconciliation_complete,
-        } => {
-            if !matches!(state.phase, P::PartiallyApplied | P::ReconciliationRequired)
-                || receipt_refs.is_empty()
-                || receipt_refs.iter().any(|value| !valid_identity(value))
-                || state.phase == P::ReconciliationRequired && !reconciliation_complete
+        C::MarkCompensated { receipt_links } => {
+            let successful_receipts = state
+                .members
+                .values()
+                .filter_map(|member| {
+                    member.receipt.as_ref().and_then(|receipt| {
+                        (receipt.outcome == ReceiptOutcome::Succeeded)
+                            .then(|| receipt.receipt_ref.clone())
+                    })
+                })
+                .collect::<BTreeSet<_>>();
+            let linked_originals = receipt_links
+                .iter()
+                .map(|link| link.original_receipt_ref.clone())
+                .collect::<BTreeSet<_>>();
+            let linked_compensations = receipt_links
+                .iter()
+                .map(|link| link.compensation_receipt_ref.clone())
+                .collect::<BTreeSet<_>>();
+            let linked_members = receipt_links
+                .iter()
+                .map(|link| {
+                    (
+                        link.compensation_declaration_id.clone(),
+                        link.compensation_member_id.clone(),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            if state.phase != P::PartiallyApplied
+                || successful_receipts.is_empty()
+                || receipt_links.len() != successful_receipts.len()
+                || receipt_links.iter().any(|link| !link.valid())
+                || linked_originals != successful_receipts
+                || linked_compensations.len() != receipt_links.len()
+                || linked_members.len() != receipt_links.len()
             {
                 return reject(
-                    "markCompensated: authenticated forward-repair evidence is required",
+                    "markCompensated: exact one-to-one forward-repair evidence is required",
                 );
             }
-            Ok(vec![E::CoordinatorCompensated { receipt_refs }])
+            Ok(vec![E::CoordinatorCompensatedV2 { receipt_links }])
         }
         C::AbandonPartial { reason } => {
             if !matches!(
@@ -803,6 +855,14 @@ pub fn evolve(
         E::CoordinatorCompensated { receipt_refs } => {
             next.phase = P::Compensated;
             next.compensation_receipt_refs = receipt_refs;
+        }
+        E::CoordinatorCompensatedV2 { receipt_links } => {
+            next.phase = P::Compensated;
+            next.compensation_receipt_refs = receipt_links
+                .iter()
+                .map(|link| link.compensation_receipt_ref.clone())
+                .collect();
+            next.compensation_receipt_links = receipt_links;
         }
         E::CoordinatorAbandonedPartial { reason } => {
             next.phase = P::AbandonedPartial;
@@ -1478,6 +1538,81 @@ mod tests {
             state.members[&members[1].member_id].phase,
             SettlementMemberPhase::SupersededBeforeStart
         );
+    }
+
+    #[test]
+    fn compensation_requires_exact_one_to_one_success_coverage_after_reconciliation() {
+        let mut state = ready();
+        let members = declaration().members;
+        admit(
+            &mut state,
+            TargetSettlementCommand::StartMember {
+                member_id: members[0].member_id.clone(),
+                lane_permit: permit(&members[0], 1),
+            },
+        );
+        let original = receipt(&members[0], ReceiptOutcome::Succeeded);
+        admit(
+            &mut state,
+            TargetSettlementCommand::RecordReceipt(original.clone()),
+        );
+        admit(
+            &mut state,
+            TargetSettlementCommand::CancelUnstarted {
+                reason: "operator selected forward repair".into(),
+            },
+        );
+        assert_eq!(state.phase, SettlementPhase::PartiallyApplied);
+        let link = CompensationReceiptLink {
+            original_receipt_ref: original.receipt_ref.clone(),
+            compensation_declaration_id: "declaration:repair".into(),
+            compensation_member_id: "repair-a".into(),
+            compensation_receipt_ref: "receipt:repair-a".into(),
+        };
+        assert!(decide(
+            &state,
+            TargetSettlementCommand::MarkCompensated {
+                receipt_links: vec![link.clone(), link.clone()],
+            }
+        )
+        .is_err());
+        admit(
+            &mut state,
+            TargetSettlementCommand::MarkCompensated {
+                receipt_links: vec![link.clone()],
+            },
+        );
+        assert_eq!(state.phase, SettlementPhase::Compensated);
+        assert_eq!(state.compensation_receipt_links, vec![link]);
+        assert_eq!(state.compensation_receipt_refs, vec!["receipt:repair-a"]);
+
+        let mut unknown = ready();
+        admit(
+            &mut unknown,
+            TargetSettlementCommand::StartMember {
+                member_id: members[0].member_id.clone(),
+                lane_permit: permit(&members[0], 1),
+            },
+        );
+        admit(
+            &mut unknown,
+            TargetSettlementCommand::RecordUnknown {
+                member_id: members[0].member_id.clone(),
+                evidence_ref: "timeout:unknown".into(),
+            },
+        );
+        assert!(decide(
+            &unknown,
+            TargetSettlementCommand::MarkCompensated {
+                receipt_links: vec![CompensationReceiptLink {
+                    original_receipt_ref: "receipt:invented".into(),
+                    compensation_declaration_id: "declaration:repair".into(),
+                    compensation_member_id: "repair-a".into(),
+                    compensation_receipt_ref: "receipt:repair-a".into(),
+                }],
+            }
+        )
+        .is_err());
     }
 
     #[test]

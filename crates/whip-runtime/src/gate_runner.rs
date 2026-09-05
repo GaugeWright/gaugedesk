@@ -20,11 +20,9 @@
 use std::path::{Path, PathBuf};
 
 use whipplescript_kernel::coerce::{CoerceRequest, CoerceResult, CoerceStatus};
-/// Re-exported so a host can build a [`GateCoercionConfig`] without taking a
-/// direct kernel dependency — GaugeDesk deliberately keeps the parser and kernel
-/// as dev-dependencies, so anything a runtime caller needs comes through here.
+/// Re-exported so a caller can build a [`GateCoercionConfig`] without taking a
+/// direct kernel dependency for the provider configuration type.
 pub use whipplescript_kernel::coerce_native::CoerceProvider as CoerceBackend;
-pub use whipplescript_parser::IrProgram as GateProgram;
 
 use whipplescript_kernel::coerce_native::{
     build_coerce_call_parts, build_request, parse_response, CoerceCall, CoerceProvider,
@@ -43,7 +41,44 @@ use whipplescript_kernel::{CoerceExecution, ProgramVersionInput, RuntimeKernel};
 use whipplescript_parser::IrProgram;
 use whipplescript_store::files::NativeFileStore;
 use whipplescript_store::native_stores::NativeStores;
-use whipplescript_store::{ClaimableEffect, RunStart, RuntimeStore, StoreError};
+use whipplescript_store::{
+    stable_hash_hex, ClaimableEffect, InstanceView, RunStart, RuntimeStore, StoreError,
+};
+
+/// An admitted source/IR pair and the current project governance envelope.
+/// Retaining source is necessary: the IR snapshot is inspectable, not an
+/// executable serialization that can replace the authored program on restart.
+#[derive(Clone, Debug)]
+pub struct GateProgram {
+    source: String,
+    ir: IrProgram,
+    envelope: String,
+}
+
+impl GateProgram {
+    pub fn compile(source: &str, envelope: &str) -> Result<Self, GateRunError> {
+        let verified = crate::ifc::VerifiedEnvelope::verify_text(envelope)
+            .map_err(GateRunError::NoDisposition)?;
+        let compiled = crate::compile_whip_program(source);
+        let ir = compiled.ir.ok_or_else(|| {
+            GateRunError::NoDisposition(format!(
+                "the gate does not compile: {}",
+                compiled.diagnostics.join("; ")
+            ))
+        })?;
+        let diagnostics = crate::ifc::check_with_envelope(&ir, &verified);
+        if !diagnostics.is_empty() {
+            return Err(GateRunError::NoDisposition(format!(
+                "the gate violates current governance: {diagnostics:?}"
+            )));
+        }
+        Ok(Self {
+            source: source.to_owned(),
+            ir,
+            envelope: envelope.to_owned(),
+        })
+    }
+}
 
 /// What the gate needs to reach a model.
 ///
@@ -67,15 +102,6 @@ pub struct GateCoercionConfig {
 /// The fact a gate records its verdict as. The envelope governs this name.
 const SCREENING_FACT: &str = "Screening";
 
-/// A stable key for one compiled gate, so a project's instance is reused across
-/// arrivals but a rewritten gate starts a fresh one.
-fn program_key(ir: &IrProgram) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    format!("{ir:?}").hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
 /// The stamp a gate's queue effects record.
 ///
 /// A gate's durable ordering is its own instance log, not this value, so a fixed
@@ -88,6 +114,9 @@ const PENDING_FACT: &str = "Pending";
 /// The tracker a reviewer's answer is filed into. The envelope vouches it, which
 /// is what lets a claim on it endorse (WhippleScript DR-0051 §3).
 const VERDICT_QUEUE: &str = "verdicts";
+
+/// Public correlation emitted beside the vouched verdict by one program firing.
+const SETTLED_FACT: &str = "Settled";
 
 /// The signal an arrival is delivered on. Declared by both shipped gates, and
 /// the only way an item reaches one (GATE-3i).
@@ -122,6 +151,8 @@ impl Disposition {
 #[derive(Debug)]
 pub enum GateRunError {
     Store(StoreError),
+    /// The program filed a review request for this item and has not ruled yet.
+    AwaitingReview,
     /// The gate settled without a usable disposition, or produced one outside
     /// the closed union its own class declares.
     NoDisposition(String),
@@ -131,6 +162,7 @@ impl std::fmt::Display for GateRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Store(error) => write!(f, "gate run failed: {error:?}"),
+            Self::AwaitingReview => write!(f, "the gate is awaiting this item's reviewer"),
             Self::NoDisposition(detail) => {
                 write!(f, "the gate produced no usable disposition: {detail}")
             }
@@ -300,6 +332,7 @@ impl InstanceDriver for GateDriver<'_> {
                             api_key: &self.coerce.api_key,
                             model: &self.coerce.model,
                             prompt: &prompt,
+                            media: None,
                             output_schema: &output_schema,
                             schema_name: &schema_name,
                             max_tokens: self.coerce.max_tokens,
@@ -374,7 +407,7 @@ impl InstanceDriver for GateDriver<'_> {
 ///
 /// `state_dir` holds the run's durable stores.
 pub fn run_gate<T: GateTransport>(
-    ir: &IrProgram,
+    program: &GateProgram,
     coerce: &GateCoercionConfig,
     item: &str,
     store_root: &Path,
@@ -383,58 +416,77 @@ pub fn run_gate<T: GateTransport>(
 ) -> Result<Disposition, GateRunError> {
     std::fs::create_dir_all(state_dir)
         .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
-    // Three native connections, the composition `step_instance_generic`'s
-    // `RuntimeStore + Coordination + WorkItems` bound requires.
     let store = NativeStores::open(
         state_dir.join("runtime.sqlite"),
         state_dir.join("coord.sqlite"),
         state_dir.join("items.sqlite"),
     )?;
-    // 0.2.2 made the admission gate real for the std packages: a `file.read`
-    // whose capability rows were never seeded blocks as
-    // `blocked_by_capability`. 0.2.3 makes those manifests reachable from the
-    // library, so a host seeds them the same way `whip` does rather than
-    // reimplementing it.
     whipplescript::std_manifests::register_all(&store.runtime).map_err(GateRunError::Store)?;
     let mut kernel = RuntimeKernel::new(store);
-    // 0.2.2 gates effects on the program version's declared ability ceiling, so
-    // the version must be derived *from the IR* — a bare version declares no
-    // capabilities and every effect lands `blocked_by_capability`.
-    let version = kernel.create_program_version_for_program(
-        ProgramVersionInput {
-            program_name: "gate",
-            source_hash: "gate",
-            ir_hash: "gate",
-            compiler_version: env!("CARGO_PKG_VERSION"),
-        },
-        ir,
-    )?;
-    // Open-or-create the project's gate instance rather than making a fresh one
-    // per arrival (ADR 0117 §2). A parked review lives in an instance, so a new
-    // instance per item would strand every question a person has not answered
-    // yet — and re-driving after their answer would have nothing to re-drive.
-    //
-    // Keyed by the program so a *changed* gate gets its own instance: items
-    // already in flight finish under the gate that started them, which is what
-    // ADR 0117 §7 says a mid-queue edit means.
-    let marker = state_dir.join(format!("instance-{}", program_key(ir)));
-    let instance_id = match std::fs::read_to_string(&marker) {
-        Ok(existing) if kernel.store().status(existing.trim())?.is_some() => {
-            existing.trim().to_owned()
+    let (instance_id, retained) = if let Some(instance) = instance_for_item(&kernel, item)? {
+        let retained = retained_program(&kernel, &instance, program)?;
+        (instance.instance_id, retained)
+    } else {
+        let snapshot = program.ir.to_snapshot();
+        let source_hash = kernel.store().put_content(&program.source)?;
+        let ir_hash = stable_hash_hex(&snapshot);
+        let version = kernel.create_program_version_for_program(
+            ProgramVersionInput {
+                program_name: "gate",
+                source_hash: &source_hash,
+                ir_hash: &ir_hash,
+                compiler_version: concat!("gaugedesk-whip-runtime/", env!("CARGO_PKG_VERSION")),
+                ir_snapshot: Some(&snapshot),
+            },
+            &program.ir,
+        )?;
+        let mut existing = gate_instances(&kernel)?
+            .into_iter()
+            .filter(|instance| instance.version_id == version.version_id);
+        let first = existing.next();
+        if existing.next().is_some() {
+            return Err(GateRunError::NoDisposition(
+                "multiple instances claim this gate version; preserve the queues and repair instance routing".into()
+            ));
         }
-        _ => {
-            let created = kernel.create_instance(&version, "{}")?;
-            // Started exactly once, at creation. Re-ingesting it on a later
-            // pass is a *distinct commit under an already-used key*, which the
-            // store refuses — and that refusal is right: an instance does not
-            // start twice.
-            kernel.ingest_external_event(&created, "external.started", "{}", Some("start"))?;
-            std::fs::write(&marker, &created)
-                .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
-            created
+        let instance_id = if let Some(instance) = first {
+            instance.instance_id
+        } else {
+            kernel.create_instance(&version, "{}")?
+        };
+        // Resume a creation interrupted before start, without minting another
+        // start event for an existing instance on each later arrival.
+        if !kernel
+            .store()
+            .list_events(&instance_id)?
+            .iter()
+            .any(|event| event.event_type == "external.started")
+        {
+            kernel.ingest_external_event(&instance_id, "external.started", "{}", Some("start"))?;
         }
+        (instance_id, program.clone())
     };
+    drive_gate(
+        kernel,
+        &instance_id,
+        &retained.ir,
+        coerce,
+        item,
+        store_root,
+        transport,
+    )
+}
 
+fn drive_gate<T: GateTransport>(
+    mut kernel: RuntimeKernel<NativeStores>,
+    instance_id: &str,
+    ir: &IrProgram,
+    coerce: &GateCoercionConfig,
+    item: &str,
+    store_root: &Path,
+    transport: &T,
+) -> Result<Disposition, GateRunError> {
+    let instance_id = instance_id.to_owned();
     // Deliver the arrival. A signal is two steps: the external event records
     // that something arrived, and the derived fact is what
     // `when quarantine.arrived as arrival` matches.
@@ -500,43 +552,160 @@ pub fn run_gate<T: GateTransport>(
     if let InstanceOutcome::Failed(error) = outcome {
         return Err(GateRunError::Store(error));
     }
-    disposition_from(&driver)
+    disposition_from(&driver, item)
 }
 
-/// Read the gate's verdict out of the governed fact the program recorded.
+fn gate_instances(kernel: &RuntimeKernel<NativeStores>) -> Result<Vec<InstanceView>, GateRunError> {
+    let mut gates = Vec::new();
+    for instance in kernel.store().list_instances()? {
+        let version = kernel.store().get_program_version(&instance.version_id)?
+            .ok_or_else(|| GateRunError::NoDisposition(format!(
+                "instance {} has no retained program version; preserve its queue and repair the store", instance.instance_id
+            )))?;
+        if version.program_name == "gate" {
+            gates.push(instance);
+        }
+    }
+    Ok(gates)
+}
+
+fn instance_for_item(
+    kernel: &RuntimeKernel<NativeStores>,
+    item: &str,
+) -> Result<Option<InstanceView>, GateRunError> {
+    let mut owner = None;
+    for instance in gate_instances(kernel)? {
+        let received = kernel
+            .store()
+            .list_events(&instance.instance_id)?
+            .iter()
+            .any(|event| {
+                event.event_type == ARRIVAL_SIGNAL
+                    && json_from_str(&event.payload_json)
+                        .get("item")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(item)
+            });
+        if received {
+            if owner.is_some() {
+                return Err(GateRunError::NoDisposition(format!(
+                    "item {item} arrived in multiple gate instances; preserve pending work and repair routing"
+                )));
+            }
+            owner = Some(instance);
+        }
+    }
+    Ok(owner)
+}
+
+fn retained_program(
+    kernel: &RuntimeKernel<NativeStores>,
+    instance: &InstanceView,
+    current: &GateProgram,
+) -> Result<GateProgram, GateRunError> {
+    let repair = |detail: &str| {
+        GateRunError::NoDisposition(format!(
+        "gate instance {} cannot resume: {detail}; pending work is preserved; restore the exact retained program/version evidence before retrying",
+        instance.instance_id
+    ))
+    };
+    let version = kernel
+        .store()
+        .get_program_version(&instance.version_id)?
+        .ok_or_else(|| repair("program version is missing"))?;
+    let source = kernel
+        .store()
+        .get_content(&version.source_hash)?
+        .ok_or_else(|| {
+            repair("original source is unavailable (legacy versions did not retain it)")
+        })?;
+    let snapshot = kernel
+        .store()
+        .get_content(&version.ir_hash)?
+        .ok_or_else(|| repair("original IR snapshot is unavailable"))?;
+    if stable_hash_hex(&source) != version.source_hash
+        || stable_hash_hex(&snapshot) != version.ir_hash
+    {
+        return Err(repair(
+            "retained source or IR content does not match its version",
+        ));
+    }
+    // A program edit selects the next arrival's workflow, not this item's.
+    // Current governance still admits/refuses the old workflow before effects.
+    let retained = GateProgram::compile(&source, &current.envelope)?;
+    if retained.ir.to_snapshot() != snapshot {
+        return Err(repair(
+            "the current compiler does not reproduce the recorded IR",
+        ));
+    }
+    Ok(retained)
+}
+
+/// Read the item-bound pair of assertions the program committed together.
 ///
-/// Deliberately only that fact. The kernel also emits a `schema.coerce.succeeded`
+/// Deliberately only program assertions. The kernel also emits a `schema.coerce.succeeded`
 /// effect outcome carrying the same value, and reading it would work — but it is
 /// the runtime's bookkeeping, not the program's assertion. The `record` is what
 /// the envelope governs (`grant fact screening -> fact:Screening from Operator`)
 /// and what the endorsement crossing targets, so reading anything else would
 /// mean the step `gate::admit` verifies is not the step the verdict comes from.
 ///
+/// Read their committing event, not the live set-like fact projection: equal
+/// dispositions for different items have equal fact content. Live rows may
+/// coalesce, but each distinct firing records its assertions in the immutable
+/// log, which remains the item-bound authority across restarts.
+///
 /// The value must be one of the two the class declares. Anything else fails
 /// rather than defaulting, because a verdict that could not be understood must
 /// never read as approval.
-fn disposition_from(driver: &GateDriver<'_>) -> Result<Disposition, GateRunError> {
-    let facts = driver.kernel.store().list_facts(&driver.instance_id)?;
-    let recorded = facts
-        .iter()
-        .find(|fact| fact.name == SCREENING_FACT)
-        .map(|fact| json_from_str(&fact.value_json));
-    let Some(value) = recorded else {
-        return Err(GateRunError::NoDisposition(format!(
-            "the gate settled without recording a `{SCREENING_FACT}` fact"
-        )));
-    };
-    let disposition = value
-        .get("disposition")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            GateRunError::NoDisposition(format!("`{SCREENING_FACT}` carries no disposition"))
-        })?;
-    Disposition::parse(disposition).ok_or_else(|| {
-        GateRunError::NoDisposition(format!(
-            "`{disposition}` is outside the union the gate declares"
-        ))
-    })
+fn disposition_from(driver: &GateDriver<'_>, item: &str) -> Result<Disposition, GateRunError> {
+    let mut result = None;
+    for event in driver.kernel.store().list_events(&driver.instance_id)? {
+        if event.event_type != "rule.committed" || event.source != "kernel" {
+            continue;
+        }
+        let payload = json_from_str(&event.payload_json);
+        let Some(facts) = payload.get("facts").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        if !facts.iter().any(|fact| {
+            fact["name"] == SETTLED_FACT && fact["value"]["item"].as_str() == Some(item)
+        }) {
+            continue;
+        }
+        let screenings = facts
+            .iter()
+            .filter(|fact| fact["name"] == SCREENING_FACT)
+            .collect::<Vec<_>>();
+        let settlements = facts
+            .iter()
+            .filter(|fact| fact["name"] == SETTLED_FACT)
+            .collect::<Vec<_>>();
+        if screenings.len() != 1 || settlements.len() != 1 || result.is_some() {
+            return Err(GateRunError::NoDisposition(format!(
+                "the gate did not commit one unambiguous item/verdict pair ({} verdicts, {} settlements, prior result {})",
+                screenings.len(), settlements.len(), result.is_some()
+            )));
+        }
+        let disposition = screenings[0]["value"]["disposition"]
+            .as_str()
+            .and_then(Disposition::parse)
+            .ok_or_else(|| {
+                GateRunError::NoDisposition(
+                    "the item-bound Screening carries no valid disposition".to_owned(),
+                )
+            })?;
+        result = Some(disposition);
+    }
+    if let Some(disposition) = result {
+        return Ok(disposition);
+    }
+    if pending_request_for(&driver.kernel, &driver.instance_id, item)?.is_some() {
+        return Err(GateRunError::AwaitingReview);
+    }
+    Err(GateRunError::NoDisposition(format!(
+        "the gate has not committed a `{SETTLED_FACT}` / `{SCREENING_FACT}` pair for this item; inspect its runtime failure or repair the project's gate correlation contract"
+    )))
 }
 
 /// Deliver a person's verdict to a project's gate, and drive it.
@@ -546,16 +715,16 @@ fn disposition_from(driver: &GateDriver<'_>) -> Result<Disposition, GateRunError
 /// parked against rather than as a call that moves bytes behind its back. The
 /// HTTP route stays the transport; what changes is that it no longer decides.
 ///
-/// The correlation runs the other way from `Settled`: a parked review left a
-/// `Pending { item, request }` fact, so the item id finds the request id the
-/// gate is waiting on, and the verdict is filed with that id as its body —
-/// which is exactly what the gate's `settle` rule matches.
+/// A parked review supplies the request id used in the human-facing answer.
+/// Public item correlation is filed separately from that vouched verdict, so
+/// neither source can raise the other's free-text identifiers across the
+/// integrity boundary.
 ///
 /// Returns the disposition when the gate settled, and `None` when it did not —
 /// an unknown item, an answer for something already ruled, or a gate that needs
 /// another pass.
 pub fn deliver_verdict<T: GateTransport>(
-    ir: &IrProgram,
+    program: &GateProgram,
     coerce: &GateCoercionConfig,
     item: &str,
     verdict: Disposition,
@@ -569,21 +738,21 @@ pub fn deliver_verdict<T: GateTransport>(
         state_dir.join("items.sqlite"),
     )?;
     let kernel = RuntimeKernel::new(store);
-    let marker = state_dir.join(format!("instance-{}", program_key(ir)));
-    let Ok(instance_id) = std::fs::read_to_string(&marker) else {
-        // No instance means nothing ever screened this project, so there is no
-        // parked question for this answer to be about.
+    let Some(instance) = instance_for_item(&kernel, item)? else {
         return Ok(None);
     };
-    let instance_id = instance_id.trim().to_owned();
+    let instance_id = instance.instance_id.clone();
 
     let Some(request) = pending_request_for(&kernel, &instance_id, item)? else {
         return Ok(None);
     };
+    // Verify/re-admit before filing an answer. Missing legacy evidence may
+    // not enqueue a verdict that some replacement workflow could consume.
+    let retained = retained_program(&kernel, &instance, program)?;
 
-    // The reviewer's answer, filed into the queue the envelope vouches. The
-    // title is the disposition because that is what `settle` reads, and the body
-    // is the request id because that is what it correlates on.
+    // The reviewer's answer is the only vouched input. The program matches its
+    // request to Pending and emits public correlation in the same firing as the
+    // closed Screening disposition; the host does not announce settlement.
     let mut store = kernel.into_store();
     store.items.file_item(
         VERDICT_QUEUE,
@@ -594,7 +763,19 @@ pub fn deliver_verdict<T: GateTransport>(
         Some("reviewer"),
     )?;
 
-    run_gate(ir, coerce, item, store_root, state_dir, transport).map(Some)
+    match drive_gate(
+        RuntimeKernel::new(store),
+        &instance_id,
+        &retained.ir,
+        coerce,
+        item,
+        store_root,
+        transport,
+    ) {
+        Ok(disposition) => Ok(Some(disposition)),
+        Err(GateRunError::AwaitingReview) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// The request id a parked review is waiting on for this item.
@@ -635,26 +816,11 @@ fn pending_request_for(
 /// into and leaves the *review* issue that asked the question open, so an open-
 /// issue count would keep counting questions that have already been answered.
 pub fn reviews_awaiting_a_person(state_dir: &Path) -> Result<usize, GateRunError> {
-    let marker_dir = std::fs::read_dir(state_dir);
-    let Ok(entries) = marker_dir else {
-        // No gate has ever run for this project. Nothing is waiting.
-        return Ok(0);
-    };
-    let mut instance_ids: Vec<String> = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("instance-") {
-            continue;
-        }
-        if let Ok(id) = std::fs::read_to_string(entry.path()) {
-            let id = id.trim().to_owned();
-            if !id.is_empty() {
-                instance_ids.push(id);
-            }
-        }
-    }
-    if instance_ids.is_empty() {
+    if !state_dir
+        .join("runtime.sqlite")
+        .try_exists()
+        .map_err(|error| GateRunError::NoDisposition(error.to_string()))?
+    {
         return Ok(0);
     }
     let store = NativeStores::open(
@@ -664,12 +830,10 @@ pub fn reviews_awaiting_a_person(state_dir: &Path) -> Result<usize, GateRunError
     )?;
     let kernel = RuntimeKernel::new(store);
     let mut waiting = 0;
-    // Every instance, not only the current one: ADR 0117 §7 says items in flight
-    // finish under the gate that started them, so a project whose gate was
-    // edited has questions parked in the previous instance that a person still
-    // owes an answer to.
-    for instance_id in instance_ids {
-        for fact in kernel.store().list_facts(&instance_id)? {
+    // The durable instance registry, not rebuildable marker files, owns every
+    // previous version's pending reviews.
+    for instance in gate_instances(&kernel)? {
+        for fact in kernel.store().list_facts(&instance.instance_id)? {
             if fact.name == PENDING_FACT {
                 waiting += 1;
             }

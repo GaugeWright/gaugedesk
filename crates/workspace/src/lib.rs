@@ -21,7 +21,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use whipplescript_store::branches::{CreateBranchOutcome, RetargetOutcome, MAINLINE_BRANCH_ID};
+use whipplescript_kernel::effect_handlers::{
+    release_reserved_boundary_generic, run_reserved_boundary_promotion_generic, BoundaryRunOutcome,
+    PromoteDoorRequest, SingleWriterSerialization,
+};
+use whipplescript_store::branches::{
+    CreateBranchOutcome, HeadReservationOutcome, RetargetOutcome, MAINLINE_BRANCH_ID,
+};
 use whipplescript_store::content::ContentBlobs;
 use whipplescript_store::diff::DiffEntry;
 use whipplescript_store::materialize::MaterializedScratch;
@@ -31,8 +37,8 @@ use whipplescript_store::vcs::{
     VcsWriteOutcome,
 };
 use whipplescript_store::workstreams::{
-    ArchiveOutcome, BoundaryReservation, ClosePromotedOutcome, CreateStreamOutcome,
-    RecordRefAdvancedOutcome, ReserveBoundaryOutcome, WorkstreamStore, Workstreams,
+    ArchiveOutcome, BoundaryReservation, CreateStreamOutcome, ReserveBoundaryOutcome,
+    WorkstreamStore, Workstreams,
 };
 pub use whipplescript_store::workstreams::{
     BranchHomeReceiptV1, JoinOutcome as WorkstreamTransferOutcome, StreamStatus,
@@ -55,6 +61,65 @@ fn is_chat_local_path(path: &str) -> bool {
 
 fn nonempty(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
+}
+
+/// Prove cancellation admissible under the same writers as promotion, then
+/// delegate the durable two-store cleanup to WhippleScript. An absent receipt
+/// alone is not proof that Main never advanced.
+fn cancel_promotion_under_writers(
+    streams: &mut WorkstreamStore,
+    vcs: &mut NativeWorkspaceVcs,
+    id: &str,
+    reservation_id: &str,
+    at: &str,
+) -> Result<()> {
+    let stream = streams
+        .get_stream(id)?
+        .ok_or_else(|| WorkspaceError::msg(format!("no such workstream `{id}`")))?;
+    if stream.status == StreamStatus::BoundaryReserved {
+        if stream.reservation_id.as_deref() != Some(reservation_id) {
+            return Err(WorkspaceError::msg(
+                "cancellation reservation does not match",
+            ));
+        }
+        let expected = stream.expected_main_cut.as_deref().ok_or_else(|| {
+            WorkspaceError::msg("cancellation retained: expected Main cut is missing")
+        })?;
+        let proposed = stream
+            .proposed_main_cut
+            .as_deref()
+            .filter(|cut| !cut.is_empty())
+            .ok_or_else(|| {
+                WorkspaceError::msg("cancellation retained: proposed Main cut is missing")
+            })?;
+        if vcs
+            .boundary_ref_evidence(&stream.line_branch_id, nonempty(expected), proposed)?
+            .is_some()
+        {
+            return Err(WorkspaceError::msg(
+                "cancellation refused: Main advanced; promotion must close forward",
+            ));
+        }
+        let main = vcs
+            .get_branch(MAINLINE_BRANCH_ID)?
+            .ok_or_else(|| WorkspaceError::msg("cancellation retained: Main is unavailable"))?;
+        if main.head_cut_id.as_deref() != nonempty(expected) {
+            return Err(WorkspaceError::msg(
+                "cancellation retained: unchanged Main could not be proved",
+            ));
+        }
+    } else if stream.status == StreamStatus::Active
+        && stream.reservation_id.is_none()
+        && vcs
+            .branch_head_reservation(&stream.line_branch_id)?
+            .is_some()
+    {
+        return Err(WorkspaceError::msg(
+            "cancellation retained: legacy line lock has no topology ownership evidence",
+        ));
+    }
+    release_reserved_boundary_generic(streams, vcs, id, reservation_id, at)
+        .map_err(WorkspaceError::msg)
 }
 
 /// Same-provider export envelope: raw snapshots of the native VCS and
@@ -669,6 +734,23 @@ impl Instance {
         Ok(())
     }
 
+    /// Whether `descendant_cut` is on the immutable parent chain rooted at
+    /// `ancestor_cut`. This is an authority query over recorded WhippleScript
+    /// cuts, not a comparison of caller labels or timestamps.
+    pub fn cut_descends_from(&self, descendant_cut: &str, ancestor_cut: &str) -> Result<bool> {
+        Ok(self
+            .store()?
+            .cut_chain(descendant_cut, ancestor_cut)?
+            .is_some())
+    }
+
+    pub fn current_main_cut(&self) -> Result<Option<String>> {
+        Ok(self
+            .store()?
+            .get_branch(MAINLINE_BRANCH_ID)?
+            .and_then(|branch| branch.head_cut_id))
+    }
+
     /// Reclaim orphaned content (whip's conservative GC sweep): the
     /// residue of superseded saves and refused imports. Everything any
     /// recorded cut, branch pointer, resolution memory, or conflict row
@@ -808,13 +890,35 @@ impl Instance {
         reservation_id: &str,
     ) -> Result<WorkstreamPromotionReservation> {
         let mut vcs = self.store()?;
-        sync_in(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
         let at = now_at();
         let mut streams = self.workstreams()?;
+        let stream = streams
+            .get_stream(id)?
+            .ok_or_else(|| WorkspaceError::msg(format!("no such workstream `{id}`")))?;
+        let writers = workspace_writers(
+            &self.store_root,
+            &[MAINLINE_BRANCH_ID, &stream.line_branch_id],
+        );
+        let _holds = hold_writers(&writers);
         let mut stream = streams
             .get_stream(id)?
             .ok_or_else(|| WorkspaceError::msg(format!("no such workstream `{id}`")))?;
         if stream.status == StreamStatus::Active {
+            if let Some(pending) = stream.reservation_id.as_deref() {
+                cancel_promotion_under_writers(&mut streams, &mut vcs, id, pending, &at)?;
+                stream = streams
+                    .get_stream(id)?
+                    .ok_or_else(|| WorkspaceError::msg("cancelled workstream disappeared"))?;
+            }
+        }
+        if stream.status == StreamStatus::Active {
+            sync_in_with_roots_under_writer(
+                &mut vcs,
+                &self.store_root,
+                MAINLINE_BRANCH_ID,
+                &self.repo,
+                None,
+            )?;
             let line = vcs
                 .get_branch(&stream.line_branch_id)?
                 .ok_or_else(|| WorkspaceError::msg("workstream line is missing"))?;
@@ -852,6 +956,29 @@ impl Instance {
                 "workstream cannot reserve promotion from {}",
                 stream.status.as_str()
             )));
+        }
+        if matches!(
+            stream.status,
+            StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced
+        ) {
+            let active_reservation = stream.reservation_id.clone().unwrap_or_default();
+            match vcs.reserve_branch_head(&stream.line_branch_id, &active_reservation, &at)? {
+                HeadReservationOutcome::Reserved | HeadReservationOutcome::Existing => {}
+                outcome => {
+                    if stream.status == StreamStatus::BoundaryReserved {
+                        cancel_promotion_under_writers(
+                            &mut streams,
+                            &mut vcs,
+                            id,
+                            &active_reservation,
+                            &at,
+                        )?;
+                    }
+                    return Err(WorkspaceError::msg(format!(
+                        "stream-line reservation refused: {outcome:?}"
+                    )));
+                }
+            }
         }
         let expected_line_cut = stream.expected_line_cut.clone().unwrap_or_default();
         let expected_main_cut = stream.expected_main_cut.clone().unwrap_or_default();
@@ -891,14 +1018,17 @@ impl Instance {
         id: &str,
         reservation_id: &str,
     ) -> Result<()> {
+        let mut vcs = self.store()?;
         let mut streams = self.workstreams()?;
-        match streams.release_boundary(id, reservation_id, &now_at())? {
-            whipplescript_store::workstreams::ReleaseBoundaryOutcome::Released
-            | whipplescript_store::workstreams::ReleaseBoundaryOutcome::AlreadyActive => Ok(()),
-            outcome => Err(WorkspaceError::msg(format!(
-                "promotion reservation release refused: {outcome:?}"
-            ))),
-        }
+        let stream = streams
+            .get_stream(id)?
+            .ok_or_else(|| WorkspaceError::msg(format!("no such workstream `{id}`")))?;
+        let writers = workspace_writers(
+            &self.store_root,
+            &[MAINLINE_BRANCH_ID, &stream.line_branch_id],
+        );
+        let _holds = hold_writers(&writers);
+        cancel_promotion_under_writers(&mut streams, &mut vcs, id, reservation_id, &now_at())
     }
 
     pub fn promote_workstream_to_main(&self, id: &str) -> Result<MergeOutcome> {
@@ -913,9 +1043,8 @@ impl Instance {
         }
     }
 
-    /// DR-0078's recoverable `active → reserved → ref-advanced → archived`
-    /// sequence. The WhippleScript row freezes every topology/contribution path;
-    /// the exact Main CAS is the sole collaboration acceptance boundary.
+    /// Adapt WhippleScript's one promotion protocol while retaining native
+    /// filesystem serialization and materialization in the host.
     pub fn promote_workstream_boundary(
         &self,
         id: &str,
@@ -923,171 +1052,81 @@ impl Instance {
         reservation_id: &str,
     ) -> Result<WorkstreamPromotionOutcome> {
         let mut vcs = self.store()?;
-        let main = sync_in(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
         let at = now_at();
         let mut streams = self.workstreams()?;
-        let mut stream = streams
+        // The line identity is immutable. Only use this first read to choose
+        // writer locks; every lifecycle decision uses the read under them.
+        let line = streams
+            .get_stream(id)?
+            .ok_or_else(|| WorkspaceError::msg(format!("no such workstream `{id}`")))?
+            .line_branch_id;
+        let writers = workspace_writers(&self.store_root, &[MAINLINE_BRANCH_ID, &line]);
+        let _holds = hold_writers(&writers);
+        let stream = streams
             .get_stream(id)?
             .ok_or_else(|| WorkspaceError::msg(format!("no such workstream `{id}`")))?;
-        if stream.status == StreamStatus::Archived {
-            let receipt = stream
-                .boundary_receipt(workspace_authority_id)
-                .ok_or_else(|| WorkspaceError::msg("archived workstream has no receipt"))?;
-            return Ok(WorkstreamPromotionOutcome::Promoted {
-                receipt: Box::new(receipt),
-                rehomed_chat_ids: Vec::new(),
-            });
-        }
-        if stream.status == StreamStatus::Active {
-            let line = vcs
-                .get_branch(&stream.line_branch_id)?
-                .ok_or_else(|| WorkspaceError::msg("workstream line is missing"))?;
-            let main = vcs
-                .get_branch(MAINLINE_BRANCH_ID)?
-                .ok_or_else(|| WorkspaceError::msg("collaboration Main is missing"))?;
-            let expected_line = line.head_cut_id.unwrap_or_default();
-            let expected_main = main.head_cut_id.unwrap_or_default();
-            let proposed_main = fresh_cut_id("promote-main");
-            stream = match streams.reserve_boundary(
-                id,
-                BoundaryReservation {
-                    reservation_id,
-                    expected_line_cut: &expected_line,
-                    expected_main_cut: &expected_main,
-                    proposed_main_cut: &proposed_main,
-                    at: &at,
-                },
-            )? {
-                ReserveBoundaryOutcome::Reserved(row) | ReserveBoundaryOutcome::Existing(row) => {
-                    row
-                }
-                outcome => {
-                    return Ok(WorkstreamPromotionOutcome::Refused(format!(
-                        "promotion reservation refused: {outcome:?}"
-                    )))
-                }
-            };
-        }
-        let reservation = stream.reservation_id.clone().unwrap_or_default();
-        if stream.status == StreamStatus::RefAdvanced {
-            let rehomed_branch_ids = match streams.close_promoted(id, &reservation, &at)? {
-                ClosePromotedOutcome::Closed { rehomed_branch_ids } => rehomed_branch_ids,
-                ClosePromotedOutcome::AlreadyClosed => Vec::new(),
-                outcome => {
-                    return Ok(WorkstreamPromotionOutcome::Refused(format!(
-                        "post-CAS close refused: {outcome:?}"
-                    )))
-                }
-            };
-            let row = streams
-                .get_stream(id)?
-                .ok_or_else(|| WorkspaceError::msg("closed workstream disappeared"))?;
-            let receipt = row
-                .boundary_receipt(workspace_authority_id)
-                .ok_or_else(|| WorkspaceError::msg("closed workstream has no boundary receipt"))?;
-            return Ok(WorkstreamPromotionOutcome::Promoted {
-                receipt: Box::new(receipt),
-                rehomed_chat_ids: rehomed_branch_ids
-                    .into_iter()
-                    .filter_map(|branch| branch.strip_prefix("engagement/").map(str::to_owned))
-                    .collect(),
-            });
-        }
-        if stream.status != StreamStatus::BoundaryReserved {
-            return Ok(WorkstreamPromotionOutcome::Refused(format!(
-                "workstream cannot promote from {}",
-                stream.status.as_str()
-            )));
-        }
-        let expected_line = stream.expected_line_cut.clone().unwrap_or_default();
-        let expected_main = stream.expected_main_cut.clone().unwrap_or_default();
-        let proposed_main = stream.proposed_main_cut.clone().unwrap_or_default();
-        if let Some((position, handle)) = vcs.boundary_ref_evidence(
-            &stream.line_branch_id,
-            nonempty(&expected_main),
-            &proposed_main,
-        )? {
-            match streams.record_ref_advanced(id, &reservation, position, &handle, &at)? {
-                RecordRefAdvancedOutcome::Recorded(_) | RecordRefAdvancedOutcome::Existing(_) => {}
-                outcome => {
-                    return Ok(WorkstreamPromotionOutcome::Refused(format!(
-                        "promotion receipt refused: {outcome:?}"
-                    )))
-                }
-            }
+        let recovering = stream.status != StreamStatus::Active || stream.reservation_id.is_some();
+        let main = if recovering {
+            ImportScan::unscanned()
         } else {
-            match vcs.promote_line_exact(
-                &stream.line_branch_id,
-                nonempty(&expected_line),
-                nonempty(&expected_main),
-                &proposed_main,
-                &at,
-            )? {
-                whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
-                    ref_position,
-                    ref_receipt_handle,
-                    ..
-                } => match streams.record_ref_advanced(
-                    id,
-                    &reservation,
-                    ref_position,
-                    &ref_receipt_handle,
-                    &at,
-                )? {
-                    RecordRefAdvancedOutcome::Recorded(_)
-                    | RecordRefAdvancedOutcome::Existing(_) => {}
-                    outcome => {
-                        return Ok(WorkstreamPromotionOutcome::Refused(format!(
-                            "promotion receipt refused: {outcome:?}"
-                        )))
-                    }
-                },
-                whipplescript_store::vcs::BoundaryPromotionOutcome::Conflicted { conflicts } => {
-                    let _ = streams.release_boundary(id, &reservation, &at);
-                    return Ok(WorkstreamPromotionOutcome::Conflicted {
-                        paths: conflicts
-                            .into_iter()
-                            .map(|conflict| conflict.path)
-                            .collect(),
-                    });
-                }
-                outcome => {
-                    let _ = streams.release_boundary(id, &reservation, &at);
-                    return Ok(WorkstreamPromotionOutcome::Refused(format!(
-                        "exact collaboration cuts moved or promotion was refused: {outcome:?}"
-                    )));
-                }
-            }
-        }
-        let members = streams.members(id)?;
-        match streams.close_promoted(id, &reservation, &at)? {
-            ClosePromotedOutcome::Closed { .. } | ClosePromotedOutcome::AlreadyClosed => {}
-            outcome => {
-                return Ok(WorkstreamPromotionOutcome::Refused(format!(
-                    "post-CAS close refused: {outcome:?}"
-                )))
-            }
-        }
-        sync_out_observing(
+            sync_in_with_roots_under_writer(
+                &mut vcs,
+                &self.store_root,
+                MAINLINE_BRANCH_ID,
+                &self.repo,
+                None,
+            )?
+        };
+        // Both filesystem writers are held for the whole shared door and
+        // projection step. This is an already-serialized host invocation.
+        let outcome = run_reserved_boundary_promotion_generic(
+            &mut streams,
             &mut vcs,
-            &self.store_root,
-            MAINLINE_BRANCH_ID,
-            &self.repo,
-            &main.observed,
-        )?;
-        let row = streams
-            .get_stream(id)?
-            .ok_or_else(|| WorkspaceError::msg("closed workstream disappeared"))?;
-        let receipt = row
-            .boundary_receipt(workspace_authority_id)
-            .ok_or_else(|| WorkspaceError::msg("closed workstream has no boundary receipt"))?;
-        Ok(WorkstreamPromotionOutcome::Promoted {
-            receipt: Box::new(receipt),
-            rehomed_chat_ids: members
-                .into_iter()
-                .filter_map(|branch| branch.strip_prefix("engagement/").map(str::to_owned))
-                .collect(),
-        })
+            &PromoteDoorRequest {
+                stream_id: id,
+                reservation_id,
+                proposed_main: &fresh_cut_id("promote-main"),
+                at: &at,
+                receipt_scope: workspace_authority_id,
+            },
+            &mut SingleWriterSerialization,
+        )
+        .map_err(WorkspaceError::msg)?;
+        match outcome {
+            BoundaryRunOutcome::Promoted {
+                receipt,
+                member_branches,
+                ..
+            } => {
+                if recovering {
+                    recover_main_projection(&mut vcs, &self.store_root, &self.repo)?;
+                } else {
+                    sync_out_observing(
+                        &mut vcs,
+                        &self.store_root,
+                        MAINLINE_BRANCH_ID,
+                        &self.repo,
+                        &main.observed,
+                    )?;
+                }
+                Ok(WorkstreamPromotionOutcome::Promoted {
+                    receipt,
+                    rehomed_chat_ids: member_branches
+                        .into_iter()
+                        .filter_map(|branch| branch.strip_prefix("engagement/").map(str::to_owned))
+                        .collect(),
+                })
+            }
+            BoundaryRunOutcome::Conflicted { conflicts } => {
+                Ok(WorkstreamPromotionOutcome::Conflicted {
+                    paths: conflicts
+                        .into_iter()
+                        .map(|conflict| conflict.path)
+                        .collect(),
+                })
+            }
+            BoundaryRunOutcome::Refused(reason) => Ok(WorkstreamPromotionOutcome::Refused(reason)),
+        }
     }
 }
 
@@ -2046,6 +2085,53 @@ fn sync_in_with_roots_under_writer(
     }
 }
 
+/// Recover the projection of an already accepted Main without importing it.
+/// The last materialization cache distinguishes old projected files from work
+/// added while the host was down. A partial projection is safe to repeat when
+/// its bytes already equal the accepted manifest. The caller holds Main's writer.
+fn recover_main_projection(
+    vcs: &mut NativeWorkspaceVcs,
+    store_root: &Path,
+    root: &Path,
+) -> Result<()> {
+    let scratch = load_scratch(vcs, store_root, MAINLINE_BRANCH_ID);
+    let manifest = vcs
+        .manifest(MAINLINE_BRANCH_ID)?
+        .ok_or_else(|| WorkspaceError::msg("collaboration Main is missing"))?;
+    if root.is_dir() {
+        let pending = whipplescript_store::materialize::import_scratch(
+            root,
+            &scratch,
+            vcs.content_store(),
+            scan_stamp(),
+        )?;
+        let conflict = pending
+            .changed
+            .iter()
+            .find(|(path, hash)| {
+                !is_chat_local_path(path)
+                    && manifest
+                        .get(*path)
+                        .is_some_and(|accepted| accepted != *hash)
+            })
+            .map(|(path, _)| path.as_str())
+            .or_else(|| {
+                pending
+                    .removed
+                    .iter()
+                    .find(|path| manifest.contains_key(*path) && !is_chat_local_path(path))
+                    .map(String::as_str)
+            });
+        if let Some(path) = conflict {
+            return Err(WorkspaceError::msg(format!(
+                "promotion is accepted but Main projection has an unsynced edit at `{path}`; reconcile it before retrying materialization"
+            )));
+        }
+    }
+    let observed = scratch.cache.entries.keys().cloned().collect();
+    sync_out_observing(vcs, store_root, MAINLINE_BRANCH_ID, root, &observed)
+}
+
 /// Project the branch head into its worktree: clear files the manifest no
 /// longer names, materialize the rest, persist the fresh stat cache.
 ///
@@ -2323,6 +2409,16 @@ pub trait Workspace: Send {
         self.fork_engagement_at(id, source_branch, target, cut_id)
     }
     fn remove_engagement(&self, id: &str) -> Result<()>;
+    fn cut_descends_from(&self, _descendant_cut: &str, _ancestor_cut: &str) -> Result<bool> {
+        Err(WorkspaceError::msg(
+            "this workspace has no durable cut-lineage authority",
+        ))
+    }
+    fn current_main_cut(&self) -> Result<Option<String>> {
+        Err(WorkspaceError::msg(
+            "this workspace has no durable Main ref authority",
+        ))
+    }
     fn purge_unreachable_objects(&self) -> Result<()>;
     fn reconcile_engagements(&self) -> Result<Vec<(String, Box<dyn ChatWorkspace>)>>;
     fn create_workstream(&self, ws_id: &str) -> Result<()>;
@@ -2549,6 +2645,12 @@ impl Workspace for Instance {
     }
     fn remove_engagement(&self, id: &str) -> Result<()> {
         Self::remove_engagement(self, id)
+    }
+    fn cut_descends_from(&self, descendant_cut: &str, ancestor_cut: &str) -> Result<bool> {
+        Self::cut_descends_from(self, descendant_cut, ancestor_cut)
+    }
+    fn current_main_cut(&self) -> Result<Option<String>> {
+        Self::current_main_cut(self)
     }
     fn purge_unreachable_objects(&self) -> Result<()> {
         Self::purge_unreachable_objects(self)
@@ -3374,16 +3476,245 @@ mod tests {
     }
 
     #[test]
+    fn promotion_store_error_releases_only_the_pre_cas_boundary() {
+        let (_directory, instance) = instance();
+        instance.seed_main(&[("base.txt", "base")]).unwrap();
+        instance.create_named_workstream("team", None).unwrap();
+        let line = instance.workstream("team").unwrap().unwrap().line_branch_id;
+        let mut vcs = instance.store().unwrap();
+        vcs.write(&line, "work.txt", Some("work"), "line-work", "t1")
+            .unwrap();
+        let reservation = instance
+            .reserve_workstream_promotion_boundary("team", "attempt")
+            .unwrap();
+        let db = rusqlite::Connection::open(instance.store_root.join("branches.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_proposed_cut BEFORE INSERT ON cuts
+             BEGIN SELECT RAISE(FAIL, 'pre-CAS cut fault'); END;",
+        )
+        .unwrap();
+        let error = instance
+            .promote_workstream_boundary("team", "workspace", "attempt")
+            .unwrap_err();
+        let stream = instance.workstream("team").unwrap().unwrap();
+        assert_eq!(stream.status, StreamStatus::Active);
+        assert_eq!(stream.reservation_id, None);
+        assert_eq!(vcs.branch_head_reservation(&line).unwrap(), None);
+        assert!(error.message.contains("before Main CAS"), "{error}");
+        assert_eq!(
+            vcs.get_branch("main")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            nonempty(&reservation.expected_main_cut)
+        );
+        db.execute_batch("DROP TRIGGER fail_proposed_cut").unwrap();
+        assert!(matches!(
+            vcs.write(&line, "later.txt", Some("later"), "later", "t2")
+                .unwrap(),
+            VcsWriteOutcome::Written { .. }
+        ));
+        let promoted = instance
+            .promote_workstream_boundary("team", "workspace", "fresh")
+            .unwrap();
+        assert!(matches!(
+            promoted,
+            WorkstreamPromotionOutcome::Promoted { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(instance.repo.join("later.txt")).unwrap(),
+            "later"
+        );
+    }
+
+    #[test]
+    fn cancellation_recovers_exact_tokens_and_preserves_uncertain_work() {
+        for mode in [
+            "pending",
+            "line-released",
+            "ack-failure",
+            "landed",
+            "main-moved",
+            "stale",
+            "legacy",
+        ] {
+            let (directory, instance) = instance();
+            instance.seed_main(&[("base.txt", "base")]).unwrap();
+            instance.create_named_workstream("team", None).unwrap();
+            let line = instance.workstream("team").unwrap().unwrap().line_branch_id;
+            let mut vcs = instance.store().unwrap();
+            vcs.write(&line, "work.txt", Some("work"), "line-work", "t1")
+                .unwrap();
+            let reservation = instance
+                .reserve_workstream_promotion_boundary("team", "cancelled")
+                .unwrap();
+            let db =
+                rusqlite::Connection::open(instance.store_root.join("workstreams.sqlite")).unwrap();
+            match mode {
+                "pending" | "line-released" | "legacy" => {
+                    instance
+                        .workstreams()
+                        .unwrap()
+                        .release_boundary("team", "cancelled", "t2")
+                        .unwrap();
+                    if mode == "line-released" {
+                        vcs.release_branch_head_reservation(&line, "cancelled")
+                            .unwrap();
+                    }
+                    if mode == "legacy" {
+                        // The old release wrote Active + NULL before releasing
+                        // the separate line lock. No ownership may be guessed.
+                        db.execute(
+                            "UPDATE workstreams SET reservation_id = NULL WHERE stream_id = 'team'",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                }
+                "ack-failure" => db
+                    .execute_batch(
+                        "CREATE TRIGGER fail_ack BEFORE UPDATE ON workstreams
+                     WHEN NEW.status = 'active' AND NEW.reservation_id IS NULL
+                     BEGIN SELECT RAISE(FAIL, 'ack fault'); END;",
+                    )
+                    .unwrap(),
+                "landed" => {
+                    let result = vcs
+                        .promote_line_exact(
+                            &line,
+                            "cancelled",
+                            nonempty(&reservation.expected_line_cut),
+                            nonempty(&reservation.expected_main_cut),
+                            &reservation.proposed_main_cut,
+                            "t2",
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        result,
+                        whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted { .. }
+                    ));
+                }
+                "main-moved" => {
+                    vcs.write("main", "other.txt", Some("other"), "other", "t2")
+                        .unwrap();
+                }
+                "stale" => {}
+                _ => unreachable!(),
+            }
+            drop(db);
+            drop(vcs);
+            drop(instance);
+            let reopened = Instance::open(
+                directory.path().join("repo"),
+                directory.path().join("worktrees"),
+            );
+            let token = if mode == "stale" {
+                "wrong"
+            } else {
+                "cancelled"
+            };
+            let result = reopened.release_workstream_promotion_boundary("team", token);
+            let vcs = reopened.store().unwrap();
+            let row = reopened.workstream("team").unwrap().unwrap();
+            if matches!(mode, "pending" | "line-released") {
+                result.unwrap();
+                assert_eq!(row.status, StreamStatus::Active);
+                assert_eq!(row.reservation_id, None);
+                assert_eq!(vcs.branch_head_reservation(&line).unwrap(), None);
+                reopened
+                    .release_workstream_promotion_boundary("team", token)
+                    .unwrap();
+                let fresh = reopened
+                    .reserve_workstream_promotion_boundary("team", "fresh")
+                    .unwrap();
+                assert_eq!(fresh.reservation_id, "fresh");
+                assert!(reopened
+                    .release_workstream_promotion_boundary("team", token)
+                    .is_err());
+                assert_eq!(
+                    vcs.branch_head_reservation(&line).unwrap().as_deref(),
+                    Some("fresh")
+                );
+            } else {
+                assert!(result.is_err(), "{mode}");
+                if mode == "ack-failure" {
+                    assert_eq!(row.status, StreamStatus::Active);
+                    assert_eq!(row.reservation_id.as_deref(), Some("cancelled"));
+                    assert_eq!(vcs.branch_head_reservation(&line).unwrap(), None);
+                    let db =
+                        rusqlite::Connection::open(reopened.store_root.join("workstreams.sqlite"))
+                            .unwrap();
+                    db.execute_batch("DROP TRIGGER fail_ack").unwrap();
+                    reopened
+                        .release_workstream_promotion_boundary("team", token)
+                        .unwrap();
+                    assert_eq!(
+                        reopened.workstream("team").unwrap().unwrap().reservation_id,
+                        None
+                    );
+                } else {
+                    assert_eq!(
+                        vcs.branch_head_reservation(&line).unwrap().as_deref(),
+                        Some("cancelled"),
+                        "{mode}"
+                    );
+                    assert_eq!(
+                        row.status,
+                        if mode == "legacy" {
+                            StreamStatus::Active
+                        } else {
+                            StreamStatus::BoundaryReserved
+                        }
+                    );
+                }
+                if mode == "landed" {
+                    assert_eq!(
+                        vcs.get_branch("main")
+                            .unwrap()
+                            .unwrap()
+                            .head_cut_id
+                            .as_deref(),
+                        Some(reservation.proposed_main_cut.as_str())
+                    );
+                    assert!(matches!(
+                        reopened
+                            .promote_workstream_boundary("team", "workspace", token)
+                            .unwrap(),
+                        WorkstreamPromotionOutcome::Promoted { .. }
+                    ));
+                    assert_eq!(
+                        vcs.get_branch("main")
+                            .unwrap()
+                            .unwrap()
+                            .head_cut_id
+                            .as_deref(),
+                        Some(reservation.proposed_main_cut.as_str())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn promotion_reopens_after_main_cas_and_closes_forward_without_repeating_it() {
         let (directory, instance) = instance();
         instance
+            .seed_main(&[("removed.txt", "old"), ("changed.txt", "old")])
+            .expect("seed Main projection");
+        instance
             .create_named_workstream("team", Some("Team"))
             .expect("workstream");
-        let chat = instance.create_engagement("chat").expect("chat");
+        let mut chat = instance.create_engagement("chat").expect("chat");
         instance
             .transfer_engagement_to_workstream("chat", "team")
             .expect("join");
+        chat.set_target(Instance::workstream_ref("team"))
+            .expect("materialized stream target");
         chat.write_file("accepted.txt", "candidate").expect("write");
+        chat.write_file("changed.txt", "accepted change")
+            .expect("edit existing file");
+        chat.remove_file("removed.txt").expect("accepted deletion");
         chat.commit_turn("candidate").expect("cut");
         assert_eq!(
             chat.merge_into_main().expect("line advance"),
@@ -3395,9 +3726,20 @@ mod tests {
             .expect("reserve");
         let at = now_at();
         let mut vcs = instance.store().expect("vcs");
+        let direct_write = vcs
+            .write(
+                &reservation.line_branch_id,
+                "bypass.txt",
+                Some("must not land"),
+                "bypass-cut",
+                &at,
+            )
+            .expect_err("GaugeDesk's reservation must freeze direct VCS line writes");
+        assert!(format!("{direct_write:?}").contains("reserved by `reservation-crash`"));
         let promoted = vcs
             .promote_line_exact(
                 &reservation.line_branch_id,
+                &reservation.reservation_id,
                 nonempty(&reservation.expected_line_cut),
                 nonempty(&reservation.expected_main_cut),
                 &reservation.proposed_main_cut,
@@ -3417,6 +3759,8 @@ mod tests {
             .expect("topology")
             .record_ref_advanced("team", "reservation-crash", position, &handle, &at)
             .expect("record landed CAS");
+        std::fs::write(instance.repo.join("unobserved.txt"), "local work")
+            .expect("unobserved local file");
         drop(vcs);
         drop(instance);
 
@@ -3424,6 +3768,9 @@ mod tests {
             directory.path().join("repo"),
             directory.path().join("worktrees"),
         );
+        reopened
+            .reserve_workstream_promotion_boundary("team", "reservation-crash")
+            .expect("product reservation retry must not import stale files");
         let outcome = reopened
             .promote_workstream_boundary("team", "workspace-authority", "reservation-crash")
             .expect("recover close");
@@ -3437,6 +3784,44 @@ mod tests {
             .workstream_members("team")
             .expect("members")
             .is_empty());
+        assert_eq!(
+            reopened
+                .store()
+                .unwrap()
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some(reservation.proposed_main_cut.as_str()),
+            "recovery must not import the stale disk projection as a new Main cut",
+        );
+        assert_eq!(
+            std::fs::read_to_string(reopened.repo.join("accepted.txt"))
+                .expect("recovered Main materialization"),
+            "candidate",
+            "closing topology alone does not recover the accepted files",
+        );
+        assert_eq!(
+            std::fs::read_to_string(reopened.repo.join("changed.txt")).unwrap(),
+            "accepted change"
+        );
+        assert!(
+            !reopened.repo.join("removed.txt").exists(),
+            "accepted deletions reach disk"
+        );
+        assert_eq!(
+            std::fs::read_to_string(reopened.repo.join("unobserved.txt")).unwrap(),
+            "local work"
+        );
+        assert_eq!(
+            reopened
+                .store()
+                .unwrap()
+                .read(MAINLINE_BRANCH_ID, "unobserved.txt")
+                .unwrap(),
+            None
+        );
         let replay = reopened
             .promote_workstream_boundary("team", "workspace-authority", "reservation-crash")
             .expect("idempotent closed recovery");
@@ -3447,6 +3832,38 @@ mod tests {
                 ..
             } if rehomed_chat_ids.is_empty()
         ));
+        std::fs::write(reopened.repo.join("changed.txt"), "unsynced edit").expect("local edit");
+        let refused = reopened
+            .promote_workstream_boundary("team", "workspace-authority", "reservation-crash")
+            .expect_err("preserve unsynced overlapping edit");
+        assert!(
+            refused.message.contains("unsynced edit at `changed.txt`"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(reopened.repo.join("changed.txt")).unwrap(),
+            "unsynced edit"
+        );
+        std::fs::remove_file(reopened.repo.join("changed.txt")).expect("unsynced deletion");
+        let refused = reopened
+            .promote_workstream_boundary("team", "workspace-authority", "reservation-crash")
+            .expect_err("preserve unsynced local deletion");
+        assert!(
+            refused.message.contains("unsynced edit at `changed.txt`"),
+            "{refused}"
+        );
+        assert!(!reopened.repo.join("changed.txt").exists());
+        assert_eq!(
+            reopened
+                .store()
+                .unwrap()
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some(reservation.proposed_main_cut.as_str())
+        );
     }
 
     #[test]

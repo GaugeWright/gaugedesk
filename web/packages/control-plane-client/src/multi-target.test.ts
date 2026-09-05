@@ -164,7 +164,13 @@ describe("multi-target product wire contract", () => {
         await queryTargetSettlementMember(transport, "settlement-a", "member-a");
         await retryTargetSettlementMember(transport, "settlement-a", "member-a");
         await supersedeTargetSettlementMember(transport, "settlement-a", "member-a", "settlement-b", "member-b");
-        await compensateTargetSettlement(transport, "settlement-a", ["receipt-compensation"], true);
+        const compensationLink = {
+            original_receipt_ref: "receipt-original",
+            compensation_declaration_id: "settlement-repair",
+            compensation_member_id: "member-repair",
+            compensation_receipt_ref: "receipt-compensation",
+        };
+        await compensateTargetSettlement(transport, "settlement-a", [compensationLink]);
         await abandonTargetSettlement(transport, "settlement-a", "operator chose forward repair");
         await cancelTargetSettlement(transport, "settlement-a", "not started");
 
@@ -180,7 +186,7 @@ describe("multi-target product wire contract", () => {
             ["POST", "/target-settlements/settlement-a/members/member-a/query", {}],
             ["POST", "/target-settlements/settlement-a/members/member-a/retry", {}],
             ["POST", "/target-settlements/settlement-a/members/member-a/supersede", { later_declaration_id: "settlement-b", later_member_id: "member-b" }],
-            ["POST", "/target-settlements/settlement-a/compensate", { receipt_refs: ["receipt-compensation"], reconciliation_complete: true }],
+            ["POST", "/target-settlements/settlement-a/compensate", { receipt_links: [compensationLink] }],
             ["POST", "/target-settlements/settlement-a/abandon", { reason: "operator chose forward repair" }],
             ["POST", "/target-settlements/settlement-a/cancel", { reason: "not started" }],
         ]);

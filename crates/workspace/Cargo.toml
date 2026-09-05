@@ -11,6 +11,10 @@ license.workspace = true
 # crate only adapts worktrees-on-disk and lifecycle policy. The immutable rev
 # is the public v0.4 projection used by the public GaugeDesk CI path.
 whipplescript-store = { version = "0.5.6", features = ["native"] }
+# MTARGET-6: reuse the generic promotion/cleanup door, not a product-owned
+# copy of its cross-store recovery protocol. The native store above owns the
+# native feature; this edge introduces no provider or product-layer dependency.
+whipplescript-kernel = { version = "0.5.6", default-features = false }
 # Store-file snapshots (VACUUM INTO) for export/fork, and the read-only
 # peek at pre-vcs legacy stores during migration. Same version whip's
 # native feature bundles, so cargo unifies them.

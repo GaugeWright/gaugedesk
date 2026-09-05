@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use gaugedesk_whip_runtime::gate_runner::{
     deliver_verdict, run_gate, CoerceBackend, Disposition, GateCoercionConfig, GateProgram,
-    GateTransport,
+    GateRunError, GateTransport,
 };
 use gaugedesk_whip_runtime::sansio_types::{HttpRequest, HttpResponse, TransportError};
 
@@ -175,7 +175,8 @@ pub fn screen_item<T: GateTransport>(
         Ok(disposition) => Ok(Some(disposition)),
         // A gate that reaches a person settles nothing on this pass. Reporting
         // that as an error would make every human review look like a failure.
-        Err(_) => Ok(None),
+        Err(GateRunError::AwaitingReview) => Ok(None),
+        Err(error) => Err(io::Error::other(error)),
     }
 }
 
@@ -193,14 +194,14 @@ pub fn project_gate(
     let repo = targets_dir
         .join(crate::library_state::managed_project_target_id(project_id))
         .join("repo");
-    crate::gate::admit_installed(&repo)?;
     let source = std::fs::read_to_string(repo.join(crate::gate::GATE_PROGRAM_PATH))
         .map_err(|error| crate::gate::GateRefusal::Malformed(vec![error.to_string()]))?;
-    gaugedesk_whip_runtime::compile_whip_program(&source)
-        .ir
-        .ok_or_else(|| {
-            crate::gate::GateRefusal::Malformed(vec!["the gate does not compile".into()])
-        })
+    let envelope = std::fs::read_to_string(repo.join(crate::gate::GATE_ENVELOPE_PATH))
+        .map_err(|error| crate::gate::GateRefusal::Envelope(error.to_string()))?;
+    // Admit and retain the SAME read, not a second read racing a file edit.
+    crate::gate::admit(&source, &envelope)?;
+    GateProgram::compile(&source, &envelope)
+        .map_err(|error| crate::gate::GateRefusal::Malformed(vec![error.to_string()]))
 }
 
 impl crate::Workbench {

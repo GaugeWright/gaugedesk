@@ -1084,15 +1084,20 @@ export async function supersedeTargetSettlementMember(
     });
 }
 
+export interface CompensationReceiptLink {
+    original_receipt_ref: string;
+    compensation_declaration_id: string;
+    compensation_member_id: string;
+    compensation_receipt_ref: string;
+}
+
 export async function compensateTargetSettlement(
     transport: WorkbenchTransport,
     declarationId: string,
-    receiptRefs: readonly string[],
-    reconciliationComplete: boolean,
+    receiptLinks: readonly CompensationReceiptLink[],
 ): Promise<unknown> {
     return transport.json("POST", `/target-settlements/${encodeURIComponent(declarationId)}/compensate`, {
-        receipt_refs: receiptRefs,
-        reconciliation_complete: reconciliationComplete,
+        receipt_links: receiptLinks,
     });
 }
 

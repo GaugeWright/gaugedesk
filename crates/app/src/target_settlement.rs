@@ -14,12 +14,14 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use gaugedesk_core::signature::SigningKey;
+use gaugedesk_core::ids::PublicKey;
+use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
 use gaugedesk_core::target_settlement::{
-    AuthenticatedTargetReceipt, MemberPreflightEvidence, ReceiptOutcome, SettlementAct,
-    SettlementMemberDeclaration, SettlementMemberPhase, TargetLaneMember, TargetLanePermit,
-    TargetSettlementCommand, TargetSettlementDeclaration, TargetSettlementLaneCommand,
-    TargetSettlementLaneState, TargetSettlementState,
+    decide, decide_target_lane, AuthenticatedTargetReceipt, CompensationReceiptLink,
+    MemberPreflightEvidence, ReceiptOutcome, SettlementAct, SettlementMemberDeclaration,
+    SettlementMemberPhase, TargetLaneMember, TargetLanePermit, TargetSettlementCommand,
+    TargetSettlementDeclaration, TargetSettlementLaneCommand, TargetSettlementLaneState,
+    TargetSettlementState,
 };
 use gaugedesk_workspace::MergeOutcome;
 use serde::{Deserialize, Serialize};
@@ -54,8 +56,7 @@ pub struct CreateTargetSettlementMemberBody {
 
 #[derive(Debug, Deserialize)]
 pub struct CompensateTargetSettlementBody {
-    pub receipt_refs: Vec<String>,
-    pub reconciliation_complete: bool,
+    pub receipt_links: Vec<CompensationReceiptLink>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +95,45 @@ struct TargetSettlementChatRef {
 
 fn digest(value: impl AsRef<[u8]>) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(value.as_ref())))
+}
+
+fn target_receipt_payload(receipt: &AuthenticatedTargetReceipt) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&(
+        &receipt.member_id,
+        &receipt.target_id,
+        &receipt.operation_id,
+        &receipt.expected_basis,
+        &receipt.resulting_basis,
+        &receipt.resulting_digest,
+        receipt.outcome,
+        &receipt.authority_ref,
+        &receipt.failure_reason,
+    ))
+    .map_err(|error| error.to_string())
+}
+
+fn verify_target_receipt_authentication(
+    receipt: &AuthenticatedTargetReceipt,
+    expected_signer: &PublicKey,
+) -> Result<(), String> {
+    let encoded = receipt
+        .authentication_ref
+        .strip_prefix("p256:")
+        .ok_or_else(|| "compensation receipt has no P-256 authentication".to_owned())?;
+    let (public_key, signature) = encoded
+        .split_once(':')
+        .ok_or_else(|| "compensation receipt authentication is malformed".to_owned())?;
+    let signature = hex::decode(signature)
+        .map(Signature::new)
+        .map_err(|_| "compensation receipt signature is not hex".to_owned())?;
+    let payload = target_receipt_payload(receipt)?;
+    if public_key != expected_signer.as_str()
+        || receipt.receipt_ref != format!("target-receipt:{}", digest(&payload))
+        || verify_signature(&payload, &signature, &PublicKey::new(public_key)) != Ok(true)
+    {
+        return Err("compensation receipt authentication is invalid".to_owned());
+    }
+    Ok(())
 }
 
 fn core_act(act: TargetActKind) -> Result<SettlementAct, String> {
@@ -199,13 +239,25 @@ impl Workbench {
             .ok_or_else(|| "target change-set declaration is unavailable".to_owned())
     }
 
+    fn settlement_source(
+        &self,
+        declaration: &TargetSettlementDeclaration,
+    ) -> Result<TargetChangeSetDeclaration, String> {
+        let source =
+            self.target_change_set(&declaration.chat_id, &declaration.source_change_set_ref)?;
+        if source.chat_id != declaration.chat_id || source.project_id != declaration.project_id {
+            return Err("settlement source identity does not match its declaration".to_owned());
+        }
+        self.validate_promotion_change_set(&source, declaration.promotion_manifest_ref.as_deref())?;
+        Ok(source)
+    }
+
     fn exact_candidate_files(
         &self,
         declaration: &TargetSettlementDeclaration,
         member: &SettlementMemberDeclaration,
     ) -> Result<(TargetCandidateSnapshot, CandidateFileSnapshot), String> {
-        let source =
-            self.target_change_set(&declaration.chat_id, &declaration.source_change_set_ref)?;
+        let source = self.settlement_source(declaration)?;
         let candidate = source
             .candidate_snapshots
             .into_iter()
@@ -289,28 +341,8 @@ impl Workbench {
             .get(&member.target_id)
             .map(|target| target.authority.clone())
             .ok_or_else(|| "settlement target is unavailable".to_owned())?;
-        let payload = serde_json::to_vec(&(
-            &member.member_id,
-            &member.target_id,
-            &member.operation_id,
-            &member.expected_basis,
-            &resulting_basis,
-            &resulting_digest,
-            outcome,
-            &authority_ref,
-            &failure_reason,
-        ))
-        .map_err(|error| error.to_string())?;
-        let signing_key = SigningKey::from_seed(&self.governance_seed())
-            .map_err(|error| error.reason.to_owned())?;
-        let signature = signing_key.sign(&payload);
-        let authentication_ref = format!(
-            "p256:{}:{}",
-            signing_key.public_key().as_str(),
-            hex::encode(signature.as_bytes())
-        );
-        Ok(AuthenticatedTargetReceipt {
-            receipt_ref: format!("target-receipt:{}", digest(&payload)),
+        let mut receipt = AuthenticatedTargetReceipt {
+            receipt_ref: String::new(),
             member_id: member.member_id.clone(),
             target_id: member.target_id.clone(),
             operation_id: member.operation_id.clone(),
@@ -319,9 +351,20 @@ impl Workbench {
             resulting_digest,
             outcome,
             authority_ref,
-            authentication_ref,
+            authentication_ref: String::new(),
             failure_reason,
-        })
+        };
+        let payload = target_receipt_payload(&receipt)?;
+        let signing_key = SigningKey::from_seed(&self.governance_seed())
+            .map_err(|error| error.reason.to_owned())?;
+        let signature = signing_key.sign(&payload);
+        receipt.authentication_ref = format!(
+            "p256:{}:{}",
+            signing_key.public_key().as_str(),
+            hex::encode(signature.as_bytes())
+        );
+        receipt.receipt_ref = format!("target-receipt:{}", digest(&payload));
+        Ok(receipt)
     }
 
     fn execute_prepared_target_effect(
@@ -626,9 +669,8 @@ impl Workbench {
                 member.operation_id, member_id, state.members[member_id].attempts
             ))
         );
+        let source = self.settlement_source(&declaration)?;
         self.request_settlement_query(declaration_id, member_id, &query_ref)?;
-        let source =
-            self.target_change_set(&declaration.chat_id, &declaration.source_change_set_ref)?;
         let candidate = source
             .candidate_snapshots
             .into_iter()
@@ -674,6 +716,10 @@ impl Workbench {
             return Err("settlement must request at least one target act".to_owned());
         }
         let source = self.target_change_set(chat_id, source_change_set_ref)?;
+        if source.chat_id != chat_id {
+            return Err("settlement source belongs to another chat".to_owned());
+        }
+        self.validate_promotion_change_set(&source, promotion_manifest_ref.as_deref())?;
         let candidates = source
             .candidate_snapshots
             .iter()
@@ -865,6 +911,11 @@ impl Workbench {
             .store_ref()
             .fold::<TargetSettlementState>(&scope)
             .map_err(|error| format!("{error:?}"))?;
+        let declaration = current
+            .declaration
+            .clone()
+            .ok_or_else(|| "settlement declaration is absent".to_owned())?;
+        let source = self.settlement_source(&declaration)?;
         let mut state = match current.phase {
             gaugedesk_core::target_settlement::SettlementPhase::Declared => {
                 self.store_mut()
@@ -881,12 +932,6 @@ impl Workbench {
             gaugedesk_core::target_settlement::SettlementPhase::Ready => current,
             _ => return Ok(current),
         };
-        let declaration = state
-            .declaration
-            .clone()
-            .ok_or_else(|| "settlement declaration is absent".to_owned())?;
-        let source =
-            self.target_change_set(&declaration.chat_id, &declaration.source_change_set_ref)?;
         let candidates = source
             .candidate_snapshots
             .iter()
@@ -981,6 +1026,9 @@ impl Workbench {
             .declaration
             .clone()
             .ok_or_else(|| "settlement declaration is absent".to_owned())?;
+        if declaration.promotion_manifest_ref.is_some() {
+            self.settlement_source(&declaration)?;
+        }
         let member = declaration
             .members
             .iter()
@@ -1177,6 +1225,9 @@ impl Workbench {
             .declaration
             .as_ref()
             .ok_or_else(|| "settlement declaration is absent".to_owned())?;
+        if declaration.promotion_manifest_ref.is_some() {
+            self.settlement_source(declaration)?;
+        }
         let member = declaration
             .members
             .iter()
@@ -1234,17 +1285,125 @@ impl Workbench {
     pub(crate) fn compensate_target_settlement(
         &mut self,
         declaration_id: &str,
-        receipt_refs: Vec<String>,
-        reconciliation_complete: bool,
+        mut receipt_links: Vec<CompensationReceiptLink>,
     ) -> Result<TargetSettlementState, String> {
+        receipt_links.sort_by(|left, right| {
+            left.original_receipt_ref
+                .cmp(&right.original_receipt_ref)
+                .then_with(|| {
+                    left.compensation_declaration_id
+                        .cmp(&right.compensation_declaration_id)
+                })
+                .then_with(|| {
+                    left.compensation_member_id
+                        .cmp(&right.compensation_member_id)
+                })
+                .then_with(|| {
+                    left.compensation_receipt_ref
+                        .cmp(&right.compensation_receipt_ref)
+                })
+        });
+        let scope = settlement_scope(declaration_id);
+        let original_state = self
+            .store_ref()
+            .fold::<TargetSettlementState>(&scope)
+            .map_err(|error| format!("{error:?}"))?;
+        let original_declaration = original_state
+            .declaration
+            .as_ref()
+            .ok_or_else(|| "settlement declaration is absent".to_owned())?;
+        let successful = original_state
+            .members
+            .values()
+            .filter_map(|member| {
+                member.receipt.as_ref().and_then(|receipt| {
+                    if receipt.outcome == ReceiptOutcome::Succeeded {
+                        member
+                            .lane_permit
+                            .as_ref()
+                            .map(|permit| (receipt.receipt_ref.clone(), (receipt, permit.sequence)))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        let receipt_signer = SigningKey::from_seed(&self.governance_seed())
+            .map_err(|error| error.reason.to_owned())?
+            .public_key();
+
+        for link in &receipt_links {
+            let (original, original_lane_sequence) =
+                successful.get(&link.original_receipt_ref).ok_or_else(|| {
+                    "compensation link names no successful original effect".to_owned()
+                })?;
+            if link.compensation_declaration_id == declaration_id {
+                return Err("a settlement cannot compensate itself".to_owned());
+            }
+            let later_state = self
+                .store_ref()
+                .fold::<TargetSettlementState>(&settlement_scope(&link.compensation_declaration_id))
+                .map_err(|error| format!("{error:?}"))?;
+            let later_declaration = later_state
+                .declaration
+                .as_ref()
+                .ok_or_else(|| "compensation settlement declaration is absent".to_owned())?;
+            if later_declaration.declaration_id != link.compensation_declaration_id
+                || later_declaration.project_id != original_declaration.project_id
+            {
+                return Err("compensation settlement belongs to a different project".to_owned());
+            }
+            let later_member = later_declaration
+                .members
+                .iter()
+                .find(|member| member.member_id == link.compensation_member_id)
+                .ok_or_else(|| "compensation member is unavailable".to_owned())?;
+            let later_member_state = later_state
+                .members
+                .get(&link.compensation_member_id)
+                .ok_or_else(|| "compensation member state is unavailable".to_owned())?;
+            let later_receipt = later_member_state
+                .receipt
+                .as_ref()
+                .filter(|receipt| {
+                    receipt.receipt_ref == link.compensation_receipt_ref
+                        && receipt.outcome == ReceiptOutcome::Succeeded
+                })
+                .ok_or_else(|| "compensation member has no exact successful receipt".to_owned())?;
+            if later_member.target_id != original.target_id
+                || later_member.expected_basis != original.resulting_basis.as_deref().unwrap_or("")
+                || later_member.act == SettlementAct::Propose
+                || later_member_state
+                    .lane_permit
+                    .as_ref()
+                    .map(|permit| permit.sequence <= *original_lane_sequence)
+                    .unwrap_or(true)
+            {
+                return Err(
+                    "compensation must be a later lane effect on the same target and resulting basis"
+                        .to_owned(),
+                );
+            }
+            let expected_authority = self
+                .library
+                .work_targets
+                .get(&later_member.target_id)
+                .map(|target| target.authority.as_str())
+                .ok_or_else(|| "compensation target is unavailable".to_owned())?;
+            if later_receipt.authority_ref != expected_authority {
+                return Err("compensation receipt names the wrong target authority".to_owned());
+            }
+            verify_target_receipt_authentication(later_receipt, &receipt_signer)?;
+        }
+
         self.store_mut()
             .admit_materialized::<TargetSettlementState>(
-                &settlement_scope(declaration_id),
-                &format!("compensate:{}", digest(receipt_refs.join("\0"))),
-                TargetSettlementCommand::MarkCompensated {
-                    receipt_refs,
-                    reconciliation_complete,
-                },
+                &scope,
+                &format!(
+                    "compensate:{}",
+                    digest(serde_json::to_vec(&receipt_links).map_err(|error| error.to_string())?)
+                ),
+                TargetSettlementCommand::MarkCompensated { receipt_links },
             )
             .map(|admission| admission.state)
             .map_err(|error| format!("{error:?}"))
@@ -1282,6 +1441,18 @@ impl Workbench {
             .clone()
             .ok_or_else(|| "settlement declaration is absent".to_owned())?;
         let cancellation_ref = format!("cancellation:{}", digest(reason));
+        let command = if state.started_effects == 0 {
+            TargetSettlementCommand::CancelBeforeEffects {
+                reason: reason.to_owned(),
+            }
+        } else {
+            TargetSettlementCommand::CancelUnstarted {
+                reason: reason.to_owned(),
+            }
+        };
+        // The coordinator is the cancellation authority. Validate its entire
+        // transition before mutating any independently durable target lane.
+        decide(&state, command.clone()).map_err(|error| error.reason.to_owned())?;
         for member in &declaration.members {
             if !matches!(
                 state.members[&member.member_id].phase,
@@ -1312,15 +1483,6 @@ impl Workbench {
                     .map_err(|error| format!("{error:?}"))?;
             }
         }
-        let command = if state.started_effects == 0 {
-            TargetSettlementCommand::CancelBeforeEffects {
-                reason: reason.to_owned(),
-            }
-        } else {
-            TargetSettlementCommand::CancelUnstarted {
-                reason: reason.to_owned(),
-            }
-        };
         self.store_mut()
             .admit_materialized::<TargetSettlementState>(
                 &scope,
@@ -1370,11 +1532,70 @@ impl Workbench {
             })
             .cloned()
             .ok_or_else(|| "later settlement member is unavailable".to_owned())?;
+        let earlier_declaration = earlier_state
+            .declaration
+            .as_ref()
+            .expect("member resolution requires a declaration");
+        let later_declaration = later_state
+            .declaration
+            .as_ref()
+            .expect("member resolution requires a declaration");
         if earlier.target_id != later.target_id
             || later_state.members[later_member_id].phase != SettlementMemberPhase::PreflightPassed
         {
             return Err(
                 "later member must have exact preflight for the same stable target".to_owned(),
+            );
+        }
+        if earlier_declaration.project_id != later_declaration.project_id
+            || earlier_declaration.declaration_id == later_declaration.declaration_id
+        {
+            return Err("supersession declarations must be distinct and project-scoped".to_owned());
+        }
+        let earlier_manifest_ref = earlier_declaration
+            .promotion_manifest_ref
+            .as_deref()
+            .ok_or_else(|| "earlier settlement has no promoted project cut".to_owned())?;
+        let later_manifest_ref = later_declaration
+            .promotion_manifest_ref
+            .as_deref()
+            .ok_or_else(|| "later settlement has no promoted project cut".to_owned())?;
+        self.settlement_source(earlier_declaration)?;
+        self.settlement_source(later_declaration)?;
+        let earlier_manifest = self.workstream_promotion_manifest(
+            &earlier_declaration.chat_id,
+            Some(earlier_manifest_ref),
+        )?;
+        let later_manifest = self
+            .workstream_promotion_manifest(&later_declaration.chat_id, Some(later_manifest_ref))?;
+        if earlier_manifest.project_id != earlier_declaration.project_id
+            || later_manifest.project_id != later_declaration.project_id
+            || earlier_manifest.workspace_id != later_manifest.workspace_id
+            || earlier_manifest.proposed_main_cut == later_manifest.proposed_main_cut
+        {
+            return Err("supersession requires distinct cuts in one project workspace".to_owned());
+        }
+        let workspace = self
+            .collaboration_workspaces
+            .get(&earlier_manifest.workspace_id)
+            .ok_or_else(|| "project collaboration workspace is unavailable".to_owned())?;
+        let current_main_cut = workspace
+            .current_main_cut()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "project collaboration Main has no durable cut".to_owned())?;
+        let later_contains_earlier = workspace
+            .cut_descends_from(
+                &later_manifest.proposed_main_cut,
+                &earlier_manifest.proposed_main_cut,
+            )
+            .map_err(|error| error.to_string())?;
+        let main_contains_later = workspace
+            .cut_descends_from(&current_main_cut, &later_manifest.proposed_main_cut)
+            .map_err(|error| error.to_string())?;
+        if !later_contains_earlier || !main_contains_later {
+            return Err(
+                "later settlement is not proven cumulative by promoted Main-cut ancestry"
+                    .to_owned(),
             );
         }
         let earlier_ref = format!("{earlier_scope}#{earlier_member_id}#attempt:1");
@@ -1384,28 +1605,39 @@ impl Workbench {
             .as_ref()
             .map(|evidence| evidence.governance_decision_ref.clone())
             .ok_or_else(|| "later member has no exact preflight evidence".to_owned())?;
+        let lane_id = lane_scope(&earlier.target_id);
+        let lane_command = TargetSettlementLaneCommand::SupersedeQueued {
+            earlier_member_ref: earlier_ref,
+            later_member_ref: later_ref.clone(),
+            preflight_ref,
+        };
+        let coordinator_command = TargetSettlementCommand::SupersedeNotStarted {
+            member_id: earlier_member_id.to_owned(),
+            later_member_ref: later_ref,
+        };
+        let lane_state = self
+            .store_ref()
+            .fold::<TargetSettlementLaneState>(&lane_id)
+            .map_err(|error| format!("{error:?}"))?;
+        decide_target_lane(&lane_state, lane_command.clone())
+            .map_err(|error| error.reason.to_owned())?;
+        decide(&earlier_state, coordinator_command.clone())
+            .map_err(|error| error.reason.to_owned())?;
         self.store_mut()
             .admit_materialized::<TargetSettlementLaneState>(
-                &lane_scope(&earlier.target_id),
+                &lane_id,
                 &format!(
                     "supersede:{}:by:{}",
                     earlier.operation_id, later.operation_id
                 ),
-                TargetSettlementLaneCommand::SupersedeQueued {
-                    earlier_member_ref: earlier_ref,
-                    later_member_ref: later_ref.clone(),
-                    preflight_ref,
-                },
+                lane_command,
             )
             .map_err(|error| format!("{error:?}"))?;
         self.store_mut()
             .admit_materialized::<TargetSettlementState>(
                 &earlier_scope,
                 &format!("supersede:{}", earlier.operation_id),
-                TargetSettlementCommand::SupersedeNotStarted {
-                    member_id: earlier_member_id.to_owned(),
-                    later_member_ref: later_ref,
-                },
+                coordinator_command,
             )
             .map(|admission| admission.state)
             .map_err(|error| format!("{error:?}"))
@@ -1549,11 +1781,7 @@ pub async fn compensate_target_settlement(
     Json(body): Json<CompensateTargetSettlementBody>,
 ) -> impl IntoResponse {
     let mut workbench = workbench.lock_unpoisoned();
-    match workbench.compensate_target_settlement(
-        &declaration_id,
-        body.receipt_refs,
-        body.reconciliation_complete,
-    ) {
+    match workbench.compensate_target_settlement(&declaration_id, body.receipt_links) {
         Ok(state) => (StatusCode::OK, Json(state)).into_response(),
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
     }
@@ -1704,6 +1932,62 @@ mod tests {
             authority_ref: format!("authority:{}", member.target_id),
             authentication_ref: format!("signature:{suffix}"),
             failure_reason: Some("provider proved no effect".into()),
+        }
+    }
+
+    fn admit_settlement(
+        workbench: &mut Workbench,
+        declaration_id: &str,
+        key: &str,
+        command: TargetSettlementCommand,
+    ) -> TargetSettlementState {
+        workbench
+            .store_mut()
+            .admit_materialized::<TargetSettlementState>(
+                &settlement_scope(declaration_id),
+                key,
+                command,
+            )
+            .expect("settlement command")
+            .state
+    }
+
+    fn test_member(id: &str, target_id: &str, expected_basis: &str) -> SettlementMemberDeclaration {
+        SettlementMemberDeclaration {
+            member_id: format!("member:{id}"),
+            target_id: target_id.to_owned(),
+            operation_id: format!("operation:{id}"),
+            expected_basis: expected_basis.to_owned(),
+            candidate_digest: format!("candidate:{id}"),
+            expected_result_digest: format!("result:{id}"),
+            policy_decision_handle: format!("policy:{id}"),
+            adapter: "managed:whipplescript-v1".into(),
+            act: SettlementAct::Apply,
+            retry_safe_after_failure: true,
+            authoritative_query: true,
+        }
+    }
+
+    fn test_preflight(member: &SettlementMemberDeclaration) -> MemberPreflightEvidence {
+        MemberPreflightEvidence {
+            member_id: member.member_id.clone(),
+            observed_basis: member.expected_basis.clone(),
+            observed_candidate_digest: member.candidate_digest.clone(),
+            adapter_contract_ref: "whipplescript-target-receipt/v1".into(),
+            governance_decision_ref: member.policy_decision_handle.clone(),
+            admitted: true,
+            refusal_reason: None,
+        }
+    }
+
+    fn test_permit(member: &SettlementMemberDeclaration, sequence: u64) -> TargetLanePermit {
+        TargetLanePermit {
+            lane_id: format!("lane:{}", member.target_id),
+            target_id: member.target_id.clone(),
+            member_id: member.member_id.clone(),
+            operation_id: member.operation_id.clone(),
+            sequence,
+            authority_position: format!("position:{sequence}"),
         }
     }
 
@@ -2034,5 +2318,615 @@ mod tests {
             .expect("query")
             .expect("decisive query");
         assert_eq!(completed.phase, SettlementPhase::Completed);
+    }
+
+    #[test]
+    fn invalid_cancellation_changes_neither_coordinator_nor_target_lane() {
+        let root = tempfile::tempdir().expect("root");
+        let workbench = open_workbench(root.path()).expect("workbench");
+        let mut workbench = workbench.lock_unpoisoned();
+        let chat = workbench
+            .create_chat_in_instance(DEFAULT_PLACEMENT, "cancel settlement")
+            .expect("chat");
+        let chat_id = chat["id"].as_str().expect("chat id");
+        let (source, target_id) = seed_change_set(&mut workbench, chat_id, "cancel");
+        let declared = workbench
+            .create_target_settlement(
+                chat_id,
+                &source.id,
+                None,
+                vec![RequestedSettlementMember {
+                    target_id: target_id.clone(),
+                    act: TargetActKind::Apply,
+                }],
+            )
+            .expect("declare");
+        let declaration_id = declared.declaration.unwrap().declaration_id;
+        let before_coordinator = workbench
+            .preflight_target_settlement(&declaration_id)
+            .expect("preflight");
+        let before_lane = workbench
+            .store_ref()
+            .fold::<TargetSettlementLaneState>(&lane_scope(&target_id))
+            .expect("lane");
+
+        assert!(workbench
+            .cancel_target_settlement(&declaration_id, "   ")
+            .is_err());
+        assert_eq!(
+            workbench
+                .store_ref()
+                .fold::<TargetSettlementState>(&settlement_scope(&declaration_id))
+                .expect("coordinator after refusal"),
+            before_coordinator
+        );
+        assert_eq!(
+            workbench
+                .store_ref()
+                .fold::<TargetSettlementLaneState>(&lane_scope(&target_id))
+                .expect("lane after refusal"),
+            before_lane
+        );
+    }
+
+    #[test]
+    fn compensation_resolves_and_authenticates_exact_forward_repair_receipts() {
+        let root = tempfile::tempdir().expect("root");
+        let workbench = open_workbench(root.path()).expect("workbench");
+        let mut workbench = workbench.lock_unpoisoned();
+        let chat = workbench
+            .create_chat_in_instance(DEFAULT_PLACEMENT, "compensation settlement")
+            .expect("chat");
+        let chat_id = chat["id"].as_str().expect("chat id");
+        let (source, target_id) = seed_change_set(&mut workbench, chat_id, "compensation");
+        let project_id = source.project_id;
+        let original_id = "settlement:original";
+        let original_member = test_member("original", &target_id, "basis:before");
+        let skipped_member = test_member("skipped", &target_id, "basis:before");
+        admit_settlement(
+            &mut workbench,
+            original_id,
+            "declare",
+            TargetSettlementCommand::Declare(TargetSettlementDeclaration {
+                declaration_id: original_id.into(),
+                project_id: project_id.clone(),
+                chat_id: chat_id.into(),
+                source_change_set_ref: "change-set:original".into(),
+                promotion_manifest_ref: Some("promotion:original".into()),
+                members: vec![original_member.clone(), skipped_member.clone()],
+            }),
+        );
+        admit_settlement(
+            &mut workbench,
+            original_id,
+            "preflight",
+            TargetSettlementCommand::BeginPreflight,
+        );
+        admit_settlement(
+            &mut workbench,
+            original_id,
+            "preflight-original",
+            TargetSettlementCommand::RecordPreflight(test_preflight(&original_member)),
+        );
+        admit_settlement(
+            &mut workbench,
+            original_id,
+            "preflight-skipped",
+            TargetSettlementCommand::RecordPreflight(test_preflight(&skipped_member)),
+        );
+        admit_settlement(
+            &mut workbench,
+            original_id,
+            "start-original",
+            TargetSettlementCommand::StartMember {
+                member_id: original_member.member_id.clone(),
+                lane_permit: test_permit(&original_member, 1),
+            },
+        );
+        let original_receipt = workbench
+            .sign_target_receipt(
+                &original_member,
+                ReceiptOutcome::Succeeded,
+                Some("basis:after-original".into()),
+                Some(original_member.expected_result_digest.clone()),
+                None,
+            )
+            .expect("signed original receipt");
+        admit_settlement(
+            &mut workbench,
+            original_id,
+            "receipt-original",
+            TargetSettlementCommand::RecordReceipt(original_receipt.clone()),
+        );
+        let partial = admit_settlement(
+            &mut workbench,
+            original_id,
+            "cancel-skipped",
+            TargetSettlementCommand::CancelUnstarted {
+                reason: "forward repair selected".into(),
+            },
+        );
+        assert_eq!(partial.phase, SettlementPhase::PartiallyApplied);
+
+        let early_repair_id = "settlement:early-repair";
+        let early_repair_member = test_member("early-repair", &target_id, "basis:after-original");
+        admit_settlement(
+            &mut workbench,
+            early_repair_id,
+            "declare",
+            TargetSettlementCommand::Declare(TargetSettlementDeclaration {
+                declaration_id: early_repair_id.into(),
+                project_id: project_id.clone(),
+                chat_id: chat_id.into(),
+                source_change_set_ref: "change-set:early-repair".into(),
+                promotion_manifest_ref: Some("promotion:early-repair".into()),
+                members: vec![early_repair_member.clone()],
+            }),
+        );
+        admit_settlement(
+            &mut workbench,
+            early_repair_id,
+            "preflight",
+            TargetSettlementCommand::BeginPreflight,
+        );
+        admit_settlement(
+            &mut workbench,
+            early_repair_id,
+            "preflight-early-repair",
+            TargetSettlementCommand::RecordPreflight(test_preflight(&early_repair_member)),
+        );
+        admit_settlement(
+            &mut workbench,
+            early_repair_id,
+            "start-early-repair",
+            TargetSettlementCommand::StartMember {
+                member_id: early_repair_member.member_id.clone(),
+                lane_permit: test_permit(&early_repair_member, 1),
+            },
+        );
+        let early_repair_receipt = workbench
+            .sign_target_receipt(
+                &early_repair_member,
+                ReceiptOutcome::Succeeded,
+                Some("basis:early-repair".into()),
+                Some(early_repair_member.expected_result_digest.clone()),
+                None,
+            )
+            .expect("signed same-position receipt");
+        admit_settlement(
+            &mut workbench,
+            early_repair_id,
+            "receipt-early-repair",
+            TargetSettlementCommand::RecordReceipt(early_repair_receipt.clone()),
+        );
+        assert!(workbench
+            .compensate_target_settlement(
+                original_id,
+                vec![CompensationReceiptLink {
+                    original_receipt_ref: original_receipt.receipt_ref.clone(),
+                    compensation_declaration_id: early_repair_id.into(),
+                    compensation_member_id: early_repair_member.member_id,
+                    compensation_receipt_ref: early_repair_receipt.receipt_ref,
+                }],
+            )
+            .is_err());
+
+        let forged_repair_id = "settlement:forged-repair";
+        let forged_repair_member = test_member("forged-repair", &target_id, "basis:after-original");
+        admit_settlement(
+            &mut workbench,
+            forged_repair_id,
+            "declare",
+            TargetSettlementCommand::Declare(TargetSettlementDeclaration {
+                declaration_id: forged_repair_id.into(),
+                project_id: project_id.clone(),
+                chat_id: chat_id.into(),
+                source_change_set_ref: "change-set:forged-repair".into(),
+                promotion_manifest_ref: Some("promotion:forged-repair".into()),
+                members: vec![forged_repair_member.clone()],
+            }),
+        );
+        admit_settlement(
+            &mut workbench,
+            forged_repair_id,
+            "preflight",
+            TargetSettlementCommand::BeginPreflight,
+        );
+        admit_settlement(
+            &mut workbench,
+            forged_repair_id,
+            "preflight-forged-repair",
+            TargetSettlementCommand::RecordPreflight(test_preflight(&forged_repair_member)),
+        );
+        admit_settlement(
+            &mut workbench,
+            forged_repair_id,
+            "start-forged-repair",
+            TargetSettlementCommand::StartMember {
+                member_id: forged_repair_member.member_id.clone(),
+                lane_permit: test_permit(&forged_repair_member, 2),
+            },
+        );
+        let mut forged_repair_receipt = workbench
+            .sign_target_receipt(
+                &forged_repair_member,
+                ReceiptOutcome::Succeeded,
+                Some("basis:forged-repair".into()),
+                Some(forged_repair_member.expected_result_digest.clone()),
+                None,
+            )
+            .expect("initially valid forged receipt body");
+        forged_repair_receipt.authentication_ref = "p256:invented:00".into();
+        admit_settlement(
+            &mut workbench,
+            forged_repair_id,
+            "receipt-forged-repair",
+            TargetSettlementCommand::RecordReceipt(forged_repair_receipt.clone()),
+        );
+        assert!(workbench
+            .compensate_target_settlement(
+                original_id,
+                vec![CompensationReceiptLink {
+                    original_receipt_ref: original_receipt.receipt_ref.clone(),
+                    compensation_declaration_id: forged_repair_id.into(),
+                    compensation_member_id: forged_repair_member.member_id,
+                    compensation_receipt_ref: forged_repair_receipt.receipt_ref,
+                }],
+            )
+            .is_err());
+
+        let repair_id = "settlement:repair";
+        let repair_member = test_member("repair", &target_id, "basis:after-original");
+        admit_settlement(
+            &mut workbench,
+            repair_id,
+            "declare",
+            TargetSettlementCommand::Declare(TargetSettlementDeclaration {
+                declaration_id: repair_id.into(),
+                project_id,
+                chat_id: chat_id.into(),
+                source_change_set_ref: "change-set:repair".into(),
+                promotion_manifest_ref: Some("promotion:repair".into()),
+                members: vec![repair_member.clone()],
+            }),
+        );
+        admit_settlement(
+            &mut workbench,
+            repair_id,
+            "preflight",
+            TargetSettlementCommand::BeginPreflight,
+        );
+        admit_settlement(
+            &mut workbench,
+            repair_id,
+            "preflight-repair",
+            TargetSettlementCommand::RecordPreflight(test_preflight(&repair_member)),
+        );
+        admit_settlement(
+            &mut workbench,
+            repair_id,
+            "start-repair",
+            TargetSettlementCommand::StartMember {
+                member_id: repair_member.member_id.clone(),
+                lane_permit: test_permit(&repair_member, 3),
+            },
+        );
+        let repair_receipt = workbench
+            .sign_target_receipt(
+                &repair_member,
+                ReceiptOutcome::Succeeded,
+                Some("basis:repaired".into()),
+                Some(repair_member.expected_result_digest.clone()),
+                None,
+            )
+            .expect("signed repair receipt");
+        admit_settlement(
+            &mut workbench,
+            repair_id,
+            "receipt-repair",
+            TargetSettlementCommand::RecordReceipt(repair_receipt.clone()),
+        );
+        assert!(workbench
+            .compensate_target_settlement(
+                original_id,
+                vec![CompensationReceiptLink {
+                    original_receipt_ref: original_receipt.receipt_ref.clone(),
+                    compensation_declaration_id: repair_id.into(),
+                    compensation_member_id: repair_member.member_id.clone(),
+                    compensation_receipt_ref: "receipt:invented".into(),
+                }],
+            )
+            .is_err());
+        let link = CompensationReceiptLink {
+            original_receipt_ref: original_receipt.receipt_ref,
+            compensation_declaration_id: repair_id.into(),
+            compensation_member_id: repair_member.member_id,
+            compensation_receipt_ref: repair_receipt.receipt_ref.clone(),
+        };
+        let compensated = workbench
+            .compensate_target_settlement(original_id, vec![link.clone()])
+            .expect("authenticated compensation");
+        assert_eq!(compensated.phase, SettlementPhase::Compensated);
+        assert_eq!(compensated.compensation_receipt_links, vec![link]);
+        assert_eq!(
+            compensated.compensation_receipt_refs,
+            vec![repair_receipt.receipt_ref]
+        );
+    }
+
+    #[test]
+    fn supersession_requires_a_later_promoted_main_cut_before_lane_mutation() {
+        use crate::library::{RecordOp, WorkstreamRecord};
+        use crate::workstream_promotion::{
+            WorkstreamPromotionManifest, WORKSTREAM_PROMOTION_MANIFEST_KIND,
+        };
+
+        let root = tempfile::tempdir().expect("root");
+        let workbench = open_workbench(root.path()).expect("workbench");
+        let mut workbench = workbench.lock_unpoisoned();
+        let chat = workbench
+            .create_chat_in_instance(DEFAULT_PLACEMENT, "supersession settlement")
+            .expect("chat");
+        let chat_id = chat["id"].as_str().expect("chat id").to_owned();
+        let (earlier_source, target_id) =
+            seed_change_set(&mut workbench, &chat_id, "supersession-earlier");
+        let (fake_source, _) = seed_change_set(&mut workbench, &chat_id, "supersession-fake");
+        let (later_source, _) = seed_change_set(&mut workbench, &chat_id, "supersession-later");
+        workbench.write_workstream_record(WorkstreamRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            id: chat_id.clone(),
+            op: RecordOp::Upsert,
+            instance_id: DEFAULT_PLACEMENT.to_owned(),
+            name: "Supersession fixture".to_owned(),
+            created_position: 0,
+        });
+        let fake_cut = earlier_source.candidate_snapshots[0].candidate_cut.clone();
+        let project_id = earlier_source.project_id.clone();
+        let workspace_id = workbench.library.project_collaboration_workspaces[&project_id]
+            .workspace_id
+            .clone();
+        let (earlier_cut, later_cut) = {
+            let workspace = &workbench.collaboration_workspaces[&workspace_id];
+            workspace
+                .seed_main(&[("supersession-proof/earlier", "earlier")])
+                .expect("earlier Main cut");
+            let earlier_cut = workspace
+                .current_main_cut()
+                .expect("Main authority")
+                .expect("earlier cut");
+            workspace
+                .seed_main(&[("supersession-proof/later", "later")])
+                .expect("later Main cut");
+            let later_cut = workspace
+                .current_main_cut()
+                .expect("Main authority")
+                .expect("later cut");
+            (earlier_cut, later_cut)
+        };
+        let manifest =
+            |id: &str, proposed_main_cut: String, source: &TargetChangeSetDeclaration| {
+                WorkstreamPromotionManifest {
+                    schema: "gaugedesk.workstream-promotion-manifest.v1".into(),
+                    id: id.into(),
+                    workstream_id: chat_id.clone(),
+                    project_id: project_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    reservation_id: format!("reservation:{id}"),
+                    line_branch_id: format!("line:{id}"),
+                    expected_line_cut: format!("line-cut:{id}"),
+                    expected_main_cut: earlier_cut.clone(),
+                    proposed_main_cut,
+                    partitions: source.candidate_snapshots.clone(),
+                }
+            };
+        let earlier_manifest = manifest("manifest:earlier", earlier_cut.clone(), &earlier_source);
+        let fake_manifest = manifest("manifest:fake", fake_cut, &fake_source);
+        let later_manifest = manifest("manifest:later", later_cut, &later_source);
+        for manifest in [&earlier_manifest, &fake_manifest, &later_manifest] {
+            workbench
+                .store_mut()
+                .append_record(
+                    &chat_id,
+                    WORKSTREAM_PROMOTION_MANIFEST_KIND,
+                    &serde_json::to_string(manifest).expect("manifest"),
+                )
+                .expect("record manifest");
+            let source = manifest
+                .change_set(
+                    DEFAULT_PLACEMENT.to_owned(),
+                    manifest.partitions.clone(),
+                    false,
+                )
+                .unwrap();
+            workbench
+                .store_mut()
+                .append_record(
+                    &chat_id,
+                    TARGET_CHANGE_SET_DECLARATION_KIND,
+                    &serde_json::to_string(&source).unwrap(),
+                )
+                .unwrap();
+        }
+        let earlier_source = earlier_manifest
+            .change_set(
+                DEFAULT_PLACEMENT.to_owned(),
+                earlier_manifest.partitions.clone(),
+                false,
+            )
+            .unwrap();
+        let fake_source = fake_manifest
+            .change_set(
+                DEFAULT_PLACEMENT.to_owned(),
+                fake_manifest.partitions.clone(),
+                false,
+            )
+            .unwrap();
+        let later_source = later_manifest
+            .change_set(
+                DEFAULT_PLACEMENT.to_owned(),
+                later_manifest.partitions.clone(),
+                false,
+            )
+            .unwrap();
+
+        let earlier = workbench
+            .create_target_settlement(
+                &chat_id,
+                &earlier_source.id,
+                Some(earlier_manifest.id.clone()),
+                vec![RequestedSettlementMember {
+                    target_id: target_id.clone(),
+                    act: TargetActKind::Apply,
+                }],
+            )
+            .expect("earlier settlement");
+        let earlier_id = earlier.declaration.unwrap().declaration_id;
+        let earlier_ready = workbench
+            .preflight_target_settlement(&earlier_id)
+            .expect("earlier preflight");
+        let earlier_member_id = earlier_ready.declaration.unwrap().members[0]
+            .member_id
+            .clone();
+
+        let fake = workbench
+            .create_target_settlement(
+                &chat_id,
+                &fake_source.id,
+                Some(fake_manifest.id.clone()),
+                vec![RequestedSettlementMember {
+                    target_id: target_id.clone(),
+                    act: TargetActKind::Apply,
+                }],
+            )
+            .expect("fake settlement");
+        let fake_id = fake.declaration.unwrap().declaration_id;
+        let fake_ready = workbench
+            .preflight_target_settlement(&fake_id)
+            .expect("fake preflight");
+        let fake_member_id = fake_ready.declaration.unwrap().members[0].member_id.clone();
+
+        let lane_before = workbench
+            .store_ref()
+            .fold::<TargetSettlementLaneState>(&lane_scope(&target_id))
+            .expect("lane before refusal");
+        assert!(
+            workbench
+                .supersede_settlement_member(
+                    &earlier_id,
+                    &earlier_member_id,
+                    &fake_id,
+                    &fake_member_id,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            workbench
+                .store_ref()
+                .fold::<TargetSettlementLaneState>(&lane_scope(&target_id))
+                .expect("lane after refusal"),
+            lane_before,
+            "same-target preflight without Main ancestry must be externally null"
+        );
+
+        let later = workbench
+            .create_target_settlement(
+                &chat_id,
+                &later_source.id,
+                Some(later_manifest.id),
+                vec![RequestedSettlementMember {
+                    target_id,
+                    act: TargetActKind::Apply,
+                }],
+            )
+            .expect("later settlement");
+        let later_id = later.declaration.unwrap().declaration_id;
+        let later_ready = workbench
+            .preflight_target_settlement(&later_id)
+            .expect("later preflight");
+        let later_member_id = later_ready.declaration.as_ref().unwrap().members[0]
+            .member_id
+            .clone();
+
+        // Model a declaration persisted by the old route: a real cumulative
+        // manifest attached to another immutable source. Every resumption path
+        // must validate it before mutating coordinator state or target lanes.
+        let mut forged = later_ready.declaration.clone().unwrap();
+        forged.declaration_id = "settlement:borrowed-manifest".into();
+        forged.source_change_set_ref = fake_source.id;
+        let forged_id = forged.declaration_id.clone();
+        admit_settlement(
+            &mut workbench,
+            &forged_id,
+            "declare",
+            TargetSettlementCommand::Declare(forged),
+        );
+        admit_settlement(
+            &mut workbench,
+            &forged_id,
+            "preflight",
+            TargetSettlementCommand::BeginPreflight,
+        );
+        admit_settlement(
+            &mut workbench,
+            &forged_id,
+            "evidence",
+            TargetSettlementCommand::RecordPreflight(
+                later_ready.members[&later_member_id]
+                    .preflight_evidence
+                    .clone()
+                    .unwrap(),
+            ),
+        );
+        let forged_scope = settlement_scope(&forged_id);
+        let lane_id = lane_scope(&later_ready.declaration.as_ref().unwrap().members[0].target_id);
+        let coordinator_before = workbench.store_ref().events(&forged_scope).unwrap();
+        let lane_before = workbench.store_ref().events(&lane_id).unwrap();
+        let outcomes = [
+            workbench
+                .preflight_target_settlement(&forged_id)
+                .map(|_| ()),
+            workbench
+                .start_settlement_member(&forged_id, &later_member_id)
+                .map(|_| ()),
+            workbench
+                .execute_settlement_member(&forged_id, &later_member_id)
+                .map(|_| ()),
+            workbench
+                .query_settlement_member(&forged_id, &later_member_id)
+                .map(|_| ()),
+            workbench
+                .retry_failed_settlement_member(&forged_id, &later_member_id)
+                .map(|_| ()),
+            workbench
+                .supersede_settlement_member(
+                    &earlier_id,
+                    &earlier_member_id,
+                    &forged_id,
+                    &later_member_id,
+                )
+                .map(|_| ()),
+        ];
+        for outcome in outcomes {
+            assert!(outcome.unwrap_err().contains("promotion manifest"));
+        }
+        assert_eq!(
+            workbench.store_ref().events(&forged_scope).unwrap(),
+            coordinator_before
+        );
+        assert_eq!(workbench.store_ref().events(&lane_id).unwrap(), lane_before);
+
+        let superseded = workbench
+            .supersede_settlement_member(
+                &earlier_id,
+                &earlier_member_id,
+                &later_id,
+                &later_member_id,
+            )
+            .expect("cumulative promoted cut supersedes");
+        assert_eq!(
+            superseded.members[&earlier_member_id].phase,
+            SettlementMemberPhase::SupersededBeforeStart
+        );
     }
 }

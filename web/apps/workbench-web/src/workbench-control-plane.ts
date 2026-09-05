@@ -1125,8 +1125,8 @@ export class WorkbenchControlPlane implements ControlPlane {
         await workbenchClient.supersedeTargetSettlementMember(this.workbenchTransport(), declarationId, memberId, laterDeclarationId, laterMemberId);
     }
 
-    async compensateTargetSettlement(declarationId: string, receiptRefs: readonly string[], reconciliationComplete: boolean): Promise<void> {
-        await workbenchClient.compensateTargetSettlement(this.workbenchTransport(), declarationId, receiptRefs, reconciliationComplete);
+    async compensateTargetSettlement(declarationId: string, receiptLinks: readonly workbenchClient.CompensationReceiptLink[]): Promise<void> {
+        await workbenchClient.compensateTargetSettlement(this.workbenchTransport(), declarationId, receiptLinks);
     }
 
     async abandonTargetSettlement(declarationId: string, reason: string): Promise<void> {
