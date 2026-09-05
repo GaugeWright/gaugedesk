@@ -1109,12 +1109,13 @@ mod tests {
             .write_all(b"GET /health HTTP/1.1\r\nHost: home\r\n\r\n")
             .await
             .unwrap();
-        let mut response = Vec::new();
-        timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+        let expected = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut response = vec![0; expected.len()];
+        timeout(Duration::from_secs(2), client.read_exact(&mut response))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        assert_eq!(&response, expected);
         loopback_task.abort();
         if let Some(relay) = relay {
             relay.abort();
