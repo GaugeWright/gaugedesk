@@ -5,7 +5,7 @@ import {
     isDeliverablePath,
     mediaTypeFor,
     newDeliverables,
-} from "./deliverables";
+} from "./deliverable";
 
 describe("deliverable paths", () => {
     it("admits only files under the fixed root", () => {

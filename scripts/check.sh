@@ -177,6 +177,12 @@ run_contracts() {
     # merge, where `mirror-verdict` reports it (DR-0069 OPS-8). This runs in
     # `contracts` because that is a required context and this needs the private
     # tree to know what was withheld.
+    # Runs before the mirror projection because it asks a question about the
+    # tree itself, and the answer decides whether a bundle can build at all on
+    # two of the three platforms a release targets.
+    echo "== case collisions =="
+    node scripts/check-case-collisions.mjs
+
     echo "== mirror projection =="
     node scripts/check-mirror-projection.mjs
 

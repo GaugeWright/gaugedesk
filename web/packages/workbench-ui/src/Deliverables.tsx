@@ -11,7 +11,7 @@
  * surface exists to prevent.
  */
 import { createEffect, createResource, createSignal, For, Show, type JSX } from "solid-js";
-import { type Deliverable, deliverablesIn, newDeliverables } from "./deliverables";
+import { type Deliverable, deliverablesIn, newDeliverables } from "./deliverable";
 import { type Session, useSession } from "./session-context";
 
 export interface DeliverablesProps {

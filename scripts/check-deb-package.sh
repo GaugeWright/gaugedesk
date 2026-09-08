@@ -58,7 +58,28 @@ for document in changelog.gz copyright; do
 done
 
 if command -v lintian >/dev/null 2>&1; then
-  lintian --fail-on error "$DEB"
+  # lintian finds embedded libraries by scanning for byte signatures, and the
+  # binary carries `unsafe-libyaml` — a Rust transliteration of libyaml, reached
+  # through `serde_yaml_ng`. It matches the signature and is not the C library:
+  # there is no shared object to link against instead, and no C-side CVE that
+  # could apply to code that is not C. Reported as an error, it failed the
+  # v0.4.9 release lane's Linux job after the .deb had already built.
+  #
+  # Allowlisted by exact tag, library, and path rather than by suppressing the
+  # tag, so a genuinely embedded copy of anything — including a real libyaml at
+  # another path — still fails. Every other lintian error still fails too, which
+  # is why this parses the report instead of relaxing `--fail-on`.
+  ALLOWED_LINTIAN_ERROR='^E: gauge-desk: embedded-library libyaml usr/bin/gaugedesk$'
+
+  lintian_report="$(lintian "$DEB" 2>&1 || true)"
+  printf '%s\n' "$lintian_report"
+
+  unexpected="$(printf '%s\n' "$lintian_report" | grep '^E: ' | grep -vE "$ALLOWED_LINTIAN_ERROR" || true)"
+  if [ -n "$unexpected" ]; then
+    echo "lintian reported errors that are not allowlisted:" >&2
+    printf '%s\n' "$unexpected" >&2
+    exit 1
+  fi
 fi
 
 printf 'validated %s %s (%s)\n' "$(field Package)" "$(field Version)" "$(field Architecture)"

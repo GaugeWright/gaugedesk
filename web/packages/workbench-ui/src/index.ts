@@ -249,7 +249,7 @@ export {
     mediaTypeFor,
     newDeliverables,
     type Deliverable,
-} from "./deliverables";
+} from "./deliverable";
 export { WorkbenchShell, createWorkbenchShellState } from "./WorkbenchShell";
 export type {
     WorkbenchShellOptions,
