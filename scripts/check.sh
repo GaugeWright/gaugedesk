@@ -90,6 +90,15 @@ run_contracts() {
     echo "== updater endpoint =="
     node scripts/check-updater-endpoint.mjs
 
+    # The neighbouring release fact, and it fails the same way: silently, in the
+    # field. A release derives its version from its tag, and the version the app
+    # SHOWS and REPORTS was derived separately from the version its bundle is
+    # NAMED — so v0.4.6 through v0.4.8 each installed under its own name and
+    # then told the user, and every Home it spoke to, that it was 0.4.5. Every
+    # gate was green throughout.
+    echo "== release version sources =="
+    python3 scripts/check-release-version-sources.py
+
     # The other bundle fact nothing else looks at. `generate_context!` requires
     # only that an icon be RGBA, which a flattened matte satisfies, so an icon
     # whose transparency has been baked out builds and ships clean and then

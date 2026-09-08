@@ -305,7 +305,74 @@ jobs:
         with:
           name: control-plane-client-generated
           path: web/packages/control-plane-client/src/generated
+      # The single place a release derives its version from its tag. Two
+      # consumers used to derive it separately and drifted apart for three
+      # releases: the bundle names came from the tag while the version the app
+      # SHOWS and REPORTS came from the in-repo dev default, so v0.4.6, v0.4.7
+      # and v0.4.8 each installed as themselves and then identified as 0.4.5 —
+      # in the account menu, and in the `x-gaugedesk-client-version`
+      # compatibility header every control-plane request carries (ADR 0095), so
+      # a Home was told the wrong client version by every desktop in the field.
+      # Derive once here; the steps below consume what this resolves. A
+      # workflow_dispatch tag ref is normalized identically without creating a
+      # GitHub Release; a non-tag dry run resolves nothing and every consumer
+      # keeps the in-repo dev default.
+      - name: resolve the release version
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.ref, 'v') || startsWith(inputs.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.os-label }}
+          RELEASE_REF: ${{ inputs.ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          RELEASE_NAME="${RELEASE_REF#refs/tags/}"
+          VERSION="${RELEASE_NAME#v}"
+          BUNDLE_VERSION="$VERSION"
+
+          # WiX only accepts a single numeric prerelease identifier, so Windows
+          # maps alpha.N/beta.N/rc.N to ordered numeric bands that retain SemVer
+          # ordering. Only the BUNDLE version is mapped: what the app reports
+          # about itself stays the SemVer the tag actually names.
+          if [[ "$PLATFORM" == "windows" && "$VERSION" == *-* ]]; then
+            base="${VERSION%%-*}"
+            prerelease="${VERSION#*-}"
+            IFS='.' read -r channel sequence extra <<<"$prerelease"
+            if [[ -n "${extra:-}" || ! "${sequence:-}" =~ ^[0-9]+$ ]]; then
+              echo "Windows release tags must use alpha.N, beta.N, or rc.N" >&2
+              exit 1
+            fi
+            case "$channel" in
+              alpha) offset=10000 ;;
+              beta) offset=20000 ;;
+              rc) offset=30000 ;;
+              *)
+                echo "unsupported Windows prerelease channel: $channel" >&2
+                exit 1
+                ;;
+            esac
+            sequence_value=$((10#$sequence))
+            if (( sequence_value > 9999 )); then
+              echo "Windows prerelease sequence cannot exceed 9999" >&2
+              exit 1
+            fi
+            BUNDLE_VERSION="${base}-$((offset + sequence_value))"
+          fi
+
+          echo "release $RELEASE_NAME: version $VERSION, bundle version $BUNDLE_VERSION"
+          {
+            echo "GAUGEDESK_RELEASE_VERSION=$VERSION"
+            echo "GAUGEDESK_BUNDLE_VERSION=$BUNDLE_VERSION"
+          } >> "$GITHUB_ENV"
+
       - name: build enterprise workbench bundle
+        env:
+          # The version the shipped frontend reports as its own, in the account
+          # menu and in every control-plane request's client header. It is read
+          # at BUILD time, and this is the step that builds the frontend the
+          # bundle ships — stamping a file after this point changes nothing that
+          # reaches a user. Empty on a non-tag dry run, where the client falls
+          # back to the in-repo manifest version.
+          VITE_GAUGEDESK_RELEASE_VERSION: ${{ env.GAUGEDESK_RELEASE_VERSION }}
         run: |
           npm --prefix web ci
           npm --prefix ee/web ci
@@ -371,51 +438,19 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: pin bundle version to the release tag
-        # Single source of version truth = the git tag. On a tag push, rewrite the
-        # tauri.conf.json version to the tag (`vX.Y.Z` -> `X.Y.Z`) so the bundle names
-        # (.dmg/.msi/.deb/.AppImage) and updater metadata derive from the release
-        # tag, never the hard-coded in-repo dev default (Tauri reads the bundle
-        # version from here). WiX only accepts a single numeric prerelease identifier,
-        # so Windows maps alpha.N/beta.N/rc.N to ordered numeric bands while retaining
-        # SemVer prerelease ordering. A workflow_dispatch tag ref is normalized
-        # identically without creating a GitHub Release; non-tag dry-runs keep the
-        # in-repo default. jq ships on all three GitHub runner images.
+        # Tauri reads the bundle version from tauri.conf.json: it names the
+        # .dmg/.msi/.deb/.AppImage and is what the updater compares against
+        # latest.json. It is pinned here, after the release identity has been
+        # stamped, because that stamp requires a clean tree and this dirties one.
+        # Nothing the frontend reads may be pinned this late — see the resolve
+        # step above for why. jq ships on all three GitHub runner images.
         if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.ref, 'v') || startsWith(inputs.ref, 'refs/tags/v')
         shell: bash
-        env:
-          PLATFORM: ${{ matrix.os-label }}
-          RELEASE_REF: ${{ inputs.ref || github.ref_name }}
         run: |
           set -euo pipefail
-          RELEASE_NAME="${RELEASE_REF#refs/tags/}"
-          VERSION="${RELEASE_NAME#v}"
+          VERSION="${GAUGEDESK_BUNDLE_VERSION:?resolve the release version ran first}"
 
-          if [[ "$PLATFORM" == "windows" && "$VERSION" == *-* ]]; then
-            base="${VERSION%%-*}"
-            prerelease="${VERSION#*-}"
-            IFS='.' read -r channel sequence extra <<<"$prerelease"
-            if [[ -n "${extra:-}" || ! "${sequence:-}" =~ ^[0-9]+$ ]]; then
-              echo "Windows release tags must use alpha.N, beta.N, or rc.N" >&2
-              exit 1
-            fi
-            case "$channel" in
-              alpha) offset=10000 ;;
-              beta) offset=20000 ;;
-              rc) offset=30000 ;;
-              *)
-                echo "unsupported Windows prerelease channel: $channel" >&2
-                exit 1
-                ;;
-            esac
-            sequence_value=$((10#$sequence))
-            if (( sequence_value > 9999 )); then
-              echo "Windows prerelease sequence cannot exceed 9999" >&2
-              exit 1
-            fi
-            VERSION="${base}-$((offset + sequence_value))"
-          fi
-
-          echo "Pinning bundle version to $VERSION (tag $RELEASE_NAME)"
+          echo "Pinning bundle version to $VERSION"
           tmp="$(mktemp)"
           jq --arg v "$VERSION" '.version = $v' src-tauri/tauri.conf.json > "$tmp"
           mv "$tmp" src-tauri/tauri.conf.json
