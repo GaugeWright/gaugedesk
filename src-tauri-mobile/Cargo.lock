@@ -1267,7 +1267,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-env"
-version = "0.4.5"
+version = "0.4.9"
 
 [[package]]
 name = "gaugedesk-mobile"
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-relay-transport"
-version = "0.4.5"
+version = "0.4.9"
 dependencies = [
  "base64 0.23.1",
  "futures-util",

@@ -17,7 +17,7 @@ exclude = ["src-tauri"]
 
 [workspace.package]
 edition = "2021"
-version = "0.4.5"
+version = "0.4.9"
 # The platform default (ADR 0121 / company DR-0056).
 license = "AGPL-3.0-only"
 
