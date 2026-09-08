@@ -6,6 +6,8 @@
 //! enforce (ADR 0080 / SUB-1).
 
 use std::collections::BTreeSet;
+
+pub mod host_actions;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};

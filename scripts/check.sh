@@ -77,6 +77,7 @@ run_contracts() {
 
     echo "== WhippleScript workstream host contract =="
     node scripts/check-whipplescript-workstream-contract.mjs
+    python3 scripts/check-whipplescript-host-action.py
 
     echo "== TokenWright Environment bundle =="
     node scripts/check-tokenwright-environment.mjs
@@ -211,6 +212,10 @@ run_contracts() {
 }
 
 run_rust() {
+    echo "== resolved WhippleScript action contract =="
+    python3 scripts/check-whipplescript-host-action.py --resolved
+    python3 scripts/test-whipplescript-host-action.py
+
     echo "== formatting =="
     cargo fmt --all --check
 

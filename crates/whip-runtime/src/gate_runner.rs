@@ -39,11 +39,14 @@ use whipplescript_kernel::sansio::{
 };
 use whipplescript_kernel::{CoerceExecution, ProgramVersionInput, RuntimeKernel};
 use whipplescript_parser::IrProgram;
-use whipplescript_store::files::NativeFileStore;
 use whipplescript_store::native_stores::NativeStores;
 use whipplescript_store::{
     stable_hash_hex, ClaimableEffect, InstanceView, RunStart, RuntimeStore, StoreError,
 };
+
+#[path = "gate_files.rs"]
+mod gate_files;
+use gate_files::GateFiles;
 
 /// An admitted source/IR pair and the current project governance envelope.
 /// Retaining source is necessary: the IR snapshot is inspectable, not an
@@ -199,30 +202,9 @@ struct GateDriver<'a> {
     instance_id: String,
     ir: &'a IrProgram,
     coerce: &'a GateCoercionConfig,
-    files: NativeFileStore,
     /// The directory the program's file store resolves against — the project's
     /// quarantine. Nothing else may be given this program to run.
     store_root: PathBuf,
-}
-
-impl GateDriver<'_> {
-    /// Rewrite a file effect's declared store root to this run's real
-    /// directory. Only the root moves; the path, the `allow` globs, and the
-    /// escape checks the kernel applies against it are untouched, so a program
-    /// that tried to climb out of its store is refused exactly as before.
-    fn with_mapped_root(&self, effect: &ClaimableEffect) -> ClaimableEffect {
-        let mut input = json_from_str(&effect.input_json);
-        if let Some(object) = input.as_object_mut() {
-            object.insert(
-                "root".to_owned(),
-                serde_json::Value::String(self.store_root.to_string_lossy().into_owned()),
-            );
-        }
-        ClaimableEffect {
-            input_json: input.to_string(),
-            ..effect.clone()
-        }
-    }
 }
 
 impl InstanceDriver for GateDriver<'_> {
@@ -259,12 +241,16 @@ impl InstanceDriver for GateDriver<'_> {
         let event = match effect.kind.as_str() {
             "file.read" => {
                 // The program declares a *logical* store root (`./quarantine`),
-                // which the lowering puts in the effect input. Mapping it onto
-                // this project's real quarantine directory is the host's job,
-                // and doing it here rather than by process cwd is what lets one
-                // compiled gate serve every project without the runs colliding.
-                let mapped = self.with_mapped_root(effect);
-                run_file_effect_generic(&mut self.kernel, &self.files, &self.instance_id, &mapped)?
+                // which remains immutable from admission through dispatch.
+                // Bind physical storage at the byte-I/O seam, without editing
+                // the effect the runtime verifies against its recorded row.
+                let input = json_from_str(&effect.input_json);
+                let logical_root = input
+                    .get("root")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let files = GateFiles::new(Path::new(logical_root), &self.store_root);
+                run_file_effect_generic(&mut self.kernel, &files, &self.instance_id, effect)?
             }
             // The tracker legs: filing a review question, claiming it, finishing
             // it. Without these a gate that reaches a person compiles, admits,
@@ -520,7 +506,6 @@ fn drive_gate<T: GateTransport>(
         instance_id,
         ir,
         coerce,
-        files: NativeFileStore,
         store_root: store_root.to_path_buf(),
     };
 

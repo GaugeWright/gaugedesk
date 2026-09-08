@@ -22,6 +22,8 @@ use std::time::Duration;
 use gaugedesk_core::{Lifecycle, Rejection};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
+pub mod command_dispatch;
+
 /// A transparent at-rest transform applied to record payloads of designated
 /// **content** kinds (`SECAUD-9`/`SECAUD-6`). The store crate stays crypto-free: this
 /// is the seam an app-side content vault implements to encrypt sensitive content

@@ -178,11 +178,11 @@ pub async fn require_home_admission(
         )
             .into_response();
     };
-    let rejection = {
+    let admitted = {
         let bearer = net_http::bearer(req.headers());
         let wb = wb.lock_unpoisoned();
         match wb.admit_data_request(bearer, None) {
-            Err((code, message)) => Some((code, message)),
+            Err(rejection) => Err(rejection),
             Ok(actor) => {
                 let actor = AuthorityId::new(actor);
                 if wb
@@ -190,7 +190,7 @@ pub async fn require_home_admission(
                     .authorize(wb.home_id(), &actor, &token)
                     .is_err()
                 {
-                    Some((
+                    Err((
                         StatusCode::FORBIDDEN,
                         "Home admission does not match this Home and identity",
                     ))
@@ -198,18 +198,33 @@ pub async fn require_home_admission(
                     .scope_project_of_path(req.uri().path())
                     .is_some_and(|project| !wb.owns_project(&project))
                 {
-                    Some((
+                    Err((
                         StatusCode::MISDIRECTED_REQUEST,
                         "project is authoritative on another Home",
                     ))
                 } else {
-                    None
+                    // Admission has legacy local/bootstrap fallbacks. Only a
+                    // bearer verified at this boundary can supply attribution.
+                    Ok(bearer
+                        .and_then(|token| wb.authenticate_bearer(token))
+                        .filter(|verified| verified == &actor))
                 }
             }
         }
     };
-    if let Some((code, message)) = rejection {
-        return (code, Json(json!({ "error": message }))).into_response();
+    let actor = match admitted {
+        Ok(actor) => actor,
+        Err((code, message)) => {
+            return (code, Json(json!({ "error": message }))).into_response();
+        }
+    };
+    // Preserve the identity actually verified and admitted by this Home.
+    // Never promote a legacy fallback or an upstream extension into proof.
+    req.extensions_mut()
+        .remove::<crate::identity::AuthenticatedActor>();
+    if let Some(actor) = actor {
+        req.extensions_mut()
+            .insert(crate::identity::AuthenticatedActor(actor));
     }
     next.run(req).await
 }
@@ -260,16 +275,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn home_admission_does_not_promote_local_or_bootstrap_defaults_to_authenticated_actors() {
+        for bootstrap in [false, true] {
+            let mut workbench =
+                crate::Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+            if bootstrap {
+                workbench.set_identity_provider(Some(Arc::new(LoopbackIdentityProvider::new())));
+            }
+            let default_actor = workbench.admit_data_request(None, None).unwrap();
+            let home = workbench.home_id().clone();
+            let token = workbench
+                .home_admissions
+                .open(home, AuthorityId::new(default_actor));
+            let wb = Arc::new(std::sync::Mutex::new(workbench));
+            let app =
+                Router::new()
+                    .route(
+                        "/inspect-admitted-actor",
+                        axum::routing::get(
+                            |actor: Option<
+                                axum::Extension<crate::identity::AuthenticatedActor>,
+                            >| async move {
+                                assert!(
+                                    actor.is_none(),
+                                    "a fallback is not an authenticated actor"
+                                );
+                                StatusCode::NO_CONTENT
+                            },
+                        ),
+                    )
+                    .route_layer(axum::middleware::from_fn_with_state(
+                        wb,
+                        require_home_admission,
+                    ));
+            let request = Request::builder()
+                .uri("/inspect-admitted-actor")
+                .header(HOME_ADMISSION_HEADER, token.encode())
+                .extension(crate::identity::AuthenticatedActor(AuthorityId::new(
+                    "unverified",
+                )))
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.oneshot(request).await.unwrap().status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn account_login_alone_cannot_call_home_work_routes() {
         let dir = tempfile::tempdir().unwrap();
         let wb = open_workbench(dir.path()).unwrap();
         {
             let mut guard = wb.lock_unpoisoned();
-            guard.set_identity_provider(Some(Arc::new(LoopbackIdentityProvider::new().enroll(
-                "alice-login",
-                AuthorityId::new("alice"),
-                AuthorityAttributes::default(),
-            ))));
+            guard.set_identity_provider(Some(Arc::new(
+                LoopbackIdentityProvider::new()
+                    .enroll(
+                        "alice-login",
+                        AuthorityId::new("alice"),
+                        AuthorityAttributes::default(),
+                    )
+                    .enroll(
+                        "alice-renewed",
+                        AuthorityId::new("alice"),
+                        AuthorityAttributes::default(),
+                    ),
+            )));
             let membership = MembershipRecord {
                 id: "alice".into(),
                 op: RecordOp::Upsert,
@@ -294,6 +366,14 @@ mod tests {
         let app = Router::new()
             .merge(local_routes::routes(false))
             .merge(routes())
+            .route(
+                "/inspect-admitted-actor",
+                axum::routing::get(
+                    |axum::Extension(actor): axum::Extension<
+                        crate::identity::AuthenticatedActor,
+                    >| async move { actor.0.as_str().to_owned() },
+                ),
+            )
             .route_layer(axum::middleware::from_fn_with_state(
                 wb.clone(),
                 require_home_admission,
@@ -320,6 +400,38 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+
+        // The actual handler observes the admitted account, including after
+        // credential renewal. The control plane's own authority is different.
+        assert_ne!(inspect.lock_unpoisoned().authority().as_str(), "alice");
+        for bearer in ["alice-login", "alice-renewed"] {
+            let (status, actor) = response(
+                &app,
+                "GET",
+                "/inspect-admitted-actor",
+                Some(bearer),
+                Some(&admission),
+            )
+            .await;
+            assert_eq!((status, actor.as_str()), (StatusCode::OK, "alice"));
+        }
+        let other_identity_admission = {
+            let mut guard = inspect.lock_unpoisoned();
+            let home = guard.home_id().clone();
+            guard
+                .home_admissions
+                .open(home, AuthorityId::new("bob"))
+                .encode()
+        };
+        let (status, _) = response(
+            &app,
+            "GET",
+            "/inspect-admitted-actor",
+            Some("alice-login"),
+            Some(&other_identity_admission),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
 
         // Home identity is already returned by the admission ceremony and the
         // relay runtime owns its locator directly. No production client used
