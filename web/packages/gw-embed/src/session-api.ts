@@ -49,6 +49,13 @@ export interface EmbedSessionApi {
         id: EngagementId,
         path: string,
     ): Promise<{ content: string; cut: string | null }>;
+    /** The same read kept as bytes, for a file the viewer renders rather than
+     *  decodes — a PDF, an image. Optional: a session without it shows those
+     *  files as an unopenable handle rather than mojibake. */
+    getFileBytes?(
+        id: EngagementId,
+        path: string,
+    ): Promise<{ bytes: Uint8Array; cut: string | null }>;
     putFile(id: EngagementId, path: string, content: string): Promise<void>;
     saveFile?(
         id: EngagementId,

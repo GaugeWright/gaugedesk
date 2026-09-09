@@ -58,6 +58,12 @@ export interface ControlPlane {
         id: EngagementId,
         path: string,
     ): Promise<{ content: string; cut: string | null }>;
+    /** The same read kept as bytes, for a file whose content is not text —
+     *  a PDF or an image the viewer renders rather than decodes. */
+    getFileBytes(
+        id: EngagementId,
+        path: string,
+    ): Promise<{ bytes: Uint8Array; cut: string | null }>;
     putFile(id: EngagementId, path: string, content: string): Promise<void>;
     /** Base-carrying save (SUB-6): concurrent changes merge server-side;
      *  divergence resolves to a structured conflict; fold-settled
@@ -367,6 +373,17 @@ export class RemoteControlPlane implements ControlPlane {
         );
         return {
             content: await response.text(),
+            cut: response.headers.get("x-workspace-cut"),
+        };
+    }
+
+    async getFileBytes(id: EngagementId, path: string) {
+        const response = await this.raw(
+            "GET",
+            `/chats/${id}/file?path=${encodeURIComponent(path)}`,
+        );
+        return {
+            bytes: new Uint8Array(await response.arrayBuffer()),
             cut: response.headers.get("x-workspace-cut"),
         };
     }

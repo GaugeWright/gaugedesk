@@ -37,6 +37,7 @@ function controlPlane(): ControlPlane {
         getTree: vi.fn(async () => []),
         getFile: vi.fn(async () => ""),
         getFileWithCut: vi.fn(async () => ({ content: "", cut: null })),
+        getFileBytes: vi.fn(async () => ({ bytes: new Uint8Array(), cut: null })),
         putFile: vi.fn(async () => undefined),
         saveFile: vi.fn(async () => ({ kind: "saved", cut: "cut-1" })),
         previewMerge: vi.fn(async () => ({ knownBase: false as const })),

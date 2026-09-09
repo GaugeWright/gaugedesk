@@ -837,6 +837,44 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 /* The active mode body grows to fill and scrolls within. View/Diff benefit too. */
 .viewer > .filebody, .viewer > .editor { flex: 1; min-height: 0; }
 .viewer > .filebody { overflow: auto; }
+.viewer > .filemedia, .viewer > .pdfview, .viewer > .officeview { flex: 1; min-height: 0; }
+
+/* A file the View tab paints rather than reads: a picture, or a card naming a
+   format it cannot show. Both centre in the pane; the picture is contained
+   rather than cropped, because a screenshot's edges are usually the point. */
+.filemedia { display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 8px; padding: 16px; overflow: auto; }
+.filemedia-image { max-width: 100%; max-height: 100%; object-fit: contain;
+    border: 1px solid var(--edge); border-radius: 3px; background: var(--panel); }
+.filemedia-caption { flex: 0 0 auto; font-size: var(--fs-label); color: var(--muted); }
+.filemedia-card { max-width: 46ch; padding: 16px; border: 1px solid var(--edge);
+    border-radius: 6px; background: var(--panel); }
+.filemedia-name { font-family: var(--mono); font-size: var(--fs-ui); color: var(--ink);
+    overflow-wrap: anywhere; }
+.filemedia-facts { margin-top: 4px; font-size: var(--fs-label); color: var(--muted);
+    overflow-wrap: anywhere; }
+.filemedia-note { margin-top: 10px; font-size: var(--fs-ui); line-height: 1.45; color: var(--muted); }
+
+/* A Word, Excel or PowerPoint file: the OOXML engine owns everything inside
+   the host element (its own scroller, pages and zoom), so this only gives it a
+   filled, scrollable box to live in. */
+.officeview { display: flex; flex-direction: column; }
+.officeview > .status { flex: 0 0 auto; }
+.officeview-host { flex: 1; min-height: 0; min-width: 0; }
+
+/* A PDF: a page count and zoom over a scroller of rendered pages. The pages
+   themselves are paper — they carry their own white ground in either theme,
+   because the document decides its colours, not the workbench. */
+.pdfview { display: flex; flex-direction: column; }
+.pdfview-bar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+    padding: 4px 10px; border-bottom: 1px solid var(--edge); }
+.pdfview-zoom { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.pdfview-zoom button { font-size: var(--fs-small); padding: 2px 8px; line-height: 1.2; }
+.pdfview-pages { flex: 1; min-height: 0; overflow: auto; padding: 16px;
+    display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.pdfview-page { background: #fff; border-radius: 2px;
+    box-shadow: 0 1px 8px rgb(0 0 0 / 35%); }
+.pdfview-page canvas { display: block; border-radius: 2px; }
 
 /* Full-panel file editor: a header row over a textarea that fills the rest. */
 .editor { display: flex; flex-direction: column; }

@@ -13,7 +13,7 @@
  * **rejects** (isolate); a conflict surfaces with repair/retry.
  */
 
-import { createEffect, createMemo, createResource, createSignal, lazy, on, onCleanup, Show, Suspense, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, lazy, Match, on, onCleanup, Show, Suspense, Switch, type JSX } from "solid-js";
 import { useSession } from "./session-context";
 import { changedUserFiles, diffHasFiles } from "./changed-files";
 import { defaultContentMode, isSettledPhase, phaseLabel as phaseLabelFor, shouldShowViewOnSelect } from "./content-view";
@@ -22,6 +22,8 @@ import { EnvironmentDocumentView, type EnvironmentViewRegistry } from "./Environ
 import { manifestDocumentForPath } from "./environment-view";
 import { isWhipProgram, tabsForPath, programForPath, programsFromV1} from "./whip-view";
 import { WhipInstancesView, WhipStructureView } from "./WhipViews";
+import { ImageFileView, OpaqueFileView } from "./FileMediaView";
+import { readAsTextFailed, viewerFileFor } from "./file-kind";
 
 // The diff viewer pulls in @git-diff-view (+ highlight.js/lowlight, ~350 KB).
 // Load that chunk only when the Diff tab is first opened, not on app boot.
@@ -31,6 +33,16 @@ const DiffView = lazy(() => import("./DiffView").then((m) => ({ default: m.DiffV
 // first viewed — same deferral pattern as the diff chunk.
 const MarkdownView = lazy(() => import("./MarkdownView").then((m) => ({ default: m.MarkdownView })));
 const isMarkdownPath = (path: string) => /\.(md|markdown)$/i.test(path);
+
+// pdf.js's renderer (~400 KB) loads only when a PDF is first opened — the same
+// deferral as the diff and markdown chunks. The composer's attachment path
+// already carries this dependency; this is the rest of it.
+const PdfView = lazy(() => import("./PdfView").then((m) => ({ default: m.PdfView })));
+
+// The OOXML engine's parsers are per-format wasm chunks (~1.7 MB each) behind
+// their own renderers; none of it loads until a Word, Excel or PowerPoint file
+// is opened. Read-only by construction — see the note in OfficeView.
+const OfficeView = lazy(() => import("./OfficeView").then((m) => ({ default: m.OfficeView })));
 
 // The conflict fold (SUB-6) mounts only when a save actually conflicts.
 const ConflictFold = lazy(() => import("./ConflictFold").then((m) => ({ default: m.ConflictFold })));
@@ -84,11 +96,23 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     // base every save carries back. Null against sessions/servers without cuts
     // — those fall back to content-named bases.
     const [baseCut, setBaseCut] = createSignal<string | null>(null);
+    // How this file opens: a worktree holds pictures and PDFs as readily as
+    // source, and reading one as text was a 400 with a filename in it. The
+    // decision is made from the path, before any read, because it chooses
+    // which read to issue.
+    const viewerFile = createMemo(() => viewerFileFor(file() ?? ""));
+    const rendersFromBytes = () =>
+        viewerFile().kind === "image" ||
+        viewerFile().kind === "pdf" ||
+        viewerFile().kind === "office";
     const [content, { refetch }] = createResource(
         () => {
             const i = id();
             const f = file();
             const revision = props.refreshKey?.();
+            // A file we are going to paint is never read as text: decoding a
+            // PNG produces nothing anyone wants to see.
+            if (viewerFile().kind !== "text") return null;
             return i && f ? ([i, f, revision] as const) : null;
         },
         async ([i, f]) => {
@@ -100,6 +124,19 @@ export function ContentViewer(props: ContentViewerProps = {}) {
             setBaseCut(null);
             return session.api.getFile(i, f);
         },
+    );
+    // The same file, kept as bytes, for the views that render it rather than
+    // read it. A session whose transport cannot serve bytes simply never
+    // fetches — the pane says what the file is instead of painting it.
+    const [fileBytes] = createResource(
+        () => {
+            const i = id();
+            const f = file();
+            const revision = props.refreshKey?.();
+            if (!rendersFromBytes() || !session.api.getFileBytes) return null;
+            return i && f ? ([i, f, revision] as const) : null;
+        },
+        async ([i, f]) => (await session.api.getFileBytes!(i, f)).bytes,
     );
     const [draft, setDraft] = createSignal<string | null>(null);
     const [msg, setMsg] = createSignal("");
@@ -260,6 +297,9 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     const fileEditable = () => {
         const path = file();
         if (!path || path === ".agent-config.json" || path.startsWith(".whipple/versions/")) return false;
+        // The editor is a text buffer, and a save writes text. A picture or a
+        // PDF is viewable here and not editable here.
+        if (viewerFile().kind !== "text") return false;
         if (path.startsWith(".whipple/")) {
             return chatKind() === "edit" && (
                 path.startsWith(".whipple/draft/") ||
@@ -504,14 +544,83 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                                 <Show
                                     when={specialRenderer()}
                                     fallback={
-                                        <Show
-                                            when={isMarkdownPath(file() ?? "")}
-                                            fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}
-                                        >
-                                            <Suspense fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
-                                                <MarkdownView text={content() ?? ""} />
-                                            </Suspense>
-                                        </Show>
+                                        <Switch fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
+                                            {/* A file we know is not text: name the format
+                                                rather than paint its bytes as characters. */}
+                                            <Match when={viewerFile().kind === "opaque"}>
+                                                <OpaqueFileView
+                                                    path={file()!}
+                                                    mediaType={viewerFile().mediaType}
+                                                />
+                                            </Match>
+                                            {/* A picture or a PDF: rendered from the file's
+                                                own bytes, read only once the view needs them. */}
+                                            <Match when={rendersFromBytes()}>
+                                                <Show
+                                                    when={session.api.getFileBytes}
+                                                    fallback={
+                                                        <OpaqueFileView
+                                                            path={file()!}
+                                                            mediaType={viewerFile().mediaType}
+                                                        />
+                                                    }
+                                                >
+                                                    <Show
+                                                        when={fileBytes()}
+                                                        keyed
+                                                        fallback={
+                                                            <div class="status">
+                                                                {fileBytes.error
+                                                                    ? "This file couldn't be opened."
+                                                                    : "loading…"}
+                                                            </div>
+                                                        }
+                                                    >
+                                                        {(bytes) => (
+                                                            <Switch
+                                                                fallback={
+                                                                    <ImageFileView
+                                                                        path={file()!}
+                                                                        bytes={bytes}
+                                                                        mediaType={viewerFile().mediaType}
+                                                                    />
+                                                                }
+                                                            >
+                                                                <Match when={viewerFile().kind === "pdf"}>
+                                                                    <Suspense fallback={<div class="status">opening the document…</div>}>
+                                                                        <PdfView bytes={bytes} path={file()!} />
+                                                                    </Suspense>
+                                                                </Match>
+                                                                <Match when={viewerFile().format}>
+                                                                    {(format) => (
+                                                                        <Suspense fallback={<div class="status">opening the document…</div>}>
+                                                                            <OfficeView
+                                                                                format={format()}
+                                                                                bytes={bytes}
+                                                                                path={file()!}
+                                                                            />
+                                                                        </Suspense>
+                                                                    )}
+                                                                </Match>
+                                                            </Switch>
+                                                        )}
+                                                    </Show>
+                                                </Show>
+                                            </Match>
+                                            <Match when={isMarkdownPath(file() ?? "")}>
+                                                <Suspense fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
+                                                    <MarkdownView text={content() ?? ""} />
+                                                </Suspense>
+                                            </Match>
+                                            {/* An extension the rules above don't know, whose
+                                                content turned out not to be text after all. */}
+                                            <Match when={!content.loading && readAsTextFailed(content() ?? "")}>
+                                                <OpaqueFileView
+                                                    path={file()!}
+                                                    mediaType="application/octet-stream"
+                                                />
+                                            </Match>
+                                        </Switch>
                                     }
                                 >
                                     {(renderer) => renderer().render({ path: file()!, content: content() ?? "" })}
@@ -533,7 +642,9 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                 <Show when={file()} fallback={<div class="status">Pick a file from the Files panel on the right to edit it.</div>}>
                     <Show
                         when={fileEditable()}
-                        fallback={<div class="status" data-file-readonly>{session.readOnlyFileReason?.(file() ?? "") ?? "This file is read-only here. Edit only the package draft in an edit chat; change runtime selection through Settings."}</div>}
+                        fallback={<div class="status" data-file-readonly>{viewerFile().kind !== "text"
+                            ? "This file isn't text, so there's nothing here to edit. The View tab shows it."
+                            : session.readOnlyFileReason?.(file() ?? "") ?? "This file is read-only here. Edit only the package draft in an edit chat; change runtime selection through Settings."}</div>}
                     >
                       <Show
                         when={!conflict()}

@@ -1522,6 +1522,27 @@ export async function getFileWithCut(
     return { content: await res.text(), cut: res.headers.get("x-workspace-cut") };
 }
 
+/**
+ * The same read as `getFile`, kept as bytes.
+ *
+ * A worktree holds whatever the work put in it, and a PDF or an image is a
+ * file to look at rather than text that failed to decode. The viewer picks
+ * the media type from the path — the response body is deliberately served as
+ * a download, so its content type says nothing about how to render it.
+ */
+export async function getFileBytes(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    path: string,
+): Promise<{ bytes: Uint8Array; cut: string | null }> {
+    const res = await request(transport, `/chats/${id}/file?path=${encodeURIComponent(path)}`);
+    if (!res.ok) throw new Error(`read ${path}: ${res.status}`);
+    return {
+        bytes: new Uint8Array(await res.arrayBuffer()),
+        cut: res.headers.get("x-workspace-cut"),
+    };
+}
+
 export async function putFile(
     transport: WorkbenchTransport,
     id: EngagementId,

@@ -31,6 +31,7 @@
   "dependencies": {
     "@git-diff-view/file": "^0.1.5",
     "@git-diff-view/solid": "^0.1.5",
+    "@silurus/ooxml": "^0.86.1",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "officeparser": "^7.6.2",
     "pdfjs-dist": "^6.2.108",

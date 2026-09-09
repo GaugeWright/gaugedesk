@@ -973,6 +973,24 @@ export class EdgeSessionApi implements EmbedSessionApi {
         return { content: await this.getFile(id, path), cut: null };
     }
 
+    /** The public projection serves a file's bytes as they are, so a shared
+     *  session renders the same PDFs and images the workbench does. */
+    async getFileBytes(
+        _id: EngagementId,
+        path: string,
+    ): Promise<{ bytes: Uint8Array; cut: string | null }> {
+        const response = await fetch(
+            (() => {
+                const url = new URL(this.projection("files"));
+                url.searchParams.set("path", path);
+                return url.toString();
+            })(),
+            { credentials: "omit", cache: "no-store" },
+        );
+        if (!response.ok) throw new Error(`read ${path}: ${response.status}`);
+        return { bytes: new Uint8Array(await response.arrayBuffer()), cut: null };
+    }
+
     putFile(): Promise<void> {
         return Promise.reject(new Error("public session files are read-only"));
     }

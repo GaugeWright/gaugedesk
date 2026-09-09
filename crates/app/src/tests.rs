@@ -416,6 +416,21 @@ async fn send_with_cut(app: &Router, uri: &str) -> (StatusCode, Option<String>, 
     (status, cut, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
+/// `send` for GETs whose body is not text — the response headers and the
+/// exact bytes, which `send` would have to lossily decode.
+async fn send_raw(app: &Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
+}
+
 #[tokio::test]
 async fn transcript_is_durable_across_a_fresh_read() {
     let _fake_agent = fake_agent_env();
@@ -3514,6 +3529,72 @@ async fn publish_rejects_discipline_capability_drift_without_advancing_version()
         .join(library_state::authoring_target_id(DEFAULT_AGENT))
         .join("repo/.whipple/versions/2")
         .exists());
+}
+
+#[tokio::test]
+async fn the_viewer_read_serves_a_binary_worktree_file_as_bytes() {
+    // The worktree holds whatever the work put in it. Reading a file as UTF-8
+    // text made every non-text file a 400 — a PNG or a PDF the agent produced
+    // could be listed in Files and then not opened. The read serves the file's
+    // own bytes instead, and text is untouched by that.
+    let (_dir, wb) = seeded_workbench();
+    let inspect = wb.clone();
+    let app = open_control_plane(wb);
+    let (status, body) = send(&app, "POST", "/chats", Some(r#"{"id":"bin"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED, "chat: {body}");
+
+    // The eight-byte PNG signature: not UTF-8, and exactly the shape of file a
+    // turn leaves behind.
+    let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    {
+        let guard = inspect.lock_unpoisoned();
+        let workspace_path = guard.engagement_workspace_path("bin", "shot.png");
+        guard.engagements["bin"]
+            .write_file_bytes(&workspace_path, &png)
+            .unwrap();
+    }
+
+    let (status, headers, bytes) = send_raw(&app, "/chats/bin/file?path=shot.png").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, png, "the read must serve the file's own bytes");
+    // Worktree bytes are a download, never something the Home's own origin
+    // renders: a document that carries script cannot be navigated into.
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment")
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+
+    // Text keeps the body every existing reader expects.
+    {
+        let guard = inspect.lock_unpoisoned();
+        let workspace_path = guard.engagement_workspace_path("bin", "notes.md");
+        guard.engagements["bin"]
+            .write_file(&workspace_path, "hello")
+            .unwrap();
+    }
+    let (status, _, text) = send_with_cut(&app, "/chats/bin/file?path=notes.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "hello");
+
+    // Past the cap the read refuses rather than truncating — a truncated PDF
+    // is not a smaller PDF, it is a corrupt one.
+    let guard = inspect.lock_unpoisoned();
+    assert!(
+        guard
+            .read_engagement_file_bytes("bin", "shot.png", 4)
+            .unwrap()
+            .unwrap()
+            .is_none(),
+        "a file larger than the cap is refused, not cut short"
+    );
 }
 
 #[tokio::test]

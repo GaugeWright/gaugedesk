@@ -1326,6 +1326,13 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.getFileWithCut(this.workbenchTransport(), id, path);
     }
 
+    getFileBytes(
+        id: EngagementId,
+        path: string,
+    ): Promise<{ bytes: Uint8Array; cut: string | null }> {
+        return workbenchClient.getFileBytes(this.workbenchTransport(), id, path);
+    }
+
     putFile(id: EngagementId, path: string, content: string): Promise<void> {
         return workbenchClient.putFile(this.workbenchTransport(), id, path, content);
     }

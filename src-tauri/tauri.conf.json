@@ -21,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"
     }
   },
   "bundle": {
@@ -40,15 +40,29 @@
     "linux": {
       "deb": {
         "desktopTemplate": "deep-link.desktop",
-        "depends": ["libc6", "libwebkit2gtk-4.1-0", "libgtk-3-0"],
+        "depends": [
+          "libc6",
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0"
+        ],
         "section": "utils",
         "files": {
           "/usr/share/doc/gauge-desk/changelog.gz": "linux/changelog.gz",
           "/usr/share/doc/gauge-desk/copyright": "linux/copyright"
         },
-        "provides": ["gauge-bench", "gaugebench", "gaugedesk"],
-        "conflicts": ["gauge-bench", "gaugebench"],
-        "replaces": ["gauge-bench", "gaugebench"]
+        "provides": [
+          "gauge-bench",
+          "gaugebench",
+          "gaugedesk"
+        ],
+        "conflicts": [
+          "gauge-bench",
+          "gaugebench"
+        ],
+        "replaces": [
+          "gauge-bench",
+          "gaugebench"
+        ]
       }
     },
     "windows": {
@@ -66,7 +80,9 @@
     },
     "deep-link": {
       "desktop": {
-        "schemes": ["gaugewright"]
+        "schemes": [
+          "gaugewright"
+        ]
       }
     }
   }

@@ -5479,7 +5479,7 @@
       "scope": "person-home-project-placement-chat-worktree",
       "capability": "read-chat-worktree-file",
       "requestSchema": "http/path-chat-id-query-worktree-path",
-      "responseSchema": "text/plain+x-workspace-cut",
+      "responseSchema": "text/plain-or-worktree-bytes+x-workspace-cut",
       "sideEffect": "none",
       "risk": "important",
       "compatibility": {

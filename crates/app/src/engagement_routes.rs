@@ -491,6 +491,22 @@ impl Workbench {
             .map(|eng| eng.read_file(&path))
     }
 
+    /// Read one file from a live engagement worktree as bytes, refusing
+    /// anything past `max_bytes` (`Ok(None)`). A worktree holds whatever the
+    /// work put in it, so the viewer's read cannot assume UTF-8: a PDF or a
+    /// PNG is a file, not a failed text read.
+    pub fn read_engagement_file_bytes(
+        &self,
+        chat_id: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Option<Result<Option<Vec<u8>>, WorkspaceError>> {
+        let path = self.engagement_workspace_path(chat_id, path);
+        self.engagements
+            .get(chat_id)
+            .map(|eng| eng.read_file_bytes_capped(&path, max_bytes))
+    }
+
     /// The engagement's current cut — minted on demand so what the reader
     /// just saw is always an addressable save base (cut-on-read).
     pub fn engagement_current_cut(
@@ -1138,35 +1154,74 @@ pub(crate) struct FileQuery {
     path: String,
 }
 
+/// The largest file this read serves. A worktree holds whatever the work put
+/// in it, up to and including multi-gigabyte artifacts; buffering one into a
+/// response to paint it in a browser pane helps nobody, so the read refuses
+/// past this and the viewer says so rather than hanging.
+pub(crate) const MAX_VIEWABLE_FILE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Read a worktree file (the content viewer's View mode).
+///
+/// UTF-8 content keeps the `text/plain` body every existing reader expects.
+/// Anything else is served as opaque bytes — a PDF or an image is a file the
+/// viewer renders, and reading it as text was never a failure of the file.
 pub(crate) async fn get_file(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
     Query(q): Query<FileQuery>,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    let Some(content) = wb.read_engagement_file(&id, &q.path) else {
+    let Some(content) = wb.read_engagement_file_bytes(&id, &q.path, MAX_VIEWABLE_FILE_BYTES) else {
         return (StatusCode::NOT_FOUND, "no such engagement").into_response();
     };
-    match content {
-        Ok(content) => {
-            // The cut the reader is looking at, minted on demand — the
-            // addressable base a cut-carrying save sends back (§12).
-            // Best-effort: an unreadable cut degrades to a plain body.
-            let cut = wb
-                .engagement_current_cut(&id)
-                .and_then(|result| result.ok())
-                .flatten();
-            let mut response = (StatusCode::OK, content).into_response();
-            if let Some(cut) = cut {
-                if let Ok(value) = axum::http::HeaderValue::from_str(&cut) {
-                    response.headers_mut().insert("x-workspace-cut", value);
-                }
-            }
-            response.into_response()
+    let bytes = match content {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "{} is larger than the {} MiB this viewer opens",
+                    q.path,
+                    MAX_VIEWABLE_FILE_BYTES / (1024 * 1024)
+                ),
+            )
+                .into_response();
         }
-        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    };
+    // The cut the reader is looking at, minted on demand — the addressable
+    // base a cut-carrying save sends back (§12). Best-effort: an unreadable
+    // cut degrades to a plain body.
+    let cut = wb
+        .engagement_current_cut(&id)
+        .and_then(|result| result.ok())
+        .flatten();
+    let mut response = match String::from_utf8(bytes) {
+        Ok(text) => (StatusCode::OK, text).into_response(),
+        Err(not_utf8) => {
+            let mut response = (StatusCode::OK, not_utf8.into_bytes()).into_response();
+            let headers = response.headers_mut();
+            // Worktree bytes are never rendered in the Home's own origin: a
+            // direct navigation to this URL downloads them. The viewer reads
+            // them through `fetch` and paints them from a blob either way, so
+            // nothing legitimate needs the browser to interpret this body.
+            headers.insert(
+                axum::http::header::CONTENT_DISPOSITION,
+                axum::http::HeaderValue::from_static("attachment"),
+            );
+            headers.insert(
+                axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                axum::http::HeaderValue::from_static("nosniff"),
+            );
+            response
+        }
+    };
+    if let Some(cut) = cut {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&cut) {
+            response.headers_mut().insert("x-workspace-cut", value);
+        }
     }
+    response
 }
 
 /// The base-carrying save body (SUB-6). `base_cut` names the state the

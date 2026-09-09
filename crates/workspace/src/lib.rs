@@ -514,8 +514,12 @@ impl Instance {
                     .put_chunk_root(&blob.id, chunk_ids, blob.byte_len)?;
                 continue;
             }
-            if let Some(body) = &blob.body {
-                let stored = vcs.content_store().put(body)?;
+            // `carried_bytes`, not `blob.body`: a bundle carrying content
+            // that is not text puts it in the base64 lane, and reading only
+            // the text field would land a peer's workspace with its pictures
+            // quietly missing while every other blob verified.
+            if let Some(body) = blob.carried_bytes()? {
+                let stored = vcs.content_store().put(&body)?;
                 if stored != blob.id {
                     return Err(WorkspaceError::msg(format!(
                         "peer blob `{}` does not match its content (hashes to `{stored}`)",
@@ -1771,7 +1775,7 @@ impl Engagement {
                 // newest recorded cut that bound this path to exactly that
                 // body (an empty base also matches a cut without the
                 // path — the "file didn't exist yet" base).
-                let id = vcs.content_store().put(body)?;
+                let id = vcs.content_store().put_text(body)?;
                 let matching_cut = vcs
                     .list_cuts(&self.branch, 200)?
                     .into_iter()
