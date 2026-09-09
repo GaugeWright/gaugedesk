@@ -198,6 +198,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             put(lr::update_project).delete(lr::delete_project),
         )
         .route("/projects/{id}/home", get(lr::project_home))
+        .route("/projects/{id}/whips", get(lr::project_whips))
         .route(
             "/projects/{id}/credentials",
             get(project_credential_routes::get_project_credentials)

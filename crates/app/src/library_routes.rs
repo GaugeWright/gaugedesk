@@ -706,6 +706,22 @@ pub async fn project_home(
     }
 }
 
+/// A project's whip programs with their structure and instances.
+pub async fn project_whips(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    match wb.project_whips_value(&id) {
+        Some(value) => (StatusCode::OK, Json(value)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such project" })),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn create_project(
     State(wb): State<SharedWorkbench>,
     Json(body): Json<CreateProject>,

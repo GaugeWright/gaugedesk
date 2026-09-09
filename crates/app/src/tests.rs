@@ -6107,6 +6107,63 @@ async fn onboarding_checklist_appears_and_advances_on_credential() {
 /// flows satisfy its own envelope. That assertion was impossible until
 /// WhippleScript DR-0051 gave a person's decision an integrity crossing.
 #[tokio::test]
+async fn a_project_s_whips_start_with_its_gate_s_structure_and_no_instances() {
+    // The route the Structure and Instances tabs read. A fresh project has run
+    // nothing, so there is exactly one program — the seeded gate — with the
+    // structure compiled from the file the project carries and an empty
+    // instance list. That empty list is the honest answer, not a gap: the
+    // marks in the Instances tab are read from runtime stores, and a store
+    // that does not exist yet holds nothing.
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/projects/{DEFAULT_PROJECT}/whips"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["schema"], crate::whip_views::PROJECT_WHIPS_SCHEMA);
+    assert_eq!(value["project"], DEFAULT_PROJECT);
+
+    let whips = value["whips"].as_array().expect("a list of programs");
+    let gate = whips
+        .iter()
+        .find(|whip| whip["program"] == "gate")
+        .expect("the seeded gate is a program of every project");
+    // The path the file nav shows for the project's own files, so selecting
+    // the gate there finds this program.
+    let target = library_state::managed_project_target_id(DEFAULT_PROJECT);
+    let encoded =
+        crate::library::target_id_path_v1(&target).expect("the managed target id encodes");
+    assert_eq!(
+        gate["path"],
+        format!("targets/{encoded}/{}", crate::gate::GATE_PROGRAM_PATH)
+    );
+    assert_eq!(
+        gate["structure"]["available"], true,
+        "the gate compiles, so it has a structure"
+    );
+    assert!(
+        gate["structure"]["rules"]
+            .as_array()
+            .is_some_and(|rules| !rules.is_empty()),
+        "a structure with no rules is not the gate"
+    );
+    assert_eq!(
+        gate["instances"],
+        serde_json::json!([]),
+        "nothing has been screened"
+    );
+
+    let (status, _) = send(&app, "GET", "/projects/no-such-project/whips", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn every_project_is_created_with_the_default_gate() {
     let (d, wb) = seeded_workbench();
     let app = open_control_plane(wb);

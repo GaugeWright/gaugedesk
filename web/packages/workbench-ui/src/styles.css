@@ -2480,3 +2480,218 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
     border-left: 2px solid var(--edge); padding-left: 8px; line-height: 1.45; max-width: 70ch; }
 .twb-warn-text { font-size: var(--fs-small); color: var(--warn); }
 .twb-native { margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06); }
+
+/* === Whip program views ==================================================== */
+/*
+ * Structure and Instances on a `.whip` file, composed to the company system
+ * (GaugeWright `brand/composition.md`, `brand/typography.md`) as it applies to
+ * an operated surface. Four of its rules do the work here:
+ *
+ * 1. "Sections divide by a rule carrying a centred diamond. Never by a
+ *    background band, and never by a card: a boxed grid is the shape a page
+ *    takes when its composition was not decided." So firings are separated by
+ *    the rule-and-diamond, not boxed.
+ * 2. The double rule "is the only frame in the system, which is what makes it
+ *    carry meaning", and it frames "a live panel — a thing a visitor may act
+ *    inside". The effect graph is exactly that, and it is the only framed thing
+ *    in these views.
+ * 3. Controls are engraved: "square corners, a hairline rule, letterspaced
+ *    capitals". No pills, no fills, no rounded corners anywhere below.
+ * 4. "Gold carries section titles, the company tagline, and rules. Nothing
+ *    else." Gold appears here on the dividers and the section eyebrows only;
+ *    status keeps the workbench's semantic tokens, which is the app's own
+ *    adaptation and the one place legibility must win.
+ *
+ * Sizes resolve to the WORKBENCH scale (--fs-*), not the brand's 18px base:
+ * that scale is the app's derivation for dense chrome and its stylesheet
+ * requires every size to land on it. Vertical space is the 24px module, halved
+ * to 12 only inside a figure.
+ */
+
+.whip-panel { padding: 0 0 24px; overflow: auto; }
+
+/* Section label: engraved. Letterspaced capitals in gold, the rule running out
+   to the margin — the wordmark's own underline figure, at chrome scale. */
+.whip-eyebrow { display: flex; align-items: center; gap: 12px;
+    font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.18em;
+    color: var(--gold); margin: 24px 0 12px; }
+.whip-eyebrow::after { content: ""; flex: 1; height: 1px;
+    background: linear-gradient(90deg, color-mix(in srgb, var(--gold) 55%, transparent), transparent); }
+.whip-eyebrow:first-child { margin-top: 12px; }
+.whip-eyebrow .whip-meta { text-transform: none; letter-spacing: 0; color: var(--muted);
+    font-family: var(--mono); }
+
+/* The divider: hairlines meeting at a small rotated square. This is what
+   separates one firing from the next — never a card. */
+.whip-div { display: flex; align-items: center; justify-content: center; gap: 12px;
+    margin: 24px 0; }
+.whip-div::before, .whip-div::after { content: ""; height: 1px; flex: 1;
+    background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--gold) 40%, transparent)); }
+.whip-div::after { background: linear-gradient(90deg, color-mix(in srgb, var(--gold) 40%, transparent), transparent); }
+.whip-div i { width: 7px; height: 7px; transform: rotate(45deg); flex: none;
+    border: 1px solid color-mix(in srgb, var(--gold) 55%, transparent); }
+
+.whip-group { margin: 0 0 12px; }
+.whip-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.whip-title { font-family: var(--mono); font-weight: 700; font-size: var(--fs-ui);
+    color: var(--ink); }
+.whip-meta, .whip-sub { font-family: var(--mono); font-size: var(--fs-small);
+    color: var(--muted); }
+.whip-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Engraved label, per Controls: square, hairline, letterspaced capitals. The
+   tone is carried by the rule and the mark, never by a fill. */
+.whip-chip { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+    font-family: var(--ui); font-size: var(--fs-label); text-transform: uppercase;
+    letter-spacing: 0.14em; padding: 2px 8px; border: 1px solid currentColor;
+    border-radius: 0; }
+.whip-chip::before { content: ""; width: 5px; height: 5px; flex: none;
+    background: currentColor; }
+/* Completed and running are both "fine", so both stay in the accent family and
+   the difference is carried by WEIGHT, not by a second hue — the reader must be
+   able to find the live effect in one sweep. Settled work recedes toward muted;
+   the running mark is the brightest thing in the figure and wears a halo, so it
+   survives a greyscale print and a colour-blind reader both. */
+.whip-chip[data-tone="ok"] { color: color-mix(in srgb, var(--accent) 62%, var(--muted)); }
+.whip-chip[data-tone="run"] { color: var(--accent-hover, var(--accent)); }
+.whip-chip[data-tone="run"]::before {
+    box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 30%, transparent); }
+.whip-chip[data-tone="blocked"] { color: var(--warn); }
+.whip-chip[data-tone="failed"] { color: var(--bad); }
+.whip-chip[data-tone="idle"] { color: var(--muted); }
+/* The ghost is hollow: a mark with nothing in it, for a node with nothing
+   behind it. */
+.whip-chip[data-tone="absent"] { color: var(--muted); border-style: dashed; }
+.whip-chip[data-tone="absent"]::before { background: none;
+    box-shadow: inset 0 0 0 1px currentColor; }
+
+.whip-note { display: flex; gap: 8px; font-size: var(--fs-small); color: var(--warn);
+    margin: 12px 0 0; }
+.whip-note[data-kind="untrusted"] { color: var(--bad); }
+.whip-note::before { content: "▲"; font-size: var(--fs-label); line-height: 1.6; }
+
+/* --- the plate: the only frame ------------------------------------------- */
+/* Heavy outside, fine within, framing the live panel — the graph a reader
+   inspects, framed apart from the text discussing it. */
+.whip-plate { border: 2px solid color-mix(in srgb, var(--gold) 45%, transparent);
+    padding: 5px; margin: 12px 0; }
+.whip-plate-inner { border: 1px solid color-mix(in srgb, var(--gold) 22%, transparent);
+    padding: 12px; overflow-x: auto; }
+
+.whip-dag { display: block; }
+.whip-dag text { font-family: var(--mono); }
+.whip-dag-node .whip-dag-box { fill: none; stroke: var(--edge); }
+.whip-dag-node .whip-dag-name { font-size: var(--fs-small); font-weight: 700; fill: var(--ink); }
+.whip-dag-node .whip-dag-kind { font-size: var(--fs-label); fill: var(--muted); }
+.whip-dag-node .whip-dag-status { font-size: var(--fs-label); fill: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.1em; }
+.whip-dag-node .whip-dag-dot { fill: var(--muted); }
+.whip-dag-node .whip-dag-halo { fill: none; stroke: none; }
+
+.whip-dag-node[data-tone="ok"] .whip-dag-dot,
+.whip-dag-node[data-tone="ok"] .whip-dag-status {
+    fill: color-mix(in srgb, var(--accent) 62%, var(--muted)); }
+.whip-dag-node[data-tone="ok"] .whip-dag-box { stroke: color-mix(in srgb, var(--accent) 50%, var(--edge)); }
+.whip-dag-node[data-tone="run"] .whip-dag-dot,
+.whip-dag-node[data-tone="run"] .whip-dag-status { fill: var(--accent-hover, var(--accent)); }
+.whip-dag-node[data-tone="run"] .whip-dag-box { stroke: var(--accent-hover, var(--accent)); }
+/* The halo, as a second concentric mark rather than a shadow: SVG has no
+   box-shadow, and the ring is the same signal the chip carries. */
+.whip-dag-node[data-tone="run"] .whip-dag-halo { fill: none;
+    stroke: color-mix(in srgb, var(--accent-hover) 45%, transparent); }
+.whip-dag-node[data-tone="blocked"] .whip-dag-dot,
+.whip-dag-node[data-tone="blocked"] .whip-dag-status { fill: var(--warn); }
+.whip-dag-node[data-tone="blocked"] .whip-dag-box { stroke: var(--warn); }
+.whip-dag-node[data-tone="failed"] .whip-dag-dot,
+.whip-dag-node[data-tone="failed"] .whip-dag-status { fill: var(--bad); }
+.whip-dag-node[data-tone="failed"] .whip-dag-box { stroke: var(--bad); }
+.whip-dag-node[data-tone="absent"] .whip-dag-box { stroke: var(--edge); stroke-dasharray: 3 3; }
+.whip-dag-node[data-tone="absent"] .whip-dag-name { fill: var(--muted); font-weight: 400; }
+.whip-dag-node[data-tone="absent"] .whip-dag-dot { fill: none; stroke: var(--muted); }
+
+.whip-dag-edge path { fill: none; stroke: var(--edge); }
+.whip-dag-edge text { font-size: var(--fs-label); fill: var(--muted); }
+.whip-dag-edge[data-absent="true"] path { stroke-dasharray: 3 3; }
+.whip-dag-arrowhead { fill: var(--edge); }
+
+.whip-effect-note { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px;
+    font-size: var(--fs-small); padding: 1px 0; }
+.whip-note-node { font-family: var(--mono); color: var(--muted); min-width: 96px; }
+.whip-note-reason { color: var(--warn); }
+.whip-note-run { font-family: var(--mono); font-size: var(--fs-label); color: var(--muted); }
+
+.whip-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px;
+    padding-top: 12px;
+    border-top: 1px solid color-mix(in srgb, var(--gold) 30%, transparent); }
+.whip-legend .whip-legend-note { font-size: var(--fs-small); color: var(--muted);
+    flex: 1 1 100%; }
+.whip-legend .whip-legend-note em { color: var(--ink); font-style: normal; }
+
+/* --- lanes: many firings of one rule, on one axis ------------------------- */
+/* Rows are firings, columns are effects, and a column of like marks is the
+   finding — "nine of these are stuck on the lease" is a glance here and a
+   scrolling exercise in a stack of graphs. Each row carries the same computed
+   template, so the columns line up without the rows losing their boxes. */
+.whip-lanes { --whip-lane-label: 132px; font-family: var(--mono);
+    font-size: var(--fs-label); }
+.whip-lane-head, .whip-lane { display: grid; align-items: center; }
+.whip-lane-head { align-items: end; padding-bottom: 6px;
+    border-bottom: 1px solid var(--edge); }
+/* Vertical rather than rotated: 26px of column will not hold `release_blocked`
+   any other way, and a name the reader cannot finish is not a header. */
+.whip-lane-col { writing-mode: vertical-rl; transform: rotate(180deg);
+    color: var(--muted); text-align: left; padding: 0 0 2px; letter-spacing: 0.04em;
+    max-height: 108px; overflow: hidden; }
+.whip-lane { min-height: 22px; }
+.whip-lane:hover { background: color-mix(in srgb, var(--gold) 6%, transparent); }
+.whip-lane-id { color: var(--ink); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; padding-right: 12px; }
+.whip-lane-cell { display: flex; align-items: center; justify-content: center;
+    height: 22px; }
+.whip-lane-cell i { width: 9px; height: 9px; background: currentColor; }
+.whip-lane-cell[data-tone="ok"] { color: color-mix(in srgb, var(--accent) 62%, var(--muted)); }
+.whip-lane-cell[data-tone="run"] { color: var(--accent-hover, var(--accent)); }
+.whip-lane-cell[data-tone="run"] i {
+    box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 28%, transparent); }
+.whip-lane-cell[data-tone="blocked"] { color: var(--warn); }
+.whip-lane-cell[data-tone="failed"] { color: var(--bad); }
+.whip-lane-cell[data-tone="idle"] { color: var(--muted); }
+.whip-lane-cell[data-tone="idle"] i { background: none;
+    box-shadow: inset 0 0 0 1px currentColor; }
+/* Absence keeps the hollow mark it has in the graph. A grid that shaded it as
+   a dim status would erase the distinction this whole view exists to make. */
+.whip-lane-cell[data-tone="absent"] { color: color-mix(in srgb, var(--muted) 55%, transparent); }
+.whip-lane-cell[data-tone="absent"] i { background: none; width: 7px; height: 7px;
+    box-shadow: inset 0 0 0 1px currentColor; }
+
+.whip-lane-note { display: flex; gap: 12px; align-items: baseline; padding: 2px 0;
+    font-size: var(--fs-small); }
+.whip-lane-note .whip-note-node { min-width: 120px; }
+.whip-lane-note-body { flex: 1; min-width: 0; }
+
+/* A label the engine had to put ON a line — downward flow makes the runs
+   vertical and text is not. The stroke knocks the line out behind the glyphs,
+   painted first so it never touches the letterforms. */
+.whip-dag text[data-on-line="true"] { paint-order: stroke; stroke: var(--panel);
+    stroke-width: 4px; stroke-linejoin: round; }
+
+/* --- the structure figure: rule boxes with their effects inside ----------- */
+/* No plate. A hairline box per rule is the figure; the effect graph is drawn
+   inside it in the same ink, one step smaller. Rule boxes take the gold the
+   effect nodes do not, because they are the map. */
+.whip-figure { overflow-x: auto; margin: 12px 0; }
+.whip-structure { display: block; }
+.whip-rule-box { fill: none; stroke: color-mix(in srgb, var(--gold) 38%, var(--edge)); }
+.whip-rule-name { font-family: var(--mono); font-size: var(--fs-ui); font-weight: 700;
+    fill: var(--ink); }
+.whip-rule-when { font-family: var(--mono); font-size: var(--fs-label); fill: var(--muted); }
+.whip-rule-keyword { fill: color-mix(in srgb, var(--muted) 55%, transparent); }
+.whip-rule-empty { font-style: italic; }
+.whip-rule-edge path { stroke: color-mix(in srgb, var(--gold) 45%, var(--edge)); }
+.whip-rule-edge text { fill: var(--gold); font-size: var(--fs-label); letter-spacing: 0.04em; }
+/* A rule feeding itself, and a paced cycle between two, are the shapes that
+   make a workflow go round. Drawn in gold because they are the couplings a
+   reader most needs to find, not because they are wrong. */
+.whip-rule-edge[data-kind="self"] path,
+.whip-rule-edge[data-kind="back"] path {
+    stroke: color-mix(in srgb, var(--gold) 55%, transparent); }

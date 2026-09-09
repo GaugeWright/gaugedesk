@@ -9,11 +9,15 @@
  * renders.
  */
 
+import { programsFromV1, projectWhipFor } from "./whip-view";
 import { createResource, For, Show, type JSX } from "solid-js";
-import type { ProjectHome } from "@gaugewright/control-plane-client";
+import type { ProjectHome, ProjectWhips } from "@gaugewright/control-plane-client";
 
 export interface ProjectHomeApi {
     projectHome(project: string): Promise<ProjectHome>;
+    /** The project's whip programs and instances. Optional: a session
+     *  that cannot list them shows the section empty rather than absent. */
+    listWhips?(project: string): Promise<ProjectWhips>;
 }
 
 export function ProjectHomePanel(props: {
@@ -21,9 +25,22 @@ export function ProjectHomePanel(props: {
     project: string;
     projectName: string;
     onOpenChat?: (chat: string) => void;
+    /** Open a whip program's file, which is where its views live. */
+    onOpenWhip?: (path: string) => void;
     onClose: () => void;
 }): JSX.Element {
     const [home] = createResource(() => props.project, (p) => props.api.projectHome(p));
+    // Every project runs at least the inbound gate, so this is never a section
+    // the reader has to go looking for. Rolled up from the same instance views
+    // the file's Instances tab renders, so the two cannot disagree.
+    const [programs] = createResource(
+        () => props.project,
+        async (p) => (props.api.listWhips ? programsFromV1(await props.api.listWhips(p)) : []),
+    );
+    const whips = () =>
+        (programs() ?? []).flatMap((program) =>
+            program.instances.map((view) => projectWhipFor(program.path ?? program.program, view)),
+        );
 
     return (
         <div class="modal-overlay" onClick={() => props.onClose()}>
@@ -77,6 +94,40 @@ export function ProjectHomePanel(props: {
                                     <span class="member-status">{r.phase}</span>
                                     <Show when={r.ran}>
                                         <span class="badge">ran</span>
+                                    </Show>
+                                </li>
+                            )}
+                        </For>
+                    </ul>
+                </section>
+
+                <section class="admin-section" data-project-home-whips>
+                    <h4>Whips running</h4>
+                    <ul class="member-list">
+                        <For
+                            each={whips()}
+                            fallback={<li class="muted">No whip is running in this project.</li>}
+                        >
+                            {(whip) => (
+                                <li
+                                    class="member-row"
+                                    data-whip-instance={whip.instanceId}
+                                    onClick={() => props.onOpenWhip?.(whip.path)}
+                                >
+                                    <span class="member-id">{whip.workflow}</span>
+                                    <span class="member-status">{whip.status}</span>
+                                    {/* Typed reasons, so "why is nothing happening"
+                                        is a lookup rather than an investigation. */}
+                                    <Show when={whip.blocked > 0}>
+                                        <span class="badge" data-whip-blocked>
+                                            {whip.blocked} blocked
+                                        </span>
+                                    </Show>
+                                    {/* The count no log can produce. */}
+                                    <Show when={whip.neverRequested > 0}>
+                                        <span class="badge" data-whip-absent>
+                                            {whip.neverRequested} never requested
+                                        </span>
                                     </Show>
                                 </li>
                             )}

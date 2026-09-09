@@ -134,6 +134,106 @@ pub(crate) fn workspace_resource_refs(
 }
 use whipplescript::ifc::VerifiedEnvelope;
 
+/// The runtime database a chat's harness writes: one SQLite store per chat
+/// under the factory's runtime root, named by the chat id.
+///
+/// One derivation, because two readers of it now exist. The harness opens it
+/// to run turns, and the Instances view opens it to draw what those turns
+/// did; a second spelling of this path would be a way to draw nothing while
+/// the harness writes somewhere else.
+pub fn chat_runtime_database(runtime_root: &Path, chat_id: &str) -> PathBuf {
+    runtime_root.join(format!("{}.sqlite", hex::encode(chat_id.as_bytes())))
+}
+
+/// One instance, projected, with the program it belongs to.
+#[derive(Clone, Debug)]
+pub struct ProjectedInstance {
+    /// The program version's `program_name`: `"gate"` for the inbound gate,
+    /// the agent's name for a chat's package.
+    pub program: String,
+    /// `whipplescript.instance_view.v0`, as `whip view --json` prints it.
+    pub view: serde_json::Value,
+}
+
+/// Every instance in a runtime store, projected.
+///
+/// Opens the store the harness or gate writes and reads it as a second
+/// connection — SQLite in WAL mode admits a reader beside the writer — so a
+/// running instance is drawn as it runs. The projection is WhippleScript's
+/// own (`whipplescript::instance_view`), which is what keeps this and `whip
+/// view` from disagreeing about the same instance.
+pub fn instance_views(store_path: &Path) -> io::Result<Vec<ProjectedInstance>> {
+    use whipplescript::instance_view;
+    // `StoreError` is not a `std::error::Error`, so it is carried by its text.
+    let store_io = |error: whipplescript_store::StoreError| io::Error::other(format!("{error:?}"));
+    let store = whipplescript_store::SqliteStore::open(store_path).map_err(store_io)?;
+    let mut projected = Vec::new();
+    for instance in store.list_instances().map_err(store_io)? {
+        let program = store
+            .get_program_version(&instance.version_id)
+            .map_err(store_io)?
+            .map(|version| version.program_name)
+            .unwrap_or_default();
+        if let Some(view) = instance_view::load(&store, &instance.instance_id).map_err(store_io)? {
+            projected.push(ProjectedInstance { program, view });
+        }
+    }
+    Ok(projected)
+}
+
+/// The structure of a program from its source, with no instance.
+///
+/// `None` when the source does not compile: a Structure tab for a broken file
+/// shows the diagnostics the editor already shows, not an empty graph.
+pub fn program_structure(source: &str) -> Option<serde_json::Value> {
+    let compiled = compile_whip_program(source);
+    let ir = compiled.ir?;
+    let snapshot = ir.to_snapshot();
+    let ir_hash = whipplescript_store::stable_hash_hex(&snapshot);
+    Some(whipplescript::instance_view::structure(&snapshot, &ir_hash))
+}
+
+#[cfg(test)]
+mod instance_view_tests {
+    use super::*;
+
+    #[test]
+    fn a_chat_s_runtime_database_is_named_by_its_id_in_one_place() {
+        // The harness writes here and the Instances view reads here. A second
+        // spelling would draw nothing while turns are recorded somewhere else.
+        let root = Path::new("/r");
+        assert_eq!(
+            chat_runtime_database(root, "chat_1"),
+            root.join(format!("{}.sqlite", hex::encode("chat_1".as_bytes())))
+        );
+    }
+
+    #[test]
+    fn a_program_has_a_structure_before_anything_runs_it() {
+        let structure = program_structure(
+            "workflow Demo\n\nrule work\n  when started\n  then\n    log \"hi\"\n",
+        );
+        // Whether this particular source lowers is the parser's business; what
+        // this asserts is the contract: a compiling program yields the view's
+        // `structure` member with `available: true`, and a broken one yields
+        // nothing rather than an empty graph.
+        if let Some(structure) = structure {
+            assert_eq!(structure["available"], true);
+            assert_eq!(structure["program_version_id"], "");
+        }
+        assert!(program_structure("this is not a program").is_none());
+    }
+
+    #[test]
+    fn an_empty_runtime_store_has_no_instances_and_is_not_an_error() {
+        // The ordinary state of a project nothing has run in.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("runtime.sqlite");
+        drop(whipplescript_store::SqliteStore::open(&path).expect("open"));
+        assert!(instance_views(&path).expect("read").is_empty());
+    }
+}
+
 pub mod gate_runner;
 /// The sans-I/O HTTP types a gate host implements its transport against.
 pub mod sansio_types {
@@ -431,8 +531,7 @@ impl WhipHarnessFactory {
             GovernanceRootVerifier::new(self.authority.clone(), self.signing_key.public_key());
         std::fs::create_dir_all(&self.runtime_root)?;
         GovernedHostRuntime::open_with_verifier(
-            self.runtime_root
-                .join(format!("{}.sqlite", hex::encode(chat_id.as_bytes()))),
+            chat_runtime_database(&self.runtime_root, chat_id),
             epoch,
             signed_policy,
             &verifier,

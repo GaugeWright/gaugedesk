@@ -16,6 +16,7 @@
  */
 import { createContext, useContext, type Accessor } from "solid-js";
 import {
+    type ProjectWhips,
     type EngagementId,
     type FileEntry,
     type MergeAction,
@@ -35,6 +36,10 @@ import {
 
 export interface SessionApi {
     getFile(id: EngagementId, path: string): Promise<string>;
+    /** The project's whip programs with their structure and instances, as
+     *  WhippleScript projects them. Optional: only a session standing in a
+     *  project can answer, and a `.whip` file outside one has no instances. */
+    listWhips?(project: string): Promise<ProjectWhips>;
     /** The project's quarantine index — provenance only, never payload
      *  (ADR 0110 §7). Optional: only a session that can review inbound material
      *  serves it. */
@@ -150,6 +155,11 @@ export interface Session {
     readonly api: SessionApi;
     /** The engagement (chat) this session is bound to; null when none is open. */
     readonly engagementId: Accessor<EngagementId | null>;
+    /** The project this engagement works in, when the session knows one. A
+     *  file's whip views are project-scoped — instances belong to the project
+     *  that ran them, not to the chat that opened the file. Optional so a
+     *  Session with no project notion still typechecks. */
+    readonly project?: Accessor<string | null>;
     /** An opaque key that changes whenever this session's worktree mutates — the
      *  refetch trigger for worktree-derived projections (the desktop wires it to
      *  the per-turn `status` signal). */

@@ -132,6 +132,48 @@ fn the_gate_runs_and_returns_a_keep() {
 /// So the run reaching no disposition is the *correct* outcome here, not a
 /// failure. What a parked gate needs next is the queued service (`GATE-3j`),
 /// which is what will carry the human's verdict back in.
+/// After a gate runs, its instance is readable through WhippleScript's own
+/// projection from the store the gate wrote — which is what the Instances tab
+/// draws. This is the whole real-data path in one place: no fixture, no second
+/// spelling of the store's location, and the `structure` under the instance is
+/// the program the gate actually ran.
+#[test]
+fn a_gate_that_ran_is_projected_as_an_instance_of_program_gate() {
+    let quarantine = staged(r#"{"q1":"the coffee was cold"}"#);
+    let state = tempfile::tempdir().unwrap();
+    run_gate(
+        &compiled(),
+        &config(),
+        ITEM,
+        quarantine.path(),
+        state.path(),
+        &ScriptedProvider::new("keep"),
+    )
+    .expect("the gate settles");
+
+    let instances = gaugedesk_whip_runtime::instance_views(&state.path().join("runtime.sqlite"))
+        .expect("the gate's own store reads back");
+    assert_eq!(instances.len(), 1, "one item screened, one instance");
+    let instance = &instances[0];
+    assert_eq!(instance.program, "gate");
+    assert_eq!(instance.view["schema"], "whipplescript.instance_view.v0");
+    assert_eq!(
+        instance.view["structure"]["available"], true,
+        "the snapshot was retained with the version"
+    );
+    assert!(
+        instance.view["firings"]
+            .as_array()
+            .is_some_and(|firings| !firings.is_empty()),
+        "a gate that settled fired at least once: {}",
+        instance.view
+    );
+    // The projection reads the same identity the store wrote: every effect the
+    // run created is attributed to a node of the program, so the absences the
+    // view reports are findings and not artefacts of a mis-keyed join.
+    assert_eq!(instance.view["unattributed_effects"], serde_json::json!([]));
+}
+
 #[test]
 fn a_flagged_item_escalates_to_a_person_instead_of_settling() {
     let quarantine =

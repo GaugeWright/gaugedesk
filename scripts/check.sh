@@ -159,6 +159,10 @@ run_contracts() {
     echo "== advisory outcome classification =="
     node --test scripts/npm-audit-outcome.test.mjs
     bash scripts/advisory-database.test.sh
+    # The same question one layer down: the bounded apt install decides
+    # whether a runner's failing vendor index reddens a healthy tree, and
+    # tolerating one must not tolerate a package that never installed.
+    bash scripts/apt-install-action.test.sh
 
     echo "== build coverage =="
     node scripts/check-build-coverage.mjs

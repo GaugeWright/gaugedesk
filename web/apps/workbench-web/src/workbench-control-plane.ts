@@ -1287,6 +1287,9 @@ export class WorkbenchControlPlane implements ControlPlane {
     // The review surface's three reads/commands (ADR 0110 §7). Project-scoped, not
     // engagement-scoped: quarantine belongs to a project and reaches no chat's
     // worktree, which is the whole protection (ADR 0110 §1).
+    listWhips(project: string) {
+        return workbenchClient.projectWhips(this.workbenchTransport(), project);
+    }
     listQuarantine(project: string) {
         return workbenchClient.listQuarantine(this.workbenchTransport(), project);
     }

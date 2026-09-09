@@ -547,6 +547,31 @@ export async function projectHome(transport: WorkbenchTransport, id: ProjectId):
     return parseProjectHome(await transport.json("GET", `/projects/${id}/home`));
 }
 
+/** A project's whip programs, each with its structure and every instance of
+ *  it. The instance views are `whipplescript.instance_view.v0` verbatim —
+ *  WhippleScript's own projection, so the desk never re-derives absence from
+ *  a log that cannot carry it. Shape-checked only as far as the desk reads. */
+export interface ProjectWhips {
+    readonly project: string;
+    readonly whips: readonly {
+        readonly path: string | null;
+        readonly program: string;
+        readonly chat: string | null;
+        readonly structure: unknown | null;
+        readonly instances: readonly unknown[];
+    }[];
+}
+
+export async function projectWhips(transport: WorkbenchTransport, id: string): Promise<ProjectWhips> {
+    const o = (await transport.json("GET", `/projects/${id}/whips`)) as {
+        project?: unknown; whips?: unknown;
+    };
+    if (typeof o.project !== "string" || !Array.isArray(o.whips)) {
+        throw new Error("project whips: response is not the declared shape");
+    }
+    return o as ProjectWhips;
+}
+
 export async function placeArchetype(
     transport: WorkbenchTransport,
     pid: ProjectId,

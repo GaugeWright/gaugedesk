@@ -2198,6 +2198,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const desktopSessionFor = (id: EngagementId): Session => ({
         api,
         engagementId: () => id,
+        project: () => currentProject()?.id ?? null,
         worktreeRev: status,
         selectedFile,
         selectFile: (path) => setSelectedFile(path),

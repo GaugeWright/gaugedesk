@@ -20,6 +20,8 @@ import { defaultContentMode, isSettledPhase, phaseLabel as phaseLabelFor, should
 import { readPolicyDiff } from "./policy-diff";
 import { EnvironmentDocumentView, type EnvironmentViewRegistry } from "./EnvironmentDocumentView";
 import { manifestDocumentForPath } from "./environment-view";
+import { isWhipProgram, tabsForPath, programForPath, programsFromV1} from "./whip-view";
+import { WhipInstancesView, WhipStructureView } from "./WhipViews";
 
 // The diff viewer pulls in @git-diff-view (+ highlight.js/lowlight, ~350 KB).
 // Load that chunk only when the Diff tab is first opened, not on app boot.
@@ -33,7 +35,12 @@ const isMarkdownPath = (path: string) => /\.(md|markdown)$/i.test(path);
 // The conflict fold (SUB-6) mounts only when a save actually conflicts.
 const ConflictFold = lazy(() => import("./ConflictFold").then((m) => ({ default: m.ConflictFold })));
 
-type Mode = "view" | "edit" | "diff";
+// A `.whip` file is a program with runtime state, so it gets two modes the
+// other files have no meaning for. `SpecialFileRenderer` below is the existing
+// seam for rendering one file type differently, but it replaces the body of
+// View with a single rendering; a program needs several views the reader
+// switches between, which is a tab-set question rather than a renderer one.
+type Mode = "view" | "edit" | "diff" | "structure" | "instances";
 
 export interface SpecialFileRenderer {
     readonly id: string;
@@ -393,7 +400,39 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     const phaseLabel = (): string => phaseLabelFor(phase(), chatKind(), methodName());
 
     // Plain tab labels (#3): "diff" is dev-speak for the review of what changed.
-    const tabLabel: Record<Mode, string> = { view: "view", edit: "edit", diff: "changes" };
+    const tabLabel: Record<Mode, string> = {
+        view: "view",
+        edit: "edit",
+        diff: "changes",
+        structure: "structure",
+        instances: "instances",
+    };
+    // Only a whip program offers the extra two, so every other file keeps the
+    // three tabs it always had.
+    const tabs = createMemo(() => tabsForPath(file()) as Mode[]);
+    // Selecting a non-whip file while standing on a whip-only tab would leave
+    // the viewer on a tab that is not in its own tab bar.
+    createEffect(on(() => file(), () => {
+        if (!tabs().includes(mode())) setMode("view");
+    }));
+    // The project's whip programs, read through WhippleScript's own instance
+    // projection. Keyed on the project rather than the chat: instances belong
+    // to the project that ran them, and the gate runs with no chat at all. A
+    // session that knows no project, or cannot list, draws the empty state.
+    const [whipPrograms] = createResource(
+        () => (isWhipProgram(file()) ? [session.project?.() ?? null, session.api.listWhips ? 1 : 0] as const : null),
+        async ([project, can]) => (project && can ? programsFromV1(await session.api.listWhips!(project)) : []),
+    );
+    const whipProgram = createMemo(() => {
+        const path = file();
+        return path ? programForPath(whipPrograms() ?? [], path) : undefined;
+    });
+    const whipInstances = createMemo(() => whipProgram()?.instances ?? []);
+    // A program's structure comes from the file when nothing has run it, and
+    // from what its instances ran under otherwise; both are the same shape.
+    const whipStructure = createMemo(
+        () => whipProgram()?.structure ?? whipInstances()[0]?.structure ?? null,
+    );
 
     // Plain-language reading of a security/permission change buried in the config
     // file (#3): a change that only touches `.agent-config.json` is otherwise shown
@@ -414,7 +453,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     return (
         <div class="viewer">
             <div class="tabs" data-viewer-tabs>
-                {(["view", "edit", "diff"] as Mode[]).map((m) => (
+                {tabs().map((m) => (
                     <span class="tab" classList={{ active: mode() === m }} data-tab={m} onClick={() => setMode(m)}>
                         {tabLabel[m]}
                     </span>
@@ -423,6 +462,18 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                     <span class="status viewer-filename" title={file() ?? ""}>{file()}</span>
                 </Show>
             </div>
+
+            <Show when={mode() === "structure"}>
+                <div class="filebody">
+                    <WhipStructureView structure={whipStructure()} />
+                </div>
+            </Show>
+
+            <Show when={mode() === "instances"}>
+                <div class="filebody">
+                    <WhipInstancesView instances={whipInstances()} />
+                </div>
+            </Show>
 
             <Show when={mode() === "view"}>
                 <Show when={file()} fallback={<div class="status">Pick a file from the Files panel on the right to view it.</div>}>
