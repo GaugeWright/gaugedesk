@@ -1150,7 +1150,66 @@ pub struct Engagement {
     sparse_roots: Option<BTreeSet<String>>,
 }
 
+/// A transient view of workspace changes, without importing them into history.
+/// `recorded_cut` names only an already recorded version, never a disk hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceObservation {
+    pub recorded_cut: Option<String>,
+    pub changed_paths: BTreeSet<String>,
+}
+
 impl Engagement {
+    pub fn observe(&self) -> Result<WorkspaceObservation> {
+        let vcs = NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?;
+        let branch = vcs
+            .get_branch(&self.branch)?
+            .ok_or_else(|| WorkspaceError::msg("workspace observation has no candidate line"))?;
+        let candidate = whipplescript_store::stat_cache::scan_dir(
+            &self.path,
+            &load_scratch(&vcs, &self.store_root, &self.branch).cache,
+            scan_stamp(),
+        )?
+        .manifest;
+        let target = vcs
+            .get_branch(&self.target)?
+            .ok_or_else(|| WorkspaceError::msg("workspace observation has no target line"))?;
+        let target_manifest = if self.target == MAINLINE_BRANCH_ID {
+            whipplescript_store::stat_cache::scan_dir(
+                &self.repo,
+                &load_scratch(&vcs, &self.store_root, &self.target).cache,
+                scan_stamp(),
+            )?
+            .manifest
+        } else if let Some(cut) = target.head_cut_id {
+            vcs.cut_manifest(&cut)?.ok_or_else(|| {
+                WorkspaceError::msg("workspace observation target cut is unavailable")
+            })?
+        } else {
+            BTreeMap::new()
+        };
+        let changed_paths = candidate
+            .keys()
+            .chain(target_manifest.keys())
+            .filter(|path| {
+                !is_chat_local_path(path)
+                    && self.sparse_roots.as_ref().is_none_or(|roots| {
+                        roots
+                            .iter()
+                            .any(|root| *path == root || path.starts_with(&format!("{root}/")))
+                    })
+                    && candidate.get(*path) != target_manifest.get(*path)
+            })
+            .cloned()
+            .collect();
+        Ok(WorkspaceObservation {
+            recorded_cut: branch.head_cut_id,
+            changed_paths,
+        })
+    }
+
     fn store(&self) -> Result<NativeWorkspaceVcs> {
         let mut vcs = NativeWorkspaceVcs::open(
             self.store_root.join("branches.sqlite"),
@@ -2525,6 +2584,13 @@ pub trait ChatWorkspace: Send {
         ))
     }
     fn diff_against_main(&self) -> Result<String>;
+    /// Observe recorded identity and current file differences without importing,
+    /// initializing storage, or saving a refreshed cache. No impure fallback.
+    fn observe(&self) -> Result<WorkspaceObservation> {
+        Err(WorkspaceError::msg(
+            "this workspace adapter does not support read-only observation",
+        ))
+    }
     fn revert_to_main(&self) -> Result<()>;
     fn sync_from_main(&self) -> Result<MergeOutcome>;
     fn merge_probe(&self) -> Result<MergeOutcome>;
@@ -2770,6 +2836,9 @@ impl ChatWorkspace for Engagement {
     fn diff_against_main(&self) -> Result<String> {
         self.diff_against_main()
     }
+    fn observe(&self) -> Result<WorkspaceObservation> {
+        self.observe()
+    }
     fn revert_to_main(&self) -> Result<()> {
         self.revert_to_main()
     }
@@ -2982,6 +3051,134 @@ mod tests {
         )
         .expect("init");
         (directory, instance)
+    }
+
+    fn observation_files(root: &Path) -> BTreeMap<PathBuf, String> {
+        fn walk(root: &Path, out: &mut BTreeMap<PathBuf, String>) {
+            for entry in std::fs::read_dir(root).expect("snapshot directory") {
+                let path = entry.expect("snapshot entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if !path.to_string_lossy().ends_with("-shm") {
+                    // SQLite may create transient lock pages and an empty WAL
+                    // while opening a reader. Neither carries durable history.
+                    let bytes = std::fs::read(&path).expect("snapshot file");
+                    if bytes.is_empty() && path.to_string_lossy().ends_with("-wal") {
+                        continue;
+                    }
+                    out.insert(
+                        path,
+                        whipplescript_store::chunking::content_hash_hex(&bytes),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        walk(root, &mut files);
+        files
+    }
+
+    #[test]
+    fn observation_detects_unimported_changes_without_mutating_history_or_cache() {
+        let (directory, instance) = instance();
+        let eng = instance.create_engagement("observe").expect("engagement");
+        eng.write_file("edited.txt", "before").unwrap();
+        eng.write_file("removed.txt", "remove me").unwrap();
+        eng.commit_turn("seed").unwrap();
+        eng.merge_into_main().unwrap();
+        let recorded = eng.current_cut().unwrap();
+        assert!(eng.observe().unwrap().changed_paths.is_empty());
+        eng.write_file("edited.txt", "after").unwrap();
+        eng.write_file("added.txt", "new").unwrap();
+        std::fs::remove_file(eng.path.join("removed.txt")).unwrap();
+        eng.write_file(".gaugedesk-runtime/tool", "host overlay")
+            .unwrap();
+        let before = observation_files(directory.path());
+        for _ in 0..2 {
+            let observation = eng.observe().unwrap();
+            assert_eq!(observation.recorded_cut, recorded);
+            assert_eq!(
+                observation.changed_paths,
+                BTreeSet::from([
+                    "added.txt".to_owned(),
+                    "edited.txt".to_owned(),
+                    "removed.txt".to_owned(),
+                ])
+            );
+        }
+        assert_eq!(observation_files(directory.path()), before);
+        let vcs = eng.store().unwrap();
+        assert!(vcs
+            .content_store()
+            .get(&whipplescript_store::stable_hash_hex("after"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            vcs.get_branch(eng.branch()).unwrap().unwrap().head_cut_id,
+            recorded
+        );
+    }
+
+    #[test]
+    fn observation_detects_target_edits_and_limits_sparse_view_differences() {
+        let (directory, instance) = instance();
+        let mut eng = instance.create_engagement("sparse-observe").unwrap();
+        eng.sparse_roots = Some(BTreeSet::from(["selected".to_owned()]));
+        std::fs::create_dir_all(eng.repo.join("selected")).unwrap();
+        std::fs::write(eng.repo.join("selected/new.txt"), "target edit").unwrap();
+        std::fs::write(eng.repo.join("outside.txt"), "outside target edit").unwrap();
+        std::fs::write(eng.path.join("outside.txt"), "outside candidate edit").unwrap();
+        let before = observation_files(directory.path());
+        assert_eq!(
+            eng.observe().unwrap().changed_paths,
+            BTreeSet::from(["selected/new.txt".to_owned()])
+        );
+        assert_eq!(observation_files(directory.path()), before);
+    }
+
+    #[test]
+    fn observation_refuses_missing_storage_or_view_without_recreating_it() {
+        let (directory, instance) = instance();
+        let eng = instance.create_engagement("unavailable-observe").unwrap();
+        std::fs::remove_dir_all(&eng.path).unwrap();
+        let before = observation_files(directory.path());
+        assert!(eng.observe().is_err());
+        assert_eq!(observation_files(directory.path()), before);
+        std::fs::remove_dir_all(&eng.store_root).unwrap();
+        assert!(eng.observe().is_err());
+        assert!(!eng.store_root.exists());
+    }
+
+    #[test]
+    fn observation_uses_the_recorded_workstream_target_and_refuses_erased_manifest() {
+        let (directory, instance) = instance();
+        instance.create_workstream("observed-target").unwrap();
+        let mut eng = instance.create_engagement("target-observer").unwrap();
+        let target = Instance::workstream_ref("observed-target");
+        eng.set_target(&target).unwrap();
+        let mut writer = eng.store().unwrap();
+        writer
+            .write(
+                &target,
+                "target.txt",
+                Some("target body"),
+                "target-cut",
+                "t1",
+            )
+            .unwrap();
+        std::fs::write(eng.repo.join("unrelated-main.txt"), "main only").unwrap();
+        let before = observation_files(directory.path());
+        assert_eq!(
+            eng.observe().unwrap().changed_paths,
+            ["target.txt".to_owned()].into()
+        );
+        assert_eq!(observation_files(directory.path()), before);
+        let manifest = writer.get_cut("target-cut").unwrap().unwrap().manifest_hash;
+        writer.content_store().erase(&manifest, "t2").unwrap();
+        assert!(
+            eng.observe().is_err(),
+            "erased target is not an empty target"
+        );
     }
 
     /// SUB-6 save contract: an unmoved file writes plain; a concurrent

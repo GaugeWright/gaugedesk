@@ -13,7 +13,9 @@ use gaugedesk_core::run::RunState;
 use gaugedesk_core::workstream::{WorkstreamPhase, WorkstreamState};
 use gaugedesk_harness::HarnessFactory;
 use gaugedesk_store::{AdmitError, Store};
-use gaugedesk_workspace::{ChatWorkspace, Instance, MergeOutcome, Workspace, WorkspaceError};
+use gaugedesk_workspace::{
+    ChatWorkspace, Instance, MergeOutcome, Workspace, WorkspaceError, WorkspaceObservation,
+};
 
 use crate::attestation_verifier::{LoopbackVerifier, QuoteVerifier, RealQuoteVerifierError};
 use crate::boundary_keeper::{accept_boundary_attested, AcceptError};
@@ -6387,18 +6389,12 @@ impl Workbench {
             && rules.attention(Signal::Conflict) != Attention::Mute
     }
 
-    /// Whether moving this chat would discard or transplant workspace state. This is
-    /// derived from the provider's actual chat→target diff rather than a UI lifecycle
-    /// hint, so manual file edits and interrupted turns fail closed too.
-    fn library_chat_rehome_blocked(&self, chat_id: &str) -> bool {
-        self.engagement_rehome_blocked(chat_id)
-    }
-
     fn library_chat_json(
         &self,
         chat: &ChatRecord,
         chat_ws: &std::collections::BTreeMap<String, String>,
         rules: &crate::attention::AttentionRules,
+        observations: &mut BTreeMap<String, Option<WorkspaceObservation>>,
     ) -> serde_json::Value {
         let kind = self
             .library
@@ -6407,7 +6403,15 @@ impl Workbench {
             .map(|instance| instance.kind.chat_kind())
             .unwrap_or("work");
         let conflict = self.library_chat_conflicted(&chat.id, rules);
-        let rehome_blocked = self.library_chat_rehome_blocked(&chat.id);
+        let observation = observations
+            .entry(chat.id.clone())
+            .or_insert_with(|| {
+                self.engagements
+                    .get(&chat.id)
+                    .and_then(|engagement| engagement.observe().ok())
+            })
+            .as_ref();
+        let rehome_blocked = self.engagement_rehome_blocked_with_observation(&chat.id, observation);
         let binding = self.library.chat_targets.get(&chat.id);
         let current_set = self.library.current_target_set(&chat.id);
         let (target_set_revision, target_set_members) = match (current_set, binding) {
@@ -6457,11 +6461,8 @@ impl Workbench {
                 chat.instance_id, target.id, target.adapter_family
             )
         });
-        let candidate_revision = self
-            .engagements
-            .get(&chat.id)
-            .and_then(|engagement| engagement.current_cut().ok())
-            .flatten()
+        let candidate_revision = observation
+            .and_then(|observation| observation.recorded_cut.clone())
             .or_else(|| binding.map(|binding| binding.basis.clone()))
             .unwrap_or_default();
         let available_acts = self.available_target_acts(&chat.id);
@@ -6557,6 +6558,9 @@ impl Workbench {
 
     pub(crate) fn workspace_value(&self) -> serde_json::Value {
         let lib = &self.library;
+        // A chat can appear under a placement and in recent. Observe it once
+        // for this response; a later response gets a fresh observation.
+        let mut observations = BTreeMap::new();
         // The operator's attention rules (ATTN-2) gate the badge flags below —
         // parsed once per projection read, shared by every chat row.
         let rules = crate::attention::AttentionRules::parse(
@@ -6612,7 +6616,7 @@ impl Workbench {
                     "is_default": agent.id == DEFAULT_AGENT,
                     "forked_from": agent.forked_from,
                     "forked_from_name": agent.forked_from.as_ref().and_then(|src| lib.agents.get(src).map(|source| source.name.clone())),
-                    "chats": lib.chats_in(&agent.instance_id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules)).collect::<Vec<_>>(),
+                    "chats": lib.chats_in(&agent.instance_id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules, &mut observations)).collect::<Vec<_>>(),
                     "workstreams": self.library_workstreams_in(&agent.instance_id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
                 })
             })
@@ -6679,7 +6683,7 @@ impl Workbench {
                                 "status": binding.status,
                             })).collect::<Vec<_>>(),
                             "target_ids": lib.placement_targets.get(&instance.id).map(|targets| targets.target_ids.clone()).unwrap_or_default(),
-                            "chats": lib.chats_in(&instance.id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules)).collect::<Vec<_>>(),
+                            "chats": lib.chats_in(&instance.id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules, &mut observations)).collect::<Vec<_>>(),
                             "workstreams": self.library_workstreams_in(&instance.id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
                         })
                     })
@@ -6716,7 +6720,8 @@ impl Workbench {
                     .and_then(|instance| lib.agents.get(&instance.agent_id))
                     .map(|agent| agent.name.clone())
                     .unwrap_or_default();
-                let mut projected = self.library_chat_json(chat, &chat_ws, &rules);
+                let mut projected =
+                    self.library_chat_json(chat, &chat_ws, &rules, &mut observations);
                 projected
                     .as_object_mut()
                     .expect("chat projections are objects")

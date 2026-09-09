@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use super::{
     ChatWorkspace, FileEntry, MergeOutcome, MergePreview, PeerSource, RegionResolution, Result,
     RevisionId, SaveBase, SaveFileOutcome, Workspace, WorkspaceError, WorkspaceExport,
+    WorkspaceObservation,
 };
 
 const METADATA_FILE: &str = "candidate.json";
@@ -427,6 +428,25 @@ impl ChatWorkspace for ExternalCandidate {
         }
     }
 
+    fn observe(&self) -> Result<WorkspaceObservation> {
+        let before = file_map(&self.base_snapshot)?;
+        let after = file_map(&self.candidate)?;
+        let changed_paths = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .cloned()
+            .collect();
+        let recorded_cut = match self.metadata.kind {
+            ExternalTargetKind::Git => Some(git(&self.candidate, &["rev-parse", "HEAD"])?),
+            ExternalTargetKind::Folder => None,
+        };
+        Ok(WorkspaceObservation {
+            recorded_cut,
+            changed_paths,
+        })
+    }
+
     fn revert_to_main(&self) -> Result<()> {
         match self.metadata.kind {
             ExternalTargetKind::Git => {
@@ -807,7 +827,14 @@ mod tests {
             ExternalWorkspace::open(source.path(), state.path(), ExternalTargetKind::Folder)
                 .unwrap();
         let candidate = workspace.create_engagement("chat").unwrap();
+        assert!(candidate.observe().unwrap().changed_paths.is_empty());
         candidate.write_file("a.txt", "candidate\n").unwrap();
+        let observation = candidate.observe().unwrap();
+        assert_eq!(
+            observation.recorded_cut, None,
+            "disk fingerprints are not cuts"
+        );
+        assert_eq!(observation.changed_paths, ["a.txt".to_owned()].into());
         candidate.commit_turn("change").unwrap();
         assert_eq!(
             std::fs::read_to_string(source.path().join("a.txt")).unwrap(),
@@ -846,7 +873,15 @@ mod tests {
         let workspace =
             ExternalWorkspace::open(source.path(), state.path(), ExternalTargetKind::Git).unwrap();
         let candidate = workspace.create_engagement("chat").unwrap();
+        let recorded = candidate.observe().unwrap().recorded_cut;
         candidate.write_file("a.txt", "candidate\n").unwrap();
+        candidate.write_file("untracked.txt", "new\n").unwrap();
+        let observation = candidate.observe().unwrap();
+        assert_eq!(observation.recorded_cut, recorded);
+        assert_eq!(
+            observation.changed_paths,
+            ["a.txt".to_owned(), "untracked.txt".to_owned()].into()
+        );
         candidate.commit_turn("candidate").unwrap();
         assert!(candidate.diff_against_main().unwrap().contains("candidate"));
         assert_eq!(candidate.merge_into_main().unwrap(), MergeOutcome::Clean);

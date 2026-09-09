@@ -97,16 +97,6 @@ fn record_promotion_conflict(wb: &mut Workbench, workstream_id: &str, paths: &[S
     wb.write_workstream_record(record);
 }
 
-/// Whether a rendered provider diff contains collaborative workspace changes.
-/// `.agent-config.json` is a host-owned per-chat overlay, preserved across re-home;
-/// it is not a candidate against the shared line.
-fn diff_has_shared_line_changes(diff: &str) -> bool {
-    diff.lines()
-        .filter_map(|line| line.strip_prefix("diff --git a/"))
-        .filter_map(|line| line.split_once(" b/").map(|(path, _)| path))
-        .any(|path| path != gaugedesk_boundary::definition::CONFIG_PATH)
-}
-
 #[derive(Deserialize)]
 pub struct CreateWorkstreamBody {
     pub name: String,
@@ -190,9 +180,21 @@ impl Workbench {
     }
 
     /// Fail-closed transfer eligibility shared by admission and the navigation
-    /// projection. The provider diff catches manual edits; lifecycle folds catch the
+    /// projection. Read-only observation catches manual edits; lifecycle folds catch the
     /// pre-write part of a running turn and explicit review/conflict candidates.
     pub(crate) fn engagement_rehome_blocked(&self, chat_id: &str) -> bool {
+        let observation = self
+            .engagements
+            .get(chat_id)
+            .and_then(|engagement| engagement.observe().ok());
+        self.engagement_rehome_blocked_with_observation(chat_id, observation.as_ref())
+    }
+
+    pub(crate) fn engagement_rehome_blocked_with_observation(
+        &self,
+        chat_id: &str,
+        observation: Option<&gaugedesk_workspace::WorkspaceObservation>,
+    ) -> bool {
         let run_active = self
             .store_ref()
             .fold::<RunState>(chat_id)
@@ -219,10 +221,13 @@ impl Workbench {
             })
             // Likewise, no merge events means the default Idle candidate state.
             .unwrap_or(false);
-        let workspace_dirty = self
-            .engagement_diff(chat_id)
-            .and_then(Result::ok)
-            .map(|diff| diff_has_shared_line_changes(&diff))
+        let workspace_dirty = observation
+            .map(|observation| {
+                observation.changed_paths.iter().any(|path| {
+                    // Host-owned per-chat configuration survives re-home.
+                    path != gaugedesk_boundary::definition::CONFIG_PATH
+                })
+            })
             .unwrap_or(true);
         run_active || candidate_active || workspace_dirty
     }

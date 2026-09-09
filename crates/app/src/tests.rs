@@ -3780,8 +3780,65 @@ async fn file_edits_respect_draft_version_and_host_control_ownership() {
     assert_eq!(status, StatusCode::FORBIDDEN, "work package write: {body}");
 }
 
-/// The All-chats "+ new chat" quick-start: `POST /chats` with no id mints one
-/// server-side and roots on the hidden Personal default placement (a work chat).
+/// ACTION-4: a projection can block an unsafe move without importing the edit.
+#[tokio::test]
+async fn workspace_projection_observes_manual_edits_without_importing_a_cut() {
+    let (_directory, wb) = seeded_workbench();
+    let app = open_control_plane(wb.clone());
+    let (status, body) = send(&app, "POST", "/chats", Some("{}")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (path, recorded) = {
+        let guard = wb.lock_unpoisoned();
+        let engagement = guard.engagements.get(&id).unwrap();
+        let target_id = &guard.library.chat_targets[&id].target_id;
+        let root = library::target_id_path_v1(target_id).unwrap();
+        let path = engagement.path().join(format!("targets/{root}/manual.txt"));
+        let recorded = engagement.observe().unwrap().recorded_cut.unwrap();
+        (path, recorded)
+    };
+    std::fs::write(&path, "unimported human edit").unwrap();
+    for _ in 0..2 {
+        let (status, body) = send(&app, "GET", "/workspace", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let workspace: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let chat = workspace["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|chat| chat["id"] == id)
+            .unwrap();
+        assert_eq!(chat["candidate_revision"], recorded);
+        assert_eq!(chat["rehome_blocked"], true);
+        let guard = wb.lock_unpoisoned();
+        let observed = guard.engagements[&id].observe().unwrap();
+        assert_eq!(observed.recorded_cut.as_deref(), Some(recorded.as_str()));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "unimported human edit"
+    );
+    std::fs::remove_file(path).unwrap();
+    assert!(!wb.lock_unpoisoned().engagement_rehome_blocked(&id));
+    let (_, body) = send(&app, "GET", "/workspace", None).await;
+    let workspace: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let chat = workspace["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|chat| chat["id"] == id)
+        .unwrap();
+    assert_eq!(
+        chat["rehome_blocked"], false,
+        "each response observes afresh"
+    );
+    assert_eq!(chat["candidate_revision"], recorded);
+}
+
+/// The All-chats "+ new chat" quick-start mints a work chat server-side.
 #[tokio::test]
 async fn post_chats_without_id_mints_a_work_chat_on_the_default_placement() {
     let (_d, wb) = seeded_workbench();
