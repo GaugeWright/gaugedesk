@@ -64,8 +64,11 @@ def check_resolved(pin, expected_source, consumer_root=ROOT):
     # Execute the published owner's fixture driver rather than copy its wire
     # schema, normalization or vector assertions into a consumer implementation.
     # Its build output belongs to this consumer worktree, never the Cargo cache.
+    # Each publication is a distinct source tree. Cargo's relative dep-info can
+    # otherwise reuse the prior publication's path-dependency artifacts when
+    # their package versions are unchanged, even after this pin is verified.
     environment = os.environ.copy()
-    environment["CARGO_TARGET_DIR"] = str(consumer_root / "target/host-action-contract")
+    environment["CARGO_TARGET_DIR"] = str(consumer_root / "target/host-action-contract" / commit)
     subprocess.run([
         "cargo", "test", "--locked", "--manifest-path", str(runtime / "crates/whipplescript-kernel/Cargo.toml"),
         "-p", "whipplescript-kernel", "--test", "host_action_contract",

@@ -28,6 +28,7 @@ pub mod federated_envelope;
 pub mod federation;
 pub mod freshness;
 pub mod handoff;
+pub mod host_action_admission;
 pub mod ids;
 pub mod instance;
 pub mod key_release;

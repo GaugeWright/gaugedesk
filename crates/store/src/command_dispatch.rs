@@ -29,7 +29,114 @@ pub struct DispatchIntent {
     pub dispatch: CommandDispatch,
 }
 
+/// Original command and destination backed by a committed product receipt.
+/// This is delivery data, not an authentication or execution grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedDispatch<Command> {
+    pub command_id: String,
+    pub command: Command,
+    pub dispatch: CommandDispatch,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchSnapshot<Command> {
+    kind: String,
+    command: Command,
+    dispatch: CommandDispatch,
+}
+
 impl Store {
+    /// Read a delivery from one SQLite snapshot, without creating a command,
+    /// repairing status, or advancing its lifecycle. A claimed command with no
+    /// durable receipt is not deliverable. Legacy or inconsistent receipts
+    /// cannot be promoted into outbox authority by this read.
+    pub fn committed_dispatch<L: Lifecycle>(
+        &mut self,
+        scope_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<CommittedDispatch<L::Command>>, AdmitError>
+    where
+        L::Command: serde::de::DeserializeOwned,
+    {
+        if scope_id.trim().is_empty() || idempotency_key.trim().is_empty() {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "invalid product command dispatch identity",
+            }));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let receipted = tx
+            .query_row(
+                "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
+                params![scope_id, idempotency_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !receipted {
+            return Ok(None);
+        }
+        let expected_id = format!("command:{}:{scope_id}{idempotency_key}", scope_id.len());
+        let original: Option<(String, String)> = tx
+            .query_row(
+                "SELECT command_id, snapshot_json FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
+                params![scope_id, idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((command_id, snapshot_json)) = original else {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "dispatch receipt has no original command",
+            }));
+        };
+        let snapshot: DispatchSnapshot<L::Command> = serde_json::from_str(&snapshot_json)?;
+        if command_id != expected_id
+            || snapshot.kind != L::KIND
+            || snapshot.dispatch.runtime_ref.trim().is_empty()
+            || snapshot.dispatch.command_ref.trim().is_empty()
+        {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "dispatch receipt does not match its original command",
+            }));
+        }
+        let intent = DispatchIntent {
+            command_id: command_id.clone(),
+            dispatch: snapshot.dispatch.clone(),
+        };
+        let mut matches = 0;
+        {
+            let mut statement = tx.prepare(
+                "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
+            )?;
+            for row in statement.query_map(params![scope_id, DISPATCH_KIND], |row| {
+                row.get::<_, String>(0)
+            })? {
+                let recorded: DispatchIntent = serde_json::from_str(&row?)?;
+                if recorded.command_id == command_id {
+                    if recorded != intent {
+                        return Err(AdmitError::Rejected(Rejection {
+                            reason: "dispatch receipt does not match its committed intent",
+                        }));
+                    }
+                    matches += 1;
+                }
+            }
+        }
+        if matches != 1 {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "dispatch receipt has no unique committed intent",
+            }));
+        }
+        tx.commit()?;
+        Ok(Some(CommittedDispatch {
+            command_id,
+            command: snapshot.command,
+            dispatch: snapshot.dispatch,
+        }))
+    }
+
     /// Commit the original product command, lifecycle events, outbox reference
     /// and product receipt in one transaction. A dispatcher reads only committed
     /// outbox facts and retries delivery under the referenced runtime identity.
@@ -197,6 +304,205 @@ mod tests {
             runtime_ref: "home-runtime:alice".into(),
             command_ref: "admitted-command:immutable-1".into(),
         }
+    }
+
+    #[test]
+    fn delivery_read_keeps_the_original_command_without_repairing_status() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .admit_with_dispatch::<RunState>("scope", "key", RunCommand::RequestRun, &dispatch())
+            .unwrap();
+        store
+            .admit::<RunState>("scope", RunCommand::AdmitRun)
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE commands SET status = 'received'", [])
+            .unwrap();
+        let mut reopened = store.sibling().unwrap();
+        drop(store);
+        let changes = reopened.conn.total_changes();
+        let delivery = reopened
+            .committed_dispatch::<RunState>("scope", "key")
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.command, RunCommand::RequestRun);
+        assert_eq!(delivery.dispatch, dispatch());
+        assert_eq!(
+            delivery.command_id,
+            reopened
+                .command_for_key("scope", "key")
+                .unwrap()
+                .unwrap()
+                .command_id
+        );
+        assert_eq!(
+            reopened.fold::<RunState>("scope").unwrap().phase,
+            RunPhase::Admitted
+        );
+        assert_eq!(
+            reopened
+                .command_for_key("scope", "key")
+                .unwrap()
+                .unwrap()
+                .status,
+            "received"
+        );
+        assert_eq!(
+            reopened.conn.total_changes(),
+            changes,
+            "delivery reads cannot write or repair status"
+        );
+        assert!(reopened
+            .committed_dispatch::<RunState>("different-scope", "key")
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .committed_dispatch::<RunState>("scope", "different-key")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn delivery_requires_a_receipt_even_when_status_and_outbox_claim_admission() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .admit_with_dispatch::<RunState>("scope", "key", RunCommand::RequestRun, &dispatch())
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM command_receipts", [])
+            .unwrap();
+        assert_eq!(
+            store
+                .command_for_key("scope", "key")
+                .unwrap()
+                .unwrap()
+                .status,
+            "applied"
+        );
+        let changes = store.conn.total_changes();
+        assert!(store
+            .committed_dispatch::<RunState>("scope", "key")
+            .unwrap()
+            .is_none());
+        assert_eq!(store.conn.total_changes(), changes);
+    }
+
+    #[test]
+    fn delivery_refuses_missing_duplicate_or_changed_intents() {
+        for corruption in [
+            "missing",
+            "duplicate",
+            "destination",
+            "command-ref",
+            "command-id",
+        ] {
+            let mut store = Store::open_in_memory().unwrap();
+            store
+                .admit_with_dispatch::<RunState>(
+                    "scope",
+                    "key",
+                    RunCommand::RequestRun,
+                    &dispatch(),
+                )
+                .unwrap();
+            let payload = store.records("scope", DISPATCH_KIND).unwrap().remove(0);
+            let mut intent: DispatchIntent = serde_json::from_str(&payload).unwrap();
+            match corruption {
+                "missing" => {
+                    store
+                        .conn
+                        .execute("DELETE FROM events WHERE kind = ?1", [DISPATCH_KIND])
+                        .unwrap();
+                }
+                "duplicate" => {
+                    store.conn.execute("INSERT INTO events (scope_id, position, kind, payload) VALUES ('scope', 2, ?1, ?2)", params![DISPATCH_KIND, payload]).unwrap();
+                }
+                other => {
+                    match other {
+                        "destination" => intent.dispatch.runtime_ref.push_str(":other"),
+                        "command-ref" => intent.dispatch.command_ref.push_str(":other"),
+                        "command-id" => intent.command_id.push_str(":other"),
+                        _ => unreachable!(),
+                    }
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE events SET payload = ?1 WHERE kind = ?2",
+                            params![serde_json::to_string(&intent).unwrap(), DISPATCH_KIND],
+                        )
+                        .unwrap();
+                }
+            }
+            let changes = store.conn.total_changes();
+            assert!(
+                store
+                    .committed_dispatch::<RunState>("scope", "key")
+                    .is_err(),
+                "{corruption}"
+            );
+            assert_eq!(store.conn.total_changes(), changes);
+        }
+    }
+
+    #[test]
+    fn delivery_refuses_missing_or_reclassified_original_commands() {
+        for corruption in [
+            "missing",
+            "command-id",
+            "kind",
+            "empty-destination",
+            "empty-command-ref",
+        ] {
+            let mut store = Store::open_in_memory().unwrap();
+            store
+                .admit_with_dispatch::<RunState>(
+                    "scope",
+                    "key",
+                    RunCommand::RequestRun,
+                    &dispatch(),
+                )
+                .unwrap();
+            let record = store.command_for_key("scope", "key").unwrap().unwrap();
+            match corruption {
+                "missing" => {
+                    store.conn.execute("DELETE FROM commands", []).unwrap();
+                }
+                "command-id" => {
+                    store
+                        .conn
+                        .execute("UPDATE commands SET command_id = 'other'", [])
+                        .unwrap();
+                }
+                other => {
+                    let mut snapshot: serde_json::Value =
+                        serde_json::from_str(&record.snapshot_json).unwrap();
+                    match other {
+                        "kind" => snapshot["kind"] = "other-lifecycle".into(),
+                        "empty-destination" => snapshot["dispatch"]["runtime_ref"] = " ".into(),
+                        "empty-command-ref" => snapshot["dispatch"]["command_ref"] = "".into(),
+                        _ => unreachable!(),
+                    }
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE commands SET snapshot_json = ?1",
+                            [snapshot.to_string()],
+                        )
+                        .unwrap();
+                }
+            }
+            assert!(
+                store
+                    .committed_dispatch::<RunState>("scope", "key")
+                    .is_err(),
+                "{corruption}"
+            );
+        }
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(store.committed_dispatch::<RunState>(" ", "key").is_err());
+        assert!(store.committed_dispatch::<RunState>("scope", "").is_err());
     }
 
     #[test]

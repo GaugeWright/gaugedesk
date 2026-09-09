@@ -7407,7 +7407,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "whipplescript"
 version = "0.5.6"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=9a79e11ca9e90f0ec5de93169525398c8db0cbf1#9a79e11ca9e90f0ec5de93169525398c8db0cbf1"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=f8d9f14c5a6db34a2a2afd3a42d147879ac656c1#f8d9f14c5a6db34a2a2afd3a42d147879ac656c1"
 dependencies = [
  "chrono",
  "htmd",
@@ -7430,7 +7430,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-core"
 version = "0.5.6"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=9a79e11ca9e90f0ec5de93169525398c8db0cbf1#9a79e11ca9e90f0ec5de93169525398c8db0cbf1"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=f8d9f14c5a6db34a2a2afd3a42d147879ac656c1#f8d9f14c5a6db34a2a2afd3a42d147879ac656c1"
 dependencies = [
  "serde",
  "serde_json",
@@ -7439,7 +7439,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-custody"
 version = "0.5.6"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=9a79e11ca9e90f0ec5de93169525398c8db0cbf1#9a79e11ca9e90f0ec5de93169525398c8db0cbf1"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=f8d9f14c5a6db34a2a2afd3a42d147879ac656c1#f8d9f14c5a6db34a2a2afd3a42d147879ac656c1"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -7452,7 +7452,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-kernel"
 version = "0.5.6"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=9a79e11ca9e90f0ec5de93169525398c8db0cbf1#9a79e11ca9e90f0ec5de93169525398c8db0cbf1"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=f8d9f14c5a6db34a2a2afd3a42d147879ac656c1#f8d9f14c5a6db34a2a2afd3a42d147879ac656c1"
 dependencies = [
  "bashkit",
  "chrono",
@@ -7476,7 +7476,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-parser"
 version = "0.5.6"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=9a79e11ca9e90f0ec5de93169525398c8db0cbf1#9a79e11ca9e90f0ec5de93169525398c8db0cbf1"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=f8d9f14c5a6db34a2a2afd3a42d147879ac656c1#f8d9f14c5a6db34a2a2afd3a42d147879ac656c1"
 dependencies = [
  "serde_json",
  "sha2 0.11.0",
@@ -7487,7 +7487,7 @@ dependencies = [
 [[package]]
 name = "whipplescript-store"
 version = "0.5.6"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=9a79e11ca9e90f0ec5de93169525398c8db0cbf1#9a79e11ca9e90f0ec5de93169525398c8db0cbf1"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=f8d9f14c5a6db34a2a2afd3a42d147879ac656c1#f8d9f14c5a6db34a2a2afd3a42d147879ac656c1"
 dependencies = [
  "rusqlite",
  "serde",

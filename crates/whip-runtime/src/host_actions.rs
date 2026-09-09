@@ -11,3 +11,10 @@ pub const DIGEST: &str = "17575ebb1b477d939a2bfc71bb07d866ba2ac45b4230f2b36ac622
 pub use whipplescript_kernel::host_action::CompiledHostAction;
 pub use whipplescript_kernel::host_facade as facade;
 pub use whipplescript_kernel::host_protocol::{action, action_result, execution, recovery};
+pub use whipplescript_store::{log_append::LogAppend, native_stores::NativeStores, RuntimeStore};
+
+/// Product admission carries the runtime owner's complete command. The shell
+/// authenticates it before calling the product store; this alias grants no
+/// authority and does not create an agent run or turn.
+pub type ProductActionAdmission =
+    gaugedesk_core::host_action_admission::HostActionAdmission<action::HostActionCommand>;
