@@ -472,6 +472,8 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .embed-new-session:hover:not(:disabled) { border-color: var(--accent); color: var(--ink); }
 .embed-new-session:disabled { opacity: 0.55; cursor: default; }
 .embed-new-session-error { color: var(--bad); font-size: var(--fs-small); }
+.embed-session-notice { flex: 0 0 auto; margin: 0 0 8px; padding: 7px 10px; border: 1px solid var(--edge);
+    border-radius: 6px; color: var(--muted); font: 400 var(--fs-small) var(--ui); line-height: 1.4; }
 .audience-chats { flex: 0 0 auto; border-bottom: 1px solid var(--edge); }
 .audience-chats-toggle { width: 100%; padding: 6px 10px; border: 0; background: transparent;
     color: var(--muted); text-align: left; font: inherit; cursor: pointer; }

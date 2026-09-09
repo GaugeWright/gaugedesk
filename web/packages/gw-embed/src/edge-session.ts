@@ -53,8 +53,15 @@ type PendingStop = PendingAck & {
     operationId: string;
 };
 
+/** Why the client is asking for a session other than the one it holds. The
+ *  visitor's own **New session** action passes nothing; `expired` says the
+ *  session they were in is terminally gone — the deployment answered its
+ *  projection with 404/410 — so the replacement should say so rather than
+ *  arrive as an unexplained empty panel. */
+export type EmbedSessionReplacement = "expired";
+
 export interface EmbedChatControls {
-    create(): Promise<void>;
+    create(cause?: EmbedSessionReplacement): Promise<void>;
     open?(chat: string): Promise<void>;
     erase?(chat: string): Promise<void>;
 }
@@ -354,7 +361,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
             }
             this.pendingTurns.clear();
             if (this.chatControls) {
-                await this.chatControls.create().catch(() => undefined);
+                await this.chatControls.create("expired").catch(() => undefined);
             }
             return;
         }

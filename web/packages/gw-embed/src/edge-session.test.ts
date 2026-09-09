@@ -134,6 +134,8 @@ describe("EdgeSessionApi", () => {
         expect(anonymous.embedAudience).toBe(false);
         await anonymous.embedNewChat();
         expect(anonymousControls.create).toHaveBeenCalledOnce();
+        // The visitor asked for this one; nothing about it needs explaining.
+        expect(anonymousControls.create).toHaveBeenCalledWith();
         await expect(anonymous.embedOpenChat(
             "sess_11111111111111111111111111111111",
         )).rejects.toThrow(
@@ -963,6 +965,9 @@ describe("EdgeSessionApi", () => {
             sockets[0]!.close();
             await vi.advanceTimersByTimeAsync(100);
             await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+            // The replacement is asked for as an expiry, so the panel can tell
+            // the visitor why their conversation is gone.
+            expect(create).toHaveBeenCalledWith("expired");
 
             expect(fetchMock).toHaveBeenCalledOnce();
             expect(new URL(String(fetchMock.mock.calls[0]![0])).pathname).toBe(

@@ -85,6 +85,11 @@ export interface ChatPanelProps {
     readonly openingMessage?: string;
     /** Human-readable assistant name used in transcript labels and the composer. */
     readonly agentName?: string;
+    /** A host-supplied line about how this session came to be — an embed
+     *  replacing a session whose lease expired says so here. Shown only while
+     *  the transcript is empty: once the visitor has spoken, the new
+     *  conversation is its own explanation. */
+    readonly notice?: string;
     /** Desktop already owns the panel container; preserve direct flex children. */
     readonly bare?: boolean;
     /** Fork at the head, carrying the draft — the *composer's* fork. Distinct
@@ -278,6 +283,11 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                 <div class="embed-chat-toolbar" data-embed-chat-toolbar>
                     <AudienceChats session={session()} />
                     <NewSessionButton session={session()} />
+                </div>
+            </Show>
+            <Show when={props.notice && session().transcript().lines.length === 0}>
+                <div class="embed-session-notice" role="status" data-embed-session-notice>
+                    {props.notice}
                 </div>
             </Show>
             <div

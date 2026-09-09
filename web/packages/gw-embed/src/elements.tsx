@@ -20,7 +20,7 @@
 import { createResource, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { type ControlPlane, type EngagementId } from "@gaugewright/control-plane-client";
-import { EdgeSessionApi } from "./edge-session";
+import { EdgeSessionApi, type EmbedSessionReplacement } from "./edge-session";
 import {
     LATENCY_EVENT,
     observeBrowserLatency,
@@ -245,6 +245,13 @@ interface TurnstileRequired {
     turnstile_action?: unknown;
 }
 
+/** Said in the empty panel when the session a visitor was in has ended and a
+ *  fresh one replaced it. Institutional register, complete sentences, no blame:
+ *  the lease ran out, nothing broke, and the record of their conversation was
+ *  not lost — it was collected (or retained) under the deployment's policy. */
+const SESSION_EXPIRED_NOTICE =
+    "Your earlier conversation ended after a period of inactivity. This is a new session.";
+
 /** `<gw-session cp="…" engagement="…">`: builds + owns the scoped remote Session. */
 export class GwSessionElement extends HTMLElement {
     static get observedAttributes(): string[] {
@@ -253,6 +260,9 @@ export class GwSessionElement extends HTMLElement {
 
     /** The Session its panel children render against (also settable directly). */
     session?: Session;
+    /** Why the current Session is not the one this browser was in, when that
+     *  is worth telling the visitor; the chat panel shows it while empty. */
+    notice?: string;
     /** The first-class producer that binds identity, placement transport, and
      * the panel manifest (ADR 0076). */
     environment?: Environment;
@@ -472,9 +482,14 @@ export class GwSessionElement extends HTMLElement {
                     ),
                 });
             let res = await activate(resumeCapability);
+            this.notice = undefined;
             if (res.status === 410) {
+                // The session this browser was resuming has ended — its lease
+                // ran out while the tab was closed. The visitor is about to
+                // see an empty panel where their conversation was, so say why.
                 localStorage.removeItem(resumeStorageKey);
                 resumeCapability = null;
+                this.notice = SESSION_EXPIRED_NOTICE;
                 res = await activate(null);
             }
             res = await this.satisfyTurnstile(res, (token) =>
@@ -551,7 +566,7 @@ export class GwSessionElement extends HTMLElement {
             payload.white_label === true,
             this._latencyObserver,
             {
-                create: () => this.activateSession({ new_session: true }),
+                create: (cause) => this.activateSession({ new_session: true }, cause),
                 ...(audienceAssertion
                     ? {
                           open: (chat: string) =>
@@ -578,7 +593,9 @@ export class GwSessionElement extends HTMLElement {
 
     private async activateSession(
         selection: { requested_session_id: string } | { new_session: true },
+        cause?: EmbedSessionReplacement,
     ): Promise<void> {
+        this.notice = cause === "expired" ? SESSION_EXPIRED_NOTICE : undefined;
         const base = this._base;
         const audienceAssertion = this._audienceAssertion;
         if (!base) throw new Error("hosted session is unavailable");
@@ -718,6 +735,12 @@ abstract class GwPanelElement extends HTMLElement {
     /** The Solid view this element renders against the resolved Session. */
     protected abstract view(session: Session): JSX.Element;
 
+    /** What the owning `<gw-session>` wants said about how this session came
+     *  to be — set when it replaced an expired one, otherwise nothing. */
+    protected sessionNotice(): string | undefined {
+        return this.session ? undefined : this.closest<GwSessionElement>("gw-session")?.notice;
+    }
+
     connectedCallback() {
         this.bind();
     }
@@ -793,6 +816,7 @@ export class GwChatElement extends GwPanelElement {
                 audience
                 openingMessage={this.getAttribute("opening-message") ?? undefined}
                 agentName={this.getAttribute("agent-name") ?? undefined}
+                notice={this.sessionNotice()}
                 transcriptTail={<Deliverables session={session} />}
             />
         );
