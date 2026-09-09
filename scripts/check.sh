@@ -151,6 +151,15 @@ run_contracts() {
     # been found, rather than by a release and an advisory finding them.
     # Rendered from tools/shared-checks/build-coverage.mjs in the GaugeWright
     # repository, which owns it and tests it. A local edit fails here.
+    # Both halves of the advisory question: that npm's error document is not
+    # read as a report, and that an unreachable RustSec degrades to an
+    # unrefreshed database rather than to a pass. Each decides whether a
+    # non-zero audit fails this run, so the one way either could hide a real
+    # vulnerability is by being wrong in the safe-looking direction.
+    echo "== advisory outcome classification =="
+    node --test scripts/npm-audit-outcome.test.mjs
+    bash scripts/advisory-database.test.sh
+
     echo "== build coverage =="
     node scripts/check-build-coverage.mjs
 
@@ -308,15 +317,72 @@ run_web() {
 # between naming and discovery is free to be what suits each.
 # `.cargo/audit.toml` carries the triage record for anything formally
 # risk-accepted.
+advisories_unavailable=0
+
+audit_npm_tree() {
+    local dir="$1" output attempt
+
+    for attempt in 1 2 3; do
+        if output="$(npm --prefix "$dir" audit --omit=dev --json 2>&1)"; then
+            echo "$dir: no production advisories"
+            return 0
+        fi
+
+        if printf '%s' "$output" | node scripts/npm-audit-outcome.mjs; then
+            # Re-run for the human-readable report: the operator needs the
+            # advisory, not the JSON this classification read.
+            npm --prefix "$dir" audit --omit=dev || true
+            echo "production advisories found in $dir" >&2
+            return 1
+        fi
+
+        if [ "$attempt" -lt 3 ]; then
+            sleep "$((attempt * 5))"
+        fi
+    done
+
+    advisories_unavailable=$((advisories_unavailable + 1))
+    echo "!! ADVISORIES NOT AUDITED for $dir: npm answered no report in 3 attempts." >&2
+    echo "!! This says nothing about $dir — the next run audits it again." >&2
+    printf '%s\n' "$output" | tail -3 >&2
+    return 0
+}
+
 run_dependencies() {
     echo "== production dependency advisories =="
     command -v cargo-audit >/dev/null || {
         echo "cargo-audit is not installed; run: cargo install cargo-audit" >&2
         exit 1
     }
-    cargo audit --file Cargo.lock
-    cargo audit --file src-tauri/Cargo.lock
-    cargo audit --file src-tauri-mobile/Cargo.lock
+    # RustSec's advisory database is a third party, and the subject of this gate
+    # is the lockfiles this repository tracks. Those are different things, and a
+    # failure of the second used to be reported as a failure of the first — the
+    # same shape as the npm outage handled below, which failed a green bar four
+    # runs running over a tree nobody had touched.
+    #
+    # The cargo half recovers better, because the database is a git checkout
+    # that persists: an unreachable RustSec means "audited against the copy on
+    # disk", not "not audited". `resolve_advisory_database` separates reaching
+    # it from auditing against it, and its own tests run in the contracts
+    # section.
+    # shellcheck source=scripts/advisory-database.sh
+    source scripts/advisory-database.sh
+    resolve_advisory_database
+
+    if [ "$ADVISORY_DB_MISSING" -eq 0 ]; then
+        # Before trusting a clean audit, check that these flags can still report
+        # a dirty one.
+        assert_findings_still_fail
+
+        # Unquoted on purpose: ADVISORY_DB_FLAGS is a flag list this repository
+        # sets from a fixed set of literals, never from input.
+        # shellcheck disable=SC2086
+        cargo audit $ADVISORY_DB_FLAGS --file Cargo.lock
+        # shellcheck disable=SC2086
+        cargo audit $ADVISORY_DB_FLAGS --file src-tauri/Cargo.lock
+        # shellcheck disable=SC2086
+        cargo audit $ADVISORY_DB_FLAGS --file src-tauri-mobile/Cargo.lock
+    fi
 
     # cargo-deny adds the license, bans, and source policy that cargo audit does
     # not cover (deny.toml at the repo root, SOC 2 remediation 4.1). It operates
@@ -336,8 +402,19 @@ run_dependencies() {
 
     # Production only. The dev trees are vite, wrangler, and playwright, none of
     # which reach a user.
+    #
+    # npm's advisory service is a third party too, and the same split applies: a
+    # finding is a fact about this repository and hard-fails; an unreachable
+    # endpoint is a fact about npm, and is retried, reported in a line nobody can
+    # miss, and survived. On 2026-09-04 the bulk advisories endpoint spent an
+    # hour answering `Service Unavailable`, which read here as a broken tree.
+    #
+    # `scripts/npm-audit-outcome.mjs` decides which of the two a non-zero exit
+    # was. It is a separate file with its own tests because misreading a finding
+    # as an outage is the one way this could hide a known-vulnerable dependency
+    # behind a warning nobody has to clear.
     while IFS= read -r lock; do
-        npm --prefix "${lock%/package-lock.json}" audit --omit=dev
+        audit_npm_tree "${lock%/package-lock.json}"
     done < <(find . -name package-lock.json -not -path '*/node_modules/*' -print)
 }
 
@@ -587,4 +664,21 @@ node scripts/check-live-fabric.mjs
 
 dispatch "$section" "${2:-}"
 
-echo "== gaugedesk green bar PASSED ($section) =="
+# The bar says what it actually established. A run that could not reach an
+# advisory service passed everything it could assert and must not read as though
+# it had asserted that too.
+unasserted=""
+if [ "$advisories_unavailable" -gt 0 ]; then
+    unasserted="npm advisories unaudited for $advisories_unavailable tree(s)"
+fi
+if [ "${ADVISORY_DB_MISSING:-0}" -gt 0 ]; then
+    unasserted="${unasserted:+$unasserted; }cargo advisories unaudited"
+elif [ "${ADVISORY_DB_STALE:-0}" -gt 0 ]; then
+    unasserted="${unasserted:+$unasserted; }cargo advisories from an unrefreshed database"
+fi
+
+if [ -n "$unasserted" ]; then
+    echo "== gaugedesk green bar PASSED ($section — $unasserted) =="
+else
+    echo "== gaugedesk green bar PASSED ($section) =="
+fi

@@ -427,11 +427,14 @@ fn migrate_project_workspaces_and_target_sets(
             {
                 continue;
             }
-            if existing.host_contract_revision
-                != crate::workstream_host_contract::MIGRATABLE_PREVIOUS_REVISION
-                || existing.host_contract_digest
-                    != crate::workstream_host_contract::MIGRATABLE_PREVIOUS_DIGEST
-            {
+            // Any pin this build knows how to bring forward, not only the one
+            // it immediately superseded: a state root that skipped a release is
+            // ordinary, and refusing it strands live data behind every later
+            // build (`workstream_host_contract::MIGRATABLE_SUPERSEDED_PINS`).
+            if !crate::workstream_host_contract::is_migratable_pin(
+                &existing.host_contract_revision,
+                &existing.host_contract_digest,
+            ) {
                 return Err(invalid_data(format!(
                     "project {} collaboration workspace has unsupported WhippleScript contract pin {} / {}; upgrade through a supported GaugeDesk release or repair/reset this pre-release state root",
                     project.id,
@@ -949,8 +952,19 @@ mod target_set_migration_tests {
     use whipplescript_store::vcs::NativeWorkspaceVcs;
     use whipplescript_store::workstreams::{ReleaseBoundaryOutcome, WorkstreamStore, Workstreams};
 
+    /// Every pin the contract module says it can bring forward must actually
+    /// migrate — not only the one this build immediately superseded. A state
+    /// root that skipped a release is the case that took the production Hub
+    /// down on 2026-09-09, and it is only a loop away from the case that
+    /// always worked.
     #[test]
-    fn persisted_v102_workspace_pin_migrates_once_and_unknown_pins_write_nothing() {
+    fn every_superseded_workspace_pin_migrates_once_and_unknown_pins_write_nothing() {
+        for (revision, digest) in crate::workstream_host_contract::MIGRATABLE_SUPERSEDED_PINS {
+            migrates_once_from(revision, digest);
+        }
+    }
+
+    fn migrates_once_from(superseded_revision: &str, superseded_digest: &str) {
         let mut store = Store::open_in_memory().unwrap();
         let project = ProjectRecord {
             id: "project-contract".to_owned(),
@@ -969,10 +983,8 @@ mod target_set_migration_tests {
             workspace_id: "workspace-contract".to_owned(),
             home_id: project.home_id.clone(),
             substrate: "whipplescript".to_owned(),
-            host_contract_revision: crate::workstream_host_contract::MIGRATABLE_PREVIOUS_REVISION
-                .to_owned(),
-            host_contract_digest: crate::workstream_host_contract::MIGRATABLE_PREVIOUS_DIGEST
-                .to_owned(),
+            host_contract_revision: superseded_revision.to_owned(),
+            host_contract_digest: superseded_digest.to_owned(),
             op: RecordOp::Upsert,
             schema: LIBRARY_RECORD_SCHEMA,
             extra: [("preserved".to_owned(), serde_json::Value::Bool(true))]
