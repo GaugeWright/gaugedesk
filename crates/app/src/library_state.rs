@@ -6913,12 +6913,18 @@ impl Workbench {
     /// issue (content) with its admitted assignment. Every tracker task carries
     /// its boundary because an item id is only meaningful inside that tracker;
     /// the client must send both back when it assigns the item.
+    ///
+    /// **Nobody is assigned work by asking who is assigned.** Every assignee
+    /// here is derived from a durable fact — a tracker issue's admitted
+    /// `assigned_to`, or a chat's own addressee — never from the authority that
+    /// happens to be requesting the projection (ADR 0165 §2). The distinction is
+    /// invisible while one person is the only authority, and it is the whole of
+    /// the difference once they are not: a projection that fills a missing
+    /// assignee with its reader reports different work to each reader and calls
+    /// it assignment. Unassigned stays unassigned — a real state meaning
+    /// "whoever has access" (`GATE-3f`), answered by the workspace backlog
+    /// rather than by this bar.
     pub(crate) fn task_queue_value(&self) -> serde_json::Value {
-        // The acting authority remains the default assignee for chat-derived
-        // tasks below. Tracker issues instead project their durable assignment;
-        // unassigned is a meaningful "whoever has access" state (GATE-3f).
-        let assignee = self.authority.as_str();
-
         // Chats with an unanswered agent question (ADR 0113). The question is a
         // GaugeDesk record in the chat's own scope, so this is read per chat
         // below rather than from one tracker query.
@@ -6990,6 +6996,7 @@ impl Workbench {
             else {
                 continue;
             };
+            let assignee = self.default_addressee(&chat);
             tasks.push(serde_json::json!({
                 "id": chat,
                 "title": project.name,
@@ -7067,6 +7074,20 @@ impl Workbench {
                 continue;
             };
             let ask = raised_signal.ask();
+            // Who should act, read off the chat rather than off the reader. An
+            // `answer` belongs to the question's own recipient (ADR 0113 §2); the
+            // rest belong to the chat's addressee. `default_addressee` is the seam
+            // that already exists for this: it collapses to the acting authority
+            // while a chat carries no distinct owner, and reads the owner once one
+            // does, without changing this call site.
+            let assignee = if raised_signal == crate::attention::Signal::Question {
+                crate::agent_question::open_questions(&self.store, &chat.id)
+                    .ok()
+                    .and_then(|open| open.into_iter().next().map(|q| q.recipient))
+                    .unwrap_or_else(|| self.default_addressee(&chat.id))
+            } else {
+                self.default_addressee(&chat.id)
+            };
             // ADR 0113 §3: the agent declared it cannot usefully proceed. This drives a
             // stronger presentation and suppresses *automatic* continuation — it is
             // never a lock on the person's own chat, who may always type.

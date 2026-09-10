@@ -5962,6 +5962,41 @@ async fn task_queue_types_asks_repair_and_answer() {
         !body.contains(r#""kind":"repair""#),
         "answer outranks repair for the same chat: {body}"
     );
+
+    // ADR 0165 §2: the `answer` task is addressed to the question's own
+    // recipient (ADR 0113 §2), read off the stored question rather than filled
+    // in with whoever asked for the projection. This pins the join: drop the
+    // field, or go back to naming the acting authority, and the assignee stops
+    // matching the record it is supposed to come from.
+    //
+    // It cannot yet distinguish the two by *value* — the single-authority
+    // collapse makes the chat's addressee and the acting authority the same
+    // string, and a roster with a second person is what WHIP-4 brings. So this
+    // asserts what is assertable today and no more.
+    let recipient = {
+        let guard = wb2.lock_unpoisoned();
+        crate::agent_question::open_questions(guard.store_ref(), "ra")
+            .expect("the question is readable")
+            .into_iter()
+            .next()
+            .expect("it is open")
+            .recipient
+    };
+    let projected = wb2.lock_unpoisoned().task_queue_value();
+    let answer = projected["tasks"]
+        .as_array()
+        .expect("tasks is an array")
+        .iter()
+        .find(|task| task["kind"] == "answer")
+        .expect("the answer task is queued");
+    assert_eq!(
+        answer["assignee"], recipient,
+        "the answer task carries the question's recipient: {answer}"
+    );
+    assert!(
+        !recipient.is_empty(),
+        "a recipient that defaulted to nothing would make the assertion vacuous",
+    );
 }
 
 /// ATTN-2 (ADR 0082 §3): the operator's attention rules re-shape the queue —
