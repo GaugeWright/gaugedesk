@@ -837,7 +837,8 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 /* The active mode body grows to fill and scrolls within. View/Diff benefit too. */
 .viewer > .filebody, .viewer > .editor { flex: 1; min-height: 0; }
 .viewer > .filebody { overflow: auto; }
-.viewer > .filemedia, .viewer > .pdfview, .viewer > .officeview { flex: 1; min-height: 0; }
+.viewer > .filemedia, .viewer > .pdfview, .viewer > .officeview,
+.viewer > .deckview { flex: 1; min-height: 0; }
 
 /* A file the View tab paints rather than reads: a picture, or a card naming a
    format it cannot show. Both centre in the pane; the picture is contained
@@ -861,6 +862,30 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .officeview { display: flex; flex-direction: column; }
 .officeview > .status { flex: 0 0 auto; }
 .officeview-host { flex: 1; min-height: 0; min-width: 0; }
+
+/* A deck: back/next over one slide at a time, and a present mode that fills
+   the screen. The slide keeps its own ground in either theme — the deck decides
+   its colours, as paper does above. */
+.deckview { display: flex; flex-direction: column; outline: none; }
+.deckview-bar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+    padding: 4px 10px; border-bottom: 1px solid var(--edge); }
+.deckview-bar button { font-size: var(--fs-small); padding: 2px 8px; line-height: 1.2; }
+.deckview-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.deckview-slide { flex: 1; min-height: 0; min-width: 0; overflow: auto;
+    display: flex; align-items: center; justify-content: center; padding: 16px; }
+
+/* Presenting: the panel IS the fullscreen element, so it paints the whole
+   screen. The bar thins to what a presenter needs and stays out of the way. */
+.deckview.presenting { background: #000; padding: 0; }
+.deckview.presenting .deckview-slide { padding: 0; }
+.deckview.presenting .deckview-bar { opacity: 0.25; border-bottom: none;
+    transition: opacity 120ms ease; }
+.deckview.presenting .deckview-bar:hover,
+.deckview.presenting:focus-within .deckview-bar:focus-within { opacity: 1; }
+.deckview-hint { position: absolute; bottom: 16px; left: 50%;
+    transform: translateX(-50%); font-size: var(--fs-small);
+    color: var(--muted); opacity: 0.6; pointer-events: none; }
+.deckview.presenting { position: relative; }
 
 /* A PDF: a page count and zoom over a scroller of rendered pages. The pages
    themselves are paper — they carry their own white ground in either theme,

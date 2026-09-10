@@ -23,13 +23,17 @@
  * resource limits rather than trusted to be reasonable.
  */
 
-import { createEffect, createSignal, onCleanup, Show } from "solid-js";
+import { createEffect, createSignal, lazy, onCleanup, Show, Suspense } from "solid-js";
 import {
     MAX_DOCUMENT_UNCOMPRESSED_BYTES,
     MAX_DOCUMENT_ZIP_ENTRIES,
     MAX_DOCUMENT_INPUT_BYTES,
 } from "./attachments";
 import type { OfficeFormat } from "./file-kind";
+
+// A deck pages rather than scrolls, so it brings its own shell — back/next, the
+// position, and a present mode. Lazy like everything else on this path.
+const DeckView = lazy(() => import("./DeckView").then((m) => ({ default: m.DeckView })));
 
 /** What a hostile OOXML archive is allowed to cost. These are the bounds the
  *  composer's attachment parser already applies to a picked document
@@ -50,25 +54,24 @@ interface MountedViewer {
     destroy(): void;
 }
 
+/** Engine options shared by every format: the archive bounds and the worker. */
+const ENGINE_OPTIONS = {
+    resourceLimits: RESOURCE_LIMITS,
+    workerTimeoutMs: WORKER_TIMEOUT_MS,
+    mode: "worker" as const,
+};
+
 async function mountViewer(
-    format: OfficeFormat,
+    format: Exclude<OfficeFormat, "pptx">,
     container: HTMLElement,
 ): Promise<MountedViewer> {
     // Imported per format so a spreadsheet never pays for the Word parser: each
     // format's wasm is its own ~1.7 MB chunk, fetched the first time one opens.
-    const options = {
-        resourceLimits: RESOURCE_LIMITS,
-        workerTimeoutMs: WORKER_TIMEOUT_MS,
-        mode: "worker" as const,
-    };
+    const options = ENGINE_OPTIONS;
     switch (format) {
         case "docx": {
             const { DocxScrollViewer } = await import("@silurus/ooxml/docx");
             return new DocxScrollViewer(container, options) as unknown as MountedViewer;
-        }
-        case "pptx": {
-            const { PptxScrollViewer } = await import("@silurus/ooxml/pptx");
-            return new PptxScrollViewer(container, options) as unknown as MountedViewer;
         }
         case "xlsx": {
             const { XlsxViewer } = await import("@silurus/ooxml/xlsx");
@@ -89,6 +92,7 @@ export function OfficeView(props: {
     createEffect(() => {
         const format = props.format;
         const bytes = props.bytes;
+        if (format === "pptx") return; // the deck mounts its own viewer
         let viewer: MountedViewer | undefined;
         let dropped = false;
         setFailed(null);
@@ -115,15 +119,29 @@ export function OfficeView(props: {
     });
 
     return (
-        <div class="officeview" data-file-view data-file-media={props.format}>
-            <Show when={failed()}>
-                <div class="status" data-office-error>{failed()}</div>
-            </Show>
-            <Show when={!failed() && !ready()}>
-                <div class="status">opening the document…</div>
-            </Show>
-            <div class="officeview-host" ref={host} />
-        </div>
+        <Show
+            when={props.format !== "pptx" || failed()}
+            fallback={
+                <Suspense fallback={<div class="status">opening the deck…</div>}>
+                    <DeckView
+                        bytes={props.bytes}
+                        path={props.path}
+                        options={ENGINE_OPTIONS}
+                        onFailure={(error) => setFailed(messageFor(error))}
+                    />
+                </Suspense>
+            }
+        >
+            <div class="officeview" data-file-view data-file-media={props.format}>
+                <Show when={failed()}>
+                    <div class="status" data-office-error>{failed()}</div>
+                </Show>
+                <Show when={!failed() && !ready()}>
+                    <div class="status">opening the document…</div>
+                </Show>
+                <div class="officeview-host" ref={host} />
+            </div>
+        </Show>
     );
 }
 
