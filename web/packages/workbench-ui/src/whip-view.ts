@@ -35,6 +35,12 @@ export interface WhipRun {
     readonly completedAt: string | null;
 }
 
+/** The `case` arm an effect sits in: what was matched on, and against what. */
+export interface WhipCaseArm {
+    readonly scrutinee: string;
+    readonly pattern: string;
+}
+
 /** One static effect of a rule, in one firing. */
 export interface WhipEffectSlot {
     /** The snapshot's node name (`turn`, `effect4`). Machinery: an effect id is
@@ -48,6 +54,11 @@ export interface WhipEffectSlot {
     readonly verb: string;
     /** The author's own name for this effect, or `null` when they gave none. */
     readonly label: string | null;
+    /** The `case` arm this effect sits in, or `null` for one outside any `case`.
+     *  The arms of a `case` all hang off ONE edge with one predicate, so this is
+     *  the only thing that tells them apart — and the only thing that says what
+     *  decided against an arm nothing requested. */
+    readonly case: WhipCaseArm | null;
     readonly binding: string | null;
     /** `"<binding>:<predicate>"` when the effect sits in an `after` arm. */
     readonly arm: string | null;
@@ -87,6 +98,7 @@ export interface WhipStructureRule {
         readonly kind: string;
         readonly verb: string;
         readonly label: string | null;
+        readonly case: WhipCaseArm | null;
         /** The binding as the snapshot wrote it, synthetic prefix included. The
          *  graph resolves every edge through it, which is why it is not the
          *  `label`. */
@@ -134,6 +146,14 @@ const arr = (v: unknown): readonly V0[] => (Array.isArray(v) ? (v as V0[]) : [])
 const strs = (v: unknown): readonly string[] =>
     Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 
+/** A `case` arm as v0 carries it, or `null` for an effect outside any `case`.
+ *  Both halves are required: half an arm identifies nothing. */
+function caseArmFromV0(value: unknown): WhipCaseArm | null {
+    const arm = (value ?? {}) as V0;
+    if (typeof arm.scrutinee !== "string" || typeof arm.pattern !== "string") return null;
+    return { scrutinee: arm.scrutinee, pattern: arm.pattern };
+}
+
 /** The `structure` member of a v0 view — or the bare structure a program has
  *  before any instance, which the runtime serialises in the same shape. */
 export function structureFromV0(value: unknown): WhipStructure {
@@ -161,6 +181,7 @@ export function structureFromV0(value: unknown): WhipStructure {
                 // behind, rather than quietly inventing a word.
                 verb: str(effect.verb, str(effect.kind)),
                 label: typeof effect.label === "string" ? effect.label : null,
+                case: caseArmFromV0(effect.case),
                 binding: typeof effect.binding === "string" ? effect.binding : null,
                 arm: arms.get(str(effect.node)) ?? null,
             })),
@@ -184,6 +205,7 @@ function slotFromV0(v: V0): WhipEffectSlot {
         kind: str(v.kind),
         verb: str(v.verb, str(v.kind)),
         label: typeof v.label === "string" ? v.label : null,
+        case: caseArmFromV0(v.case),
         binding: typeof v.binding === "string" ? v.binding : null,
         arm: typeof v.arm === "string" ? v.arm : null,
     };
@@ -295,6 +317,7 @@ export interface NamedEffect {
     readonly kind: string;
     readonly verb: string;
     readonly label: string | null;
+    readonly case?: WhipCaseArm | null;
 }
 
 /** The kind's family — `tracker` of `tracker.release`.
@@ -320,11 +343,18 @@ export function nodeTitle(effect: NamedEffect): string {
     return effect.verb || effect.node;
 }
 
-/** The line under it: the author's own name where they gave one, the kind's
- *  family where they did not. Two `release` nodes in one rule are then told
- *  apart by position, which is what a graph is for. */
+/**
+ * The line under it: the most specific thing known about this node.
+ *
+ * The author's own name first. Then the `case` arm that selected it, which is
+ * the common shape — the arms of a `case` are usually unbound `release` and
+ * `finish` calls, and three of those hanging off one edge were interchangeable
+ * until the arm told them apart. Then the kind's family, which is what is left
+ * when nothing more specific is known and is still worth saying, because `renew`
+ * alone is ambiguous between a tracker's and a lease's.
+ */
 export function nodeSubtitle(effect: NamedEffect): string {
-    return effect.label ?? kindFamily(effect.kind);
+    return effect.label ?? effect.case?.pattern ?? kindFamily(effect.kind);
 }
 
 /**
@@ -346,6 +376,11 @@ export function effectHandle(effect: {
 /** The machinery a figure leaves out, for the tooltip that carries it. */
 export function nodeProvenance(effect: NamedEffect): string {
     return `${effect.node} — ${effect.kind}`;
+}
+
+/** How a `case` arm reads in a sentence: `case decision.verdict is "revise"`. */
+export function caseArmLabel(arm: WhipCaseArm): string {
+    return `case ${arm.scrutinee} is ${arm.pattern}`;
 }
 
 /** How many characters a rule box's header line carries before it is elided.

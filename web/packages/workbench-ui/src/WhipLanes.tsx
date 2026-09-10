@@ -16,7 +16,7 @@
 
 import { For, Show, type JSX } from "solid-js";
 import { laneColumns, laneLabel } from "./whip-lanes";
-import { effectHandle, slotLabel, type WhipFiring } from "./whip-view";
+import { caseArmLabel, effectHandle, slotLabel, type WhipFiring } from "./whip-view";
 import { toneFor } from "./WhipDag";
 
 export function WhipLanes(props: { readonly firings: readonly WhipFiring[] }): JSX.Element {
@@ -48,7 +48,11 @@ export function WhipLanes(props: { readonly firings: readonly WhipFiring[] }): J
                                     class="whip-lane-col"
                                     role="columnheader"
                                     data-node={column.node}
-                                    title={`${column.node} — ${column.kind}`}
+                                    title={
+                                        column.case
+                                            ? `${column.node} — ${column.kind} — ${caseArmLabel(column.case)}`
+                                            : `${column.node} — ${column.kind}`
+                                    }
                                 >
                                     {effectHandle(column)}
                                 </span>

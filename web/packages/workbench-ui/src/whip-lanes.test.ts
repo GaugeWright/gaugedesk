@@ -7,6 +7,7 @@ const slot = (node: string, arm: string | null, extra: Record<string, unknown> =
     kind: `kind.${node}`,
     verb: "act",
     label: node,
+    case: null,
     binding: node,
     arm,
     ...extra,
@@ -237,5 +238,22 @@ describe("a group whose structure is not recoverable", () => {
             { ...firing("implement", "a", "ver_1"), structureAvailable: false } as WhipFiring,
         ]);
         expect(columns.map((column) => column.node)).toEqual(["a"]);
+    });
+});
+
+describe("a case arm in the lane grid", () => {
+    it("names the arm on the column, because an alternative reads as stuck without it", () => {
+        const columns = laneColumns([
+            firing("implement", "a", "ver_1", [
+                slot("log_entry", null),
+                slot("effect8", "log_entry:succeeds", {
+                    label: null,
+                    case: { scrutinee: "decision.verdict", pattern: '"revise"' },
+                }),
+            ]),
+        ]);
+        const armed = columns.find((column) => column.node === "effect8");
+        expect(armed!.case).toEqual({ scrutinee: "decision.verdict", pattern: '"revise"' });
+        expect(columns.find((column) => column.node === "log_entry")!.case).toBeNull();
     });
 });

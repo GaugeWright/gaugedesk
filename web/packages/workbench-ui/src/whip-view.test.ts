@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+    caseArmLabel,
     effectHandle,
     firingSummary,
     headerLines,
@@ -51,9 +52,9 @@ describe("slotLabel", () => {
     it("never spells absence as a status", () => {
         // The point of the view: an effect with no runtime row must not read as
         // one more state beside `queued`. There is no row — that IS the finding.
-        expect(slotLabel({ node: "closed", kind: "tracker.finish", verb: "finish", label: null, binding: null, arm: null, absent: true }))
+        expect(slotLabel({ node: "closed", kind: "tracker.finish", verb: "finish", label: null, case: null, binding: null, arm: null, absent: true }))
             .toBe("not requested");
-        expect(slotLabel({ node: "hold", kind: "tracker.claim", verb: "claim", label: "hold", binding: "hold", arm: null, status: "running" }))
+        expect(slotLabel({ node: "hold", kind: "tracker.claim", verb: "claim", label: "hold", case: null, binding: "hold", arm: null, status: "running" }))
             .toBe("running");
     });
 });
@@ -66,8 +67,8 @@ describe("firingSummary", () => {
         programVersionId: "ver_1",
         structureAvailable: true,
         effects: [
-            { node: "hold", kind: "tracker.claim", verb: "claim", label: "hold", binding: "hold", arm: null, status: "running" },
-            { node: "closed", kind: "tracker.finish", verb: "finish", label: null, binding: null, arm: "hold:succeeds", absent: true },
+            { node: "hold", kind: "tracker.claim", verb: "claim", label: "hold", case: null, binding: "hold", arm: null, status: "running" },
+            { node: "closed", kind: "tracker.finish", verb: "finish", label: null, case: null, binding: null, arm: "hold:succeeds", absent: true },
         ],
     };
 
@@ -173,6 +174,23 @@ describe("naming an effect", () => {
         expect(nodeTitle(then)).toBe("tell");
         expect(nodeSubtitle(then)).toBe("plan");
         expect(nodeTitle(unbound)).toBe("release");
+    });
+
+    it("prefers the case arm to the kind's family, and a name to both", () => {
+        // The common shape: a `case` arm holds unbound `release` and `finish`
+        // calls, so three of them hung off one edge reading `tracker` were
+        // interchangeable. The arm is the most specific thing known about them.
+        const armed = {
+            node: "effect9",
+            kind: "tracker.release",
+            verb: "release",
+            label: null,
+            case: { scrutinee: "decision.verdict", pattern: '"blocked"' },
+        };
+        expect(nodeTitle(armed)).toBe("release");
+        expect(nodeSubtitle(armed)).toBe('"blocked"');
+        // A name the author gave still wins: it is more specific than the arm.
+        expect(nodeSubtitle({ ...armed, label: "closed" })).toBe("closed");
     });
 
     it("falls back to the kind's family when the author named nothing", () => {
@@ -325,5 +343,52 @@ describe("reading the author's words out of v0", () => {
         expect(effect.verb).toBe("tracker.release");
         expect(effect.label).toBeNull();
         expect(structure.rules[0]!.records).toEqual([]);
+    });
+});
+
+describe("reading a case arm", () => {
+    it("carries both halves, or neither", () => {
+        const structure = structureFromV0({
+            available: true,
+            rules: [
+                {
+                    name: "implement",
+                    whens: [],
+                    effects: [
+                        {
+                            node: "effect8",
+                            kind: "tracker.release",
+                            verb: "release",
+                            label: null,
+                            binding: "-",
+                            case: { scrutinee: "decision.verdict", pattern: '"revise"' },
+                        },
+                        { node: "turn", kind: "agent.tell", verb: "tell", label: "turn", binding: "turn" },
+                        // Half an arm identifies nothing, so it is not an arm.
+                        {
+                            node: "half",
+                            kind: "tracker.release",
+                            verb: "release",
+                            label: null,
+                            binding: "-",
+                            case: { scrutinee: "decision.verdict" },
+                        },
+                    ],
+                    dependencies: [],
+                    records: [],
+                },
+            ],
+            rule_edges: [],
+        });
+        const [armed, plain, half] = structure.rules[0]!.effects;
+        expect(armed!.case).toEqual({ scrutinee: "decision.verdict", pattern: '"revise"' });
+        expect(plain!.case).toBeNull();
+        expect(half!.case).toBeNull();
+    });
+
+    it("reads as a sentence for the tooltip that carries it", () => {
+        expect(caseArmLabel({ scrutinee: "decision.verdict", pattern: '"revise"' })).toBe(
+            'case decision.verdict is "revise"',
+        );
     });
 });

@@ -608,6 +608,9 @@ fn a_legacy_gate_without_program_evidence_keeps_its_question_and_refuses_rescree
                 &[],
                 &serde_json::Value::Null,
                 None,
+                // `assigned_to`, since whipplescript DR-0110. Unassigned, which
+                // is what this fixture has always modelled.
+                None,
             )
             .unwrap();
         let mut kernel = RuntimeKernel::new(stores);

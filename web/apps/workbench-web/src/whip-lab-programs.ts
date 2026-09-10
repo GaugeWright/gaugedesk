@@ -2,12 +2,11 @@
  * The programs the whip figure lab draws, as `whipplescript.instance_view.v0`
  * actually prints them.
  *
- * Not written by hand and not trimmed: each `structure` below is what
- * `whipplescript::instance_view::structure` emits for that example program, so
- * the bench cannot flatter the figure by feeding it a shape the runtime never
- * sends. The one substituted field is `ir_hash`, because a bench has no store to
- * have stored anything under. Regenerate by compiling the example in the
- * whipplescript repository and projecting its snapshot.
+ * Not written by hand and not trimmed: each `structure` below is exactly what
+ * `gaugedesk_whip_runtime::program_structure` returns for that example program
+ * under the pinned WhippleScript, so the bench cannot flatter the figure by
+ * feeding it a shape the runtime never sends. Regenerate by calling that
+ * function on the example sources in the whipplescript repository.
  *
  * Each of the three carries one of the things this figure used to render badly.
  */
@@ -19,13 +18,14 @@ export interface LabProgram {
 export const LAB_PROGRAMS: readonly LabProgram[] = [
     /** Nine effects in one rule, four of them unbound — the case where
      *  `effect7`, `effect8` and `effect9` were the whole of what a reader got.
-     *  Two `table` declarations too, which used to draw as rules.
+     *  Its three `case` arms all hang off one edge, and only the pattern on
+     *  each tells them apart. Two `table` declarations too.
      */
     {
         name: "gastown-lite",
         structure: {
             available: true,
-            ir_hash: "ir-lab",
+            ir_hash: "5cbb95f2611e242cc79cd3ff50a64d8f",
             program_version_id: "",
             rule_edges: [
                 {
@@ -64,6 +64,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                     effects: [
                         {
                             binding: null,
+                            case: null,
                             kind: "tracker.file",
                             label: null,
                             node: "effect1",
@@ -122,6 +123,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                     effects: [
                         {
                             binding: "claimed",
+                            case: null,
                             kind: "tracker.claim",
                             label: "claimed",
                             node: "claimed",
@@ -129,6 +131,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                         },
                         {
                             binding: "slot",
+                            case: null,
                             kind: "lease.acquire",
                             label: "slot",
                             node: "slot",
@@ -136,6 +139,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                         },
                         {
                             binding: "turn",
+                            case: null,
                             kind: "agent.tell",
                             label: "turn",
                             node: "turn",
@@ -143,6 +147,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                         },
                         {
                             binding: null,
+                            case: null,
                             kind: "tracker.release",
                             label: null,
                             node: "effect4",
@@ -150,6 +155,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                         },
                         {
                             binding: "review",
+                            case: null,
                             kind: "schema.coerce",
                             label: "review",
                             node: "review",
@@ -157,6 +163,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                         },
                         {
                             binding: "log_entry",
+                            case: null,
                             kind: "ledger.append",
                             label: "log_entry",
                             node: "log_entry",
@@ -164,6 +171,10 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                         },
                         {
                             binding: null,
+                            case: {
+                                pattern: "\"merge\"",
+                                scrutinee: "decision.verdict",
+                            },
                             kind: "tracker.finish",
                             label: null,
                             node: "effect7",
@@ -171,6 +182,10 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                         },
                         {
                             binding: null,
+                            case: {
+                                pattern: "\"revise\"",
+                                scrutinee: "decision.verdict",
+                            },
                             kind: "tracker.release",
                             label: null,
                             node: "effect8",
@@ -178,6 +193,10 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                         },
                         {
                             binding: null,
+                            case: {
+                                pattern: "\"blocked\"",
+                                scrutinee: "decision.verdict",
+                            },
                             kind: "tracker.release",
                             label: null,
                             node: "effect9",
@@ -203,7 +222,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
         name: "triage-chain",
         structure: {
             available: true,
-            ir_hash: "ir-lab",
+            ir_hash: "dc7b7ea848c278b9791b99ba30c5c84e",
             program_version_id: "",
             rule_edges: [
                 {
@@ -238,6 +257,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                     effects: [
                         {
                             binding: "__then_plan",
+                            case: null,
                             kind: "agent.tell",
                             label: "plan",
                             node: "__then_plan",
@@ -245,6 +265,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                         },
                         {
                             binding: "__then_signoff",
+                            case: null,
                             kind: "schema.coerce",
                             label: "signoff",
                             node: "__then_signoff",
@@ -269,7 +290,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
         name: "incident-router",
         structure: {
             available: true,
-            ir_hash: "ir-lab",
+            ir_hash: "7eb2fa799566300d26fb53f22c7819d7",
             program_version_id: "",
             rule_edges: [
                 {
@@ -302,6 +323,7 @@ export const LAB_PROGRAMS: readonly LabProgram[] = [
                     effects: [
                         {
                             binding: "turn",
+                            case: null,
                             kind: "agent.tell",
                             label: "turn",
                             node: "turn",

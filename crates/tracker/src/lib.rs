@@ -168,9 +168,13 @@ impl WhipTrackerHandle {
         metadata: &serde_json::Value,
         filed_by: Option<&str>,
     ) -> TrackerResult<WorkItem> {
+        // `assigned_to` is the store's since whipplescript DR-0110, which lets an
+        // issue be filed already assigned. Nothing here files on someone else's
+        // behalf, and this facade has no assignee to pass, so it files
+        // unassigned exactly as it did before the parameter existed.
         Ok(self
             .items
-            .file_item(queue, title, body, labels, metadata, filed_by)?)
+            .file_item(queue, title, body, labels, metadata, filed_by, None)?)
     }
 
     /// List issues, optionally filtered by queue and status.

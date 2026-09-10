@@ -746,6 +746,10 @@ pub fn deliver_verdict<T: GateTransport>(
         &[],
         &serde_json::Value::Null,
         Some("reviewer"),
+        // Unassigned: whipplescript DR-0110 lets an issue be filed already
+        // assigned, and a verdict is filed for the gate program to consume
+        // rather than for anyone to pick up.
+        None,
     )?;
 
     match drive_gate(

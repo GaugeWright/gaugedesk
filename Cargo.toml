@@ -32,7 +32,7 @@ debug = false
 # source revision to the published contract revision and digest; no project
 # workstream feature may compile against the older crates.io release.
 [patch.crates-io]
-whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "cf33e0ed49debb1f3919f7652a6678a0c8aff9fa" }
-whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "cf33e0ed49debb1f3919f7652a6678a0c8aff9fa" }
-whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "cf33e0ed49debb1f3919f7652a6678a0c8aff9fa" }
-whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "cf33e0ed49debb1f3919f7652a6678a0c8aff9fa" }
+whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "ffb9575dcf3382de90df8864383e734735bc8896" }
+whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "ffb9575dcf3382de90df8864383e734735bc8896" }
+whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "ffb9575dcf3382de90df8864383e734735bc8896" }
+whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "ffb9575dcf3382de90df8864383e734735bc8896" }

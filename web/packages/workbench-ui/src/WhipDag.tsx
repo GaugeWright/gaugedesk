@@ -25,10 +25,12 @@
 import { For, Show, type JSX } from "solid-js";
 import { layout, type Layout } from "./whip-dag-layout";
 import {
+    caseArmLabel,
     nodeProvenance,
     nodeSubtitle,
     nodeTitle,
     slotLabel,
+    type WhipCaseArm,
     type WhipEffectSlot,
 } from "./whip-view";
 
@@ -62,6 +64,8 @@ export interface EffectLike {
     readonly verb: string;
     /** The author's own name for the effect, `null` when they gave none. */
     readonly label: string | null;
+    /** The `case` arm this effect sits in, drawn on the edge that reaches it. */
+    readonly case?: WhipCaseArm | null;
     readonly arm?: string | null;
     readonly binding?: string | null;
 }
@@ -135,13 +139,18 @@ export function EffectGraphBody(props: {
     // the drawing must still put SOMETHING legible in the box rather than throw.
     const namesFor = (node: string) => {
         const effect = effectOf(node);
-        return effect
-            ? {
-                  title: nodeTitle(effect),
-                  subtitle: nodeSubtitle(effect),
-                  provenance: nodeProvenance(effect),
-              }
-            : { title: node, subtitle: "", provenance: node };
+        if (!effect) return { title: node, subtitle: "", provenance: node };
+        // The scrutinee rides in the tooltip rather than the figure: it is the
+        // same for every arm of one `case`, so drawing it on each edge would
+        // repeat one fact three times and crowd out the pattern that differs.
+        const provenance = effect.case
+            ? `${nodeProvenance(effect)} — ${caseArmLabel(effect.case)}`
+            : nodeProvenance(effect);
+        return {
+            title: nodeTitle(effect),
+            subtitle: nodeSubtitle(effect),
+            provenance,
+        };
     };
     const slotOf = (node: string) => props.slots?.find((slot) => slot.node === node);
     const marker = () => `url(#${props.marker ?? "whip-arrow"})`;

@@ -22,7 +22,7 @@
  */
 
 import { layout } from "./whip-dag-layout";
-import type { WhipFiring } from "./whip-view";
+import type { WhipCaseArm, WhipFiring } from "./whip-view";
 
 /** A column of the lane grid: one effect node of the shared program. */
 export interface LaneColumn {
@@ -35,6 +35,10 @@ export interface LaneColumn {
      *  to disambiguate by, so two adjacent columns both reading `release` would
      *  cost more than `effect8` does. */
     readonly label: string | null;
+    /** The `case` arm the effect sits in. A column of one `case`'s arms is a
+     *  column that is empty for every firing that went the other way, which
+     *  reads as "stuck" unless the header says it is an alternative. */
+    readonly case: WhipCaseArm | null;
     /** Depth in the effect graph, so the header can show where the run gets to
      *  rather than only which node it is. */
     readonly layer: number;
@@ -85,11 +89,13 @@ export function laneColumns(firings: readonly WhipFiring[]): readonly LaneColumn
     // disappears takes the evidence with it.
     const kinds = new Map<string, string>();
     const labels = new Map<string, string | null>();
+    const cases = new Map<string, WhipCaseArm | null>();
     const bindings = new Map<string, string>();
     for (const firing of firings) {
         for (const slot of firing.effects) {
             if (!kinds.has(slot.node)) kinds.set(slot.node, slot.kind);
             if (!labels.has(slot.node)) labels.set(slot.node, slot.label);
+            if (!cases.has(slot.node)) cases.set(slot.node, slot.case);
             bindings.set(slot.binding ?? slot.node, slot.node);
         }
     }
@@ -115,6 +121,7 @@ export function laneColumns(firings: readonly WhipFiring[]): readonly LaneColumn
             node: node.id,
             kind: kinds.get(node.id) ?? "",
             label: labels.get(node.id) ?? null,
+            case: cases.get(node.id) ?? null,
             layer: node.layer,
         }));
 }
