@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GaugeDesk — whip figure lab</title>
+    <style>
+      /* Bench chrome only. Everything inside a case is the product stylesheet;
+         nothing here may style a product class, or the prototype would flatter
+         itself and the agreed result would not survive the move into the app. */
+      body { margin: 0; background: var(--bg, #0c1a2e); color: var(--ink, #e6ebf2);
+             font-family: var(--ui), sans-serif; }
+      .lab { max-width: 1180px; margin: 0 auto; padding: 32px 24px 96px; }
+      .lab-head h1 { font-size: 20px; margin: 0 0 6px; font-weight: 650; }
+      .lab-head p { color: var(--muted); font-size: var(--fs-body, 13px);
+             max-width: 74ch; line-height: 1.6; margin: 0 0 28px; }
+      .lab-head code { font-family: var(--mono); font-size: 0.95em; }
+      .lab-case { margin: 0 0 44px; }
+      .lab-case h2 { font-size: var(--fs-ui, 12px); text-transform: uppercase;
+             letter-spacing: 0.08em; color: var(--muted); margin: 0 0 10px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/apps/workbench-web/src/whip-lab.tsx"></script>
+  </body>
+</html>

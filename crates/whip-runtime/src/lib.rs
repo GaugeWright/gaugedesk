@@ -225,6 +225,45 @@ mod instance_view_tests {
     }
 
     #[test]
+    fn the_structure_names_each_effect_the_way_its_author_wrote_it() {
+        // The cross-repository contract the Structure figure is drawn from
+        // (whipplescript DR-0109). Asserted on THIS side of the pin because the
+        // figure degrades quietly without it: the mapper falls back to the kind,
+        // so a pin that went backwards would draw `agent.tell` where the verb
+        // belongs and nothing would fail.
+        let structure = program_structure(
+            "workflow Demo\n\
+             \n\
+             agent writer {\n  \
+             provider fixture\n  \
+             profile \"scribe\"\n  \
+             capacity 1\n\
+             }\n\
+             \n\
+             rule work\n  \
+             when started\n  \
+             when writer is available\n\
+             => {\n  \
+             then note <- tell writer \"\"\"markdown\n  \
+             say something\n  \
+             \"\"\"\n\
+             }\n",
+        )
+        .expect("the program compiles");
+
+        let effect = &structure["rules"][0]["effects"][0];
+        // The verb the author typed, not the kind the compiler assigned...
+        assert_eq!(effect["verb"], "tell");
+        assert_eq!(effect["kind"], "agent.tell");
+        // ...and their own name, not the `then` sugar's synthetic handle.
+        assert_eq!(effect["label"], "note");
+        assert_eq!(effect["node"], "__then_note");
+        // Every rule answers about its record sources, which is what tells a
+        // `table` declaration's lowered rule from behaviour someone wrote.
+        assert!(structure["rules"][0]["records"].is_array());
+    }
+
+    #[test]
     fn an_empty_runtime_store_has_no_instances_and_is_not_an_error() {
         // The ordinary state of a project nothing has run in.
         let dir = tempfile::tempdir().expect("tempdir");

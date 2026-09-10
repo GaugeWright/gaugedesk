@@ -28,10 +28,18 @@ import type { WhipFiring } from "./whip-view";
 export interface LaneColumn {
     readonly node: string;
     readonly kind: string;
+    /** The author's own name for the effect, or `null` when they gave none.
+     *
+     *  A header here keeps the node id where there is no label, unlike the graph,
+     *  which shows the verb. A column is a 26px vertical strip with no position
+     *  to disambiguate by, so two adjacent columns both reading `release` would
+     *  cost more than `effect8` does. */
+    readonly label: string | null;
     /** Depth in the effect graph, so the header can show where the run gets to
      *  rather than only which node it is. */
     readonly layer: number;
 }
+
 
 export interface FiringGroup {
     readonly rule: string;
@@ -76,10 +84,12 @@ export function laneColumns(firings: readonly WhipFiring[]): readonly LaneColumn
     // this build cannot fully resolve may carry fewer, and a column that
     // disappears takes the evidence with it.
     const kinds = new Map<string, string>();
+    const labels = new Map<string, string | null>();
     const bindings = new Map<string, string>();
     for (const firing of firings) {
         for (const slot of firing.effects) {
             if (!kinds.has(slot.node)) kinds.set(slot.node, slot.kind);
+            if (!labels.has(slot.node)) labels.set(slot.node, slot.label);
             bindings.set(slot.binding ?? slot.node, slot.node);
         }
     }
@@ -101,7 +111,12 @@ export function laneColumns(firings: readonly WhipFiring[]): readonly LaneColumn
     );
     return [...placed.nodes]
         .sort((a, b) => (a.layer === b.layer ? a.order - b.order : a.layer - b.layer))
-        .map((node) => ({ node: node.id, kind: kinds.get(node.id) ?? "", layer: node.layer }));
+        .map((node) => ({
+            node: node.id,
+            kind: kinds.get(node.id) ?? "",
+            label: labels.get(node.id) ?? null,
+            layer: node.layer,
+        }));
 }
 
 /** A firing's short name for the row label: the identity's most specific part,

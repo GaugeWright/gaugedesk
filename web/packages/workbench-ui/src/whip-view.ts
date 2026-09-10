@@ -37,9 +37,17 @@ export interface WhipRun {
 
 /** One static effect of a rule, in one firing. */
 export interface WhipEffectSlot {
-    /** The snapshot's node name (`turn`, `effect4`). */
+    /** The snapshot's node name (`turn`, `effect4`). Machinery: an effect id is
+     *  a hash over it, and it is what a slot is joined on. Not a name a reader
+     *  was ever shown — see {@link nodeTitle}. */
     readonly node: string;
     readonly kind: string;
+    /** The source keyword the author wrote: `tell`, `exec`, `timer`, or a
+     *  construct's own keyword. Not derivable from `kind` — see
+     *  {@link nodeTitle}. */
+    readonly verb: string;
+    /** The author's own name for this effect, or `null` when they gave none. */
+    readonly label: string | null;
     readonly binding: string | null;
     /** `"<binding>:<predicate>"` when the effect sits in an `after` arm. */
     readonly arm: string | null;
@@ -64,15 +72,31 @@ export interface WhipFiring {
     readonly effects: readonly WhipEffectSlot[];
 }
 
+/** One schema a rule records, and the construct that wrote the `record`. */
+export interface WhipRecordSource {
+    readonly schema: string;
+    /** `table_row` for a row of a declared `table`. */
+    readonly construct: string;
+}
+
 export interface WhipStructureRule {
     readonly name: string;
     readonly whens: readonly string[];
     readonly effects: readonly {
         readonly node: string;
         readonly kind: string;
+        readonly verb: string;
+        readonly label: string | null;
+        /** The binding as the snapshot wrote it, synthetic prefix included. The
+         *  graph resolves every edge through it, which is why it is not the
+         *  `label`. */
+        readonly binding: string | null;
         /** `"<binding>:<predicate>"`, the edge this effect hangs off. */
         readonly arm?: string | null;
     }[];
+    /** What this rule records, and which construct wrote it. A `table`
+     *  declaration lowers to a rule, and this is the only thing that says so. */
+    readonly records: readonly WhipRecordSource[];
 }
 
 export interface WhipStructureEdge {
@@ -131,8 +155,18 @@ export function structureFromV0(value: unknown): WhipStructure {
             effects: arr(rule.effects).map((effect) => ({
                 node: str(effect.node),
                 kind: str(effect.kind),
+                // The kind is the fallback and it is deliberately a visible one:
+                // this desk pins the runtime that fills these in, so a node
+                // reading `tracker.release` where a verb belongs says the pin is
+                // behind, rather than quietly inventing a word.
+                verb: str(effect.verb, str(effect.kind)),
+                label: typeof effect.label === "string" ? effect.label : null,
                 binding: typeof effect.binding === "string" ? effect.binding : null,
                 arm: arms.get(str(effect.node)) ?? null,
+            })),
+            records: arr(rule.records).map((source) => ({
+                schema: str(source.schema),
+                construct: str(source.construct),
             })),
         };
     });
@@ -148,6 +182,8 @@ function slotFromV0(v: V0): WhipEffectSlot {
     const base = {
         node: str(v.node),
         kind: str(v.kind),
+        verb: str(v.verb, str(v.kind)),
+        label: typeof v.label === "string" ? v.label : null,
         binding: typeof v.binding === "string" ? v.binding : null,
         arm: typeof v.arm === "string" ? v.arm : null,
     };
@@ -250,6 +286,172 @@ export function firingSummary(firing: WhipFiring): string {
 export function slotLabel(slot: WhipEffectSlot): string {
     if (slot.absent) return "not requested";
     return slot.status ?? "unknown";
+}
+
+/** The parts of an effect a figure names it by. Both a static node and a firing
+ *  slot carry them, so one set of helpers labels both pictures. */
+export interface NamedEffect {
+    readonly node: string;
+    readonly kind: string;
+    readonly verb: string;
+    readonly label: string | null;
+}
+
+/** The kind's family — `tracker` of `tracker.release`.
+ *
+ *  A verb on its own is sometimes ambiguous: `renew` is a tracker's and a
+ *  lease's both. The family is what a node shows when its author gave it no name
+ *  to show instead. */
+export function kindFamily(kind: string): string {
+    const dot = kind.indexOf(".");
+    return dot > 0 ? kind.slice(0, dot) : kind;
+}
+
+/**
+ * What a node is CALLED in a figure: the verb its author wrote.
+ *
+ * Never the node id. `effect4` is a lowering position and `__then_plan` is a
+ * reserved handle an author is refused if they spell it themselves — a picture
+ * showing either is showing its reader the compiler's bookkeeping and asking
+ * them to find their own program inside it. The id is still on the node, in
+ * `data-node` and in the tooltip, for anyone who wants the join.
+ */
+export function nodeTitle(effect: NamedEffect): string {
+    return effect.verb || effect.node;
+}
+
+/** The line under it: the author's own name where they gave one, the kind's
+ *  family where they did not. Two `release` nodes in one rule are then told
+ *  apart by position, which is what a graph is for. */
+export function nodeSubtitle(effect: NamedEffect): string {
+    return effect.label ?? kindFamily(effect.kind);
+}
+
+/**
+ * The shortest handle that still identifies an effect in TEXT: the author's own
+ * name where they gave one, the node id where they did not.
+ *
+ * Distinct from {@link nodeTitle}, which a FIGURE uses. A figure has position to
+ * tell two `release` nodes apart, so it can afford to show the verb; a line of
+ * notes and a 26px column header have no position, and two lines both reading
+ * `release` cost a reader more than `effect8` does.
+ */
+export function effectHandle(effect: {
+    readonly node: string;
+    readonly label: string | null;
+}): string {
+    return effect.label ?? effect.node;
+}
+
+/** The machinery a figure leaves out, for the tooltip that carries it. */
+export function nodeProvenance(effect: NamedEffect): string {
+    return `${effect.node} — ${effect.kind}`;
+}
+
+/** How many characters a rule box's header line carries before it is elided.
+ *
+ *  A box is sized by its longest line and a `where` guard is unbounded:
+ *  `incident-router`'s is 170 characters, which on its own makes that rule's box
+ *  about eleven hundred pixels wide and pushes the rest of the figure sideways
+ *  off the page. The untruncated text stays in the line's tooltip. */
+export const HEADER_LINE_MAX = 44;
+
+export interface HeaderLine {
+    /** `when` or `where`, drawn in the dimmed keyword ink. */
+    readonly keyword: string;
+    readonly text: string;
+    /** The untruncated text, when `text` was elided. `null` when it was not. */
+    readonly full: string | null;
+}
+
+function elide(text: string, max: number): string {
+    return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
+}
+
+/**
+ * A rule's `when` clauses as the lines its box draws.
+ *
+ * A guard becomes its own line. `when` answers what triggers the rule and
+ * `where` answers "and only if"; run together on one line, the trigger — the
+ * short structural half a reader scans for — is the part that falls off the end
+ * of the box, because the guard in front of it can be arbitrarily long.
+ */
+export function headerLines(whens: readonly string[]): readonly HeaderLine[] {
+    const lines: HeaderLine[] = [];
+    for (const when of whens) {
+        // The snapshot writes `when <pattern> where <guard>`, so the first
+        // occurrence is the separator. A pattern is a schema, an agent or a
+        // resource read; none of them contains the word.
+        const split = when.indexOf(" where ");
+        const pattern = split < 0 ? when : when.slice(0, split);
+        const guard = split < 0 ? null : when.slice(split + " where ".length);
+        const shortPattern = elide(pattern, HEADER_LINE_MAX);
+        lines.push({
+            keyword: "when",
+            text: shortPattern,
+            full: shortPattern === pattern ? null : pattern,
+        });
+        if (guard !== null) {
+            const shortGuard = elide(guard, HEADER_LINE_MAX);
+            lines.push({
+                keyword: "where",
+                text: shortGuard,
+                full: shortGuard === guard ? null : guard,
+            });
+        }
+    }
+    return lines;
+}
+
+/**
+ * Whether a rule is a `table` declaration rather than behaviour someone wrote.
+ *
+ * A table lowers to a rule — `table_tickets`, `when started`, one `record` per
+ * row — so from the rules alone the two are indistinguishable, and the coupling
+ * figure gave a table of data a box the same size and weight as the rules that
+ * act. In `gastown-lite` that is two boxes of four. The record sources are the
+ * evidence: every `record` came from a declared table's row, and the rule does
+ * nothing else at all.
+ */
+export function isTableRule(rule: {
+    readonly effects: readonly unknown[];
+    readonly records: readonly WhipRecordSource[];
+}): boolean {
+    return (
+        rule.effects.length === 0 &&
+        rule.records.length > 0 &&
+        rule.records.every((source) => source.construct === "table_row")
+    );
+}
+
+function count(n: number, noun: string): string {
+    return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * The line beside a program's name: how much of it there is.
+ *
+ * Tables are counted apart from rules rather than with them. They lower to rules
+ * and the figure now draws them as the data they are, so counting them as rules
+ * would have the number disagree with the picture directly under it.
+ */
+export function structureSummary(structure: {
+    readonly rules: readonly WhipStructureRule[];
+    readonly ruleEdges: readonly unknown[];
+}): string {
+    const tables = structure.rules.filter(isTableRule).length;
+    const parts = [
+        count(structure.rules.length - tables, "rule"),
+        count(structure.ruleEdges.length, "coupling"),
+    ];
+    if (tables > 0) parts.push(count(tables, "table"));
+    return parts.join(" · ");
+}
+
+/** A table's own name. The `table_` prefix belongs to the lowering, not to the
+ *  author who wrote `table tickets as Ticket [ … ]`. */
+export function tableName(rule: { readonly name: string }): string {
+    return rule.name.startsWith("table_") ? rule.name.slice("table_".length) : rule.name;
 }
 
 /** Which of the five tabs a `.whip` file offers, in order. A non-whip file keeps

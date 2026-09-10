@@ -52,6 +52,8 @@
     "./TopBar": "./src/TopBar.tsx",
     "./TranscriptFilterMenu": "./src/TranscriptFilterMenu.tsx",
     "./TranscriptView": "./src/TranscriptView.tsx",
+    "./WhipViews": "./src/WhipViews.tsx",
+    "./whip-view": "./src/whip-view.ts",
     "./Workspace": "./src/Workspace.tsx",
     "./WorkbenchShell": "./src/WorkbenchShell.tsx",
     "./access-request": "./src/access-request.ts",

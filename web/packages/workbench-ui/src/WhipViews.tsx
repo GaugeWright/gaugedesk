@@ -22,8 +22,10 @@
 import { For, Show, type JSX } from "solid-js";
 import { groupFirings, laneLabel } from "./whip-lanes";
 import {
+    effectHandle,
     firingSummary,
     slotLabel,
+    structureSummary,
     type WhipEffectSlot,
     type WhipFiring,
     type WhipInstanceView,
@@ -47,7 +49,7 @@ function Notes(props: { readonly effects: readonly WhipEffectSlot[] }): JSX.Elem
         <For each={noteworthy()}>
             {(slot) => (
                 <div class="whip-effect-note" data-node={slot.node}>
-                    <span class="whip-note-node">{slot.node}</span>
+                    <span class="whip-note-node">{effectHandle(slot)}</span>
                     <Show when={slot.blockReason}>
                         <span class="whip-note-reason">{slot.blockReason}</span>
                     </Show>
@@ -120,7 +122,7 @@ function LaneNotes(props: { readonly firings: readonly WhipFiring[] }): JSX.Elem
                         <For each={firing.effects.filter((slot) => slot.blockReason)}>
                             {(slot) => (
                                 <div class="whip-effect-note" data-node={slot.node}>
-                                    <span class="whip-note-node">{slot.node}</span>
+                                    <span class="whip-note-node">{effectHandle(slot)}</span>
                                     <span class="whip-note-reason">{slot.blockReason}</span>
                                 </div>
                             )}
@@ -174,10 +176,7 @@ export function WhipStructureView(props: {
             >
                 <div class="whip-eyebrow">
                     {props.structure!.workflow}
-                    <span class="whip-meta">
-                        {props.structure!.rules.length} rules ·{" "}
-                        {props.structure!.ruleEdges.length} couplings
-                    </span>
+                    <span class="whip-meta">{structureSummary(props.structure!)}</span>
                 </div>
 
                 {/* One figure. The coupling flow is the top-level view — it

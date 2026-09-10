@@ -2724,6 +2724,15 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
     fill: var(--ink); }
 .whip-rule-when { font-family: var(--mono); font-size: var(--fs-label); fill: var(--muted); }
 .whip-rule-keyword { fill: color-mix(in srgb, var(--muted) 55%, transparent); }
+/* A guard reads as a condition ON the trigger, so it recedes behind it. The
+   trigger is the structural half a reader scans a figure for; the guard is what
+   they read once they have found the rule. */
+.whip-rule-guard { fill: color-mix(in srgb, var(--muted) 62%, transparent); }
+/* A `table` declaration lowers to a rule and is drawn in the plain ink the
+   effect nodes take, not the gold. The gold in this figure is the map of what
+   ACTS, and a table is the data the map acts on. */
+.whip-rule-node[data-kind="table"] .whip-rule-box { stroke: var(--edge); }
+.whip-rule-node[data-kind="table"] .whip-rule-name { font-weight: 400; fill: var(--muted); }
 .whip-rule-empty { font-style: italic; }
 .whip-rule-edge path { stroke: color-mix(in srgb, var(--gold) 45%, var(--edge)); }
 .whip-rule-edge text { fill: var(--gold); font-size: var(--fs-label); letter-spacing: 0.04em; }

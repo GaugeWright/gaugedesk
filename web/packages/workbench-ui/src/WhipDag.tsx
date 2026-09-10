@@ -24,7 +24,13 @@
 
 import { For, Show, type JSX } from "solid-js";
 import { layout, type Layout } from "./whip-dag-layout";
-import { slotLabel, type WhipEffectSlot } from "./whip-view";
+import {
+    nodeProvenance,
+    nodeSubtitle,
+    nodeTitle,
+    slotLabel,
+    type WhipEffectSlot,
+} from "./whip-view";
 
 export const EFFECT_NODE_W = 156;
 export const EFFECT_NODE_H = 52;
@@ -51,6 +57,11 @@ const DOWNWARD = {
 export interface EffectLike {
     readonly node: string;
     readonly kind: string;
+    /** The source keyword the author wrote. Drawn as the node's name — see
+     *  `nodeTitle` in `whip-view.ts` for why the node id is not. */
+    readonly verb: string;
+    /** The author's own name for the effect, `null` when they gave none. */
+    readonly label: string | null;
     readonly arm?: string | null;
     readonly binding?: string | null;
 }
@@ -119,7 +130,19 @@ export function EffectGraphBody(props: {
         }
         return map;
     };
-    const kindOf = (node: string) => props.effects.find((e) => e.node === node)?.kind ?? "";
+    const effectOf = (node: string) => props.effects.find((e) => e.node === node);
+    // A node the placement knows and the effect list does not cannot happen, but
+    // the drawing must still put SOMETHING legible in the box rather than throw.
+    const namesFor = (node: string) => {
+        const effect = effectOf(node);
+        return effect
+            ? {
+                  title: nodeTitle(effect),
+                  subtitle: nodeSubtitle(effect),
+                  provenance: nodeProvenance(effect),
+              }
+            : { title: node, subtitle: "", provenance: node };
+    };
     const slotOf = (node: string) => props.slots?.find((slot) => slot.node === node);
     const marker = () => `url(#${props.marker ?? "whip-arrow"})`;
 
@@ -160,8 +183,15 @@ export function EffectGraphBody(props: {
                                 reads before the colour does. */}
                             <circle class="whip-dag-halo" cx="13" cy="16" r="6" />
                             <circle class="whip-dag-dot" cx="13" cy="16" r="3.5" />
-                            <text class="whip-dag-name" x="24" y="20">{node.id}</text>
-                            <text class="whip-dag-kind" x="13" y="34">{kindOf(node.id)}</text>
+                            {/* The id and the full kind, for a reader who wants
+                                the join the figure leaves out. */}
+                            <title>{namesFor(node.id).provenance}</title>
+                            <text class="whip-dag-name" x="24" y="20">
+                                {namesFor(node.id).title}
+                            </text>
+                            <text class="whip-dag-kind" x="13" y="34">
+                                {namesFor(node.id).subtitle}
+                            </text>
                             <Show when={slot()}>
                                 <text class="whip-dag-status" x="13" y="46">
                                     {slotLabel(slot()!)}

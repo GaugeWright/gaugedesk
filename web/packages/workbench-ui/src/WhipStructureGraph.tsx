@@ -26,11 +26,22 @@
 import { For, Show, type JSX } from "solid-js";
 import { layout, type Layout } from "./whip-dag-layout";
 import { ArrowMarker, EffectGraphBody, effectPlacement, type EffectLike } from "./WhipDag";
+import {
+    headerLines,
+    isTableRule,
+    tableName,
+    type HeaderLine,
+    type WhipRecordSource,
+} from "./whip-view";
 
 export interface RuleNode {
     readonly name: string;
     readonly whens: readonly string[];
     readonly effects: readonly EffectLike[];
+    /** What the rule records, and the construct that wrote it. A `table`
+     *  declaration lowers to a rule, and this is what says which boxes in the
+     *  figure are data rather than behaviour. */
+    readonly records: readonly WhipRecordSource[];
 }
 
 export interface RuleEdge {
@@ -65,27 +76,59 @@ const WHEN_LINE = 13;
 const NAME_CHAR = 7.4;
 const WHEN_CHAR = 6.4;
 const MIN_WIDTH = 188;
+// A table holds one short line and no graph, so it takes less room — and reading
+// smaller is the point: it is the data the rules act on, not one of them.
+const TABLE_MIN_WIDTH = 152;
+
+/** A table's one line: how many rows, of what. */
+export function tableSummary(records: readonly WhipRecordSource[]): string {
+    const schemas = [...new Set(records.map((source) => source.schema))].sort((a, b) =>
+        a.localeCompare(b),
+    );
+    return `${records.length} row${records.length === 1 ? "" : "s"} of ${schemas.join(", ")}`;
+}
 
 export interface RuleBox {
     readonly inner: Layout | null;
     readonly headerHeight: number;
     readonly width: number;
     readonly height: number;
+    /** The `when` / `where` lines under the name, already elided. Empty for a
+     *  table, whose trigger is always `started` and says nothing. */
+    readonly lines: readonly HeaderLine[];
+    /** A table's summary line, or `null` for a rule. */
+    readonly table: string | null;
+    /** The name as drawn, which for a table drops the lowering's `table_`. */
+    readonly name: string;
 }
 
 /** A rule box is sized by what it holds. */
 export function ruleBox(rule: RuleNode): RuleBox {
+    const table = isTableRule(rule) ? tableSummary(rule.records) : null;
+    const name = table ? tableName(rule) : rule.name;
     const inner = rule.effects.length ? effectPlacement(rule.effects, "down") : null;
-    const lines = rule.whens.length + (inner ? 0 : 1);
-    const headerHeight = HEADER_TOP + NAME_LINE + lines * WHEN_LINE + (inner ? 4 : 8);
+    const lines = table ? [] : headerLines(rule.whens);
+    // One line beyond the triggers: a table's summary, or the note that a rule
+    // with no effects only records.
+    const trailing = table || !inner ? 1 : 0;
+    const headerHeight =
+        HEADER_TOP + NAME_LINE + (lines.length + trailing) * WHEN_LINE + (inner ? 4 : 8);
+    const bodyChars = [
+        ...lines.map((line) => line.keyword.length + 1 + line.text.length),
+        ...(table ? [table.length] : []),
+    ];
     const textWidth =
         Math.max(
-            rule.name.length * NAME_CHAR,
-            ...rule.whens.map((when) => (when.length + 5) * WHEN_CHAR),
+            (table ? "table ".length + name.length : name.length) * NAME_CHAR,
+            ...bodyChars.map((chars) => chars * WHEN_CHAR),
         ) + INSET * 2;
-    const width = Math.max(MIN_WIDTH, Math.ceil(textWidth), inner ? inner.width + INSET * 2 : 0);
+    const width = Math.max(
+        table ? TABLE_MIN_WIDTH : MIN_WIDTH,
+        Math.ceil(textWidth),
+        inner ? inner.width + INSET * 2 : 0,
+    );
     const height = headerHeight + (inner ? inner.height + INSET : 0);
-    return { inner, headerHeight, width, height };
+    return { inner, headerHeight, width, height, lines, table, name };
 }
 
 // Between rule boxes the row gap holds fact labels, which are long —
@@ -173,34 +216,60 @@ export function WhipStructureGraph(props: {
                             <g
                                 class="whip-rule-node"
                                 data-rule={node.id}
+                                data-kind={box()?.table ? "table" : undefined}
                                 transform={`translate(${node.x}, ${node.y})`}
                             >
                                 <rect class="whip-rule-box" width={node.width} height={node.height} />
+                                {/* The lowered rule name stays reachable: it is
+                                    what an event and a firing are attributed to. */}
+                                <Show when={box()?.table}>
+                                    <title>{node.id}</title>
+                                </Show>
                                 <text class="whip-rule-name" x={INSET} y={HEADER_TOP + 13}>
-                                    {node.id}
+                                    <Show when={box()?.table}>
+                                        <tspan class="whip-rule-keyword">table </tspan>
+                                    </Show>
+                                    {box()?.name ?? node.id}
                                 </text>
-                                <For each={rule()?.whens ?? []}>
-                                    {(when, index) => (
+                                <For each={box()?.lines ?? []}>
+                                    {(line, index) => (
                                         <text
                                             class="whip-rule-when"
+                                            classList={{ "whip-rule-guard": line.keyword === "where" }}
                                             x={INSET}
                                             y={HEADER_TOP + NAME_LINE + (index() + 1) * WHEN_LINE}
                                         >
-                                            <tspan class="whip-rule-keyword">when </tspan>
-                                            {when}
+                                            {/* Elided, so the whole clause is on
+                                                the line for a reader who needs it. */}
+                                            <Show when={line.full}>
+                                                <title>{`${line.keyword} ${line.full}`}</title>
+                                            </Show>
+                                            <tspan class="whip-rule-keyword">{line.keyword} </tspan>
+                                            {line.text}
                                         </text>
                                     )}
                                 </For>
+                                <Show when={box()?.table}>
+                                    <text
+                                        class="whip-rule-when"
+                                        x={INSET}
+                                        y={HEADER_TOP + NAME_LINE + WHEN_LINE}
+                                    >
+                                        {box()!.table}
+                                    </text>
+                                </Show>
                                 <Show
                                     when={box()?.inner}
                                     fallback={
-                                        <text
-                                            class="whip-rule-when whip-rule-empty"
-                                            x={INSET}
-                                            y={HEADER_TOP + NAME_LINE + ((rule()?.whens.length ?? 0) + 1) * WHEN_LINE}
-                                        >
-                                            records only — no effects
-                                        </text>
+                                        <Show when={!box()?.table}>
+                                            <text
+                                                class="whip-rule-when whip-rule-empty"
+                                                x={INSET}
+                                                y={HEADER_TOP + NAME_LINE + ((box()?.lines.length ?? 0) + 1) * WHEN_LINE}
+                                            >
+                                                records only — no effects
+                                            </text>
+                                        </Show>
                                     }
                                 >
                                     {(inner) => (

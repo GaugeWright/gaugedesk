@@ -5,6 +5,8 @@ import type { WhipFiring } from "./whip-view";
 const slot = (node: string, arm: string | null, extra: Record<string, unknown> = {}) => ({
     node,
     kind: `kind.${node}`,
+    verb: "act",
+    label: node,
     binding: node,
     arm,
     ...extra,
@@ -95,6 +97,20 @@ describe("laneColumns", () => {
             "review",
         ]);
         expect(columns.map((column) => column.layer)).toEqual([0, 1, 2, 2, 3]);
+    });
+
+    it("carries the author's name, and keeps the node id where there is none", () => {
+        // A header is a 26px vertical strip with no position to disambiguate by,
+        // so an unnamed effect keeps its id rather than printing the same verb as
+        // its neighbour. The graph, which has position, shows the verb instead.
+        const columns = laneColumns([
+            firing("implement", "a", "ver_1", [
+                slot("__then_plan", null, { label: "plan" }),
+                slot("effect8", "__then_plan:succeeds", { label: null }),
+            ]),
+        ]);
+        expect(columns.map((column) => column.label)).toEqual(["plan", null]);
+        expect(columns.map((column) => column.node)).toEqual(["__then_plan", "effect8"]);
     });
 
     it("takes the union, so a column never vanishes because one firing lacks it", () => {
