@@ -240,10 +240,19 @@ pub struct PublishDeploymentRequest {
     #[serde(default)]
     pub white_label: bool,
     /// Operative lease for this deployment, within the frozen version ceiling.
-    #[serde(default = "default_idle_ttl_seconds")]
-    pub retention_idle_ttl_seconds: u64,
-    #[serde(default = "default_absolute_ttl_seconds")]
-    pub retention_absolute_ttl_seconds: u64,
+    ///
+    /// Absent means "leave it as it is", not "reset it": a release update that
+    /// says nothing about the lease must not silently move it, and a publisher
+    /// that does name one must be obeyed. Those two are only distinguishable
+    /// because absence is a distinct value here. While these carried a serde
+    /// default, every request arrived naming 24h/30d whether or not anyone had
+    /// chosen it, so the publisher defended the deployment by copying its live
+    /// retention back over the request — which made the setting unchangeable
+    /// after first publish (ADR 0109 §4 says it is the owner's to set).
+    #[serde(default)]
+    pub retention_idle_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub retention_absolute_ttl_seconds: Option<u64>,
     /// End every live session as part of this publication (DR-0090).
     ///
     /// Defaults to false, because a visitor's conversation surviving a change
@@ -1299,10 +1308,40 @@ impl Workbench {
                 ));
             }
         }
-        if request.retention_idle_ttl_seconds == 0
-            || request.retention_absolute_ttl_seconds < request.retention_idle_ttl_seconds
-            || request.retention_idle_ttl_seconds > profile.retention.idle_ttl_seconds
-            || request.retention_absolute_ttl_seconds > profile.retention.absolute_ttl_seconds
+        // What this deployment already carries, so an unspecified lease can be
+        // left alone rather than reset. Read before the retention resolution
+        // below; the binding is also what decides whether this publication
+        // reuses an already-admitted operational configuration.
+        let existing = self
+            .library
+            .public_deployments
+            .values()
+            .find(|binding| {
+                binding.hosted_deployment_id == request.deployment_id && binding.edge_origin == edge
+            })
+            .cloned();
+        let names_retention = request.retention_idle_ttl_seconds.is_some()
+            || request.retention_absolute_ttl_seconds.is_some();
+        let retention_idle_ttl_seconds = request
+            .retention_idle_ttl_seconds
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|b| b.operational.retention_idle_ttl_seconds)
+            })
+            .unwrap_or_else(default_idle_ttl_seconds);
+        let retention_absolute_ttl_seconds = request
+            .retention_absolute_ttl_seconds
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|b| b.operational.retention_absolute_ttl_seconds)
+            })
+            .unwrap_or_else(default_absolute_ttl_seconds);
+        if retention_idle_ttl_seconds == 0
+            || retention_absolute_ttl_seconds < retention_idle_ttl_seconds
+            || retention_idle_ttl_seconds > profile.retention.idle_ttl_seconds
+            || retention_absolute_ttl_seconds > profile.retention.absolute_ttl_seconds
         {
             return Err(invalid(
                 "deployment retention must be positive, ordered, and within the release ceiling",
@@ -1337,17 +1376,9 @@ impl Workbench {
             per_visitor_turn_limit: request.per_visitor_turn_limit,
             max_concurrent_sessions: request.max_concurrent_sessions,
             white_label: request.white_label,
-            retention_idle_ttl_seconds: request.retention_idle_ttl_seconds,
-            retention_absolute_ttl_seconds: request.retention_absolute_ttl_seconds,
+            retention_idle_ttl_seconds,
+            retention_absolute_ttl_seconds,
         };
-        let existing = self
-            .library
-            .public_deployments
-            .values()
-            .find(|binding| {
-                binding.hosted_deployment_id == request.deployment_id && binding.edge_origin == edge
-            })
-            .cloned();
         if existing
             .as_ref()
             .is_some_and(|binding| binding.placement_id != placement.id)
@@ -1534,8 +1565,8 @@ impl Workbench {
             // later rate change never reprices work already sold.
             "pricing": crate::deployment_pricing::pricing_block(),
             "retention": {
-                "idle_ttl_seconds": request.retention_idle_ttl_seconds,
-                "absolute_ttl_seconds": request.retention_absolute_ttl_seconds,
+                "idle_ttl_seconds": retention_idle_ttl_seconds,
+                "absolute_ttl_seconds": retention_absolute_ttl_seconds,
                 "transcript_retained": profile.retention.transcript_retained,
                 "workspace_retained": profile.retention.workspace_retained
             },
@@ -1568,10 +1599,22 @@ impl Workbench {
             }
             (200, current) => {
                 let current: serde_json::Value = serde_json::from_str(&current).map_err(invalid)?;
-                // Pricing and retention are host-owned deployment snapshots. A GaugeDesk
-                // release update must not replace them with publisher defaults merely
-                // because the public configuration was edited.
-                for field in ["pricing", "retention"] {
+                // Pricing is a host-owned snapshot: a deployment keeps the rate card
+                // it was published under, so a later rate change never reprices work
+                // already sold, and a release update never restates it.
+                //
+                // Retention is the owner's setting rather than a snapshot (ADR 0109
+                // §4), so it is preserved only when this publication says nothing
+                // about it. Preserving it unconditionally is what made the setting
+                // unchangeable: two republications of the `oai` deployment asked for
+                // a seven-day idle lease and shipped the one-hour lease already
+                // there, and the visitor evidence for that was a conversation
+                // ending an hour after its last message.
+                let mut preserved = vec!["pricing"];
+                if !names_retention {
+                    preserved.push("retention");
+                }
+                for field in preserved {
                     if let Some(value) = current.pointer(&format!("/deployment/config/{field}")) {
                         config[field] = value.clone();
                     }

@@ -252,6 +252,106 @@ fn a_seeded_workbench_reaches_the_publisher() {
     }
 }
 
+/// A deployment's lease is the owner's setting, not a snapshot of what is
+/// already deployed (ADR 0109 §4). Two republications of the `oai` deployment
+/// asked for a seven-day idle lease and shipped the one-hour lease already
+/// there, because the publisher copied the live retention back over every
+/// request. The evidence a visitor saw was a conversation ending an hour after
+/// its last message; the evidence here is the wire body.
+#[test]
+fn a_republication_ships_the_retention_it_asks_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let workbench = open_workbench(dir.path()).unwrap();
+    workbench
+        .lock_unpoisoned()
+        .seed_panel_placement("inst-seeded", PanelPublicProfile::default())
+        .unwrap();
+    let (edge, state) = publisher_edge();
+
+    let mut initial = publish_request("inst-seeded");
+    initial.edge_origin = edge.clone();
+    workbench
+        .lock_unpoisoned()
+        .publish_agent_deployment(initial)
+        .expect("the synthetic edge admits the first publication");
+
+    let mut widened = publish_request("inst-seeded");
+    widened.edge_origin = edge;
+    widened.retention_idle_ttl_seconds = Some(7_200);
+    widened.retention_absolute_ttl_seconds = Some(172_800);
+    workbench
+        .lock_unpoisoned()
+        .publish_agent_deployment(widened)
+        .expect("the synthetic edge admits the widened lease");
+
+    let state = state.lock().unwrap();
+    let replacement = state
+        .mutation_bodies
+        .last()
+        .expect("the update reached the edge");
+    assert_eq!(
+        replacement["config"]["retention"]["idle_ttl_seconds"], 7_200,
+        "the idle lease the publisher asked for is the one that shipped",
+    );
+    assert_eq!(
+        replacement["config"]["retention"]["absolute_ttl_seconds"], 172_800,
+        "the absolute lease the publisher asked for is the one that shipped",
+    );
+}
+
+/// The other half of the same rule: a release update that says nothing about
+/// the lease must leave it alone. Before the request could express "unchanged"
+/// this was the reason retention was copied back unconditionally — every
+/// request carried a serde default of 24h whether or not anyone chose it, so
+/// obeying the request would have silently reset the owner's setting.
+#[test]
+fn a_republication_silent_on_retention_leaves_the_deployed_lease_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let workbench = open_workbench(dir.path()).unwrap();
+    workbench
+        .lock_unpoisoned()
+        .seed_panel_placement("inst-seeded", PanelPublicProfile::default())
+        .unwrap();
+    let (edge, state) = publisher_edge();
+
+    let mut initial = publish_request("inst-seeded");
+    initial.edge_origin = edge.clone();
+    initial.retention_idle_ttl_seconds = Some(1_800);
+    initial.retention_absolute_ttl_seconds = Some(43_200);
+    workbench
+        .lock_unpoisoned()
+        .publish_agent_deployment(initial)
+        .expect("the synthetic edge admits the first publication");
+
+    let mut silent = publish_request("inst-seeded");
+    silent.edge_origin = edge;
+    silent.retention_idle_ttl_seconds = None;
+    silent.retention_absolute_ttl_seconds = None;
+    silent.allowed_origins = vec!["https://changed.example".to_owned()];
+    workbench
+        .lock_unpoisoned()
+        .publish_agent_deployment(silent)
+        .expect("the synthetic edge admits the origin change");
+
+    let state = state.lock().unwrap();
+    let replacement = state
+        .mutation_bodies
+        .last()
+        .expect("the update reached the edge");
+    assert_eq!(
+        replacement["config"]["allowed_origins"][0], "https://changed.example",
+        "the change that was asked for did happen",
+    );
+    assert_eq!(
+        replacement["config"]["retention"]["idle_ttl_seconds"], 1_800,
+        "an unspoken lease is left as deployed, never reset to a default",
+    );
+    assert_eq!(
+        replacement["config"]["retention"]["absolute_ttl_seconds"], 43_200,
+        "an unspoken lease is left as deployed, never reset to a default",
+    );
+}
+
 #[test]
 fn a_rejected_update_preserves_the_active_binding_and_operational_snapshot() {
     let dir = tempfile::tempdir().unwrap();
