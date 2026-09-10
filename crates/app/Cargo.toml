@@ -86,6 +86,7 @@ whipplescript-store = { version = "0.5.6" }
 whipplescript-kernel = { version = "0.5.6" }
 
 [dev-dependencies]
+whipplescript = { version = "0.5.6", default-features = false }
 gaugedesk-pi-bridge = { path = "../pi-bridge" }
 gaugedesk-relay-transport = { path = "../relay-transport", features = ["test-relay"] }
 # Compiles the shipped gate program in tests. A gate we ship but never parse is
