@@ -1,4 +1,4 @@
-gauge-desk (0.4.3) stable; urgency=medium
+gaugedesk (0.4.3) stable; urgency=medium
 
   * Publish GaugeDesk as a self-contained desktop workbench.
 

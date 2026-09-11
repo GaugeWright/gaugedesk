@@ -13,38 +13,39 @@ make_deb() {
   local package_root="$TMP/package-$version"
   mkdir -p "$package_root/DEBIAN" "$package_root/usr/bin" \
     "$package_root/usr/share/applications" \
-    "$package_root/usr/share/doc/gauge-desk"
+    "$package_root/usr/share/doc/gaugedesk"
   apply_control="$package_root/DEBIAN/control"
   printf '%s\n' \
-    'Package: gauge-desk' \
+    'Package: gaugedesk' \
     "Version: $version" \
     'Architecture: amd64' \
     'Priority: optional' \
     'Maintainer: GaugeWright <support@gaugewright.com>' \
     'Depends: libc6' \
-    'Provides: gauge-bench, gaugebench' \
-    'Conflicts: gauge-bench, gaugebench' \
-    'Replaces: gauge-bench, gaugebench' \
+    'Provides: gauge-bench, gaugebench, gauge-desk' \
+    'Conflicts: gauge-bench, gaugebench, gauge-desk' \
+    'Replaces: gauge-bench, gaugebench, gauge-desk' \
     'Description: GaugeDesk test package' >"$apply_control"
   printf '#!/bin/sh\nexit 0\n' >"$package_root/usr/bin/gaugedesk"
   chmod 755 "$package_root/usr/bin/gaugedesk"
   printf '%s\n' \
     '[Desktop Entry]' 'Name=GaugeDesk' 'Exec=gaugedesk' \
-    'Type=Application' >"$package_root/usr/share/applications/gauge-desk.desktop"
+    'Type=Application' 'StartupWMClass=gaugedesk' \
+    >"$package_root/usr/share/applications/gaugedesk.desktop"
   printf 'test changelog\n' \
-    | gzip -9 -n >"$package_root/usr/share/doc/gauge-desk/changelog.gz"
+    | gzip -9 -n >"$package_root/usr/share/doc/gaugedesk/changelog.gz"
   printf 'Copyright 2026 GaugeWright\nLicense: AGPL-3\n' \
-    >"$package_root/usr/share/doc/gauge-desk/copyright"
+    >"$package_root/usr/share/doc/gaugedesk/copyright"
   dpkg-deb --build --root-owner-group "$package_root" \
-    "$TMP/gauge-desk_${version}_amd64.deb" >/dev/null
+    "$TMP/gaugedesk_${version}_amd64.deb" >/dev/null
 }
 
 make_deb 0.4.3
 make_deb 0.4.4
-"$ROOT/scripts/check-deb-package.sh" "$TMP/gauge-desk_0.4.4_amd64.deb"
+"$ROOT/scripts/check-deb-package.sh" "$TMP/gaugedesk_0.4.4_amd64.deb"
 SOURCE_DATE_EPOCH=1783987200 "$ROOT/scripts/build-apt-repository.sh" \
-  "$TMP/repository" "$TMP/gauge-desk_0.4.3_amd64.deb" \
-  "$TMP/gauge-desk_0.4.4_amd64.deb"
+  "$TMP/repository" "$TMP/gaugedesk_0.4.3_amd64.deb" \
+  "$TMP/gaugedesk_0.4.4_amd64.deb"
 
 export GNUPGHOME="$TMP/gnupg"
 mkdir -m 700 "$GNUPGHOME"
@@ -74,7 +75,7 @@ while read -r digest size relative; do
 done < <(sed -n '/^SHA256:$/,$p' "$release" | tail -n +2)
 
 packages="$TMP/repository/dists/stable/main/binary-amd64/Packages"
-[ "$(grep -c '^Package: gauge-desk$' "$packages")" -eq 2 ]
+[ "$(grep -c '^Package: gaugedesk$' "$packages")" -eq 2 ]
 grep -q '^Version: 0.4.4$' "$packages"
 for index in Packages Packages.gz Packages.xz; do
   digest="$(sha256_file "$(dirname "$packages")/$index")"
@@ -96,7 +97,7 @@ apt_options=(
   -o APT::Sandbox::User=
 )
 apt-get "${apt_options[@]}" update >/dev/null
-policy="$(apt-cache "${apt_options[@]}" policy gauge-desk)"
+policy="$(apt-cache "${apt_options[@]}" policy gaugedesk)"
 grep -q 'Candidate: 0.4.4' <<<"$policy"
 
 cp "$TMP/repository/dists/stable/InRelease" "$TMP/InRelease.valid"

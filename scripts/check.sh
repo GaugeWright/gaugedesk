@@ -54,6 +54,17 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 section="${1:-all}"
 
+# The Debian archive tooling `scripts/test-apt-repository.sh` drives. Every
+# runner that builds a package and every machine that installs one has it, so
+# an absence here is a workstation missing `dpkg-dev`, not a platform that
+# cannot answer.
+apt_repository_prerequisites_present() {
+    local tool
+    for tool in dpkg-deb dpkg-scanpackages gpg gpgv apt-get apt-cache xz; do
+        command -v "$tool" >/dev/null 2>&1 || return 1
+    done
+}
+
 run_contracts() {
     echo "== agent guide =="
     node scripts/check-agent-guide.mjs
@@ -167,6 +178,21 @@ run_contracts() {
     # whether a runner's failing vendor index reddens a healthy tree, and
     # tolerating one must not tolerate a package that never installed.
     bash scripts/apt-install-action.test.sh
+
+    # The archive one layer up: that a built package is what the archive will
+    # accept, that the indexes and signatures an `apt-get update` reads are the
+    # ones these scripts write, and that tampered metadata is refused. It ran
+    # nowhere — `sync-public-mirror.yml` names the file among its path triggers,
+    # which publishes it without ever invoking it — so the distribution lane
+    # every Linux install arrives through was covered by a script no gate ran.
+    # It belongs in `contracts` because it needs only Debian tooling.
+    echo "== apt repository =="
+    apt_repository_prerequisites_present || {
+        echo "the APT repository test needs Debian archive tooling." >&2
+        echo "install: sudo apt-get install -y dpkg-dev gnupg apt-utils xz-utils" >&2
+        exit 1
+    }
+    bash scripts/test-apt-repository.sh
 
     echo "== build coverage =="
     node scripts/check-build-coverage.mjs

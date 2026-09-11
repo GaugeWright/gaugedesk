@@ -11,13 +11,13 @@ for tool in dpkg-deb dpkg-scanpackages gzip xz sha256sum; do
 done
 sha256_file() { sha256sum "$1" | awk '{ print $1 }'; }
 
-mkdir -p "$REPO_ROOT/pool/main/g/gauge-desk"
+mkdir -p "$REPO_ROOT/pool/main/g/gaugedesk"
 for source_deb in "$@"; do
   [ -f "$source_deb" ] || { echo "package not found: $source_deb" >&2; exit 1; }
   package="$(dpkg-deb --field "$source_deb" Package)"
   version="$(dpkg-deb --field "$source_deb" Version)"
   architecture="$(dpkg-deb --field "$source_deb" Architecture)"
-  [ "$package" = "gauge-desk" ] || {
+  [ "$package" = "gaugedesk" ] || {
     echo "refusing non-canonical package $package from $source_deb" >&2
     exit 1
   }
@@ -25,7 +25,7 @@ for source_deb in "$@"; do
     echo "refusing unsupported architecture $architecture" >&2
     exit 1
   }
-  destination="$REPO_ROOT/pool/main/g/gauge-desk/${package}_${version}_${architecture}.deb"
+  destination="$REPO_ROOT/pool/main/g/gaugedesk/${package}_${version}_${architecture}.deb"
   if [ -f "$destination" ]; then
     [ "$(sha256_file "$source_deb")" = "$(sha256_file "$destination")" ] || {
       echo "immutable package collision: $destination" >&2
@@ -41,7 +41,7 @@ mapfile -t all_debs < <(find "$REPO_ROOT/pool" -type f -name '*.deb' -print | so
 
 architectures=()
 for deb in "${all_debs[@]}"; do
-  [ "$(dpkg-deb --field "$deb" Package)" = "gauge-desk" ] || {
+  [ "$(dpkg-deb --field "$deb" Package)" = "gaugedesk" ] || {
     echo "unexpected package in pool: $deb" >&2
     exit 1
   }

@@ -9,7 +9,7 @@ version="$(node -p "require('$ROOT/src-tauri/tauri.conf.json').version")"
   exit 1
 }
 
-sed -E "1s/^gauge-desk \([^)]+\)/gauge-desk ($version)/" \
+sed -E "1s/^gaugedesk \([^)]+\)/gaugedesk ($version)/" \
   "$ROOT/src-tauri/linux/changelog" \
   | gzip -9 -n >"$ROOT/src-tauri/linux/changelog.gz"
 
