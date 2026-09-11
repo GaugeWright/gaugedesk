@@ -86,6 +86,8 @@ whipplescript-store = { version = "0.5.6" }
 whipplescript-kernel = { version = "0.5.6" }
 
 [dev-dependencies]
+# Competing connection proves publication holds the content authority's lock.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 whipplescript = { version = "0.5.6", default-features = false }
 gaugedesk-pi-bridge = { path = "../pi-bridge" }
 gaugedesk-relay-transport = { path = "../relay-transport", features = ["test-relay"] }

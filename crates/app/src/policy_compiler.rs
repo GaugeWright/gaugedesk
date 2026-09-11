@@ -179,49 +179,13 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
         .iter()
         .filter(|record| !record.tombstoned)
         .collect::<Vec<_>>();
-    for record in &active_resources {
-        if !permitted_with_policy(
-            true,
-            &input.org_policy,
-            &Decision {
-                actor: input.actor_attributes.clone(),
-                resource: record.attributes.clone(),
-                action: Action::Run,
-                context: Context {
-                    // A remote host is not automatically an attested host.
-                    // Cloudflare DO is hosted/unattested; only the explicit
-                    // confidential-compute placement may raise this ceiling.
-                    ceiling_attested: input.placement_kind == "attested",
-                },
-            },
-        ) {
-            return Err(format!(
-                "organization policy denies runtime access to resource `{}`",
-                record.resource.id.as_str()
-            ));
-        }
-        if !record.attributes.purpose.is_empty()
-            && input.turn_purpose.as_ref().is_none_or(|purpose| {
-                !record
-                    .attributes
-                    .purpose
-                    .iter()
-                    .any(|allowed| allowed.as_str() == purpose)
-            })
-        {
-            return Err(format!(
-                "resource `{}` requires an admitted run purpose ({})",
-                record.resource.id.as_str(),
-                record
-                    .attributes
-                    .purpose
-                    .iter()
-                    .map(|purpose| purpose.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
+    validate_execution_resources(
+        &active_resources,
+        &input.actor_attributes,
+        &input.org_policy,
+        input.turn_purpose.as_deref(),
+        input.placement_kind == "attested",
+    )?;
 
     let mut workspace_readers = BTreeSet::new();
     for record in &active_resources {
@@ -383,54 +347,15 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
         );
         policy.bindings.insert(handle, address);
     }
-    let mut clearances = BTreeSet::new();
-    clearances.insert("classification:public".to_owned());
-    // The role floor, not the raw claim: an IdP that asserts no clearance leaves
-    // `Clearance::default()`, which clears only `public`, while an unlabeled
-    // resource is fail-closed `Regulated` — so the default actor could not read
-    // the default resource and an agent turn over an ordinary project was
-    // refused for a reason nobody chose. See `Clearance::implied_by`.
-    let clearance = input.actor_attributes.effective_clearance();
-    for (level, name) in [
-        (1, "classification:internal"),
-        (2, "classification:pii"),
-        (3, "classification:regulated"),
-    ] {
-        if clearance.0 >= level {
-            clearances.insert(name.to_owned());
-        }
-    }
-    clearances.extend(
+    let clearances = actor_clearances(
+        &input.actor_attributes,
+        input.turn_purpose.as_deref(),
+        &input.resources,
         input
-            .actor_attributes
-            .roles
+            .target_bindings
             .iter()
-            .map(|role| format!("role:{}", role.as_str())),
+            .flat_map(|binding| binding.authorities.iter().map(String::as_str)),
     );
-    if let Some(region) = &input.actor_attributes.region {
-        clearances.insert(format!("residency:{}", region.as_str()));
-    }
-    if let Some(purpose) = &input.turn_purpose {
-        clearances.insert(format!("purpose:{purpose}"));
-    }
-    // A granted GaugeDesk resource-access decision explicitly clears this actor
-    // for the stakeholder compartments on the resources handed to the runtime.
-    for record in &input.resources {
-        clearances.extend(
-            record
-                .stakeholders
-                .iter()
-                .map(|authority| authority_role(authority.as_str())),
-        );
-    }
-    for binding in &input.target_bindings {
-        clearances.extend(
-            binding
-                .authorities
-                .iter()
-                .map(|authority| authority_role(authority)),
-        );
-    }
     policy.delegations.extend(
         clearances
             .into_iter()
@@ -441,7 +366,127 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
     Ok(policy)
 }
 
-fn resource_reader_roles(record: &ResourceRecord) -> BTreeSet<String> {
+pub(crate) fn validate_execution_resources(
+    resources: &[&ResourceRecord],
+    actor_attributes: &AuthorityAttributes,
+    org_policy: &Policy,
+    purpose: Option<&str>,
+    ceiling_attested: bool,
+) -> Result<(), String> {
+    validate_resources_for_action(
+        resources,
+        actor_attributes,
+        org_policy,
+        purpose,
+        ceiling_attested,
+        Action::Run,
+    )
+}
+
+pub(crate) fn validate_resources_for_action(
+    resources: &[&ResourceRecord],
+    actor_attributes: &AuthorityAttributes,
+    org_policy: &Policy,
+    purpose: Option<&str>,
+    ceiling_attested: bool,
+    action: Action,
+) -> Result<(), String> {
+    for record in resources {
+        if !permitted_with_policy(
+            true,
+            org_policy,
+            &Decision {
+                actor: actor_attributes.clone(),
+                resource: record.attributes.clone(),
+                action,
+                context: Context {
+                    // A remote host is not automatically an attested host.
+                    // Cloudflare DO is hosted/unattested; only the explicit
+                    // confidential-compute placement may raise this ceiling.
+                    ceiling_attested,
+                },
+            },
+        ) {
+            return Err(format!(
+                "organization policy denies runtime access to resource `{}`",
+                record.resource.id.as_str()
+            ));
+        }
+        if !record.attributes.purpose.is_empty()
+            && purpose.is_none_or(|purpose| {
+                !record
+                    .attributes
+                    .purpose
+                    .iter()
+                    .any(|allowed| allowed.as_str() == purpose)
+            })
+        {
+            return Err(format!(
+                "resource `{}` requires an admitted run purpose ({})",
+                record.resource.id.as_str(),
+                record
+                    .attributes
+                    .purpose
+                    .iter()
+                    .map(|purpose| purpose.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn actor_clearances<'a>(
+    actor_attributes: &AuthorityAttributes,
+    purpose: Option<&str>,
+    resources: &[ResourceRecord],
+    target_authorities: impl IntoIterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    let mut clearances = BTreeSet::new();
+    clearances.insert("classification:public".to_owned());
+    // The role floor, not the raw claim: an IdP that asserts no clearance leaves
+    // `Clearance::default()`, which clears only `public`, while an unlabeled
+    // resource is fail-closed `Regulated` — so the default actor could not read
+    // the default resource and an agent turn over an ordinary project was
+    // refused for a reason nobody chose. See `Clearance::implied_by`.
+    let clearance = actor_attributes.effective_clearance();
+    for (level, name) in [
+        (1, "classification:internal"),
+        (2, "classification:pii"),
+        (3, "classification:regulated"),
+    ] {
+        if clearance.0 >= level {
+            clearances.insert(name.to_owned());
+        }
+    }
+    clearances.extend(
+        actor_attributes
+            .roles
+            .iter()
+            .map(|role| format!("role:{}", role.as_str())),
+    );
+    if let Some(region) = &actor_attributes.region {
+        clearances.insert(format!("residency:{}", region.as_str()));
+    }
+    if let Some(purpose) = purpose {
+        clearances.insert(format!("purpose:{purpose}"));
+    }
+    // A granted GaugeDesk resource-access decision explicitly clears this actor
+    // for the stakeholder compartments on the resources handed to the runtime.
+    for record in resources {
+        clearances.extend(
+            record
+                .stakeholders
+                .iter()
+                .map(|authority| authority_role(authority.as_str())),
+        );
+    }
+    clearances.extend(target_authorities.into_iter().map(authority_role));
+    clearances
+}
+
+pub(crate) fn resource_reader_roles(record: &ResourceRecord) -> BTreeSet<String> {
     let mut roles = record
         .stakeholders
         .iter()
@@ -469,7 +514,7 @@ fn resource_reader_roles(record: &ResourceRecord) -> BTreeSet<String> {
     roles
 }
 
-fn authority_role(authority: &str) -> String {
+pub(crate) fn authority_role(authority: &str) -> String {
     format!("authority:{}", short_hash(authority))
 }
 

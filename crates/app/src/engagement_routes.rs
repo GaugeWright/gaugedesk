@@ -932,7 +932,7 @@ impl Workbench {
     }
 }
 
-fn path_is_in_scope(path: &str, scopes: &[String]) -> bool {
+pub(crate) fn path_is_in_scope(path: &str, scopes: &[String]) -> bool {
     let path = path.trim_start_matches("./");
     scopes.iter().any(|scope| {
         let scope = scope.trim().trim_start_matches("./").trim_end_matches('/');

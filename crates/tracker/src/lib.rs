@@ -264,6 +264,10 @@ mod tests {
             )
             .expect("file_item");
         assert!(item.id.starts_with("WS-"));
+        assert!(
+            item.assigned_to.is_none(),
+            "filing does not assign the issue"
+        );
         assert!(tracker.has_items("onboarding").expect("has_items"));
 
         let open = tracker

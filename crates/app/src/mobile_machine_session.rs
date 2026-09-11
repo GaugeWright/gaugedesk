@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use crate::{account::RecordOp, session::random_bytes, LockUnpoisoned, SharedWorkbench};
 
 pub const MACHINE_SESSION_HEADER: &str = "x-gaugewright-machine-session";
-const SCOPE: &str = "machine-controllers";
+pub(crate) const SCOPE: &str = "machine-controllers";
 const KIND: &str = "controller-grant";
 const INVITATION_TTL_SECS: u64 = 10 * 60;
 const CHALLENGE_TTL_SECS: u64 = 5 * 60;
@@ -647,27 +647,39 @@ async fn post_revoke(
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn folded_grants(store: &gaugedesk_store::Store) -> Vec<ControllerGrantRecord> {
+fn try_folded_grants(
+    store: &gaugedesk_store::Store,
+) -> Result<Vec<ControllerGrantRecord>, gaugedesk_store::AdmitError> {
     let mut grants = BTreeMap::<String, ControllerGrantRecord>::new();
-    for payload in store.records(SCOPE, KIND).unwrap_or_default() {
-        if let Ok(record) = serde_json::from_str::<ControllerGrantRecord>(&payload) {
-            match record.op {
-                RecordOp::Upsert => {
-                    grants.insert(record.id.clone(), record);
-                }
-                RecordOp::Tombstone => {
-                    grants.remove(&record.id);
-                }
+    for payload in store.records(SCOPE, KIND)? {
+        let record: ControllerGrantRecord = serde_json::from_str(&payload)?;
+        match record.op {
+            RecordOp::Upsert => {
+                grants.insert(record.id.clone(), record);
+            }
+            RecordOp::Tombstone => {
+                grants.remove(&record.id);
             }
         }
     }
-    grants.into_values().collect()
+    Ok(grants.into_values().collect())
+}
+
+fn folded_grants(store: &gaugedesk_store::Store) -> Vec<ControllerGrantRecord> {
+    try_folded_grants(store).unwrap_or_default()
+}
+
+pub(crate) fn current_action_grant(
+    store: &gaugedesk_store::Store,
+    grant_id: &str,
+) -> Result<Option<ControllerGrantRecord>, gaugedesk_store::AdmitError> {
+    Ok(try_folded_grants(store)?
+        .into_iter()
+        .find(|grant| grant.id == grant_id && grant.status == ControllerGrantStatus::Active))
 }
 
 fn active_grant(store: &gaugedesk_store::Store, grant_id: &str) -> Option<ControllerGrantRecord> {
-    folded_grants(store)
-        .into_iter()
-        .find(|grant| grant.id == grant_id && grant.status == ControllerGrantStatus::Active)
+    current_action_grant(store, grant_id).ok().flatten()
 }
 
 /// Validate a short-lived Machine session and its still-active durable grant.
@@ -871,9 +883,34 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         let token = opened["session"].as_str().unwrap().to_string();
         assert!(authorize_session(&mut reopened.lock_unpoisoned(), &token).is_some());
+        let expected_grant = grant_id.clone();
         let guarded_work = Router::new()
             .merge(crate::local_routes::routes(false))
             .merge(routes())
+            .route(
+                "/inspect-controller-action",
+                axum::routing::get(
+                    move |axum::Extension(context): axum::Extension<
+                        crate::identity::AuthenticatedActionContext,
+                    >| {
+                        let expected_grant = expected_grant.clone();
+                        async move {
+                            assert_eq!(context.actor().as_str(), "device:android");
+                            assert_eq!(
+                                context.authentication(),
+                                &crate::identity::ActorAuthentication::MachineController {
+                                    grant_ref: expected_grant,
+                                }
+                            );
+                            assert_eq!(
+                                context.claims(),
+                                &gaugedesk_core::abac::AuthorityAttributes::default()
+                            );
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
+            )
             .route_layer(axum::middleware::from_fn_with_state(
                 reopened.clone(),
                 crate::home_routes::require_home_admission,
@@ -882,6 +919,10 @@ mod tests {
         assert_eq!(
             get_with_session(&guarded_work, "/workspace", &token).await,
             StatusCode::OK
+        );
+        assert_eq!(
+            get_with_session(&guarded_work, "/inspect-controller-action", &token).await,
+            StatusCode::NO_CONTENT
         );
         assert_eq!(
             get_with_session(&guarded_work, "/mobile/controllers", &token).await,
@@ -910,6 +951,10 @@ mod tests {
             StatusCode::NO_CONTENT,
         );
         assert!(authorize_session(&mut reopened.lock_unpoisoned(), &token).is_none());
+        assert_eq!(
+            get_with_session(&guarded_work, "/inspect-controller-action", &token).await,
+            StatusCode::UNAUTHORIZED
+        );
         assert_eq!(
             get_with_session(&guarded_work, "/workspace", &token).await,
             StatusCode::UNAUTHORIZED

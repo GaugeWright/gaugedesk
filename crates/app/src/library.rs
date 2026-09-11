@@ -571,6 +571,10 @@ pub struct WorkTargetRecord {
     /// credentials remain behind the locator handle.
     pub authority: String,
     pub parties: Vec<String>,
+    /// Target-owned confidentiality, residency and purpose restrictions.
+    /// Legacy targets inherit the most-protected resource default.
+    #[serde(default)]
+    pub attributes: gaugedesk_core::abac::ResourceAttributes,
     pub locator_handle: String,
     pub adapter: String,
     pub adapter_family: String,

@@ -659,6 +659,7 @@ fn managed_target_record(
     current_basis: String,
 ) -> WorkTargetRecord {
     WorkTargetRecord {
+        attributes: Default::default(),
         schema: crate::library::LIBRARY_RECORD_SCHEMA,
         extra: Default::default(),
         locator_handle: format!("managed-target:{id}"),
@@ -1087,6 +1088,7 @@ mod target_set_migration_tests {
             extra: Default::default(),
         });
         library.apply_work_target(WorkTargetRecord {
+            attributes: Default::default(),
             id: "target/frontend".to_owned(),
             op: RecordOp::Upsert,
             name: "Frontend".to_owned(),

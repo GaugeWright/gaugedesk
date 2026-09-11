@@ -164,6 +164,25 @@ impl Workbench {
             .or_else(|| self.idp.as_ref().and_then(|idp| idp.authenticate(token)))
     }
 
+    /// Preserve the source that actually verified the credential. Used at the
+    /// Home authentication boundary, never to re-authenticate in an action factory.
+    pub(crate) fn authenticate_action_context(
+        &self,
+        token: &str,
+    ) -> Option<crate::identity::AuthenticatedActionContext> {
+        use crate::identity::AuthenticatedActionContext;
+        if let Some(account) = self.account_sessions.resolve_now(token) {
+            return Some(AuthenticatedActionContext::account_session(
+                gaugedesk_core::ids::AuthorityId::new(account),
+                crate::account_session::session_id(token),
+            ));
+        }
+        let idp = self.idp.as_ref()?;
+        let actor = idp.authenticate(token)?;
+        let claims = idp.claims(&actor);
+        Some(AuthenticatedActionContext::identity_provider(actor, claims))
+    }
+
     pub fn account_sessions(&self) -> Arc<crate::account_session::AccountSessionStore> {
         Arc::clone(&self.account_sessions)
     }
@@ -1038,6 +1057,24 @@ mod provider_neutral_identity_tests {
             .identity_claims(Some("oidc-token"), &account_id)
             .roles
             .contains(&Role::admin()));
+        let account_context = wb.authenticate_action_context(&account_token).unwrap();
+        let idp_context = wb.authenticate_action_context("oidc-token").unwrap();
+        assert_eq!(account_context.actor(), idp_context.actor());
+        assert_eq!(account_context.claims(), &AuthorityAttributes::default());
+        assert!(idp_context.claims().roles.contains(&Role::admin()));
+        assert_eq!(
+            account_context.authentication(),
+            &crate::identity::ActorAuthentication::AccountSession {
+                session_ref: crate::account_session::session_id(&account_token),
+            }
+        );
+        assert_eq!(
+            idp_context.authentication(),
+            &crate::identity::ActorAuthentication::IdentityProvider
+        );
+        assert!(wb.authenticate_action_context("unknown-token").is_none());
+        wb.account_sessions().revoke(&account_token);
+        assert!(wb.authenticate_action_context(&account_token).is_none());
     }
 
     #[test]

@@ -25,8 +25,8 @@ def check_pin(root=ROOT):
         require(pin.get(field) == workstream.get(field), f"{field} disagrees with the workstream runtime pin")
     for field, size in (("source_commit", 40), ("public_commit", 40), ("contract_digest", 64)):
         require(re.fullmatch(f"[0-9a-f]{{{size}}}", pin.get(field, "")), f"invalid {field}")
-    require(pin.get("contract_path") == "spec/host-action-contract-v1.json", "unexpected contract path")
-    require(pin.get("contract_revision") == "whipplescript-host-action/v1.0.0", "unsupported contract revision")
+    require(pin.get("contract_path") == "spec/host-action-contract-v3.json", "unexpected contract path")
+    require(pin.get("contract_revision") == "whipplescript-host-action/v3.0.0", "unsupported contract revision")
     adapter = (root / "crates/whip-runtime/src/host_actions.rs").read_text()
     for name, field in (("REVISION", "contract_revision"), ("DIGEST", "contract_digest")):
         require(f'pub const {name}: &str = "{pin[field]}";' in adapter, f"adapter {name} differs from its pin")
@@ -60,7 +60,11 @@ def check_resolved(pin, expected_source, consumer_root=ROOT):
     bundle = json.loads((runtime / pin["contract_path"]).read_text())
     for field in ("contract_revision", "contract_digest"):
         require(bundle.get(field) == pin[field], f"resolved bundle has a different {field}")
-    subprocess.run([sys.executable, str(runtime / "scripts/check-host-action-contract.py")], cwd=runtime, check=True)
+    # The recording bundle pins its predecessors. Verify all three with the
+    # owner's validators; legacy checks alone cannot qualify the v3 pin.
+    for validator in ("check-host-action-contract.py", "check-host-action-contract-v2.py",
+                      "check-host-action-contract-v3.py"):
+        subprocess.run([sys.executable, str(runtime / "scripts" / validator)], cwd=runtime, check=True)
     # Execute the published owner's fixture driver rather than copy its wire
     # schema, normalization or vector assertions into a consumer implementation.
     # Its build output belongs to this consumer worktree, never the Cargo cache.
@@ -72,6 +76,7 @@ def check_resolved(pin, expected_source, consumer_root=ROOT):
     subprocess.run([
         "cargo", "test", "--locked", "--manifest-path", str(runtime / "crates/whipplescript-kernel/Cargo.toml"),
         "-p", "whipplescript-kernel", "--test", "host_action_contract",
+        "--test", "host_action_contract_v2", "--test", "host_action_contract_v3",
     ], cwd=runtime, env=environment, check=True)
 
 

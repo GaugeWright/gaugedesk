@@ -23,6 +23,7 @@ use gaugedesk_core::{Lifecycle, Rejection};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 pub mod command_dispatch;
+mod record_admission;
 
 /// A transparent at-rest transform applied to record payloads of designated
 /// **content** kinds (`SECAUD-9`/`SECAUD-6`). The store crate stays crypto-free: this
@@ -32,7 +33,7 @@ pub mod command_dispatch;
 pub trait ContentCodec: Send + Sync {
     /// Transform a payload for storage. Must be reversible by [`decode`](Self::decode).
     /// A non-content `kind` returns the payload unchanged (pass-through).
-    /// Failure aborts the store append before a transaction is opened; protected
+    /// Failure aborts the store append before protected bytes are written; protected
     /// content must never be replaced with a lossy placeholder or plaintext.
     fn encode(&self, scope: &str, kind: &str, payload: &str) -> Result<String, String>;
     /// Reverse [`encode`](Self::encode). Returns `None` when the payload is
@@ -824,6 +825,42 @@ impl Store {
         self.admit_record_facts_chained(command_scope, idempotency_key, snapshot_json, facts, None)
     }
 
+    /// Read the original record command only when its durable receipt exists.
+    /// One query supplies a consistent observation, including inside a caller's
+    /// read snapshot. Mutable command status is neither repaired nor trusted.
+    /// The owning reader must separately verify the corresponding record facts.
+    pub fn committed_record_snapshot(
+        &self,
+        command_scope: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<String>, AdmitError> {
+        let original: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT commands.command_id, commands.snapshot_json
+             FROM command_receipts AS receipts
+             LEFT JOIN commands ON commands.scope_id = receipts.scope_id
+               AND commands.idempotency_key = receipts.command_key
+             WHERE receipts.scope_id = ?1 AND receipts.command_key = ?2",
+                params![command_scope, idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, snapshot)) = original else {
+            return Ok(None);
+        };
+        let expected = format!(
+            "record-command:{}:{command_scope}{idempotency_key}",
+            command_scope.len()
+        );
+        if id.as_deref() != Some(expected.as_str()) || snapshot.is_none() {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "record receipt has no matching original command",
+            }));
+        }
+        Ok(snapshot)
+    }
+
     /// [`admit_record_facts`](Self::admit_record_facts) plus an optional
     /// [`ChainedRecordFact`] appended last, whose payload is resolved against its
     /// scope's committed head **inside this transaction**. That placement is the
@@ -839,143 +876,20 @@ impl Store {
         facts: &[CommandRecordFact],
         chained: Option<ChainedRecordFact<'_>>,
     ) -> Result<MaterializedRecordAdmission, AdmitError> {
-        let stored: Result<Vec<CommandRecordFact>, AdmitError> = facts
-            .iter()
-            .map(|fact| {
-                let payload = match &self.codec {
-                    Some(codec) => codec
-                        .encode(&fact.scope_id, &fact.kind, &fact.payload)
-                        .map_err(AdmitError::Codec)?,
-                    None => fact.payload.clone(),
-                };
-                Ok(CommandRecordFact {
-                    scope_id: fact.scope_id.clone(),
-                    kind: fact.kind.clone(),
-                    payload,
-                })
-            })
-            .collect();
-        let stored = stored?;
-        let command_id = format!(
-            "record-command:{}:{command_scope}{idempotency_key}",
-            command_scope.len()
-        );
+        let stored = record_admission::encode_facts(self.codec.as_ref(), facts)?;
         let codec = self.codec.clone();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO commands
-             (command_id, scope_id, idempotency_key, status, snapshot_json)
-             VALUES (?1, ?2, ?3, 'received', ?4)",
-            params![command_id, command_scope, idempotency_key, snapshot_json],
-        )?;
-        let record = tx
-            .query_row(
-                "SELECT command_id, scope_id, idempotency_key, status, snapshot_json
-                 FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
-                params![command_scope, idempotency_key],
-                command_record_from_row,
-            )
-            .optional()?
-            .ok_or_else(|| AdmitError::Db(rusqlite::Error::QueryReturnedNoRows))?;
-        if record.snapshot_json != snapshot_json {
-            return Err(AdmitError::Rejected(Rejection {
-                reason: "idempotency key reused with different command",
-            }));
-        }
-        if tx
-            .query_row(
-                "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-                params![command_scope, idempotency_key],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some()
-        {
-            tx.execute(
-                "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
-                 WHERE command_id = ?1",
-                params![record.command_id],
-            )?;
-            tx.commit()?;
-            return Ok(MaterializedRecordAdmission {
-                positions: Vec::new(),
-                replayed: true,
-                chained_payload: None,
-            });
-        }
-        if record.status != "received" {
-            let reason = match record.status.as_str() {
-                "processing" => "command is already processing",
-                "rejected" => "command already rejected; submit with a new key",
-                "expired" => "idempotency key expired; submit with a new key",
-                "applied" => "applied command is missing its durable receipt",
-                _ => "command could not be claimed",
-            };
-            return Err(AdmitError::Rejected(Rejection { reason }));
-        }
-        tx.execute(
-            "UPDATE commands SET status = 'processing', updated_at = CURRENT_TIMESTAMP
-             WHERE command_id = ?1 AND status = 'received'",
-            params![record.command_id],
-        )?;
-
-        let mut positions = Vec::with_capacity(stored.len());
-        for fact in stored {
-            let position: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-                params![fact.scope_id],
-                |row| row.get(0),
-            )?;
-            tx.execute(
-                "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![fact.scope_id, position, fact.kind, fact.payload],
-            )?;
-            positions.push(position);
-        }
-        // Resolve the chain link against the head visible to *this* transaction and
-        // append it here. Reading the head outside the transaction would let two
-        // concurrent governed actions link to the same predecessor and fork the
-        // chain — the defect this method exists to make unrepresentable.
-        let mut chained_payload = None;
-        if let Some(chained) = chained {
-            let previous = tx_chain_head(&tx, codec.as_ref(), chained.scope_id, chained.kind)?;
-            let payload = (chained.link)(previous.as_deref());
-            let encoded = match &codec {
-                Some(codec) => codec
-                    .encode(chained.scope_id, chained.kind, &payload)
-                    .map_err(AdmitError::Codec)?,
-                None => payload.clone(),
-            };
-            let position: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-                params![chained.scope_id],
-                |row| row.get(0),
-            )?;
-            tx.execute(
-                "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![chained.scope_id, position, chained.kind, encoded],
-            )?;
-            positions.push(position);
-            chained_payload = Some(payload);
-        }
-        let applied_at = positions.first().copied().unwrap_or(0);
-        tx.execute(
-            "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
-            params![command_scope, idempotency_key, applied_at],
-        )?;
-        tx.execute(
-            "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
-             WHERE command_id = ?1",
-            params![record.command_id],
-        )?;
-        tx.commit()?;
-        Ok(MaterializedRecordAdmission {
-            positions,
-            replayed: false,
-            chained_payload,
-        })
+        record_admission::commit(
+            tx,
+            codec,
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            stored,
+            chained,
+        )
     }
 
     pub fn put_projection_meta(&mut self, meta: &ProjectionMeta) -> Result<(), AdmitError> {
@@ -1401,6 +1315,23 @@ impl Store {
     /// `(position, kind, payload)` rows across all lifecycles in the scope. A content
     /// codec decodes content kinds; a crypto-erased content row is dropped.
     pub fn events(&self, scope_id: &str) -> Result<Vec<(i64, String, String)>, AdmitError> {
+        self.read_events(scope_id, false)
+    }
+
+    /// Full history for an authority fold. Unavailable records refuse the read
+    /// instead of disappearing and potentially undoing a retained revocation.
+    pub fn retained_events(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<(i64, String, String)>, AdmitError> {
+        self.read_events(scope_id, true)
+    }
+
+    fn read_events(
+        &self,
+        scope_id: &str,
+        require_retained: bool,
+    ) -> Result<Vec<(i64, String, String)>, AdmitError> {
         let mut stmt = self.conn.prepare(
             "SELECT position, kind, payload FROM events WHERE scope_id = ?1 ORDER BY position",
         )?;
@@ -1415,11 +1346,15 @@ impl Store {
         for row in rows {
             let (pos, kind, payload) = row?;
             match &self.codec {
-                Some(codec) => {
-                    if let Some(plain) = codec.decode(scope_id, &kind, &payload) {
-                        out.push((pos, kind, plain));
+                Some(codec) => match codec.decode(scope_id, &kind, &payload) {
+                    Some(plain) => out.push((pos, kind, plain)),
+                    None if require_retained => {
+                        return Err(AdmitError::Codec(
+                            "authority history contains an unavailable record".into(),
+                        ))
                     }
-                }
+                    None => {}
+                },
                 None => out.push((pos, kind, payload)),
             }
         }
@@ -1465,6 +1400,30 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Page scope identifiers containing an event kind, without decoding any
+    /// payload. The lexical cursor orders discovery only; it is not causal order
+    /// or a consistent cross-page snapshot. A new discovery pass finds appends
+    /// before an earlier cursor. The limit bounds returned rows, not scan cost.
+    pub fn scope_ids_with_kind(
+        &self,
+        kind: &str,
+        after: Option<&str>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<String>, AdmitError> {
+        let limit = i64::try_from(limit.get()).map_err(|_| {
+            AdmitError::Rejected(Rejection {
+                reason: "scope discovery page size is out of range",
+            })
+        })?;
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT scope_id FROM events
+             WHERE kind = ?1 AND (?2 IS NULL OR scope_id > ?2)
+             ORDER BY scope_id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![kind, after, limit], |row| row.get(0))?;
+        rows.collect::<Result<Vec<String>, _>>().map_err(Into::into)
     }
 
     /// Admit one command into a scope: fold → `decide` → append atomically
@@ -2907,5 +2866,70 @@ mod tests {
                 dirty: false,
             })
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scope_discovery_tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    struct NoPayloadReads;
+    impl ContentCodec for NoPayloadReads {
+        fn encode(&self, _: &str, _: &str, payload: &str) -> Result<String, String> {
+            Ok(payload.into())
+        }
+        fn decode(&self, _: &str, _: &str, _: &str) -> Option<String> {
+            panic!("discovery must never read content")
+        }
+    }
+
+    #[test]
+    fn scope_discovery_pages_unique_matching_ids_without_reading_payloads() {
+        let mut store = Store::open_in_memory()
+            .unwrap()
+            .with_codec(Arc::new(NoPayloadReads));
+        for (scope, kind) in [
+            ("c", "grant"),
+            ("a", "grant"),
+            ("a", "grant"),
+            ("b", "other"),
+        ] {
+            store.append_record(scope, kind, "private payload").unwrap();
+        }
+        let one = NonZeroUsize::new(1).unwrap();
+        assert_eq!(
+            store.scope_ids_with_kind("grant", None, one).unwrap(),
+            ["a"]
+        );
+        assert_eq!(
+            store.scope_ids_with_kind("grant", Some("a"), one).unwrap(),
+            ["c"]
+        );
+        assert!(store
+            .scope_ids_with_kind("grant", Some("c"), one)
+            .unwrap()
+            .is_empty());
+        store
+            .append_record("aa", "grant", "new before cursor")
+            .unwrap();
+        assert!(store
+            .scope_ids_with_kind("grant", Some("c"), one)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .scope_ids_with_kind("grant", None, NonZeroUsize::new(10).unwrap())
+                .unwrap(),
+            ["a", "aa", "c"]
+        );
+        assert_eq!(
+            store.scope_ids_with_kind("other", None, one).unwrap(),
+            ["b"]
+        );
+        assert!(store
+            .scope_ids_with_kind("missing", None, one)
+            .unwrap()
+            .is_empty());
     }
 }

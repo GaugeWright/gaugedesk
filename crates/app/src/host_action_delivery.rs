@@ -73,7 +73,7 @@ pub fn deliver_admitted_action<S: RuntimeStore + LogAppend>(
     record_runtime_acknowledgment(product, scope, delivery, receipt)
 }
 
-fn record_runtime_acknowledgment(
+pub(crate) fn record_runtime_acknowledgment(
     product: &mut Store,
     scope: &str,
     delivery: CommittedDispatch<HostActionCommand>,

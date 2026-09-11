@@ -47,6 +47,12 @@ pub use whipplescript_store::workstreams::{
 
 mod external;
 pub use external::{ExternalTargetKind, ExternalWorkspace};
+mod action_target;
+pub use action_target::{NativeFileActionEvidenceTarget, NativeFileActionTarget};
+mod resolution_recording_target;
+pub use resolution_recording_target::{
+    NativeResolutionRecordingEvidenceTarget, NativeResolutionRecordingTarget,
+};
 
 /// Host-owned per-chat materializations are never target history. The runtime
 /// mount contains the selected archetype discipline; it is recreated from the
@@ -57,6 +63,15 @@ fn is_chat_local_path(path: &str) -> bool {
     CHAT_LOCAL_PATHS
         .iter()
         .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+}
+
+/// Shared path boundary for native action descriptors. Current Home admission
+/// separately checks the target grant; a descriptor never imports disk state.
+fn valid_native_action_target_path(path: &str) -> bool {
+    !path.contains('\\')
+        && !path.contains('\0')
+        && !path.split('/').any(|part| matches!(part, "" | "." | ".."))
+        && !is_chat_local_path(path)
 }
 
 fn nonempty(value: &str) -> Option<&str> {
@@ -2559,6 +2574,49 @@ pub trait Workspace: Send {
 }
 
 pub trait ChatWorkspace: Send {
+    /// Bind an independently authorized recording to this actual native store.
+    /// External targets must provide their own governed recording boundary.
+    fn native_resolution_recording_target(
+        &self,
+        _path: &str,
+        _scope: whipplescript_store::vcs::resolution_scope::ResolutionMemoryScope,
+    ) -> Result<NativeResolutionRecordingTarget> {
+        Err(WorkspaceError::msg(
+            "this workspace has no native resolution-recording boundary",
+        ))
+    }
+    /// Locate historical recording evidence without reopening correction bodies.
+    fn native_resolution_recording_evidence_target(
+        &self,
+        _path: &str,
+        _scope: whipplescript_store::vcs::resolution_scope::ResolutionMemoryScope,
+    ) -> Result<NativeResolutionRecordingEvidenceTarget> {
+        Err(WorkspaceError::msg(
+            "this workspace has no native resolution-recording evidence boundary",
+        ))
+    }
+    /// Resolve original native result coordinates without importing edits or
+    /// reopening base bytes. External adapters need their own evidence boundary.
+    fn native_file_action_evidence_target(
+        &self,
+        _path: &str,
+        _base: &str,
+    ) -> Result<NativeFileActionEvidenceTarget> {
+        Err(WorkspaceError::msg(
+            "this workspace has no native file-action evidence boundary",
+        ))
+    }
+    /// Resolve an exact base without importing external edits. Unsupported
+    /// adapters refuse; they may not manufacture authoritative native history.
+    fn native_file_action_target(
+        &self,
+        _path: &str,
+        _base: &str,
+    ) -> Result<NativeFileActionTarget> {
+        Err(WorkspaceError::msg(
+            "this workspace has no native file-action publication boundary",
+        ))
+    }
     /// An owned copy of this handle.
     ///
     /// A chat workspace is a *locator* — roots, a path, a branch, a target — and
@@ -2807,6 +2865,30 @@ impl Workspace for Instance {
 }
 
 impl ChatWorkspace for Engagement {
+    fn native_resolution_recording_target(
+        &self,
+        path: &str,
+        scope: whipplescript_store::vcs::resolution_scope::ResolutionMemoryScope,
+    ) -> Result<NativeResolutionRecordingTarget> {
+        Engagement::native_resolution_recording_target(self, path, scope)
+    }
+    fn native_resolution_recording_evidence_target(
+        &self,
+        path: &str,
+        scope: whipplescript_store::vcs::resolution_scope::ResolutionMemoryScope,
+    ) -> Result<NativeResolutionRecordingEvidenceTarget> {
+        Engagement::native_resolution_recording_evidence_target(self, path, scope)
+    }
+    fn native_file_action_evidence_target(
+        &self,
+        path: &str,
+        base: &str,
+    ) -> Result<NativeFileActionEvidenceTarget> {
+        Engagement::native_file_action_evidence_target(self, path, base)
+    }
+    fn native_file_action_target(&self, path: &str, base: &str) -> Result<NativeFileActionTarget> {
+        Engagement::native_file_action_target(self, path, base)
+    }
     fn boxed_clone(&self) -> Box<dyn ChatWorkspace> {
         Box::new(self.clone())
     }
@@ -4175,6 +4257,38 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(instance.repo().join("local.txt")).expect("local file"),
             "local work"
+        );
+    }
+
+    #[test]
+    fn fork_then_pull_preserves_binary_peer_content() {
+        let (_directory, instance) = instance();
+        instance.seed_main(&[("shared.txt", "base")]).unwrap();
+        let fork_dir = tempfile::tempdir().unwrap();
+        let forked = Instance::fork_from_at(fork_dir.path(), &instance.peer_source()).unwrap();
+        let bytes = b"image\0\xff\x80\n";
+        std::fs::write(forked.repo().join("image.bin"), bytes).unwrap();
+        forked.seed_main(&[]).unwrap();
+        instance.seed_main(&[("local.txt", "local work")]).unwrap();
+        assert_eq!(
+            instance.pull_from(&forked.peer_source()).unwrap(),
+            MergeOutcome::Clean
+        );
+        assert_eq!(
+            std::fs::read(instance.repo().join("image.bin")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            std::fs::read_to_string(instance.repo().join("local.txt")).unwrap(),
+            "local work"
+        );
+        let vcs = instance.store().unwrap();
+        let manifest = vcs.manifest(MAINLINE_BRANCH_ID).unwrap().unwrap();
+        let hash = whipplescript_store::stable_hash_bytes_hex(bytes);
+        assert_eq!(manifest.get("image.bin"), Some(&hash));
+        assert_eq!(
+            vcs.content_store().get(&hash).unwrap().as_deref(),
+            Some(&bytes[..])
         );
     }
 

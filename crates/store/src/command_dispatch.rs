@@ -9,6 +9,62 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use crate::{AdmitError, MaterializedAdmission, Store};
 
+/// Process-local event-plane read basis. Only the store can capture one. It
+/// conveys no permission and is never a replacement for current execution
+/// authorization. Other storage planes need their own publication guards.
+pub struct DispatchReadBasis {
+    store_path: String,
+    heads: std::collections::BTreeMap<String, Option<i64>>,
+    deadline: Option<std::time::SystemTime>,
+}
+
+impl DispatchReadBasis {
+    /// Add a validity ceiling from the captured authority. An existing ceiling
+    /// can only be shortened; this observation still grants no authority.
+    pub fn with_deadline(mut self, deadline: std::time::SystemTime) -> Self {
+        self.deadline = Some(
+            self.deadline
+                .map_or(deadline, |existing| existing.min(deadline)),
+        );
+        self
+    }
+
+    pub fn deadline(&self) -> Option<std::time::SystemTime> {
+        self.deadline
+    }
+}
+
+/// One product commit while its current-authority writer transaction is held.
+/// The evidence publisher consumes this inside its retention callback. Dropping
+/// it rolls back; a successful commit remains durable if the callback then fails.
+pub struct DispatchRecordAdmission<'tx> {
+    tx: rusqlite::Transaction<'tx>,
+    codec: Option<std::sync::Arc<dyn crate::ContentCodec>>,
+}
+
+impl DispatchRecordAdmission<'_> {
+    /// Commit the exact command and its facts before releasing external evidence
+    /// retention. This consumes the handle; it grants no external execution right.
+    pub fn commit(
+        self,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        facts: &[crate::CommandRecordFact],
+    ) -> Result<crate::MaterializedRecordAdmission, AdmitError> {
+        let stored = crate::record_admission::encode_facts(self.codec.as_ref(), facts)?;
+        crate::record_admission::commit(
+            self.tx,
+            self.codec,
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            stored,
+            None,
+        )
+    }
+}
+
 /// An append-only outbox fact in the same scope/order as the product admission.
 pub const DISPATCH_KIND: &str = "runtime_command_dispatch_v1";
 
@@ -46,7 +102,139 @@ struct DispatchSnapshot<Command> {
     dispatch: CommandDispatch,
 }
 
+fn check_dispatch_basis(
+    tx: &rusqlite::Transaction<'_>,
+    store_path: &str,
+    basis: &DispatchReadBasis,
+) -> Result<(), AdmitError> {
+    if basis
+        .deadline
+        .is_some_and(|deadline| std::time::SystemTime::now() >= deadline)
+    {
+        return Err(AdmitError::Rejected(Rejection {
+            reason: "dispatch authorization expired while waiting",
+        }));
+    }
+    if basis.store_path != store_path {
+        return Err(AdmitError::Rejected(Rejection {
+            reason: "dispatch authorization came from another store",
+        }));
+    }
+    for (scope, expected) in &basis.heads {
+        let current: Option<i64> = tx.query_row(
+            "SELECT MAX(position) FROM events WHERE scope_id = ?1",
+            params![scope],
+            |row| row.get(0),
+        )?;
+        if &current != expected {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "dispatch authorization changed during preparation",
+            }));
+        }
+    }
+    Ok(())
+}
+
 impl Store {
+    /// Fence current product standing before entering a bounded evidence
+    /// publisher. Commit through the one-use handle inside that publisher's
+    /// retention callback, so both exclusions span the product commit. No network
+    /// work or external effect belongs in this callback. A callback error after
+    /// commit does not undo the admission; retry the same exact command.
+    ///
+    /// The handle cannot escape this callback to become a deferred grant:
+    /// ```compile_fail
+    /// let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
+    /// let (_, basis) = store.read_for_dispatch(&["authority"], |_| Ok(())).unwrap();
+    /// let escaped = store.with_dispatch_record_admission(&basis, |writer| writer);
+    /// ```
+    pub fn with_dispatch_record_admission<T>(
+        &mut self,
+        basis: &DispatchReadBasis,
+        publish: impl for<'tx> FnOnce(DispatchRecordAdmission<'tx>) -> T,
+    ) -> Result<T, AdmitError> {
+        let codec = self.codec.clone();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_dispatch_basis(&tx, &self.path, basis)?;
+        Ok(publish(DispatchRecordAdmission { tx, codec }))
+    }
+
+    /// Serialize a bounded native runtime operation with current product standing.
+    /// The callback writes only separate runtime/target authorities; it must not write
+    /// this product store, do network work, or return an escaping authority grant.
+    /// Its error cannot undo a runtime admission which already committed.
+    pub fn with_dispatch_basis<T>(
+        &mut self,
+        basis: &DispatchReadBasis,
+        admit_runtime: impl FnOnce() -> T,
+    ) -> Result<T, AdmitError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_dispatch_basis(&tx, &self.path, basis)?;
+        let result = admit_runtime();
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Fold the declared event scopes in one read snapshot. Callers must name
+    /// every event scope on which their authorization depends; this does not
+    /// fence the separate records/content tables or external authorities.
+    pub fn read_for_dispatch<T>(
+        &self,
+        scopes: &[&str],
+        read: impl FnOnce(&Store) -> Result<T, AdmitError>,
+    ) -> Result<(T, DispatchReadBasis), AdmitError> {
+        if scopes.is_empty() || scopes.iter().any(|scope| scope.trim().is_empty()) {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "dispatch authorization requires explicit event scopes",
+            }));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut heads = std::collections::BTreeMap::new();
+        for scope in scopes {
+            let head: Option<i64> = tx.query_row(
+                "SELECT MAX(position) FROM events WHERE scope_id = ?1",
+                params![scope],
+                |row| row.get(0),
+            )?;
+            heads.insert((*scope).to_owned(), head);
+        }
+        let value = read(self)?;
+        tx.commit()?;
+        Ok((
+            value,
+            DispatchReadBasis {
+                store_path: self.path.clone(),
+                heads,
+                deadline: None,
+            },
+        ))
+    }
+
+    /// Refuse an intervening authorization-scope append before any command or
+    /// outbox write. A stale retry must obtain a fresh authorized read too.
+    pub fn admit_with_dispatch_against<L: Lifecycle>(
+        &mut self,
+        scope_id: &str,
+        idempotency_key: &str,
+        command: L::Command,
+        dispatch: &CommandDispatch,
+        basis: &DispatchReadBasis,
+    ) -> Result<MaterializedAdmission<L::State>, AdmitError>
+    where
+        L::Command: serde::Serialize,
+    {
+        self.admit_with_dispatch_inner::<L>(
+            scope_id,
+            idempotency_key,
+            command,
+            dispatch,
+            Some(basis),
+        )
+    }
     /// Read a delivery from one SQLite snapshot, without creating a command,
     /// repairing status, or advancing its lifecycle. A claimed command with no
     /// durable receipt is not deliverable. Legacy or inconsistent receipts
@@ -161,6 +349,20 @@ impl Store {
     where
         L::Command: serde::Serialize,
     {
+        self.admit_with_dispatch_inner::<L>(scope_id, idempotency_key, command, dispatch, None)
+    }
+
+    fn admit_with_dispatch_inner<L: Lifecycle>(
+        &mut self,
+        scope_id: &str,
+        idempotency_key: &str,
+        command: L::Command,
+        dispatch: &CommandDispatch,
+        basis: Option<&DispatchReadBasis>,
+    ) -> Result<MaterializedAdmission<L::State>, AdmitError>
+    where
+        L::Command: serde::Serialize,
+    {
         if [
             scope_id,
             idempotency_key,
@@ -188,6 +390,9 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(basis) = basis {
+            check_dispatch_basis(&tx, &self.path, basis)?;
+        }
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO commands
              (command_id, scope_id, idempotency_key, status, snapshot_json)
@@ -294,10 +499,168 @@ impl Store {
 }
 
 #[cfg(test)]
+#[path = "command_dispatch_record_tests.rs"]
+mod record_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use gaugedesk_core::run::{RunCommand, RunPhase, RunState};
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn expired_authority_refuses_command_and_runtime_entry_without_changed_events() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (_, basis) = store.read_for_dispatch(&["grants"], |_| Ok(())).unwrap();
+        let expired = basis
+            .with_deadline(std::time::UNIX_EPOCH)
+            .with_deadline(std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
+        assert_eq!(expired.deadline(), Some(std::time::UNIX_EPOCH));
+        assert!(store
+            .with_dispatch_basis(&expired, || panic!("expired runtime entry"))
+            .is_err());
+        assert!(store
+            .admit_with_dispatch_against::<RunState>(
+                "scope",
+                "key",
+                RunCommand::RequestRun,
+                &dispatch(),
+                &expired
+            )
+            .is_err());
+        assert!(store.command_for_key("scope", "key").unwrap().is_none());
+        assert!(store.records("scope", DISPATCH_KIND).unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_admission_guard_excludes_changes_and_releases_after_lost_response() {
+        let mut product = Store::open_in_memory().unwrap();
+        let mut runtime = Store::open_in_memory().unwrap();
+        let competing = rusqlite::Connection::open(product.path()).unwrap();
+        competing.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let (_, stale) = product.read_for_dispatch(&["grants"], |_| Ok(())).unwrap();
+        product.append_record("grants", "grant", "changed").unwrap();
+        assert!(product
+            .with_dispatch_basis(&stale, || panic!("stale callback entered"))
+            .is_err());
+        let (_, basis) = product.read_for_dispatch(&["grants"], |_| Ok(())).unwrap();
+        let result = product
+            .with_dispatch_basis(&basis, || {
+                assert!(competing.execute_batch("BEGIN IMMEDIATE").is_err());
+                runtime
+                    .append_record("action", "admission", "exact command")
+                    .unwrap();
+                Err::<(), _>("lost runtime response")
+            })
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            runtime.records("action", "admission").unwrap(),
+            ["exact command"]
+        );
+        competing
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
+        let mut foreign = Store::open_in_memory().unwrap();
+        assert!(foreign
+            .with_dispatch_basis(&basis, || panic!("foreign callback entered"))
+            .is_err());
+    }
+
+    #[test]
+    fn authorization_read_is_consistent_and_changed_grants_publish_nothing() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.append_record("grants", "grant", "active").unwrap();
+        let mut other = store.sibling().unwrap();
+        let (observed, basis) = store
+            .read_for_dispatch(&["grants"], |snapshot| {
+                other.append_record("grants", "grant", "revoked")?;
+                snapshot.records("grants", "grant")
+            })
+            .unwrap();
+        assert_eq!(observed, ["active"]);
+        let rejected = store.admit_with_dispatch_against::<RunState>(
+            "scope",
+            "key",
+            RunCommand::RequestRun,
+            &dispatch(),
+            &basis,
+        );
+        assert!(matches!(
+            rejected,
+            Err(AdmitError::Rejected(Rejection {
+                reason: "dispatch authorization changed during preparation"
+            }))
+        ));
+        assert!(store.command_for_key("scope", "key").unwrap().is_none());
+        assert!(store.records("scope", DISPATCH_KIND).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fenced_admission_replays_with_fresh_authority_and_rejects_a_different_store() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (_, basis) = store.read_for_dispatch(&["grants"], |_| Ok(())).unwrap();
+        store.append_record("unrelated", "fact", "change").unwrap();
+        let admitted = store
+            .admit_with_dispatch_against::<RunState>(
+                "scope",
+                "key",
+                RunCommand::RequestRun,
+                &dispatch(),
+                &basis,
+            )
+            .unwrap();
+        assert!(!admitted.replayed);
+        assert!(
+            store
+                .admit_with_dispatch_against::<RunState>(
+                    "scope",
+                    "key",
+                    RunCommand::RequestRun,
+                    &dispatch(),
+                    &basis
+                )
+                .unwrap()
+                .replayed
+        );
+        store.append_record("grants", "grant", "changed").unwrap();
+        assert!(store
+            .admit_with_dispatch_against::<RunState>(
+                "scope",
+                "key",
+                RunCommand::RequestRun,
+                &dispatch(),
+                &basis
+            )
+            .is_err());
+        let (_, current) = store.read_for_dispatch(&["grants"], |_| Ok(())).unwrap();
+        assert!(
+            store
+                .admit_with_dispatch_against::<RunState>(
+                    "scope",
+                    "key",
+                    RunCommand::RequestRun,
+                    &dispatch(),
+                    &current
+                )
+                .unwrap()
+                .replayed
+        );
+        let mut other = Store::open_in_memory().unwrap();
+        other.append_record("grants", "grant", "changed").unwrap();
+        assert!(other
+            .admit_with_dispatch_against::<RunState>(
+                "scope",
+                "key",
+                RunCommand::RequestRun,
+                &dispatch(),
+                &current
+            )
+            .is_err());
+        assert_eq!(store.records("scope", DISPATCH_KIND).unwrap().len(), 1);
+        assert!(other.records("scope", DISPATCH_KIND).unwrap().is_empty());
+        assert!(store.read_for_dispatch(&[], |_| Ok(())).is_err());
+    }
 
     fn dispatch() -> CommandDispatch {
         CommandDispatch {

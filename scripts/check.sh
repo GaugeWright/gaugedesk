@@ -75,6 +75,10 @@ run_contracts() {
     echo "== product contracts =="
     node scripts/check-product-contracts.mjs --enforce-local-evidence
 
+    echo "== action provenance inventory =="
+    node scripts/check-action-provenance.mjs
+    node --test scripts/check-action-provenance.test.mjs
+
     echo "== WhippleScript workstream host contract =="
     node scripts/check-whipplescript-workstream-contract.mjs
     python3 scripts/check-whipplescript-host-action.py

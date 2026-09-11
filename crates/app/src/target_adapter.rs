@@ -353,6 +353,7 @@ impl Workbench {
             WorkTargetKind::Managed => unreachable!(),
         };
         let target = WorkTargetRecord {
+            attributes: Default::default(),
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: target_id.clone(),

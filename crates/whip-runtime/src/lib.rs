@@ -161,12 +161,13 @@ pub struct ProjectedInstance {
 /// connection — SQLite in WAL mode admits a reader beside the writer — so a
 /// running instance is drawn as it runs. The projection is WhippleScript's
 /// own (`whipplescript::instance_view`), which is what keeps this and `whip
-/// view` from disagreeing about the same instance.
+/// view` from disagreeing about the same instance. Observation never initializes
+/// or migrates a store; unavailable storage remains an error for the caller.
 pub fn instance_views(store_path: &Path) -> io::Result<Vec<ProjectedInstance>> {
     use whipplescript::instance_view;
     // `StoreError` is not a `std::error::Error`, so it is carried by its text.
     let store_io = |error: whipplescript_store::StoreError| io::Error::other(format!("{error:?}"));
-    let store = whipplescript_store::SqliteStore::open(store_path).map_err(store_io)?;
+    let store = whipplescript_store::SqliteStore::open_read_only(store_path).map_err(store_io)?;
     let mut projected = Vec::new();
     for instance in store.list_instances().map_err(store_io)? {
         let program = store
@@ -261,6 +262,36 @@ mod instance_view_tests {
         // Every rule answers about its record sources, which is what tells a
         // `table` declaration's lowered rule from behaviour someone wrote.
         assert!(structure["rules"][0]["records"].is_array());
+    }
+
+    #[test]
+    fn observing_an_unavailable_runtime_does_not_initialize_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [
+            dir.path().join("missing.sqlite"),
+            dir.path().join("absent/runtime.sqlite"),
+        ] {
+            assert!(instance_views(&path).is_err());
+            assert!(!path.exists());
+        }
+        assert!(!dir.path().join("absent").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_projection_preserves_existing_database_bytes_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sqlite");
+        drop(whipplescript_store::SqliteStore::open(&path).unwrap());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(instance_views(&path).unwrap().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 
     #[test]

@@ -55,10 +55,17 @@ class PinTests(unittest.TestCase):
     def test_changed_source_public_revision_and_digest_are_refused(self):
         path = self.root / checker.PIN
         original = json.loads(path.read_text())
-        for field, size in (("source_commit", 40), ("public_commit", 40), ("contract_digest", 64)):
+        for field, value in (
+            ("source_commit", "0" * 40), ("public_commit", "0" * 40),
+            ("contract_digest", "0" * 64),
+            ("contract_path", "spec/host-action-contract-v1.json"),
+            ("contract_path", "spec/host-action-contract-v2.json"),
+            ("contract_revision", "whipplescript-host-action/v1.0.0"),
+            ("contract_revision", "whipplescript-host-action/v2.0.0"),
+        ):
             with self.subTest(field=field):
                 changed = dict(original)
-                changed[field] = "0" * size
+                changed[field] = value
                 path.write_text(json.dumps(changed))
                 with self.assertRaises(SystemExit):
                     checker.check_pin(self.root)

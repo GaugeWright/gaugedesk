@@ -100,6 +100,12 @@ pub async fn require_home_admission(
     mut req: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
+    // Only this boundary's successful verification may supply action facts.
+    // This applies to exempt routes too: passing through is not authentication.
+    req.extensions_mut()
+        .remove::<crate::identity::AuthenticatedActor>();
+    req.extensions_mut()
+        .remove::<crate::identity::AuthenticatedActionContext>();
     let path = req.uri().path();
     if req.method() == Method::OPTIONS
         || path == "/health"
@@ -128,6 +134,9 @@ pub async fn require_home_admission(
                 crate::mobile_machine_session::authorize_session(&mut wb, session)
             };
             if let Some(grant) = grant {
+                req.extensions_mut().insert(
+                    crate::identity::AuthenticatedActionContext::machine_controller(&grant),
+                );
                 req.extensions_mut()
                     .insert(crate::identity::AuthenticatedActor(AuthorityId::new(
                         grant.device.as_str(),
@@ -156,6 +165,9 @@ pub async fn require_home_admission(
                     crate::mobile_machine_session::authorize_session(&mut wb, session)
                 };
                 if let Some(grant) = grant.filter(|grant| grant.id == grant_id) {
+                    req.extensions_mut().insert(
+                        crate::identity::AuthenticatedActionContext::machine_controller(&grant),
+                    );
                     req.extensions_mut()
                         .insert(crate::identity::AuthenticatedActor(AuthorityId::new(
                             grant.device.as_str(),
@@ -206,25 +218,24 @@ pub async fn require_home_admission(
                     // Admission has legacy local/bootstrap fallbacks. Only a
                     // bearer verified at this boundary can supply attribution.
                     Ok(bearer
-                        .and_then(|token| wb.authenticate_bearer(token))
-                        .filter(|verified| verified == &actor))
+                        .and_then(|token| wb.authenticate_action_context(token))
+                        .filter(|verified| verified.actor() == &actor))
                 }
             }
         }
     };
-    let actor = match admitted {
-        Ok(actor) => actor,
+    let context = match admitted {
+        Ok(context) => context,
         Err((code, message)) => {
             return (code, Json(json!({ "error": message }))).into_response();
         }
     };
     // Preserve the identity actually verified and admitted by this Home.
     // Never promote a legacy fallback or an upstream extension into proof.
-    req.extensions_mut()
-        .remove::<crate::identity::AuthenticatedActor>();
-    if let Some(actor) = actor {
+    if let Some(context) = context {
         req.extensions_mut()
-            .insert(crate::identity::AuthenticatedActor(actor));
+            .insert(crate::identity::AuthenticatedActor(context.actor().clone()));
+        req.extensions_mut().insert(context);
     }
     next.run(req).await
 }
@@ -288,32 +299,36 @@ mod tests {
                 .home_admissions
                 .open(home, AuthorityId::new(default_actor));
             let wb = Arc::new(std::sync::Mutex::new(workbench));
-            let app =
-                Router::new()
-                    .route(
-                        "/inspect-admitted-actor",
-                        axum::routing::get(
-                            |actor: Option<
-                                axum::Extension<crate::identity::AuthenticatedActor>,
-                            >| async move {
-                                assert!(
-                                    actor.is_none(),
-                                    "a fallback is not an authenticated actor"
-                                );
-                                StatusCode::NO_CONTENT
-                            },
-                        ),
-                    )
-                    .route_layer(axum::middleware::from_fn_with_state(
-                        wb,
-                        require_home_admission,
-                    ));
+            let app = Router::new()
+                .route(
+                    "/inspect-admitted-actor",
+                    axum::routing::get(
+                        |actor: Option<axum::Extension<crate::identity::AuthenticatedActor>>,
+                         context: Option<
+                            axum::Extension<crate::identity::AuthenticatedActionContext>,
+                        >| async move {
+                            assert!(actor.is_none(), "a fallback is not an authenticated actor");
+                            assert!(context.is_none(), "a fallback has no action claims");
+                            StatusCode::NO_CONTENT
+                        },
+                    ),
+                )
+                .route_layer(axum::middleware::from_fn_with_state(
+                    wb,
+                    require_home_admission,
+                ));
             let request = Request::builder()
                 .uri("/inspect-admitted-actor")
                 .header(HOME_ADMISSION_HEADER, token.encode())
                 .extension(crate::identity::AuthenticatedActor(AuthorityId::new(
                     "unverified",
                 )))
+                .extension(
+                    crate::identity::AuthenticatedActionContext::account_session(
+                        AuthorityId::new("unverified"),
+                        "unverified-session".into(),
+                    ),
+                )
                 .body(Body::empty())
                 .unwrap();
             assert_eq!(
@@ -321,6 +336,47 @@ mod tests {
                 StatusCode::NO_CONTENT
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_exempt_route_does_not_inherit_unverified_action_context() {
+        let workbench = crate::Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        let wb = Arc::new(std::sync::Mutex::new(workbench));
+        let app = Router::new()
+            .route(
+                "/health",
+                axum::routing::get(
+                    |actor: Option<axum::Extension<crate::identity::AuthenticatedActor>>,
+                     context: Option<
+                        axum::Extension<crate::identity::AuthenticatedActionContext>,
+                    >| async move {
+                        assert!(actor.is_none());
+                        assert!(context.is_none());
+                        StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                wb,
+                require_home_admission,
+            ));
+        let request = Request::builder()
+            .uri("/health")
+            .extension(crate::identity::AuthenticatedActor(AuthorityId::new(
+                "upstream",
+            )))
+            .extension(
+                crate::identity::AuthenticatedActionContext::account_session(
+                    AuthorityId::new("upstream"),
+                    "unverified-session".into(),
+                ),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
     }
 
     #[tokio::test]
@@ -371,7 +427,33 @@ mod tests {
                 axum::routing::get(
                     |axum::Extension(actor): axum::Extension<
                         crate::identity::AuthenticatedActor,
-                    >| async move { actor.0.as_str().to_owned() },
+                    >,
+                     axum::Extension(context): axum::Extension<
+                        crate::identity::AuthenticatedActionContext,
+                    >| async move {
+                        assert_eq!(context.actor(), &actor.0);
+                        assert_eq!(
+                            context.authentication(),
+                            &crate::identity::ActorAuthentication::IdentityProvider
+                        );
+                        assert_eq!(context.claims(), &AuthorityAttributes::default());
+                        actor.0.as_str().to_owned()
+                    },
+                ),
+            )
+            .route(
+                "/inspect-account-action",
+                axum::routing::get(
+                    |axum::Extension(context): axum::Extension<
+                        crate::identity::AuthenticatedActionContext,
+                    >| async move {
+                        assert!(matches!(
+                            context.authentication(),
+                            crate::identity::ActorAuthentication::AccountSession { .. }
+                        ));
+                        assert_eq!(context.claims(), &AuthorityAttributes::default());
+                        context.actor().as_str().to_owned()
+                    },
                 ),
             )
             .route_layer(axum::middleware::from_fn_with_state(
@@ -415,6 +497,19 @@ mod tests {
             .await;
             assert_eq!((status, actor.as_str()), (StatusCode::OK, "alice"));
         }
+        let account_token = inspect
+            .lock_unpoisoned()
+            .mint_account_session("alice", "passkey", 60)
+            .unwrap();
+        let (status, actor) = response(
+            &app,
+            "GET",
+            "/inspect-account-action",
+            Some(&account_token),
+            Some(&admission),
+        )
+        .await;
+        assert_eq!((status, actor.as_str()), (StatusCode::OK, "alice"));
         let other_identity_admission = {
             let mut guard = inspect.lock_unpoisoned();
             let home = guard.home_id().clone();

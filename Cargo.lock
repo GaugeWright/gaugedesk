@@ -1286,6 +1286,7 @@ dependencies = [
  "proptest",
  "rcgen",
  "ring",
+ "rusqlite",
  "semver",
  "serde",
  "serde_json",
@@ -1467,10 +1468,12 @@ name = "gaugedesk-workspace"
 version = "0.4.9"
 dependencies = [
  "hex",
+ "quote",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "syn 2.0.119",
  "tempfile",
  "whipplescript-kernel",
  "whipplescript-store",

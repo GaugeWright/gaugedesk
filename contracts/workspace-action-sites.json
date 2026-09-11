@@ -1,0 +1,4226 @@
+{
+  "schema": "gaugedesk.workspace-action-sites.v1",
+  "coverage": "workspace-capability-syntax",
+  "packages": [
+    "gaugedesk-app",
+    "gaugedesk-workspace",
+    "gaugedesk-ee"
+  ],
+  "api": [
+    {
+      "declaration": {
+        "name": "boundary_cut",
+        "owner": "ChatWorkspace",
+        "signature": "fn boundary_cut (& self) -> Result < RevisionId >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "boxed_clone",
+        "owner": "ChatWorkspace",
+        "signature": "fn boxed_clone (& self) -> Box < dyn ChatWorkspace >"
+      },
+      "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "branch",
+        "owner": "ChatWorkspace",
+        "signature": "fn branch (& self) -> & str"
+      },
+      "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "commit_turn",
+        "owner": "ChatWorkspace",
+        "signature": "fn commit_turn (& self , message : & str) -> Result < Option < RevisionId > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "current_cut",
+        "owner": "ChatWorkspace",
+        "signature": "fn current_cut (& self) -> Result < Option < String > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "diff_against_main",
+        "owner": "ChatWorkspace",
+        "signature": "fn diff_against_main (& self) -> Result < String >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "ingest",
+        "owner": "ChatWorkspace",
+        "signature": "fn ingest (& self , source : & Path) -> Result < usize >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "ingest_into",
+        "owner": "ChatWorkspace",
+        "signature": "fn ingest_into (& self , prefix : & str , source : & Path) -> Result < usize >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "ingest_upload",
+        "owner": "ChatWorkspace",
+        "signature": "fn ingest_upload (& self , files : & [(String , String)]) -> Result < usize >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "ingest_upload_into",
+        "owner": "ChatWorkspace",
+        "signature": "fn ingest_upload_into (& self , prefix : & str , files : & [(String , String)]) -> Result < usize >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "merge_into_main",
+        "owner": "ChatWorkspace",
+        "signature": "fn merge_into_main (& self) -> Result < MergeOutcome >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "merge_preview",
+        "owner": "ChatWorkspace",
+        "signature": "fn merge_preview (& self , rel : & str , draft : & str , base_cut : & str) -> Result < Option < MergePreview > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "merge_probe",
+        "owner": "ChatWorkspace",
+        "signature": "fn merge_probe (& self) -> Result < MergeOutcome >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "native_file_action_evidence_target",
+        "owner": "ChatWorkspace",
+        "signature": "fn native_file_action_evidence_target (& self , _path : & str , _base : & str ,) -> Result < NativeFileActionEvidenceTarget >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "native_file_action_target",
+        "owner": "ChatWorkspace",
+        "signature": "fn native_file_action_target (& self , _path : & str , _base : & str ,) -> Result < NativeFileActionTarget >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "observe",
+        "owner": "ChatWorkspace",
+        "signature": "fn observe (& self) -> Result < WorkspaceObservation >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "path",
+        "owner": "ChatWorkspace",
+        "signature": "fn path (& self) -> & Path"
+      },
+      "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "publish",
+        "owner": "ChatWorkspace",
+        "signature": "fn publish (& self) -> Result < RevisionId >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "read_file",
+        "owner": "ChatWorkspace",
+        "signature": "fn read_file (& self , rel : & str) -> Result < String >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "read_file_bytes_capped",
+        "owner": "ChatWorkspace",
+        "signature": "fn read_file_bytes_capped (& self , rel : & str , max_bytes : usize) -> Result < Option < Vec < u8 > > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "read_file_capped",
+        "owner": "ChatWorkspace",
+        "signature": "fn read_file_capped (& self , rel : & str , max_bytes : usize) -> Result < Option < String > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "rehome",
+        "owner": "ChatWorkspace",
+        "signature": "fn rehome (& mut self , target : & str) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "remove_file",
+        "owner": "ChatWorkspace",
+        "signature": "fn remove_file (& self , rel : & str) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "replace_sparse_roots",
+        "owner": "ChatWorkspace",
+        "signature": "fn replace_sparse_roots (& mut self , _roots : & BTreeSet < String >) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "revert_to_main",
+        "owner": "ChatWorkspace",
+        "signature": "fn revert_to_main (& self) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "save_file_with_base",
+        "owner": "ChatWorkspace",
+        "signature": "fn save_file_with_base (& self , rel : & str , draft : & str , base : SaveBase < '_ > , resolutions : & [RegionResolution] ,) -> Result < SaveFileOutcome >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "set_target",
+        "owner": "ChatWorkspace",
+        "signature": "fn set_target (& mut self , target : & str) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "standing_revision",
+        "owner": "ChatWorkspace",
+        "signature": "fn standing_revision (& self) -> Result < RevisionId >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "sync_from_main",
+        "owner": "ChatWorkspace",
+        "signature": "fn sync_from_main (& self) -> Result < MergeOutcome >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "target",
+        "owner": "ChatWorkspace",
+        "signature": "fn target (& self) -> & str"
+      },
+      "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "tree",
+        "owner": "ChatWorkspace",
+        "signature": "fn tree (& self) -> Result < Vec < FileEntry > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "write_file",
+        "owner": "ChatWorkspace",
+        "signature": "fn write_file (& self , rel : & str , content : & str) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "write_file_bytes",
+        "owner": "ChatWorkspace",
+        "signature": "fn write_file_bytes (& self , rel : & str , content : & [u8]) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "archive_workstream",
+        "owner": "Workspace",
+        "signature": "fn archive_workstream (& self , _workstream_id : & str) -> Result < Vec < String > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "create_engagement",
+        "owner": "Workspace",
+        "signature": "fn create_engagement (& self , id : & str) -> Result < Box < dyn ChatWorkspace > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "create_engagement_on",
+        "owner": "Workspace",
+        "signature": "fn create_engagement_on (& self , id : & str , target : & str) -> Result < Box < dyn ChatWorkspace > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "create_engagement_subset",
+        "owner": "Workspace",
+        "signature": "fn create_engagement_subset (& self , id : & str , target : & str , roots : & BTreeSet < String > ,) -> Result < Box < dyn ChatWorkspace > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "create_named_workstream",
+        "owner": "Workspace",
+        "signature": "fn create_named_workstream (& self , ws_id : & str , _name : Option < & str >) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "create_workstream",
+        "owner": "Workspace",
+        "signature": "fn create_workstream (& self , ws_id : & str) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "current_main_cut",
+        "owner": "Workspace",
+        "signature": "fn current_main_cut (& self) -> Result < Option < String > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "cut_descends_from",
+        "owner": "Workspace",
+        "signature": "fn cut_descends_from (& self , _descendant_cut : & str , _ancestor_cut : & str) -> Result < bool >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "engagement_home_receipt",
+        "owner": "Workspace",
+        "signature": "fn engagement_home_receipt (& self , _engagement_id : & str) -> Result < BranchHomeReceiptV1 >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "export",
+        "owner": "Workspace",
+        "signature": "fn export (& self) -> Result < WorkspaceExport >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "export_format",
+        "owner": "Workspace",
+        "signature": "fn export_format (& self) -> & 'static str"
+      },
+      "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "fork_engagement_at",
+        "owner": "Workspace",
+        "signature": "fn fork_engagement_at (& self , id : & str , source_branch : & str , target : & str , cut_id : & str ,) -> Result < Box < dyn ChatWorkspace > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "fork_engagement_subset_at",
+        "owner": "Workspace",
+        "signature": "fn fork_engagement_subset_at (& self , id : & str , source_branch : & str , target : & str , cut_id : & str , roots : & BTreeSet < String > ,) -> Result < Box < dyn ChatWorkspace > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "leave_engagement_workstream",
+        "owner": "Workspace",
+        "signature": "fn leave_engagement_workstream (& self , _engagement_id : & str) -> Result < Option < String > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "mainline",
+        "owner": "Workspace",
+        "signature": "fn mainline (& self) -> & str"
+      },
+      "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "peer_source",
+        "owner": "Workspace",
+        "signature": "fn peer_source (& self) -> PeerSource"
+      },
+      "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "promote_workstream_boundary",
+        "owner": "Workspace",
+        "signature": "fn promote_workstream_boundary (& self , _workstream_id : & str , _workspace_authority_id : & str , _reservation_id : & str ,) -> Result < WorkstreamPromotionOutcome >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "promote_workstream_to_main",
+        "owner": "Workspace",
+        "signature": "fn promote_workstream_to_main (& self , ws_id : & str) -> Result < MergeOutcome >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "pull_from",
+        "owner": "Workspace",
+        "signature": "fn pull_from (& self , src : & PeerSource) -> Result < MergeOutcome >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "purge_unreachable_objects",
+        "owner": "Workspace",
+        "signature": "fn purge_unreachable_objects (& self) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "reconcile_engagements",
+        "owner": "Workspace",
+        "signature": "fn reconcile_engagements (& self) -> Result < Vec < (String , Box < dyn ChatWorkspace >) > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "release_workstream_promotion_boundary",
+        "owner": "Workspace",
+        "signature": "fn release_workstream_promotion_boundary (& self , _workstream_id : & str , _reservation_id : & str ,) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "remove_engagement",
+        "owner": "Workspace",
+        "signature": "fn remove_engagement (& self , id : & str) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "reserve_workstream_promotion_boundary",
+        "owner": "Workspace",
+        "signature": "fn reserve_workstream_promotion_boundary (& self , _workstream_id : & str , _reservation_id : & str ,) -> Result < WorkstreamPromotionReservation >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "seed_main",
+        "owner": "Workspace",
+        "signature": "fn seed_main (& self , files : & [(& str , & str)]) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "transfer_engagement_to_workstream",
+        "owner": "Workspace",
+        "signature": "fn transfer_engagement_to_workstream (& self , _engagement_id : & str , _workstream_id : & str ,) -> Result < WorkstreamTransferOutcome >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "workstream",
+        "owner": "Workspace",
+        "signature": "fn workstream (& self , _workstream_id : & str) -> Result < Option < WorkstreamRow > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "workstream_id_of",
+        "owner": "Workspace",
+        "signature": "fn workstream_id_of (& self , target : & str) -> Option < String >"
+      },
+      "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "workstream_members",
+        "owner": "Workspace",
+        "signature": "fn workstream_members (& self , _workstream_id : & str) -> Result < Vec < String > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "workstream_ref",
+        "owner": "Workspace",
+        "signature": "fn workstream_ref (& self , ws_id : & str) -> String"
+      },
+      "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "export_format",
+        "owner": "WorkspaceProvider",
+        "signature": "fn export_format (& self) -> & 'static str"
+      },
+      "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "fork_from_at",
+        "owner": "WorkspaceProvider",
+        "signature": "fn fork_from_at (& self , dir : & Path , source : & PeerSource) -> Result < Box < dyn Workspace > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "from_export_at",
+        "owner": "WorkspaceProvider",
+        "signature": "fn from_export_at (& self , dir : & Path , export : & [u8]) -> Result < Box < dyn Workspace > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "init_at",
+        "owner": "WorkspaceProvider",
+        "signature": "fn init_at (& self , dir : & Path) -> Result < Box < dyn Workspace > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "open_at",
+        "owner": "WorkspaceProvider",
+        "signature": "fn open_at (& self , dir : & Path) -> Box < dyn Workspace >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "native_resolution_recording_evidence_target",
+        "owner": "ChatWorkspace",
+        "signature": "fn native_resolution_recording_evidence_target (& self , _path : & str , _scope : whipplescript_store :: vcs :: resolution_scope :: ResolutionMemoryScope ,) -> Result < NativeResolutionRecordingEvidenceTarget >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "native_resolution_recording_target",
+        "owner": "ChatWorkspace",
+        "signature": "fn native_resolution_recording_target (& self , _path : & str , _scope : whipplescript_store :: vcs :: resolution_scope :: ResolutionMemoryScope ,) -> Result < NativeResolutionRecordingTarget >"
+      },
+      "classification": "requires-provenance-review"
+    }
+  ],
+  "profiles": {
+    "editor-and-import": {
+      "coverage_id": "ACTION-4",
+      "reason": "Editor, import, upload, restore and read/base helpers require exact admitted intent and evidence; existing materialization and best-effort transcript publication do not establish parity.",
+      "required_evidence": [
+        "Migrate actual HTTP and non-HTTP callers to the shared governed implementation.",
+        "Preserve conflict/resolution and exact observed bases; attribute external writes only as observed."
+      ]
+    },
+    "agent-turn": {
+      "coverage_id": "ACTION-5",
+      "reason": "Agent turn boundaries, automatic merge and autosync mutate or observe shared workspace state and need their causal command/effect/result mapping.",
+      "required_evidence": [
+        "Retain actor, delegation, input taint and exact turn/candidate bases.",
+        "Reconcile interrupted merges and commits without manufacturing success or losing external uncertainty."
+      ]
+    },
+    "authoring": {
+      "coverage_id": "ACTION-4",
+      "reason": "Definition reads, ability edits, archetype construction and version freezing combine durable authoring work with temporary workspace views.",
+      "required_evidence": [
+        "Separate admitted authored bytes and immutable versions from derived materialization.",
+        "Bind every durable authoring change and release result to its originating authenticated command."
+      ]
+    },
+    "startup-and-migration": {
+      "coverage_id": "ACTION-8",
+      "reason": "Startup migration, reconciliation and recovery can import or change durable work without an HTTP request; bootstrap must not manufacture a work grant or retroactive actor.",
+      "required_evidence": [
+        "Declare the migration/observation boundary and preserve legacy or unknown provenance.",
+        "Map durable effects and recovery to their actual authority; classify disposable initialization separately."
+      ]
+    },
+    "topology-and-settlement": {
+      "coverage_id": "ACTION-5",
+      "reason": "Workspace construction, homing, promotion and target settlement require shared command/effect/result provenance under their existing independent authorities.",
+      "required_evidence": [
+        "Preserve reservations, CAS, exact candidate/target bases and compensation identity.",
+        "Qualify partial application, current authority and interrupted recovery without a second settlement machine."
+      ]
+    },
+    "native-action-boundary": {
+      "coverage_id": "ACTION-3",
+      "reason": "These are native input/target custody and action-boundary calls already exercised by the editor foundation; entry-point migration and other callers remain open.",
+      "required_evidence": [
+        "Retain current actor/policy and ownership fencing plus input/base/result exclusion.",
+        "Connect the qualified runtime evidence and product admission to live entry points without an alternate writer."
+      ]
+    },
+    "native-workspace-adapter": {
+      "coverage_id": "ACTION-5",
+      "reason": "Native workspace methods adapt the owning WhippleScript stores, including read-triggered imports, versioned changes, topology and disposable materialization.",
+      "required_evidence": [
+        "Map each effectful adapter call to an admitted operation; storage-engine writes do not recursively become commands.",
+        "Preserve exact native cuts and retention, and identify observation-only or derived paths explicitly."
+      ]
+    },
+    "external-workspace-adapter": {
+      "coverage_id": "ACTION-5",
+      "reason": "External-folder and Git adapters retain external authority and may perform file or process effects; native history cannot stand in for their observation ceiling.",
+      "required_evidence": [
+        "Bind exact external bases and declared apply/publish/reconciliation capability.",
+        "Keep opaque process footprints and unknown external authorship explicit; do not retry uncertain effects blindly."
+      ]
+    },
+    "custody-and-erasure": {
+      "coverage_id": "ACTION-6",
+      "reason": "Credential, content-key and quarantine cleanup sites share workspace method names but belong to dedicated custody/erasure authorities.",
+      "required_evidence": [
+        "Verify the actual receiver and admitted custody/erasure outcome rather than inferring a workspace call from its name.",
+        "Retain permitted metadata only; secret bytes never enter generic commands or runtime evidence."
+      ]
+    },
+    "publication-review": {
+      "coverage_id": "ACTION-8",
+      "reason": "Publication-shaped sites can emit projections or invoke another authority; syntax alone cannot establish whether a durable or external effect occurs.",
+      "required_evidence": [
+        "Resolve the actual receiver and distinguish admitted-fact notification from directory, package or other external publication.",
+        "A projection notification is derived only when it creates no independent durable work or effect."
+      ]
+    },
+    "route-reference": {
+      "coverage_id": "ACTION-3",
+      "reason": "These qualified function references register handlers with capability-shaped names; the referenced handler and its downstream effects require explicit mapping.",
+      "required_evidence": [
+        "Link each registration to its actual authenticated command factory and result path.",
+        "A handler reference is not itself proof of runtime mediation or an exemption for the handler body."
+      ]
+    },
+    "native-recording-boundary": {
+      "coverage_id": "ACTION-4",
+      "reason": "Native recording descriptors bind the actual selected store and namespace, with a separate read-only historical evidence adapter. Home admission retains exact input and a fenced independent command/outbox; delivery verifies original admission and current authority. Execution resolves the retained input under the Home fences and invokes the runtime-owned recording door after exact target, scope and IFC checks. Independent inspection authenticates the current reader, preserves all original and current metadata restrictions and validates the original Home input mapping before reading the actual historical batch through a read-only adapter. Reconciliation uses its independently admitted outbox and retained read policy, current investigator authority and an explicitly acquired actual-Home runtime epoch. The owner verifies the original execution, input mapping and actual historical target batch before publishing a disposition; the Home admits only the pinned runtime acknowledgment, with no recording retry or workflow advance. Product result admission independently checks the committed reconciliation/outbox/acknowledgment, undisputed Applied history and actual original batch, then records the owner's exact ordered outcomes under the current product fence. Reads return only the immutable admitted metadata under current access and all retained result restrictions, without opening runtime, target or input databases or promising body availability. Derived-input handling and activation remain open.",
+      "required_evidence": [
+        "Derive input and scope from current Home authority and invoke only the runtime-owned fixed recording profile after durable dispatch.",
+        "Preserve original attribution and first-wins outcomes without advancing file heads or reconstructing erased bodies.",
+        "Authorize an independent investigator before reading the original target receipt; do not treat an absent receipt as non-application.",
+        "Refuse stale or foreign-Home ownership, missing outboxes and revoked current investigators; recover a lost acknowledgment from the exact runtime receipt without retrying the target.",
+        "Keep original batch attribution and both merge orientations, including inserted=false for existing winners; a later investigator or result-admitting reader never becomes their original author.",
+        "Refuse missing admission, acknowledgment, target receipt or product commit receipt, and disputed runtime evidence; retain stricter historical metadata restrictions after target policy relaxation.",
+        "Recover product commit failures under the same result identity without runtime or target mutation; independently authorize read-only historical result retrieval after backing runtime or target removal."
+      ]
+    }
+  },
+  "sites": [
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::remove_project_credential_key",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "fs :: remove_file (self . project_credential_key_path (project_id))",
+        "file": "crates/app/src/account.rs"
+      },
+      "profile": "custody-and-erasure"
+    },
+    {
+      "site": {
+        "callable": "post_library_sync_publish",
+        "capability": "publish",
+        "count": 1,
+        "expression": "crate :: directory_sync :: publish (& crate :: net_http :: HttpClient :: new () , & base , & put)",
+        "file": "crates/app/src/account_routes.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "retract_published_entry",
+        "capability": "publish",
+        "count": 1,
+        "expression": "crate :: directory_sync :: publish (& crate :: net_http :: HttpClient :: new () , & base , & put)",
+        "file": "crates/app/src/account_routes.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for ActionInputCustody < C >::publish",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish ()",
+        "file": "crates/app/src/action_inputs.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "local_content_kek",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (& staged)",
+        "file": "crates/app/src/at_rest.rs"
+      },
+      "profile": "custody-and-erasure"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for ContentVault::crypto_erase",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (self . key_path (scope))",
+        "file": "crates/app/src/content_vault.rs"
+      },
+      "profile": "custody-and-erasure"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for ContentVault::reerase_recorded",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (& path)",
+        "file": "crates/app/src/content_vault.rs"
+      },
+      "profile": "custody-and-erasure"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_engagement_merge_action",
+        "capability": "current_cut",
+        "count": 1,
+        "expression": "engagement . current_cut ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_engagement_merge_action",
+        "capability": "merge_into_main",
+        "count": 2,
+        "expression": "self . engagements . get (id) . unwrap () . merge_into_main ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_engagement_merge_action",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (id , event)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_engagement_merge_action",
+        "capability": "sync_from_main",
+        "count": 1,
+        "expression": "sibling . sync_from_main ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::candidate_within_target_scope",
+        "capability": "diff_against_main",
+        "count": 1,
+        "expression": "self . engagements . get (chat_id) . ok_or_else (| | \"chat candidate is unavailable\" . to_owned ()) ? . diff_against_main ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_default_engagement",
+        "capability": "create_engagement_subset",
+        "count": 1,
+        "expression": "workspace . create_engagement_subset (& id , workspace . mainline () , & BTreeSet :: from ([root]))",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::engagement_current_cut",
+        "capability": "current_cut",
+        "count": 1,
+        "expression": "eng . current_cut ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::engagement_diff",
+        "capability": "diff_against_main",
+        "count": 1,
+        "expression": "eng . diff_against_main ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::engagement_merge_preview",
+        "capability": "merge_preview",
+        "count": 1,
+        "expression": "eng . merge_preview (& path , draft , base_cut)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::engagement_task_context",
+        "capability": "boundary_cut",
+        "count": 1,
+        "expression": "eng . boundary_cut ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::engagement_tree",
+        "capability": "tree",
+        "count": 1,
+        "expression": "eng . tree ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ingest_context_into_engagement",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "eng . commit_turn (& format ! (\"ingest context: {}\" , path . display ()))",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ingest_context_into_engagement",
+        "capability": "ingest",
+        "count": 1,
+        "expression": "eng . ingest (path)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ingest_context_into_engagement",
+        "capability": "ingest_into",
+        "count": 1,
+        "expression": "eng . ingest_into (& prefix , path)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ingest_upload_into_engagement",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "eng . commit_turn (& format ! (\"ingest uploaded context: {n} file(s)\"))",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ingest_upload_into_engagement",
+        "capability": "ingest_upload",
+        "count": 1,
+        "expression": "eng . ingest_upload (files)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ingest_upload_into_engagement",
+        "capability": "ingest_upload_into",
+        "count": 1,
+        "expression": "eng . ingest_upload_into (& prefix , files)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::read_engagement_file",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "eng . read_file (& path)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::read_engagement_file_bytes",
+        "capability": "read_file_bytes_capped",
+        "count": 1,
+        "expression": "eng . read_file_bytes_capped (& path , max_bytes)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::revert_engagement",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (id , ServerEvent :: Admitted { kind : \"revert\" . into () , text : \"reverted to main — engagement work discarded\" . into () , } ,)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::revert_engagement",
+        "capability": "revert_to_main",
+        "count": 1,
+        "expression": "eng . revert_to_main ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::save_engagement_file_with_base",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (chat_id , ev)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::save_engagement_file_with_base",
+        "capability": "save_file_with_base",
+        "count": 1,
+        "expression": "eng . save_file_with_base (& workspace_path , draft , base , resolutions)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_live_engagement_target",
+        "capability": "set_target",
+        "count": 1,
+        "expression": "eng . set_target (& target . into ())",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::sync_engagement_from_main",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (id , ev)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::sync_engagement_from_main",
+        "capability": "sync_from_main",
+        "count": 1,
+        "expression": "eng . sync_from_main ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::write_engagement_config",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (id , ServerEvent :: Admitted { kind : \"authoring\" . into () , text : \"agent config updated\" . into () , } ,)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::write_engagement_file",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "eng . commit_turn (& format ! (\"edit {path}\"))",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::write_engagement_file",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (chat_id , ev)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::write_engagement_file",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "eng . write_file (& workspace_path , body)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::auto_advance_turn",
+        "capability": "diff_against_main",
+        "count": 1,
+        "expression": "e . diff_against_main ()",
+        "file": "crates/app/src/engine.rs"
+      },
+      "profile": "agent-turn"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::auto_advance_turn",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "e . merge_into_main ()",
+        "file": "crates/app/src/engine.rs"
+      },
+      "profile": "agent-turn"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::greedy_autosync",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "e . merge_into_main ()",
+        "file": "crates/app/src/engine.rs"
+      },
+      "profile": "agent-turn"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::greedy_autosync",
+        "capability": "sync_from_main",
+        "count": 1,
+        "expression": "se . sync_from_main ()",
+        "file": "crates/app/src/engine.rs"
+      },
+      "profile": "agent-turn"
+    },
+    {
+      "site": {
+        "callable": "run_task_streaming_billed",
+        "capability": "boundary_cut",
+        "count": 1,
+        "expression": "engagement . boundary_cut ()",
+        "file": "crates/app/src/engine.rs"
+      },
+      "profile": "agent-turn"
+    },
+    {
+      "site": {
+        "callable": "run_task_streaming_billed",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (task)",
+        "file": "crates/app/src/engine.rs"
+      },
+      "profile": "agent-turn"
+    },
+    {
+      "site": {
+        "callable": "run_task_streaming_billed",
+        "capability": "diff_against_main",
+        "count": 2,
+        "expression": "engagement . diff_against_main ()",
+        "file": "crates/app/src/engine.rs"
+      },
+      "profile": "agent-turn"
+    },
+    {
+      "site": {
+        "callable": "run_task_streaming_billed",
+        "capability": "merge_probe",
+        "count": 1,
+        "expression": "engagement . merge_probe ()",
+        "file": "crates/app/src/engine.rs"
+      },
+      "profile": "agent-turn"
+    },
+    {
+      "site": {
+        "callable": "admit_crossing",
+        "capability": "publish",
+        "count": 1,
+        "expression": "guard . publish (FED_INBOX_SCOPE , ServerEvent :: Admitted { kind : \"federated\" . into () , text : format ! (\"{} ← {} : {}\" , wire . target , wire . source , wire . payload_handle) , } ,)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "admit_observations",
+        "capability": "publish",
+        "count": 1,
+        "expression": "guard . publish (run_scope , ServerEvent :: Admitted { kind : \"remote-run\" . into () , text : format ! (\"{} observation(s) federated from {source}\" , observations . len ()) , } ,)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "admit_remote_consent",
+        "capability": "publish",
+        "count": 1,
+        "expression": "guard . publish (& req . review_scope , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"remote consent from {} → {:?}\" , req . consenting_authority , state . phase) , } ,)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "admit_revocation",
+        "capability": "publish",
+        "count": 1,
+        "expression": "guard . publish (FED_INBOX_SCOPE , ServerEvent :: Admitted { kind : \"revocation\" . into () , text : format ! (\"revoked a device subkey of {revoker}\") , } ,)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "admit_run_place",
+        "capability": "workstream_members",
+        "count": 1,
+        "expression": "guard . workstream_members (& root . workstream_id)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_default_target_engagement",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "target . create_engagement (id)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::materialize_collaboration_workspace",
+        "capability": "from_export_at",
+        "count": 1,
+        "expression": "provider . from_export_at (& dir , bundle)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::materialize_target",
+        "capability": "from_export_at",
+        "count": 1,
+        "expression": "provider . from_export_at (& dir , bundle)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::materialize_target",
+        "capability": "reconcile_engagements",
+        "count": 1,
+        "expression": "target . reconcile_engagements ()",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::bind_native_editor_target",
+        "capability": "native_file_action_target",
+        "count": 1,
+        "expression": "self . engagements . get (chat_id) . ok_or (\"editor workspace is unavailable\") ? . native_file_action_target (& path , base)",
+        "file": "crates/app/src/file_action_delivery.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::deliver_editor_file_save",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (std :: slice :: from_ref (input) , | | { target . publish_base (| | { self . store_mut () . with_dispatch_basis (& basis , | | { let verifier = NativeAdmissionVerifier { command , key : key . public_key () , } ; let proof = key . sign (& bytes) ; runtime . admit_action (command . clone () , & action , & verifier , proof . as_bytes () ,) }) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"editor delivery authorization changed: {error:?}\")) }) ? . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"runtime editor admission refused: {error:?}\")) }) }) })",
+        "file": "crates/app/src/file_action_delivery.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_editor_file_save",
+        "capability": "native_file_action_target",
+        "count": 1,
+        "expression": "self . engagements . get (request . chat_id) . ok_or (\"chat workspace is unavailable\") ? . native_file_action_target (& authority . workspace_path , request . base_cut)",
+        "file": "crates/app/src/file_action_factory.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_editor_file_save",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (std :: slice :: from_ref (& input) , | | { target . publish_base (| | { self . store_mut () . admit_with_dispatch_against :: < ProductActionAdmission > (& scope , & command . request_id , command . clone () , & dispatch , & basis ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"file admission refused: {error:?}\")) }) }) })",
+        "file": "crates/app/src/file_action_factory.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::inspect_editor_file_save_attempt",
+        "capability": "native_file_action_evidence_target",
+        "count": 1,
+        "expression": "self . engagements . get (& prepared . chat_id) . ok_or (\"editor workspace is unavailable\") ? . native_file_action_evidence_target (& path , base)",
+        "file": "crates/app/src/file_action_recovery.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::reconcile_editor_file_save_attempt",
+        "capability": "native_file_action_evidence_target",
+        "count": 1,
+        "expression": "self . engagements . get (& prepared . chat_id) . ok_or (\"editor workspace is unavailable\") ? . native_file_action_evidence_target (& path , base)",
+        "file": "crates/app/src/file_action_recovery.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_editor_file_save_result_fenced",
+        "capability": "native_file_action_evidence_target",
+        "count": 1,
+        "expression": "self . engagements . get (& prepared . chat_id) . ok_or (\"editor workspace is unavailable\") ? . native_file_action_evidence_target (& path , base)",
+        "file": "crates/app/src/file_action_result_admission.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::archetype_abilities",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::archetype_abilities",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& format ! (\"{}/{}\" , gaugedesk_boundary :: definition :: DRAFT_ROOT , gaugedesk_boundary :: definition :: MANIFEST_FILE))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::archetype_abilities",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::compensate_failed_chat_fork",
+        "capability": "leave_engagement_workstream",
+        "count": 1,
+        "expression": "workspace . leave_engagement_workstream (chat_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::compensate_failed_chat_fork",
+        "capability": "purge_unreachable_objects",
+        "count": 1,
+        "expression": "workspace . purge_unreachable_objects ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::compensate_failed_chat_fork",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (chat_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_archetype",
+        "capability": "boundary_cut",
+        "count": 1,
+        "expression": "probe . boundary_cut ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_archetype",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& basis_probe)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_archetype",
+        "capability": "init_at",
+        "count": 1,
+        "expression": "provider . init_at (& dir)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_archetype",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& basis_probe)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_archetype",
+        "capability": "seed_main",
+        "count": 1,
+        "expression": "workspace . seed_main (& files)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_chat_in_instance_on_targets",
+        "capability": "boundary_cut",
+        "count": 1,
+        "expression": "eng . boundary_cut ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_chat_in_instance_on_targets",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "storage . create_engagement (& chat_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_chat_in_instance_on_targets",
+        "capability": "create_engagement_subset",
+        "count": 1,
+        "expression": "storage . create_engagement_subset (& chat_id , storage . mainline () , roots)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_managed_project_target",
+        "capability": "boundary_cut",
+        "count": 1,
+        "expression": "probe . boundary_cut ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_managed_project_target",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_managed_project_target",
+        "capability": "init_at",
+        "count": 1,
+        "expression": "self . workspace_provider (& target_id) . init_at (& self . targets_dir () . join (& target_id))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_managed_project_target",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_managed_project_target",
+        "capability": "seed_main",
+        "count": 1,
+        "expression": "workspace . seed_main (& default_gate_files ())",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::delete_chat_cascade",
+        "capability": "purge_unreachable_objects",
+        "count": 1,
+        "expression": "inst . purge_unreachable_objects ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::delete_project_cascade",
+        "capability": "purge_unreachable_objects",
+        "count": 1,
+        "expression": "inst . purge_unreachable_objects ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::destroy_chat",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "inst . remove_engagement (chat_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "collaboration . create_engagement (& collab_probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "source . create_engagement (& probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "probe . read_file (& entry . path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "collaboration . remove_engagement (& collab_probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "source . remove_engagement (& probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
+        "capability": "seed_main",
+        "count": 1,
+        "expression": "self . collaboration_workspaces . get (& workspace_id) . ok_or_else (| | \"project collaboration workspace is not open\" . to_owned ()) ? . seed_main (& borrowed)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
+        "capability": "tree",
+        "count": 1,
+        "expression": "collab_probe . tree ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
+        "capability": "tree",
+        "count": 1,
+        "expression": "probe . tree ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_project_collaboration_workspace",
+        "capability": "init_at",
+        "count": 1,
+        "expression": "self . workspace_provider (& record . workspace_id) . init_at (& path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::fork_archetype",
+        "capability": "boundary_cut",
+        "count": 1,
+        "expression": "probe . boundary_cut ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::fork_archetype",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& basis_probe)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::fork_archetype",
+        "capability": "fork_from_at",
+        "count": 1,
+        "expression": "self . workspace_provider (& new_target) . fork_from_at (& dir , & src_source)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::fork_archetype",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& basis_probe)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::fork_chat_from",
+        "capability": "boundary_cut",
+        "count": 1,
+        "expression": "src_eng . boundary_cut ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::fork_chat_from",
+        "capability": "engagement_home_receipt",
+        "count": 1,
+        "expression": "workspace . engagement_home_receipt (& new_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::fork_chat_from",
+        "capability": "fork_engagement_at",
+        "count": 1,
+        "expression": "inst . fork_engagement_at (& new_id , & source_branch , & source_target , workspace_cut)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::fork_chat_from",
+        "capability": "fork_engagement_subset_at",
+        "count": 1,
+        "expression": "inst . fork_engagement_subset_at (& new_id , & source_branch , & source_target , workspace_cut , roots ,)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::fork_chat_from",
+        "capability": "set_target",
+        "count": 1,
+        "expression": "new_eng . set_target (& admitted . line_ref)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::fork_chat_from",
+        "capability": "transfer_engagement_to_workstream",
+        "count": 1,
+        "expression": "workspace . transfer_engagement_to_workstream (& new_id , stream_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (& format ! (\"freeze archetype version {version}\"))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "instance . create_engagement (& snapshot_chat)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "engagement . merge_into_main ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& format ! (\"{draft}/{file}\"))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "instance . remove_engagement (& snapshot_chat)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "tree",
+        "count": 1,
+        "expression": "engagement . tree ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& format ! (\"{discipline_target}/{path}\") , body)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& format ! (\"{target}/{file}\") , & body)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::library_chat_json",
+        "capability": "observe",
+        "count": 1,
+        "expression": "engagement . observe ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::library_project_relocation_content_bundles",
+        "capability": "export",
+        "count": 1,
+        "expression": "inst . export ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::library_project_relocation_content_bundles",
+        "capability": "export",
+        "count": 1,
+        "expression": "workspace . export ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::pull_archetype_from_source",
+        "capability": "pull_from",
+        "count": 1,
+        "expression": "fork_inst . pull_from (& src)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::refresh_work_target_basis_from_chat",
+        "capability": "standing_revision",
+        "count": 1,
+        "expression": "engagement . standing_revision ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::resolve_fork_destination",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "workspace . workstream (workstream_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::revise_chat_targets",
+        "capability": "replace_sparse_roots",
+        "count": 1,
+        "expression": "self . engagements . get_mut (chat_id) . ok_or_else (| | \"chat collaboration branch is unavailable\" . to_owned ()) ? . replace_sparse_roots (& roots)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::search_engagement_files",
+        "capability": "read_file_capped",
+        "count": 1,
+        "expression": "eng . read_file_capped (& entry . path , Self :: FILE_SEARCH_MAX_BYTES)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::search_engagement_files",
+        "capability": "tree",
+        "count": 1,
+        "expression": "eng . tree ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_archetype_abilities",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (\"set archetype agent abilities\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_archetype_abilities",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_archetype_abilities",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "engagement . merge_into_main ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_archetype_abilities",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_archetype_abilities",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_archetype_abilities",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& path , & body)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::turn_fork_snapshot",
+        "capability": "engagement_home_receipt",
+        "count": 1,
+        "expression": "workspace . engagement_home_receipt (chat_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::workspace_value",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "workspace . workstream (& workstream . id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::workspace_value",
+        "capability": "workstream_members",
+        "count": 1,
+        "expression": "self . workstream_members (& workstream . id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "init_managed_target",
+        "capability": "boundary_cut",
+        "count": 1,
+        "expression": "probe . boundary_cut ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "init_managed_target",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "init_managed_target",
+        "capability": "init_at",
+        "count": 1,
+        "expression": "provider_for (providers , target_id) . init_at (& targets_dir . join (target_id))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "init_managed_target",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "init_managed_target",
+        "capability": "seed_main",
+        "count": 1,
+        "expression": "workspace . seed_main (files)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "load_startup_library_state",
+        "capability": "sync_from_main",
+        "count": 1,
+        "expression": "engagement . sync_from_main ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (\"migrate explicit agent ability ceilings\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "engagement . merge_into_main ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "open_at",
+        "count": 1,
+        "expression": "provider_for (providers , & target . id) . open_at (& targets_dir . join (& target . id))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& manifest_path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& source_path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& manifest_path , & format ! (\"{}\\n\" , serde_json :: to_string_pretty (& manifest) . map_err (io) ?) ,)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& path , & format ! (\"{}\\n\" , serde_json :: to_string_pretty (& manifest) . map_err (io) ?) ,)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_ability_manifests",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& source_path , & source)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "archive_workstream",
+        "count": 1,
+        "expression": "collaboration . archive_workstream (& root . workstream_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "migrated . commit_turn (\"migrate singular target candidate\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "create_engagement_subset",
+        "count": 1,
+        "expression": "collaboration . create_engagement_subset (& chat . id , collaboration . mainline () , & roots)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "create_named_workstream",
+        "count": 1,
+        "expression": "collaboration . create_named_workstream (& root . workstream_id , Some (& workstream . name))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "read_file_bytes_capped",
+        "count": 1,
+        "expression": "source . read_file_bytes_capped (& relative , usize :: MAX)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "migrated . remove_file (& path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "set_target",
+        "count": 1,
+        "expression": "engagement . set_target (& collaboration . workstream_ref (& root . workstream_id))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "transfer_engagement_to_workstream",
+        "count": 1,
+        "expression": "collaboration . transfer_engagement_to_workstream (& chat_id , & root . workstream_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "tree",
+        "count": 1,
+        "expression": "migrated . tree ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "tree",
+        "count": 1,
+        "expression": "source . tree ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "source . workstream (& root . workstream_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "workstream_members",
+        "count": 1,
+        "expression": "source . workstream_members (& root . workstream_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_legacy_project_topology",
+        "capability": "write_file_bytes",
+        "count": 1,
+        "expression": "migrated . write_file_bytes (& format ! (\"{prefix}/{relative}\") , & body)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "open_project_chat_engagements",
+        "capability": "create_engagement_subset",
+        "count": 1,
+        "expression": "workspace . create_engagement_subset (& chat . id , target , & roots)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "open_project_chat_engagements",
+        "capability": "engagement_home_receipt",
+        "count": 1,
+        "expression": "workspace . engagement_home_receipt (& chat . id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "open_project_collaboration_workspaces",
+        "capability": "init_at",
+        "count": 1,
+        "expression": "provider_for (providers , & record . workspace_id) . init_at (& path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "open_project_collaboration_workspaces",
+        "capability": "open_at",
+        "count": 1,
+        "expression": "provider_for (providers , & record . workspace_id) . open_at (& path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "open_startup_targets",
+        "capability": "open_at",
+        "count": 1,
+        "expression": "provider_for (providers , & target . id) . open_at (& targets_dir . join (& target . id))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "open_startup_targets",
+        "capability": "reconcile_engagements",
+        "count": 1,
+        "expression": "workspace . reconcile_engagements ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "open_startup_targets",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& chat_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "recover_project_workstream_promotions",
+        "capability": "promote_workstream_boundary",
+        "count": 1,
+        "expression": "workspace . promote_workstream_boundary (& workstream . id , & root . workspace_id , reservation_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "recover_project_workstream_promotions",
+        "capability": "release_workstream_promotion_boundary",
+        "count": 1,
+        "expression": "workspace . release_workstream_promotion_boundary (& workstream . id , reservation_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "recover_project_workstream_promotions",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "workspace . workstream (& workstream . id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "seed_empty_collaboration_workspaces",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "collaboration . create_engagement (& probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "seed_empty_collaboration_workspaces",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "source . create_engagement (& source_probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "seed_empty_collaboration_workspaces",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "source_probe . read_file (& entry . path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "seed_empty_collaboration_workspaces",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "collaboration . remove_engagement (& probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "seed_empty_collaboration_workspaces",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "source . remove_engagement (& source_probe_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "seed_empty_collaboration_workspaces",
+        "capability": "seed_main",
+        "count": 1,
+        "expression": "collaboration . seed_main (& borrowed)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "seed_empty_collaboration_workspaces",
+        "capability": "tree",
+        "count": 1,
+        "expression": "probe . tree ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "seed_empty_collaboration_workspaces",
+        "capability": "tree",
+        "count": 1,
+        "expression": "source_probe . tree ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_export_command",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"export\" . into () , text : format ! (\"export → {:?}\" , admission . state . phase) , } ,)",
+        "file": "crates/app/src/lifecycle_routes.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_review_command",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"review → {:?}\" , admission . state . phase) , } ,)",
+        "file": "crates/app/src/lifecycle_routes.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_run_command",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"run\" . into () , text : format ! (\"run → {:?}\" , admission . state . phase) , } ,)",
+        "file": "crates/app/src/lifecycle_routes.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "routes",
+        "capability": "archive_workstream",
+        "count": 1,
+        "expression": "wr :: archive_workstream",
+        "file": "crates/app/src/local_routes.rs"
+      },
+      "profile": "route-reference"
+    },
+    {
+      "site": {
+        "callable": "routes",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "er :: create_engagement",
+        "file": "crates/app/src/local_routes.rs"
+      },
+      "profile": "route-reference"
+    },
+    {
+      "site": {
+        "callable": "routes",
+        "capability": "create_workstream",
+        "count": 1,
+        "expression": "wr :: create_workstream",
+        "file": "crates/app/src/local_routes.rs"
+      },
+      "profile": "route-reference"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::publish_package",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (self . store_mut () , LIBRARY_SCOPE , package)",
+        "file": "crates/app/src/package_flow.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for QuarantineStore::discard",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (path)",
+        "file": "crates/app/src/quarantine.rs"
+      },
+      "profile": "custody-and-erasure"
+    },
+    {
+      "site": {
+        "callable": "post_context",
+        "capability": "publish",
+        "count": 1,
+        "expression": "wb . publish (& id , ServerEvent :: Admitted { kind : \"context\" . into () , text : format ! (\"ingested {n} file(s) -> {handle}\") , } ,)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "post_context_upload",
+        "capability": "publish",
+        "count": 1,
+        "expression": "wb . publish (& id , ServerEvent :: Admitted { kind : \"context\" . into () , text : format ! (\"uploaded {n} file(s) -> {handle}\") , } ,)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "post_resource_export",
+        "capability": "publish",
+        "count": 1,
+        "expression": "wb . publish (& id , ServerEvent :: Admitted { kind : \"export\" . into () , text : format ! (\"export proposed for {}\" , res_id . as_str ()) , } ,)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "post_resource_export_to_disk",
+        "capability": "publish",
+        "count": 1,
+        "expression": "wb . publish (& id , ServerEvent :: Admitted { kind : \"export\" . into () , text : format ! (\"exported {} file(s) to disk\" , written . len ()) , } ,)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "post_resource_review",
+        "capability": "publish",
+        "count": 1,
+        "expression": "wb . publish (& id , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"review proposed for {}\" , res_id . as_str ()) , } ,)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "post_resource_tombstone",
+        "capability": "publish",
+        "count": 1,
+        "expression": "wb . publish (& id , ServerEvent :: Admitted { kind : \"erasure\" . into () , text : format ! (\"tombstoned {}\" , res_id . as_str ()) , } ,)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "remove_locator",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (locator_file (targets_root , handle))",
+        "file": "crates/app/src/target_adapter.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "request_terminal_target_act",
+        "capability": "publish",
+        "count": 1,
+        "expression": "candidate . publish ()",
+        "file": "crates/app/src/target_adapter.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::current_target_files",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& probe_id)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::current_target_files",
+        "capability": "read_file_bytes_capped",
+        "count": 1,
+        "expression": "probe . read_file_bytes_capped (path , usize :: MAX)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::current_target_files",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& probe_id)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::current_target_files",
+        "capability": "standing_revision",
+        "count": 1,
+        "expression": "probe . standing_revision ()",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::current_target_files",
+        "capability": "tree",
+        "count": 1,
+        "expression": "probe . tree ()",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::exact_candidate_files",
+        "capability": "fork_engagement_subset_at",
+        "count": 1,
+        "expression": "workspace . fork_engagement_subset_at (& temporary_id , & candidate . candidate_line_ref , workspace . mainline () , & candidate . candidate_cut , & roots ,)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::exact_candidate_files",
+        "capability": "read_file_bytes_capped",
+        "count": 1,
+        "expression": "view . read_file_bytes_capped (& materialized_path , usize :: MAX)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::exact_candidate_files",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& temporary_id)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::exact_candidate_files",
+        "capability": "tree",
+        "count": 1,
+        "expression": "view . tree ()",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::execute_prepared_target_effect",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "candidate . commit_turn (& member . operation_id)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::execute_prepared_target_effect",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& effect_id)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::execute_prepared_target_effect",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "candidate . merge_into_main ()",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::execute_prepared_target_effect",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& effect_id)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::execute_prepared_target_effect",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "candidate . remove_file (path)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::execute_prepared_target_effect",
+        "capability": "standing_revision",
+        "count": 2,
+        "expression": "candidate . standing_revision ()",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::execute_prepared_target_effect",
+        "capability": "write_file_bytes",
+        "count": 1,
+        "expression": "candidate . write_file_bytes (path , body)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::supersede_settlement_member",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "workspace . current_main_cut ()",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::supersede_settlement_member",
+        "capability": "cut_descends_from",
+        "count": 1,
+        "expression": "workspace . cut_descends_from (& current_main_cut , & later_manifest . proposed_main_cut)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::supersede_settlement_member",
+        "capability": "cut_descends_from",
+        "count": 1,
+        "expression": "workspace . cut_descends_from (& later_manifest . proposed_main_cut , & earlier_manifest . proposed_main_cut ,)",
+        "file": "crates/app/src/target_settlement.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::build_workstream_promotion_manifest",
+        "capability": "fork_engagement_subset_at",
+        "count": 1,
+        "expression": "workspace . fork_engagement_subset_at (& temporary_id , & reservation . line_branch_id , workspace . mainline () , & reservation . expected_line_cut , & roots ,)",
+        "file": "crates/app/src/workstream_promotion.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::build_workstream_promotion_manifest",
+        "capability": "read_file_bytes_capped",
+        "count": 1,
+        "expression": "view . read_file_bytes_capped (full_path , usize :: MAX)",
+        "file": "crates/app/src/workstream_promotion.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::build_workstream_promotion_manifest",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& temporary_id)",
+        "file": "crates/app/src/workstream_promotion.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::build_workstream_promotion_manifest",
+        "capability": "tree",
+        "count": 1,
+        "expression": "view . tree ()",
+        "file": "crates/app/src/workstream_promotion.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_promotion_change_set",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "self . workstream (& manifest . workstream_id)",
+        "file": "crates/app/src/workstream_promotion.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::validate_promotion_change_set",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "self . workstream (& manifest . workstream_id)",
+        "file": "crates/app/src/workstream_promotion.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "archive_active_workstream",
+        "capability": "archive_workstream",
+        "count": 1,
+        "expression": "workspace . archive_workstream (ws_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "archive_active_workstream",
+        "capability": "workstream_members",
+        "count": 1,
+        "expression": "wb . workstream_members (ws_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "archive_workstream",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "wb . workstream (& ws_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "create_workstream",
+        "capability": "create_named_workstream",
+        "count": 1,
+        "expression": "workspace . create_named_workstream (& ws_id , Some (& body . name))",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "create_workstream_settlement",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "workspace . workstream (& ws_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::create_workstream_ref",
+        "capability": "create_named_workstream",
+        "count": 1,
+        "expression": "self . workspace_by_storage_id (storage_id) . ok_or_else (| | std :: io :: Error :: new (std :: io :: ErrorKind :: NotFound , \"workspace missing\")) ? . create_named_workstream (workstream_id , None)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::engagement_rehome_blocked",
+        "capability": "observe",
+        "count": 1,
+        "expression": "engagement . observe ()",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::promote_workstream_ref_to_main",
+        "capability": "promote_workstream_to_main",
+        "count": 1,
+        "expression": "self . workspace_by_storage_id (storage_id) . ok_or_else (| | std :: io :: Error :: new (std :: io :: ErrorKind :: NotFound , \"workspace missing\")) ? . promote_workstream_to_main (workstream_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::rehome_engagement",
+        "capability": "rehome",
+        "count": 1,
+        "expression": "self . engagements . get_mut (chat_id) . ok_or_else (| | \"chat has no live workspace\" . to_string ()) ? . rehome (target)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::restore_workstream_homing",
+        "capability": "engagement_home_receipt",
+        "count": 1,
+        "expression": "workspace . engagement_home_receipt (& chat)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::sync_mainline_members",
+        "capability": "sync_from_main",
+        "count": 1,
+        "expression": "engagement . sync_from_main ()",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::workstream_members",
+        "capability": "workstream_members",
+        "count": 1,
+        "expression": "workspace . workstream_members (workstream_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "join_workstream",
+        "capability": "leave_engagement_workstream",
+        "count": 1,
+        "expression": "workspace . leave_engagement_workstream (& body . chat)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "join_workstream",
+        "capability": "transfer_engagement_to_workstream",
+        "count": 1,
+        "expression": "workspace . transfer_engagement_to_workstream (& body . chat , & ws_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "join_workstream",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "workspace . workstream (& ws_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "leave_workstream",
+        "capability": "engagement_home_receipt",
+        "count": 1,
+        "expression": "workspace . engagement_home_receipt (& body . chat)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "leave_workstream",
+        "capability": "leave_engagement_workstream",
+        "count": 1,
+        "expression": "workspace . leave_engagement_workstream (& body . chat)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "leave_workstream",
+        "capability": "transfer_engagement_to_workstream",
+        "count": 1,
+        "expression": "workspace . transfer_engagement_to_workstream (& body . chat , & ws_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "promote_workstream",
+        "capability": "promote_workstream_boundary",
+        "count": 1,
+        "expression": "wb . workspace_by_storage_id (& root . workspace_id) . expect (\"reserved workspace remains open\") . promote_workstream_boundary (& ws_id , & root . workspace_id , & stored_reservation_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "promote_workstream",
+        "capability": "release_workstream_promotion_boundary",
+        "count": 4,
+        "expression": "workspace . release_workstream_promotion_boundary (& ws_id , & stored_reservation_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "promote_workstream",
+        "capability": "reserve_workstream_promotion_boundary",
+        "count": 1,
+        "expression": "workspace . reserve_workstream_promotion_boundary (& ws_id , & reservation_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "promote_workstream",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "workspace . workstream (& ws_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "promote_workstream",
+        "capability": "workstream_members",
+        "count": 1,
+        "expression": "wb . workstream_members (& ws_id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "workstream_json",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "workspace . workstream (& rec . id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "workstream_json",
+        "capability": "workstream_members",
+        "count": 1,
+        "expression": "wb . workstream_members (& rec . id)",
+        "file": "crates/app/src/workstream_routes.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::native_file_action_target",
+        "capability": "observe",
+        "count": 1,
+        "expression": "target . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionEvidenceTarget::publish_committed_result",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . target . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionEvidenceTarget::publish_committed_result",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (& workspace , & current)",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionEvidenceTarget::publish_committed_scoped_result",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . target . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionEvidenceTarget::publish_committed_scoped_result",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (& workspace , & current)",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionEvidenceTarget::read_committed_result",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . target . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionEvidenceTarget::read_committed_scoped_result",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . target . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionTarget::open_scoped_versioned_save",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionTarget::open_versioned_save",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionTarget::publish_base",
+        "capability": "observe",
+        "count": 2,
+        "expression": "self . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionTarget::publish_base",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for ExternalCandidate::ingest_upload",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "self . write_file (path , body)",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for ExternalCandidate::merge_preview",
+        "capability": "current_cut",
+        "count": 1,
+        "expression": "self . current_cut ()",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for ExternalCandidate::merge_probe",
+        "capability": "sync_from_main",
+        "count": 1,
+        "expression": "self . sync_from_main ()",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for ExternalCandidate::publish",
+        "capability": "standing_revision",
+        "count": 1,
+        "expression": "self . standing_revision ()",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for ExternalCandidate::remove_file",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (safe_path (& self . candidate , rel) ?)",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for ExternalCandidate::save_file_with_base",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "self . commit_turn (& format ! (\"edit {rel}\"))",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for ExternalCandidate::save_file_with_base",
+        "capability": "current_cut",
+        "count": 2,
+        "expression": "self . current_cut ()",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for ExternalCandidate::save_file_with_base",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "self . read_file (rel)",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for ExternalCandidate::save_file_with_base",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "self . write_file (rel , draft)",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for ExternalWorkspace::create_engagement_on",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "self . create_engagement (id)",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "sync_tree",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (destination . join (path))",
+        "file": "crates/workspace/src/external.rs"
+      },
+      "profile": "external-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "clear_worktree",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (root . join (& entry . path))",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::boundary_cut",
+        "capability": "boundary_cut",
+        "count": 1,
+        "expression": "self . boundary_cut ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::commit_turn",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "self . commit_turn (message)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::current_cut",
+        "capability": "current_cut",
+        "count": 1,
+        "expression": "self . current_cut ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::diff_against_main",
+        "capability": "diff_against_main",
+        "count": 1,
+        "expression": "self . diff_against_main ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::ingest",
+        "capability": "ingest",
+        "count": 1,
+        "expression": "self . ingest (source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::ingest_into",
+        "capability": "ingest_into",
+        "count": 1,
+        "expression": "self . ingest_into (prefix , source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::ingest_upload",
+        "capability": "ingest_upload",
+        "count": 1,
+        "expression": "self . ingest_upload (files)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::ingest_upload_into",
+        "capability": "ingest_upload_into",
+        "count": 1,
+        "expression": "self . ingest_upload_into (prefix , files)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::merge_into_main",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "self . merge_into_main ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::merge_preview",
+        "capability": "merge_preview",
+        "count": 1,
+        "expression": "self . merge_preview (relative , draft , base_cut)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::merge_probe",
+        "capability": "merge_probe",
+        "count": 1,
+        "expression": "self . merge_probe ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::native_file_action_evidence_target",
+        "capability": "native_file_action_evidence_target",
+        "count": 1,
+        "expression": "Engagement :: native_file_action_evidence_target (self , path , base)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::native_file_action_target",
+        "capability": "native_file_action_target",
+        "count": 1,
+        "expression": "Engagement :: native_file_action_target (self , path , base)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::observe",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . observe ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::read_file",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "self . read_file (relative)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::read_file_capped",
+        "capability": "read_file_capped",
+        "count": 1,
+        "expression": "self . read_file_capped (relative , max_bytes)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::rehome",
+        "capability": "rehome",
+        "count": 1,
+        "expression": "self . rehome (target)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::remove_file",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (path)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::replace_sparse_roots",
+        "capability": "replace_sparse_roots",
+        "count": 1,
+        "expression": "self . replace_sparse_roots (roots)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::revert_to_main",
+        "capability": "revert_to_main",
+        "count": 1,
+        "expression": "self . revert_to_main ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::save_file_with_base",
+        "capability": "save_file_with_base",
+        "count": 1,
+        "expression": "self . save_file_with_base (relative , draft , base , resolutions)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::set_target",
+        "capability": "set_target",
+        "count": 1,
+        "expression": "self . set_target (target)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::standing_revision",
+        "capability": "boundary_cut",
+        "count": 1,
+        "expression": "self . boundary_cut ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::sync_from_main",
+        "capability": "sync_from_main",
+        "count": 1,
+        "expression": "self . sync_from_main ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::tree",
+        "capability": "tree",
+        "count": 1,
+        "expression": "self . tree ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::write_file",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "self . write_file (relative , content)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::archive_workstream",
+        "capability": "archive_workstream",
+        "count": 1,
+        "expression": "Self :: archive_workstream (self , workstream_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::create_engagement",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "Self :: create_engagement (self , id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::create_engagement_on",
+        "capability": "create_engagement_on",
+        "count": 1,
+        "expression": "Self :: create_engagement_on (self , id , target)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::create_engagement_subset",
+        "capability": "create_engagement_subset",
+        "count": 1,
+        "expression": "Self :: create_engagement_subset (self , id , target , roots ,)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::create_named_workstream",
+        "capability": "create_named_workstream",
+        "count": 1,
+        "expression": "Self :: create_named_workstream (self , id , name)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::create_workstream",
+        "capability": "create_workstream",
+        "count": 1,
+        "expression": "Self :: create_workstream (self , id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::current_main_cut",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "Self :: current_main_cut (self)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::cut_descends_from",
+        "capability": "cut_descends_from",
+        "count": 1,
+        "expression": "Self :: cut_descends_from (self , descendant_cut , ancestor_cut)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::engagement_home_receipt",
+        "capability": "engagement_home_receipt",
+        "count": 1,
+        "expression": "Self :: engagement_home_receipt (self , engagement_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::export",
+        "capability": "export",
+        "count": 1,
+        "expression": "Self :: export (self)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::fork_engagement_at",
+        "capability": "fork_engagement_at",
+        "count": 1,
+        "expression": "Self :: fork_engagement_at (self , id , source_branch , target , cut_id ,)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::fork_engagement_subset_at",
+        "capability": "fork_engagement_subset_at",
+        "count": 1,
+        "expression": "Self :: fork_engagement_subset_at (self , id , source_branch , target , cut_id , roots ,)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::leave_engagement_workstream",
+        "capability": "leave_engagement_workstream",
+        "count": 1,
+        "expression": "Self :: leave_engagement_workstream (self , engagement_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::promote_workstream_boundary",
+        "capability": "promote_workstream_boundary",
+        "count": 1,
+        "expression": "Self :: promote_workstream_boundary (self , workstream_id , workspace_authority_id , reservation_id ,)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::promote_workstream_to_main",
+        "capability": "promote_workstream_to_main",
+        "count": 1,
+        "expression": "Self :: promote_workstream_to_main (self , id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::pull_from",
+        "capability": "pull_from",
+        "count": 1,
+        "expression": "Self :: pull_from (self , source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::purge_unreachable_objects",
+        "capability": "purge_unreachable_objects",
+        "count": 1,
+        "expression": "Self :: purge_unreachable_objects (self)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::reconcile_engagements",
+        "capability": "reconcile_engagements",
+        "count": 1,
+        "expression": "Self :: reconcile_engagements (self)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::release_workstream_promotion_boundary",
+        "capability": "release_workstream_promotion_boundary",
+        "count": 1,
+        "expression": "Self :: release_workstream_promotion_boundary (self , workstream_id , reservation_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::remove_engagement",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "Self :: remove_engagement (self , id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::reserve_workstream_promotion_boundary",
+        "capability": "reserve_workstream_promotion_boundary",
+        "count": 1,
+        "expression": "Self :: reserve_workstream_promotion_boundary (self , workstream_id , reservation_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::seed_main",
+        "capability": "seed_main",
+        "count": 1,
+        "expression": "Self :: seed_main (self , files)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::transfer_engagement_to_workstream",
+        "capability": "transfer_engagement_to_workstream",
+        "count": 1,
+        "expression": "Self :: transfer_engagement_to_workstream (self , engagement_id , workstream_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::workstream",
+        "capability": "workstream",
+        "count": 1,
+        "expression": "Self :: workstream (self , workstream_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::workstream_members",
+        "capability": "workstream_members",
+        "count": 1,
+        "expression": "Self :: workstream_members (self , workstream_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl WorkspaceProvider for WhippleWorkspaceProvider::fork_from_at",
+        "capability": "fork_from_at",
+        "count": 1,
+        "expression": "Instance :: fork_from_at (dir , source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl WorkspaceProvider for WhippleWorkspaceProvider::from_export_at",
+        "capability": "from_export_at",
+        "count": 1,
+        "expression": "Instance :: from_export_at (dir , export)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl WorkspaceProvider for WhippleWorkspaceProvider::init_at",
+        "capability": "init_at",
+        "count": 1,
+        "expression": "Instance :: init_at (dir)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl WorkspaceProvider for WhippleWorkspaceProvider::open_at",
+        "capability": "open_at",
+        "count": 1,
+        "expression": "Instance :: open_at (dir)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::boundary_cut",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "self . commit_turn (\"turn boundary\")",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::ingest_upload",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "self . write_file (& base , content)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::ingest_upload_into",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "self . write_file (& format ! (\"{prefix}/{base}\") , content)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::merge_preview",
+        "capability": "merge_preview",
+        "count": 1,
+        "expression": "vcs . merge_preview (& self . branch , relative , draft , base_cut)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::merge_probe",
+        "capability": "merge_probe",
+        "count": 1,
+        "expression": "vcs . merge_probe (& self . branch)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::rehome",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "self . write_file (& path , & body)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::save_file_with_base",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "self . read_file (relative)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::save_file_with_base",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "self . write_file (relative , & merged)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::save_file_with_base",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "self . write_file (relative , draft)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::create_engagement",
+        "capability": "create_engagement_on",
+        "count": 1,
+        "expression": "self . create_engagement_on (id , MAINLINE_BRANCH_ID)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::create_workstream",
+        "capability": "create_named_workstream",
+        "count": 1,
+        "expression": "self . create_named_workstream (id , None)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::fork_from_at",
+        "capability": "from_export_at",
+        "count": 1,
+        "expression": "Self :: from_export_at (dir , & export)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::from_export_at",
+        "capability": "reconcile_engagements",
+        "count": 1,
+        "expression": "instance . reconcile_engagements ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::promote_workstream_to_main",
+        "capability": "promote_workstream_boundary",
+        "count": 1,
+        "expression": "self . promote_workstream_boundary (id , \"native-workspace\" , & fresh_cut_id (\"promotion-reservation\") ,)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::remove_engagement",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (scratch_cache_path (& self . store_root , & engagement_line (id)))",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "snapshot_sqlite",
+        "capability": "remove_file",
+        "count": 2,
+        "expression": "std :: fs :: remove_file (& target)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait ChatWorkspace::ingest_into",
+        "capability": "ingest",
+        "count": 1,
+        "expression": "self . ingest (source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait ChatWorkspace::ingest_upload_into",
+        "capability": "ingest_upload",
+        "count": 1,
+        "expression": "self . ingest_upload (files)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait ChatWorkspace::read_file_bytes_capped",
+        "capability": "read_file_capped",
+        "count": 1,
+        "expression": "self . read_file_capped (rel , max_bytes)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait ChatWorkspace::write_file_bytes",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "self . write_file (rel , body)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait Workspace::create_engagement_subset",
+        "capability": "create_engagement_on",
+        "count": 1,
+        "expression": "self . create_engagement_on (id , target)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait Workspace::create_named_workstream",
+        "capability": "create_workstream",
+        "count": 1,
+        "expression": "self . create_workstream (ws_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait Workspace::fork_engagement_subset_at",
+        "capability": "fork_engagement_at",
+        "count": 1,
+        "expression": "self . fork_engagement_at (id , source_branch , target , cut_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::native_resolution_recording_evidence_target",
+        "capability": "native_resolution_recording_evidence_target",
+        "count": 1,
+        "expression": "Engagement :: native_resolution_recording_evidence_target (self , path , scope)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::native_resolution_recording_target",
+        "capability": "native_resolution_recording_target",
+        "count": 1,
+        "expression": "Engagement :: native_resolution_recording_target (self , path , scope)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeResolutionRecordingEvidenceTarget::observe",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . coordinates . observe ()",
+        "file": "crates/workspace/src/resolution_recording_target.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeResolutionRecordingTarget::open_recording",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . coordinates . observe ()",
+        "file": "crates/workspace/src/resolution_recording_target.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_editor_corrections",
+        "capability": "native_resolution_recording_target",
+        "count": 1,
+        "expression": "self . engagements . get (request . chat_id) . ok_or (\"chat workspace is unavailable\") ? . native_resolution_recording_target (& authority . workspace_path , authority . resolution_scope . clone () ,)",
+        "file": "crates/app/src/resolution_recording_factory.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_editor_corrections",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (std :: slice :: from_ref (& input) , | | { self . store_mut () . admit_with_dispatch_against :: < ProductActionAdmission > (& scope , & command . request_id , command . clone () , & dispatch , & basis ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"correction admission refused: {error:?}\")) }) })",
+        "file": "crates/app/src/resolution_recording_factory.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::deliver_editor_corrections",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (std :: slice :: from_ref (& command . inputs [\"corrections\"]) , | | { self . store_mut () . with_dispatch_basis (& prepared . basis , | | { let verifier = super :: super :: delivery :: NativeAdmissionVerifier { command , key : prepared . key . public_key () , } ; runtime . admit_action (command . clone () , recording . action () , & verifier , prepared . key . sign (& bytes) . as_bytes () ,) }) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"correction delivery authority changed: {error:?}\" ,)) }) ? . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"runtime correction admission refused: {error:?}\" ,)) }) })",
+        "file": "crates/app/src/resolution_recording_delivery.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::prepare_native_corrections",
+        "capability": "native_resolution_recording_target",
+        "count": 1,
+        "expression": "self . engagements . get (& chat) . ok_or (\"chat workspace is unavailable\") ? . native_resolution_recording_target (& path , original_scope)",
+        "file": "crates/app/src/resolution_recording_delivery.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::inspect_editor_correction_attempt",
+        "capability": "observe",
+        "count": 1,
+        "expression": "prepared . target . observe (& binding , | workspace | { read_committed_resolution_recording (workspace , & binding) })",
+        "file": "crates/app/src/resolution_recording_inspection.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::prepare_correction_inspection_scoped",
+        "capability": "native_resolution_recording_evidence_target",
+        "count": 1,
+        "expression": "self . engagements . get (& chat) . ok_or (\"correction workspace is unavailable\") ? . native_resolution_recording_evidence_target (& path , original_scope)",
+        "file": "crates/app/src/resolution_recording_inspection.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::deliver_editor_correction_reconciliation",
+        "capability": "observe",
+        "count": 1,
+        "expression": "prepared . inspection . target . observe (& historical . binding , | workspace | { let source = ResolutionRecordingEvidenceSource { action : & action , admission , workspace , authority_ref : & original . issuer , } ; let receipt = owner . runtime . reconcile_resolution_recording (command . clone () , owner . epoch , & source , & authority , proof . as_bytes () ,) . map_err (refused) ? ; validate_receipt (& owner . runtime , command , & receipt) ? ; let ack = CorrectionReconciliationAcknowledgment { product_command_id : prepared . delivery . command_id . clone () , runtime_ref : prepared . delivery . dispatch . runtime_ref . clone () , receipt , } ; let payload = serde_json :: to_string (& ack) ? ; writer . commit (& format ! (\"correction-reconciliation-ack:{}\" , prepared . scope) , \"reconciled\" , & payload , & [CommandRecordFact { scope_id : prepared . scope . clone () , kind : ACK_KIND . into () , payload : payload . clone () , }] ,) . map_err (refused) ? ; Ok (ack) })",
+        "file": "crates/app/src/resolution_recording_reconciliation_delivery.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_editor_correction_result",
+        "capability": "observe",
+        "count": 1,
+        "expression": "prepared . target . observe (& historical . binding , | workspace | { let recording = read_committed_resolution_recording (workspace , & historical . binding) ? . ok_or_else (| | refused (\"original correction receipt is unavailable\")) ? ; let result = NativeEditorCorrectionResult { protocol : RESULT_PROTOCOL . into () , issuer : original . issuer . clone () , request_id : request . request_id . into () , admission : admission . clone () , policy : retained . policy_ref () . clone () , evidence_label_ref : format ! (\"policy:{}:result\" , retained . policy_ref () . envelope_hash) , provenance : ActionProvenance { initiator : context . actor () . as_str () . into () , executor : context . actor () . as_str () . into () , delegation : vec ! [] , origin : \"editor.corrections.result\" . into () , causes : vec ! [cause (original , & admission . admitted_at) ?, cause (original , & acknowledgment . receipt . recorded_at) ?,] , } , reconciliation : reconciliation . clone () , acknowledgment : acknowledgment . clone () , observed_at : evidence . observed_at . clone () , binding : historical . binding . clone () , recording , } ; verify_result_identity (original , admission , request . request_id , & result) ? ; let payload = serde_json :: to_string (& result) ? ; let admitted = writer . commit (scope , request . request_id , & payload , & [CommandRecordFact { scope_id : scope . clone () , kind : RESULT_KIND . into () , payload : payload . clone () , }] ,) . map_err (refused) ? ; Ok (AdmittedEditorCorrectionResult { result , replayed : admitted . replayed , }) })",
+        "file": "crates/app/src/resolution_recording_result.rs"
+      },
+      "profile": "native-recording-boundary"
+    }
+  ]
+}

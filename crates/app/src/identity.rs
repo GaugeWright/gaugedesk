@@ -22,6 +22,88 @@ use crate::Workbench;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthenticatedActor(pub AuthorityId);
 
+/// The authentication source to revalidate for this actor. These references
+/// carry no credential and do not imply a physical human or product permission.
+/// The native dispatch variant additionally requires its exact admitted grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActorAuthentication {
+    AccountSession {
+        session_ref: String,
+    },
+    IdentityProvider,
+    /// Retained authority for one already-admitted command, never a request
+    /// credential or permission to construct new commands.
+    NativeEditorDispatchGrant {
+        grant_ref: String,
+    },
+    MachineController {
+        grant_ref: String,
+    },
+}
+
+/// Source-specific request facts for action construction (ACTION-3). The Home
+/// boundary constructs these only after verifying the corresponding credential.
+/// Factories still admit current directory, target and delegation authority;
+/// these claims are neither a signed policy nor permission to dispatch later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedActionContext {
+    actor: AuthorityId,
+    authentication: ActorAuthentication,
+    claims: AuthorityAttributes,
+}
+
+impl AuthenticatedActionContext {
+    pub fn actor(&self) -> &AuthorityId {
+        &self.actor
+    }
+
+    pub fn authentication(&self) -> &ActorAuthentication {
+        &self.authentication
+    }
+
+    pub fn claims(&self) -> &AuthorityAttributes {
+        &self.claims
+    }
+
+    pub(crate) fn native_editor_dispatch_grant(actor: AuthorityId, grant_ref: String) -> Self {
+        Self {
+            actor,
+            authentication: ActorAuthentication::NativeEditorDispatchGrant { grant_ref },
+            claims: AuthorityAttributes::default(),
+        }
+    }
+
+    pub(crate) fn account_session(actor: AuthorityId, session_ref: String) -> Self {
+        Self {
+            actor,
+            authentication: ActorAuthentication::AccountSession { session_ref },
+            // An account session proves its account, not an IdP's claims about
+            // an independently enrolled identity with the same identifier.
+            claims: AuthorityAttributes::default(),
+        }
+    }
+
+    pub(crate) fn identity_provider(actor: AuthorityId, claims: AuthorityAttributes) -> Self {
+        Self {
+            actor,
+            authentication: ActorAuthentication::IdentityProvider,
+            claims,
+        }
+    }
+
+    pub(crate) fn machine_controller(
+        grant: &crate::mobile_machine_session::ControllerGrantRecord,
+    ) -> Self {
+        Self {
+            actor: AuthorityId::new(grant.device.as_str()),
+            authentication: ActorAuthentication::MachineController {
+                grant_ref: grant.id.clone(),
+            },
+            claims: AuthorityAttributes::default(),
+        }
+    }
+}
+
 impl Workbench {
     /// Apply the optional local authority override used by self-operated
     /// federation/dev deployments. Empty values are ignored so a mis-set env var
