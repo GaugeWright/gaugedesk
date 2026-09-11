@@ -6222,6 +6222,64 @@ async fn onboarding_checklist_appears_and_advances_on_credential() {
 /// on any two files, while what makes a gate a gate is that it compiles and its
 /// flows satisfy its own envelope. That assertion was impossible until
 /// WhippleScript DR-0051 gave a person's decision an integrity crossing.
+/// ACTION-7: a store that cannot be read says so, instead of drawing like a
+/// project nothing has run in.
+///
+/// This is the obligation the tracker records against the project-whips caller
+/// — "renders unavailable reads as empty" — and ADR 0166 §3's rule that missing
+/// or inaccessible evidence must never present as an empty successful subtree.
+/// The failure it prevents is specific and quiet: an investigator opens the
+/// Instances tab of a project whose runtime store is corrupt or on a disk that
+/// has gone away, is shown "no runs", and concludes nothing ever ran.
+///
+/// The control is the previous behaviour: swallow the read error back into an
+/// empty vector and this fails while the neighbouring test — which asserts that
+/// a genuinely empty project reads as complete — keeps passing. That pairing is
+/// the point. An implementation that reported *every* absence as a gap would
+/// satisfy this test and break that one.
+#[tokio::test]
+async fn a_runtime_store_that_cannot_be_read_is_not_an_empty_one() {
+    let (dir, wb) = seeded_workbench();
+    // Put something unreadable exactly where the gate's runtime store belongs.
+    // A directory is the cheapest thing SQLite cannot open as a database, and
+    // it needs no permission games that a root-running CI would ignore.
+    let gate_store =
+        crate::gate_service::gate_state_dir(dir.path(), DEFAULT_PROJECT).join("runtime.sqlite");
+    std::fs::create_dir_all(&gate_store).expect("a directory where a database should be");
+
+    let app = open_control_plane(wb);
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/projects/{DEFAULT_PROJECT}/whips"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the page still draws: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(
+        value["complete"], false,
+        "the view knows it is partial: {value}"
+    );
+    let gate = value["whips"]
+        .as_array()
+        .expect("a list of programs")
+        .iter()
+        .find(|whip| whip["program"] == "gate")
+        .expect("the gate is still listed — a program that cannot be read is still a program");
+    assert_eq!(
+        gate["unread"],
+        crate::whip_views::UNREADABLE,
+        "the gate names what went wrong rather than showing nothing: {gate}"
+    );
+    assert_eq!(
+        gate["instances"].as_array().map(Vec::len),
+        Some(0),
+        "and it does not invent runs it could not read"
+    );
+}
+
 #[tokio::test]
 async fn a_project_s_whips_start_with_its_gate_s_structure_and_no_instances() {
     // The route the Structure and Instances tabs read. A fresh project has run

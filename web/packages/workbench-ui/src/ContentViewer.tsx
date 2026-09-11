@@ -511,7 +511,10 @@ export function ContentViewer(props: ContentViewerProps = {}) {
 
             <Show when={mode() === "instances"}>
                 <div class="filebody">
-                    <WhipInstancesView instances={whipInstances()} />
+                    <WhipInstancesView
+                        instances={whipInstances()}
+                        unread={whipProgram()?.unread ?? null}
+                    />
                 </div>
             </Show>
 

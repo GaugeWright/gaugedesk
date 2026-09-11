@@ -161,6 +161,24 @@ describe("reading whipplescript.instance_view.v0", () => {
         expect(programs[1]!.structure).toBeNull();
         expect(programs[0]!.instances[0]!.structure.workflow).toBe("Demo");
     });
+
+    it("keeps an unread store apart from a program nothing has run (ACTION-7)", () => {
+        // Both arrive with no instances and they mean opposite things: the
+        // second is a complete answer, the first is the absence of one. The
+        // view renders on this difference, so losing it here is the quiet way
+        // "could not read" becomes "no runs".
+        const programs = programsFromV1({
+            whips: [
+                { path: null, program: "gate", chat: null, structure: null, instances: [], unread: "unreadable" },
+                { path: null, program: "quiet", chat: null, structure: null, instances: [] },
+            ],
+        });
+        expect(programs[0]!.unread).toBe("unreadable");
+        expect(programs[0]!.instances).toHaveLength(0);
+        // Absent on the wire reads as complete — what an older server meant
+        // before it could say otherwise.
+        expect(programs[1]!.unread).toBeNull();
+    });
 });
 
 describe("naming an effect", () => {

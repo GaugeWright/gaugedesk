@@ -51,13 +51,14 @@ impl Workbench {
             .and_then(|source| gaugedesk_whip_runtime::program_structure(&source));
         let gate_store =
             crate::gate_service::gate_state_dir(&root, project_id).join("runtime.sqlite");
-        let gate_instances = projected(&gate_store, Some("gate"));
+        let (gate_instances, gate_unread) = projected(&gate_store, Some("gate"));
         whips.push(json!({
             "path": gate_path,
             "program": "gate",
             "chat": Value::Null,
             "structure": gate_structure,
             "instances": gate_instances,
+            "unread": gate_unread,
         }));
 
         // Every chat's package. A chat that has never run has no store, and a
@@ -66,11 +67,25 @@ impl Workbench {
         for chat in self.library.project_chats(project_id) {
             let store = gaugedesk_whip_runtime::chat_runtime_database(&runtime_root, &chat.id);
             let mut by_program: std::collections::BTreeMap<String, Vec<Value>> = Default::default();
-            for instance in read(&store) {
+            let chat_read = read(&store);
+            for instance in chat_read.instances {
                 by_program
                     .entry(instance.program)
                     .or_default()
                     .push(instance.view);
+            }
+            // A store that would not open has no programs to group, so without
+            // this the whole chat vanishes from the view rather than appearing
+            // as a chat whose runs could not be read.
+            if let Some(unread) = chat_read.unread {
+                whips.push(json!({
+                    "path": Value::Null,
+                    "program": Value::Null,
+                    "chat": chat.id,
+                    "structure": Value::Null,
+                    "instances": [],
+                    "unread": unread,
+                }));
             }
             for (program, instances) in by_program {
                 // The structure a program has is what its instances ran under;
@@ -86,39 +101,83 @@ impl Workbench {
                     "chat": chat.id,
                     "structure": structure,
                     "instances": instances,
+                    "unread": Value::Null,
                 }));
             }
         }
 
+        // One place a reader can look to learn the view is partial, so a
+        // banner does not have to be derived by scanning every program.
+        let complete = whips
+            .iter()
+            .all(|whip| whip.get("unread").is_none_or(Value::is_null));
         Some(json!({
             "schema": PROJECT_WHIPS_SCHEMA,
             "project": project_id,
+            "complete": complete,
             "whips": whips,
         }))
     }
 }
 
-/// The instances in one runtime store, or none when the store is not there
-/// yet — which is the ordinary state of a project nothing has run in.
-fn read(store: &Path) -> Vec<gaugedesk_whip_runtime::ProjectedInstance> {
+/// One store's instances, and what the read could not see (ACTION-7).
+///
+/// The distinction this type exists to keep is between **nothing to see** and
+/// **could not see**. Both used to arrive as an empty vector, so a store that
+/// was corrupt, locked, or on a disk that had gone away drew exactly like a
+/// project nothing had ever run in — an investigator reading the Instances tab
+/// was told "no runs" by a view that meant "no answer".
+struct StoreRead {
+    instances: Vec<gaugedesk_whip_runtime::ProjectedInstance>,
+    /// `None` when the read is complete — *including* when the store does not
+    /// exist, which is a complete answer: nothing has run. `Some(reason)` when
+    /// the view is missing something it cannot enumerate.
+    unread: Option<&'static str>,
+}
+
+/// The instances in one runtime store.
+///
+/// An absent store is not a gap. A store that exists and refuses to be read is,
+/// and says so rather than answering with silence.
+fn read(store: &Path) -> StoreRead {
     if !store.exists() {
-        return Vec::new();
+        return StoreRead {
+            instances: Vec::new(),
+            unread: None,
+        };
     }
     match gaugedesk_whip_runtime::instance_views(store) {
-        Ok(instances) => instances,
+        Ok(instances) => StoreRead {
+            instances,
+            unread: None,
+        },
         Err(error) => {
-            // A store that exists and cannot be read is worth a line in the
-            // log, not a failed page: the other programs still draw.
+            // Still not a failed page — the other programs draw. What changes
+            // is that this one no longer claims to have drawn.
             tracing::warn!(store = %store.display(), error = %error, "whip views: could not read a runtime store");
-            Vec::new()
+            StoreRead {
+                instances: Vec::new(),
+                unread: Some(UNREADABLE),
+            }
         }
     }
 }
 
-fn projected(store: &Path, program: Option<&str>) -> Vec<Value> {
-    read(store)
+/// The reason a read saw less than the whole store. One spelling, because the
+/// client renders on it and a second would render as nothing.
+///
+/// `unauthorized` belongs in this set the moment these routes carry a caller
+/// identity to refuse; today they do not, so inventing the value would be a
+/// state nothing can produce.
+pub const UNREADABLE: &str = "unreadable";
+
+fn projected(store: &Path, program: Option<&str>) -> (Vec<Value>, Option<&'static str>) {
+    let read = read(store);
+    let views = read
+        .instances
         .into_iter()
         .filter(|instance| program.is_none_or(|name| instance.program == name))
         .map(|instance| instance.view)
-        .collect()
+        .collect();
+    (views, read.unread)
 }

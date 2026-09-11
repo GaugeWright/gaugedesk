@@ -259,6 +259,12 @@ export interface WhipProgram {
     readonly chat: string | null;
     readonly structure: WhipStructure | null;
     readonly instances: readonly WhipInstanceView[];
+    /** Why this program's runs could not be read, when they could not be
+     *  (ACTION-7). `null` means the list below is the whole answer — including
+     *  when it is empty, which is what a program nothing has run looks like.
+     *  Non-null means the runtime store refused, and an empty list here is an
+     *  absence of evidence rather than evidence of absence. */
+    readonly unread: string | null;
 }
 
 export function programsFromV1(value: {
@@ -268,6 +274,7 @@ export function programsFromV1(value: {
         readonly chat: string | null;
         readonly structure: unknown | null;
         readonly instances: readonly unknown[];
+        readonly unread?: string | null;
     }[];
 }): readonly WhipProgram[] {
     return value.whips.map((whip) => ({
@@ -276,6 +283,9 @@ export function programsFromV1(value: {
         chat: whip.chat,
         structure: whip.structure == null ? null : structureFromV0(whip.structure),
         instances: whip.instances.map(instanceViewFromV0),
+        // Optional on the wire so an older server simply reads as "complete",
+        // which is what it meant before it could say otherwise.
+        unread: whip.unread ?? null,
     }));
 }
 

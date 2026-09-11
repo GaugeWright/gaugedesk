@@ -195,12 +195,34 @@ export function WhipStructureView(props: {
 
 export function WhipInstancesView(props: {
     readonly instances: readonly WhipInstanceView[];
+    /** Why the runs could not be read, when they could not be (ACTION-7). */
+    readonly unread?: string | null;
 }): JSX.Element {
     return (
         <div class="whip-panel" data-whip-instances>
+            {/* An unreadable store and a program nothing has run both arrive as
+                an empty list, and they mean opposite things. Saying "no runs"
+                for the first is the confident lie the note above guards against
+                elsewhere in this view — so it gets the same treatment. */}
+            <Show when={props.unread}>
+                <div class="whip-note" data-kind="untrusted" data-whip-unread>
+                    This program's runs could not be read
+                    {props.unread === "unreadable" ? " — its runtime store did not open" : ""}. Runs
+                    may exist that are not shown here; this is not a record of none.
+                </div>
+            </Show>
             <Show
                 when={props.instances.length}
-                fallback={<div class="status">No instance of this program is running.</div>}
+                fallback={
+                    <div class="status">
+                        <Show
+                            when={props.unread}
+                            fallback="No instance of this program is running."
+                        >
+                            Nothing could be listed.
+                        </Show>
+                    </div>
+                }
             >
                 <For each={props.instances}>
                     {(instance) => (
