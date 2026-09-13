@@ -14,6 +14,9 @@
  */
 
 import { createEffect, createMemo, createResource, createSignal, lazy, Match, on, onCleanup, Show, Suspense, Switch, type JSX } from "solid-js";
+import { editorSaveUpdate } from "./editor-save-update";
+import { editorRequestFence } from "./editor-request-fence";
+import type { SaveBase, SaveFileResult } from "@gaugewright/control-plane-client";
 import { useSession } from "./session-context";
 import { changedUserFiles, diffHasFiles } from "./changed-files";
 import { defaultContentMode, isSettledPhase, phaseLabel as phaseLabelFor, shouldShowViewOnSelect } from "./content-view";
@@ -86,6 +89,9 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     // everywhere it runs, so we phrase keep/kept in method terms (naming the method).
     const id = () => session.engagementId();
     const file = () => session.selectedFile();
+    const editorContext = createMemo(() => ({ id: id(), file: file(), api: session.api }));
+    const requests = editorRequestFence(editorContext);
+    onCleanup(requests.dispose);
     const diff = () => session.diff();
     const mergePhase = () => session.mergePhase();
     // A `Rejected` merge can mean two different things: the user discarded the work, or git
@@ -118,24 +124,39 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     // but both are read as text and both can be written back as text, so this
     // is what the read and the editor agree on.
     const readsAsText = () => viewerFile().kind === "text" || viewerFile().kind === "table";
-    const [content, { refetch }] = createResource(
+    const [draft, updateDraft] = createSignal<string | null>(null);
+    const [draftBase, setDraftBase] = createSignal<SaveBase | null>(null);
+    function setDraft(value: string | null) {
+        requests.change();
+        if (value === null) setDraftBase(null);
+        else if (draft() === null) {
+            const cut = baseCut();
+            setDraftBase(cut ? { cut } : { content: content() ?? "" });
+        }
+        updateDraft(value);
+    }
+    const [content, { refetch, mutate }] = createResource(
         () => {
-            const i = id();
-            const f = file();
+            const context = editorContext();
+            const { id: i, file: f } = context;
             const revision = props.refreshKey?.();
             // A file we are going to paint is never read as text: decoding a
             // PNG produces nothing anyone wants to see.
             if (!readsAsText()) return null;
-            return i && f ? ([i, f, revision] as const) : null;
+            return i && f ? ([i, f, revision, context] as const) : null;
         },
-        async ([i, f]) => {
-            if (session.api.getFileWithCut) {
-                const read = await session.api.getFileWithCut(i, f);
-                setBaseCut(read.cut);
-                return read.content;
-            }
-            setBaseCut(null);
-            return session.api.getFile(i, f);
+        async ([i, f, _revision, context]): Promise<string> => {
+            const token = requests.beginRead();
+            const read = context.api.getFileWithCut
+                ? await context.api.getFileWithCut(i, f)
+                : { content: await context.api.getFile(i, f), cut: null };
+            // Only the latest read owns the displayed baseline. An existing
+            // draft keeps its independently captured basis.
+            if (requests.currentRead(token)) setBaseCut(read.cut);
+            // A read started before save completion cannot replace the
+            // accepted revision after mutate() installs it.
+            if (context === editorContext() && !requests.currentRead(token)) return content.latest ?? read.content;
+            return read.content;
         },
     );
     // The same file, kept as bytes, for the views that render it rather than
@@ -151,7 +172,6 @@ export function ContentViewer(props: ContentViewerProps = {}) {
         },
         async ([i, f]) => (await session.api.getFileBytes!(i, f)).bytes,
     );
-    const [draft, setDraft] = createSignal<string | null>(null);
     const [msg, setMsg] = createSignal("");
     const text = () => draft() ?? content() ?? "";
     const specialRenderer = () => {
@@ -211,13 +231,13 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     // file) still drops them into View as before.
     createEffect(
         on(
-            () => file(),
-            (f) => {
-                if (!f) return;
+            editorContext,
+            ({ file: f }) => {
                 setDraft(null);
                 setMsg("");
                 setConflict(null);
-                if (shouldShowViewOnSelect(mergePhase() ?? null)) setMode("view");
+                setBaseCut(null);
+                if (f && shouldShowViewOnSelect(mergePhase() ?? null)) setMode("view");
             },
         ),
     );
@@ -266,19 +286,24 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     async function liveFold() {
         const i = id();
         const f = file();
-        const cut = baseCut();
+        const basis = draftBase();
+        const cut = basis && "cut" in basis ? basis.cut : null;
         // Best-effort by design: no preview API, no cut, or an already-open
         // fold means the save-time gate still protects the write.
         if (!i || !f || !cut || !session.api.previewMerge || conflict()) return;
+        const token = requests.beginPreview();
+        if (!token) return;
         try {
             const preview = await session.api.previewMerge(i, f, text(), cut);
-            if (!preview.knownBase) return;
-            if (preview.clean && typeof preview.merged === "string") {
+            if (!requests.currentPreview(token) || !preview.knownBase) return;
+            if (preview.clean && typeof preview.merged === "string" && preview.currentCut) {
                 if (preview.merged !== text()) {
                     setDraft(preview.merged);
                     setMsg("folded the assistant's newer changes into your unsaved edit");
                 }
-                if (preview.currentCut) setBaseCut(preview.currentCut);
+                // A clean preview has rebased this exact draft. Keep that
+                // basis separate from any newer file read's cut.
+                setDraftBase({ cut: preview.currentCut });
                 // Re-read so the on-disk body (and dirty()) stay honest under
                 // the folded draft.
                 void refetch();
@@ -340,6 +365,33 @@ export function ContentViewer(props: ContentViewerProps = {}) {
         pieces: import("@gaugewright/control-plane-client").MergePiece[];
     }>(null);
 
+    // Install exactly the bytes accepted for this submission. A working-copy
+    // refetch could already name a later writer and is not this save's result.
+    function applySave(token: NonNullable<ReturnType<typeof requests.beginSave>>,
+        submitted: string, result: SaveFileResult) {
+        if (!requests.belongs(token)) return;
+        if (result.kind === "conflict") {
+            if (!requests.unchanged(token)) {
+                setMsg("not saved — the file changed; your newer edit is unchanged");
+                return;
+            }
+            setConflict({ current: result.current, currentCut: result.currentCut, pieces: result.pieces });
+            setMsg("");
+            return;
+        }
+        const update = editorSaveUpdate(submitted, result, {
+            draft: draft(), basis: draftBase(), unchanged: requests.unchanged(token),
+        });
+        requests.invalidateReads();
+        mutate(update.accepted);
+        setBaseCut(update.cut);
+        setDraft(update.draft);
+        setDraftBase(update.basis);
+        if (update.draft === null) setConflict(null);
+        setMsg(update.message);
+        session.onContentSaved();
+    }
+
     async function saveResolved(
         resolved: string,
         resolutions: import("@gaugewright/control-plane-client").RegionResolution[],
@@ -348,74 +400,48 @@ export function ContentViewer(props: ContentViewerProps = {}) {
         const f = file();
         const c = conflict();
         if (!i || !f || !c || !session.api.saveFile) return;
+        const token = requests.beginSave();
+        if (!token) return;
         try {
-            // The settled triples ride the re-save: they mint durable region
-            // memory server-side, so the same divergence never re-asks.
             const base = c.currentCut ? { cut: c.currentCut } : { content: c.current };
             const result = await session.api.saveFile(i, f, resolved, base, resolutions);
-            if (result.kind === "conflict") {
-                // The file moved again while resolving: fold the new regions.
-                setConflict({
-                    current: result.current,
-                    currentCut: result.currentCut,
-                    pieces: result.pieces,
-                });
-                setMsg("the file changed again while you were resolving — updated the choices");
-                return;
-            }
-            setConflict(null);
-            setMsg(result.kind === "merged" ? "saved — merged with newer changes" : "saved");
-            setDraft(null);
-            await refetch();
-            session.onContentSaved();
+            applySave(token, resolved, result);
         } catch (e) {
-            setMsg(String(e));
+            if (requests.belongs(token)) setMsg(String(e));
+        } finally {
+            requests.finishSave(token);
         }
     }
 
     async function save() {
         const i = id();
         const f = file();
-        if (!i || !f) return;
-        // Nothing changed — nothing to save (also guards the Ctrl+S path).
-        if (!dirty()) return;
+        if (!i || !f || content.loading || content.error || !dirty() || requests.saving()) return;
+        const submitted = text();
         if (isJsonFile(f)) {
             try {
-                JSON.parse(text());
+                JSON.parse(submitted);
             } catch {
                 setMsg("Not saved — this isn't valid settings text. Check for a stray character or a missing comma, bracket, or quote.");
                 return;
             }
         }
+        const base = draftBase();
+        if (!base) return;
+        const token = requests.beginSave();
+        if (!token) return;
         try {
-            // Base-carrying save (SUB-6): the base is the cut this draft was
-            // read at (or the content, against older servers), so a concurrent
-            // agent write merges through whip's engine instead of being
-            // clobbered. Sessions without saveFile keep the legacy write.
             if (session.api.saveFile) {
-                const cut = baseCut();
-                const base = cut ? { cut } : { content: content() ?? "" };
-                const result = await session.api.saveFile(i, f, text(), base);
-                if (result.kind === "conflict") {
-                    setConflict({
-                        current: result.current,
-                        currentCut: result.currentCut,
-                        pieces: result.pieces,
-                    });
-                    setMsg("");
-                    return;
-                }
-                if (result.cut) setBaseCut(result.cut);
-                setMsg(result.kind === "merged" ? "saved — merged with the assistant's changes" : "saved");
+                const result = await session.api.saveFile(i, f, submitted, base);
+                applySave(token, submitted, result);
             } else {
-                await session.api.putFile(i, f, text());
-                setMsg("saved");
+                await session.api.putFile(i, f, submitted);
+                applySave(token, submitted, { kind: "saved", cut: null });
             }
-            setDraft(null);
-            await refetch();
-            session.onContentSaved();
         } catch (e) {
-            setMsg(String(e));
+            if (requests.belongs(token)) setMsg(String(e));
+        } finally {
+            requests.finishSave(token);
         }
     }
 
@@ -704,6 +730,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                                         void saveResolved(resolved, resolutions)
                                     }
                                     onCancel={() => {
+                                        requests.change();
                                         setConflict(null);
                                         setMsg("not saved — the file has newer changes; your draft is unchanged");
                                     }}
@@ -733,11 +760,12 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                             data-file-edit
                             aria-label={`Edit ${file()}`}
                             spellcheck={false}
+                            disabled={content.loading || !!content.error}
                             value={text()}
                             onInput={(e) => {
                                 setDraft(e.currentTarget.value);
                                 // A fresh edit invalidates the lingering "saved" note.
-                                if (msg() === "saved") setMsg("");
+                                setMsg("");
                             }}
                             onKeyDown={onKeyDown}
                         />

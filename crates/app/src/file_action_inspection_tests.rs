@@ -9,6 +9,9 @@ use crate::{
 use whipplescript_kernel::file_lease::FileLeasePolicy;
 use whipplescript_store::SqliteStore;
 
+#[path = "file_action_route_tests.rs"]
+mod route_tests;
+
 pub(super) struct Fixture {
     pub(super) shared: SharedWorkbench,
     pub(super) command: HostActionCommand,
@@ -111,7 +114,7 @@ pub(super) fn reader(wb: &mut Workbench) -> (AuthenticatedActionContext, String)
     let token = wb.mint_account_session("bob", "passkey", 3600).unwrap();
     (wb.authenticate_action_context(&token).unwrap(), token)
 }
-fn forget(path: &std::path::Path) {
+pub(super) fn forget(path: &std::path::Path) {
     for suffix in ["", "-wal", "-shm"] {
         let path = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
         if path.exists() {
@@ -410,3 +413,6 @@ fn saved_input_observation_keeps_interrupted_outcome_unknown_and_cannot_restore_
         )
         .is_err());
 }
+
+#[path = "file_action_product_result_inspection_tests.rs"]
+mod product_result_tests;

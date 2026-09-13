@@ -522,7 +522,12 @@ impl Workbench {
         client: crate::client_admission::ClientBuild,
         enforce_software: bool,
     ) -> Result<String, (StatusCode, &'static str)> {
-        if self.idp.is_none() && !web_account_mode() {
+        // A durable account session is independently verifiable after restart.
+        // The optional IdP's absence must not replace that actor with the local
+        // operator, or Home admission and action attribution disagree.
+        let account_session =
+            bearer.is_some_and(|token| self.account_sessions.resolve_now(token).is_some());
+        if self.idp.is_none() && !web_account_mode() && !account_session {
             if self.hosted_home_mode() {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1030,6 +1035,48 @@ mod provider_neutral_identity_tests {
     use crate::app_support::LockUnpoisoned;
     use gaugedesk_core::abac::{AuthorityAttributes, Role};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn account_session_data_admission_preserves_actor_without_idp_and_enforces_membership() {
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        let member = crate::org::MembershipRecord {
+            id: "member".into(),
+            op: crate::org::RecordOp::Upsert,
+            org_id: crate::org::ORG_ID.into(),
+            authority: "member".into(),
+            email: String::new(),
+            role: "member".into(),
+            status: crate::org::MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        };
+        wb.store_mut()
+            .append_record(
+                crate::org::ORG_SCOPE,
+                "membership",
+                &serde_json::to_string(&member).unwrap(),
+            )
+            .unwrap();
+        let token = wb.mint_account_session("member", "passkey", 3600).unwrap();
+        let outsider = wb
+            .mint_account_session("outsider", "passkey", 3600)
+            .unwrap();
+        assert!(wb.idp.is_none());
+        assert_eq!(wb.admit_data_request(Some(&token), None).unwrap(), "member");
+        assert_eq!(
+            wb.authenticate_action_context(&token)
+                .unwrap()
+                .actor()
+                .as_str(),
+            "member"
+        );
+        assert_eq!(
+            wb.admit_data_request(Some(&outsider), None).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(wb.revoke_account_session(&token));
+        assert!(wb.authenticate_action_context(&token).is_none());
+    }
 
     #[test]
     fn account_session_never_inherits_claims_from_a_colliding_idp_authority() {

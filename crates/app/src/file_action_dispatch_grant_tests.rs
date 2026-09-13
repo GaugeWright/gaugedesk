@@ -172,10 +172,14 @@ fn scoped_authority_cannot_mint_commands_renew_grants_or_change_the_admitted_com
         ActionBasis::Version { version_ref } => version_ref,
         _ => panic!("expected base"),
     };
+    let identity = wb
+        .prepare_editor_file_save_request(&context, &chat, "note.txt", "another-save")
+        .unwrap();
     let error = wb
         .admit_editor_file_save(
             &scoped.context,
             &inputs,
+            &identity,
             &EditorFileSave {
                 chat_id: &chat,
                 request_id: "another-save",
@@ -570,10 +574,14 @@ fn controller_dispatch_uses_the_exact_revocable_device_source_and_home() {
     let ActionBasis::Version { version_ref } = &original.resources["target"].basis else {
         panic!("base")
     };
+    let identity = wb
+        .prepare_editor_file_save_request(&context, &chat, "note.txt", "device-save")
+        .unwrap();
     let command = wb
         .admit_editor_file_save(
             &context,
             &inputs,
+            &identity,
             &EditorFileSave {
                 chat_id: &chat,
                 request_id: "device-save",

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{CommandRecordFact, ContentCodec};
+use crate::{CommandRecordFact, CommittedRecordSnapshot, ContentCodec};
 use std::sync::Arc;
 
 fn facts() -> Vec<CommandRecordFact> {
@@ -293,4 +293,96 @@ fn authority_history_refuses_an_unavailable_revocation_instead_of_reactivating_t
         store.read_for_dispatch(&["authority"], |store| store.retained_events("authority")),
         Err(AdmitError::Codec(_))
     ));
+}
+
+#[test]
+fn committed_record_snapshots_preserve_scope_identity_and_ignore_mutable_status() {
+    let mut store = Store::open_in_memory().unwrap();
+    assert!(store
+        .committed_record_snapshots("results")
+        .unwrap()
+        .is_empty());
+    store
+        .append_record("fact-results", "before", "earlier")
+        .unwrap();
+    for (scope, key, value) in [
+        ("results", "z", "last"),
+        ("results", "a", "first"),
+        ("other", "a", "foreign"),
+    ] {
+        store
+            .admit_record_facts(
+                scope,
+                key,
+                value,
+                &[CommandRecordFact {
+                    scope_id: format!("fact-{scope}"),
+                    kind: "result".into(),
+                    payload: value.into(),
+                }],
+            )
+            .unwrap();
+    }
+    store
+        .conn
+        .execute("UPDATE commands SET status = 'expired'", [])
+        .unwrap();
+    assert_eq!(
+        store.committed_record_snapshots("results").unwrap(),
+        vec![
+            CommittedRecordSnapshot {
+                idempotency_key: "a".into(),
+                snapshot_json: "first".into(),
+                first_fact_position: 2
+            },
+            CommittedRecordSnapshot {
+                idempotency_key: "z".into(),
+                snapshot_json: "last".into(),
+                first_fact_position: 1
+            }
+        ]
+    );
+    assert_eq!(
+        store
+            .command_for_key("results", "a")
+            .unwrap()
+            .unwrap()
+            .status,
+        "expired"
+    );
+    store
+        .conn
+        .execute(
+            "DELETE FROM command_receipts WHERE scope_id = 'results' AND command_key = 'a'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        store.committed_record_snapshots("results").unwrap(),
+        vec![CommittedRecordSnapshot {
+            idempotency_key: "z".into(),
+            snapshot_json: "last".into(),
+            first_fact_position: 1
+        }]
+    );
+}
+
+#[test]
+fn committed_record_snapshots_refuse_orphaned_or_misidentified_receipts() {
+    for corrupt in ["delete", "identity"] {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .admit_record_facts("results", "key", "saved", &[])
+            .unwrap();
+        let sql = if corrupt == "delete" {
+            "DELETE FROM commands"
+        } else {
+            "UPDATE commands SET command_id = 'foreign'"
+        };
+        store.conn.execute(sql, []).unwrap();
+        assert!(
+            store.committed_record_snapshots("results").is_err(),
+            "{corrupt}"
+        );
+    }
 }

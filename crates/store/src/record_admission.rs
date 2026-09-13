@@ -1,6 +1,26 @@
 //! The shared record-fact commit, used by ordinary and retained publication.
 use super::*;
 
+pub(crate) fn validate_snapshot(
+    command_scope: &str,
+    idempotency_key: &str,
+    id: Option<String>,
+    snapshot: Option<String>,
+) -> Result<String, AdmitError> {
+    let expected = format!(
+        "record-command:{}:{command_scope}{idempotency_key}",
+        command_scope.len()
+    );
+    if id.as_deref() != Some(expected.as_str()) {
+        return Err(AdmitError::Rejected(Rejection {
+            reason: "record receipt has no matching original command",
+        }));
+    }
+    snapshot.ok_or(AdmitError::Rejected(Rejection {
+        reason: "record receipt has no matching original command",
+    }))
+}
+
 pub(crate) fn encode_facts(
     codec: Option<&Arc<dyn ContentCodec>>,
     facts: &[CommandRecordFact],

@@ -412,6 +412,7 @@ impl Workbench {
         &mut self,
         context: &AuthenticatedActionContext,
         inputs: &NativeActionInputCustody,
+        original: &EditorFileSaveRequestIdentity,
         request: &EditorFileSave<'_>,
     ) -> Result<AdmittedEditorFileSave, String> {
         if inputs.authority_scope() != self.home_id().as_str() {
@@ -431,6 +432,16 @@ impl Workbench {
                 read,
             )
             .map_err(|error| format!("file action authorization refused: {error:?}"))?;
+        let expected = request_preparation::identity(
+            home.as_str(),
+            self.authority().as_str(),
+            &authority.project_id,
+            request.chat_id,
+            request.request_id,
+        )?;
+        if original != &expected {
+            return Err("original file request differs from the current Home or placement".into());
+        }
         let target = self
             .engagements
             .get(request.chat_id)
@@ -439,14 +450,9 @@ impl Workbench {
             .map_err(|error| format!("{error:?}"))?;
         let action = editor_file_save_workflow()?;
         let identity = ActionPolicyIdentity {
-            issuer: self.authority().as_str().into(),
-            scope: serde_json::to_string(&(
-                "gaugedesk.editor-file.v1",
-                &authority.project_id,
-                request.chat_id,
-            ))
-            .map_err(|error| format!("{error:?}"))?,
-            request_id: request.request_id.into(),
+            issuer: original.issuer.clone(),
+            scope: original.scope.clone(),
+            request_id: original.request_id.clone(),
         };
         let signing_key =
             SigningKey::from_seed(&self.governance_seed()).map_err(|error| error.reason)?;
@@ -574,6 +580,10 @@ mod tests;
 #[path = "file_action_delivery.rs"]
 mod delivery;
 
+#[path = "file_action_request_preparation.rs"]
+mod request_preparation;
+pub use request_preparation::EditorFileSaveRequestIdentity;
+
 #[path = "file_action_execution.rs"]
 mod execution;
 
@@ -585,7 +595,9 @@ mod ownership;
 
 pub use ownership::NativeEditorActionRuntime;
 pub use recovery::{
-    AdmittedEditorSavedResult, EditorFileSaveObservation, NativeEditorSavedResult,
+    AdmittedEditorSavedResult, EditorFileSaveExecutionObservation, EditorFileSaveObservation,
+    EditorFileSaveRequest, EditorFileSaveRequestObservation, EditorFileSavedContentObservation,
+    EditorFileSavedResultObservation, NativeEditorSavedResult, ObservedEditorSavedProductResult,
     RetainedEditorFileSaveSource,
 };
 

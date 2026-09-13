@@ -17,8 +17,15 @@ use http_body_util::BodyExt;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+#[path = "file_action_request_preparation_tests.rs"]
+mod request_preparation_tests;
+
+#[path = "file_action_submission_route_tests.rs"]
+mod submission_route_tests;
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct Intent {
+    identity: EditorFileSaveRequestIdentity,
     chat_id: String,
     request_id: String,
     path: String,
@@ -34,7 +41,7 @@ fn router(wb: SharedWorkbench, input_path: std::path::PathBuf) -> Router {
         async move {
             let mut wb = wb.lock_unpoisoned();
             let custody = NativeActionInputCustody::open(path, wb.home_id().as_str(), 4096).unwrap();
-            match wb.admit_editor_file_save(&context, &custody, &EditorFileSave {
+            match wb.admit_editor_file_save(&context, &custody, &intent.identity, &EditorFileSave {
                 chat_id: &intent.chat_id, request_id: &intent.request_id, path: &intent.path,
                 base_cut: &intent.base_cut, content: &intent.content,
             }) {
@@ -118,8 +125,13 @@ fn setup_content(
         let engagement = &wb.engagements[&chat_id];
         engagement.write_file(&path, base_body).unwrap();
         let base = engagement.commit_turn("fixture base").unwrap().unwrap().0;
+        let context = wb.authenticate_action_context(&token).unwrap();
+        let identity = wb
+            .prepare_editor_file_save_request(&context, &chat_id, "note.txt", "save-1")
+            .unwrap();
         (
             Intent {
+                identity,
                 chat_id,
                 request_id: "save-1".into(),
                 path: "note.txt".into(),
@@ -296,6 +308,7 @@ fn native_factory_refuses_revoked_or_unretained_account_context_before_preparati
     let result = wb.admit_editor_file_save(
         &context,
         &inputs,
+        &intent.identity,
         &EditorFileSave {
             chat_id: &intent.chat_id,
             request_id: &intent.request_id,
@@ -473,6 +486,7 @@ pub(super) fn admitted_content_fixture(
             .admit_editor_file_save(
                 &context,
                 &inputs,
+                &intent.identity,
                 &EditorFileSave {
                     chat_id: &intent.chat_id,
                     request_id: &intent.request_id,
@@ -505,6 +519,7 @@ pub(super) fn home_storage_fixture(
             .admit_editor_file_save(
                 &context,
                 storage.inputs(),
+                &intent.identity,
                 &EditorFileSave {
                     chat_id: &intent.chat_id,
                     request_id: &intent.request_id,

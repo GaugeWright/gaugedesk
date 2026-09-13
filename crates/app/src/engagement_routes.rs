@@ -500,13 +500,18 @@ impl Workbench {
             .map(|eng| eng.read_file_bytes_capped(&path, max_bytes))
     }
 
-    /// The engagement's current cut — minted on demand so what the reader
-    /// just saw is always an addressable save base (cut-on-read).
-    pub fn engagement_current_cut(
+    /// A retained immutable revision matching the exact bytes served. Reading
+    /// a file never imports the worktree just to manufacture response metadata.
+    pub fn engagement_recorded_file_cut(
         &self,
         chat_id: &str,
+        path: &str,
+        served: &[u8],
     ) -> Option<Result<Option<String>, WorkspaceError>> {
-        self.engagements.get(chat_id).map(|eng| eng.current_cut())
+        let path = self.engagement_workspace_path(chat_id, path);
+        self.engagements
+            .get(chat_id)
+            .map(|eng| eng.recorded_file_cut(&path, served))
     }
 
     /// Read-only preview of what a base-carrying save would do (the live
@@ -1182,11 +1187,11 @@ pub(crate) async fn get_file(
         }
         Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
     };
-    // The cut the reader is looking at, minted on demand — the addressable
-    // base a cut-carrying save sends back (§12). Best-effort: an unreadable
-    // cut degrades to a plain body.
+    // Name a cut only if retained history contains the exact served body.
+    // A transient working-copy edit remains viewable without becoming history;
+    // unavailable evidence omits the cut instead of importing or repairing it.
     let cut = wb
-        .engagement_current_cut(&id)
+        .engagement_recorded_file_cut(&id, &q.path, &bytes)
         .and_then(|result| result.ok())
         .flatten();
     let mut response = match String::from_utf8(bytes) {

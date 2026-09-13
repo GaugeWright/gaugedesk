@@ -73,6 +73,55 @@ pub fn deliver_admitted_action<S: RuntimeStore + LogAppend>(
     record_runtime_acknowledgment(product, scope, delivery, receipt)
 }
 
+/// Read only the exact receipted product/runtime link. This is evidence lookup,
+/// not read authorization; callers must retain their current authority fence.
+/// None means no retained acknowledgment, never that runtime admission or work
+/// did not occur. Unavailable or inconsistent history is an error.
+pub(crate) fn retained_runtime_acknowledgment(
+    product: &Store,
+    delivery: &CommittedDispatch<HostActionCommand>,
+) -> Result<Option<RuntimeAcknowledgment>, DeliveryError> {
+    let scope = delivery.command.instance_ref().map_err(|_| {
+        DeliveryError::Invalid("runtime acknowledgment has an invalid original command")
+    })?;
+    let snapshot = product
+        .committed_record_snapshot(&format!("host-action-runtime-ack:{scope}"), "admitted")
+        .map_err(DeliveryError::Product)?;
+    let history = product
+        .retained_events(&scope)
+        .map_err(DeliveryError::Product)?;
+    let acknowledgments: Vec<_> = history
+        .iter()
+        .filter(|(_, kind, _)| kind == ACKNOWLEDGMENT_KIND)
+        .collect();
+    let Some(snapshot) = snapshot else {
+        if !acknowledgments.is_empty() {
+            return Err(DeliveryError::Invalid(
+                "runtime acknowledgment has no committed receipt",
+            ));
+        }
+        return Ok(None);
+    };
+    let acknowledgment: RuntimeAcknowledgment = serde_json::from_str(&snapshot)
+        .map_err(|_| DeliveryError::Invalid("runtime acknowledgment is malformed"))?;
+    if acknowledgments.len() != 1
+        || acknowledgments[0].2 != snapshot
+        || acknowledgment.product_command_id != delivery.command_id
+        || acknowledgment.runtime_ref != delivery.dispatch.runtime_ref
+    {
+        return Err(DeliveryError::Invalid(
+            "runtime acknowledgment differs from its committed command",
+        ));
+    }
+    acknowledgment
+        .receipt
+        .validate_for(&delivery.command)
+        .map_err(|_| {
+            DeliveryError::Invalid("runtime acknowledgment has a mismatched admission receipt")
+        })?;
+    Ok(Some(acknowledgment))
+}
+
 pub(crate) fn record_runtime_acknowledgment(
     product: &mut Store,
     scope: &str,
@@ -432,6 +481,130 @@ rule echo
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn retained_acknowledgment_cannot_hide_unavailable_history_as_an_evidence_gap() {
+        struct UnavailableRead;
+        impl ContentCodec for UnavailableRead {
+            fn encode(&self, _: &str, _: &str, payload: &str) -> Result<String, String> {
+                Ok(payload.into())
+            }
+            fn decode(&self, _: &str, kind: &str, payload: &str) -> Option<String> {
+                (kind != ACKNOWLEDGMENT_KIND).then(|| payload.into())
+            }
+        }
+        let fixture = Fixture::new(false);
+        let mut product = Store::open_in_memory()
+            .unwrap()
+            .with_codec(Arc::new(UnavailableRead));
+        fixture.admit_product(&mut product, fixture.command.fingerprint().unwrap());
+        let delivery = product
+            .committed_dispatch::<ProductActionAdmission>(
+                &fixture.scope(),
+                &fixture.command.request_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(retained_runtime_acknowledgment(&product, &delivery)
+            .unwrap()
+            .is_none());
+        // A historical fact is now unavailable, and no receipt is readable.
+        // Filtering the fact out would turn unavailable evidence into None.
+        product
+            .append_record(&fixture.scope(), ACKNOWLEDGMENT_KIND, "unavailable")
+            .unwrap();
+        assert!(retained_runtime_acknowledgment(&product, &delivery).is_err());
+    }
+
+    #[test]
+    fn retained_acknowledgment_requires_the_exact_receipt_and_unique_fact() {
+        let fixture = Fixture::new(false);
+        let mut host = fixture.host();
+        let receipt = host
+            .admit_action(
+                fixture.command.clone(),
+                &fixture.action,
+                &fixture.verifier,
+                &fixture.proof,
+            )
+            .unwrap();
+        for corruption in [
+            "valid",
+            "command",
+            "runtime",
+            "fingerprint",
+            "instance",
+            "position",
+            "digest",
+            "missing_fact",
+            "different_fact",
+            "duplicate_fact",
+            "malformed",
+        ] {
+            let mut product = Store::open_in_memory().unwrap();
+            fixture.admit_product(&mut product, fixture.command.fingerprint().unwrap());
+            let delivery = product
+                .committed_dispatch::<ProductActionAdmission>(
+                    &fixture.scope(),
+                    &fixture.command.request_id,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(retained_runtime_acknowledgment(&product, &delivery)
+                .unwrap()
+                .is_none());
+            let mut acknowledgment = RuntimeAcknowledgment {
+                product_command_id: delivery.command_id.clone(),
+                runtime_ref: delivery.dispatch.runtime_ref.clone(),
+                receipt: receipt.clone(),
+            };
+            match corruption {
+                "command" => acknowledgment.product_command_id.push_str("-other"),
+                "runtime" => acknowledgment.runtime_ref.push_str("-other"),
+                "fingerprint" => acknowledgment.receipt.fingerprint.push_str("-other"),
+                "instance" => acknowledgment.receipt.instance_ref.push_str("-other"),
+                "position" => acknowledgment.receipt.admitted_at.sequence = 0,
+                "digest" => acknowledgment.receipt.admitted_at.head_digest.clear(),
+                _ => {}
+            }
+            let snapshot = if corruption == "malformed" {
+                "{".into()
+            } else {
+                serde_json::to_string(&acknowledgment).unwrap()
+            };
+            let mut facts = vec![CommandRecordFact {
+                scope_id: fixture.scope(),
+                kind: ACKNOWLEDGMENT_KIND.into(),
+                payload: if corruption == "different_fact" {
+                    "{}".into()
+                } else {
+                    snapshot.clone()
+                },
+            }];
+            if corruption == "missing_fact" {
+                facts.clear();
+            }
+            product
+                .admit_record_facts(
+                    &format!("host-action-runtime-ack:{}", fixture.scope()),
+                    "admitted",
+                    &snapshot,
+                    &facts,
+                )
+                .unwrap();
+            if corruption == "duplicate_fact" {
+                product
+                    .append_record(&fixture.scope(), ACKNOWLEDGMENT_KIND, &snapshot)
+                    .unwrap();
+            }
+            let observed = retained_runtime_acknowledgment(&product, &delivery);
+            if corruption == "valid" {
+                assert_eq!(observed.unwrap(), Some(acknowledgment));
+            } else {
+                assert!(observed.is_err(), "{corruption}");
+            }
+        }
     }
 
     #[test]

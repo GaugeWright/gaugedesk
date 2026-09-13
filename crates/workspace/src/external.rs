@@ -540,6 +540,29 @@ impl ChatWorkspace for ExternalCandidate {
         }
     }
 
+    fn recorded_file_cut(&self, rel: &str, served: &[u8]) -> Result<Option<String>> {
+        if self.metadata.kind != ExternalTargetKind::Git {
+            return Ok(None);
+        }
+        safe_path(&self.candidate, rel)?;
+        let cut = String::from_utf8_lossy(&git_file_observation(
+            &self.candidate,
+            &["rev-parse", "HEAD"],
+        )?)
+        .trim()
+        .to_owned();
+        let object = format!("{cut}:{rel}");
+        let size = match git_file_observation(&self.candidate, &["cat-file", "-s", &object]) {
+            Ok(size) => String::from_utf8_lossy(&size).trim().parse::<usize>().ok(),
+            Err(_) => return Ok(None),
+        };
+        if size != Some(served.len()) {
+            return Ok(None);
+        }
+        let bytes = git_file_observation(&self.candidate, &["cat-file", "blob", &object])?;
+        Ok((bytes == served).then_some(cut))
+    }
+
     fn current_cut(&self) -> Result<Option<String>> {
         Ok(Some(self.candidate_revision()?))
     }
@@ -585,6 +608,20 @@ impl ChatWorkspace for ExternalCandidate {
             pieces: Vec::new(),
         }))
     }
+}
+
+/// Missing promised objects are unavailable evidence. A viewer must not make
+/// Git fetch and persist them behind an otherwise read-only cat-file command.
+/// Git versions without this switch refuse instead of falling back to fetching.
+fn git_file_observation(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    run_output(
+        Command::new("git")
+            .arg("--no-lazy-fetch")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(root)
+            .args(args),
+        "observe recorded Git file",
+    )
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String> {
@@ -827,6 +864,10 @@ mod tests {
             ExternalWorkspace::open(source.path(), state.path(), ExternalTargetKind::Folder)
                 .unwrap();
         let candidate = workspace.create_engagement("chat").unwrap();
+        assert_eq!(
+            candidate.recorded_file_cut("a.txt", b"one\n").unwrap(),
+            None
+        );
         assert!(candidate.observe().unwrap().changed_paths.is_empty());
         candidate.write_file("a.txt", "candidate\n").unwrap();
         let observation = candidate.observe().unwrap();
@@ -854,7 +895,9 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         git(source.path(), &["init", "--quiet"]).unwrap();
         std::fs::write(source.path().join("a.txt"), "one\n").unwrap();
-        git(source.path(), &["add", "a.txt"]).unwrap();
+        let binary = [0xff, 0, 0x89, b'P'];
+        std::fs::write(source.path().join("image.bin"), binary).unwrap();
+        git(source.path(), &["add", "a.txt", "image.bin"]).unwrap();
         run(
             Command::new("git")
                 .current_dir(source.path())
@@ -874,8 +917,51 @@ mod tests {
             ExternalWorkspace::open(source.path(), state.path(), ExternalTargetKind::Git).unwrap();
         let candidate = workspace.create_engagement("chat").unwrap();
         let recorded = candidate.observe().unwrap().recorded_cut;
+        // Older Git versions must refuse the cut rather than run a potentially
+        // fetching lookup. The HTTP caller treats unavailable metadata as None.
+        let supported = git_file_observation(candidate.path(), &["rev-parse", "HEAD"]).is_ok();
+        let expected = if supported { recorded.clone() } else { None };
+        assert_eq!(
+            candidate
+                .recorded_file_cut("image.bin", &binary)
+                .ok()
+                .flatten(),
+            expected
+        );
+        assert_eq!(
+            candidate
+                .recorded_file_cut("image.bin", &[0, 0, 0x89, b'P'])
+                .ok()
+                .flatten(),
+            None
+        );
+        assert_eq!(
+            candidate
+                .recorded_file_cut("a.txt", b"one\n")
+                .ok()
+                .flatten(),
+            expected
+        );
+        assert_eq!(
+            candidate.recorded_file_cut("a.txt", b"one").ok().flatten(),
+            None
+        );
         candidate.write_file("a.txt", "candidate\n").unwrap();
         candidate.write_file("untracked.txt", "new\n").unwrap();
+        assert_eq!(
+            candidate
+                .recorded_file_cut("a.txt", b"candidate\n")
+                .ok()
+                .flatten(),
+            None
+        );
+        assert_eq!(
+            candidate
+                .recorded_file_cut("untracked.txt", b"new\n")
+                .ok()
+                .flatten(),
+            None
+        );
         let observation = candidate.observe().unwrap();
         assert_eq!(observation.recorded_cut, recorded);
         assert_eq!(
@@ -893,6 +979,64 @@ mod tests {
             git(source.path(), &["rev-list", "--count", "HEAD"]).unwrap(),
             "2"
         );
+    }
+
+    #[test]
+    fn recorded_git_file_read_does_not_fetch_a_missing_promised_blob() {
+        let source = tempfile::tempdir().unwrap();
+        git(source.path(), &["init", "--quiet"]).unwrap();
+        std::fs::write(source.path().join("note.txt"), "recorded").unwrap();
+        git(source.path(), &["add", "note.txt"]).unwrap();
+        git(
+            source.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+        )
+        .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let workspace =
+            ExternalWorkspace::open(source.path(), state.path(), ExternalTargetKind::Git).unwrap();
+        let candidate = workspace.materialize("promised").unwrap();
+        let hash = git(&candidate.candidate, &["rev-parse", "HEAD:note.txt"]).unwrap();
+        std::fs::remove_file(
+            candidate
+                .candidate
+                .join(".git/objects")
+                .join(&hash[..2])
+                .join(&hash[2..]),
+        )
+        .unwrap();
+        git(
+            &candidate.candidate,
+            &["config", "core.repositoryformatversion", "1"],
+        )
+        .unwrap();
+        git(
+            &candidate.candidate,
+            &["config", "extensions.partialClone", "origin"],
+        )
+        .unwrap();
+        git(
+            &candidate.candidate,
+            &["config", "remote.origin.promisor", "true"],
+        )
+        .unwrap();
+        let before = crate::tests::observation_files(&candidate.candidate);
+        let observed = candidate.recorded_file_cut("note.txt", b"recorded");
+        assert_eq!(
+            crate::tests::observation_files(&candidate.candidate),
+            before,
+            "file observation fetched a promised Git object"
+        );
+        assert_eq!(observed.ok().flatten(), None);
     }
 
     #[test]

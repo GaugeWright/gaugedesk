@@ -27,7 +27,8 @@
     "./projection-carriage": "./src/projection-carriage.ts",
     "./workspace-delta": "./src/workspace-delta.ts",
     "./generated/tunnel.js": "./src/generated/tunnel.js",
-    "./generated/directory.js": "./src/generated/directory.js"
+    "./generated/directory.js": "./src/generated/directory.js",
+    "./native-file-actions": "./src/native-file-actions.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p ../../tsconfig.open-client.json"

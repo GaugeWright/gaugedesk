@@ -5468,6 +5468,186 @@
       }
     },
     {
+      "id": "home.file-action.save.submit",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/chats/:id/file-actions/save",
+      "producer": "gaugedesk-app explicitly configured native save Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-and-home-admission-or-machine-controller-session",
+      "scope": "original-home-project-chat-current-save-and-dispatch-authority",
+      "capability": "admit-native-file-save-and-authorize-dispatch",
+      "requestSchema": "rust:gaugedesk-app/file_action_submission_routes/SubmitFileSave",
+      "responseSchema": "ts:@gaugewright/control-plane-client/NativeFileSaveReceipt",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 2,
+        "minimumConsumer": 2,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/file_action_submission_route_tests.rs#submission_http_lost_response_recovers_through_startup_dispatch_and_saved_read"
+        ],
+        "authority": [
+          "crates/app/src/file_action_submission_route_tests.rs#submission_http_refuses_a_changed_authenticated_actor_before_custody"
+        ],
+        "journey": [
+          "crates/app/src/file_action_submission_route_tests.rs#submission_http_lost_response_recovers_through_startup_dispatch_and_saved_read"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/file_action_submission_route_tests.rs#submission_http_revoked_dispatch_does_not_hide_admission_or_renew_authority"
+        ]
+      }
+    },
+    {
+      "id": "home.file-action.actor.inspect",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/file-actions/actor",
+      "producer": "gaugedesk-app native and hosted Home compositions",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-idp-and-home-admission-or-machine-controller-session",
+      "scope": "current-authenticated-home-actor",
+      "capability": "inspect-own-native-file-actor",
+      "requestSchema": "http/empty",
+      "responseSchema": "ts:@gaugewright/control-plane-client/NativeFileActor",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/file_action_submission_route_tests.rs#submission_actor_read_uses_current_home_credentials_without_action_custody"
+        ],
+        "authority": [
+          "crates/app/src/file_action_submission_route_tests.rs#submission_actor_read_uses_current_home_credentials_without_action_custody"
+        ],
+        "journey": [
+          "crates/app/src/file_action_submission_route_tests.rs#submission_actor_read_uses_current_home_credentials_without_action_custody"
+        ],
+        "deployed": [],
+        "property": [
+          "web/packages/control-plane-client/src/native-file-actions.test.ts#reads verified actor metadata from the exact Home without accepting credentials or a substituted Home"
+        ]
+      }
+    },
+    {
+      "id": "home.file-action.saved-content.read",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/file-actions/saved-content",
+      "producer": "gaugedesk-app native and hosted Home compositions",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-idp-and-home-admission-or-machine-controller-session",
+      "scope": "original-home-issuer-scope-request-exact-saved-cut-current-reader-authority",
+      "capability": "read-exact-native-saved-content",
+      "requestSchema": "rust:gaugedesk-app/file_action_routes/ReadSavedContent",
+      "responseSchema": "ts:@gaugewright/control-plane-client/NativeFileSavedContent",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/file_action_route_tests.rs#saved_content_http_preserves_exact_cut_authority_and_erasure_boundaries"
+        ],
+        "authority": [
+          "crates/app/src/file_action_route_tests.rs#saved_content_http_preserves_exact_cut_authority_and_erasure_boundaries"
+        ],
+        "journey": [
+          "crates/app/src/file_action_route_tests.rs#saved_content_http_preserves_exact_cut_authority_and_erasure_boundaries"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/file_action_request_inspection_tests.rs#saved_content_request_returns_the_admitted_cut_without_importing_newer_files"
+        ]
+      }
+    },
+    {
+      "id": "home.file-action.request.prepare",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/chats/:id/file-actions/request",
+      "producer": "gaugedesk-app native and hosted Home compositions",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-idp-and-home-admission-or-machine-controller-session",
+      "scope": "original-home-project-chat-current-save-authority",
+      "capability": "prepare-native-file-request-coordinates",
+      "requestSchema": "rust:gaugedesk-app/file_action_routes/PrepareFileRequest",
+      "responseSchema": "ts:@gaugewright/control-plane-client/NativeFileRequestIdentity",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/file_action_route_tests.rs#request_http_preparation_is_not_admission_and_rechecks_target_write_authority"
+        ],
+        "authority": [
+          "crates/app/src/file_action_route_tests.rs#request_http_reads_use_real_home_credentials_in_native_and_wrapped_compositions"
+        ],
+        "journey": [
+          "crates/app/src/file_action_route_tests.rs#request_http_preparation_is_not_admission_and_rechecks_target_write_authority"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/file_action_request_preparation_tests.rs#request_preparation_fences_publication_against_intervening_authority_change"
+        ]
+      }
+    },
+    {
+      "id": "home.file-action.request.inspect",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/file-actions/requests/:view",
+      "producer": "gaugedesk-app native and hosted Home compositions",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-idp-and-home-admission-or-machine-controller-session",
+      "scope": "original-home-issuer-scope-request-current-reader-authority",
+      "capability": "inspect-native-file-request-evidence",
+      "requestSchema": "rust:gaugedesk-app/file_action_factory/EditorFileSaveRequestIdentity+FileRequestView",
+      "responseSchema": "ts:@gaugewright/control-plane-client/NativeFileActionObservation",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/file_action_route_tests.rs#request_http_saved_facts_survive_unavailable_runtime_without_repair_or_false_success"
+        ],
+        "authority": [
+          "crates/app/src/file_action_route_tests.rs#request_http_reads_use_real_home_credentials_in_native_and_wrapped_compositions"
+        ],
+        "journey": [
+          "crates/app/src/file_action_route_tests.rs#request_http_saved_facts_survive_unavailable_runtime_without_repair_or_false_success"
+        ],
+        "deployed": [],
+        "property": [
+          "web/packages/control-plane-client/src/native-file-actions.test.ts#refuses substituted identity or view and never turns an unavailable read into success"
+        ]
+      }
+    },
+    {
       "id": "home.chat.file.read",
       "jurisdiction": "private-home",
       "transport": "http-json",
@@ -5499,7 +5679,7 @@
         ],
         "deployed": [],
         "property": [
-          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#chat-management-authority-matrix"
+          "crates/app/src/tests.rs#file_reads_do_not_import_unrecorded_edits_or_claim_a_mismatched_cut"
         ]
       }
     },

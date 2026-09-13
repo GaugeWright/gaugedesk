@@ -3,6 +3,7 @@
 //! lease nor permission to derive, reconcile, replay or execute another action.
 use super::*;
 use crate::action_policy::load_action_policy;
+use gaugedesk_store::command_dispatch::{CommittedDispatch, DispatchReadBasis};
 use gaugedesk_whip_runtime::{
     host_actions::action_result::{ReadActionResult, ACTION_RESULT_PROTOCOL},
     sign_hosted_policy_envelope, ResourcePolicy,
@@ -37,6 +38,48 @@ impl EditorFileSaveObservation {
     pub fn observer(&self) -> &str {
         &self.observer
     }
+}
+
+/// A currently authorized view of original command and execution metadata.
+/// A missing runtime snapshot means no acknowledgment was retained. Execution
+/// may already have happened; this view does not redeliver work or assert Saved.
+pub struct EditorFileSaveExecutionObservation {
+    command: HostActionCommand,
+    runtime: Option<ActionResultSnapshot>,
+    restrictions: ResourcePolicy,
+    observer: String,
+}
+impl EditorFileSaveExecutionObservation {
+    pub fn command(&self) -> &HostActionCommand {
+        &self.command
+    }
+    pub fn runtime(&self) -> Option<&ActionResultSnapshot> {
+        self.runtime.as_ref()
+    }
+    pub fn restrictions(&self) -> &ResourcePolicy {
+        &self.restrictions
+    }
+    pub fn observer(&self) -> &str {
+        &self.observer
+    }
+}
+
+pub(super) struct EditorFileSaveReadPreparation {
+    pub(super) key: SigningKey,
+    pub(super) basis: DispatchReadBasis,
+    pub(super) dispatch: CommittedDispatch<HostActionCommand>,
+    pub(super) restrictions: ResourcePolicy,
+    policy: HostGovernancePolicy,
+    chat: String,
+    branch: String,
+    path: String,
+    base: String,
+}
+
+struct SavedEvidenceReader<'a> {
+    runtime: &'a GovernedHostFacade<whipplescript_store::SqliteStore>,
+    target: &'a gaugedesk_workspace::NativeFileActionEvidenceTarget,
+    history: &'a dispatch_grant::NativeDispatchHistory,
 }
 
 fn read_policy(
@@ -124,8 +167,24 @@ impl Workbench {
         )
     }
 
-    // The one-use writer is consumed only by retained source publication. An
-    // ordinary observation drops it without committing any product fact.
+    /// Observe retained execution evidence without a caller-held runtime receipt
+    /// or a write-attempt id. Missing acknowledgment never proves non-execution.
+    pub fn observe_editor_file_save_execution(
+        &mut self,
+        context: &AuthenticatedActionContext,
+        command: &HostActionCommand,
+    ) -> Result<EditorFileSaveExecutionObservation, String> {
+        self.with_editor_file_save_read(
+            context,
+            command,
+            None,
+            SavedObservationOptions::default(),
+            |observation, _, _| Ok(observation),
+        )
+    }
+
+    // Saved-input reads and retention keep their exact attempt-bound target
+    // verification, under the same authority fence as general execution reads.
     fn with_editor_file_save_observation<T>(
         &mut self,
         context: &AuthenticatedActionContext,
@@ -140,6 +199,56 @@ impl Workbench {
             gaugedesk_store::command_dispatch::DispatchRecordAdmission<'tx>,
         ) -> StoreResult<T>,
     ) -> Result<T, String> {
+        self.with_editor_file_save_read(
+            context,
+            command,
+            Some(admission),
+            options,
+            |observation, reader, writer| {
+                let reader = reader.ok_or_else(refused)?;
+                let evidence = observation.runtime.ok_or_else(refused)?;
+                let store = reader.runtime.kernel().store();
+                let effect = store
+                    .list_effects(&admission.instance_ref)?
+                    .into_iter()
+                    .find(|effect| effect.effect_id == attempt.effect_id)
+                    .ok_or_else(refused)?;
+                let original = original_save(
+                    &evidence,
+                    store.chain_prefix(&admission.instance_ref)?,
+                    effect,
+                    attempt.run_id,
+                    reader.history,
+                )?;
+                let saved = reader.target.read_committed_scoped_result(
+                    &original.binding,
+                    &original.resolution_scope,
+                    &original.attempt,
+                )?;
+                publish(
+                    EditorFileSaveObservation {
+                        evidence,
+                        saved,
+                        restrictions: observation.restrictions,
+                        observer: observation.observer,
+                    },
+                    &original,
+                    reader.target,
+                    writer,
+                )
+            },
+        )
+    }
+
+    // Shared current authority and original metadata verification; no runtime,
+    // content, workspace or coordination store is opened by this preparation.
+    pub(super) fn prepare_editor_file_save_inspection(
+        &mut self,
+        context: &AuthenticatedActionContext,
+        command: &HostActionCommand,
+        additional_scopes: &[&str],
+        retained_restrictions: Option<&ResourcePolicy>,
+    ) -> Result<EditorFileSaveReadPreparation, String> {
         let invalid_profile = || "saved input is outside the registered native profile".to_owned();
         if command.issuer != self.authority().as_str()
             || command.provenance.initiator != command.provenance.executor
@@ -153,9 +262,6 @@ impl Workbench {
         }
         delivery::registered_editor_workflow(command)?;
         command.signing_bytes().map_err(|_| invalid_profile())?;
-        admission
-            .validate_for(command)
-            .map_err(|_| invalid_profile())?;
         let (format, project, chat): (String, String, String) =
             serde_json::from_str(&command.scope).map_err(|_| invalid_profile())?;
         if format != "gaugedesk.editor-file.v1" {
@@ -198,36 +304,37 @@ impl Workbench {
         let policy_scope = identity.storage_scope()?;
         let key = SigningKey::from_seed(&self.governance_seed()).map_err(|e| e.reason)?;
         let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
+        let acknowledgment_scope = format!("host-action-runtime-ack:{scope}");
+        let mut scopes = vec![
+            LIBRARY_SCOPE,
+            ORG_SCOPE,
+            crate::account_auth::ACCOUNT_AUTH_SCOPE,
+            crate::mobile_machine_session::SCOPE,
+            &scope,
+            &policy_scope,
+            &acknowledgment_scope,
+        ];
+        scopes.extend_from_slice(additional_scopes);
         let ((current, admitted, retained), basis) = self
             .store_ref()
-            .read_for_dispatch(
-                &[
-                    LIBRARY_SCOPE,
-                    ORG_SCOPE,
-                    crate::account_auth::ACCOUNT_AUTH_SCOPE,
-                    crate::mobile_machine_session::SCOPE,
-                    &scope,
-                    &policy_scope,
-                ],
-                |store| {
-                    let current = current_target_authority(
-                        store,
-                        &home,
-                        context,
-                        &NativeTargetIntent {
-                            chat_id: &chat,
-                            request_id: &command.request_id,
-                            path: &path,
-                        },
-                        NativeActionKind::InspectHistory,
-                    )?;
-                    Ok((
-                        current,
-                        store.fold::<ProductActionAdmission>(&scope)?,
-                        load_action_policy(store, &identity, &command.policy, &root),
-                    ))
-                },
-            )
+            .read_for_dispatch(&scopes, |store| {
+                let current = current_target_authority(
+                    store,
+                    &home,
+                    context,
+                    &NativeTargetIntent {
+                        chat_id: &chat,
+                        request_id: &command.request_id,
+                        path: &path,
+                    },
+                    NativeActionKind::InspectHistory,
+                )?;
+                Ok((
+                    current,
+                    store.fold::<ProductActionAdmission>(&scope)?,
+                    load_action_policy(store, &identity, &command.policy, &root),
+                ))
+            })
             .map_err(|e| format!("current saved-input authority refused: {e:?}"))?;
         if admitted.command.as_ref() != Some(command)
             || current.project_id != project
@@ -255,7 +362,7 @@ impl Workbench {
             return Err("original saved-input policy cannot be represented losslessly".into());
         }
         let (mut policy, mut restrictions) = read_policy(&current, &original_scope, &original)?;
-        if let Some(retained) = options.retained {
+        if let Some(retained) = retained_restrictions {
             if retained.principal
                 || retained.internal
                 || !retained.writer.is_empty()
@@ -268,21 +375,92 @@ impl Workbench {
                 *resource = restrictions.clone();
             }
         }
-        let signed = sign_hosted_policy_envelope(&policy.to_json()?, self.authority(), &key, 1)?;
-        let target = self
-            .engagements
-            .get(&chat)
-            .ok_or("saved-input workspace is unavailable")?
-            .native_file_action_evidence_target(&path, base)
-            .map_err(|e| format!("{e:?}"))?;
-        if target.branch() != branch || target.path() != path || target.base() != base {
-            return Err("saved input differs from its actual target".into());
-        }
-        let source = self.native_action_observation_source()?;
-        let history = dispatch_grant::NativeDispatchHistory::open(self, key.public_key())?;
         let basis = current.bind_deadline(basis).map_err(|e| format!("{e:?}"))?;
+        Ok(EditorFileSaveReadPreparation {
+            key,
+            basis,
+            dispatch,
+            restrictions,
+            policy,
+            chat,
+            branch,
+            path,
+            base: base.clone(),
+        })
+    }
+
+    // The one-use writer is consumed only by retained source publication. An
+    // ordinary observation drops it without committing any product fact.
+    fn with_editor_file_save_read<T>(
+        &mut self,
+        context: &AuthenticatedActionContext,
+        command: &HostActionCommand,
+        admission: Option<&ActionAdmissionReceipt>,
+        options: SavedObservationOptions<'_>,
+        publish: impl for<'tx> FnOnce(
+            EditorFileSaveExecutionObservation,
+            Option<SavedEvidenceReader<'_>>,
+            gaugedesk_store::command_dispatch::DispatchRecordAdmission<'tx>,
+        ) -> StoreResult<T>,
+    ) -> Result<T, String> {
+        if let Some(admission) = admission {
+            admission
+                .validate_for(command)
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        let EditorFileSaveReadPreparation {
+            key,
+            basis,
+            dispatch,
+            restrictions,
+            policy,
+            chat,
+            branch,
+            path,
+            base,
+        } = self.prepare_editor_file_save_inspection(context, command, &[], options.retained)?;
+        let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
+        let admission = match admission {
+            Some(receipt) => Some(receipt.clone()),
+            None => crate::host_action_delivery::retained_runtime_acknowledgment(
+                self.store_ref(),
+                &dispatch,
+            )
+            .map_err(|e| format!("retained runtime evidence refused: {e:?}"))?
+            .map(|acknowledgment| acknowledgment.receipt),
+        };
+        let signed = sign_hosted_policy_envelope(&policy.to_json()?, self.authority(), &key, 1)?;
+        let prepared = if admission.is_some() {
+            let target = self
+                .engagements
+                .get(&chat)
+                .ok_or("saved-input workspace is unavailable")?
+                .native_file_action_evidence_target(&path, &base)
+                .map_err(|e| format!("{e:?}"))?;
+            if target.branch() != branch || target.path() != path || target.base() != base {
+                return Err("saved input differs from its actual target".into());
+            }
+            let source = self.native_action_observation_source()?;
+            let history = dispatch_grant::NativeDispatchHistory::open(self, key.public_key())?;
+            Some((target, source, history))
+        } else {
+            None
+        };
         self.store_mut()
             .with_dispatch_record_admission(&basis, |writer| {
+                let Some(admission) = admission.as_ref() else {
+                    return publish(
+                        EditorFileSaveExecutionObservation {
+                            command: command.clone(),
+                            runtime: None,
+                            restrictions,
+                            observer: context.actor().as_str().into(),
+                        },
+                        None,
+                        writer,
+                    );
+                };
+                let (target, source, history) = prepared.as_ref().ok_or_else(refused)?;
                 let runtime = GovernedHostFacade::from_signed_store_with_verifier(
                     source.open()?,
                     1,
@@ -321,33 +499,18 @@ impl Workbench {
                 if &evidence.command != command || &evidence.admission != admission {
                     return Err(refused());
                 }
-                let store = runtime.kernel().store();
-                let effect = store
-                    .list_effects(&admission.instance_ref)?
-                    .into_iter()
-                    .find(|effect| effect.effect_id == attempt.effect_id)
-                    .ok_or_else(refused)?;
-                let original = original_save(
-                    &evidence,
-                    store.chain_prefix(&admission.instance_ref)?,
-                    effect,
-                    attempt.run_id,
-                    &history,
-                )?;
-                let saved = target.read_committed_scoped_result(
-                    &original.binding,
-                    &original.resolution_scope,
-                    &original.attempt,
-                )?;
                 publish(
-                    EditorFileSaveObservation {
-                        evidence,
-                        saved,
+                    EditorFileSaveExecutionObservation {
+                        command: command.clone(),
+                        runtime: Some(evidence),
                         restrictions,
                         observer: context.actor().as_str().into(),
                     },
-                    &original,
-                    &target,
+                    Some(SavedEvidenceReader {
+                        runtime: &runtime,
+                        target,
+                        history,
+                    }),
                     writer,
                 )
             })
@@ -363,3 +526,13 @@ mod tests;
 #[path = "file_action_source.rs"]
 mod source;
 pub use source::RetainedEditorFileSaveSource;
+
+#[path = "file_action_request_inspection.rs"]
+mod request;
+pub use request::{
+    EditorFileSaveRequest, EditorFileSaveRequestObservation, EditorFileSavedContentObservation,
+};
+
+#[cfg(test)]
+#[path = "file_action_execution_inspection_tests.rs"]
+mod execution_tests;

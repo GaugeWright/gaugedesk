@@ -3532,6 +3532,56 @@ async fn publish_rejects_discipline_capability_drift_without_advancing_version()
 }
 
 #[tokio::test]
+async fn file_reads_do_not_import_unrecorded_edits_or_claim_a_mismatched_cut() {
+    let (_dir, wb) = seeded_workbench();
+    let app = open_control_plane(wb.clone());
+    let (status, _) = send(&app, "POST", "/chats", Some(r#"{"id":"observed-file"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = send(
+        &app,
+        "PUT",
+        "/chats/observed-file/file?path=note.txt",
+        Some("recorded"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, recorded, _) = send_with_cut(&app, "/chats/observed-file/file?path=note.txt").await;
+    assert!(recorded.is_some());
+    let before = {
+        let guard = wb.lock_unpoisoned();
+        let path = guard.engagement_workspace_path("observed-file", "note.txt");
+        guard.engagements["observed-file"]
+            .write_file(&path, "external edit")
+            .unwrap();
+        let path = guard.engagement_workspace_path("observed-file", "new.txt");
+        guard.engagements["observed-file"]
+            .write_file(&path, "external file")
+            .unwrap();
+        guard.engagements["observed-file"].observe().unwrap()
+    };
+    for (path, expected) in [("note.txt", "external edit"), ("new.txt", "external file")] {
+        for _ in 0..2 {
+            let (status, cut, body) =
+                send_with_cut(&app, &format!("/chats/observed-file/file?path={path}")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, expected);
+            assert_eq!(
+                cut, None,
+                "a transient file acquired an unadmitted cut through GET"
+            );
+        }
+    }
+    assert_eq!(
+        wb.lock_unpoisoned().engagements["observed-file"]
+            .observe()
+            .unwrap(),
+        before,
+        "file read imported an external change"
+    );
+    assert_eq!(before.recorded_cut, recorded);
+}
+
+#[tokio::test]
 async fn the_viewer_read_serves_a_binary_worktree_file_as_bytes() {
     // The worktree holds whatever the work put in it. Reading a file as UTF-8
     // text made every non-text file a 400 — a PNG or a PDF the agent produced
@@ -3557,6 +3607,10 @@ async fn the_viewer_read_serves_a_binary_worktree_file_as_bytes() {
     let (status, headers, bytes) = send_raw(&app, "/chats/bin/file?path=shot.png").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(bytes, png, "the read must serve the file's own bytes");
+    assert!(
+        !headers.contains_key("x-workspace-cut"),
+        "viewing a binary file must not import it"
+    );
     // Worktree bytes are a download, never something the Home's own origin
     // renders: a document that carries script cannot be navigated into.
     assert_eq!(

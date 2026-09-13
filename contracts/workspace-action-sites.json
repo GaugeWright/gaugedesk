@@ -177,6 +177,14 @@
     },
     {
       "declaration": {
+        "name": "recorded_file_cut",
+        "owner": "ChatWorkspace",
+        "signature": "fn recorded_file_cut (& self , _rel : & str , _served : & [u8]) -> Result < Option < String > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
         "name": "rehome",
         "owner": "ChatWorkspace",
         "signature": "fn rehome (& mut self , target : & str) -> Result < () >"
@@ -677,6 +685,15 @@
         "Refuse missing admission, acknowledgment, target receipt or product commit receipt, and disputed runtime evidence; retain stricter historical metadata restrictions after target policy relaxation.",
         "Recover product commit failures under the same result identity without runtime or target mutation; independently authorize read-only historical result retrieval after backing runtime or target removal."
       ]
+    },
+    "native-action-observation-callback": {
+      "coverage_id": "ACTION-3",
+      "reason": "These private observation callbacks share the current reader and original-command authority fence. Execution-only reads drop the one-use writer; saved-source retention may consume it only after the existing exact attempt-bound target proof.",
+      "required_evidence": [
+        "Missing acknowledgment remains an evidence gap without redelivery or store initialization; retained acknowledgment requires the exact receipt, fact, command, runtime and independently verified runtime prefix.",
+        "Execution observations preserve original attribution and original/current restrictions, refuse revoked readers, and leave product and runtime history unchanged.",
+        "Saved-input observation and source retention retain their exact target proof and one-use publication fence; live entry-point migration remains open."
+      ]
     }
   },
   "sites": [
@@ -812,10 +829,10 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::engagement_current_cut",
-        "capability": "current_cut",
+        "callable": "impl inherent for Workbench::engagement_recorded_file_cut",
+        "capability": "recorded_file_cut",
         "count": 1,
-        "expression": "eng . current_cut ()",
+        "expression": "eng . recorded_file_cut (& path , served)",
         "file": "crates/app/src/engagement_routes.rs"
       },
       "profile": "editor-and-import"
@@ -3432,6 +3449,16 @@
     },
     {
       "site": {
+        "callable": "impl ChatWorkspace for Engagement::recorded_file_cut",
+        "capability": "recorded_file_cut",
+        "count": 1,
+        "expression": "Engagement :: recorded_file_cut (self , relative , served)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
         "callable": "impl ChatWorkspace for Engagement::rehome",
         "capability": "rehome",
         "count": 1,
@@ -4153,22 +4180,42 @@
     {
       "site": {
         "callable": "impl inherent for Workbench::with_editor_file_save_observation",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (EditorFileSaveObservation { evidence , saved , restrictions : observation . restrictions , observer : observation . observer , } , & original , reader . target , writer ,)",
+        "file": "crates/app/src/file_action_inspection.rs"
+      },
+      "profile": "native-action-observation-callback"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::with_editor_file_save_read",
         "capability": "native_file_action_evidence_target",
         "count": 1,
-        "expression": "self . engagements . get (& chat) . ok_or (\"saved-input workspace is unavailable\") ? . native_file_action_evidence_target (& path , base)",
+        "expression": "self . engagements . get (& chat) . ok_or (\"saved-input workspace is unavailable\") ? . native_file_action_evidence_target (& path , & base)",
         "file": "crates/app/src/file_action_inspection.rs"
       },
       "profile": "native-action-boundary"
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::with_editor_file_save_observation",
+        "callable": "impl inherent for Workbench::with_editor_file_save_read",
         "capability": "publish",
         "count": 1,
-        "expression": "publish (EditorFileSaveObservation { evidence , saved , restrictions , observer : context . actor () . as_str () . into () , } , & original , & target , writer ,)",
+        "expression": "publish (EditorFileSaveExecutionObservation { command : command . clone () , runtime : None , restrictions , observer : context . actor () . as_str () . into () , } , None , writer ,)",
         "file": "crates/app/src/file_action_inspection.rs"
       },
-      "profile": "native-action-boundary"
+      "profile": "native-action-observation-callback"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::with_editor_file_save_read",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (EditorFileSaveExecutionObservation { command : command . clone () , runtime : Some (evidence) , restrictions , observer : context . actor () . as_str () . into () , } , Some (SavedEvidenceReader { runtime : & runtime , target , history , }) , writer ,)",
+        "file": "crates/app/src/file_action_inspection.rs"
+      },
+      "profile": "native-action-observation-callback"
     },
     {
       "site": {

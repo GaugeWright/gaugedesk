@@ -1,7 +1,7 @@
 //! Bounded execution and recovery of one admitted native save. The scheduler
 //! owns when to call this driver; it cannot supply actor, paths or lease clocks.
 use super::*;
-use crate::host_action_delivery::{RuntimeAcknowledgment, ACKNOWLEDGMENT_KIND};
+use crate::host_action_delivery::retained_runtime_acknowledgment;
 use gaugedesk_whip_runtime::host_actions::action_result::{
     ActionInstanceStatus, ActionResultSnapshot,
 };
@@ -44,47 +44,19 @@ impl Workbench {
             command,
             &command.policy,
         )?;
-        let receipt_scope = format!("host-action-runtime-ack:{}", prepared.scope);
-        let snapshot = self
-            .store_ref()
-            .committed_record_snapshot(&receipt_scope, "admitted")
-            .map_err(|e| format!("{e:?}"))?;
-        let history = self
-            .store_ref()
-            .retained_events(&prepared.scope)
-            .map_err(|e| format!("{e:?}"))?;
-        let acknowledgments: Vec<_> = history
-            .iter()
-            .filter(|(_, kind, _)| kind == ACKNOWLEDGMENT_KIND)
-            .collect();
-        let admission = if let Some(snapshot) = snapshot {
-            let acknowledgment: RuntimeAcknowledgment =
-                serde_json::from_str(&snapshot).map_err(|e| e.to_string())?;
-            if acknowledgments.len() != 1
-                || acknowledgments[0].2 != snapshot
-                || acknowledgment.product_command_id != prepared.delivery.command_id
-                || acknowledgment.runtime_ref != prepared.delivery.dispatch.runtime_ref
-            {
-                return Err(
-                    "native driver acknowledgment differs from its committed command".into(),
-                );
-            }
-            acknowledgment
+        let admission = match retained_runtime_acknowledgment(self.store_ref(), &prepared.delivery)
+            .map_err(|e| format!("{e:?}"))?
+        {
+            Some(acknowledgment) => acknowledgment.receipt,
+            None => {
+                self.deliver_editor_file_save(
+                    &authority.context,
+                    storage.inputs(),
+                    command,
+                    &mut runtime,
+                )?
                 .receipt
-                .validate_for(command)
-                .map_err(|e| format!("{e:?}"))?;
-            acknowledgment.receipt
-        } else {
-            if !acknowledgments.is_empty() {
-                return Err("native driver acknowledgment has no committed receipt".into());
             }
-            self.deliver_editor_file_save(
-                &authority.context,
-                storage.inputs(),
-                command,
-                &mut runtime,
-            )?
-            .receipt
         };
         // This revalidates the exact runtime admission under current product
         // standing before acquiring ownership, including after reading the ack.

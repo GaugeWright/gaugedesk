@@ -120,37 +120,6 @@ pub async fn require_home_admission(
         return next.run(req).await;
     }
 
-    // ADR 0109: a proved, approved device may authenticate the exact same work
-    // routes through its short-lived Machine session. This is an alternative to
-    // account-bearer + Home admission, not a parallel mobile API.
-    if !path.starts_with("/mobile/")
-        && !path.starts_with("/account/")
-        && !path.starts_with("/auth/")
-        && !path.starts_with("/home/")
-    {
-        if let Some(session) = crate::mobile_machine_session::session_token(req.headers()) {
-            let grant = {
-                let mut wb = wb.lock_unpoisoned();
-                crate::mobile_machine_session::authorize_session(&mut wb, session)
-            };
-            if let Some(grant) = grant {
-                req.extensions_mut().insert(
-                    crate::identity::AuthenticatedActionContext::machine_controller(&grant),
-                );
-                req.extensions_mut()
-                    .insert(crate::identity::AuthenticatedActor(AuthorityId::new(
-                        grant.device.as_str(),
-                    )));
-                return next.run(req).await;
-            }
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "Machine controller session is expired or revoked" })),
-            )
-                .into_response();
-        }
-    }
-
     // A controller may revoke only its own exact durable grant. This is the one
     // controller-management command available to the phone itself; listing or
     // revoking any sibling grant remains an owner/Home-admitted operation.
@@ -183,46 +152,9 @@ pub async fn require_home_admission(
         }
     }
 
-    let Some(token) = admission_token(req.headers()) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "target Home admission required" })),
-        )
-            .into_response();
-    };
     let admitted = {
-        let bearer = net_http::bearer(req.headers());
-        let wb = wb.lock_unpoisoned();
-        match wb.admit_data_request(bearer, None) {
-            Err(rejection) => Err(rejection),
-            Ok(actor) => {
-                let actor = AuthorityId::new(actor);
-                if wb
-                    .home_admissions
-                    .authorize(wb.home_id(), &actor, &token)
-                    .is_err()
-                {
-                    Err((
-                        StatusCode::FORBIDDEN,
-                        "Home admission does not match this Home and identity",
-                    ))
-                } else if wb
-                    .scope_project_of_path(req.uri().path())
-                    .is_some_and(|project| !wb.owns_project(&project))
-                {
-                    Err((
-                        StatusCode::MISDIRECTED_REQUEST,
-                        "project is authoritative on another Home",
-                    ))
-                } else {
-                    // Admission has legacy local/bootstrap fallbacks. Only a
-                    // bearer verified at this boundary can supply attribution.
-                    Ok(bearer
-                        .and_then(|token| wb.authenticate_action_context(token))
-                        .filter(|verified| verified.actor() == &actor))
-                }
-            }
-        }
+        let mut workbench = wb.lock_unpoisoned();
+        authenticate_home_work_request(&mut workbench, req.headers(), req.uri().path())
     };
     let context = match admitted {
         Ok(context) => context,
@@ -238,6 +170,58 @@ pub async fn require_home_admission(
         req.extensions_mut().insert(context);
     }
     next.run(req).await
+}
+
+/// The Home HTTP boundary shared by middleware and individually protected
+/// routes in local compositions. Only verified request credentials yield action
+/// facts; a legacy admission fallback still yields no action context.
+pub(crate) fn authenticate_home_work_request(
+    wb: &mut crate::Workbench,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<Option<crate::identity::AuthenticatedActionContext>, (StatusCode, &'static str)> {
+    if !path.starts_with("/mobile/")
+        && !path.starts_with("/account/")
+        && !path.starts_with("/auth/")
+        && !path.starts_with("/home/")
+    {
+        if let Some(session) = crate::mobile_machine_session::session_token(headers) {
+            return crate::mobile_machine_session::authorize_session(wb, session)
+                .map(|grant| {
+                    Some(crate::identity::AuthenticatedActionContext::machine_controller(&grant))
+                })
+                .ok_or((
+                    StatusCode::UNAUTHORIZED,
+                    "Machine controller session is expired or revoked",
+                ));
+        }
+    }
+    let token = admission_token(headers)
+        .ok_or((StatusCode::UNAUTHORIZED, "target Home admission required"))?;
+    let bearer = net_http::bearer(headers);
+    let actor = AuthorityId::new(wb.admit_data_request(bearer, None)?);
+    if wb
+        .home_admissions
+        .authorize(wb.home_id(), &actor, &token)
+        .is_err()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Home admission does not match this Home and identity",
+        ));
+    }
+    if wb
+        .scope_project_of_path(path)
+        .is_some_and(|project| !wb.owns_project(&project))
+    {
+        return Err((
+            StatusCode::MISDIRECTED_REQUEST,
+            "project is authoritative on another Home",
+        ));
+    }
+    Ok(bearer
+        .and_then(|token| wb.authenticate_action_context(token))
+        .filter(|verified| verified.actor() == &actor))
 }
 
 #[cfg(test)]

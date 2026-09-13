@@ -110,6 +110,7 @@ function isUnprovisionedHomeError(error: unknown): boolean {
 /** App-owned control-plane edge for the open workbench shell. */
 export class WorkbenchControlPlane implements ControlPlane {
     private bearer: string | null = null;
+    private credentialGeneration = 0;
     private homeAdmission: string | null = null;
     private readonly route: RouteJson;
     private readonly request: RouteRequest;
@@ -173,12 +174,77 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     setBearer(token: string | null): void {
         if (this.bearer !== token) {
+            this.credentialGeneration++;
             this.homeAdmission = null;
             this.homeTransport = null;
             void this.pool?.closeAll().catch(() => undefined);
             this.pool = null;
         }
         this.bearer = token;
+    }
+
+    /** Explicit original-Home routing for retained saves. This is available to
+     * qualified callers; it does not replace the editor's legacy save method or
+     * enable the Home's optional native submission/supervisor composition. */
+    async openNativeFileSaveSession(home: string, journal: workbenchClient.NativeSaveJournal)
+        : Promise<workbenchClient.NativeFileSaveSession> {
+        if (!home.trim()) throw new Error("An original Home is required for native file saves");
+        const generation = this.credentialGeneration;
+        const connections = new Map<string, Promise<workbenchClient.NativeSaveHome>>();
+        return workbenchClient.openNativeFileSaveSession(home, journal,
+            (originalHome) => {
+                let pending = connections.get(originalHome);
+                if (!pending) {
+                    pending = this.connectNativeFileHome(originalHome);
+                    connections.set(originalHome, pending);
+                    const attempt = pending;
+                    void pending.catch(() => {
+                        if (connections.get(originalHome) === attempt) connections.delete(originalHome);
+                    });
+                }
+                return pending;
+            },
+            () => generation === this.credentialGeneration);
+    }
+
+    private async connectNativeFileHome(home: string): Promise<workbenchClient.NativeSaveHome> {
+        if (!this.splitHomes) {
+            // A retained binding must not follow a later admission header to
+            // another Home at the same local or reverse-proxy origin.
+            const bearer = this.bearer;
+            const admission = this.homeAdmission;
+            return { home, transport: { base: this.base, json: browserRouteJson(this.base, {
+                bearer: () => bearer, homeAdmission: () => admission,
+            }) } };
+        }
+        const pool = await this.homePool();
+        try {
+            const connection = await pool.connectHome(home as HomeId);
+            if (connection.homeId !== home) throw new Error("Native save Home identity mismatch");
+            return { home, transport: connection.api };
+        } catch (error) {
+            if (!(error instanceof UnroutedHomeError)) throw error;
+        }
+        // Registered Homes may have an endpoint before publishing project
+        // routes. Resolve this exact id; the account's selected Home is unused.
+        const state = await accountClient.accountHomes(this.route);
+        const original = state.homes.find((candidate) => candidate.id === home);
+        if (!original?.endpoint) throw new UnroutedHomeError(`No route reaches original Home ${home}`);
+        const bearer = this.bearer;
+        let admission: string | null = null;
+        const json = browserRouteJson(original.endpoint, {
+            bearer: () => bearer, homeAdmission: () => admission,
+        });
+        const admitted = await json("POST", "/home/admissions") as { home?: unknown; admission?: unknown };
+        if (admitted.home !== home || typeof admitted.admission !== "string" || !admitted.admission) {
+            if (typeof admitted.admission === "string" && admitted.admission) {
+                admission = admitted.admission;
+                await json("DELETE", "/home/admissions").catch(() => undefined);
+            }
+            throw new Error(`Native save Home identity mismatch: expected ${home}`);
+        }
+        admission = admitted.admission;
+        return { home, transport: { base: original.endpoint, json } };
     }
 
     /**
@@ -319,7 +385,11 @@ export class WorkbenchControlPlane implements ControlPlane {
      * refreshed whenever the account directory is re-read. */
     private async homePool(): Promise<HomePool<workbenchClient.WorkbenchTransport>> {
         if (this.pool) return this.pool;
+        const generation = this.credentialGeneration;
         const routes = await this.homeRoutes();
+        if (generation !== this.credentialGeneration) {
+            throw new Error("Account session changed while resolving Home routes");
+        }
         // The live carrier per relay-only Home. A tunnel is not reclaimed by
         // being forgotten: the Home stays spliced to a client that has gone and
         // never re-parks, so the *next* attempt to reach it waits for a splice

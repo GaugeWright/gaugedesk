@@ -332,3 +332,7 @@ impl Workbench {
 #[cfg(test)]
 #[path = "file_action_result_admission_tests.rs"]
 mod tests;
+
+#[path = "file_action_product_result_inspection.rs"]
+mod inspection;
+pub use inspection::{EditorFileSavedResultObservation, ObservedEditorSavedProductResult};

@@ -28,3 +28,6 @@ export * from "./placement-policy";
 export * from "./projection-carriage";
 export * from "./remote-control-plane";
 export * from "./workspace-delta";
+export * from "./native-file-actions";
+export * from "./native-file-save-journal";
+export * from "./native-file-save-session";

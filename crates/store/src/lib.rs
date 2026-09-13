@@ -100,6 +100,16 @@ pub struct CommandRecord {
     pub snapshot_json: String,
 }
 
+/// Immutable record snapshot backed by its receipt. `first_fact_position`
+/// belongs to the first fact's scope (which the owning caller knows), not
+/// necessarily the command scope; an admission without facts records zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedRecordSnapshot {
+    pub idempotency_key: String,
+    pub snapshot_json: String,
+    pub first_fact_position: i64,
+}
+
 /// Result of an application command admitted through the materialized command
 /// shell. `replayed` means the idempotency receipt already existed, so callers
 /// must not repeat non-durable notifications for the original admission.
@@ -849,16 +859,42 @@ impl Store {
         let Some((id, snapshot)) = original else {
             return Ok(None);
         };
-        let expected = format!(
-            "record-command:{}:{command_scope}{idempotency_key}",
-            command_scope.len()
-        );
-        if id.as_deref() != Some(expected.as_str()) || snapshot.is_none() {
-            return Err(AdmitError::Rejected(Rejection {
-                reason: "record receipt has no matching original command",
-            }));
-        }
-        Ok(snapshot)
+        record_admission::validate_snapshot(command_scope, idempotency_key, id, snapshot).map(Some)
+    }
+
+    /// Enumerate receipted record commands in one scope without trusting or
+    /// repairing mutable command status. Keys are lexical coordinates, not
+    /// causal order. Owning readers must verify matching facts under their
+    /// current authority fence; orphaned receipts refuse instead of disappearing.
+    pub fn committed_record_snapshots(
+        &self,
+        command_scope: &str,
+    ) -> Result<Vec<CommittedRecordSnapshot>, AdmitError> {
+        let mut query = self.conn.prepare(
+            "SELECT receipts.command_key, commands.command_id, commands.snapshot_json, receipts.applied_at
+             FROM command_receipts AS receipts
+             LEFT JOIN commands ON commands.scope_id = receipts.scope_id
+               AND commands.idempotency_key = receipts.command_key
+             WHERE receipts.scope_id = ?1 ORDER BY receipts.command_key",
+        )?;
+        let rows = query.query_map([command_scope], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (key, id, snapshot, first_fact_position) = row?;
+            let snapshot = record_admission::validate_snapshot(command_scope, &key, id, snapshot)?;
+            Ok(CommittedRecordSnapshot {
+                idempotency_key: key,
+                snapshot_json: snapshot,
+                first_fact_position,
+            })
+        })
+        .collect()
     }
 
     /// [`admit_record_facts`](Self::admit_record_facts) plus an optional

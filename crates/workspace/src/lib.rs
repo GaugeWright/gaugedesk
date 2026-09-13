@@ -899,7 +899,9 @@ impl Instance {
     }
 
     pub fn leave_engagement_workstream(&self, engagement_id: &str) -> Result<Option<String>> {
-        Ok(self.workstreams()?.leave(&engagement_line(engagement_id))?)
+        Ok(self
+            .workstreams()?
+            .leave(&engagement_line(engagement_id), &now_at())?)
     }
 
     pub fn engagement_home_receipt(&self, engagement_id: &str) -> Result<BranchHomeReceiptV1> {
@@ -1792,6 +1794,41 @@ impl Engagement {
         }
     }
 
+    /// Name an existing immutable revision only when it contains these exact
+    /// served bytes. This never imports the projection or initializes storage.
+    pub fn recorded_file_cut(&self, relative: &str, served: &[u8]) -> Result<Option<String>> {
+        self.ensure_selected_path(relative)?;
+        if !valid_native_action_target_path(relative) {
+            return Ok(None);
+        }
+        let vcs = NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?;
+        let Some(cut) = vcs
+            .get_branch(&self.branch)?
+            .and_then(|branch| branch.head_cut_id)
+        else {
+            return Ok(None);
+        };
+        let manifest = vcs
+            .cut_manifest(&cut)?
+            .ok_or_else(|| WorkspaceError::msg("recorded file cut is unavailable"))?;
+        let Some(hash) = manifest.get(relative) else {
+            return Ok(None);
+        };
+        // The owner supplies byte identity. Comparing it first avoids loading a
+        // different, potentially much larger historical file into this read.
+        if hash != &whipplescript_store::stable_hash_bytes_hex(served) {
+            return Ok(None);
+        }
+        let retained = vcs
+            .content_store()
+            .get(hash)?
+            .ok_or_else(|| WorkspaceError::msg("recorded file content is unavailable or erased"))?;
+        Ok((retained == served).then_some(cut))
+    }
+
     pub fn write_file(&self, relative: &str, content: &str) -> Result<()> {
         self.ensure_projection()?;
         self.ensure_selected_path(relative)?;
@@ -1803,8 +1840,8 @@ impl Engagement {
     }
 
     /// The branch's head cut after folding the worktree in — the
-    /// addressable base a reader carries into its next save (cut-on-read,
-    /// spec §12: the state you saw is always a recorded cut).
+    /// explicit importing operation. Observation paths use recorded_file_cut
+    /// or observe instead; they must never call this to obtain read metadata.
     pub fn current_cut(&self) -> Result<Option<String>> {
         let mut vcs = self.store()?;
         self.import_branch(&mut vcs)?;
@@ -2754,6 +2791,11 @@ pub trait ChatWorkspace: Send {
         self.read_file_capped(rel, max_bytes)
             .map(|body| body.map(String::into_bytes))
     }
+    /// Optional immutable basis for the exact served file bytes. Unsupported
+    /// adapters report no cut, never a fingerprint or an importing read.
+    fn recorded_file_cut(&self, _rel: &str, _served: &[u8]) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn write_file(&self, rel: &str, content: &str) -> Result<()>;
     /// Write exact bytes for an admitted target effect.
     fn write_file_bytes(&self, rel: &str, content: &[u8]) -> Result<()> {
@@ -3041,6 +3083,9 @@ impl ChatWorkspace for Engagement {
         let bytes = std::fs::read(safe_path(&self.path, relative)?).map_err(WorkspaceError::io)?;
         Ok((bytes.len() <= max_bytes).then_some(bytes))
     }
+    fn recorded_file_cut(&self, relative: &str, served: &[u8]) -> Result<Option<String>> {
+        Engagement::recorded_file_cut(self, relative, served)
+    }
     fn write_file(&self, relative: &str, content: &str) -> Result<()> {
         self.write_file(relative, content)
     }
@@ -3219,7 +3264,7 @@ mod tests {
         (directory, instance)
     }
 
-    fn observation_files(root: &Path) -> BTreeMap<PathBuf, String> {
+    pub(super) fn observation_files(root: &Path) -> BTreeMap<PathBuf, String> {
         fn walk(root: &Path, out: &mut BTreeMap<PathBuf, String>) {
             for entry in std::fs::read_dir(root).expect("snapshot directory") {
                 let path = entry.expect("snapshot entry").path();
@@ -3242,6 +3287,117 @@ mod tests {
         let mut files = BTreeMap::new();
         walk(root, &mut files);
         files
+    }
+
+    #[test]
+    fn recorded_file_basis_preserves_storage_and_only_names_matching_retained_bytes() {
+        let (directory, instance) = instance();
+        let eng = instance.create_engagement("file-read").unwrap();
+        eng.write_file("note.txt", "recorded").unwrap();
+        eng.write_file("other.txt", "other").unwrap();
+        let binary = [0xff, 0, 0x89, b'P', b'N', b'G'];
+        ChatWorkspace::write_file_bytes(&eng, "image.bin", &binary).unwrap();
+        let cut = eng.commit_turn("base").unwrap().unwrap().0;
+        eng.write_file("other.txt", "unrecorded change").unwrap();
+        eng.write_file("new.txt", "unrecorded file").unwrap();
+        let before = observation_files(directory.path());
+        for _ in 0..2 {
+            assert_eq!(
+                eng.recorded_file_cut("note.txt", b"recorded").unwrap(),
+                Some(cut.clone())
+            );
+            assert_eq!(
+                eng.recorded_file_cut("image.bin", &binary).unwrap(),
+                Some(cut.clone())
+            );
+            assert_eq!(
+                eng.recorded_file_cut("other.txt", b"unrecorded change")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                eng.recorded_file_cut("new.txt", b"unrecorded file")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                eng.recorded_file_cut("note.txt", b"different").unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            observation_files(directory.path()),
+            before,
+            "file metadata read changed durable storage or the projection"
+        );
+        assert_eq!(eng.observe().unwrap().recorded_cut, Some(cut));
+    }
+
+    #[test]
+    fn recorded_file_basis_does_not_pair_old_served_bytes_with_a_newer_head() {
+        let (_directory, instance) = instance();
+        let eng = instance.create_engagement("racing-read").unwrap();
+        eng.write_file("note.txt", "old").unwrap();
+        eng.commit_turn("base").unwrap();
+        let served = eng.read_file("note.txt").unwrap();
+        eng.write_file("note.txt", "new").unwrap();
+        let cut = eng.commit_turn("concurrent writer").unwrap().unwrap().0;
+        assert_eq!(
+            eng.recorded_file_cut("note.txt", served.as_bytes())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            eng.recorded_file_cut("note.txt", b"new").unwrap(),
+            Some(cut)
+        );
+    }
+
+    #[test]
+    fn recorded_file_basis_refuses_erased_or_missing_history_without_repair() {
+        let (directory, instance) = instance();
+        let eng = instance.create_engagement("erased-read").unwrap();
+        eng.write_file("note.txt", "recorded").unwrap();
+        eng.commit_turn("base").unwrap();
+        let hash = whipplescript_store::stable_hash_hex("recorded");
+        whipplescript_store::content::ContentStore::open(eng.store_root.join("content.sqlite"))
+            .unwrap()
+            .erase(&hash, "erase fixture")
+            .unwrap();
+        let before = observation_files(directory.path());
+        assert!(eng.recorded_file_cut("note.txt", b"recorded").is_err());
+        assert_eq!(observation_files(directory.path()), before);
+        for database in ["branches.sqlite", "content.sqlite"] {
+            let path = eng.store_root.join(database);
+            std::fs::rename(&path, path.with_extension("removed")).unwrap();
+            let before = observation_files(directory.path());
+            assert!(eng.recorded_file_cut("note.txt", b"recorded").is_err());
+            assert_eq!(observation_files(directory.path()), before);
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn recorded_file_basis_respects_selected_paths_and_excludes_host_overlays() {
+        let (_directory, instance) = instance();
+        let mut eng = instance.create_engagement("scoped-read").unwrap();
+        eng.write_file("allowed/note.txt", "recorded").unwrap();
+        let cut = eng.commit_turn("base").unwrap().unwrap().0;
+        eng.sparse_roots = Some(BTreeSet::from(["allowed".into()]));
+        assert_eq!(
+            eng.recorded_file_cut("allowed/note.txt", b"recorded")
+                .unwrap(),
+            Some(cut)
+        );
+        assert!(eng.recorded_file_cut("outside.txt", b"recorded").is_err());
+        assert_eq!(
+            eng.recorded_file_cut(".gaugedesk-runtime/tool", b"overlay")
+                .unwrap(),
+            None
+        );
+        assert!(eng
+            .recorded_file_cut("../allowed/note.txt", b"recorded")
+            .is_err());
     }
 
     #[test]

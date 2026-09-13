@@ -190,9 +190,13 @@ async fn measure_native_save_pipeline() {
         let command = {
             let mut wb = wb.lock_unpoisoned();
             let context = wb.authenticate_action_context(&token).unwrap();
+            let identity = wb
+                .prepare_editor_file_save_request(&context, &chat, "note.txt", &request_id)
+                .unwrap();
             wb.admit_editor_file_save(
                 &context,
                 storage.inputs(),
+                &identity,
                 &EditorFileSave {
                     chat_id: &chat,
                     request_id: &request_id,

@@ -38,7 +38,7 @@ debug = "line-tables-only"
 # source revision to the published contract revision and digest; no project
 # workstream feature may compile against the older crates.io release.
 [patch.crates-io]
-whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "0a48a16bb45680d95a6e154fd3c4caeb886e5b41" }
-whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "0a48a16bb45680d95a6e154fd3c4caeb886e5b41" }
-whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "0a48a16bb45680d95a6e154fd3c4caeb886e5b41" }
-whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "0a48a16bb45680d95a6e154fd3c4caeb886e5b41" }
+whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "5792ada59470b60b44d5151b82784b36dfc67513" }
+whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "5792ada59470b60b44d5151b82784b36dfc67513" }
+whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "5792ada59470b60b44d5151b82784b36dfc67513" }
+whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "5792ada59470b60b44d5151b82784b36dfc67513" }

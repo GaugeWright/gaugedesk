@@ -54,6 +54,8 @@ pub mod federation;
 pub mod federation_relay;
 pub mod file_action_factory;
 pub mod file_action_policy;
+pub mod file_action_routes;
+pub mod file_action_submission_routes;
 pub mod gate;
 pub mod gate_service;
 pub mod harness_select;
@@ -131,7 +133,7 @@ pub use gaugedesk_whip_runtime::{
     AdmittedPolicyEpoch, DoHostConfig, DoHostRequest, DoHostResponse, DoHostTransport,
     PolicyAdmissionError, PolicyEpoch, WhipHarnessFactory,
 };
-pub use open_route_stack::open_control_plane;
+pub use open_route_stack::{open_control_plane, open_control_plane_with_native_saves};
 pub use open_runtime::{open_control_plane_root, open_serve};
 // The test-only reset route is this alias's only consumer (DR-0054 Phase A).
 #[cfg(debug_assertions)]

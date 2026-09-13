@@ -8,12 +8,30 @@ use crate::{
 };
 
 pub fn open_control_plane(wb: SharedWorkbench) -> Router {
+    compose(wb, None)
+}
+
+/// Explicit host opt-in after native save rollout qualification. The configured
+/// command route receives the same CORS, security and command-shell layers as
+/// the rest of the Home; its own atomic admission owns save idempotency.
+pub fn open_control_plane_with_native_saves(
+    wb: SharedWorkbench,
+    storage: crate::file_action_factory::NativeActionStorageConfig,
+) -> Router {
+    compose(wb, Some(storage))
+}
+
+fn compose(
+    wb: SharedWorkbench,
+    storage: Option<crate::file_action_factory::NativeActionStorageConfig>,
+) -> Router {
     let federation_on = {
         let g = wb.lock_unpoisoned();
         g.is_federation_enabled()
     };
-    Router::new()
+    let mut routes = Router::new()
         .merge(local_routes::routes(federation_on))
+        .merge(crate::home_routes::routes())
         .merge(account_routes::routes())
         // Facilities, tenants and invitations. `facility_routes` already
         // describes itself as "ungated on loopback; the hub adds auth on top",
@@ -37,8 +55,15 @@ pub fn open_control_plane(wb: SharedWorkbench) -> Router {
             crate::auth_oidc::AuthShellState::new(),
         ))
         .merge(mobile_machine_session::routes())
+        .with_state(wb.clone());
+    if let Some(storage) = storage {
+        routes = routes.merge(crate::file_action_submission_routes::routes(
+            wb.clone(),
+            storage,
+        ));
+    }
+    routes
         .layer(net_http::cors_layer())
-        .with_state(wb.clone())
         .layer(axum::middleware::from_fn_with_state(
             wb,
             command_idempotency::guard,

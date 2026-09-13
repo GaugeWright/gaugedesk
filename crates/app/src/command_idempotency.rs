@@ -60,6 +60,16 @@ fn reducer_command_path(path: &str) -> bool {
         )
 }
 
+// This exact typed command owns its receipted outbox and replay. Wrapping it in
+// the legacy HTTP claim would hide its admitted result behind a second status
+// and reject a safe replay before the command's current authority checks run.
+fn native_file_save_command(method: &Method, path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    method == Method::POST
+        && matches!(parts.as_slice(),
+        ["", "chats", chat, "file-actions", "save"] if !chat.is_empty())
+}
+
 fn environment_command_path(path: &str) -> bool {
     let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
     matches!(parts.as_slice(), ["environments", _, "sessions"])
@@ -92,6 +102,7 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
     if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS)
         || reducer_command_path(request.uri().path())
         || environment_command_path(request.uri().path())
+        || native_file_save_command(&method, request.uri().path())
     {
         return next.run(request).await;
     }
@@ -192,6 +203,30 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_exact_native_save_post_uses_atomic_action_idempotency() {
+        assert!(native_file_save_command(
+            &Method::POST,
+            "/chats/c/file-actions/save"
+        ));
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            assert!(!native_file_save_command(
+                &method,
+                "/chats/c/file-actions/save"
+            ));
+        }
+        for path in [
+            "/chats/c/file",
+            "/chats/c/file-actions/save/",
+            "/chats//file-actions/save",
+            "/chats/c/file-actions/save/extra",
+            "//chats/c/file-actions/save",
+            "/projects/c/file-actions/save",
+        ] {
+            assert!(!native_file_save_command(&Method::POST, path));
+        }
+    }
 
     #[test]
     fn only_atomic_reducer_command_routes_bypass_the_outer_guard() {
