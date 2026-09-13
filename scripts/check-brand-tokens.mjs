@@ -51,6 +51,13 @@ const SOURCE_EXTENSIONS = new Set([".css", ".ts", ".tsx", ".js", ".jsx", ".html"
 // name a path that has since moved.
 const PROJECTION_MARKER = "@gw-projection";
 
+// Every read normalizes line endings, so an offset measured in one read is
+// valid in another. On a CRLF stylesheet a raw offset sits one carriage return
+// further along for every line that precedes it, so blanking the block region
+// with raw offsets would cover site-owned lines the sweep must read and leave
+// part of the generated block in scope.
+const readSource = (file) => fs.readFileSync(file, "utf8").replace(/\r\n/gu, "\n");
+
 const root = path.resolve(process.argv[2] ?? process.cwd());
 const failures = [];
 const fail = (message) => failures.push(message);
@@ -71,7 +78,7 @@ if (!fs.existsSync(tokensFile)) {
       + "render them from the GaugeWright repository with `node tools/palette.mjs --write`.",
   );
 } else {
-  const contents = fs.readFileSync(tokensFile, "utf8").replace(/\r\n/gu, "\n");
+  const contents = readSource(tokensFile);
   let tokens = contents;
 
   if (TOKENS_MODE === "block") {
@@ -142,7 +149,7 @@ if (canonicalValues.size > 0) {
       // A wholly generated token file is skipped; a stylesheet that merely
       // *contains* the rendered block keeps every line outside it in scope.
       if (isTokensFile && tokensRegion === null) continue;
-      let contents = fs.readFileSync(file, "utf8");
+      let contents = readSource(file);
       if (contents.slice(0, 1000).includes(PROJECTION_MARKER)) continue;
       if (isTokensFile) {
         // Blank the region rather than cut it, so reported line numbers still

@@ -69,10 +69,40 @@ export function pillVisible(m: ScrollMetrics): boolean {
  *  exactly the shortfall between one viewport and the content at and below the
  *  anchor, never more — so the anchor works on a short conversation and the
  *  reply consumes the blank space as it streams in. `contentHeight` is the real
- *  content (scrollHeight minus any current spacer); `anchorTop` the anchor's
- *  offset in scroll coordinates. */
+ *  extent of the content in scroll coordinates, spacer excluded; `anchorTop`
+ *  the anchor's offset in the same coordinates. */
 export function spacerHeight(clientHeight: number, contentHeight: number, anchorTop: number): number {
     return Math.max(0, Math.round(clientHeight - (contentHeight - anchorTop)));
+}
+
+/** Whether the host absorbed a spacer just set to `wanted` by growing the
+ *  transcript rather than giving it scroll room — the mark of a content-sized
+ *  host, where the page is the scroller and the spacer must come back out.
+ *  `before` is the reading the spacer was sized from; `after` the next frame.
+ *
+ *  A sized panel keeps its clientHeight and turns the whole spacer into scroll
+ *  room. A content-sized host with no slack grows by the whole spacer. The
+ *  case in between is a content-sized host that still had room below its
+ *  content: it grows only by the overflow the spacer creates — the anchor's
+ *  offset, which can be a fraction of the spacer — and gains no scroll room at
+ *  all. Left in place there, the spacer feeds on itself: every reflow measures
+ *  the taller transcript, asks for a taller spacer, and grows the host again,
+ *  without end. (Scroll room alone is not the signal either way — the overflow
+ *  a spacer creates in a sized panel equals the anchor's offset, legitimately
+ *  zero for a chat's first message.) */
+export function hostAbsorbedSpacer(before: ScrollMetrics, after: ScrollMetrics, wanted: number): boolean {
+    if (wanted <= 0) return false;
+    const growth = after.clientHeight - before.clientHeight;
+    return growth > wanted / 2 || (growth > 1 && !scrollable(after));
+}
+
+/** The spacer after a reflow: room the reply has consumed is given back, and
+ *  the spacer grows only while the transcript really scrolls. On a transcript
+ *  that does not, a larger spacer would be answered by a larger transcript —
+ *  the feedback described at {@link hostAbsorbedSpacer} — so the current size
+ *  is the ceiling there. `metrics` is the reading `needed` was computed from. */
+export function spacerAfterReflow(current: number, needed: number, metrics: ScrollMetrics): number {
+    return scrollable(metrics) ? needed : Math.min(current, needed);
 }
 
 /** What send-detection needs to know about a line list. */
@@ -172,6 +202,18 @@ export function createTranscriptScroll(): TranscriptScroll {
         const outer = transcriptEl!.getBoundingClientRect();
         return el.getBoundingClientRect().top - outer.top + transcriptEl!.scrollTop;
     };
+    /** The real extent of the content in scroll coordinates: the spacer's own
+     *  top, which is the content's bottom edge, plus the scroller's bottom
+     *  padding under it. Not `scrollHeight` less the spacer — scrollHeight
+     *  never reads below one viewport, so content shorter than the viewport
+     *  would measure as a full one: the spacer sized from that falls short by
+     *  the difference, and a reflow that re-derives it asks for the anchor's
+     *  offset more than it has, every time. */
+    const contentHeight = (m: ScrollMetrics): number => {
+        const el = transcriptEl;
+        if (!el || !spacerEl) return m.scrollHeight - spacer;
+        return topWithin(spacerEl) + (parseFloat(getComputedStyle(el).paddingBottom) || 0);
+    };
 
     /** One coalesced pass after content or viewport growth: give back spacer
      *  room the reply has consumed, hold the bottom latch, refresh the pill. */
@@ -185,7 +227,8 @@ export function createTranscriptScroll(): TranscriptScroll {
         // frame would yank the anchored reader upward.
         const anchor = spacer > 0 || anchored ? lastUserLine() : null;
         if (spacer > 0 && anchor) {
-            setSpacer(spacerHeight(m.clientHeight, m.scrollHeight - spacer, topWithin(anchor)));
+            const needed = spacerHeight(m.clientHeight, contentHeight(m), topWithin(anchor));
+            setSpacer(spacerAfterReflow(spacer, needed, m));
         }
         // While a smooth glide runs, the writes below would snap it short.
         if (now() >= glideUntil) {
@@ -277,20 +320,17 @@ export function createTranscriptScroll(): TranscriptScroll {
         const target = lastUserLine();
         if (!el || !m || !target) return;
         following = false;
-        const wanted = spacerHeight(m.clientHeight, m.scrollHeight - spacer, topWithin(target));
-        const heightBefore = m.clientHeight;
+        const wanted = spacerHeight(m.clientHeight, contentHeight(m), topWithin(target));
         setSpacer(wanted);
         requestAnimationFrame(() => {
             const after = metrics();
             if (!after) return;
-            // The probe for a content-sized host: a sized panel keeps its
-            // clientHeight and turns the spacer into scroll room, while a
-            // content-sized one grows by it. (Scroll room itself is not the
-            // signal — the overflow a spacer creates equals the anchor's
-            // offset, which is legitimately zero for the first message of a
-            // chat.) Undo the spacer and let the page's own scroller carry a
-            // best-effort anchor. No pill, no latch — the page is the host's.
-            if (wanted > 0 && after.clientHeight - heightBefore > wanted / 2) {
+            // The probe for a content-sized host (hostAbsorbedSpacer): a sized
+            // panel keeps its clientHeight and turns the spacer into scroll
+            // room, while a content-sized one grows instead. Undo the spacer
+            // and let the page's own scroller carry a best-effort anchor. No
+            // pill, no latch — the page is the host's.
+            if (hostAbsorbedSpacer(m, after, wanted)) {
                 setSpacer(0);
                 target.scrollIntoView({ behavior: "smooth", block: "start" });
                 return;

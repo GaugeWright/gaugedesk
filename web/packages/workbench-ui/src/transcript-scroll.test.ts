@@ -5,10 +5,12 @@ import {
     atBottom,
     distanceFromBottom,
     gaugeLines,
+    hostAbsorbedSpacer,
     isHistoryLoad,
     isSend,
     pillVisible,
     scrollable,
+    spacerAfterReflow,
     spacerHeight,
 } from "./transcript-scroll";
 import { type TranscriptLine } from "./transcript";
@@ -75,6 +77,60 @@ describe("the anchor spacer", () => {
         const anchorTop = 750;
         const spacer = spacerHeight(clientHeight, contentHeight, anchorTop);
         expect(contentHeight + spacer - clientHeight).toBe(anchorTop);
+    });
+});
+
+describe("the content-sized host probe", () => {
+    const m = (clientHeight: number, scrollHeight: number) => ({ scrollTop: 0, clientHeight, scrollHeight });
+
+    it("reads a panel that kept its height and gained scroll room as sized", () => {
+        // 500px viewport, 120px of content, anchor at 40: a 420px spacer becomes
+        // 40px of scroll room and the viewport does not move.
+        expect(hostAbsorbedSpacer(m(500, 120), m(500, 540), 420)).toBe(false);
+    });
+
+    it("reads a host that grew by the whole spacer as content-sized", () => {
+        expect(hostAbsorbedSpacer(m(120, 120), m(540, 540), 420)).toBe(true);
+    });
+
+    it("reads a host that grew by only the anchor's offset, without scroll room, as content-sized", () => {
+        // A content-sized host with slack below its content grows by just the
+        // overflow the spacer creates — here 40px of a 420px spacer — and never
+        // scrolls. Read as sized, the spacer would ask for 40px more on every
+        // reflow and the host would grow to fit each time.
+        expect(hostAbsorbedSpacer(m(500, 120), m(540, 540), 420)).toBe(true);
+    });
+
+    it("stays quiet for a first message whose anchor sits at the top", () => {
+        // Anchor offset zero: the spacer creates no overflow in either kind of
+        // host, and there is nothing to scroll to or feed on.
+        expect(hostAbsorbedSpacer(m(500, 80), m(500, 500), 420)).toBe(false);
+        expect(hostAbsorbedSpacer(m(500, 80), m(500, 500), 0)).toBe(false);
+    });
+
+    it("ignores a pixel of layout noise", () => {
+        expect(hostAbsorbedSpacer(m(500, 120), m(501, 541), 420)).toBe(false);
+    });
+});
+
+describe("the spacer on reflow", () => {
+    it("gives back the room a streaming reply has consumed", () => {
+        const scrolling = { scrollTop: 0, clientHeight: 500, scrollHeight: 540 };
+        expect(spacerAfterReflow(420, 300, scrolling)).toBe(300);
+        const flush = { scrollTop: 0, clientHeight: 500, scrollHeight: 500 };
+        expect(spacerAfterReflow(420, 300, flush)).toBe(300);
+    });
+
+    it("grows with the viewport of a transcript that scrolls", () => {
+        const scrolling = { scrollTop: 0, clientHeight: 600, scrollHeight: 640 };
+        expect(spacerAfterReflow(420, 520, scrolling)).toBe(520);
+    });
+
+    it("never grows on a transcript that does not scroll", () => {
+        // A content-sized host answers a taller spacer with a taller
+        // transcript, which would ask for a taller spacer again.
+        const flush = { scrollTop: 0, clientHeight: 540, scrollHeight: 540 };
+        expect(spacerAfterReflow(420, 460, flush)).toBe(420);
     });
 });
 
