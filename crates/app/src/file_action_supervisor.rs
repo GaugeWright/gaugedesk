@@ -9,7 +9,7 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// Trusted host limits. No HTTP handler chooses storage or discovery limits.
 #[derive(Clone, Copy)]
@@ -113,7 +113,7 @@ fn drive_candidate(
 }
 
 /// Run one Home's supervisor until shutdown or a discovery/storage failure.
-/// Startup always discovers retained grants. Grant commits wake another pass;
+/// Startup always discovers retained grants. Grant commits hint their own scope;
 /// notifications cannot select commands or confer authority. Production callers
 /// must qualify rollout budgets before activating this host service.
 ///
@@ -126,10 +126,10 @@ pub async fn supervise_native_editor_dispatch(
     mut shutdown: watch::Receiver<bool>,
     notices: mpsc::Sender<NativeEditorDispatchNotice>,
 ) -> Result<(), String> {
-    let (changed, running) = {
+    let (mut changed, running) = {
         let wb = wb.lock_unpoisoned();
         (
-            Arc::clone(&wb.native_editor_dispatch_changed),
+            wb.native_editor_dispatch_changed.subscribe(),
             Arc::clone(&wb.native_editor_dispatch_running),
         )
     };
@@ -141,28 +141,34 @@ pub async fn supervise_native_editor_dispatch(
         cancelled: AtomicBool::new(false),
     });
     let _guard = SupervisorGuard(Arc::clone(&lease));
+    let mut hinted_grant = None;
     loop {
+        let targeted = hinted_grant.is_some();
         let mut after: Option<String> = None;
         loop {
             if stopping(&shutdown) {
                 return Ok(());
             }
-            let worker_wb = Arc::clone(&wb);
-            let worker_lease = Arc::clone(&lease);
-            let page = tokio::task::spawn_blocking(move || {
-                let _lease = worker_lease;
-                worker_wb
-                    .lock_unpoisoned()
-                    .store_ref()
-                    .scope_ids_with_kind(
-                        dispatch_grant::GRANT_KIND,
-                        after.as_deref(),
-                        config.discovery_page_size,
-                    )
-                    .map_err(|e| format!("{e:?}"))
-            })
-            .await
-            .map_err(|_| "native dispatch discovery worker failed")??;
+            let page = if let Some(grant) = hinted_grant.take() {
+                vec![grant]
+            } else {
+                let worker_wb = Arc::clone(&wb);
+                let worker_lease = Arc::clone(&lease);
+                tokio::task::spawn_blocking(move || {
+                    let _lease = worker_lease;
+                    worker_wb
+                        .lock_unpoisoned()
+                        .store_ref()
+                        .scope_ids_with_kind(
+                            dispatch_grant::GRANT_KIND,
+                            after.as_deref(),
+                            config.discovery_page_size,
+                        )
+                        .map_err(|e| format!("{e:?}"))
+                })
+                .await
+                .map_err(|_| "native dispatch discovery worker failed")??
+            };
             if page.is_empty() {
                 break;
             }
@@ -194,9 +200,22 @@ pub async fn supervise_native_editor_dispatch(
                 // No receiver or a full channel cannot withhold durable saving.
                 let _ = notices.try_send(NativeEditorDispatchNotice { grant_ref, outcome });
             }
+            if targeted {
+                break;
+            }
         }
         tokio::select! {
-            _ = changed.notified() => {}
+            hint = changed.recv() => match hint {
+                Ok(grant) => hinted_grant = Some(grant),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // The next durable scan covers all grants committed before
+                    // resubscription, while this receiver captures later hints.
+                    changed = changed.resubscribe();
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err("native dispatch hint channel closed; restart supervision".into());
+                }
+            },
             _ = shutdown.changed() => {
                 if stopping(&shutdown) { return Ok(()); }
             }
@@ -207,3 +226,7 @@ pub async fn supervise_native_editor_dispatch(
 #[cfg(test)]
 #[path = "file_action_supervisor_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "native_save_qualification.rs"]
+mod qualification;

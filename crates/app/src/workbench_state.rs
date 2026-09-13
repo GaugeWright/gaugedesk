@@ -163,8 +163,8 @@ pub struct Workbench {
     /// Woken when the publication facility changes, so reachability can follow
     /// it while the Home runs rather than only at the moment it started.
     pub(crate) publication_changed: Arc<tokio::sync::Notify>,
-    /// Coalesced native dispatch discovery hint; retained grants are the source.
-    pub(crate) native_editor_dispatch_changed: Arc<tokio::sync::Notify>,
+    /// Bounded grant-reference hints; retained grants remain the source.
+    pub(crate) native_editor_dispatch_changed: broadcast::Sender<String>,
     pub(crate) native_editor_dispatch_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -340,7 +340,7 @@ impl Workbench {
             recovered_account_key: None,
             machine_controllers: crate::mobile_machine_session::MachineControllerRuntime::default(),
             publication_changed: Arc::new(tokio::sync::Notify::new()),
-            native_editor_dispatch_changed: Arc::new(tokio::sync::Notify::new()),
+            native_editor_dispatch_changed: broadcast::channel(64).0,
             native_editor_dispatch_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }

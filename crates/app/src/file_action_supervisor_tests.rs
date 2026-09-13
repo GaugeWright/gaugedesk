@@ -437,3 +437,199 @@ async fn dropping_the_supervisor_cancels_its_already_dispatched_worker_before_ef
     .unwrap();
     assert!(!dir.path().join("actions/native/runtime.sqlite").exists());
 }
+
+#[tokio::test]
+async fn a_grant_wake_does_not_redrive_unrelated_completed_or_failed_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wb, command, storage, token) = home_storage_fixture(dir.path(), config().storage);
+    let original = authorize(&wb, &storage, &command, &token, "a-original");
+    {
+        let mut wb = wb.lock_unpoisoned();
+        for scope in ["a-malformed", "zz-startup-finished"] {
+            wb.store_mut()
+                .append_record(scope, dispatch_grant::GRANT_KIND, "{}")
+                .unwrap();
+        }
+    }
+    let (shutdown, signal) = watch::channel(false);
+    let (sender, mut receiver) = mpsc::channel(32);
+    let task = tokio::spawn(supervise_native_editor_dispatch(
+        wb.clone(),
+        config(),
+        signal,
+        sender,
+    ));
+    assert_eq!(notice(&mut receiver).await.grant_ref, "a-malformed");
+    let saved = notice(&mut receiver).await;
+    assert_eq!(saved.grant_ref, original);
+    assert!(matches!(
+        saved.outcome,
+        NativeEditorDispatchOutcome::Saved {
+            replayed: false,
+            ..
+        }
+    ));
+    assert_eq!(notice(&mut receiver).await.grant_ref, "zz-startup-finished");
+    let renewed = authorize(&wb, &storage, &command, &token, "z-renewed");
+    let observed = notice(&mut receiver).await;
+    stop(shutdown, task).await;
+    assert_eq!(
+        observed.grant_ref, renewed,
+        "a committed grant wake must target that grant, not replay the whole history"
+    );
+    assert!(matches!(
+        observed.outcome,
+        NativeEditorDispatchOutcome::Saved { replayed: true, .. }
+    ));
+    assert_eq!(
+        runtime_effect_count(dir.path(), &command.instance_ref().unwrap()),
+        2
+    );
+}
+
+#[tokio::test]
+async fn overflow_rediscovers_lost_hints_and_captures_changes_during_the_new_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wb, command, storage, token) = home_storage_fixture(dir.path(), config().storage);
+    {
+        let mut wb = wb.lock_unpoisoned();
+        wb.native_editor_dispatch_changed = broadcast::channel(2).0;
+        wb.store_mut()
+            .append_record("zz-startup-finished", dispatch_grant::GRANT_KIND, "{}")
+            .unwrap();
+    }
+    let (shutdown, signal) = watch::channel(false);
+    let (sender, mut receiver) = mpsc::channel(16);
+    let task = tokio::spawn(supervise_native_editor_dispatch(
+        wb.clone(),
+        config(),
+        signal,
+        sender,
+    ));
+    assert_eq!(notice(&mut receiver).await.grant_ref, "zz-startup-finished");
+    let lost = {
+        let mut wb = wb.lock_unpoisoned();
+        let context = wb.authenticate_action_context(&token).unwrap();
+        let grant = wb
+            .authorize_editor_file_save_dispatch(&context, storage.inputs(), &command, "z-overflow")
+            .unwrap()
+            .grant_ref;
+        // No await while holding the Workbench: the bounded receiver loses the
+        // real hint before the supervisor can consume another message.
+        for _ in 0..4 {
+            wb.native_editor_dispatch_changed
+                .send("not-a-durable-grant".into())
+                .unwrap();
+        }
+        grant
+    };
+    let recovered = notice(&mut receiver).await;
+    assert_eq!(recovered.grant_ref, lost);
+    assert!(matches!(
+        recovered.outcome,
+        NativeEditorDispatchOutcome::Saved {
+            replayed: false,
+            ..
+        }
+    ));
+    let before_cursor = authorize(&wb, &storage, &command, &token, "a-during-rescan");
+    assert!(before_cursor < lost);
+    assert_eq!(notice(&mut receiver).await.grant_ref, "zz-startup-finished");
+    let captured = notice(&mut receiver).await;
+    assert_eq!(captured.grant_ref, before_cursor);
+    assert!(matches!(
+        captured.outcome,
+        NativeEditorDispatchOutcome::Saved { replayed: true, .. }
+    ));
+    let barrier = authorize(&wb, &storage, &command, &token, "zz-post-rescan-barrier");
+    let next = notice(&mut receiver).await;
+    stop(shutdown, task).await;
+    assert_eq!(
+        next.grant_ref, barrier,
+        "overflow recovery must discard stale queued hints covered by its scan"
+    );
+    assert_eq!(
+        runtime_effect_count(dir.path(), &command.instance_ref().unwrap()),
+        2
+    );
+}
+
+#[tokio::test]
+async fn targeted_hints_still_require_receipted_grants_and_live_authentication() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wb, command, storage, token) = home_storage_fixture(dir.path(), config().storage);
+    wb.lock_unpoisoned()
+        .store_mut()
+        .append_record("zz-startup-finished", dispatch_grant::GRANT_KIND, "{}")
+        .unwrap();
+    let (shutdown, signal) = watch::channel(false);
+    let (sender, mut receiver) = mpsc::channel(8);
+    let task = tokio::spawn(supervise_native_editor_dispatch(
+        wb.clone(),
+        config(),
+        signal,
+        sender,
+    ));
+    assert_eq!(notice(&mut receiver).await.grant_ref, "zz-startup-finished");
+    let revoked = {
+        let mut wb = wb.lock_unpoisoned();
+        wb.native_editor_dispatch_changed
+            .send("forged-grant-hint".into())
+            .unwrap();
+        let context = wb.authenticate_action_context(&token).unwrap();
+        let grant = wb
+            .authorize_editor_file_save_dispatch(
+                &context,
+                storage.inputs(),
+                &command,
+                "revoked-before-hint-consumption",
+            )
+            .unwrap()
+            .grant_ref;
+        wb.revoke_account_session(&token);
+        grant
+    };
+    let forged = notice(&mut receiver).await;
+    assert_eq!(forged.grant_ref, "forged-grant-hint");
+    assert!(
+        matches!(forged.outcome, NativeEditorDispatchOutcome::NeedsAttention { detail } if detail.contains("no committed receipt"))
+    );
+    let stale = notice(&mut receiver).await;
+    stop(shutdown, task).await;
+    assert_eq!(stale.grant_ref, revoked);
+    assert!(matches!(
+        stale.outcome,
+        NativeEditorDispatchOutcome::NeedsAttention { .. }
+    ));
+    assert!(!dir.path().join("actions/native/runtime.sqlite").exists());
+}
+
+#[tokio::test]
+async fn closing_the_hint_channel_reports_failure_and_releases_supervision() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wb, _, _, _) = home_storage_fixture(dir.path(), config().storage);
+    wb.lock_unpoisoned()
+        .store_mut()
+        .append_record("zz-startup-finished", dispatch_grant::GRANT_KIND, "{}")
+        .unwrap();
+    let (_shutdown, signal) = watch::channel(false);
+    let (sender, mut receiver) = mpsc::channel(8);
+    let task = tokio::spawn(supervise_native_editor_dispatch(
+        wb.clone(),
+        config(),
+        signal,
+        sender,
+    ));
+    assert_eq!(notice(&mut receiver).await.grant_ref, "zz-startup-finished");
+    wb.lock_unpoisoned().native_editor_dispatch_changed = broadcast::channel(2).0;
+    let error = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.contains("hint channel closed"));
+    assert!(!wb
+        .lock_unpoisoned()
+        .native_editor_dispatch_running
+        .load(Ordering::Acquire));
+}

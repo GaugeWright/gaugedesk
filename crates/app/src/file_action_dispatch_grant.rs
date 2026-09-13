@@ -500,7 +500,7 @@ impl Workbench {
             })
             .map_err(|e| format!("{e:?}"))?
             .map_err(|e| format!("{e:?}"))?;
-        self.native_editor_dispatch_changed.notify_one();
+        let _ = self.native_editor_dispatch_changed.send(scope.clone());
         Ok(NativeEditorDispatchGrant {
             grant_ref: scope,
             replayed: receipt.replayed,
@@ -537,7 +537,7 @@ impl Workbench {
             self.store_mut()
                 .with_dispatch_basis(&prepared.basis, || ())
                 .map_err(|e| format!("{e:?}"))?;
-            self.native_editor_dispatch_changed.notify_one();
+            let _ = self.native_editor_dispatch_changed.send(grant_ref.into());
             return Ok(());
         }
         let record = sign(
@@ -568,7 +568,7 @@ impl Workbench {
             })
             .map_err(|e| format!("{e:?}"))?
             .map_err(|e| format!("{e:?}"))?;
-        self.native_editor_dispatch_changed.notify_one();
+        let _ = self.native_editor_dispatch_changed.send(grant_ref.into());
         Ok(())
     }
 
