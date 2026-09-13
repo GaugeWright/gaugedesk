@@ -35,6 +35,10 @@ use whipplescript_store::{
 mod result_admission;
 pub use result_admission::{AdmittedEditorSavedResult, NativeEditorSavedResult};
 
+#[path = "file_action_inspection.rs"]
+mod inspection;
+pub use inspection::{EditorFileSaveObservation, RetainedEditorFileSaveSource};
+
 fn refused() -> StoreError {
     StoreError::Conflict("original native save evidence binding is unavailable".into())
 }

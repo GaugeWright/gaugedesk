@@ -229,7 +229,7 @@ impl Workbench {
 
     /// Rebuild the in-memory measurement allow-list from the durable registry — run at
     /// startup so operator registrations survive a restart (the loopback store was
-    /// per-process). Mirrors `Workbench::restore_workstream_homing`.
+    /// per-process).
     pub fn restore_measurements(&mut self) {
         if let Ok(records) = restore_records(self.store_ref()) {
             for record in records {

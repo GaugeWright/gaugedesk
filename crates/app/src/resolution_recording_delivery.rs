@@ -53,6 +53,15 @@ pub(super) fn original_scope(command: &HostActionCommand) -> Result<ResolutionMe
     Ok(scope)
 }
 
+pub(super) fn original_policy(envelope: &str) -> Result<HostGovernancePolicy, String> {
+    let policy: HostGovernancePolicy =
+        serde_json::from_str(envelope).map_err(|error| error.to_string())?;
+    if canonicalize(&policy.to_json()?)? != canonicalize(envelope)? {
+        return Err("original correction policy cannot be represented losslessly".into());
+    }
+    Ok(policy)
+}
+
 impl Workbench {
     pub(in crate::file_action_factory) fn prepare_native_corrections(
         &mut self,
@@ -67,13 +76,12 @@ impl Workbench {
             || command.provenance.initiator != context.actor().as_str()
             || command.provenance.executor != context.actor().as_str()
             || !command.provenance.delegation.is_empty()
-            || !command.provenance.causes.is_empty()
-            || command.provenance.origin != "editor.corrections"
             || command.inputs.len() != 1
             || command.resources.len() != 1
         {
             return Err(refused());
         }
+        let source_scope = Self::correction_source_scope(command)?;
         registered_recording_workflow(command)?;
         let (format, project, chat, path): (String, String, String, String) =
             serde_json::from_str(&command.scope).map_err(|_| refused())?;
@@ -103,40 +111,53 @@ impl Workbench {
         let mapping_scope =
             crate::action_input_binding::input_binding_scope(&command.issuer, input)
                 .map_err(|error| format!("correction input mapping refused: {error:?}"))?;
-        let ((authority, input_binding), basis) = self
+        let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
+        let mut scopes = vec![
+            LIBRARY_SCOPE,
+            ORG_SCOPE,
+            crate::account_auth::ACCOUNT_AUTH_SCOPE,
+            crate::mobile_machine_session::SCOPE,
+            &scope,
+            &policy_scope,
+            &mapping_scope,
+        ];
+        scopes.extend(source_scope.as_deref());
+        let ((authority, input_binding, policy), basis) = self
             .store_ref()
-            .read_for_dispatch(
-                &[
-                    LIBRARY_SCOPE,
-                    ORG_SCOPE,
-                    crate::account_auth::ACCOUNT_AUTH_SCOPE,
-                    crate::mobile_machine_session::SCOPE,
-                    &scope,
-                    &policy_scope,
-                    &mapping_scope,
-                ],
-                |store| {
-                    let authority = current_target_authority(
-                        store,
-                        &home,
-                        context,
-                        &NativeTargetIntent {
-                            chat_id: &chat,
-                            request_id: &command.request_id,
-                            path: &path,
-                        },
-                        NativeActionKind::RecordCorrections,
-                    )?;
-                    let mapping = crate::action_input_binding::load_input_binding(
-                        store,
-                        &command.issuer,
-                        home.as_str(),
-                        input,
-                        &key.public_key(),
-                    );
-                    Ok((authority, mapping))
-                },
-            )
+            .read_for_dispatch(&scopes, |store| {
+                let policy = load_action_policy(store, &identity, &command.policy, &root)
+                    .map_err(|_| invalid("original correction policy is unavailable"))?;
+                let original_policy = original_policy(policy.signed_envelope())
+                    .map_err(|_| invalid("original correction policy is unrepresentable"))?;
+                let source_policy = Self::correction_source_policy(
+                    store,
+                    home.as_str(),
+                    &key.public_key(),
+                    command,
+                    &original_policy,
+                )
+                .map_err(|_| invalid("original correction source evidence is unavailable"))?;
+                let authority = current_target_authority_with_source(
+                    store,
+                    &home,
+                    context,
+                    &NativeTargetIntent {
+                        chat_id: &chat,
+                        request_id: &command.request_id,
+                        path: &path,
+                    },
+                    NativeActionKind::RecordCorrections,
+                    source_policy.as_ref(),
+                )?;
+                let mapping = crate::action_input_binding::load_input_binding(
+                    store,
+                    &command.issuer,
+                    home.as_str(),
+                    input,
+                    &key.public_key(),
+                );
+                Ok((authority, mapping, policy))
+            })
             .map_err(|error| format!("current correction authority refused: {error:?}"))?;
         let input_binding = input_binding
             .map_err(|error| format!("correction input mapping refused: {error:?}"))?;
@@ -146,8 +167,6 @@ impl Workbench {
         {
             return Err("current correction scope differs from its admitted ceiling".into());
         }
-        let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
-        let policy = load_action_policy(self.store_ref(), &identity, &command.policy, &root)?;
         if canonicalize(policy.signed_envelope())? != canonicalize(&authority.policy.to_json()?)?
             || runtime_policy != policy.policy_ref()
         {
@@ -177,6 +196,7 @@ impl Workbench {
             .map_err(|error| format!("{error:?}"))?;
         let envelope =
             ifc::VerifiedEnvelope::verify_signed_text_with(policy.signed_envelope(), &root)?;
+        crate::resolution_recording_policy::validate_resolution_recording_flows(&envelope)?;
         let basis = authority
             .bind_deadline(basis)
             .map_err(|error| format!("correction authority deadline refused: {error:?}"))?;

@@ -88,6 +88,32 @@ impl<C: ContentBlobs> ActionInputCustody<C> {
         label_ref: &str,
         content: &str,
     ) -> StoreResult<ActionInput> {
+        self.prepare_with(handle, label_ref, content, |encoded| {
+            self.content.put_text(encoded)
+        })
+    }
+
+    /// Derived preparation cannot restore an erased input identity. The owner
+    /// serializes the ledger check with this exact envelope's durable put.
+    /// Publication and current source authority remain separate obligations.
+    pub fn prepare_unerased(
+        &self,
+        handle: &str,
+        label_ref: &str,
+        content: &str,
+    ) -> StoreResult<ActionInput> {
+        self.prepare_with(handle, label_ref, content, |encoded| {
+            self.content.put_unerased(encoded.as_bytes())
+        })
+    }
+
+    fn prepare_with(
+        &self,
+        handle: &str,
+        label_ref: &str,
+        content: &str,
+        put: impl FnOnce(&str) -> StoreResult<String>,
+    ) -> StoreResult<ActionInput> {
         if handle.trim().is_empty() || label_ref.trim().is_empty() {
             return Err(invalid("action input has incomplete binding"));
         }
@@ -103,7 +129,7 @@ impl<C: ContentBlobs> ActionInputCustody<C> {
         };
         let encoded = serde_json::to_string(&retained)
             .map_err(|_| invalid("action input encoding failed"))?;
-        let version_ref = self.content.put_text(&encoded)?;
+        let version_ref = put(&encoded)?;
         Ok(ActionInput {
             handle: handle.into(),
             version_ref,

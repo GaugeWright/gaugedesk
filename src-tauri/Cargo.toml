@@ -22,10 +22,10 @@ path = "src/main.rs"
 # contract as the backend workspace. This nested Cargo workspace has its own
 # resolver and lockfile, so the root patch does not apply here.
 [patch.crates-io]
-whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "55906340a6609b1d5b907e350937d1c1592bc483" }
-whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "55906340a6609b1d5b907e350937d1c1592bc483" }
-whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "55906340a6609b1d5b907e350937d1c1592bc483" }
-whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "55906340a6609b1d5b907e350937d1c1592bc483" }
+whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "0a48a16bb45680d95a6e154fd3c4caeb886e5b41" }
+whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "0a48a16bb45680d95a6e154fd3c4caeb886e5b41" }
+whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "0a48a16bb45680d95a6e154fd3c4caeb886e5b41" }
+whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "0a48a16bb45680d95a6e154fd3c4caeb886e5b41" }
 
 [profile.release]
 strip = "symbols"

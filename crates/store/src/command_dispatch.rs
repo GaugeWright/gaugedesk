@@ -40,9 +40,30 @@ impl DispatchReadBasis {
 pub struct DispatchRecordAdmission<'tx> {
     tx: rusqlite::Transaction<'tx>,
     codec: Option<std::sync::Arc<dyn crate::ContentCodec>>,
+    store_path: String,
 }
 
 impl DispatchRecordAdmission<'_> {
+    /// Consume the held source fence to publish normal lifecycle admission and
+    /// its outbox while external input/evidence retention still holds. Check the
+    /// separately captured destination standing inside this same transaction.
+    /// This reuses ordinary dispatch admission, including exact replay/rollback.
+    pub fn admit_with_dispatch_against<L: Lifecycle>(
+        self,
+        scope_id: &str,
+        idempotency_key: &str,
+        command: L::Command,
+        dispatch: &CommandDispatch,
+        basis: &DispatchReadBasis,
+    ) -> Result<MaterializedAdmission<L::State>, AdmitError>
+    where
+        L::Command: serde::Serialize,
+    {
+        let prepared = PreparedDispatch::<L>::new(scope_id, idempotency_key, command, dispatch)?;
+        check_dispatch_basis(&self.tx, &self.store_path, basis)?;
+        commit_dispatch::<L>(self.tx, prepared)
+    }
+
     /// Commit the exact command and its facts before releasing external evidence
     /// retention. This consumes the handle; it grants no external execution right.
     pub fn commit(
@@ -154,11 +175,16 @@ impl Store {
         publish: impl for<'tx> FnOnce(DispatchRecordAdmission<'tx>) -> T,
     ) -> Result<T, AdmitError> {
         let codec = self.codec.clone();
+        let store_path = self.path.clone();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_dispatch_basis(&tx, &self.path, basis)?;
-        Ok(publish(DispatchRecordAdmission { tx, codec }))
+        Ok(publish(DispatchRecordAdmission {
+            tx,
+            codec,
+            store_path,
+        }))
     }
 
     /// Serialize a bounded native runtime operation with current product standing.
@@ -363,6 +389,38 @@ impl Store {
     where
         L::Command: serde::Serialize,
     {
+        let prepared = PreparedDispatch::<L>::new(scope_id, idempotency_key, command, dispatch)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(basis) = basis {
+            check_dispatch_basis(&tx, &self.path, basis)?;
+        }
+        commit_dispatch::<L>(tx, prepared)
+    }
+}
+
+/// The same identity and pure lifecycle admission are used by ordinary and
+/// externally retained publication. Preparing this value writes no state.
+struct PreparedDispatch<'a, L: Lifecycle> {
+    scope_id: &'a str,
+    idempotency_key: &'a str,
+    command: L::Command,
+    snapshot: String,
+    command_id: String,
+    intent: DispatchIntent,
+}
+
+impl<'a, L: Lifecycle> PreparedDispatch<'a, L>
+where
+    L::Command: serde::Serialize,
+{
+    fn new(
+        scope_id: &'a str,
+        idempotency_key: &'a str,
+        command: L::Command,
+        dispatch: &CommandDispatch,
+    ) -> Result<Self, AdmitError> {
         if [
             scope_id,
             idempotency_key,
@@ -387,120 +445,146 @@ impl Store {
             command_id: command_id.clone(),
             dispatch: dispatch.clone(),
         };
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(basis) = basis {
-            check_dispatch_basis(&tx, &self.path, basis)?;
-        }
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO commands
+        Ok(Self {
+            scope_id,
+            idempotency_key,
+            command,
+            snapshot,
+            command_id,
+            intent,
+        })
+    }
+}
+
+fn commit_dispatch<L: Lifecycle>(
+    tx: rusqlite::Transaction<'_>,
+    prepared: PreparedDispatch<'_, L>,
+) -> Result<MaterializedAdmission<L::State>, AdmitError>
+where
+    L::Command: serde::Serialize,
+{
+    let PreparedDispatch {
+        scope_id,
+        idempotency_key,
+        command,
+        snapshot,
+        command_id,
+        intent,
+    } = prepared;
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO commands
              (command_id, scope_id, idempotency_key, status, snapshot_json)
              VALUES (?1, ?2, ?3, 'received', ?4)",
-            params![command_id, scope_id, idempotency_key, snapshot],
-        )?;
-        let (original, status): (String, String) = tx.query_row(
-            "SELECT snapshot_json, status FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
+        params![command_id, scope_id, idempotency_key, snapshot],
+    )?;
+    let (original, status): (String, String) = tx.query_row(
+        "SELECT snapshot_json, status FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
+        params![scope_id, idempotency_key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if original != snapshot {
+        return Err(AdmitError::Rejected(Rejection {
+            reason: "idempotency key reused with different command or dispatch",
+        }));
+    }
+    let replayed = tx
+        .query_row(
+            "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
             params![scope_id, idempotency_key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if replayed {
+        // A legacy receipt without an original snapshot/outbox cannot be
+        // upgraded into a successful dispatch admission on a retry.
+        let mut statement = tx.prepare(
+            "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
         )?;
-        if original != snapshot {
-            return Err(AdmitError::Rejected(Rejection {
-                reason: "idempotency key reused with different command or dispatch",
-            }));
-        }
-        let replayed = tx
-            .query_row(
-                "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-                params![scope_id, idempotency_key],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if replayed {
-            // A legacy receipt without an original snapshot/outbox cannot be
-            // upgraded into a successful dispatch admission on a retry.
-            let mut statement = tx.prepare(
-                "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-            )?;
-            let mut matches = 0;
-            for row in statement.query_map(params![scope_id, DISPATCH_KIND], |row| {
-                row.get::<_, String>(0)
-            })? {
-                let recorded: DispatchIntent = serde_json::from_str(&row?)?;
-                if recorded.command_id == command_id {
-                    if recorded != intent {
-                        return Err(AdmitError::Rejected(Rejection {
-                            reason: "dispatch receipt does not match its committed intent",
-                        }));
-                    }
-                    matches += 1;
+        let mut matches = 0;
+        for row in statement.query_map(params![scope_id, DISPATCH_KIND], |row| {
+            row.get::<_, String>(0)
+        })? {
+            let recorded: DispatchIntent = serde_json::from_str(&row?)?;
+            if recorded.command_id == command_id {
+                if recorded != intent {
+                    return Err(AdmitError::Rejected(Rejection {
+                        reason: "dispatch receipt does not match its committed intent",
+                    }));
                 }
-            }
-            if inserted != 0 || matches != 1 {
-                return Err(AdmitError::Rejected(Rejection {
-                    reason: "dispatch receipt has no unique committed intent",
-                }));
+                matches += 1;
             }
         }
-        if !replayed && status != "received" {
+        if inserted != 0 || matches != 1 {
             return Err(AdmitError::Rejected(Rejection {
-                reason: "existing command has no replayable dispatch admission",
+                reason: "dispatch receipt has no unique committed intent",
             }));
         }
-        let mut state = L::State::default();
-        {
-            let mut statement = tx.prepare(
-                "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-            )?;
-            for row in
-                statement.query_map(params![scope_id, L::KIND], |row| row.get::<_, String>(0))?
-            {
-                state = L::evolve(&state, serde_json::from_str(&row?)?);
-            }
+    }
+    if !replayed && status != "received" {
+        return Err(AdmitError::Rejected(Rejection {
+            reason: "existing command has no replayable dispatch admission",
+        }));
+    }
+    let mut state = L::State::default();
+    {
+        let mut statement = tx.prepare(
+            "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
+        )?;
+        for row in statement.query_map(params![scope_id, L::KIND], |row| row.get::<_, String>(0))? {
+            state = L::evolve(&state, serde_json::from_str(&row?)?);
         }
-        if !replayed {
-            let events = L::decide(&state, command).map_err(AdmitError::Rejected)?;
-            let base: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-                params![scope_id],
-                |row| row.get(0),
-            )?;
-            let dispatch_position = base + events.len() as i64;
-            for (offset, event) in events.into_iter().enumerate() {
-                tx.execute(
-                    "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                    params![scope_id, base + offset as i64, L::KIND, serde_json::to_string(&event)?],
-                )?;
-                state = L::evolve(&state, event);
-            }
+    }
+    if !replayed {
+        let events = L::decide(&state, command).map_err(AdmitError::Rejected)?;
+        let base: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            params![scope_id],
+            |row| row.get(0),
+        )?;
+        let dispatch_position = base + events.len() as i64;
+        for (offset, event) in events.into_iter().enumerate() {
             tx.execute(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     scope_id,
-                    dispatch_position,
-                    DISPATCH_KIND,
-                    serde_json::to_string(&intent)?
+                    base + offset as i64,
+                    L::KIND,
+                    serde_json::to_string(&event)?
                 ],
             )?;
-            tx.execute(
-                "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
-                params![scope_id, idempotency_key, base],
-            )?;
+            state = L::evolve(&state, event);
         }
         tx.execute(
-            "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
-             WHERE scope_id = ?1 AND idempotency_key = ?2",
-            params![scope_id, idempotency_key],
+            "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                scope_id,
+                dispatch_position,
+                DISPATCH_KIND,
+                serde_json::to_string(&intent)?
+            ],
         )?;
-        tx.commit()?;
-        Ok(MaterializedAdmission { state, replayed })
+        tx.execute(
+            "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
+            params![scope_id, idempotency_key, base],
+        )?;
     }
+    tx.execute(
+        "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
+             WHERE scope_id = ?1 AND idempotency_key = ?2",
+        params![scope_id, idempotency_key],
+    )?;
+    tx.commit()?;
+    Ok(MaterializedAdmission { state, replayed })
 }
 
 #[cfg(test)]
 #[path = "command_dispatch_record_tests.rs"]
 mod record_tests;
+
+#[cfg(test)]
+#[path = "command_dispatch_retained_tests.rs"]
+mod retained_tests;
 
 #[cfg(test)]
 mod tests {

@@ -5,8 +5,8 @@ use super::*;
 use whipplescript_kernel::resolution_recording::{ResolutionRecordingAction, RECORDING_OPERATION};
 use whipplescript_store::vcs_resolution_recording::ResolutionRecordingInput;
 
-/// New authoring only: these region texts assert no verified earlier history.
-/// Derived corrections need their retained inputs and causal evidence path.
+/// Region texts alone assert no verified earlier history. Derived corrections
+/// use the saved-source admission method to bind retained evidence separately.
 /// The caller cannot select a policy, namespace, executable, actor or file base.
 pub struct EditorCorrections<'a> {
     pub chat_id: &'a str,
@@ -20,6 +20,14 @@ pub struct AdmittedEditorCorrections {
     pub replayed: bool,
 }
 
+struct PreparedCorrections {
+    command: HostActionCommand,
+    input: ActionInput,
+    scope: String,
+    dispatch: CommandDispatch,
+    basis: gaugedesk_store::command_dispatch::DispatchReadBasis,
+}
+
 impl Workbench {
     /// Admit a distinct correction command using the current Home's authority
     /// and input custody. This does not record any knowledge or activate a route.
@@ -29,6 +37,82 @@ impl Workbench {
         inputs: &NativeActionInputCustody,
         request: &EditorCorrections<'_>,
     ) -> Result<AdmittedEditorCorrections, String> {
+        let prepared = self.prepare_editor_corrections(context, inputs, request, None)?;
+        let admitted = inputs
+            .publish(std::slice::from_ref(&prepared.input), || {
+                self.store_mut()
+                    .admit_with_dispatch_against::<ProductActionAdmission>(
+                        &prepared.scope,
+                        &prepared.command.request_id,
+                        prepared.command.clone(),
+                        &prepared.dispatch,
+                        &prepared.basis,
+                    )
+                    .map_err(|e| {
+                        whipplescript_store::StoreError::Conflict(format!(
+                            "correction admission refused: {e:?}"
+                        ))
+                    })
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(AdmittedEditorCorrections {
+            command: prepared.command,
+            replayed: admitted.replayed,
+        })
+    }
+
+    /// Admit a distinct correction derived from one exact saved source. The
+    /// source cause is verified under this actor's current reading authority;
+    /// its attribution and restrictions are retained independently of this act.
+    pub fn admit_saved_source_corrections(
+        &mut self,
+        context: &AuthenticatedActionContext,
+        storage: &NativeActionStorage,
+        request: &EditorCorrections<'_>,
+        cause: &ActionCause,
+    ) -> Result<AdmittedEditorCorrections, String> {
+        let source = self.prepare_editor_saved_source(context, storage, cause)?;
+        let inputs = storage.inputs();
+        let prepared = self.prepare_editor_corrections(
+            context,
+            inputs,
+            request,
+            Some((source.restrictions(), source.cause())),
+        )?;
+        let held = [source.input().clone(), prepared.input.clone()];
+        let admitted = inputs
+            .publish(&held, || {
+                self.with_editor_saved_source(context, &source, |writer| {
+                    writer
+                        .admit_with_dispatch_against::<ProductActionAdmission>(
+                            &prepared.scope,
+                            &prepared.command.request_id,
+                            prepared.command.clone(),
+                            &prepared.dispatch,
+                            &prepared.basis,
+                        )
+                        .map_err(|e| {
+                            whipplescript_store::StoreError::Conflict(format!(
+                                "derived correction admission refused: {e:?}"
+                            ))
+                        })
+                })
+                .map_err(whipplescript_store::StoreError::Conflict)
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(AdmittedEditorCorrections {
+            command: prepared.command,
+            replayed: admitted.replayed,
+        })
+    }
+
+    fn prepare_editor_corrections(
+        &mut self,
+        context: &AuthenticatedActionContext,
+        inputs: &NativeActionInputCustody,
+        request: &EditorCorrections<'_>,
+        source: Option<(&gaugedesk_whip_runtime::ResourcePolicy, &ActionCause)>,
+    ) -> Result<PreparedCorrections, String> {
         if inputs.authority_scope() != self.home_id().as_str() {
             return Err("correction input custody belongs to another Home".into());
         }
@@ -39,12 +123,13 @@ impl Workbench {
             path: request.path,
         };
         let read = |store: &Store| {
-            current_target_authority(
+            current_target_authority_with_source(
                 store,
                 &home,
                 context,
                 &intent,
                 NativeActionKind::RecordCorrections,
+                source.map(|(restrictions, _)| restrictions),
             )
         };
         let authority_scopes = [
@@ -88,20 +173,26 @@ impl Workbench {
             prepare_action_policy(self.store_mut(), &identity, &authority.policy, &signing_key)?;
         let envelope =
             ifc::VerifiedEnvelope::verify_signed_text_with(policy.signed_envelope(), &root)?;
+        crate::resolution_recording_policy::validate_resolution_recording_flows(&envelope)?;
         if !ifc::check_with_envelope(action.program(), &envelope).is_empty() {
             return Err("correction workflow violates the admitted policy".into());
         }
         let body = serde_json::to_string(request.corrections).map_err(|error| error.to_string())?;
-        let input = inputs
-            .prepare(
-                "admitted_corrections",
-                &format!(
-                    "policy:{}:admitted_corrections",
-                    policy.policy_ref().envelope_hash
-                ),
-                &body,
-            )
-            .map_err(|error| format!("{error:?}"))?;
+        let prepare_input = if source.is_some() {
+            NativeActionInputCustody::prepare_unerased
+        } else {
+            NativeActionInputCustody::prepare
+        };
+        let input = prepare_input(
+            inputs,
+            "admitted_corrections",
+            &format!(
+                "policy:{}:admitted_corrections",
+                policy.policy_ref().envelope_hash
+            ),
+            &body,
+        )
+        .map_err(|error| format!("{error:?}"))?;
         crate::action_input_binding::retain_input_binding(
             self.store_mut(),
             inputs,
@@ -131,8 +222,15 @@ impl Workbench {
                 initiator: context.actor().as_str().into(),
                 executor: context.actor().as_str().into(),
                 delegation: vec![],
-                origin: "editor.corrections".into(),
-                causes: vec![],
+                origin: if source.is_some() {
+                    "editor.corrections.derived"
+                } else {
+                    "editor.corrections"
+                }
+                .into(),
+                causes: source
+                    .map(|(_, cause)| vec![cause.clone()])
+                    .unwrap_or_default(),
             },
             inputs: BTreeMap::from([("corrections".into(), input.clone())]),
             resources: BTreeMap::from([("resolutions".into(), resolutions)]),
@@ -158,26 +256,12 @@ impl Workbench {
         let basis = current
             .bind_deadline(basis)
             .map_err(|error| format!("correction authority deadline refused: {error:?}"))?;
-        let admitted = inputs
-            .publish(std::slice::from_ref(&input), || {
-                self.store_mut()
-                    .admit_with_dispatch_against::<ProductActionAdmission>(
-                        &scope,
-                        &command.request_id,
-                        command.clone(),
-                        &dispatch,
-                        &basis,
-                    )
-                    .map_err(|error| {
-                        whipplescript_store::StoreError::Conflict(format!(
-                            "correction admission refused: {error:?}"
-                        ))
-                    })
-            })
-            .map_err(|error| format!("{error:?}"))?;
-        Ok(AdmittedEditorCorrections {
+        Ok(PreparedCorrections {
             command,
-            replayed: admitted.replayed,
+            input,
+            scope,
+            dispatch,
+            basis,
         })
     }
 }

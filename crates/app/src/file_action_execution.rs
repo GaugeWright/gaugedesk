@@ -30,9 +30,9 @@ fn runtime_error(error: impl std::fmt::Debug) -> StoreError {
     StoreError::Conflict(format!("native editor operation failed: {error:?}"))
 }
 
-struct NativeResultVerifier<'a> {
-    request: &'a ReadActionResult,
-    key: PublicKey,
+pub(super) struct NativeResultVerifier<'a> {
+    pub(super) request: &'a ReadActionResult,
+    pub(super) key: PublicKey,
 }
 impl ActionResultVerifier for NativeResultVerifier<'_> {
     fn verify(

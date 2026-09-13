@@ -178,7 +178,7 @@ impl Workbench {
         let register: fn(&whipplescript_store::SqliteStore) -> StoreResult<()> = match kind {
             NativeActionKind::FileSave => register_native_file_package,
             NativeActionKind::RecordCorrections => register_native_recording_package,
-            NativeActionKind::InspectCorrections => {
+            NativeActionKind::InspectHistory => {
                 return Err("inspection cannot initialize a writable runtime".into())
             }
         };

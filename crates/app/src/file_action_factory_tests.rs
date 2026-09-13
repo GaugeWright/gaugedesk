@@ -72,7 +72,7 @@ async fn send(
     (status, String::from_utf8(body.to_vec()).unwrap())
 }
 
-fn membership(wb: &mut Workbench, actor: &str, role: &str) {
+pub(super) fn membership(wb: &mut Workbench, actor: &str, role: &str) {
     let member = crate::org::MembershipRecord {
         id: actor.into(),
         op: crate::org::RecordOp::Upsert,

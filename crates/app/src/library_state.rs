@@ -397,9 +397,6 @@ pub(crate) fn load_startup_library_state(
         &mut engagement_index,
         None,
     )?;
-    for engagement in engagements.values_mut() {
-        let _ = engagement.sync_from_main();
-    }
     Ok(StartupLibraryState {
         library,
         targets,
@@ -2040,12 +2037,11 @@ fn seed_empty_collaboration_workspaces(
                 "declared project collaboration workspace is not open",
             )
         })?;
-        let probe_id = library::gen_id("collaboration-probe");
-        let probe = collaboration.create_engagement(&probe_id).map_err(io)?;
-        let already_seeded = probe.tree().map_err(io)?.iter().any(|entry| !entry.is_dir);
-        drop(probe);
-        collaboration.remove_engagement(&probe_id).map_err(io)?;
-        if already_seeded {
+        // A recorded Main cut establishes initialization even when its current
+        // manifest is empty or some bodies have been erased. A disposable
+        // materialized probe both wrote history and made startup depend on all
+        // retained bodies being available.
+        if collaboration.current_main_cut().map_err(io)?.is_some() {
             continue;
         }
 
@@ -2417,9 +2413,19 @@ fn open_project_chat_engagements(
             .line_branch_id
             .as_deref()
             .unwrap_or(workspace.mainline());
-        let engagement = workspace
-            .create_engagement_subset(&chat.id, target, &roots)
-            .map_err(io)?;
+        let existing = if only_workspace_id.is_none() {
+            workspace
+                .open_engagement_subset(&chat.id, target, &roots)
+                .map_err(io)?
+        } else {
+            None
+        };
+        let engagement = match existing {
+            Some(engagement) => engagement,
+            None => workspace
+                .create_engagement_subset(&chat.id, target, &roots)
+                .map_err(io)?,
+        };
         engagements.insert(chat.id.clone(), engagement);
         engagement_index.insert(chat.id.clone(), collaboration_record.workspace_id.clone());
     }

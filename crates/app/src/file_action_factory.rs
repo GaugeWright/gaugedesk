@@ -164,7 +164,7 @@ struct NativeTargetIntent<'a> {
 enum NativeActionKind {
     FileSave,
     RecordCorrections,
-    InspectCorrections,
+    InspectHistory,
 }
 
 fn current_target_authority(
@@ -173,6 +173,17 @@ fn current_target_authority(
     context: &AuthenticatedActionContext,
     request: &NativeTargetIntent<'_>,
     kind: NativeActionKind,
+) -> Result<FileAuthority, AdmitError> {
+    current_target_authority_with_source(store, home, context, request, kind, None)
+}
+
+fn current_target_authority_with_source(
+    store: &Store,
+    home: &gaugedesk_core::ids::HomeId,
+    context: &AuthenticatedActionContext,
+    request: &NativeTargetIntent<'_>,
+    kind: NativeActionKind,
+    source: Option<&gaugedesk_whip_runtime::ResourcePolicy>,
 ) -> Result<FileAuthority, AdmitError> {
     if !normalized(request.path)
         || request.request_id.trim().is_empty()
@@ -280,11 +291,10 @@ fn current_target_authority(
         || target.kind != WorkTargetKind::Managed
         || target.vcs_posture != TargetVcsPosture::Managed
         || !target.capabilities.read
-        || (!matches!(kind, NativeActionKind::InspectCorrections) && !target.capabilities.propose)
+        || (!matches!(kind, NativeActionKind::InspectHistory) && !target.capabilities.propose)
         || !member.capability_ceiling.read
-        || (!matches!(kind, NativeActionKind::InspectCorrections)
-            && !member.capability_ceiling.propose)
-        || (!matches!(kind, NativeActionKind::InspectCorrections)
+        || (!matches!(kind, NativeActionKind::InspectHistory) && !member.capability_ceiling.propose)
+        || (!matches!(kind, NativeActionKind::InspectHistory)
             && member.participation != TargetParticipationMode::Writable)
         || !crate::engagement_routes::path_is_in_scope(relative, &target.path_scope)
         || !crate::engagement_routes::path_is_in_scope(relative, &member.path_scope)
@@ -337,7 +347,7 @@ fn current_target_authority(
         input: resource("draft"),
         target: resource("file"),
     };
-    let policy = if matches!(kind, NativeActionKind::InspectCorrections) {
+    let policy = if matches!(kind, NativeActionKind::InspectHistory) {
         crate::file_action_policy::compile_file_resource_policy(
             &policy_input,
             gaugedesk_core::abac::Action::Access,
@@ -367,11 +377,19 @@ fn current_target_authority(
     // Scope is the same target compartment a save observes. Recording then
     // receives its own explicit policy, with no file capability or binding.
     let policy = match kind {
-        NativeActionKind::FileSave | NativeActionKind::InspectCorrections => policy,
-        NativeActionKind::RecordCorrections => {
-            crate::resolution_recording_policy::compile_resolution_recording_policy(&policy_input)
-                .map_err(|_| invalid("current correction resource policy refuses this actor"))?
+        NativeActionKind::FileSave | NativeActionKind::InspectHistory => policy,
+        NativeActionKind::RecordCorrections => match source {
+            Some(source) => {
+                crate::resolution_recording_policy::compile_saved_source_recording_policy(
+                    &policy_input,
+                    std::slice::from_ref(source),
+                )
+            }
+            None => crate::resolution_recording_policy::compile_resolution_recording_policy(
+                &policy_input,
+            ),
         }
+        .map_err(|_| invalid("current correction resource policy refuses this actor"))?,
     };
     Ok(FileAuthority {
         target_id: target.id.clone(),
@@ -566,7 +584,10 @@ mod recovery;
 mod ownership;
 
 pub use ownership::NativeEditorActionRuntime;
-pub use recovery::{AdmittedEditorSavedResult, NativeEditorSavedResult};
+pub use recovery::{
+    AdmittedEditorSavedResult, EditorFileSaveObservation, NativeEditorSavedResult,
+    RetainedEditorFileSaveSource,
+};
 
 #[path = "file_action_storage.rs"]
 mod storage;

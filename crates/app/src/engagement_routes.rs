@@ -263,13 +263,6 @@ impl Workbench {
         self.engagements.contains_key(chat_id)
     }
 
-    pub(crate) fn set_live_engagement_target(&mut self, chat_id: &str, target: impl Into<String>) {
-        if let Some(eng) = self.engagements.get_mut(chat_id) {
-            // Re-home is fail-closed at the provider seam (AM-4).
-            let _ = eng.set_target(&target.into());
-        }
-    }
-
     pub(crate) fn live_engagement_target_id(&self, chat_id: &str) -> Option<&str> {
         self.engagement_index.get(chat_id).map(String::as_str)
     }

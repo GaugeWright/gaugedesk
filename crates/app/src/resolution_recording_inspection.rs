@@ -152,8 +152,6 @@ impl Workbench {
         if command.issuer != self.authority().as_str()
             || command.provenance.initiator != command.provenance.executor
             || !command.provenance.delegation.is_empty()
-            || !command.provenance.causes.is_empty()
-            || command.provenance.origin != "editor.corrections"
             || command.inputs.len() != 1
             || command.resources.len() != 1
         {
@@ -161,6 +159,7 @@ impl Workbench {
                 "original correction command is outside the registered native profile".into(),
             );
         }
+        let source_scope = Self::correction_source_scope(command)?;
         // Validate the original registered operation, not the old actor's current
         // account. Revoking that actor must not erase another reader's history.
         delivery::registered_recording_workflow(command)?;
@@ -210,7 +209,8 @@ impl Workbench {
             &mapping_scope,
         ];
         scopes.extend_from_slice(extra_scopes);
-        let ((current, admitted, retained, mapping), basis) = self
+        scopes.extend(source_scope.as_deref());
+        let ((current, admitted, original, mapping), basis) = self
             .store_ref()
             .read_for_dispatch(&scopes, |store| {
                 let current = current_target_authority(
@@ -222,10 +222,21 @@ impl Workbench {
                         request_id: &command.request_id,
                         path: &path,
                     },
-                    NativeActionKind::InspectCorrections,
+                    NativeActionKind::InspectHistory,
                 )?;
                 let admitted = store.fold::<ProductActionAdmission>(&scope)?;
-                let retained = load_action_policy(store, &identity, &command.policy, &root);
+                let retained = load_action_policy(store, &identity, &command.policy, &root)
+                    .map_err(|_| invalid("original correction policy is unavailable"))?;
+                let original = delivery::original_policy(retained.signed_envelope())
+                    .map_err(|_| invalid("original correction policy is unrepresentable"))?;
+                Self::correction_source_policy(
+                    store,
+                    home.as_str(),
+                    &key.public_key(),
+                    command,
+                    &original,
+                )
+                .map_err(|_| invalid("original correction source evidence is unavailable"))?;
                 let mapping = load_input_binding(
                     store,
                     &command.issuer,
@@ -233,7 +244,7 @@ impl Workbench {
                     input,
                     &key.public_key(),
                 );
-                Ok((current, admitted, retained, mapping))
+                Ok((current, admitted, original, mapping))
             })
             .map_err(|error| format!("current correction read authority refused: {error:?}"))?;
         if admitted.command.as_ref() != Some(command)
@@ -257,13 +268,6 @@ impl Workbench {
                     .map_err(|error| format!("{error:?}"))?
         {
             return Err("correction inspection has no original Home outbox binding".into());
-        }
-        let retained = retained?;
-        let original: HostGovernancePolicy =
-            serde_json::from_str(retained.signed_envelope()).map_err(|error| error.to_string())?;
-        // A product model cannot silently drop an owner's signed policy feature.
-        if canonicalize(&original.to_json()?)? != canonicalize(retained.signed_envelope())? {
-            return Err("original correction policy cannot be represented losslessly".into());
         }
         let read_policy = policy::compile(&current, &original_scope, &original)?;
         let signed_policy =

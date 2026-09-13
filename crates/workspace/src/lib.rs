@@ -649,6 +649,43 @@ impl Instance {
         self.create_engagement_on_with_roots(id, target, Some(roots.clone()))
     }
 
+    /// Reopen recorded coordinates without creating a branch, importing disk
+    /// edits or projecting retained content. A missing checkout is not lost
+    /// history and does not prevent a governed historical evidence read.
+    pub fn open_engagement_subset(
+        &self,
+        id: &str,
+        target: &str,
+        roots: &BTreeSet<String>,
+    ) -> Result<Option<Engagement>> {
+        let mut components = Path::new(id).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(WorkspaceError::msg("invalid engagement identity"));
+        }
+        let vcs = NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?;
+        let branch = engagement_line(id);
+        let Some(recorded) = vcs.get_branch(&branch)? else {
+            return Ok(None);
+        };
+        if recorded.parent_branch_id.as_deref() != Some(target) || vcs.get_branch(target)?.is_none()
+        {
+            return Err(WorkspaceError::msg("recorded engagement has another home"));
+        }
+        Ok(Some(Engagement {
+            store_root: self.store_root.clone(),
+            repo: self.repo.clone(),
+            path: self.worktrees.join(id),
+            branch,
+            target: target.into(),
+            sparse_roots: Some(roots.clone()),
+        }))
+    }
+
     pub fn create_engagement_on(&self, id: &str, target: &str) -> Result<Engagement> {
         self.create_engagement_on_with_roots(id, target, None)
     }
@@ -764,10 +801,12 @@ impl Instance {
     }
 
     pub fn current_main_cut(&self) -> Result<Option<String>> {
-        Ok(self
-            .store()?
-            .get_branch(MAINLINE_BRANCH_ID)?
-            .and_then(|branch| branch.head_cut_id))
+        Ok(NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?
+        .get_branch(MAINLINE_BRANCH_ID)?
+        .and_then(|branch| branch.head_cut_id))
     }
 
     /// Reclaim orphaned content (whip's conservative GC sweep): the
@@ -1341,6 +1380,19 @@ impl Engagement {
         )
     }
 
+    /// Missing cached files are unavailable, not an empty editable checkout.
+    /// Recreating only the next written path would let import mistake all other
+    /// recorded paths for deletions.
+    fn ensure_projection(&self) -> Result<()> {
+        if !std::fs::metadata(&self.path)
+            .map_err(WorkspaceError::io)?
+            .is_dir()
+        {
+            return Err(WorkspaceError::msg("chat projection is not a directory"));
+        }
+        Ok(())
+    }
+
     fn ensure_selected_path(&self, relative: &str) -> Result<()> {
         if is_chat_local_path(relative)
             || self.sparse_roots.as_ref().is_none_or(|roots| {
@@ -1644,6 +1696,7 @@ impl Engagement {
     }
 
     pub fn ingest(&self, source: &Path) -> Result<usize> {
+        self.ensure_projection()?;
         if source.is_file() {
             let name = source.file_name().ok_or_else(|| {
                 WorkspaceError::msg(format!(
@@ -1661,6 +1714,7 @@ impl Engagement {
     /// Ingest beneath one admitted sparse root without flattening the target
     /// partition. This preserves binary files for local-path context ingest.
     pub fn ingest_into(&self, prefix: &str, source: &Path) -> Result<usize> {
+        self.ensure_projection()?;
         self.ensure_selected_path(prefix)?;
         let destination = safe_path(&self.path, prefix)?;
         std::fs::create_dir_all(&destination).map_err(WorkspaceError::io)?;
@@ -1710,6 +1764,7 @@ impl Engagement {
     }
 
     pub fn tree(&self) -> Result<Vec<FileEntry>> {
+        self.ensure_projection()?;
         let mut result = Vec::new();
         walk_tree(&self.path, &self.path, &mut result).map_err(WorkspaceError::io)?;
         result.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1738,6 +1793,7 @@ impl Engagement {
     }
 
     pub fn write_file(&self, relative: &str, content: &str) -> Result<()> {
+        self.ensure_projection()?;
         self.ensure_selected_path(relative)?;
         let path = safe_path(&self.path, relative)?;
         if let Some(parent) = path.parent() {
@@ -1775,6 +1831,7 @@ impl Engagement {
     ) -> Result<SaveFileOutcome> {
         use whipplescript_store::vcs::SaveWithBaseOutcome;
         self.ensure_selected_path(relative)?;
+        self.ensure_projection()?;
         // The save IS the cut (SUB-6 §12.1), so it is a head swap like any
         // other and races a turn importing the same line. A person editing a
         // file while an agent works on it is the ordinary case here, not a
@@ -2291,7 +2348,9 @@ fn sync_out_with_roots_observing(
             .collect::<BTreeMap<_, _>>(),
         None => full_manifest.clone(),
     };
-    std::fs::create_dir_all(root).map_err(WorkspaceError::io)?;
+    // The owner creates a missing root only after preflighting and loading
+    // the selected content. An erasure refusal must not leave an empty
+    // directory that later edits could mistake for a complete checkout.
     let mut on_disk = Vec::new();
     walk_tree(root, root, &mut on_disk).map_err(WorkspaceError::io)?;
     let unmanifested: Vec<&FileEntry> = on_disk
@@ -2467,6 +2526,16 @@ pub trait Workspace: Send {
     ) -> Result<Box<dyn ChatWorkspace>> {
         let _ = roots;
         self.create_engagement_on(id, target)
+    }
+    fn open_engagement_subset(
+        &self,
+        _id: &str,
+        _target: &str,
+        _roots: &BTreeSet<String>,
+    ) -> Result<Option<Box<dyn ChatWorkspace>>> {
+        Err(WorkspaceError::msg(
+            "this workspace cannot reopen recorded engagement coordinates",
+        ))
     }
     fn fork_engagement_at(
         &self,
@@ -2739,6 +2808,15 @@ impl Workspace for Instance {
             self, id, target, roots,
         )?))
     }
+    fn open_engagement_subset(
+        &self,
+        id: &str,
+        target: &str,
+        roots: &BTreeSet<String>,
+    ) -> Result<Option<Box<dyn ChatWorkspace>>> {
+        Ok(Self::open_engagement_subset(self, id, target, roots)?
+            .map(|engagement| Box::new(engagement) as Box<dyn ChatWorkspace>))
+    }
     fn fork_engagement_at(
         &self,
         id: &str,
@@ -2967,6 +3045,7 @@ impl ChatWorkspace for Engagement {
         self.write_file(relative, content)
     }
     fn write_file_bytes(&self, relative: &str, content: &[u8]) -> Result<()> {
+        self.ensure_projection()?;
         self.ensure_selected_path(relative)?;
         let path = safe_path(&self.path, relative)?;
         if let Some(parent) = path.parent() {
@@ -2975,6 +3054,7 @@ impl ChatWorkspace for Engagement {
         std::fs::write(path, content).map_err(WorkspaceError::io)
     }
     fn remove_file(&self, relative: &str) -> Result<()> {
+        self.ensure_projection()?;
         self.ensure_selected_path(relative)?;
         let path = safe_path(&self.path, relative)?;
         match std::fs::remove_file(path) {
@@ -5013,3 +5093,7 @@ mod workspace_store_contention {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "reopen_tests.rs"]
+mod reopen_tests;

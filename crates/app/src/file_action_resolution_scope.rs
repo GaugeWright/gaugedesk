@@ -130,6 +130,69 @@ pub(super) fn original(command: &HostActionCommand) -> Result<ResolutionMemorySc
     Ok(scope)
 }
 
+fn coordinates(scope: &ResolutionMemoryScope) -> Result<(String, String, String), String> {
+    // The owner has already validated its wire object. These strings contain
+    // GaugeDesk's versioned namespace tuples, whose meaning is product-owned.
+    let value = serde_json::to_value(scope).map_err(|e| e.to_string())?;
+    let field = |name: &str| -> Result<String, String> {
+        value[name]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "missing namespace coordinate".into())
+    };
+    Ok((
+        field("authority")?,
+        field("resource")?,
+        field("compartment")?,
+    ))
+}
+fn paths_canonical(paths: &[String]) -> bool {
+    !paths.is_empty() && canonical_paths(paths).as_deref() == Ok(paths)
+}
+
+pub(super) fn original_ceiling_is_covered(
+    original: &ResolutionMemoryScope,
+    current: &ResolutionMemoryScope,
+    original_memory: &ResourcePolicy,
+) -> Result<(), String> {
+    let (old_authority, old_resource, old_compartment) = coordinates(original)?;
+    let (now_authority, now_resource, _) = coordinates(current)?;
+    let old_authority: (String, String, String) =
+        serde_json::from_str(&old_authority).map_err(|e| e.to_string())?;
+    let now_authority: (String, String, String) =
+        serde_json::from_str(&now_authority).map_err(|e| e.to_string())?;
+    let old_resource: (String, String, String, Vec<String>) =
+        serde_json::from_str(&old_resource).map_err(|e| e.to_string())?;
+    let now_resource: (String, String, String, Vec<String>) =
+        serde_json::from_str(&now_resource).map_err(|e| e.to_string())?;
+    let (version, memory): (String, ResourcePolicy) =
+        serde_json::from_str(&old_compartment).map_err(|e| e.to_string())?;
+    if old_authority.0 != "gaugedesk.resolutions.authority.v1"
+        || old_authority != now_authority
+        || old_resource.0 != "gaugedesk.resolutions.resource.v1"
+        || (
+            old_resource.0.as_str(),
+            old_resource.1.as_str(),
+            old_resource.2.as_str(),
+        ) != (
+            now_resource.0.as_str(),
+            now_resource.1.as_str(),
+            now_resource.2.as_str(),
+        )
+        || version != "gaugedesk.resolutions.compartment.v1"
+        || &memory != original_memory
+        || !paths_canonical(&old_resource.3)
+        || !paths_canonical(&now_resource.3)
+        || !old_resource
+            .3
+            .iter()
+            .all(|old| now_resource.3.iter().any(|now| covers(now, old)))
+    {
+        return Err("current read grant does not cover the original recording namespace".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

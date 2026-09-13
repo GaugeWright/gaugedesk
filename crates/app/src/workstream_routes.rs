@@ -131,37 +131,6 @@ pub struct CreateWorkstreamSettlementBody {
 }
 
 impl Workbench {
-    /// Rebuild the in-memory chat target tokens from WhippleScript's durable
-    /// branch-home receipts. GaugeDesk reducers are not a second membership
-    /// authority.
-    pub fn restore_workstream_homing(&mut self) {
-        let chats = self.engagement_index.keys().cloned().collect::<Vec<_>>();
-        for chat in chats {
-            let Some(storage_id) = self.engagement_index.get(&chat).cloned() else {
-                continue;
-            };
-            let Some(workspace) = self.workspace_by_storage_id(&storage_id) else {
-                continue;
-            };
-            let Ok(home) = workspace.engagement_home_receipt(&chat) else {
-                continue;
-            };
-            let target = home
-                .line_branch_id
-                .unwrap_or_else(|| workspace.mainline().to_owned());
-            self.set_engagement_target(&chat, target);
-        }
-    }
-
-    /// Re-home a chat's engagement onto a shared ref — joining a workstream
-    /// (`workstream/<id>/main`) or leaving it back to `main` (`WS-E`). The membership
-    /// authority is the [`WorkstreamState`] reducer; this updates the in-memory
-    /// worktree target the auto-sync hook and the merge surface read. A no-op if the
-    /// chat has no live engagement.
-    pub fn set_engagement_target(&mut self, chat_id: &str, target: impl Into<String>) {
-        self.set_live_engagement_target(chat_id, target);
-    }
-
     /// Re-home a settled chat onto another line in its immutable workspace root.
     /// The provider refuses a live candidate and rematerializes the destination cut,
     /// so changing membership cannot smuggle the old line's files into the new one.

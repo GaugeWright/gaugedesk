@@ -1,11 +1,11 @@
-//! Policy for independently recording newly authored corrections (ACTION-4).
+//! Policy for authored corrections and corrections from saved sources (ACTION-4).
 //! Current admission, retained read taint, input/store binding and execution
 //! remain separate obligations. This compiler grants no file operation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::file_action_policy::{compile_file_save_policy, FileSavePolicyInput};
-use gaugedesk_whip_runtime::HostGovernancePolicy;
+use gaugedesk_whip_runtime::{HostGovernancePolicy, ResourcePolicy};
 
 /// The same admitted actor/input/target records used by file policy compilation.
 /// Sharing this shape also shares its resource restrictions and clearance check;
@@ -50,6 +50,68 @@ pub fn compile_resolution_recording_policy(
     };
     policy.validate()?;
     Ok(policy)
+}
+
+/// Compile restrictions for corrections derived from verified saved sources.
+/// The admission boundary supplies their authenticated, retained labels. This
+/// unsigned result proves neither source authenticity nor continued custody.
+pub fn compile_saved_source_recording_policy(
+    input: &ResolutionRecordingPolicyInput,
+    sources: &[ResourcePolicy],
+) -> Result<HostGovernancePolicy, String> {
+    if sources.is_empty() {
+        return Err("derived correction has no retained source".into());
+    }
+    let mut policy = compile_resolution_recording_policy(input)?;
+    let clearances = crate::policy_compiler::actor_clearances(
+        &input.actor_attributes,
+        input.purpose.as_deref(),
+        &[input.input.clone(), input.target.clone()],
+        std::iter::empty(),
+    );
+    let mut source_readers = BTreeSet::new();
+    for source in sources {
+        if source.principal || source.internal || !source.writer.is_empty() {
+            return Err("saved source requires unendorsed data restrictions".into());
+        }
+        if !source.reader.is_subset(&clearances) {
+            return Err("correction actor does not clear retained source restrictions".into());
+        }
+        source_readers.extend(source.reader.iter().cloned());
+    }
+    for address in ["memory:/action/corrections", "result", "error"] {
+        let resource = policy
+            .resources
+            .get_mut(address)
+            .ok_or("correction policy is missing a required resource")?;
+        resource.reader.extend(source_readers.iter().cloned());
+        resource.writer.clear();
+    }
+    // Destination authority stays independently admitted. A stricter source
+    // produces a refused flow, never an implicit declassification or a rewrite
+    // of existing memory's label. The admission boundary runs the IFC check.
+    policy.validate()?;
+    Ok(policy)
+}
+
+/// Check the materialized recording boundary before command publication.
+/// The fixed workflow carries an input reference; its static check cannot prove
+/// every flow performed when the owner resolves and records that reference.
+pub fn validate_resolution_recording_flows(
+    envelope: &gaugedesk_whip_runtime::ifc::VerifiedEnvelope,
+) -> Result<(), String> {
+    for (source, destination) in [
+        ("admitted_corrections", "admitted_resolutions"),
+        ("admitted_corrections", "result"),
+        ("admitted_corrections", "error"),
+        ("admitted_resolutions", "result"),
+        ("admitted_resolutions", "error"),
+    ] {
+        envelope
+            .check_resource_flow(source, destination)
+            .map_err(|error| format!("correction flow refused: {error:?}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -213,6 +275,109 @@ mod tests {
                 }
                 assert!(
                     compile_resolution_recording_policy(&input).is_err(),
+                    "{actor}/{reason}"
+                );
+            }
+        }
+    }
+
+    fn saved_source(readers: &[&str]) -> ResourcePolicy {
+        ResourcePolicy {
+            reader: readers.iter().map(|reader| (*reader).into()).collect(),
+            writer: BTreeSet::new(),
+            principal: false,
+            internal: false,
+        }
+    }
+
+    #[test]
+    fn derived_corrections_keep_source_confidentiality_without_relabeling_memory() {
+        for actor in ["human:alice", "agent:editor"] {
+            let mut input = input(actor);
+            input.input.attributes.classification = Classification::Public;
+            input.target.attributes.classification = Classification::Public;
+            let authored = compile_resolution_recording_policy(&input).unwrap();
+            let sources = [
+                saved_source(&["classification:regulated"]),
+                saved_source(&["role:owner"]),
+            ];
+            let derived = compile_saved_source_recording_policy(&input, &sources).unwrap();
+            assert_eq!(
+                derived.resources["memory:/action/resolutions"],
+                authored.resources["memory:/action/resolutions"]
+            );
+            for address in ["memory:/action/corrections", "result", "error"] {
+                let resource = &derived.resources[address];
+                for source in &sources {
+                    assert!(source.reader.is_subset(&resource.reader));
+                }
+                assert!(authored.resources[address]
+                    .reader
+                    .is_subset(&resource.reader));
+                assert!(resource.writer.is_empty());
+            }
+            let envelope = verified(&derived);
+            assert!(envelope
+                .check_resource_flow("admitted_corrections", "admitted_resolutions")
+                .is_err());
+            for terminal in ["result", "error"] {
+                envelope
+                    .check_resource_flow("admitted_corrections", terminal)
+                    .unwrap();
+            }
+            assert!(validate_resolution_recording_flows(&envelope).is_err());
+        }
+    }
+
+    #[test]
+    fn derived_corrections_preserve_unendorsed_integrity_for_equivalent_actors() {
+        for actor in ["human:alice", "agent:editor"] {
+            let input = input(actor);
+            let source = saved_source(&["classification:regulated"]);
+            let derived = compile_saved_source_recording_policy(&input, &[source]).unwrap();
+            let envelope = verified(&derived);
+            for terminal in ["admitted_resolutions", "result", "error"] {
+                envelope
+                    .check_resource_flow("admitted_corrections", terminal)
+                    .unwrap();
+            }
+            let recording =
+                whipplescript_kernel::resolution_recording::ResolutionRecordingAction::compile()
+                    .unwrap();
+            assert!(ifc::check_with_envelope(recording.action().program(), &envelope).is_empty());
+            validate_resolution_recording_flows(&envelope).unwrap();
+            let mut endorsed = derived;
+            endorsed.resources.get_mut("result").unwrap().writer =
+                BTreeSet::from([crate::policy_compiler::authority_role(actor)]);
+            assert!(verified(&endorsed)
+                .check_resource_flow("admitted_corrections", "result")
+                .is_err());
+            assert!(validate_resolution_recording_flows(&verified(&endorsed)).is_err());
+        }
+    }
+
+    #[test]
+    fn derived_correction_policy_requires_sources_and_current_clearance() {
+        for actor in ["human:alice", "agent:editor"] {
+            let input = input(actor);
+            assert!(compile_saved_source_recording_policy(&input, &[]).is_err());
+            for reason in ["clearance", "principal", "internal", "endorsement"] {
+                let mut source = saved_source(&["classification:regulated"]);
+                match reason {
+                    "clearance" => {
+                        source.reader.insert("residency:unadmitted".into());
+                    }
+                    "principal" => source.principal = true,
+                    "internal" => source.internal = true,
+                    "endorsement" => {
+                        source
+                            .writer
+                            .insert(crate::policy_compiler::authority_role(actor));
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    compile_saved_source_recording_policy(&input, &[source]).is_err(),
                     "{actor}/{reason}"
                 );
             }
