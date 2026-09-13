@@ -1,6 +1,25 @@
 import { describe, expect, it, vi } from "vitest";
 import type { WorkbenchTransport } from "./control-plane-workbench";
-import { observeNativeFileActor, observeNativeFileRequest, parseNativeFileRequestIdentity, prepareNativeFileSaveRequest, readNativeFileSavedContent, submitNativeFileSave } from "./native-file-actions";
+import { observeNativeFileActor, observeNativeFileRequest, parseNativeFileRequestIdentity, prepareNativeFileSaveRequest, readNativeFileContent, readNativeFileSavedContent, submitNativeFileSave } from "./native-file-actions";
+
+it("reads a recorded native version without inventing Saved or accepting another reader", async () => {
+    const result = { home: "home", chat: "chat / one", path: "note & one.txt", cut: "captured-head",
+        content: "recorded bytes", content_hash: "hash", observer: "alice", restrictions: { reader: ["regulated"] } };
+    const json = vi.fn().mockResolvedValue(result);
+    const read = () => readNativeFileContent({ base: "", json }, "home", "alice", result.chat, result.path);
+    expect(await read()).toEqual(result);
+    expect(json.mock.calls[0]).toEqual(["GET", "/chats/chat%20%2F%20one/file-actions/content?expected_actor=alice&path=note+%26+one.txt"]);
+    for (const changed of [{ home: "other" }, { chat: "other" }, { path: "other" }, { observer: "bob" },
+        { cut: "" }, { content_hash: null }, { restrictions: null }, { content: null }]) {
+        json.mockResolvedValue({ ...result, ...changed });
+        await expect(read()).rejects.toThrow("unavailable");
+    }
+    json.mockResolvedValue({ ...result, content: null, content_hash: null, restrictions: null });
+    expect((await read()).content).toBeNull();
+    json.mockRejectedValue(new Error("retained content erased"));
+    await expect(read()).rejects.toThrow("erased");
+    expect(json.mock.calls.every(([method, path]) => method === "GET" && path.includes("/file-actions/content?"))).toBe(true);
+});
 
 it("reads verified actor metadata from the exact Home without accepting credentials or a substituted Home", async () => {
     const json = vi.fn().mockResolvedValue({ home: "home-one", actor: "alice" });

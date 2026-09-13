@@ -73,6 +73,12 @@ function setup(splitHomes = true) {
             ? new Response(null, { status: 204 })
             : Response.json({ home: hooks.wrongHome ? "home:wrong" : home, admission: `admission-${home}` });
         if (url.pathname === "/file-actions/actor") return Response.json({ home, actor: hooks.actor });
+        if (url.pathname.endsWith("/file-actions/content")) {
+            const actor = hooks.actor;
+            await hooks.beforeContent();
+            return Response.json({ home, chat: "chat", path: url.searchParams.get("path"), cut: "retained-head",
+                content: "retained bytes", content_hash: "hash", observer: actor, restrictions: { reader: ["private"] } });
+        }
         if (url.pathname.endsWith("/file-actions/request")) {
             await hooks.beforePreflight();
             return Response.json({ home, issuer: "home-authority", scope: "chat-scope", request_id: url.searchParams.get("request_id") });
@@ -110,6 +116,20 @@ function setup(splitHomes = true) {
 }
 
 describe("app-owned native file save sessions", () => {
+    it("binds initial reads to the actual actor and rejects a cookie switch during the response", async () => {
+        const { api, journal, hooks, calls } = setup(false);
+        const session = await api.openNativeFileSaveSession("home:a", journal);
+        const read = await session.readContent("chat", "note.txt");
+        expect(read.content).toBe("retained bytes");
+        expect(read.cut).toBe("retained-head");
+        expect(read).not.toHaveProperty("saved");
+        expect(journal.reserve).not.toHaveBeenCalled();
+        expect(calls.find(({ url }) => url.pathname.endsWith("/file-actions/content"))?.url.searchParams.get("expected_actor")).toBe("verified-alice");
+        hooks.beforeContent = async () => { hooks.actor = "bob"; };
+        await expect(session.readContent("chat", "note.txt")).rejects.toThrow("another actor");
+        expect(session.current()).toBe(false);
+        expect(journal.reserve).not.toHaveBeenCalled();
+    });
     it("submits through the bound Home and recovers its original request after the project moves", async () => {
         const { api, journal, rows, calls } = setup();
         const session = await api.openNativeFileSaveSession("home:a", journal);
@@ -243,6 +263,37 @@ describe("app-owned native file save sessions", () => {
         expect(rows.size).toBe(1);
         expect(journal.forgetSaved).not.toHaveBeenCalled();
         expect(journal.discardPrepared).not.toHaveBeenCalled();
+    });
+
+    it("refuses cookie-only actor changes before transmitting a draft", async () => {
+        const { api, journal, hooks, calls } = setup(false);
+        const session = await api.openNativeFileSaveSession("home:a", journal);
+        hooks.actor = "verified-bob"; // No setBearer call or local generation change.
+        await expect(session.begin("chat", "note.txt", "base-cut", "alice draft"))
+            .rejects.toThrow("another actor");
+        expect(session.current()).toBe(false);
+        expect(journal.reserve).not.toHaveBeenCalled();
+        expect(calls.some(({ url }) => url.pathname.endsWith("/file-actions/save"))).toBe(false);
+    });
+
+    it("fences a cookie-only actor change during preflight before draft transmission", async () => {
+        const { api, journal, hooks, calls } = setup(false);
+        const session = await api.openNativeFileSaveSession("home:a", journal);
+        hooks.beforePreflight = async () => { hooks.actor = "verified-bob"; };
+        await expect(session.begin("chat", "note.txt", "base-cut", "alice draft"))
+            .rejects.toThrow("another actor");
+        expect(journal.reserve).not.toHaveBeenCalled();
+        expect(calls.some(({ url }) => url.pathname.endsWith("/file-actions/save"))).toBe(false);
+    });
+
+    it("preserves a submitted hint when cookies change during its response", async () => {
+        const { api, journal, hooks, rows } = setup(false);
+        const session = await api.openNativeFileSaveSession("home:a", journal);
+        hooks.beforePostReply = async () => { hooks.actor = "verified-bob"; };
+        await expect(session.begin("chat", "note.txt", "base-cut", "alice draft"))
+            .rejects.toThrow(/another actor|session changed/);
+        expect([...rows.values()][0]?.phase).toBe("submitted");
+        expect(journal.forgetSaved).not.toHaveBeenCalled();
     });
 
     it("uses an exact registered original Home when no project route exists, never the selected Home", async () => {

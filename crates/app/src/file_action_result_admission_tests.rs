@@ -526,12 +526,22 @@ fn native_saved_result_admission_records_the_merged_body_instead_of_the_original
         .unwrap()
         .remove(0);
     let (.., chat): (String, String, String) = serde_json::from_str(&command.scope).unwrap();
+    let ActionBasis::Version { version_ref: base } = &command.resources["target"].basis else {
+        panic!("exact fixture base");
+    };
+    crate::file_action_factory::tests::governed_fixture_write(
+        &mut wb,
+        &context,
+        &chat,
+        base,
+        "alpha base\nbravo base\ncharlie changed\n",
+        "competing",
+    );
     let path = wb.engagement_workspace_path(&chat, "note.txt");
+    // Materialize the independently recorded competing fixture. Result
+    // admission below must leave this physical view unchanged.
     wb.engagements[&chat]
         .write_file(&path, "alpha base\nbravo base\ncharlie changed\n")
-        .unwrap();
-    wb.engagements[&chat]
-        .commit_turn("concurrent fixture edit")
         .unwrap();
     wb.execute_editor_file_save_effect(
         &context,

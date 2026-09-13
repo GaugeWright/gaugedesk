@@ -38,6 +38,40 @@ pub fn compile_file_save_policy(
     Ok(policy)
 }
 
+/// Preserve the original restrictions of a verified retained file version.
+/// Resolving and authenticating that version belongs to the admission boundary;
+/// this compiler cannot turn a storage write reference into authority.
+pub(crate) fn compile_retained_file_save_policy(
+    input: &FileSavePolicyInput,
+    source: &ResourcePolicy,
+) -> Result<HostGovernancePolicy, String> {
+    let mut policy = compile_file_save_policy(input)?;
+    if source.principal || source.internal || !source.writer.is_empty() {
+        return Err("retained file requires unendorsed data restrictions".into());
+    }
+    let clearances = actor_clearances(
+        &input.actor_attributes,
+        input.purpose.as_deref(),
+        &[input.input.clone(), input.target.clone()],
+        std::iter::empty(),
+    );
+    if !source.reader.is_subset(&clearances) {
+        return Err("file actor does not clear retained version restrictions".into());
+    }
+    for address in ["file:/action/input", "result", "error"] {
+        let resource = policy
+            .resources
+            .get_mut(address)
+            .ok_or("file policy is missing a required resource")?;
+        resource.reader.extend(source.reader.iter().cloned());
+        resource.writer.clear();
+    }
+    // Destination and resolution-memory authority remain independently granted.
+    // The admission boundary checks the owner's IFC before signing a command.
+    policy.validate()?;
+    Ok(policy)
+}
+
 /// Shared resource labels and clearance validation. No execution capability
 /// is present until the owning operation adds it; inspection uses Access.
 pub(crate) fn compile_file_resource_policy(
@@ -248,6 +282,54 @@ rule save
             epoch: attestation.epoch.unwrap(),
         };
         ifc::Composition::compose(vec![verified], vec![record]).unwrap()
+    }
+
+    #[test]
+    fn retained_file_restrictions_survive_a_relaxed_target_for_equivalent_callers() {
+        for actor in ["human:alice", "agent:editor"] {
+            let mut current = input(actor);
+            let original = compile_file_save_policy(&current).unwrap().resources
+                ["file:/action/output"]
+                .clone();
+            let unchanged = compile_retained_file_save_policy(&current, &original).unwrap();
+            assert!(flow_diagnostics(&unchanged).is_empty());
+            current.input.attributes.classification = Classification::Public;
+            current.target.attributes.classification = Classification::Public;
+            let policy = compile_retained_file_save_policy(&current, &original).unwrap();
+            for address in ["file:/action/input", "result", "error"] {
+                assert!(original.reader.is_subset(&policy.resources[address].reader));
+                assert!(policy.resources[address].writer.is_empty());
+            }
+            assert!(!policy.resources["file:/action/output"]
+                .reader
+                .contains("classification:regulated"));
+            let envelope = verified_policy(&policy);
+            assert!(envelope
+                .check_resource_flow("admitted_input", "admitted_target")
+                .is_err());
+            assert!(!flow_diagnostics(&policy).is_empty());
+            for terminal in ["result", "error"] {
+                envelope
+                    .check_resource_flow("admitted_input", terminal)
+                    .unwrap();
+            }
+            let mut uncleared = original.clone();
+            uncleared
+                .reader
+                .insert("authority:ungranted-original-owner".into());
+            assert!(compile_retained_file_save_policy(&current, &uncleared).is_err());
+            for kind in ["principal", "internal", "endorsed"] {
+                let mut invalid = original.clone();
+                match kind {
+                    "principal" => invalid.principal = true,
+                    "internal" => invalid.internal = true,
+                    _ => {
+                        invalid.writer.insert("authority:endorser".into());
+                    }
+                }
+                assert!(compile_retained_file_save_policy(&current, &invalid).is_err());
+            }
+        }
     }
 
     #[test]

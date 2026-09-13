@@ -13,6 +13,38 @@ export type NativeFileActionView = "command" | "execution" | "saved";
 
 export interface NativeFileActor { readonly home: string; readonly actor: string }
 
+/** A recorded version observed now, without a claim of product Saved admission. */
+export interface NativeFileContent {
+    readonly home: string;
+    readonly chat: string;
+    readonly path: string;
+    readonly cut: string;
+    readonly content: string | null;
+    readonly content_hash: string | null;
+    readonly observer: string;
+    readonly restrictions: Readonly<Record<string, unknown>> | null;
+}
+
+export async function readNativeFileContent(transport: WorkbenchTransport,
+    home: string, actor: string, chat: string, path: string): Promise<NativeFileContent> {
+    if ([home, actor, chat, path].some((part) => typeof part !== "string" || !part.trim())) {
+        throw new Error("An exact Home, reader and file selection are required");
+    }
+    const query = new URLSearchParams({ expected_actor: actor, path });
+    const value = await transport.json("GET", `/chats/${encodeURIComponent(chat)}/file-actions/content?${query}`);
+    if (!object(value) || value.home !== home || value.chat !== chat || value.path !== path
+        || value.observer !== actor || typeof value.cut !== "string" || !value.cut.trim()
+        || (value.content === null
+            ? value.content_hash !== null || value.restrictions !== null
+            : typeof value.content !== "string" || typeof value.content_hash !== "string"
+                || !value.content_hash.trim() || !object(value.restrictions))) {
+        throw new Error("Retained native file content is unavailable or belongs to another selection");
+    }
+    return Object.freeze({ home, chat, path, cut: value.cut, observer: actor,
+        content: value.content as string | null, content_hash: value.content_hash as string | null,
+        restrictions: value.restrictions as Readonly<Record<string, unknown>> | null });
+}
+
 export interface NativeFileSavedContent {
     readonly identity: NativeFileRequestIdentity;
     readonly cut: string;

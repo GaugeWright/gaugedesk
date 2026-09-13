@@ -756,7 +756,16 @@ pub(super) mod tests {
                 panic!("exact fixture base");
             };
             assert_eq!(erase_fixture_base(dir.path(), base, &path), 1);
-            assert!(wb.bind_native_editor_target(&chat, &command).is_err());
+            assert!(
+                wb.bind_native_editor_target(&chat, &command).is_ok(),
+                "authorization coordinates do not load erased base bytes"
+            );
+            assert!(
+                wb.engagements[&chat]
+                    .native_file_action_target(&path, base)
+                    .is_err(),
+                "the erased base must still refuse a body preflight"
+            );
             let recovered = wb
                 .inspect_editor_file_save_attempt(
                     &context,

@@ -434,6 +434,21 @@ impl Store {
         })
     }
 
+    /// Observe existing committed records with the same codec and scratch
+    /// lifetime. Opening this connection neither creates nor migrates storage;
+    /// SQLite refuses mutation through it. This supplies no authority fence.
+    pub fn read_only_sibling(&self) -> Result<Self, rusqlite::Error> {
+        let conn =
+            Connection::open_with_flags(&self.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        Ok(Self {
+            conn,
+            codec: self.codec.clone(),
+            path: self.path.clone(),
+            scratch: self.scratch.clone(),
+        })
+    }
+
     /// The database this store is connected to.
     pub fn path(&self) -> &str {
         &self.path
@@ -2006,6 +2021,57 @@ mod tests {
             vec!["one".to_string(), "two".to_string()],
             "the original connection sees the sibling's committed write"
         );
+    }
+
+    #[test]
+    fn read_only_sibling_preserves_codec_live_commits_and_scratch_lifetime() {
+        let mut store = Store::open_in_memory().unwrap();
+        let codec = Arc::new(RevCodec {
+            erased: Default::default(),
+        });
+        store.codec = Some(codec.clone());
+        store.append_record("s", "secret", "original").unwrap();
+        let mut observer = store.read_only_sibling().unwrap();
+        assert_eq!(observer.records("s", "secret").unwrap(), ["original"]);
+        store.append_record("s", "secret", "later").unwrap();
+        assert_eq!(
+            observer.records("s", "secret").unwrap(),
+            ["original", "later"]
+        );
+        assert!(observer.append_record("s", "secret", "forbidden").is_err());
+        assert!(observer
+            .conn
+            .execute_batch("CREATE TABLE forbidden (id INTEGER)")
+            .is_err());
+        let path = std::path::PathBuf::from(store.path());
+        drop(store);
+        assert!(path.exists());
+        assert_eq!(
+            observer.records("s", "secret").unwrap(),
+            ["original", "later"]
+        );
+        codec.erased.lock().unwrap().insert("s".into());
+        assert!(observer.records("s", "secret").unwrap().is_empty());
+        drop(observer);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn read_only_sibling_never_recreates_missing_storage_or_initializes_empty_schema() {
+        let store = Store::open_in_memory().unwrap();
+        let path = std::path::PathBuf::from(store.path());
+        std::fs::remove_file(&path).unwrap();
+        assert!(store.read_only_sibling().is_err());
+        assert!(!path.exists());
+        let empty = Connection::open(&path).unwrap();
+        drop(empty);
+        let observer = store.read_only_sibling().unwrap();
+        assert!(observer.records("s", "evt").is_err());
+        let tables: i64 = observer
+            .conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tables, 0);
     }
 
     /// Two in-memory stores are still independent: naming the database must not

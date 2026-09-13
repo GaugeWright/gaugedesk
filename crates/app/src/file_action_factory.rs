@@ -26,6 +26,7 @@ use gaugedesk_whip_runtime::{
     ifc, GovernanceRootVerifier, HostGovernancePolicy, ResourceRef,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use whipplescript_store::vcs::SaveVersionReadAuthority;
 
 const SOURCE: &str = r#"use std.files
 workflow GaugeDeskEditorFileSave
@@ -352,6 +353,8 @@ fn current_target_authority_with_source(
             &policy_input,
             gaugedesk_core::abac::Action::Access,
         )
+    } else if let (NativeActionKind::FileSave, Some(source)) = (kind, source) {
+        crate::file_action_policy::compile_retained_file_save_policy(&policy_input, source)
     } else {
         compile_file_save_policy(&policy_input)
     }
@@ -420,7 +423,7 @@ impl Workbench {
         }
         let home = self.home_id().clone();
         let read = |store: &Store| current_authority(store, &home, context, request);
-        let (authority, _) = self
+        let (authority, preparation_basis) = self
             .store_ref()
             .read_for_dispatch(
                 &[
@@ -446,7 +449,7 @@ impl Workbench {
             .engagements
             .get(request.chat_id)
             .ok_or("chat workspace is unavailable")?
-            .native_file_action_target(&authority.workspace_path, request.base_cut)
+            .native_file_action_authorization_target(&authority.workspace_path, request.base_cut)
             .map_err(|error| format!("{error:?}"))?;
         let action = editor_file_save_workflow()?;
         let identity = ActionPolicyIdentity {
@@ -457,6 +460,30 @@ impl Workbench {
         let signing_key =
             SigningKey::from_seed(&self.governance_seed()).map_err(|error| error.reason)?;
         let root = GovernanceRootVerifier::new(self.authority().clone(), signing_key.public_key());
+        // Refuse an incompatible original source before retaining the draft
+        // under this policy. The final publication fence repeats authorization;
+        // this check cannot become a grant that survives preparation.
+        let preparation_basis = authority
+            .bind_deadline(preparation_basis)
+            .map_err(|error| format!("file preparation deadline refused: {error:?}"))?;
+        let observer = self
+            .store_ref()
+            .read_only_sibling()
+            .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
+        let issuer = self.authority().clone();
+        self.store_mut()
+            .with_dispatch_basis(&preparation_basis, || {
+                let guard = version_authority::NativeSaveVersionAuthority::new(
+                    target.clone(),
+                    observer,
+                    authority.clone(),
+                    issuer,
+                    signing_key.clone(),
+                );
+                guard.authorize_read(target.branch(), target.path(), target.base())
+            })
+            .map_err(|error| format!("file preparation authority refused: {error:?}"))?
+            .map_err(|error| format!("{error:?}"))?;
         let policy =
             prepare_action_policy(self.store_mut(), &identity, &authority.policy, &signing_key)?;
         let envelope =
@@ -547,24 +574,41 @@ impl Workbench {
         let basis = current
             .bind_deadline(basis)
             .map_err(|error| format!("file authority deadline refused: {error:?}"))?;
-        let admitted = inputs
-            .publish(std::slice::from_ref(&input), || {
-                target.publish_base(|| {
-                    self.store_mut()
-                        .admit_with_dispatch_against::<ProductActionAdmission>(
-                            &scope,
-                            &command.request_id,
-                            command.clone(),
-                            &dispatch,
-                            &basis,
-                        )
-                        .map_err(|error| {
-                            whipplescript_store::StoreError::Conflict(format!(
-                                "file admission refused: {error:?}"
-                            ))
-                        })
+        let observer = self
+            .store_ref()
+            .read_only_sibling()
+            .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
+        let issuer = self.authority().clone();
+        let admitted = self
+            .store_mut()
+            .with_dispatch_record_admission(&basis, |writer| {
+                let guard = version_authority::NativeSaveVersionAuthority::new(
+                    target.clone(),
+                    observer,
+                    current,
+                    issuer,
+                    signing_key,
+                );
+                guard.authorize_read(target.branch(), target.path(), target.base())?;
+                inputs.publish(std::slice::from_ref(&input), || {
+                    target.publish_base(|| {
+                        writer
+                            .admit_with_dispatch_against::<ProductActionAdmission>(
+                                &scope,
+                                &command.request_id,
+                                command.clone(),
+                                &dispatch,
+                                &basis,
+                            )
+                            .map_err(|error| {
+                                whipplescript_store::StoreError::Conflict(format!(
+                                    "file admission refused: {error:?}"
+                                ))
+                            })
+                    })
                 })
             })
+            .map_err(|error| format!("file action authorization refused: {error:?}"))?
             .map_err(|error| format!("{error:?}"))?;
         Ok(AdmittedEditorFileSave {
             command,
@@ -586,6 +630,13 @@ pub use request_preparation::EditorFileSaveRequestIdentity;
 
 #[path = "file_action_execution.rs"]
 mod execution;
+
+#[path = "file_action_version_authority.rs"]
+mod version_authority;
+
+#[path = "file_action_content.rs"]
+mod content;
+pub use content::NativeFileContentObservation;
 
 #[path = "file_action_recovery.rs"]
 mod recovery;

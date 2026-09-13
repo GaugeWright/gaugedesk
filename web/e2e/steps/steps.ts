@@ -119,9 +119,9 @@ async function placeArchetypeOnFreshProject(page: Page): Promise<string> {
     await page.locator(".inline-edit").press("Enter");
     const group = page.locator(`.tree-group[data-project]`, { hasText: name });
     await expect(group.locator(".tree-node.project")).toBeVisible();
-    // "add a method" opens the picker (#1); choose the first available method.
+    // The product's Agent action opens the placement picker.
     await group.locator(".tree-node.project").click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "add an archetype" }).click();
+    await page.getByRole("button", { name: "add an agent", exact: true }).click();
     await pickFirstMethod(page);
     await ensureArchetypeLens(page, name);
     await expect(group.locator(".tree-subgroup[data-placement]").first()).toBeVisible();

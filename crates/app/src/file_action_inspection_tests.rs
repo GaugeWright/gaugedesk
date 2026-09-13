@@ -416,3 +416,108 @@ fn saved_input_observation_keeps_interrupted_outcome_unknown_and_cannot_restore_
 
 #[path = "file_action_product_result_inspection_tests.rs"]
 mod product_result_tests;
+
+#[test]
+fn subsequent_save_preserves_the_retained_base_reader_floor() {
+    use crate::file_action_factory::EditorFileSave;
+    use whipplescript_store::vcs_file_save::SaveResult;
+    for relax_target in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = saved(dir.path());
+        let mut wb = fixture.shared.lock_unpoisoned();
+        let context = wb.authenticate_action_context(&fixture.token).unwrap();
+        let original = wb
+            .observe_editor_file_save(
+                &context,
+                &fixture.command,
+                &fixture.admission,
+                fixture.attempt(),
+            )
+            .unwrap();
+        let saved = original.saved().unwrap();
+        let base = match &saved.receipt.result {
+            SaveResult::Written { cut_id, .. } | SaveResult::Merged { cut_id, .. } => {
+                cut_id.clone()
+            }
+            SaveResult::Conflicted { .. } => panic!("fixture did not save"),
+        };
+        let content = format!("{}\nnext edit", saved.accepted_content);
+        let (_, _, chat): (String, String, String) =
+            serde_json::from_str(&fixture.command.scope).unwrap();
+        let (target_id, _, path): (String, String, String) = serde_json::from_str(
+            fixture.command.resources["target"]
+                .resource
+                .selector
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        if relax_target {
+            let mut target = wb.library.work_targets[&target_id].clone();
+            target.attributes.classification = gaugedesk_core::abac::Classification::Public;
+            wb.store_mut()
+                .append_record(
+                    LIBRARY_SCOPE,
+                    "work_target",
+                    &serde_json::to_string(&target).unwrap(),
+                )
+                .unwrap();
+        }
+        let identity = wb
+            .prepare_editor_file_save_request(&context, &chat, &path, "next-save")
+            .unwrap();
+        let storage = wb
+            .open_native_action_storage(NativeActionStorageConfig {
+                input_byte_limit: 4096,
+                file_lease: FileLeasePolicy::new(17).unwrap(),
+            })
+            .unwrap();
+        let admitted = wb.admit_editor_file_save(
+            &context,
+            storage.inputs(),
+            &identity,
+            &EditorFileSave {
+                chat_id: &chat,
+                request_id: "next-save",
+                path: &path,
+                base_cut: &base,
+                content: &content,
+            },
+        );
+        // Refusal is safe; a successful new admission must retain the inherited
+        // reader floor, even though current target policy became less restrictive.
+        if !relax_target {
+            assert!(
+                admitted.is_ok(),
+                "unchanged-policy save must remain admissible"
+            );
+        }
+        if let Ok(admitted) = admitted {
+            let command = admitted.command;
+            let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+            let root = GovernanceRootVerifier::new(wb.authority().clone(), key.public_key());
+            let retained = load_action_policy(
+                wb.store_ref(),
+                &ActionPolicyIdentity {
+                    issuer: command.issuer.clone(),
+                    scope: command.scope.clone(),
+                    request_id: command.request_id.clone(),
+                },
+                &command.policy,
+                &root,
+            )
+            .unwrap();
+            let policy: HostGovernancePolicy =
+                serde_json::from_str(retained.signed_envelope()).unwrap();
+            assert!(
+                original
+                    .restrictions()
+                    .reader
+                    .is_subset(&policy.resources["file:/action/output"].reader),
+                "new save discarded its retained base reader floor: original={:?}, output={:?}",
+                original.restrictions().reader,
+                policy.resources["file:/action/output"].reader
+            );
+        }
+    }
+}

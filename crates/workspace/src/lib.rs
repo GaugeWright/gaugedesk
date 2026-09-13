@@ -2712,6 +2712,23 @@ pub trait ChatWorkspace: Send {
             "this workspace has no native file-action evidence boundary",
         ))
     }
+    /// Locate exact native coordinates without reading the base body. The
+    /// caller still needs original-version authorization before content access.
+    fn native_file_action_authorization_target(
+        &self,
+        _path: &str,
+        _base: &str,
+    ) -> Result<NativeFileActionTarget> {
+        Err(WorkspaceError::msg(
+            "this workspace has no native file-version authorization boundary",
+        ))
+    }
+    /// Capture a recorded native head without importing or disclosing content.
+    fn native_file_read_target(&self, _path: &str) -> Result<NativeFileActionTarget> {
+        Err(WorkspaceError::msg(
+            "this workspace has no native retained-file read boundary",
+        ))
+    }
     /// Resolve an exact base without importing external edits. Unsupported
     /// adapters refuse; they may not manufacture authoritative native history.
     fn native_file_action_target(
@@ -3008,6 +3025,16 @@ impl ChatWorkspace for Engagement {
     }
     fn native_file_action_target(&self, path: &str, base: &str) -> Result<NativeFileActionTarget> {
         Engagement::native_file_action_target(self, path, base)
+    }
+    fn native_file_read_target(&self, path: &str) -> Result<NativeFileActionTarget> {
+        Engagement::native_file_read_target(self, path)
+    }
+    fn native_file_action_authorization_target(
+        &self,
+        path: &str,
+        base: &str,
+    ) -> Result<NativeFileActionTarget> {
+        Engagement::native_file_action_authorization_target(self, path, base)
     }
     fn boxed_clone(&self) -> Box<dyn ChatWorkspace> {
         Box::new(self.clone())

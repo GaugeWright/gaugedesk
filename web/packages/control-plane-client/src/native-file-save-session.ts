@@ -1,4 +1,4 @@
-import { observeNativeFileActor } from "./native-file-actions";
+import { observeNativeFileActor, readNativeFileContent } from "./native-file-actions";
 import { nativeSaveRequests, type NativeSaveHome, type NativeSaveJournal,
     type NativeSaveSlot, type RetainedNativeSave } from "./native-file-save-journal";
 
@@ -20,14 +20,34 @@ export async function openNativeFileSaveSession(home: string, journal: NativeSav
         assertCurrent();
         return value;
     };
-    const bound = async (originalHome: string): Promise<NativeSaveHome> => {
+    const connectionFor = async (originalHome: string): Promise<NativeSaveHome> => {
         const connection = await guard(() => connect(originalHome));
         if (connection.home !== originalHome) throw new Error("Native save transport belongs to another Home");
-        return { home: originalHome, transport: { base: connection.transport.base,
-            json: (...args) => guard(() => connection.transport.json(...args)) } };
+        return connection;
     };
-    const initial = await bound(home);
+    const initial = await connectionFor(home);
     const identity = await guard(() => observeNativeFileActor(initial.transport, home));
+    const verifyActor = async (connection: NativeSaveHome) => {
+        const observed = await guard(() => observeNativeFileActor(connection.transport, connection.home));
+        if (observed.actor !== identity.actor) {
+            closed = true;
+            throw new Error("Native file save session belongs to another actor; reopen it under the current account");
+        }
+    };
+    // Cookies can change without a bearer update. Revalidate the actual Home
+    // actor before transmitting and before accepting an asynchronous response.
+    // The server's expected_actor check remains the authoritative effect fence.
+    const withActor = async <T>(action: () => Promise<T>, connection = initial): Promise<T> => {
+        await verifyActor(connection);
+        const result = await guard(action);
+        await verifyActor(connection);
+        return result;
+    };
+    const bound = async (originalHome: string): Promise<NativeSaveHome> => {
+        const connection = await connectionFor(originalHome);
+        return { home: originalHome, transport: { base: connection.transport.base,
+            json: (...args) => withActor(() => connection.transport.json(...args), connection) } };
+    };
     const owned = (row: RetainedNativeSave) => {
         if (row.slot.owner !== identity.actor) throw new Error("Retained save belongs to another actor");
         return row;
@@ -48,14 +68,16 @@ export async function openNativeFileSaveSession(home: string, journal: NativeSav
         home: identity.home,
         actor: identity.actor,
         current,
+        readContent: (chat: string, path: string) =>
+            withActor(() => readNativeFileContent(initial.transport, home, identity.actor, chat, path)),
         begin: (chat: string, path: string, baseCut: string, content: string) =>
-            guard(() => requests.begin(slot(chat, path), home, baseCut, content)),
-        recover: (chat: string, path: string) => guard(() => requests.recover(slot(chat, path))),
+            withActor(() => requests.begin(slot(chat, path), home, baseCut, content)),
+        recover: (chat: string, path: string) => withActor(() => requests.recover(slot(chat, path))),
         savedContent: (row: RetainedNativeSave, cut: string) =>
-            guard(() => requests.savedContent(owned(row), cut)),
+            withActor(() => requests.savedContent(owned(row), cut)),
         acknowledgeSaved: (row: RetainedNativeSave, cut: string) =>
-            guard(() => requests.acknowledgeSaved(owned(row), cut)),
-        discardPrepared: (row: RetainedNativeSave) => guard(() => guardedJournal.discardPrepared(owned(row))),
+            withActor(() => requests.acknowledgeSaved(owned(row), cut)),
+        discardPrepared: (row: RetainedNativeSave) => withActor(() => guardedJournal.discardPrepared(owned(row))),
         close: () => { closed = true; },
     });
 }

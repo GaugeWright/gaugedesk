@@ -16,6 +16,12 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
     let routes = Router::new()
         .route("/health", get(net_http::health))
         .route(
+            "/chats/{id}/file-actions/content",
+            get(crate::file_action_routes::inspect_native_content).layer(
+                axum::middleware::map_response(crate::file_action_routes::no_store),
+            ),
+        )
+        .route(
             "/file-actions/saved-content",
             get(crate::file_action_routes::inspect_saved_content).layer(
                 axum::middleware::map_response(crate::file_action_routes::no_store),

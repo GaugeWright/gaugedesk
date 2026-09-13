@@ -50,6 +50,7 @@ pub(super) struct NativeEditorPreparation {
     pub(super) delivery: CommittedDispatch<HostActionCommand>,
     pub(super) grant_cause: Option<ActionCause>,
     pub(super) resolution_scope: whipplescript_store::vcs::resolution_scope::ResolutionMemoryScope,
+    pub(super) authority: FileAuthority,
 }
 
 pub(super) fn registered_editor_workflow(
@@ -218,6 +219,7 @@ impl Workbench {
             delivery,
             grant_cause,
             resolution_scope,
+            authority,
         })
     }
 
@@ -245,7 +247,7 @@ impl Workbench {
             .engagements
             .get(chat_id)
             .ok_or("editor workspace is unavailable")?
-            .native_file_action_target(&path, base)
+            .native_file_action_authorization_target(&path, base)
             .map_err(|error| format!("editor base refused: {error:?}"))?;
         if target.branch() != branch || target.path() != path || target.base() != base {
             return Err("editor target differs from its actual native binding".into());
@@ -271,6 +273,7 @@ impl Workbench {
             key,
             basis,
             delivery,
+            authority,
             ..
         } = self.prepare_native_editor_action(context, inputs, command, runtime.policy_ref())?;
         let action = registered_editor_workflow(command)?;
@@ -278,35 +281,40 @@ impl Workbench {
         let input = &command.inputs["content"];
         let refused = || "native editor delivery binding is invalid".to_owned();
         let bytes = command.signing_bytes().map_err(|_| refused())?;
-        let receipt = inputs
-            .publish(std::slice::from_ref(input), || {
-                target.publish_base(|| {
-                    self.store_mut()
-                        .with_dispatch_basis(&basis, || {
-                            let verifier = NativeAdmissionVerifier {
-                                command,
-                                key: key.public_key(),
-                            };
-                            let proof = key.sign(&bytes);
-                            runtime.admit_action(
-                                command.clone(),
-                                &action,
-                                &verifier,
-                                proof.as_bytes(),
-                            )
-                        })
-                        .map_err(|error| {
-                            whipplescript_store::StoreError::Conflict(format!(
-                                "editor delivery authorization changed: {error:?}"
-                            ))
-                        })?
-                        .map_err(|error| {
-                            whipplescript_store::StoreError::Conflict(format!(
-                                "runtime editor admission refused: {error:?}"
-                            ))
-                        })
+        let observer = self
+            .store_ref()
+            .read_only_sibling()
+            .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
+        let issuer = self.authority().clone();
+        let receipt = self
+            .store_mut()
+            .with_dispatch_basis(&basis, || {
+                let guard = version_authority::NativeSaveVersionAuthority::new(
+                    target.clone(),
+                    observer,
+                    authority,
+                    issuer,
+                    key.clone(),
+                );
+                guard.authorize_read(target.branch(), target.path(), target.base())?;
+                inputs.publish(std::slice::from_ref(input), || {
+                    target.publish_base(|| {
+                        let verifier = NativeAdmissionVerifier {
+                            command,
+                            key: key.public_key(),
+                        };
+                        let proof = key.sign(&bytes);
+                        runtime
+                            .admit_action(command.clone(), &action, &verifier, proof.as_bytes())
+                            .map_err(|error| {
+                                whipplescript_store::StoreError::Conflict(format!(
+                                    "runtime editor admission refused: {error:?}"
+                                ))
+                            })
+                    })
                 })
             })
+            .map_err(|error| format!("editor delivery authorization changed: {error:?}"))?
             .map_err(|error| format!("{error:?}"))?;
         record_runtime_acknowledgment(self.store_mut(), &scope, delivery, receipt)
             .map_err(|error| format!("editor runtime acknowledgment refused: {error:?}"))

@@ -5540,6 +5540,42 @@
       }
     },
     {
+      "id": "home.file-action.content.read",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/chats/:id/file-actions/content",
+      "producer": "gaugedesk-app native and hosted Home compositions",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-idp-and-home-admission-or-machine-controller-session",
+      "scope": "current-home-chat-selected-path-captured-cut-original-restrictions-current-reader",
+      "capability": "read-exact-retained-native-file",
+      "requestSchema": "rust:gaugedesk-app/file_action_routes/ReadNativeContent",
+      "responseSchema": "ts:@gaugewright/control-plane-client/NativeFileContent",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/file_action_content_tests.rs#retained_file_content_http_binds_actor_home_and_selected_path"
+        ],
+        "authority": [
+          "crates/app/src/file_action_content_tests.rs#retained_file_read_keeps_original_restrictions_after_target_relaxation"
+        ],
+        "journey": [
+          "crates/app/src/file_action_content_tests.rs#retained_file_content_http_binds_actor_home_and_selected_path"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/file_action_content_tests.rs#retained_file_read_uses_recorded_bytes_without_importing_or_admitting_saved"
+        ]
+      }
+    },
+    {
       "id": "home.file-action.saved-content.read",
       "jurisdiction": "private-home",
       "transport": "http-json",

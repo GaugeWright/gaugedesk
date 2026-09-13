@@ -11,6 +11,7 @@ use whipplescript_store::{StoreError, StoreResult};
 
 /// An actual workspace adapter binding, never constructible from request data.
 /// Store paths stay private and never enter a runtime command.
+#[derive(Clone)]
 pub struct NativeFileActionTarget {
     store_root: std::path::PathBuf,
     branch: String,
@@ -34,6 +35,16 @@ impl NativeFileActionEvidenceTarget {
     }
     pub fn base(&self) -> &str {
         self.target.base()
+    }
+
+    /// Locate an exact file version's original write without reading its body.
+    /// This is metadata, never admission or an unrestricted legacy label.
+    pub fn version_origin(
+        &self,
+        cut: &str,
+        budget: std::num::NonZeroUsize,
+    ) -> StoreResult<whipplescript_store::vcs::RecordedFileVersion> {
+        self.target.version_origin(cut, budget)
     }
 
     /// Retain the exact result while publishing references under current host
@@ -190,17 +201,46 @@ impl NativeFileActionTarget {
         )
     }
 
-    fn check_base(&self, vcs: &NativeWorkspaceVcs) -> StoreResult<String> {
+    /// Current target access is a caller precondition. Metadata lookup grants
+    /// no body access and never adopts an opaque or unlabeled historical write.
+    pub fn version_origin(
+        &self,
+        cut: &str,
+        budget: std::num::NonZeroUsize,
+    ) -> StoreResult<whipplescript_store::vcs::RecordedFileVersion> {
+        let vcs = self.observe()?;
+        self.check_line(&vcs, cut)?;
+        vcs.file_version_origin(cut, &self.path, budget)
+    }
+
+    /// Read the captured immutable base only after the host authorizes its
+    /// original label and current reader. This never consults the working copy.
+    pub fn read_authorized_base(
+        &self,
+        authorize: impl FnOnce(&str, &str, &str) -> StoreResult<()>,
+    ) -> StoreResult<Option<String>> {
+        authorize(&self.branch, &self.path, &self.base)?;
+        self.observe()?.read_at_cut(&self.base, &self.path)
+    }
+
+    fn check_line(&self, vcs: &NativeWorkspaceVcs, cut: &str) -> StoreResult<()> {
         let refused =
             || StoreError::Conflict("file action base is not retained on this line".into());
         let head = vcs
             .get_branch(&self.branch)?
             .and_then(|branch| branch.head_cut_id)
             .ok_or_else(refused)?;
-        if vcs.cut_chain(&head, &self.base)?.is_none() {
+        if vcs.cut_chain(&head, cut)?.is_none() {
             return Err(refused());
         }
-        let base = vcs.get_cut(&self.base)?.ok_or_else(refused)?;
+        Ok(())
+    }
+
+    fn check_base(&self, vcs: &NativeWorkspaceVcs) -> StoreResult<String> {
+        self.check_line(vcs, &self.base)?;
+        let base = vcs.get_cut(&self.base)?.ok_or_else(|| {
+            StoreError::Conflict("file action base is not retained on this line".into())
+        })?;
         // This owner read distinguishes an absent path from erased bytes and
         // verifies the complete keyed descent needed to reconstruct this file.
         vcs.read_at_cut(&self.base, &self.path)?;
@@ -247,6 +287,7 @@ impl NativeFileActionTarget {
         &self,
         binding: whipplescript_store::vcs_file_save::VersionedSaveBinding,
         scope: ResolutionMemoryScope,
+        read_authority: std::sync::Arc<dyn whipplescript_store::vcs::SaveVersionReadAuthority>,
     ) -> StoreResult<
         whipplescript_store::vcs_file_save::VersionedSaveFileStore<
             whipplescript_store::branches::BranchStore,
@@ -261,13 +302,17 @@ impl NativeFileActionTarget {
                 "native save binding differs from its actual target".into(),
             ));
         }
+        read_authority.authorize_read(&self.branch, &self.path, &self.base)?;
         self.check_base(&self.observe()?)?;
         let workspace = NativeWorkspaceVcs::open(
             self.store_root.join("branches.sqlite"),
             self.store_root.join("content.sqlite"),
         )?;
         whipplescript_store::vcs_file_save::VersionedSaveFileStore::new_in_resolution_scope(
-            workspace, binding, scope,
+            workspace,
+            binding,
+            scope,
+            read_authority,
         )
         .map_err(|error| StoreError::Conflict(error.to_string()))
     }
@@ -286,6 +331,39 @@ impl NativeFileActionTarget {
 }
 
 impl Engagement {
+    /// Capture the recorded head without reading or importing file content.
+    /// The returned coordinates still require original-version authorization.
+    pub fn native_file_read_target(&self, path: &str) -> Result<NativeFileActionTarget> {
+        if !super::valid_native_action_target_path(path) {
+            return Err(WorkspaceError::msg(
+                "file read requires a normalized target path",
+            ));
+        }
+        self.ensure_selected_path(path)?;
+        let vcs = NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?;
+        let base = vcs
+            .get_branch(&self.branch)?
+            .and_then(|branch| branch.head_cut_id)
+            .ok_or_else(|| WorkspaceError::msg("file read has no retained head"))?;
+        self.native_file_action_authorization_target(path, &base)
+    }
+
+    /// Locate an existing line and exact base before original-version policy
+    /// authorization. This does not read file bodies or grant content access;
+    /// a scoped writer still requires its per-version authorizer.
+    pub fn native_file_action_authorization_target(
+        &self,
+        path: &str,
+        base: &str,
+    ) -> Result<NativeFileActionTarget> {
+        let target = self.native_file_action_coordinates(path, base)?;
+        target.check_line(&target.observe()?, base)?;
+        Ok(target)
+    }
+
     pub fn native_file_action_target(
         &self,
         path: &str,
@@ -342,6 +420,127 @@ mod tests {
         chat: Engagement,
         binding: VersionedSaveBinding,
         attempt: SaveAttempt,
+    }
+
+    #[test]
+    fn version_origin_metadata_survives_body_erasure_and_other_file_writes() {
+        let fixture = saved_fixture();
+        let target = fixture
+            .chat
+            .native_file_action_evidence_target("note.txt", &fixture.binding.base_cut_id)
+            .unwrap();
+        let cut = save_cut_id(&fixture.attempt.instance_id, &fixture.attempt.effect_id);
+        let budget = std::num::NonZeroUsize::new(8).unwrap();
+        let original = target.version_origin(&cut, budget).unwrap();
+        let whipplescript_store::vcs::FileVersionSource::Write { cut_id, evidence } =
+            original.source
+        else {
+            panic!("the saved version must identify its original write");
+        };
+        assert_eq!(cut_id, cut);
+        assert_eq!(evidence.unwrap().label_ref, fixture.binding.evidence_label);
+        let root = &target.target.store_root;
+        let mut writer =
+            NativeWorkspaceVcs::open(root.join("branches.sqlite"), root.join("content.sqlite"))
+                .unwrap();
+        writer
+            .write(
+                target.branch(),
+                "other.txt",
+                Some("unrelated"),
+                "other-cut",
+                "later",
+            )
+            .unwrap();
+        ContentStore::open(root.join("content.sqlite"))
+            .unwrap()
+            .erase(
+                &whipplescript_store::stable_hash_hex("replacement"),
+                "erased",
+            )
+            .unwrap();
+        let inherited = target.version_origin("other-cut", budget).unwrap();
+        assert_eq!(inherited.cut_id, "other-cut");
+        assert!(
+            matches!(inherited.source, whipplescript_store::vcs::FileVersionSource::Write { cut_id, .. } if cut_id == cut)
+        );
+        assert!(writer.read_at_cut("other-cut", "note.txt").is_err());
+        assert!(target.version_origin("missing-cut", budget).is_err());
+        let reader = fixture
+            .chat
+            .native_file_read_target("note.txt")
+            .expect("capturing the head must not read the erased body");
+        assert_eq!(reader.base(), "other-cut");
+        let refused = reader
+            .read_authorized_base(|branch, path, cut| {
+                assert_eq!(
+                    (branch, path, cut),
+                    (reader.branch(), "note.txt", "other-cut")
+                );
+                Err(StoreError::Conflict(
+                    "reader refused before content access".into(),
+                ))
+            })
+            .unwrap_err();
+        assert!(format!("{refused:?}").contains("reader refused before content access"));
+        assert!(
+            reader.read_authorized_base(|_, _, _| Ok(())).is_err(),
+            "an authorized read still refuses erased content"
+        );
+    }
+
+    #[test]
+    fn scoped_save_checks_version_authority_before_base_body_preflight() {
+        let fixture = saved_fixture();
+        let target = fixture
+            .chat
+            .native_file_action_target("note.txt", &fixture.binding.base_cut_id)
+            .unwrap();
+        ContentStore::open(target.store_root.join("content.sqlite"))
+            .unwrap()
+            .erase(
+                &whipplescript_store::stable_hash_hex("recorded base"),
+                "erased",
+            )
+            .unwrap();
+        let target = fixture
+            .chat
+            .native_file_action_authorization_target("note.txt", &fixture.binding.base_cut_id)
+            .expect("locating authorization coordinates must not read the erased base");
+        assert!(fixture
+            .chat
+            .native_file_action_authorization_target("note.txt", "missing-cut")
+            .is_err());
+        let expected = (
+            target.branch().to_owned(),
+            target.path().to_owned(),
+            target.base().to_owned(),
+        );
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = called.clone();
+        let authority = std::sync::Arc::new(move |branch: &str, path: &str, cut: &str| {
+            assert_eq!(
+                (branch, path, cut),
+                (
+                    expected.0.as_str(),
+                    expected.1.as_str(),
+                    expected.2.as_str()
+                )
+            );
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(StoreError::Conflict("version authority refused".into()))
+        });
+        let result = target.open_scoped_versioned_save(
+            fixture.binding.clone(),
+            ResolutionMemoryScope::new("authority".into(), "resource".into(), "compartment".into())
+                .unwrap(),
+            authority,
+        );
+        match result {
+            Err(StoreError::Conflict(reason)) => assert_eq!(reason, "version authority refused"),
+            _ => panic!("authorization must refuse before reading the erased base"),
+        }
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     fn saved_fixture() -> SavedFixture {

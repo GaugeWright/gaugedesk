@@ -186,6 +186,60 @@ pub fn load_action_policy(
     })
 }
 
+/// Resolve a retained content label through its original signed policy. This
+/// returns restrictions, never authority to read content or execute an action.
+/// The caller must independently authorize the selected target and reader.
+pub(crate) fn load_action_label(
+    product: &Store,
+    label: &str,
+    root: &GovernanceRootVerifier,
+) -> Result<gaugedesk_whip_runtime::ResourcePolicy, String> {
+    let (hash, binding) = label
+        .strip_prefix("policy:")
+        .and_then(|value| value.split_once(':'))
+        .filter(|(hash, binding)| !hash.is_empty() && !binding.is_empty())
+        .ok_or("retained content has no supported policy label")?;
+    let mut after = None;
+    loop {
+        let scopes = product
+            .scope_ids_with_kind(
+                POLICY_KIND,
+                after.as_deref(),
+                std::num::NonZeroUsize::new(64).unwrap(),
+            )
+            .map_err(|_| "retained content policy discovery is unavailable")?;
+        if scopes.is_empty() {
+            return Err("retained content policy is unavailable".into());
+        }
+        for scope in &scopes {
+            let retained = record(product, scope)?
+                .ok_or("retained content policy disappeared during discovery")?;
+            if retained.policy_ref.envelope_hash != hash {
+                continue;
+            }
+            if retained.identity.storage_scope()? != *scope {
+                return Err("retained content policy has a substituted storage identity".into());
+            }
+            verify_record(&retained, &retained.identity, root)?;
+            let policy: HostGovernancePolicy = serde_json::from_str(&retained.signed_envelope)
+                .map_err(|_| "retained content policy cannot be decoded")?;
+            if canonicalize(&policy.to_json()?)? != retained.canonical_policy {
+                return Err("retained content policy cannot be represented losslessly".into());
+            }
+            let resource = policy
+                .bindings
+                .get(binding)
+                .ok_or("retained content policy has no such binding")?;
+            return policy
+                .resources
+                .get(resource)
+                .cloned()
+                .ok_or_else(|| "retained content policy has no such resource".into());
+        }
+        after = scopes.last().cloned();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +489,99 @@ mod tests {
             .append_record(&id.storage_scope().unwrap(), POLICY_KIND, &fact)
             .unwrap();
         assert!(load_action_policy(&original, &id, prepared.policy_ref(), &root).is_err());
+    }
+    #[test]
+    fn retained_labels_resolve_the_original_policy_without_relabeling_or_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("product.sqlite");
+        let mut product = Store::open(path.to_str().unwrap()).unwrap();
+        let key = SigningKey::from_seed(&[41; 32]).unwrap();
+        let mut id = identity();
+        let root = GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), key.public_key());
+        let original = policy();
+        let prepared = prepare_action_policy(&mut product, &id, &original, &key).unwrap();
+        let label = format!(
+            "policy:{}:admitted_input",
+            prepared.policy_ref().envelope_hash
+        );
+        // A later, less restrictive policy cannot redefine the retained label.
+        id.request_id = "later-save".into();
+        let mut later = original.clone();
+        later
+            .resources
+            .get_mut("file:/action/input")
+            .unwrap()
+            .reader
+            .clear();
+        prepare_action_policy(&mut product, &id, &later, &key).unwrap();
+        drop(product);
+        let product = Store::open(path.to_str().unwrap()).unwrap();
+        let before = product
+            .scope_ids_with_kind(POLICY_KIND, None, std::num::NonZeroUsize::new(64).unwrap())
+            .unwrap();
+        assert_eq!(
+            load_action_label(&product, &label, &root).unwrap(),
+            original.resources["file:/action/input"]
+        );
+        for invalid in [
+            "private",
+            "policy::admitted_input",
+            "policy:missing:admitted_input",
+            &label.replace("admitted_input", "missing"),
+        ] {
+            assert!(
+                load_action_label(&product, invalid, &root).is_err(),
+                "{invalid}"
+            );
+        }
+        let other = SigningKey::from_seed(&[42; 32]).unwrap();
+        let wrong_root =
+            GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), other.public_key());
+        assert!(load_action_label(&product, &label, &wrong_root).is_err());
+        assert_eq!(
+            product
+                .scope_ids_with_kind(POLICY_KIND, None, std::num::NonZeroUsize::new(64).unwrap())
+                .unwrap(),
+            before
+        );
+    }
+    #[test]
+    fn retained_label_lookup_reaches_policies_after_the_first_discovery_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("product.sqlite");
+        let mut product = Store::open(path.to_str().unwrap()).unwrap();
+        let key = SigningKey::from_seed(&[41; 32]).unwrap();
+        let mut id = identity();
+        let root = GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), key.public_key());
+        for index in (0..65).rev() {
+            id.request_id = format!("aa-{index:03}");
+            let mut unrelated = policy();
+            unrelated
+                .resources
+                .get_mut("file:/action/input")
+                .unwrap()
+                .reader
+                .insert(format!("unrelated:{index}"));
+            prepare_action_policy(&mut product, &id, &unrelated, &key).unwrap();
+        }
+        id.request_id = "zz-original".into();
+        let original = policy();
+        let retained = prepare_action_policy(&mut product, &id, &original, &key).unwrap();
+        let label = format!(
+            "policy:{}:admitted_input",
+            retained.policy_ref().envelope_hash
+        );
+        let first_page = product
+            .scope_ids_with_kind(POLICY_KIND, None, std::num::NonZeroUsize::new(64).unwrap())
+            .unwrap();
+        assert_eq!(first_page.len(), 64);
+        assert!(
+            !first_page.contains(&id.storage_scope().unwrap()),
+            "fixture must require another page"
+        );
+        assert_eq!(
+            load_action_label(&product, &label, &root).unwrap(),
+            original.resources["file:/action/input"]
+        );
     }
 }

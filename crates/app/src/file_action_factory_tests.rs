@@ -23,6 +23,9 @@ mod request_preparation_tests;
 #[path = "file_action_submission_route_tests.rs"]
 mod submission_route_tests;
 
+#[path = "file_action_content_tests.rs"]
+mod content_tests;
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct Intent {
     identity: EditorFileSaveRequestIdentity,
@@ -126,6 +129,7 @@ fn setup_content(
         engagement.write_file(&path, base_body).unwrap();
         let base = engagement.commit_turn("fixture base").unwrap().unwrap().0;
         let context = wb.authenticate_action_context(&token).unwrap();
+        let base = governed_fixture_write(&mut wb, &context, &chat_id, &base, base_body, "initial");
         let identity = wb
             .prepare_editor_file_save_request(&context, &chat_id, "note.txt", "save-1")
             .unwrap();
@@ -142,6 +146,154 @@ fn setup_content(
         )
     };
     (wb, intent, token)
+}
+
+/// Start native-action tests from retained, signed owner evidence. This is an
+/// explicitly constructed test source, not a production legacy-migration path
+/// or a claim that the Home admitted a Saved result for the starting version.
+pub(super) fn governed_fixture_write(
+    wb: &mut Workbench,
+    context: &AuthenticatedActionContext,
+    chat: &str,
+    base: &str,
+    body: &str,
+    request: &str,
+) -> String {
+    use whipplescript_store::files::{FileStore, FileWriteContext};
+    use whipplescript_store::vcs_file_save::{save_cut_id, VersionedSaveBinding, SAVE_OUTPUT_PATH};
+    let authority = current_authority(
+        wb.store_ref(),
+        wb.home_id(),
+        context,
+        &EditorFileSave {
+            chat_id: chat,
+            request_id: request,
+            path: "note.txt",
+            base_cut: base,
+            content: body,
+        },
+    )
+    .unwrap();
+    let target = wb.engagements[chat]
+        .native_file_action_authorization_target(&authority.workspace_path, base)
+        .unwrap();
+    let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+    let identity = ActionPolicyIdentity {
+        issuer: wb.authority().as_str().into(),
+        scope: format!("fixture-source:{chat}"),
+        request_id: request.into(),
+    };
+    let policy = prepare_action_policy(wb.store_mut(), &identity, &authority.policy, &key).unwrap();
+    let binding = VersionedSaveBinding {
+        branch_id: target.branch().into(),
+        path: target.path().into(),
+        base_cut_id: base.into(),
+        draft: body.into(),
+        draft_hash: whipplescript_store::stable_hash_hex(body),
+        input_label: format!(
+            "policy:{}:admitted_input",
+            policy.policy_ref().envelope_hash
+        ),
+        executing_principal: context.actor().as_str().into(),
+        evidence_label: format!(
+            "policy:{}:admitted_target",
+            policy.policy_ref().envelope_hash
+        ),
+        recorded_at: "fixture".into(),
+    };
+    let files = target
+        .open_scoped_versioned_save(
+            binding,
+            authority.resolution_scope,
+            Arc::new(|_: &str, _: &str, _: &str| Ok(())),
+        )
+        .unwrap();
+    let instance = format!("fixture-source:{chat}:{request}");
+    files
+        .write_text_with_context(
+            std::path::Path::new(SAVE_OUTPUT_PATH),
+            body,
+            FileWriteContext {
+                instance_id: &instance,
+                effect_id: "save",
+                run_id: "attempt",
+                started_event_id: "started",
+            },
+        )
+        .unwrap();
+    save_cut_id(&instance, "save")
+}
+
+#[test]
+fn native_admission_refuses_an_opaque_base_without_admitting_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, mut intent, token) = setup(dir.path());
+    let mut wb = shared.lock_unpoisoned();
+    let path = wb.engagement_workspace_path(&intent.chat_id, &intent.path);
+    wb.engagements[&intent.chat_id]
+        .write_file(&path, "external unlabelled source")
+        .unwrap();
+    intent.base_cut = wb.engagements[&intent.chat_id]
+        .commit_turn("opaque external import")
+        .unwrap()
+        .unwrap()
+        .0;
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let inputs = NativeActionInputCustody::open(
+        dir.path().join("inputs.sqlite"),
+        wb.home_id().as_str(),
+        4096,
+    )
+    .unwrap();
+    let result = wb.admit_editor_file_save(
+        &context,
+        &inputs,
+        &intent.identity,
+        &EditorFileSave {
+            chat_id: &intent.chat_id,
+            request_id: &intent.request_id,
+            path: &intent.path,
+            base_cut: &intent.base_cut,
+            content: &intent.content,
+        },
+    );
+    let error = match result {
+        Ok(_) => panic!("opaque source was admitted without migration"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("requires explicit provenance migration"),
+        "{error}"
+    );
+    let preparation_scope = ActionPolicyIdentity {
+        issuer: intent.identity.issuer.clone(),
+        scope: intent.identity.scope.clone(),
+        request_id: intent.request_id.clone(),
+    }
+    .storage_scope()
+    .unwrap();
+    assert!(
+        wb.store_ref()
+            .records(&preparation_scope, "host_action_policy_v1")
+            .unwrap()
+            .is_empty(),
+        "refused base retained an action policy before source authorization"
+    );
+    let scope = HostActionCommand::instance_ref_for_request(
+        &intent.identity.issuer,
+        &intent.identity.scope,
+        &intent.request_id,
+    )
+    .unwrap();
+    assert!(wb
+        .store_mut()
+        .committed_dispatch::<ProductActionAdmission>(&scope, &intent.request_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        wb.engagements[&intent.chat_id].read_file(&path).unwrap(),
+        "external unlabelled source"
+    );
 }
 
 async fn home_admission(app: &Router, token: &str) -> String {
@@ -1664,20 +1816,7 @@ fn native_scoped_save_uses_only_admitted_knowledge_and_recovers_original_observa
         };
         assert_eq!(record_scope_fixture(dir.path(), base, &recorded_scope), 1);
         let (_, _, chat): (String, String, String) = serde_json::from_str(&command.scope).unwrap();
-        let (_, _, path): (String, String, String) = serde_json::from_str(
-            command.resources["target"]
-                .resource
-                .selector
-                .as_deref()
-                .unwrap(),
-        )
-        .unwrap();
-        wb.engagements[&chat].write_file(&path, "tiger").unwrap();
-        let head = wb.engagements[&chat]
-            .commit_turn("competing work fixture")
-            .unwrap()
-            .unwrap()
-            .0;
+        let head = governed_fixture_write(&mut wb, &context, &chat, base, "tiger", "competing");
         let mut runtime = editor_runtime(&wb, &command, dir.path());
         configure_native_files(runtime.kernel().store());
         let admission = wb

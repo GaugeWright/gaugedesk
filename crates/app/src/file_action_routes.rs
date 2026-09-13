@@ -30,6 +30,52 @@ pub struct ReadSavedContent {
     cut: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadNativeContent {
+    expected_actor: String,
+    path: String,
+}
+
+pub async fn inspect_native_content(
+    State(shared): State<SharedWorkbench>,
+    Path(chat): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<ReadNativeContent>,
+) -> Response {
+    tokio::task::spawn_blocking(move || {
+        let mut wb = shared.lock_unpoisoned();
+        let context = match context(
+            &mut wb,
+            &headers,
+            &format!("/chats/{chat}/file-actions/content"),
+        ) {
+            Ok(context) => context,
+            Err((status, message)) => return response(status, json!({"error": message})),
+        };
+        if context.actor().as_str() != query.expected_actor {
+            return response(
+                StatusCode::FORBIDDEN,
+                json!({"error": "file reader changed"}),
+            );
+        }
+        match wb.observe_native_file_content(&context, &chat, &query.path) {
+            Ok(observed) => response(StatusCode::OK, json!(observed)),
+            Err(_) => response(
+                StatusCode::NOT_FOUND,
+                json!({"error": "retained native file content is unavailable"}),
+            ),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "retained native file content is unavailable"}),
+        )
+    })
+}
+
 pub async fn inspect_saved_content(
     State(shared): State<SharedWorkbench>,
     headers: HeaderMap,

@@ -308,12 +308,18 @@ impl Workbench {
             scope,
             grant_cause,
             resolution_scope,
+            authority,
             ..
         } = self.prepare_native_editor_action(context, inputs, command, runtime.policy_ref())?;
         let provenance =
             dispatch_grant::with_grant_cause(command.provenance.clone(), grant_cause.as_ref());
         let action = registered_editor_workflow(command)?;
         let target = self.bind_native_editor_target(&chat_id, command)?;
+        let policy_observer = self
+            .store_ref()
+            .read_only_sibling()
+            .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
+        let issuer = self.authority().clone();
         inputs
             .with_resolved(&command.inputs["content"], |resolved| {
                 self.store_mut()
@@ -389,6 +395,15 @@ impl Workbench {
                         let files = target.open_scoped_versioned_save(
                             binding.clone(),
                             resolution_scope.clone(),
+                            std::sync::Arc::new(
+                                version_authority::NativeSaveVersionAuthority::new(
+                                    target.clone(),
+                                    policy_observer,
+                                    authority,
+                                    issuer,
+                                    key.clone(),
+                                ),
+                            ),
                         )?;
                         runtime
                             .execute_scoped_save_file_effect(
