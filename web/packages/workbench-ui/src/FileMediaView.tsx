@@ -14,8 +14,8 @@
  * quiet way around it.
  */
 
-import { createMemo, createSignal, onCleanup } from "solid-js";
-import { describeSize } from "./file-kind";
+import { Show, createMemo, createSignal, onCleanup } from "solid-js";
+import { describeSize, type MediaKind } from "./file-kind";
 
 /** A blob URL over the file's bytes, revoked as soon as it is replaced. */
 function objectUrl(bytes: () => Uint8Array, mediaType: () => string) {
@@ -60,6 +60,64 @@ export function ImageFileView(props: FileMediaProps) {
             />
             <div class="filemedia-caption">{caption()}</div>
         </div>
+    );
+}
+
+/** A recording, played by the platform rather than by anything we ship.
+ *
+ *  Every distribution already runs inside an engine with a media pipeline, so
+ *  the whole implementation is the right element over a blob of the file's own
+ *  bytes: the platform demuxes, decodes, draws the transport, and uses the
+ *  machine's hardware to do it. Shipping a decoder to sit alongside that would
+ *  be a large payload buying a worse result.
+ *
+ *  What the platform will not tell us in advance is whether *this* build
+ *  carries *this* codec — WebKitGTK and a browser genuinely disagree, and
+ *  `canPlayType` answers "maybe" often enough to be useless. So the element's
+ *  own failure is the answer: until it fails the view plays the file, and when
+ *  it fails the view says what the file is, which is what the pane did for
+ *  these formats before they were playable at all.
+ *
+ *  Read-only like its neighbours: controls, no download, no autoplay. */
+export function MediaFileView(props: FileMediaProps & { readonly media: MediaKind }) {
+    const url = objectUrl(() => props.bytes, () => props.mediaType);
+    const [unplayable, setUnplayable] = createSignal(false);
+    const caption = () => `${props.mediaType} \u00b7 ${describeSize(props.bytes.byteLength)}`;
+    return (
+        <Show
+            when={!unplayable()}
+            fallback={
+                <OpaqueFileView
+                    path={props.path}
+                    mediaType={props.mediaType}
+                    byteLength={props.bytes.byteLength}
+                />
+            }
+        >
+            <div class="filemedia" data-file-view data-file-media={props.media}>
+                <Show
+                    when={props.media === "video"}
+                    fallback={
+                        <audio
+                            class="filemedia-audio"
+                            src={url()}
+                            controls
+                            preload="metadata"
+                            onError={() => setUnplayable(true)}
+                        />
+                    }
+                >
+                    <video
+                        class="filemedia-video"
+                        src={url()}
+                        controls
+                        preload="metadata"
+                        onError={() => setUnplayable(true)}
+                    />
+                </Show>
+                <div class="filemedia-caption">{caption()}</div>
+            </div>
+        </Show>
     );
 }
 

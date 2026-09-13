@@ -45,7 +45,45 @@ const SKIP_DIRECTORIES = new Set([
 /// here keeps a literal prefix — `class={`markdown-body${…}`}`, `class={`panel
 /// ${props.cls}`}` — and the prefix is what the stylesheet selects on. An entry
 /// becomes necessary only if that stops being true.
-const EXPECTED_WITHOUT_RENDERER = new Map([]);
+const EXPECTED_WITHOUT_RENDERER = new Map([
+  // highlight.js chooses these token classes itself, from whichever grammar
+  // matched, so no source file names one and the scan's deliberately weak
+  // "appears as a word somewhere" rule cannot see them. `.hljs` is not among
+  // them: `CodeView` sets that one literally, and the scan finds it.
+  ...[
+    "hljs-addition",
+    "hljs-attr",
+    "hljs-attribute",
+    "hljs-built_in",
+    "hljs-bullet",
+    "hljs-char",
+    "hljs-comment",
+    "hljs-deletion",
+    "hljs-doctag",
+    "hljs-emphasis",
+    "hljs-formula",
+    "hljs-keyword",
+    "hljs-link",
+    "hljs-literal",
+    "hljs-meta-keyword",
+    "hljs-name",
+    "hljs-number",
+    "hljs-quote",
+    "hljs-regexp",
+    "hljs-section",
+    "hljs-selector-class",
+    "hljs-selector-id",
+    "hljs-selector-tag",
+    "hljs-string",
+    "hljs-strong",
+    "hljs-symbol",
+    "hljs-template-tag",
+    "hljs-template-variable",
+    "hljs-title",
+    "hljs-type",
+    "hljs-variable",
+  ].map((name) => [name, "emitted by highlight.js from its grammars, never named in source"]),
+]);
 
 function* sourceFiles(dir) {
   let entries;

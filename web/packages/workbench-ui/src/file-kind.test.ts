@@ -5,7 +5,13 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { describeSize, fileExtension, readAsTextFailed, viewerFileFor } from "./file-kind";
+import {
+    describeSize,
+    fileExtension,
+    readAsTextFailed,
+    syntaxLanguageFor,
+    viewerFileFor,
+} from "./file-kind";
 
 describe("fileExtension", () => {
     it("reads the last extension, lowercased", () => {
@@ -51,11 +57,11 @@ describe("viewerFileFor", () => {
     it("names a format it cannot show rather than painting it", () => {
         expect(viewerFileFor("bundle.zip").kind).toBe("opaque");
         expect(viewerFileFor("app.wasm").kind).toBe("opaque");
-        expect(viewerFileFor("clip.mp4").kind).toBe("opaque");
+        expect(viewerFileFor("lib.so").kind).toBe("opaque");
     });
 
     it("leaves everything else as text, exactly as before", () => {
-        for (const path of ["main.rs", "notes.md", "data.csv", "Makefile", ".gitignore", "a.b.unknown"]) {
+        for (const path of ["main.rs", "notes.md", "Makefile", ".gitignore", "a.b.unknown"]) {
             expect(viewerFileFor(path).kind).toBe("text");
         }
     });
@@ -88,5 +94,73 @@ describe("describeSize", () => {
         expect(describeSize(2048)).toBe("2.0 KiB");
         expect(describeSize(20 * 1024)).toBe("20 KiB");
         expect(describeSize(3 * 1024 * 1024 + 512 * 1024)).toBe("3.5 MiB");
+    });
+});
+
+describe("viewerFileFor — recordings and tables", () => {
+    it("sends a recording to the element that plays it", () => {
+        expect(viewerFileFor("turn/clip.mp4")).toEqual({
+            kind: "media",
+            media: "video",
+            mediaType: "video/mp4",
+        });
+        expect(viewerFileFor("notes/voice.mp3")).toEqual({
+            kind: "media",
+            media: "audio",
+            mediaType: "audio/mpeg",
+        });
+    });
+
+    it("no longer calls a playable recording opaque", () => {
+        // These were named-but-unshowable before the platform played them.
+        for (const path of ["a.wav", "a.ogg", "a.webm", "a.mov", "a.flac"]) {
+            expect(viewerFileFor(path).kind).toBe("media");
+        }
+    });
+
+    it("keeps the delimiter with the table so the parser need not guess", () => {
+        expect(viewerFileFor("export.csv")).toEqual({
+            kind: "table",
+            delimiter: ",",
+            mediaType: "text/csv",
+        });
+        expect(viewerFileFor("export.TSV")).toEqual({
+            kind: "table",
+            delimiter: "\t",
+            mediaType: "text/tab-separated-values",
+        });
+    });
+
+    it("leaves the formats we still cannot open alone", () => {
+        expect(viewerFileFor("old.doc").kind).toBe("opaque");
+        expect(viewerFileFor("bundle.zip").kind).toBe("opaque");
+        expect(viewerFileFor("font.woff2").kind).toBe("opaque");
+    });
+});
+
+describe("syntaxLanguageFor", () => {
+    it("names a grammar for source it recognises", () => {
+        expect(syntaxLanguageFor("crates/app/src/main.rs")).toBe("rust");
+        expect(syntaxLanguageFor("web/src/App.tsx")).toBe("typescript");
+        expect(syntaxLanguageFor("scripts/check.SH")).toBe("bash");
+    });
+
+    it("settles from the whole name when there is no extension", () => {
+        expect(syntaxLanguageFor("build/Dockerfile")).toBe("dockerfile");
+        expect(syntaxLanguageFor("Makefile")).toBe("makefile");
+    });
+
+    it("leaves anything it has no grammar for plain", () => {
+        expect(syntaxLanguageFor("notes.txt")).toBeNull();
+        expect(syntaxLanguageFor("README")).toBeNull();
+        expect(syntaxLanguageFor("data.bin")).toBeNull();
+    });
+
+    it("does not claim a language for a file another view owns", () => {
+        // Markdown, tables and pictures each have their own renderer; a
+        // language here would race them for the same file.
+        expect(syntaxLanguageFor("notes.md")).toBeNull();
+        expect(syntaxLanguageFor("export.csv")).toBeNull();
+        expect(syntaxLanguageFor("chart.png")).toBeNull();
     });
 });

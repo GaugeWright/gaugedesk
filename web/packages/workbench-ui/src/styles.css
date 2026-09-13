@@ -838,7 +838,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .viewer > .filebody, .viewer > .editor { flex: 1; min-height: 0; }
 .viewer > .filebody { overflow: auto; }
 .viewer > .filemedia, .viewer > .pdfview, .viewer > .officeview,
-.viewer > .deckview { flex: 1; min-height: 0; }
+.viewer > .deckview, .viewer > .filetable { flex: 1; min-height: 0; }
 
 /* A file the View tab paints rather than reads: a picture, or a card naming a
    format it cannot show. Both centre in the pane; the picture is contained
@@ -855,6 +855,30 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .filemedia-facts { margin-top: 4px; font-size: var(--fs-label); color: var(--muted);
     overflow-wrap: anywhere; }
 .filemedia-note { margin-top: 10px; font-size: var(--fs-ui); line-height: 1.45; color: var(--muted); }
+/* A recording. The element draws its own transport, so these only size it —
+   audio gets a readable width rather than the pane's full span, and video is
+   contained for the same reason a screenshot is. */
+.filemedia-audio { width: min(100%, 52ch); }
+.filemedia-video { max-width: 100%; max-height: 100%; border: 1px solid var(--edge);
+    border-radius: 3px; background: var(--panel); }
+
+/* Separated values drawn as a grid. The header row and the row-number gutter
+   both stick, because losing track of which column you are in is the failure
+   this view exists to fix. */
+.filetable { display: flex; flex-direction: column; min-height: 0; }
+.filetable-scroll { flex: 1; min-height: 0; overflow: auto; }
+.filetable table { border-collapse: separate; border-spacing: 0;
+    font-size: var(--fs-ui); font-family: var(--mono); }
+.filetable th, .filetable td { padding: 3px 10px; text-align: left;
+    white-space: pre; border-right: 1px solid var(--edge);
+    border-bottom: 1px solid var(--edge); }
+.filetable thead th { position: sticky; top: 0; z-index: 2; background: var(--panel);
+    color: var(--ink); font-weight: 600; }
+.filetable-gutter { position: sticky; left: 0; z-index: 1; background: var(--panel);
+    color: var(--muted); text-align: right; user-select: none; }
+.filetable thead .filetable-gutter { z-index: 3; }
+.filetable-note { flex: 0 0 auto; padding: 6px 10px; font-size: var(--fs-label);
+    color: var(--muted); border-top: 1px solid var(--edge); }
 
 /* A Word, Excel or PowerPoint file: the OOXML engine owns everything inside
    the host element (its own scroller, pages and zoom), so this only gives it a
@@ -2767,3 +2791,24 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .whip-rule-edge[data-kind="self"] path,
 .whip-rule-edge[data-kind="back"] path {
     stroke: color-mix(in srgb, var(--gold) 55%, transparent); }
+
+/* Syntax highlighting. highlight.js emits `hljs-*` class names and ships
+   themes of its own; those themes carry their own literal palettes, so the
+   colours are mapped onto the brand tokens here instead. The mapping is
+   deliberately coarse — six roles, not forty — because a code pane that
+   competes with the interface around it reads worse, not better. Any token
+   class not named here inherits the body colour, which is a legible default
+   rather than an invisible one. */
+.hljs { color: var(--ink); background: transparent; }
+.hljs-comment, .hljs-quote { color: var(--muted); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-literal,
+.hljs-type, .hljs-doctag, .hljs-meta-keyword { color: var(--accent); }
+.hljs-string, .hljs-regexp, .hljs-addition, .hljs-attr,
+.hljs-template-tag, .hljs-char.escape_ { color: var(--gold); }
+.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-link, .hljs-meta { color: var(--warn); }
+.hljs-title, .hljs-name, .hljs-section, .hljs-attribute,
+.hljs-variable, .hljs-template-variable, .hljs-selector-id,
+.hljs-selector-class { color: var(--accent-hover); }
+.hljs-deletion, .hljs-formula { color: var(--bad); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }

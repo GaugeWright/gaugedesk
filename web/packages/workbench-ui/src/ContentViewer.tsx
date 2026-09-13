@@ -22,8 +22,8 @@ import { EnvironmentDocumentView, type EnvironmentViewRegistry } from "./Environ
 import { manifestDocumentForPath } from "./environment-view";
 import { isWhipProgram, tabsForPath, programForPath, programsFromV1} from "./whip-view";
 import { WhipInstancesView, WhipStructureView } from "./WhipViews";
-import { ImageFileView, OpaqueFileView } from "./FileMediaView";
-import { readAsTextFailed, viewerFileFor } from "./file-kind";
+import { ImageFileView, MediaFileView, OpaqueFileView } from "./FileMediaView";
+import { readAsTextFailed, syntaxLanguageFor, viewerFileFor } from "./file-kind";
 
 // The diff viewer pulls in @git-diff-view (+ highlight.js/lowlight, ~350 KB).
 // Load that chunk only when the Diff tab is first opened, not on app boot.
@@ -43,6 +43,11 @@ const PdfView = lazy(() => import("./PdfView").then((m) => ({ default: m.PdfView
 // their own renderers; none of it loads until a Word, Excel or PowerPoint file
 // is opened. Read-only by construction — see the note in OfficeView.
 const OfficeView = lazy(() => import("./OfficeView").then((m) => ({ default: m.OfficeView })));
+// Separated values drawn as the grid they describe, and code coloured by a
+// highlighter. Both are lazy for the same reason as the renderers above: a
+// worktree of prose should never pay for either.
+const TableView = lazy(() => import("./TableView").then((m) => ({ default: m.TableView })));
+const CodeView = lazy(() => import("./CodeView").then((m) => ({ default: m.CodeView })));
 
 // The conflict fold (SUB-6) mounts only when a save actually conflicts.
 const ConflictFold = lazy(() => import("./ConflictFold").then((m) => ({ default: m.ConflictFold })));
@@ -104,7 +109,15 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     const rendersFromBytes = () =>
         viewerFile().kind === "image" ||
         viewerFile().kind === "pdf" ||
-        viewerFile().kind === "office";
+        viewerFile().kind === "office" ||
+        viewerFile().kind === "media";
+    // Which highlighter grammar this path gets, or null to leave it plain.
+    const syntaxLanguage = createMemo(() => syntaxLanguageFor(file() ?? ""));
+    // A file whose bytes are characters. How it is *drawn* is a separate
+    // question — separated values are drawn as a grid and code is coloured —
+    // but both are read as text and both can be written back as text, so this
+    // is what the read and the editor agree on.
+    const readsAsText = () => viewerFile().kind === "text" || viewerFile().kind === "table";
     const [content, { refetch }] = createResource(
         () => {
             const i = id();
@@ -112,7 +125,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
             const revision = props.refreshKey?.();
             // A file we are going to paint is never read as text: decoding a
             // PNG produces nothing anyone wants to see.
-            if (viewerFile().kind !== "text") return null;
+            if (!readsAsText()) return null;
             return i && f ? ([i, f, revision] as const) : null;
         },
         async ([i, f]) => {
@@ -297,9 +310,11 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     const fileEditable = () => {
         const path = file();
         if (!path || path === ".agent-config.json" || path.startsWith(".whipple/versions/")) return false;
-        // The editor is a text buffer, and a save writes text. A picture or a
-        // PDF is viewable here and not editable here.
-        if (viewerFile().kind !== "text") return false;
+        // The editor is a text buffer, and a save writes text. A picture, a
+        // PDF or a recording is viewable here and not editable here — but a
+        // spreadsheet export is text that happens to be drawn as a grid, and
+        // rendering it better must not cost anyone the ability to edit it.
+        if (!readsAsText()) return false;
         if (path.startsWith(".whipple/")) {
             return chatKind() === "edit" && (
                 path.startsWith(".whipple/draft/") ||
@@ -589,6 +604,16 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                                                                     />
                                                                 }
                                                             >
+                                                                <Match when={viewerFile().media}>
+                                                                    {(media) => (
+                                                                        <MediaFileView
+                                                                            path={file()!}
+                                                                            bytes={bytes}
+                                                                            media={media()}
+                                                                            mediaType={viewerFile().mediaType}
+                                                                        />
+                                                                    )}
+                                                                </Match>
                                                                 <Match when={viewerFile().kind === "pdf"}>
                                                                     <Suspense fallback={<div class="status">opening the document…</div>}>
                                                                         <PdfView bytes={bytes} path={file()!} />
@@ -610,10 +635,30 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                                                     </Show>
                                                 </Show>
                                             </Match>
+                                            <Match when={viewerFile().delimiter}>
+                                                {(delimiter) => (
+                                                    <Suspense fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
+                                                        <TableView text={content() ?? ""} delimiter={delimiter()} />
+                                                    </Suspense>
+                                                )}
+                                            </Match>
                                             <Match when={isMarkdownPath(file() ?? "")}>
                                                 <Suspense fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
                                                     <MarkdownView text={content() ?? ""} />
                                                 </Suspense>
+                                            </Match>
+                                            {/* Source code, coloured. Last of the text
+                                                branches so markdown and the not-text
+                                                fallback keep their precedence, and behind
+                                                a fallback that is the plain pane — a
+                                                highlighter that fails to load must not
+                                                cost anyone the file. */}
+                                            <Match when={!content.loading && !readAsTextFailed(content() ?? "") && syntaxLanguage()}>
+                                                {(language) => (
+                                                    <Suspense fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
+                                                        <CodeView text={content() ?? ""} language={language()} />
+                                                    </Suspense>
+                                                )}
                                             </Match>
                                             {/* An extension the rules above don't know, whose
                                                 content turned out not to be text after all. */}
