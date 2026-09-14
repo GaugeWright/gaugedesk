@@ -5,7 +5,7 @@
   "source_pull_request": 487,
   "public_repository": "https://github.com/GaugeWright/whipplescript.git",
   "public_commit": "52dcba5a586cf16112d2c89f29b3a46ddc62c76d",
-  "contract_path": "spec/host-action-contract-v3.json",
-  "contract_revision": "whipplescript-host-action/v3.0.0",
-  "contract_digest": "00e082316c68f5c696663cfaef2ad6f9e4488b707d172ba4f0c1829e02877e63"
+  "contract_path": "spec/host-action-contract-v4.json",
+  "contract_revision": "whipplescript-host-action/v4.0.0",
+  "contract_digest": "b468641c9ccb6d41482c2f9c5a2c5f49258611a90fd9776dec87c39546d06370"
 }
