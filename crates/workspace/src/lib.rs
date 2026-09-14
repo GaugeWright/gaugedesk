@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use whipplescript_kernel::effect_handlers::{
     release_reserved_boundary_generic, run_reserved_boundary_promotion_generic, BoundaryRunOutcome,
@@ -2087,12 +2087,85 @@ fn persist_scratch(store_root: &Path, branch: &str, cache: &StatCache) -> Result
 /// which fixes the order. Nothing takes a writer while already holding one by
 /// any other route: every verb that runs inside a hold uses an `_under_writer`
 /// import instead of a locking one.
+///
+/// The key is the store root's **filesystem identity**, not its spelling.
+/// `Instance::open*` takes whatever path a caller hands it and `store_root_for`
+/// preserves that spelling, so one store reached through a symlink, a `..`
+/// segment, and its absolute path would otherwise mint three mutexes for one
+/// branch and let the exact conflict through. Identity is what makes those one
+/// writer, and it reaches further than a canonical pathname does: a directory
+/// exposed through two bind mounts has two canonical paths and one
+/// `(device, inode)`, and it is one SQLite store either way. A root whose
+/// identity cannot be read (no such directory, or a platform without it) falls
+/// back to the canonicalized path and then to its own, which is safe because
+/// `sync_in` has created the store by the time it asks.
+///
+/// Entries are held **weakly**, so the map holds no branch alive on its own. A
+/// live entry is kept upgradeable by the `Arc` its holder keeps for the whole
+/// import — and by the vector [`hold_writers`] takes, which is what keeps a
+/// multi-branch acquisition's writers upgradeable for as long as it holds them.
+/// Once the last one leaves, the entry is dead and the next call through here
+/// sweeps it. Without that, a hosted process that creates and retires chats
+/// accumulates one entry per branch it ever touched rather than per branch
+/// currently importing.
 fn workspace_writer(store_root: &Path, branch: &str) -> Arc<Mutex<()>> {
-    static WRITERS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-    let key = format!("{}\u{0}{branch}", store_root.display());
-    let writers = WRITERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = workspace_writer_key(store_root, branch);
+    let writers = WORKSPACE_WRITERS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = writers.lock().unwrap_or_else(PoisonError::into_inner);
-    Arc::clone(guard.entry(key).or_default())
+    if let Some(writer) = guard.get(&key).and_then(Weak::upgrade) {
+        return writer;
+    }
+    guard.retain(|_, writer| writer.strong_count() > 0);
+    let writer = Arc::new(Mutex::new(()));
+    guard.insert(key, Arc::downgrade(&writer));
+    writer
+}
+
+static WORKSPACE_WRITERS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+
+fn workspace_writer_key(store_root: &Path, branch: &str) -> String {
+    format!("{}\u{0}{branch}", store_identity(store_root))
+}
+
+/// What names one store to the writer map.
+///
+/// The `(device, inode)` pair the filesystem itself keeps, because that is what
+/// two paths to one store agree on and a pathname is not: bind mounts of one
+/// directory canonicalize to two distinct paths and share an identity. Where
+/// that is unavailable — the directory does not exist yet, or the platform
+/// exposes no such pair — the canonicalized path stands in, which still folds
+/// symlinks and `..` together.
+#[cfg(unix)]
+fn store_identity(store_root: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::metadata(store_root) {
+        Ok(meta) => format!("fs:{}:{}", meta.dev(), meta.ino()),
+        Err(_) => canonical_store_path(store_root),
+    }
+}
+
+#[cfg(not(unix))]
+fn store_identity(store_root: &Path) -> String {
+    canonical_store_path(store_root)
+}
+
+fn canonical_store_path(store_root: &Path) -> String {
+    let root = std::fs::canonicalize(store_root).unwrap_or_else(|_| store_root.to_path_buf());
+    format!("path:{}", root.display())
+}
+
+/// Whether a writer for this `(store_root, branch)` is still held in the map —
+/// the property the eviction half of [`workspace_writer`] is about.
+#[cfg(test)]
+fn workspace_writer_is_tracked(store_root: &Path, branch: &str) -> bool {
+    let key = workspace_writer_key(store_root, branch);
+    WORKSPACE_WRITERS.get().is_some_and(|writers| {
+        writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&key)
+    })
 }
 
 /// The writers for every branch a verb will write, in the order to take them.
@@ -5067,6 +5140,109 @@ mod tests {
                 manifest.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// One store reached by two spellings of its path is ONE writer.
+    ///
+    /// `Instance::open*` takes whatever path a caller hands it and
+    /// `store_root_for` keeps that spelling, so a key built from the spelling
+    /// hands one branch a mutex per spelling and lets through exactly the
+    /// conflict the lock exists to refuse. Asserted on the identity of the
+    /// mutex rather than by racing importers through both spellings: the race
+    /// reproduces only about one run in three, so it would report a broken key
+    /// as a pass most of the time.
+    #[test]
+    fn one_store_reached_by_two_spellings_is_one_writer() {
+        let directory = tempfile::tempdir().expect("temp");
+        let root = directory.path().join("store");
+        std::fs::create_dir_all(&root).expect("store root");
+
+        let plain = workspace_writer(&root, "engagement/shared");
+        let around = workspace_writer(
+            &directory.path().join("store/../store"),
+            "engagement/shared",
+        );
+        assert!(
+            Arc::ptr_eq(&plain, &around),
+            "a `..` segment took a second writer for one branch"
+        );
+
+        #[cfg(unix)]
+        {
+            let linked = directory.path().join("linked");
+            std::os::unix::fs::symlink(&root, &linked).expect("symlink");
+            let through_link = workspace_writer(&linked, "engagement/shared");
+            assert!(
+                Arc::ptr_eq(&plain, &through_link),
+                "a symlinked root took a second writer for one branch"
+            );
+        }
+
+        // The keying still has to separate what genuinely is separate, or
+        // "one writer" would be bought by serializing the whole process.
+        let other_branch = workspace_writer(&root, "engagement/other");
+        assert!(
+            !Arc::ptr_eq(&plain, &other_branch),
+            "two branches in one store must still import concurrently"
+        );
+    }
+
+    /// The key names the store the filesystem's way, not the caller's.
+    ///
+    /// Two spellings agreeing is necessary but not sufficient: a canonicalized
+    /// pathname folds symlinks and `..` and still splits a directory exposed
+    /// through two bind mounts, which is one SQLite store and must be one
+    /// writer. A bind mount cannot be made from an unprivileged test, so the
+    /// property asserted is the one that implies it — the key carries the
+    /// `(device, inode)` the filesystem keeps, and no pathname at all.
+    #[cfg(unix)]
+    #[test]
+    fn the_writer_key_names_filesystem_identity_not_a_path() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().expect("temp");
+        let root = directory.path().join("store");
+        std::fs::create_dir_all(&root).expect("store root");
+        let meta = std::fs::metadata(&root).expect("store root metadata");
+
+        let key = workspace_writer_key(&root, "engagement/shared");
+        assert!(
+            key.contains(&format!("{}:{}", meta.dev(), meta.ino())),
+            "the key left out the identity two paths to one store share: {key}"
+        );
+        assert!(
+            !key.contains(&root.display().to_string()),
+            "the key still carries a pathname, so two mounts of one store split: {key}"
+        );
+    }
+
+    /// A retired branch's writer must not outlive its writers.
+    ///
+    /// The map is the only long-lived structure here, and a hosted process
+    /// creates and retires chats for as long as it runs. Holding the mutexes
+    /// strongly would grow it with the number of branches ever touched rather
+    /// than the number importing now, with nothing able to remove an entry —
+    /// `remove_engagement` cannot reach a private static. Weak values plus the
+    /// sweep on the next miss bound it to the live set.
+    #[test]
+    fn a_writer_no_one_holds_is_evicted() {
+        let directory = tempfile::tempdir().expect("temp");
+        let root = directory.path().join("store");
+        std::fs::create_dir_all(&root).expect("store root");
+
+        let held = workspace_writer(&root, "engagement/retired");
+        assert!(
+            workspace_writer_is_tracked(&root, "engagement/retired"),
+            "a live writer must stay findable, or concurrent importers miss each other"
+        );
+
+        drop(held);
+        // The sweep runs on the next miss, which is what a later import is.
+        let _next = workspace_writer(&root, "engagement/next");
+        assert!(
+            !workspace_writer_is_tracked(&root, "engagement/retired"),
+            "the retired branch's entry survived every writer that used it"
+        );
     }
 }
 
