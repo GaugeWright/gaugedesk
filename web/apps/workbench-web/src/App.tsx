@@ -1386,11 +1386,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
     }
 
-    // Files too big to inline as text are skipped rather than uploaded — the ingest
-    // endpoint stores content as text, so binaries/blobs don't round-trip anyway.
-    // Matches the control plane's own per-file ceiling
-    // (`MAX_UPLOAD_FILE_BYTES`). The server's bound is the rule and this one
-    // is the courtesy that reports a refusal without spending the upload.
+    // Files past this are skipped rather than uploaded. It matches the control
+    // plane's own per-file ceiling (`MAX_UPLOAD_FILE_BYTES`): the server's bound
+    // is the rule, and this one is the courtesy that reports a refusal without
+    // spending the upload.
+    //
+    // What the ceiling is about is memory, not format — a file that is not text
+    // uploads as bytes and round-trips exactly. The request body is buffered
+    // whole and base64-decoded, so one upload costs roughly 2.3x the file in
+    // peak memory: the encoded string at four bytes for every three, plus the
+    // decoded bytes. A recording longer than this wants a route that streams,
+    // which is a different shape rather than a larger number here.
     const MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
 
     // Browser context ingest: a native picker (folder or single file) hands us

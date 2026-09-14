@@ -741,7 +741,7 @@ pub(crate) async fn post_context(
         .into_response()
 }
 
-/// One uploaded context file (`ENTSEC-5`): a name + its text content.
+/// One uploaded context file (`ENTSEC-5`): a name, and either text or bytes.
 #[derive(serde::Deserialize)]
 pub(crate) struct UploadedFile {
     name: String,
@@ -800,7 +800,7 @@ impl UploadedFile {
 
 #[derive(serde::Deserialize)]
 pub(crate) struct ContextUploadBody {
-    /// The uploaded files (name + text content) to open into the engagement.
+    /// The uploaded files to open into the engagement.
     files: Vec<UploadedFile>,
     /// Required when a work chat has more than one writable target.
     #[serde(default)]
