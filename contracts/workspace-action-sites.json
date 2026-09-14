@@ -75,7 +75,7 @@
       "declaration": {
         "name": "ingest_upload",
         "owner": "ChatWorkspace",
-        "signature": "fn ingest_upload (& self , files : & [(String , String)]) -> Result < usize >"
+        "signature": "fn ingest_upload (& self , files : & [(String , Vec < u8 >)]) -> Result < usize >"
       },
       "classification": "requires-provenance-review"
     },
@@ -83,7 +83,7 @@
       "declaration": {
         "name": "ingest_upload_into",
         "owner": "ChatWorkspace",
-        "signature": "fn ingest_upload_into (& self , prefix : & str , files : & [(String , String)]) -> Result < usize >"
+        "signature": "fn ingest_upload_into (& self , prefix : & str , files : & [(String , Vec < u8 >)]) -> Result < usize >"
       },
       "classification": "requires-provenance-review"
     },
@@ -3406,9 +3406,9 @@
     {
       "site": {
         "callable": "impl ChatWorkspace for ExternalCandidate::ingest_upload",
-        "capability": "write_file",
+        "capability": "write_file_bytes",
         "count": 1,
-        "expression": "self . write_file (path , body)",
+        "expression": "self . write_file_bytes (path , body)",
         "file": "crates/workspace/src/external.rs"
       },
       "profile": "external-workspace-adapter"
@@ -4146,9 +4146,9 @@
     {
       "site": {
         "callable": "impl inherent for Engagement::ingest_upload",
-        "capability": "write_file",
+        "capability": "write_file_bytes",
         "count": 1,
-        "expression": "self . write_file (& base , content)",
+        "expression": "self . write_file_bytes (& base , content)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
@@ -4156,9 +4156,9 @@
     {
       "site": {
         "callable": "impl inherent for Engagement::ingest_upload_into",
-        "capability": "write_file",
+        "capability": "write_file_bytes",
         "count": 1,
-        "expression": "self . write_file (& format ! (\"{prefix}/{base}\") , content)",
+        "expression": "self . write_file_bytes (& format ! (\"{prefix}/{base}\") , content)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
@@ -4219,6 +4219,16 @@
         "capability": "write_file",
         "count": 1,
         "expression": "self . write_file (relative , draft)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::write_file",
+        "capability": "write_file_bytes",
+        "count": 1,
+        "expression": "self . write_file_bytes (relative , content . as_bytes ())",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"

@@ -684,7 +684,7 @@ mod tests {
             )
             .unwrap();
         let chat_id = chat["id"].as_str().unwrap();
-        let files = [("context.txt".to_owned(), "target-scoped".to_owned())];
+        let files = [("context.txt".to_owned(), b"target-scoped".to_vec())];
         let ambiguous = workbench
             .ingest_upload_into_engagement(chat_id, &files, None)
             .unwrap()

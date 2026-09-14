@@ -298,7 +298,16 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             get(er::get_config).put(er::put_config),
         )
         .route("/chats/{id}/context", post(rs::post_context))
-        .route("/chats/{id}/context/upload", post(rs::post_context_upload))
+        // Axum admits 2 MiB by default, which no recording clears. The
+        // raised limit is layered on this one route: every other route keeps
+        // the default, so widening what an upload may carry does not widen
+        // what anything else may carry.
+        .route(
+            "/chats/{id}/context/upload",
+            post(rs::post_context_upload).layer(axum::extract::DefaultBodyLimit::max(
+                rs::MAX_UPLOAD_BODY_BYTES,
+            )),
+        )
         .route("/chats/{id}/resources", get(rs::get_resources))
         .route(
             "/chats/{id}/resources/{rid}/content",

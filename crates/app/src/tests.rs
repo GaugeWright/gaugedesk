@@ -363,6 +363,23 @@ async fn send_with_key(
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
+/// The same request as {@link send}, with the response body left as bytes.
+///
+/// `send` ends in `String::from_utf8(..).unwrap()`, so it cannot be used to
+/// assert anything about a file that is not text — it panics on exactly the
+/// input such a test exists to check.
+async fn send_bytes(app: &Router, method: &str, uri: &str) -> (StatusCode, Vec<u8>) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
 async fn send_as(
     app: &Router,
     method: &str,
@@ -2873,6 +2890,79 @@ async fn context_upload_ingests_files_into_the_engagement() {
         tree.contains("brief.md"),
         "uploaded file present in the tree: {tree}"
     );
+}
+
+/// A person uploading a recording gets the recording, byte for byte.
+///
+/// The bytes here are deliberately not valid UTF-8. Before the upload path
+/// carried bytes, a lossy decode turned exactly this input into replacement
+/// characters and reported the file as ingested — so a test that uploads text
+/// and reads text back would have passed throughout.
+#[tokio::test]
+async fn context_upload_carries_bytes_that_are_not_text() {
+    use base64::Engine as _;
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"bin-chat"}"#)).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // A RIFF/WAVE header followed by bytes no UTF-8 decoder will accept.
+    let mut recording: Vec<u8> = b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec();
+    recording.extend_from_slice(&[0xff, 0xfe, 0x80, 0x00, 0x01, 0x7f, 0xc0, 0xaf]);
+    assert!(
+        std::str::from_utf8(&recording).is_err(),
+        "the fixture must not be valid UTF-8, or it cannot prove anything"
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&recording);
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/chats/bin-chat/context/upload",
+        Some(&format!(
+            r#"{{"files":[{{"name":"take.wav","content_base64":"{encoded}"}}]}}"#
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "upload accepted: {body}");
+
+    let (s, served) = send_bytes(&app, "GET", "/chats/bin-chat/file?path=take.wav").await;
+    assert_eq!(s, StatusCode::OK, "bytes read back");
+    assert_eq!(
+        served, recording,
+        "the worktree holds the exact bytes uploaded"
+    );
+}
+
+/// Neither and both are refusals, not defaults.
+#[tokio::test]
+async fn context_upload_refuses_an_ambiguous_or_empty_file() {
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"amb-chat"}"#)).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    for (label, payload) in [
+        ("neither", r#"{"files":[{"name":"a.bin"}]}"#),
+        (
+            "both",
+            r#"{"files":[{"name":"a.bin","content":"x","content_base64":"eA=="}]}"#,
+        ),
+        (
+            "not base64",
+            r#"{"files":[{"name":"a.bin","content_base64":"not valid!!"}]}"#,
+        ),
+    ] {
+        let (s, body) = send(
+            &app,
+            "POST",
+            "/chats/amb-chat/context/upload",
+            Some(payload),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{label} refused: {body}");
+        assert!(body.contains("a.bin"), "{label} names the file: {body}");
+    }
 }
 
 #[tokio::test]

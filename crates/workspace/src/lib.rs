@@ -1734,7 +1734,7 @@ impl Engagement {
         }
     }
 
-    pub fn ingest_upload(&self, files: &[(String, String)]) -> Result<usize> {
+    pub fn ingest_upload(&self, files: &[(String, Vec<u8>)]) -> Result<usize> {
         for (name, content) in files {
             let base = Path::new(name)
                 .file_name()
@@ -1744,12 +1744,12 @@ impl Engagement {
                     ))
                 })?
                 .to_string_lossy();
-            self.write_file(&base, content)?;
+            self.write_file_bytes(&base, content)?;
         }
         Ok(files.len())
     }
 
-    pub fn ingest_upload_into(&self, prefix: &str, files: &[(String, String)]) -> Result<usize> {
+    pub fn ingest_upload_into(&self, prefix: &str, files: &[(String, Vec<u8>)]) -> Result<usize> {
         self.ensure_selected_path(prefix)?;
         for (name, content) in files {
             let base = Path::new(name)
@@ -1760,7 +1760,7 @@ impl Engagement {
                     ))
                 })?
                 .to_string_lossy();
-            self.write_file(&format!("{prefix}/{base}"), content)?;
+            self.write_file_bytes(&format!("{prefix}/{base}"), content)?;
         }
         Ok(files.len())
     }
@@ -1830,6 +1830,17 @@ impl Engagement {
     }
 
     pub fn write_file(&self, relative: &str, content: &str) -> Result<()> {
+        self.write_file_bytes(relative, content.as_bytes())
+    }
+
+    /// Write a file from its bytes.
+    ///
+    /// Bytes are the primitive and `&str` is the convenience over it, not the
+    /// other way round: a worktree holds whatever the work put in it, and a
+    /// recording or a picture has no `&str` to be written from. Routing text
+    /// through here keeps one path confining and creating directories, so the
+    /// two cannot drift.
+    pub fn write_file_bytes(&self, relative: &str, content: &[u8]) -> Result<()> {
         self.ensure_projection()?;
         self.ensure_selected_path(relative)?;
         let path = safe_path(&self.path, relative)?;
@@ -2863,8 +2874,8 @@ pub trait ChatWorkspace: Send {
             ))
         }
     }
-    fn ingest_upload(&self, files: &[(String, String)]) -> Result<usize>;
-    fn ingest_upload_into(&self, prefix: &str, files: &[(String, String)]) -> Result<usize> {
+    fn ingest_upload(&self, files: &[(String, Vec<u8>)]) -> Result<usize>;
+    fn ingest_upload_into(&self, prefix: &str, files: &[(String, Vec<u8>)]) -> Result<usize> {
         if prefix.is_empty() {
             self.ingest_upload(files)
         } else {
@@ -3163,10 +3174,10 @@ impl ChatWorkspace for Engagement {
     fn ingest_into(&self, prefix: &str, source: &Path) -> Result<usize> {
         self.ingest_into(prefix, source)
     }
-    fn ingest_upload(&self, files: &[(String, String)]) -> Result<usize> {
+    fn ingest_upload(&self, files: &[(String, Vec<u8>)]) -> Result<usize> {
         self.ingest_upload(files)
     }
-    fn ingest_upload_into(&self, prefix: &str, files: &[(String, String)]) -> Result<usize> {
+    fn ingest_upload_into(&self, prefix: &str, files: &[(String, Vec<u8>)]) -> Result<usize> {
         self.ingest_upload_into(prefix, files)
     }
     fn tree(&self) -> Result<Vec<FileEntry>> {

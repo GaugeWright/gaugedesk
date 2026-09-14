@@ -1738,10 +1738,34 @@ export async function ingestContext(
     return o.ingested;
 }
 
-/** One uploaded context file: a name and its text content (`ENTSEC-5`). */
+/**
+ * One uploaded context file (`ENTSEC-5`): a name, and either its text or its
+ * bytes. Exactly one of `content` and `bytes` must be set — the server refuses
+ * both and neither rather than guessing which was meant.
+ */
 export interface UploadContextFile {
     name: string;
-    content: string;
+    /** The file's text, for a file that has text. */
+    content?: string;
+    /** The file's bytes, for a file that does not. */
+    bytes?: Uint8Array;
+}
+
+/**
+ * Base64 for a byte array, in chunks.
+ *
+ * `String.fromCharCode(...bytes)` is the one-liner and it throws
+ * `RangeError: too many arguments` somewhere above a hundred thousand bytes —
+ * which is to say it works for every file small enough not to matter and fails
+ * for the recordings this path exists to carry.
+ */
+function base64(bytes: Uint8Array): string {
+    const CHUNK = 0x8000;
+    let binary = "";
+    for (let at = 0; at < bytes.length; at += CHUNK) {
+        binary += String.fromCharCode(...bytes.subarray(at, at + CHUNK));
+    }
+    return btoa(binary);
 }
 
 /**
@@ -1759,7 +1783,11 @@ export async function ingestContextUpload(
     targetId?: WorkTargetId,
 ): Promise<number> {
     const o = (await transport.json("POST", `/chats/${id}/context/upload`, {
-        files,
+        files: files.map((f) =>
+            f.bytes === undefined
+                ? { name: f.name, content: f.content ?? "" }
+                : { name: f.name, content_base64: base64(f.bytes) },
+        ),
         ...(targetId ? { target_id: targetId } : {}),
     })) as {
         ingested: number;

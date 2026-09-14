@@ -1388,7 +1388,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
 
     // Files too big to inline as text are skipped rather than uploaded — the ingest
     // endpoint stores content as text, so binaries/blobs don't round-trip anyway.
-    const MAX_UPLOAD_BYTES = 1024 * 1024;
+    // Matches the control plane's own per-file ceiling
+    // (`MAX_UPLOAD_FILE_BYTES`). The server's bound is the rule and this one
+    // is the courtesy that reports a refusal without spending the upload.
+    const MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
 
     // Browser context ingest: a native picker (folder or single file) hands us
     // `File`s; we read their text and upload it (ENTSEC-5). No absolute path is
@@ -1400,7 +1403,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const picked = Array.from(input.files ?? []);
         input.value = ""; // let the same folder/file be picked again later
         if (!picked.length) return;
-        const files: { name: string; content: string }[] = [];
+        const files: import("@gaugewright/control-plane-client").UploadContextFile[] = [];
         const skipped: string[] = [];
         for (const f of picked) {
             if (f.size > MAX_UPLOAD_BYTES) {
@@ -1408,7 +1411,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 continue;
             }
             try {
-                files.push({ name: f.name, content: await f.text() });
+                // Read once, then ask the bytes whether they are text rather
+                // than asking the filename. `File.text()` alone cannot answer
+                // it: a lossy decode does not fail on a picture, it returns
+                // replacement characters, so an upload read that way arrived
+                // corrupted and was reported as ingested.
+                const bytes = new Uint8Array(await f.arrayBuffer());
+                try {
+                    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+                    files.push({ name: f.name, content: text });
+                } catch {
+                    files.push({ name: f.name, bytes });
+                }
             } catch {
                 skipped.push(f.name);
             }

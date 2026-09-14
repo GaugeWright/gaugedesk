@@ -489,9 +489,9 @@ impl ChatWorkspace for ExternalCandidate {
         Ok(file_map(&self.candidate)?.len().saturating_sub(before))
     }
 
-    fn ingest_upload(&self, files: &[(String, String)]) -> Result<usize> {
+    fn ingest_upload(&self, files: &[(String, Vec<u8>)]) -> Result<usize> {
         for (path, body) in files {
-            self.write_file(path, body)?;
+            self.write_file_bytes(path, body)?;
         }
         Ok(files.len())
     }

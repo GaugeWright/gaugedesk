@@ -444,7 +444,7 @@ impl Workbench {
     pub fn ingest_upload_into_engagement(
         &mut self,
         chat_id: &str,
-        files: &[(String, String)],
+        files: &[(String, Vec<u8>)],
         target_id: Option<&str>,
     ) -> Option<Result<(usize, String), String>> {
         let prefix = match self.engagement_context_target_root(chat_id, target_id) {

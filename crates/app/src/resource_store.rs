@@ -745,7 +745,57 @@ pub(crate) async fn post_context(
 #[derive(serde::Deserialize)]
 pub(crate) struct UploadedFile {
     name: String,
-    content: String,
+    /// The file's text, for a file that has text. Exactly one of this and
+    /// `content_base64` must be present.
+    #[serde(default)]
+    content: Option<String>,
+    /// The file's bytes, base64-encoded, for a file that is not text.
+    ///
+    /// A recording, a picture or an archive has no text to send. Before this
+    /// existed the browser read every upload with `File.text()`, which does
+    /// not fail on bytes that are not UTF-8 — it substitutes replacement
+    /// characters — so a picture uploaded here was written to the worktree
+    /// corrupted, and reported as ingested.
+    #[serde(default)]
+    content_base64: Option<String>,
+}
+
+/// The largest single uploaded file this route admits, after decoding.
+///
+/// The bound is here rather than only in the client because the client's is a
+/// courtesy and this one is the rule. The whole body is buffered to decode it,
+/// so this also sizes the route's own body limit below.
+pub(crate) const MAX_UPLOAD_FILE_BYTES: usize = 32 * 1024 * 1024;
+
+/// What the route will read before refusing. Base64 costs four bytes for every
+/// three, and a request carries names and JSON framing besides, so this leaves
+/// room above the decoded ceiling rather than sitting exactly on it.
+pub(crate) const MAX_UPLOAD_BODY_BYTES: usize = 48 * 1024 * 1024;
+
+impl UploadedFile {
+    /// The bytes to write, or why this file cannot be written.
+    ///
+    /// Refusing "neither" and "both" is not pedantry: a client that sends
+    /// neither has read nothing, and a client that sends both has two answers
+    /// and no way to say which it meant. Either silently writing an empty file
+    /// would be worse than a refusal naming the file.
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        use base64::Engine as _;
+        match (&self.content, &self.content_base64) {
+            (Some(_), Some(_)) => Err(format!(
+                "{}: sent both text and bytes; send exactly one",
+                self.name
+            )),
+            (None, None) => Err(format!(
+                "{}: sent neither text nor bytes; send exactly one",
+                self.name
+            )),
+            (Some(text), None) => Ok(text.as_bytes().to_vec()),
+            (None, Some(encoded)) => base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| format!("{}: content_base64 is not valid base64: {e}", self.name)),
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -778,12 +828,27 @@ pub(crate) async fn post_context_upload(
     if body.files.is_empty() {
         return (StatusCode::BAD_REQUEST, "no files uploaded").into_response();
     }
+    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(body.files.len());
+    for file in body.files {
+        let bytes = match file.bytes() {
+            Ok(bytes) => bytes,
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        };
+        if bytes.len() > MAX_UPLOAD_FILE_BYTES {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "{}: {} bytes exceeds the {} byte limit for one uploaded file",
+                    file.name,
+                    bytes.len(),
+                    MAX_UPLOAD_FILE_BYTES
+                ),
+            )
+                .into_response();
+        }
+        files.push((file.name, bytes));
+    }
     let mut wb = wb.lock_unpoisoned();
-    let files: Vec<(String, String)> = body
-        .files
-        .into_iter()
-        .map(|f| (f.name, f.content))
-        .collect();
     let (n, commit) = match wb.ingest_upload_into_engagement(&id, &files, body.target_id.as_deref())
     {
         Some(Ok(out)) => out,
