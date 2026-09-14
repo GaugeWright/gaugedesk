@@ -1150,14 +1150,20 @@ fn expired_session_hint_cookie_header() -> String {
 /// Append both session `Set-Cookie` headers — the `HttpOnly` credential and its JS-readable
 /// hint — so the pair can never drift apart at an issue site.
 pub(crate) fn append_session_cookies(resp: &mut axum::response::Response, credential: &str) {
-    for value in [
-        session_cookie_header(credential),
-        session_hint_cookie_header(),
-    ] {
-        if let Ok(cookie) = axum::http::HeaderValue::from_str(&value) {
-            resp.headers_mut()
-                .append(axum::http::header::SET_COOKIE, cookie);
-        }
+    if let Ok(cookie) = axum::http::HeaderValue::from_str(&session_cookie_header(credential)) {
+        resp.headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
+    }
+    append_session_hint_cookie(resp);
+}
+
+/// Add only the non-credential hint. An authenticated `/auth/login` shortcut uses this to
+/// backfill browsers whose still-valid session predates the hint, without rotating or
+/// exposing the real credential — it is the half of the pair that carries no secret.
+fn append_session_hint_cookie(resp: &mut axum::response::Response) {
+    if let Ok(cookie) = axum::http::HeaderValue::from_str(&session_hint_cookie_header()) {
+        resp.headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
     }
 }
 
@@ -1231,7 +1237,9 @@ pub async fn get_login(
             let post_login = gaugedesk_env::var("OIDC_POST_LOGIN_URL")
                 .filter(|u| !u.trim().is_empty())
                 .unwrap_or_else(|| "/".to_string());
-            return Redirect::to(&post_login).into_response();
+            let mut resp = Redirect::to(&post_login).into_response();
+            append_session_hint_cookie(&mut resp);
+            return resp;
         }
     }
     let sso = {
@@ -2568,6 +2576,22 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(cookies[0].contains("HttpOnly"));
         assert!(cookies[1].starts_with("gw_session_hint=1;"));
         assert!(!cookies[1].contains("HttpOnly"));
+    }
+
+    #[test]
+    fn authenticated_login_shortcut_backfills_only_the_session_hint() {
+        let mut resp = StatusCode::TEMPORARY_REDIRECT.into_response();
+        append_session_hint_cookie(&mut resp);
+        let cookies: Vec<String> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cookies.len(), 1);
+        assert!(cookies[0].starts_with("gw_session_hint=1;"));
+        assert!(!cookies[0].contains("gw_session="));
+        assert!(!cookies[0].contains("HttpOnly"));
     }
 
     #[test]
