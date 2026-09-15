@@ -313,6 +313,14 @@
     },
     {
       "declaration": {
+        "name": "write_file_from_path",
+        "owner": "ChatWorkspace",
+        "signature": "fn write_file_from_path (& self , rel : & str , source : & std :: path :: Path) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
         "name": "archive_workstream",
         "owner": "Workspace",
         "signature": "fn archive_workstream (& self , _workstream_id : & str) -> Result < Vec < String > >"
@@ -976,6 +984,26 @@
         "capability": "ingest_into",
         "count": 1,
         "expression": "eng . ingest_into (& prefix , path)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ingest_streamed_file_into_engagement",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "eng . commit_turn (& format ! (\"ingest uploaded context: {base}\"))",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ingest_streamed_file_into_engagement",
+        "capability": "write_file_from_path",
+        "count": 1,
+        "expression": "eng . write_file_from_path (& relative , source)",
         "file": "crates/app/src/engagement_routes.rs"
       },
       "profile": "editor-and-import"
@@ -2892,6 +2920,36 @@
     },
     {
       "site": {
+        "callable": "admit_streamed_upload",
+        "capability": "publish",
+        "count": 1,
+        "expression": "wb . publish (id , ServerEvent :: Admitted { kind : \"context\" . into () , text : format ! (\"uploaded {n} file(s) -> {handle}\") , } ,)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "admit_streamed_upload",
+        "capability": "remove_file",
+        "count": 2,
+        "expression": "std :: fs :: remove_file (source)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl Drop for StagedUpload::drop",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (path)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
         "callable": "post_context",
         "capability": "publish",
         "count": 1,
@@ -2899,6 +2957,16 @@
         "file": "crates/app/src/resource_store.rs"
       },
       "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "post_context_stream",
+        "capability": "remove_file",
+        "count": 2,
+        "expression": "std :: fs :: remove_file (& source)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "editor-and-import"
     },
     {
       "site": {
@@ -4052,6 +4120,16 @@
     },
     {
       "site": {
+        "callable": "impl ChatWorkspace for Engagement::write_file_from_path",
+        "capability": "write_file_from_path",
+        "count": 1,
+        "expression": "self . write_file_from_path (relative , source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
         "callable": "impl Workspace for Instance::archive_workstream",
         "capability": "archive_workstream",
         "count": 1,
@@ -4492,6 +4570,16 @@
     },
     {
       "site": {
+        "callable": "impl inherent for Engagement::write_file_from_path",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
         "callable": "impl inherent for Instance::create_engagement",
         "capability": "create_engagement_on",
         "count": 1,
@@ -4606,6 +4694,26 @@
         "capability": "write_file",
         "count": 1,
         "expression": "self . write_file (rel , body)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait ChatWorkspace::write_file_from_path",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait ChatWorkspace::write_file_from_path",
+        "capability": "write_file_bytes",
+        "count": 1,
+        "expression": "self . write_file_bytes (rel , & body)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"

@@ -1776,6 +1776,36 @@ function base64(bytes: Uint8Array): string {
  * solo and enterprise modes; enterprise *requires* it, since the server-path
  * ingest is disabled there.
  */
+/**
+ * Stream one file into the engagement (`POST /chats/:id/context/stream`).
+ *
+ * The JSON route base64-encodes into a buffered body, which costs about 2.3x
+ * the file at peak and is capped accordingly. This one sends the bytes as the
+ * body, so a recording is bounded by the server's disk rather than by the
+ * request. One file per request: streaming several would mean multipart, and a
+ * caller that wants several can call this several times.
+ */
+export async function streamContextUpload(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    file: { name: string; body: Blob },
+    targetId?: WorkTargetId,
+): Promise<number> {
+    const query = new URLSearchParams({ name: file.name });
+    if (targetId) query.set("target_id", targetId);
+    const res = await request(transport, `/chats/${id}/context/stream?${query}`, {
+        method: "POST",
+        headers: {
+            "idempotency-key": newIdempotencyKey(),
+            "content-type": "application/octet-stream",
+        },
+        body: file.body,
+    });
+    if (!res.ok) throw new Error(`stream ${file.name}: ${res.status} ${await res.text()}`);
+    const o = (await res.json()) as { ingested: number };
+    return o.ingested;
+}
+
 export async function ingestContextUpload(
     transport: WorkbenchTransport,
     id: EngagementId,

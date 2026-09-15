@@ -1481,6 +1481,10 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.ingestContextUpload(this.workbenchTransport(), id, files, targetId);
     }
 
+    streamContextUpload(id: EngagementId, file: { name: string; body: Blob }, targetId?: WorkTargetId): Promise<number> {
+        return workbenchClient.streamContextUpload(this.workbenchTransport(), id, file, targetId);
+    }
+
     openPairing(device: string, bridgeGrant: string | null): Promise<{ pairingId: string; bridgeGrant: string }> {
         return workbenchClient.openPairing(this.workbenchTransport(), device, bridgeGrant);
     }

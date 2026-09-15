@@ -324,6 +324,13 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
                 rs::MAX_UPLOAD_BODY_BYTES,
             )),
         )
+        // No body limit: the handler counts bytes as they arrive and refuses
+        // past its own ceiling. A DefaultBodyLimit here would buffer-cap the
+        // very thing this route exists to stream.
+        .route(
+            "/chats/{id}/context/stream",
+            post(rs::post_context_stream).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .route("/chats/{id}/resources", get(rs::get_resources))
         .route(
             "/chats/{id}/resources/{rid}/content",

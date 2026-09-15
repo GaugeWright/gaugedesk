@@ -1966,6 +1966,32 @@ impl Engagement {
         std::fs::write(path, content).map_err(WorkspaceError::io)
     }
 
+    /// Place an already-written file at `relative`, consuming `source`.
+    ///
+    /// A streamed upload never holds its bytes in memory — they went to a
+    /// staging file as they arrived — so this is how one reaches the worktree.
+    /// A move, not a copy: the point of streaming is not to spend the file's
+    /// size twice at the end of it.
+    ///
+    /// Staging lives under the same state root as the worktree, so the rename
+    /// succeeds. Across a mount boundary it fails with `EXDEV` and a copy is
+    /// the only way through; any other rename failure reappears from the copy
+    /// rather than being swallowed here.
+    pub fn write_file_from_path(&self, relative: &str, source: &Path) -> Result<()> {
+        self.ensure_projection()?;
+        self.ensure_selected_path(relative)?;
+        let path = safe_path(&self.path, relative)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(WorkspaceError::io)?;
+        }
+        if std::fs::rename(source, &path).is_ok() {
+            return Ok(());
+        }
+        std::fs::copy(source, &path).map_err(WorkspaceError::io)?;
+        let _ = std::fs::remove_file(source);
+        Ok(())
+    }
+
     /// The branch's head cut after folding the worktree in — the
     /// explicit importing operation. Observation paths use recorded_file_cut
     /// or observe instead; they must never call this to obtain read metadata.
@@ -3076,6 +3102,18 @@ pub trait ChatWorkspace: Send {
             .map_err(|_| WorkspaceError::msg("this workspace adapter cannot write binary files"))?;
         self.write_file(rel, body)
     }
+    /// Place an already-written file at `rel`, consuming `source`.
+    ///
+    /// The default buffers: an adapter that cannot move a file can still write
+    /// one, and correctness matters more here than the saving. The native
+    /// workspace overrides it with a move, which is the case streaming exists
+    /// for.
+    fn write_file_from_path(&self, rel: &str, source: &std::path::Path) -> Result<()> {
+        let body = std::fs::read(source).map_err(WorkspaceError::io)?;
+        self.write_file_bytes(rel, &body)?;
+        let _ = std::fs::remove_file(source);
+        Ok(())
+    }
     fn remove_file(&self, rel: &str) -> Result<()> {
         let _ = rel;
         Err(WorkspaceError::msg(
@@ -3394,6 +3432,9 @@ impl ChatWorkspace for Engagement {
             std::fs::create_dir_all(parent).map_err(WorkspaceError::io)?;
         }
         std::fs::write(path, content).map_err(WorkspaceError::io)
+    }
+    fn write_file_from_path(&self, relative: &str, source: &std::path::Path) -> Result<()> {
+        self.write_file_from_path(relative, source)
     }
     fn remove_file(&self, relative: &str) -> Result<()> {
         self.ensure_projection()?;

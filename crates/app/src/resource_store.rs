@@ -886,6 +886,292 @@ pub(crate) async fn post_context_upload(
         .into_response()
 }
 
+/// The largest single streamed upload.
+///
+/// The **transfer** costs constant memory — measured flat at ~62 MB of RSS
+/// while an 80 MiB body went to disk. **Admission does not.** `commit_turn`
+/// imports the completed file into the content store, and that read is what
+/// bounds this number: measured, the resident peak grew by ~228 MB for a
+/// 20 MiB file and ~317 MB for an 80 MiB one — a large fixed cost plus rather
+/// more than the file itself, transient but real.
+///
+/// So this ceiling is governed by the commit, not by the request. 512 MiB is
+/// chosen against that measurement rather than derived from it; the earlier
+/// 2 GiB would have asked for several gigabytes at commit time on a machine
+/// that may not have them. Raising it wants incremental import in the content
+/// store, not a larger constant here.
+pub(crate) const MAX_STREAMED_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+// Streaming exists to carry what the buffered route cannot, so a ceiling at or
+// below the buffered one would make the whole path pointless. Checked at
+// compile time: as a runtime assertion over two constants it would test
+// nothing, which is how it first went in.
+const _: () = assert!(MAX_STREAMED_FILE_BYTES > MAX_UPLOAD_FILE_BYTES as u64);
+
+#[derive(serde::Deserialize)]
+pub(crate) struct StreamUploadQuery {
+    /// The uploaded file's name. Only its basename is used; a client does not
+    /// choose a worktree path by naming its upload.
+    name: String,
+    #[serde(default)]
+    target_id: Option<String>,
+    #[serde(default)]
+    classification: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+}
+
+/// A partial upload that removes itself unless the transfer completes.
+///
+/// The client can vanish mid-stream and the handler's future is simply dropped,
+/// so nothing after the loop would run. Without this, every abandoned upload
+/// would leave its bytes in the staging directory forever.
+struct StagedUpload(Option<std::path::PathBuf>);
+
+impl StagedUpload {
+    fn keep(&mut self) -> std::path::PathBuf {
+        self.0.take().expect("staged upload kept twice")
+    }
+}
+
+impl Drop for StagedUpload {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// `POST /chats/:id/context/stream?name=…` — ingest one file without ever
+/// holding it whole.
+///
+/// The buffered sibling (`post_context_upload`) reads its files into memory as
+/// base64 inside a JSON body, which costs about 2.3x the file at peak and caps
+/// accordingly. This route writes each chunk to a staging file as it arrives,
+/// so a recording is bounded by the disk rather than by the request.
+///
+/// It is exempted from the outer idempotency guard, because that guard buffers
+/// the body to hash it — see `streamed_upload_path`. The guarantee is kept
+/// here instead: the same key, the same command identity, and the body hash
+/// computed while streaming, claimed *before* anything is admitted. A replay or
+/// a key reused with different input is refused exactly as the guard refuses
+/// it; only the moment of the claim moves, from before the transfer to after.
+pub(crate) async fn post_context_stream(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Query(query): Query<StreamUploadQuery>,
+    headers: HeaderMap,
+    actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
+    body: axum::body::Body,
+) -> impl IntoResponse {
+    use futures::StreamExt as _;
+    use sha2::{Digest as _, Sha256};
+    use tokio::io::AsyncWriteExt as _;
+
+    let key = match crate::command_idempotency::caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    if std::path::Path::new(&query.name).file_name().is_none() {
+        return (StatusCode::BAD_REQUEST, "name is not a file name").into_response();
+    }
+
+    let (staging_dir, path) = {
+        let wb = wb.lock_unpoisoned();
+        let dir = wb.staging_uploads_dir();
+        // Unique per request: two uploads under one key must not write the same
+        // staging file, or the loser's bytes would land under the winner's name.
+        let unique = crate::command_idempotency::digest(
+            format!(
+                "{}\n{}\n{:?}",
+                key,
+                query.name,
+                std::time::SystemTime::now()
+            )
+            .as_bytes(),
+        );
+        (dir.clone(), dir.join(format!("{unique}.part")))
+    };
+    if let Err(error) = std::fs::create_dir_all(&staging_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("staging directory: {error}"),
+        )
+            .into_response();
+    }
+
+    let mut staged = StagedUpload(Some(path.clone()));
+    let file = match tokio::fs::File::create(&path).await {
+        Ok(file) => file,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("staging file: {error}"),
+            )
+                .into_response()
+        }
+    };
+    let mut writer = tokio::io::BufWriter::new(file);
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("upload interrupted: {error}"),
+                )
+                    .into_response()
+            }
+        };
+        written += chunk.len() as u64;
+        if written > MAX_STREAMED_FILE_BYTES {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "{}: exceeds the {} byte limit for one streamed upload",
+                    query.name, MAX_STREAMED_FILE_BYTES
+                ),
+            )
+                .into_response();
+        }
+        hasher.update(&chunk);
+        if let Err(error) = writer.write_all(&chunk).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("staging write: {error}"),
+            )
+                .into_response();
+        }
+    }
+    if let Err(error) = writer.flush().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("staging flush: {error}"),
+        )
+            .into_response();
+    }
+    if written == 0 {
+        return (StatusCode::BAD_REQUEST, "no bytes uploaded").into_response();
+    }
+    let body_sha256: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    let method = axum::http::Method::POST;
+    let route = format!("/chats/{id}/context/stream");
+    let caller = crate::command_idempotency::caller_hash(&headers);
+    let snapshot = crate::command_idempotency::command_snapshot(
+        &method,
+        &route,
+        &route,
+        &caller,
+        &body_sha256,
+    );
+    let (scope, command_id) =
+        crate::command_idempotency::command_identity(&method, &route, &caller, &key);
+
+    let owner = actor
+        .map(|axum::extract::Extension(actor)| actor.0.as_str().to_owned())
+        .unwrap_or_else(|| wb.lock_unpoisoned().authority().as_str().to_string());
+
+    let source = staged.keep();
+    let outcome = {
+        let mut guard = wb.lock_unpoisoned();
+        match guard
+            .store_mut()
+            .claim_command(&command_id, &scope, &key, &snapshot)
+        {
+            Ok((receipt, claimed)) => {
+                if receipt.snapshot_json != snapshot {
+                    Err((StatusCode::CONFLICT, "key-reused-with-different-input"))
+                } else if !claimed {
+                    Err((StatusCode::CONFLICT, "already applied"))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&source);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("command receipt: {error:?}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+    if let Err((status, message)) = outcome {
+        // A refused claim admits nothing, so the bytes go no further.
+        let _ = std::fs::remove_file(&source);
+        return (status, message).into_response();
+    }
+
+    let response = admit_streamed_upload(&wb, &id, &query, &source, &owner);
+    let status = if response.status().is_success() {
+        "applied"
+    } else if response.status().is_client_error() {
+        "rejected"
+    } else {
+        "expired"
+    };
+    let _ = wb
+        .lock_unpoisoned()
+        .store_mut()
+        .set_command_status(&command_id, status);
+    response
+}
+
+/// Everything after the bytes land, which is the buffered route's path exactly.
+fn admit_streamed_upload(
+    wb: &SharedWorkbench,
+    id: &str,
+    query: &StreamUploadQuery,
+    source: &std::path::Path,
+    owner: &str,
+) -> axum::response::Response {
+    let mut wb = wb.lock_unpoisoned();
+    let (n, commit) = match wb.ingest_streamed_file_into_engagement(
+        id,
+        &query.name,
+        source,
+        query.target_id.as_deref(),
+    ) {
+        Some(Ok(out)) => out,
+        None => {
+            let _ = std::fs::remove_file(source);
+            return (StatusCode::NOT_FOUND, "no such engagement").into_response();
+        }
+        Some(Err(e)) => {
+            let _ = std::fs::remove_file(source);
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
+    };
+    let attributes = context_attributes(query.classification.as_deref(), query.region.as_deref());
+    let label = format!("uploaded: {n} file(s)");
+    let rec = match wb.mint_resource_context(id, owner, &label, &commit, attributes) {
+        Ok(r) => r,
+        Err(e) => return err_response(e),
+    };
+    let handle = rec.resource.id.as_str().to_string();
+    wb.publish(
+        id,
+        ServerEvent::Admitted {
+            kind: "context".into(),
+            text: format!("uploaded {n} file(s) -> {handle}"),
+        },
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ingested": n, "resource": handle })),
+    )
+        .into_response()
+}
+
 /// The context list / output catalog projection (`data.md`): the engagement's
 /// durable resources, rendered as handles and metadata only. Resolving payload
 /// requires the content route and a granted basis (`INV-10`).

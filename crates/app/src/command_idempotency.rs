@@ -43,11 +43,70 @@ pub fn caller_idempotency_key(headers: &HeaderMap) -> Result<String, Response> {
     Ok(key.to_string())
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(crate) fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// The caller this request speaks for, as a hash of the credentials it carried.
+///
+/// Shared with the streamed upload route rather than reimplemented there: two
+/// spellings of "who is this" would let one key claim two commands, which is
+/// exactly what the guard exists to prevent.
+pub(crate) fn caller_hash(headers: &HeaderMap) -> String {
+    let material = format!(
+        "{}\n{}\n{}",
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        headers
+            .get("cookie")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        headers
+            .get("x-gw-publishable-key")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+    );
+    digest(material.as_bytes())
+}
+
+/// `(scope, command_id)` for one caller's key against one route.
+pub(crate) fn command_identity(
+    method: &Method,
+    path: &str,
+    caller_hash: &str,
+    key: &str,
+) -> (String, String) {
+    let scope = format!("http-command:{method}:{path}:{caller_hash}");
+    let command_id = format!(
+        "http-command-{}",
+        digest(format!("{scope}\n{key}").as_bytes())
+    );
+    (scope, command_id)
+}
+
+/// The replay snapshot. The guard hashes a buffered body; the streamed route
+/// hashes the same bytes as they arrive. Same field, same meaning, so a key
+/// reused with different input is refused on either path.
+pub(crate) fn command_snapshot(
+    method: &Method,
+    uri: &str,
+    path: &str,
+    caller_hash: &str,
+    body_sha256: &str,
+) -> String {
+    serde_json::json!({
+        "method": method.as_str(),
+        "path": path,
+        "uri_sha256": digest(uri.as_bytes()),
+        "caller_sha256": caller_hash,
+        "body_sha256": body_sha256,
+    })
+    .to_string()
 }
 
 fn reducer_command_path(path: &str) -> bool {
@@ -76,6 +135,20 @@ fn native_file_save_command(method: &Method, path: &str) -> bool {
     method == Method::POST
         && matches!(parts.as_slice(),
         ["", "chats", chat, "file-actions", "save"] if !chat.is_empty())
+}
+
+// A streamed upload cannot be hashed before it is read, and this guard hashes
+// by buffering. Leaving the route inside it would cap an upload at the buffer
+// and spend the file's size in memory — which is the whole reason the streaming
+// route exists. So it is exempted here and carries the guarantee itself: the
+// handler requires the same `Idempotency-Key`, hashes the bytes as they arrive,
+// and claims the command on that hash before anything is admitted. The claim
+// happens after the transfer instead of before it; what it refuses is the same.
+fn streamed_upload_path(method: &Method, path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    method == Method::POST
+        && matches!(parts.as_slice(),
+        ["", "chats", chat, "context", "stream"] if !chat.is_empty())
 }
 
 fn environment_command_path(path: &str) -> bool {
@@ -115,6 +188,7 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
         // must not prevent delivery of that original result.
         || native_tracker_command_path(request.uri().path())
         || native_file_save_command(&method, request.uri().path())
+        || streamed_upload_path(&method, request.uri().path())
     {
         return next.run(request).await;
     }
@@ -124,25 +198,7 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
         Err(response) => return response,
     };
     let uri = request.uri().to_string();
-    let caller_material = format!(
-        "{}\n{}\n{}",
-        request
-            .headers()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(""),
-        request
-            .headers()
-            .get("cookie")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(""),
-        request
-            .headers()
-            .get("x-gw-publishable-key")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-    );
-    let caller_hash = digest(caller_material.as_bytes());
+    let caller_hash = caller_hash(request.headers());
     let (parts, body) = request.into_parts();
     let bytes = match to_bytes(body, MAX_COMMAND_BODY_BYTES).await {
         Ok(bytes) => bytes,
@@ -154,19 +210,14 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
                 .into_response()
         }
     };
-    let snapshot = serde_json::json!({
-        "method": method.as_str(),
-        "path": parts.uri.path(),
-        "uri_sha256": digest(uri.as_bytes()),
-        "caller_sha256": caller_hash,
-        "body_sha256": digest(&bytes),
-    })
-    .to_string();
-    let scope = format!("http-command:{}:{}:{caller_hash}", method, parts.uri.path());
-    let command_id = format!(
-        "http-command-{}",
-        digest(format!("{scope}\n{key}").as_bytes())
+    let snapshot = command_snapshot(
+        &method,
+        &uri,
+        parts.uri.path(),
+        &caller_hash,
+        &digest(&bytes),
     );
+    let (scope, command_id) = command_identity(&method, parts.uri.path(), &caller_hash, &key);
 
     {
         let mut guard = wb.lock_unpoisoned();
@@ -237,6 +288,34 @@ mod tests {
             "/projects/c/file-actions/save",
         ] {
             assert!(!native_file_save_command(&Method::POST, path));
+        }
+    }
+
+    /// The exemption is a hole in the replay guard, so its shape is pinned:
+    /// one method, one exact path, and nothing that merely looks like it.
+    #[test]
+    fn only_the_exact_streamed_upload_post_leaves_the_outer_guard() {
+        assert!(streamed_upload_path(
+            &Method::POST,
+            "/chats/c/context/stream"
+        ));
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            assert!(!streamed_upload_path(&method, "/chats/c/context/stream"));
+        }
+        for path in [
+            // the buffered sibling keeps the guard
+            "/chats/c/context/upload",
+            "/chats/c/context",
+            "/chats/c/context/stream/",
+            "/chats//context/stream",
+            "/chats/c/context/stream/extra",
+            "//chats/c/context/stream",
+            "/projects/c/context/stream",
+        ] {
+            assert!(
+                !streamed_upload_path(&Method::POST, path),
+                "must not exempt {path}"
+            );
         }
     }
 

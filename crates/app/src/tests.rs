@@ -380,6 +380,21 @@ async fn send_bytes(app: &Router, method: &str, uri: &str) -> (StatusCode, Vec<u
     (status, bytes.to_vec())
 }
 
+/// POST a raw byte body, the way a streaming client does.
+async fn send_stream(app: &Router, uri: &str, body: Vec<u8>, key: &str) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("idempotency-key", key)
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 async fn send_as(
     app: &Router,
     method: &str,
@@ -2963,6 +2978,138 @@ async fn context_upload_refuses_an_ambiguous_or_empty_file() {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{label} refused: {body}");
         assert!(body.contains("a.bin"), "{label} names the file: {body}");
     }
+}
+
+/// A streamed upload lands byte-exact, without the body ever being buffered.
+#[tokio::test]
+async fn streamed_upload_lands_the_exact_bytes() {
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"stream-chat"}"#)).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // Larger than the buffered route's whole-body ceiling would comfortably
+    // allow, and not valid UTF-8, so neither path could have carried it before.
+    let mut recording = Vec::with_capacity(3 * 1024 * 1024);
+    for i in 0..(3 * 1024 * 1024u32) {
+        recording.push((i % 251) as u8);
+    }
+    assert!(std::str::from_utf8(&recording).is_err());
+
+    let (s, body) = send_stream(
+        &app,
+        "/chats/stream-chat/context/stream?name=take.wav",
+        recording.clone(),
+        "stream-key-1",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "streamed upload accepted: {body}");
+
+    let (s, served) = send_bytes(&app, "GET", "/chats/stream-chat/file?path=take.wav").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        served, recording,
+        "the worktree holds the exact bytes streamed"
+    );
+}
+
+/// The streamed route left the outer guard, so it has to refuse a replay on its
+/// own. Same key and same bytes is a replay; same key and different bytes is
+/// the reuse the guard calls out by name.
+#[tokio::test]
+async fn streamed_upload_refuses_a_replay_and_a_reused_key() {
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"replay-chat"}"#)).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    let first = b"one recording".to_vec();
+    let (s, _) = send_stream(
+        &app,
+        "/chats/replay-chat/context/stream?name=a.bin",
+        first.clone(),
+        "replay-key",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, body) = send_stream(
+        &app,
+        "/chats/replay-chat/context/stream?name=a.bin",
+        first,
+        "replay-key",
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "a replay is refused: {body}");
+
+    let (s, body) = send_stream(
+        &app,
+        "/chats/replay-chat/context/stream?name=a.bin",
+        b"different bytes entirely".to_vec(),
+        "replay-key",
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "reused key is refused: {body}");
+    assert!(
+        body.contains("key-reused-with-different-input"),
+        "and says which refusal it is: {body}"
+    );
+}
+
+/// A refused upload admits nothing and leaves nothing staged.
+#[tokio::test]
+async fn a_refused_stream_leaves_no_partial_behind() {
+    let (dir, wb) = seeded_workbench();
+    let staging = wb.lock_unpoisoned().staging_uploads_dir();
+    let app = open_control_plane(wb);
+    let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"partial-chat"}"#)).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    let (s, _) = send_stream(
+        &app,
+        "/chats/partial-chat/context/stream?name=b.bin",
+        b"kept".to_vec(),
+        "partial-key",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // The replay is refused after its bytes have been staged, which is the
+    // case that would leave one behind if the refusal path did not clean up.
+    let (s, _) = send_stream(
+        &app,
+        "/chats/partial-chat/context/stream?name=b.bin",
+        b"kept".to_vec(),
+        "partial-key",
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+
+    let left: Vec<_> = std::fs::read_dir(&staging)
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "staging is empty, found {left:?}");
+    drop(dir);
+}
+
+/// An upload carrying nothing is refused rather than admitted as an empty file.
+#[tokio::test]
+async fn a_stream_with_no_bytes_is_refused() {
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"big-chat"}"#)).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, body) = send_stream(
+        &app,
+        "/chats/big-chat/context/stream?name=empty.bin",
+        Vec::new(),
+        "empty-key",
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "an empty upload is refused: {body}"
+    );
 }
 
 #[tokio::test]

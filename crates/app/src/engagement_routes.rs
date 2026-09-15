@@ -467,6 +467,55 @@ impl Workbench {
         Some(Ok((n, commit)))
     }
 
+    /// Where a streamed upload's bytes accumulate before they are admitted.
+    ///
+    /// Outside every worktree deliberately. `tree()` skips only `.git`, so a
+    /// partial staged inside one would show in the Files panel and could be
+    /// swept into a concurrent turn's commit — a half-written recording
+    /// entering the work history as though it were work.
+    pub fn staging_uploads_dir(&self) -> std::path::PathBuf {
+        self.root.join("staging").join("uploads")
+    }
+
+    /// Admit one streamed file, already complete on disk at `source`.
+    ///
+    /// The bytes arrived without ever being held whole, but everything after
+    /// they land is the buffered route's path exactly: the same target-root
+    /// resolution, the same worktree write, the same `commit_turn`. A streamed
+    /// upload and a posted one differ in transport and in nothing else, which
+    /// is what keeps one admission story rather than two.
+    pub fn ingest_streamed_file_into_engagement(
+        &mut self,
+        chat_id: &str,
+        name: &str,
+        source: &std::path::Path,
+        target_id: Option<&str>,
+    ) -> Option<Result<(usize, String), String>> {
+        let prefix = match self.engagement_context_target_root(chat_id, target_id) {
+            Ok(prefix) => prefix,
+            Err(error) => return Some(Err(error)),
+        };
+        let eng = self.engagements.get(chat_id)?;
+        // The basename only, like the buffered route: a client does not get to
+        // choose a path in the worktree by naming its upload.
+        let base = match std::path::Path::new(name).file_name() {
+            Some(base) => base.to_string_lossy().into_owned(),
+            None => return Some(Err(format!("uploaded file has no name: {name:?}"))),
+        };
+        let relative = match prefix {
+            Some(prefix) => format!("{prefix}/{base}"),
+            None => base.clone(),
+        };
+        if let Err(error) = eng.write_file_from_path(&relative, source) {
+            return Some(Err(error.to_string()));
+        }
+        let commit = match eng.commit_turn(&format!("ingest uploaded context: {base}")) {
+            Ok(commit) => commit.map(|c| c.0).unwrap_or_default(),
+            Err(e) => return Some(Err(e.to_string())),
+        };
+        Some(Ok((1, commit)))
+    }
+
     /// The current file manifest for a live engagement.
     pub fn engagement_tree(&self, chat_id: &str) -> Option<Result<Vec<FileEntry>, WorkspaceError>> {
         self.engagements.get(chat_id).map(|eng| eng.tree())

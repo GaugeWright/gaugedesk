@@ -1410,6 +1410,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // decoded bytes. A recording longer than this wants a route that streams,
     // which is a different shape rather than a larger number here.
     const MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
+    // Past the buffered route's ceiling a file goes to the streaming route
+    // instead, which sends the bytes as the body and never holds them whole.
+    // Below it the batched JSON post is kept: it carries several files in one
+    // request, and for small files that is the cheaper shape.
+    const MAX_STREAM_BYTES = 512 * 1024 * 1024;
 
     // Browser context ingest: a native picker (folder or single file) hands us
     // `File`s; we read their text and upload it (ENTSEC-5). No absolute path is
@@ -1422,10 +1427,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         input.value = ""; // let the same folder/file be picked again later
         if (!picked.length) return;
         const files: import("@gaugewright/control-plane-client").UploadContextFile[] = [];
+        const streamed: File[] = [];
         const skipped: string[] = [];
         for (const f of picked) {
-            if (f.size > MAX_UPLOAD_BYTES) {
+            if (f.size > MAX_STREAM_BYTES) {
                 skipped.push(f.name);
+                continue;
+            }
+            if (f.size > MAX_UPLOAD_BYTES) {
+                // Too big to buffer: send it as a body of its own.
+                streamed.push(f);
                 continue;
             }
             try {
@@ -1445,14 +1456,22 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 skipped.push(f.name);
             }
         }
-        if (!files.length) {
+        if (!files.length && !streamed.length) {
             setStatus(`nothing ingested — ${skipped.length} file(s) too large or unreadable`);
             return;
         }
         const targetId = contextDestination();
         if (targetId === null) return;
         try {
-            const n = await api.ingestContextUpload(id, files, targetId);
+            let n = 0;
+            if (files.length) n += await api.ingestContextUpload(id, files, targetId);
+            // One request each, and sequential: a browser will happily start
+            // several multi-hundred-megabyte uploads at once and then stall
+            // every one of them.
+            for (const f of streamed) {
+                setStatus(`uploading ${f.name}…`);
+                n += await api.streamContextUpload(id, { name: f.name, body: f }, targetId);
+            }
             setStatus(skipped.length ? `ingested ${n} file(s); skipped ${skipped.length}` : `ingested ${n} file(s)`);
             await Promise.all([refetchDiff(), refetchMerge()]);
         } catch (e) {
