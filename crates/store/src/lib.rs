@@ -23,6 +23,7 @@ use gaugedesk_core::{Lifecycle, Rejection};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 pub mod command_dispatch;
+pub mod command_scope_archive;
 mod record_admission;
 
 /// A transparent at-rest transform applied to record payloads of designated

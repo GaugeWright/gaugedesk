@@ -6332,6 +6332,150 @@
       }
     },
     {
+      "id": "home.project-tracker.directory",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/projects/:project/trackers",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "current-recipient-project-workspace-tracker",
+      "capability": "read-native-project-trackers",
+      "requestSchema": "http/path-project",
+      "responseSchema": "ts:@gaugewright/control-plane-client/ReadableProjectTracker[]",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-tracker.test.ts#reads discovered trackers and ordinary backlog through their owning project routes"
+        ],
+        "authority": [
+          "crates/app/src/project_tracker_route_tests.rs#tracker_routes_refuse_anonymous_unreadable_and_incomplete_commands"
+        ],
+        "journey": [
+          "crates/app/src/project_tracker_route_tests.rs#desktop_and_hosted_backlog_completion_use_authenticated_native_receipts"
+        ],
+        "deployed": [],
+        "property": [
+          "web/packages/control-plane-client/src/project-tracker.test.ts#encodes generated project queue and issue identities as single path segments"
+        ]
+      }
+    },
+    {
+      "id": "home.project-tracker.backlog",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/projects/:project/trackers/:queue/issues",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "current-recipient-project-workspace-tracker",
+      "capability": "read-native-project-trackers",
+      "requestSchema": "http/path-project-tracker",
+      "responseSchema": "ts:@gaugewright/control-plane-client/ProjectTrackerBacklog",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-tracker.test.ts#reads discovered trackers and ordinary backlog through their owning project routes"
+        ],
+        "authority": [
+          "crates/app/src/project_tracker_route_tests.rs#tracker_routes_refuse_anonymous_unreadable_and_incomplete_commands"
+        ],
+        "journey": [
+          "crates/app/src/project_tracker_route_tests.rs#desktop_and_hosted_backlog_completion_use_authenticated_native_receipts"
+        ],
+        "deployed": [],
+        "property": [
+          "web/packages/control-plane-client/src/project-tracker.test.ts#encodes generated project queue and issue identities as single path segments"
+        ]
+      }
+    },
+    {
+      "id": "home.project-tracker.tasks",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/projects/:project/trackers/:queue/tasks",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "current-recipient-project-workspace-tracker",
+      "capability": "read-native-project-trackers",
+      "requestSchema": "http/path-project-tracker",
+      "responseSchema": "ts:@gaugewright/control-plane-client/ProjectTrackerTasks",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-tracker.test.ts#reads the Homes authenticated assignments without supplying an actor"
+        ],
+        "authority": [
+          "crates/app/src/project_tracker_route_tests.rs#tracker_routes_refuse_anonymous_unreadable_and_incomplete_commands"
+        ],
+        "journey": [
+          "crates/app/src/project_tracker_route_tests.rs#desktop_and_hosted_backlog_completion_use_authenticated_native_receipts"
+        ],
+        "deployed": [],
+        "property": [
+          "web/packages/control-plane-client/src/project-tracker.test.ts#encodes generated project queue and issue identities as single path segments"
+        ]
+      }
+    },
+    {
+      "id": "home.project-tracker.complete",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/projects/:project/trackers/:queue/issues/:item_id/complete",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "current-recipient-project-workspace-tracker",
+      "capability": "complete-native-tracker-issue",
+      "requestSchema": "rust:gaugedesk-app/project_tracker_routes/CompletionBody+Idempotency-Key",
+      "responseSchema": "rust:gaugedesk-app/project_workflow/ProjectWorkflowStep",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-tracker.test.ts#retains the same explicit completion intent and request key across retries"
+        ],
+        "authority": [
+          "crates/app/src/project_tracker_route_tests.rs#tracker_routes_refuse_anonymous_unreadable_and_incomplete_commands"
+        ],
+        "journey": [
+          "crates/app/src/project_tracker_route_tests.rs#desktop_and_hosted_backlog_completion_use_authenticated_native_receipts"
+        ],
+        "deployed": [],
+        "property": [
+          "web/packages/control-plane-client/src/project-tracker.test.ts#encodes generated project queue and issue identities as single path segments"
+        ]
+      }
+    },
+    {
       "id": "home.navigation.tasks",
       "jurisdiction": "private-home",
       "transport": "http-json",

@@ -2,7 +2,7 @@
 //! current authority before calling this adapter; preparation is not execution.
 
 use gaugedesk_core::{ids::AuthorityId, signature::SigningKey};
-use gaugedesk_store::{CommandRecordFact, Store};
+use gaugedesk_store::{command_dispatch::DispatchReadBasis, CommandRecordFact, Store};
 use gaugedesk_whip_runtime::{
     ifc::VerifiedEnvelope, sign_hosted_policy_envelope, GovernanceRootVerifier,
     HostGovernancePolicy, PolicyEpochRef,
@@ -38,6 +38,15 @@ impl ActionPolicyIdentity {
             "host-action-policy:{}",
             serde_json::to_string(self).map_err(|error| error.to_string())?
         ))
+    }
+
+    fn project_storage_scope(&self, project: &str) -> Result<String, String> {
+        if project.trim().is_empty() || !self.scope.starts_with(&format!("project::{project}::")) {
+            return Err("action policy command does not belong to this project".into());
+        }
+        // Preserve the original command identity in the existing signed record;
+        // only its product storage location changes for this project adapter.
+        Ok(format!("project::{project}::{}", self.storage_scope()?))
     }
 }
 
@@ -115,6 +124,44 @@ pub fn prepare_action_policy(
     signing_key: &SigningKey,
 ) -> Result<RetainedActionPolicy, String> {
     let storage_scope = identity.storage_scope()?;
+    prepare_at(product, &storage_scope, identity, policy, signing_key, None)
+}
+
+/// Retain a project workflow's policy in the project's relocatable record
+/// scopes. `project` and the command identity come from current host admission;
+/// this storage helper grants neither project access nor permission to execute.
+pub fn prepare_project_action_policy(
+    product: &mut Store,
+    project: &str,
+    identity: &ActionPolicyIdentity,
+    policy: &HostGovernancePolicy,
+    signing_key: &SigningKey,
+) -> Result<RetainedActionPolicy, String> {
+    let storage_scope = identity.project_storage_scope(project)?;
+    let handoff_scope = crate::federation::handoff_scope(project);
+    let (_, basis) = product
+        .read_for_dispatch(&[&handoff_scope], |store| {
+            crate::federation::require_project_writes_available(store, project)
+        })
+        .map_err(|error| format!("project policy preparation paused: {error:?}"))?;
+    prepare_at(
+        product,
+        &storage_scope,
+        identity,
+        policy,
+        signing_key,
+        Some(&basis),
+    )
+}
+
+fn prepare_at(
+    product: &mut Store,
+    storage_scope: &str,
+    identity: &ActionPolicyIdentity,
+    policy: &HostGovernancePolicy,
+    signing_key: &SigningKey,
+    basis: Option<&DispatchReadBasis>,
+) -> Result<RetainedActionPolicy, String> {
     policy.validate()?;
     let canonical_policy = canonicalize(&policy.to_json()?)?;
     let issuer = AuthorityId::new(&identity.issuer);
@@ -128,7 +175,7 @@ pub fn prepare_action_policy(
         ACTION_EPOCH,
     ))
     .map_err(|error| error.to_string())?;
-    let candidate = match record(product, &storage_scope)? {
+    let candidate = match record(product, storage_scope)? {
         Some(previous) => {
             verify_record(&previous, identity, &root)?;
             if previous.canonical_policy != canonical_policy {
@@ -150,19 +197,30 @@ pub fn prepare_action_policy(
         }
     };
     verify_record(&candidate, identity, &root)?;
-    product
-        .admit_record_facts(
-            &storage_scope,
-            PREPARATION_KEY,
-            &snapshot,
-            &[CommandRecordFact {
-                scope_id: storage_scope.clone(),
-                kind: POLICY_KIND.into(),
-                payload: serde_json::to_string(&candidate).map_err(|error| error.to_string())?,
-            }],
-        )
-        .map_err(|error| format!("action policy preparation refused: {error:?}"))?;
-    load_action_policy(product, identity, &candidate.policy_ref, &root)
+    let facts = [CommandRecordFact {
+        scope_id: storage_scope.to_owned(),
+        kind: POLICY_KIND.into(),
+        payload: serde_json::to_string(&candidate).map_err(|error| error.to_string())?,
+    }];
+    if let Some(basis) = basis {
+        product
+            .with_dispatch_record_admission(basis, |admission| {
+                admission.commit(storage_scope, PREPARATION_KEY, &snapshot, &facts)
+            })
+            .map_err(|error| format!("project policy authority changed: {error:?}"))?
+            .map_err(|error| format!("project policy preparation refused: {error:?}"))?;
+    } else {
+        product
+            .admit_record_facts(storage_scope, PREPARATION_KEY, &snapshot, &facts)
+            .map_err(|error| format!("action policy preparation refused: {error:?}"))?;
+    }
+    load_at(
+        product,
+        storage_scope,
+        identity,
+        &candidate.policy_ref,
+        &root,
+    )
 }
 
 /// Retrieve using the identity and exact reference from the admitted command.
@@ -174,8 +232,43 @@ pub fn load_action_policy(
     expected: &PolicyEpochRef,
     root: &GovernanceRootVerifier,
 ) -> Result<RetainedActionPolicy, String> {
-    let retained = record(product, &identity.storage_scope()?)?
-        .ok_or("retained action policy is unavailable")?;
+    load_at(
+        product,
+        &identity.storage_scope()?,
+        identity,
+        expected,
+        root,
+    )
+}
+
+/// Read the original signed policy after restart or project relocation. The
+/// caller supplies an independently trusted ORIGINAL signing root, not the
+/// receiving Home's new key or a key taken from the offered payload itself.
+pub fn load_project_action_policy(
+    product: &Store,
+    project: &str,
+    identity: &ActionPolicyIdentity,
+    expected: &PolicyEpochRef,
+    root: &GovernanceRootVerifier,
+) -> Result<RetainedActionPolicy, String> {
+    load_at(
+        product,
+        &identity.project_storage_scope(project)?,
+        identity,
+        expected,
+        root,
+    )
+}
+
+fn load_at(
+    product: &Store,
+    storage_scope: &str,
+    identity: &ActionPolicyIdentity,
+    expected: &PolicyEpochRef,
+    root: &GovernanceRootVerifier,
+) -> Result<RetainedActionPolicy, String> {
+    let retained =
+        record(product, storage_scope)?.ok_or("retained action policy is unavailable")?;
     verify_record(&retained, identity, root)?;
     if &retained.policy_ref != expected {
         return Err("retained action policy differs from the admitted reference".into());
@@ -270,6 +363,189 @@ mod tests {
             capabilities: BTreeSet::from(["file.read".into()]),
             ..HostGovernancePolicy::default()
         }
+    }
+
+    #[test]
+    fn project_policy_relocation_preserves_original_signature_and_preparation_receipt() {
+        let id = ActionPolicyIdentity {
+            scope: "project::one::workflow::start".into(),
+            ..identity()
+        };
+        let key = SigningKey::from_seed(&[41; 32]).unwrap();
+        let root = GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), key.public_key());
+        let mut source = Store::open_in_memory().unwrap();
+        let prepared =
+            prepare_project_action_policy(&mut source, "one", &id, &policy(), &key).unwrap();
+        let scope = id.project_storage_scope("one").unwrap();
+        let archive = source.export_command_scopes(|s| s == scope).unwrap();
+        let wire = serde_json::to_string(&archive).unwrap();
+        let archive = serde_json::from_str(&wire).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receiving-home.sqlite");
+        let mut target = Store::open(path.to_str().unwrap()).unwrap();
+        target
+            .import_command_scopes(&archive, |s| s == scope)
+            .unwrap();
+        drop(target);
+        let mut target = Store::open(path.to_str().unwrap()).unwrap();
+        let loaded =
+            load_project_action_policy(&target, "one", &id, prepared.policy_ref(), &root).unwrap();
+        assert_eq!(loaded.signed_envelope(), prepared.signed_envelope());
+        assert!(load_action_policy(&target, &id, prepared.policy_ref(), &root).is_err());
+
+        // Exact retry consumes the imported preparation receipt; it must not
+        // create a new signature, receipt timestamp or event on the new Home.
+        let replay =
+            prepare_project_action_policy(&mut target, "one", &id, &policy(), &key).unwrap();
+        assert_eq!(replay.signed_envelope(), prepared.signed_envelope());
+        let original_archive: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        let replay_archive =
+            serde_json::to_value(target.export_command_scopes(|s| s == scope).unwrap()).unwrap();
+        for field in ["events", "receipts"] {
+            assert_eq!(
+                replay_archive["scopes"][0][field],
+                original_archive["scopes"][0][field]
+            );
+        }
+        assert_eq!(
+            target
+                .committed_record_snapshot(&scope, PREPARATION_KEY)
+                .unwrap(),
+            source
+                .committed_record_snapshot(&scope, PREPARATION_KEY)
+                .unwrap()
+        );
+        let receiving_key = SigningKey::from_seed(&[42; 32]).unwrap();
+        let receiving_root = GovernanceRootVerifier::new(
+            AuthorityId::new("home:receiver"),
+            receiving_key.public_key(),
+        );
+        assert!(load_project_action_policy(
+            &target,
+            "one",
+            &id,
+            prepared.policy_ref(),
+            &receiving_root,
+        )
+        .is_err());
+        assert!(
+            prepare_project_action_policy(&mut target, "one", &id, &policy(), &receiving_key,)
+                .is_err()
+        );
+        let mut changed = policy();
+        changed.capabilities.insert("file.write".into());
+        assert!(prepare_project_action_policy(&mut target, "one", &id, &changed, &key).is_err());
+        assert_eq!(
+            serde_json::to_value(target.export_command_scopes(|s| s == scope).unwrap()).unwrap(),
+            replay_archive
+        );
+    }
+
+    #[test]
+    fn project_policy_refuses_foreign_scopes_without_falling_back_to_global_evidence() {
+        let mut product = Store::open_in_memory().unwrap();
+        let id = ActionPolicyIdentity {
+            scope: "project::one::workflow::start".into(),
+            ..identity()
+        };
+        let key = SigningKey::from_seed(&[41; 32]).unwrap();
+        let root = GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), key.public_key());
+        let legacy = prepare_action_policy(&mut product, &id, &policy(), &key).unwrap();
+        for project in ["one", "other", "", " "] {
+            assert!(
+                load_project_action_policy(&product, project, &id, legacy.policy_ref(), &root,)
+                    .is_err()
+            );
+        }
+        let before = product.scope_high_water_marks().unwrap();
+        for scope in [
+            "project::one-other::workflow",
+            "project::other::workflow",
+            "project::one",
+            "",
+        ] {
+            let foreign = ActionPolicyIdentity {
+                scope: scope.into(),
+                ..id.clone()
+            };
+            assert!(
+                prepare_project_action_policy(&mut product, "one", &foreign, &policy(), &key,)
+                    .is_err()
+            );
+        }
+        assert_eq!(product.scope_high_water_marks().unwrap(), before);
+        let prepared =
+            prepare_project_action_policy(&mut product, "one", &id, &policy(), &key).unwrap();
+        assert!(
+            load_project_action_policy(&product, "other", &id, prepared.policy_ref(), &root,)
+                .is_err()
+        );
+        assert_eq!(
+            load_action_policy(&product, &id, legacy.policy_ref(), &root)
+                .unwrap()
+                .signed_envelope(),
+            legacy.signed_envelope()
+        );
+    }
+
+    #[test]
+    fn project_policy_preparation_cannot_cross_a_pending_handoff() {
+        use gaugedesk_core::handoff::HandoffEvent;
+        let mut product = Store::open_in_memory().unwrap();
+        let mut id = ActionPolicyIdentity {
+            scope: "project::one::workflow::start".into(),
+            ..identity()
+        };
+        let key = SigningKey::from_seed(&[41; 32]).unwrap();
+        let root = GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), key.public_key());
+        let original =
+            prepare_project_action_policy(&mut product, "one", &id, &policy(), &key).unwrap();
+        let handoff = crate::federation::handoff_scope("one");
+        let (_, basis) = product
+            .read_for_dispatch(&[&handoff], |store| {
+                crate::federation::require_project_writes_available(store, "one")
+            })
+            .unwrap();
+        product
+            .append_record(
+                &handoff,
+                "event",
+                &serde_json::to_string(&HandoffEvent::HandoffOffered).unwrap(),
+            )
+            .unwrap();
+        let before = product.scope_high_water_marks().unwrap();
+        assert!(
+            load_project_action_policy(&product, "one", &id, original.policy_ref(), &root).is_ok()
+        );
+        // Retrying preparation writes command metadata, so even that pauses.
+        assert!(prepare_project_action_policy(&mut product, "one", &id, &policy(), &key).is_err());
+        id.request_id = "prepared-before-offer".into();
+        assert!(prepare_at(
+            &mut product,
+            &id.project_storage_scope("one").unwrap(),
+            &id,
+            &policy(),
+            &key,
+            Some(&basis),
+        )
+        .is_err());
+        assert_eq!(product.scope_high_water_marks().unwrap(), before);
+        product
+            .append_record(
+                &handoff,
+                "event",
+                &serde_json::to_string(&HandoffEvent::LogSynced).unwrap(),
+            )
+            .unwrap();
+        assert!(prepare_project_action_policy(&mut product, "one", &id, &policy(), &key).is_err());
+        product
+            .append_record(
+                &handoff,
+                "event",
+                &serde_json::to_string(&HandoffEvent::HandoffAborted).unwrap(),
+            )
+            .unwrap();
+        assert!(prepare_project_action_policy(&mut product, "one", &id, &policy(), &key).is_ok());
     }
 
     #[test]

@@ -34,6 +34,9 @@ use crate::{
     DEFAULT_PLACEMENT, DEFAULT_PROJECT,
 };
 
+/// Workspace identity, provider format, opaque bytes, and collaboration scope.
+pub(crate) type ProjectRelocationContentBundle = (String, String, Vec<u8>, bool);
+
 pub(crate) fn published_package_root(
     targets_dir: &std::path::Path,
     target_id: &str,
@@ -2977,9 +2980,17 @@ impl Workbench {
         Some(project)
     }
 
-    pub(crate) fn apply_atomic_project_home_rebind(&mut self, project: ProjectRecord) {
+    pub(crate) fn apply_atomic_project_home_rebind(
+        &mut self,
+        project: ProjectRecord,
+        workspace: Option<crate::library::ProjectCollaborationWorkspaceRecord>,
+    ) {
         let id = project.id.clone();
         self.library.apply_project(project);
+        if let Some(workspace) = workspace {
+            self.library
+                .apply_project_collaboration_workspace(workspace);
+        }
         self.notify_library_changed("project", &id, "upsert");
     }
 
@@ -3074,7 +3085,8 @@ impl Workbench {
     pub(crate) fn library_project_relocation_content_bundles(
         &self,
         project: &str,
-    ) -> Vec<(String, String, Vec<u8>, bool)> {
+        protection: Option<&gaugedesk_workspace::WorkflowProtection>,
+    ) -> std::io::Result<Vec<ProjectRelocationContentBundle>> {
         let mut out = Vec::new();
         let mut target_ids = self
             .library
@@ -3107,42 +3119,51 @@ impl Workbench {
             if target.kind != WorkTargetKind::Managed {
                 continue;
             }
-            match self.targets.get(&target.id) {
-                Some(inst) => match inst.export() {
-                    Ok(export) => out.push((
-                        target.id.clone(),
-                        inst.export_format().to_string(),
-                        export.0,
-                        false,
-                    )),
-                    Err(e) => {
-                        tracing::warn!("handoff: cannot bundle target {}: {e}", target.id)
-                    }
-                },
-                None => tracing::warn!("handoff: no live store for target {}", target.id),
-            }
+            let inst = self.targets.get(&target.id).ok_or_else(|| {
+                std::io::Error::other(format!("no live store for target {}", target.id))
+            })?;
+            let export = inst.export().map_err(|error| {
+                std::io::Error::other(format!("cannot bundle target {}: {error}", target.id))
+            })?;
+            out.push((
+                target.id.clone(),
+                inst.export_format().to_string(),
+                export.0,
+                false,
+            ));
         }
         if let Some(record) = self.library.project_collaboration_workspaces.get(project) {
-            match self.collaboration_workspaces.get(&record.workspace_id) {
-                Some(workspace) => match workspace.export() {
-                    Ok(export) => out.push((
-                        record.workspace_id.clone(),
-                        workspace.export_format().to_owned(),
-                        export.0,
-                        true,
-                    )),
-                    Err(error) => tracing::warn!(
-                        "handoff: cannot bundle collaboration workspace {}: {error}",
+            let workspace = self
+                .collaboration_workspaces
+                .get(&record.workspace_id)
+                .ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "project collaboration workspace {} is not open",
                         record.workspace_id
-                    ),
-                },
-                None => tracing::warn!(
-                    "handoff: project collaboration workspace {} is not open",
-                    record.workspace_id
-                ),
+                    ))
+                })?;
+            let export = match protection {
+                Some(protection) => workspace.export_protected_workflow(protection),
+                None => workspace.export(),
             }
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "cannot bundle collaboration workspace {}: {error}",
+                    record.workspace_id
+                ))
+            })?;
+            out.push((
+                record.workspace_id.clone(),
+                if protection.is_some() {
+                    gaugedesk_workspace::PROTECTED_EXPORT_FORMAT.to_owned()
+                } else {
+                    workspace.export_format().to_owned()
+                },
+                export.0,
+                true,
+            ));
         }
-        out
+        Ok(out)
     }
 
     fn library_op_str(op: RecordOp) -> &'static str {

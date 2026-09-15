@@ -113,8 +113,13 @@ impl Workbench {
         admission: &ActionAdmissionReceipt,
         runtime: &GovernedHostFacade<NativeStores>,
     ) -> Result<ActionResultSnapshot, String> {
-        let prepared =
-            self.prepare_native_corrections(context, inputs, command, runtime.policy_ref())?;
+        let prepared = self.prepare_native_corrections_access(
+            context,
+            inputs,
+            command,
+            runtime.policy_ref(),
+            NativeActionAccess::Inspect,
+        )?;
         self.store_mut()
             .with_dispatch_basis(&prepared.basis, || {
                 read_evidence(runtime, command, admission, &prepared.key)
@@ -192,10 +197,9 @@ impl Workbench {
             self.prepare_native_corrections(context, inputs, command, runtime.policy_ref())?;
         let recording = delivery::registered_recording_workflow(command)?;
         let input = &command.inputs["corrections"];
-        inputs
-            .with_resolved(input, |resolved| {
-                self.store_mut()
-                    .with_dispatch_basis(&prepared.basis, || -> StoreResult<_> {
+        self.store_mut()
+            .with_dispatch_basis(&prepared.basis, || {
+                inputs.with_resolved(input, |resolved| -> StoreResult<_> {
                         let mapping = prepared.input_binding.as_ref()
                             .ok_or_else(|| refused("correction has no original Home input mapping"))?;
                         if mapping.input() != input || mapping.content_hash() != resolved.content_hash {
@@ -271,9 +275,9 @@ impl Workbench {
                                 &mut target,
                             )
                             .map_err(refused)
-                    })
-                    .map_err(refused)?
+                })
             })
+            .map_err(|error| format!("{error:?}"))?
             .map_err(|error| format!("{error:?}"))
     }
 }

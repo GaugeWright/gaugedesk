@@ -280,3 +280,69 @@ fn correction_delivery_requires_original_history_beside_the_receipt_and_outbox()
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn pending_handoff_fences_correction_admission_and_delivery() {
+    use gaugedesk_core::handoff::HandoffEvent;
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, command, inputs, token) = fixture(dir.path());
+    let mut wb = shared.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let mut runtime = editor_runtime(&wb, &command, dir.path());
+    let prepared = wb
+        .prepare_native_corrections(&context, &inputs, &command, &command.policy)
+        .unwrap();
+    let (_, project, chat, path): (String, String, String, String) =
+        serde_json::from_str(&command.scope).unwrap();
+    let scope = crate::federation::handoff_scope(&project);
+    wb.store_mut()
+        .append_record(
+            &scope,
+            "event",
+            &serde_json::to_string(&HandoffEvent::HandoffOffered).unwrap(),
+        )
+        .unwrap();
+    assert!(wb
+        .store_mut()
+        .with_dispatch_basis(&prepared.basis, || {
+            panic!("correction entered runtime after handoff offer")
+        })
+        .is_err());
+    assert!(wb
+        .deliver_editor_corrections(&context, &inputs, &command, &mut runtime)
+        .unwrap_err()
+        .contains("pending handoff"));
+    assert!(runtime
+        .kernel()
+        .store()
+        .list_instances()
+        .unwrap()
+        .is_empty());
+    let corrections = input("another correction");
+    let before = wb.store_ref().scope_high_water_marks().unwrap();
+    assert!(wb
+        .admit_editor_corrections(
+            &context,
+            &inputs,
+            &EditorCorrections {
+                chat_id: &chat,
+                request_id: "during-handoff",
+                path: &path,
+                corrections: &corrections,
+            }
+        )
+        .err()
+        .unwrap()
+        .contains("pending handoff"));
+    assert_eq!(wb.store_ref().scope_high_water_marks().unwrap(), before);
+    wb.store_mut()
+        .append_record(
+            &scope,
+            "event",
+            &serde_json::to_string(&HandoffEvent::HandoffAborted).unwrap(),
+        )
+        .unwrap();
+    wb.deliver_editor_corrections(&context, &inputs, &command, &mut runtime)
+        .unwrap();
+    assert_eq!(runtime.kernel().store().list_instances().unwrap().len(), 1);
+}

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { browserRouteEventStream, browserRouteJson } from "./browser-route-json";
+import { browserRouteEventStream, browserRouteJson, RouteResponseError } from "./browser-route-json";
 import { Rejected } from "./control-plane-domain";
 
 /** Stub `fetch` with a canned Response for the one call under test. */
@@ -13,6 +13,16 @@ function stubFetch(res: Response) {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("browserRouteJson error surfacing", () => {
+    it("retains HTTP status separately from the existing error message", async () => {
+        for (const status of [401, 403, 503]) {
+            stubFetch(new Response(JSON.stringify({ error: "read refused" }), { status }));
+            const failure = await browserRouteJson("http://cp")("GET", "/projects/p/trackers").catch(error => error);
+            expect(failure).toBeInstanceOf(RouteResponseError);
+            if (!(failure instanceof RouteResponseError)) throw new Error("Expected an HTTP response error");
+            expect(failure.status).toBe(status);
+            expect(failure.message).toContain("read refused");
+        }
+    });
     it("carries a caller key on mutations and never adds one to reads", async () => {
         const fetch = vi
             .fn()

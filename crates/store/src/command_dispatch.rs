@@ -29,6 +29,28 @@ impl DispatchReadBasis {
         self
     }
 
+    /// Combine independently captured resource observations for one admission.
+    /// Overlapping scopes must agree; all heads and the earliest deadline are
+    /// checked again under the final writer transaction. This grants no access.
+    pub fn combine(mut self, other: Self) -> Result<Self, AdmitError> {
+        if self.store_path != other.store_path
+            || other.heads.iter().any(|(scope, head)| {
+                self.heads
+                    .get(scope)
+                    .is_some_and(|existing| existing != head)
+            })
+        {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "resource observations have incompatible dispatch bases",
+            }));
+        }
+        self.heads.extend(other.heads);
+        if let Some(deadline) = other.deadline {
+            self = self.with_deadline(deadline);
+        }
+        Ok(self)
+    }
+
     pub fn deadline(&self) -> Option<std::time::SystemTime> {
         self.deadline
     }
@@ -44,6 +66,40 @@ pub struct DispatchRecordAdmission<'tx> {
 }
 
 impl DispatchRecordAdmission<'_> {
+    /// Stage caller-selected original commands, events and receipts in this
+    /// admission's transaction. Nothing is committed until the returned handle
+    /// is committed; dropping it rolls the import back with the admission.
+    ///
+    /// This consumes the handle so an import error rolls back the transaction
+    /// rather than leaving a partially imported archive a caller could commit.
+    /// Exact existing state is a replay; conflicting state is never overwritten.
+    /// Scope selection and current authority remain the caller's responsibility.
+    pub fn import_command_scopes(
+        self,
+        archive: &crate::command_scope_archive::CommandScopeArchive,
+        allowed: impl Fn(&str) -> bool,
+    ) -> Result<Self, AdmitError> {
+        crate::command_scope_archive::import_into(&self.tx, self.codec.as_ref(), archive, allowed)?;
+        Ok(self)
+    }
+
+    /// Commit a lifecycle command and its runtime outbox while external input
+    /// and base retention are held inside this product-first writer boundary.
+    /// The handle is consumed; a failed publisher before this call rolls back.
+    pub fn commit_dispatch<L: Lifecycle>(
+        self,
+        scope_id: &str,
+        idempotency_key: &str,
+        command: L::Command,
+        dispatch: &CommandDispatch,
+    ) -> Result<MaterializedAdmission<L::State>, AdmitError>
+    where
+        L::Command: serde::Serialize,
+    {
+        let prepared = PreparedDispatch::<L>::new(scope_id, idempotency_key, command, dispatch)?;
+        commit_dispatch::<L>(self.tx, prepared)
+    }
+
     /// Consume the held source fence to publish normal lifecycle admission and
     /// its outbox while external input/evidence retention still holds. Check the
     /// separately captured destination standing inside this same transaction.
@@ -157,6 +213,25 @@ fn check_dispatch_basis(
 }
 
 impl Store {
+    /// Serialize internal record preparation before taking external retention
+    /// locks. This grants no product authority; a caller whose admission relies
+    /// on current product standing must use `with_dispatch_record_admission`.
+    pub fn with_record_admission<T>(
+        &mut self,
+        publish: impl for<'tx> FnOnce(DispatchRecordAdmission<'tx>) -> T,
+    ) -> Result<T, AdmitError> {
+        let codec = self.codec.clone();
+        let store_path = self.path.clone();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Ok(publish(DispatchRecordAdmission {
+            tx,
+            codec,
+            store_path,
+        }))
+    }
+
     /// Fence current product standing before entering a bounded evidence
     /// publisher. Commit through the one-use handle inside that publisher's
     /// retention callback, so both exclusions span the product commit. No network
@@ -591,6 +666,36 @@ mod tests {
     use super::*;
     use gaugedesk_core::run::{RunCommand, RunPhase, RunState};
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn combining_resource_bases_preserves_all_heads_and_the_shortest_deadline() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (_, left) = store
+            .read_for_dispatch(&["left", "shared"], |_| Ok(()))
+            .unwrap();
+        let (_, right) = store
+            .read_for_dispatch(&["right", "shared"], |_| Ok(()))
+            .unwrap();
+        let sooner = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let basis = left
+            .with_deadline(sooner)
+            .combine(right.with_deadline(sooner + std::time::Duration::from_secs(60)))
+            .unwrap();
+        assert_eq!(basis.deadline(), Some(sooner));
+        store.with_dispatch_basis(&basis, || ()).unwrap();
+        store.append_record("right", "grant", "changed").unwrap();
+        assert!(store
+            .with_dispatch_basis(&basis, || panic!("stale combined basis"))
+            .is_err());
+        let (_, before) = store.read_for_dispatch(&["shared"], |_| Ok(())).unwrap();
+        store.append_record("shared", "grant", "changed").unwrap();
+        let (_, after) = store.read_for_dispatch(&["shared"], |_| Ok(())).unwrap();
+        assert!(before.combine(after).is_err());
+        let other = Store::open_in_memory().unwrap();
+        let (_, here) = store.read_for_dispatch(&["shared"], |_| Ok(())).unwrap();
+        let (_, there) = other.read_for_dispatch(&["shared"], |_| Ok(())).unwrap();
+        assert!(here.combine(there).is_err());
+    }
 
     #[test]
     fn expired_authority_refuses_command_and_runtime_entry_without_changed_events() {

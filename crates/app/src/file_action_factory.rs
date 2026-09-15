@@ -162,6 +162,21 @@ struct NativeTargetIntent<'a> {
 }
 
 #[derive(Clone, Copy)]
+enum NativeActionAccess {
+    Inspect,
+    Mutate,
+}
+
+impl NativeActionAccess {
+    fn require_available(self, store: &Store, project: &str) -> Result<(), AdmitError> {
+        match self {
+            Self::Inspect => Ok(()),
+            Self::Mutate => crate::federation::require_project_writes_available(store, project),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum NativeActionKind {
     FileSave,
     RecordCorrections,
@@ -194,46 +209,7 @@ fn current_target_authority_with_source(
             "file action has invalid intent or targets a control surface",
         ));
     }
-    let mut valid_until_ms = None;
-    match context.authentication() {
-        ActorAuthentication::AccountSession { session_ref } => {
-            // An unavailable source record cannot disappear from an authority
-            // fold and expose an older still-active session or grant.
-            store.retained_events(crate::account_auth::ACCOUNT_AUTH_SCOPE)?;
-            let auth = crate::account_auth::AccountAuth::rebuild(store)?;
-            let session = auth
-                .sessions
-                .get(session_ref)
-                .ok_or_else(|| invalid("account action session is not durably active"))?;
-            let expires = session
-                .issued_at_ms
-                .saturating_add(session.lifetime_secs.saturating_mul(1000));
-            valid_until_ms = Some(expires);
-            if session.account_id != context.actor().as_str()
-                || expires <= crate::account::session_now_ms()
-            {
-                return Err(invalid(
-                    "account action session is expired or belongs to another actor",
-                ));
-            }
-        }
-        ActorAuthentication::MachineController { grant_ref } => {
-            store.retained_events(crate::mobile_machine_session::SCOPE)?;
-            let grant = crate::mobile_machine_session::current_action_grant(store, grant_ref)?
-                .ok_or_else(|| invalid("controller action grant is not active"))?;
-            if &grant.machine != home || grant.device.as_str() != context.actor().as_str() {
-                return Err(invalid(
-                    "controller action grant has the wrong Home or device",
-                ));
-            }
-        }
-        ActorAuthentication::IdentityProvider => {}
-        ActorAuthentication::NativeEditorDispatchGrant { .. } => {
-            return Err(invalid(
-                "action-scoped authority requires its exact admitted command",
-            ));
-        }
-    }
+    let valid_until_ms = crate::identity::revalidate_action_context(store, home, context)?;
     let library = Library::rebuild(store)?;
     let org = Org::rebuild(store)?;
     let chat = library
@@ -422,7 +398,11 @@ impl Workbench {
             return Err("file input custody belongs to another Home".into());
         }
         let home = self.home_id().clone();
-        let read = |store: &Store| current_authority(store, &home, context, request);
+        let read = |store: &Store| {
+            let authority = current_authority(store, &home, context, request)?;
+            crate::federation::require_project_writes_available(store, &authority.project_id)?;
+            Ok(authority)
+        };
         let (authority, preparation_basis) = self
             .store_ref()
             .read_for_dispatch(
@@ -556,6 +536,7 @@ impl Workbench {
                 .fingerprint()
                 .map_err(|error| format!("invalid editor action: {error:?}"))?,
         };
+        let handoff_scope = crate::federation::handoff_scope(&authority.project_id);
         let (current, basis) = self
             .store_ref()
             .read_for_dispatch(
@@ -564,6 +545,7 @@ impl Workbench {
                     ORG_SCOPE,
                     crate::account_auth::ACCOUNT_AUTH_SCOPE,
                     crate::mobile_machine_session::SCOPE,
+                    &handoff_scope,
                 ],
                 read,
             )

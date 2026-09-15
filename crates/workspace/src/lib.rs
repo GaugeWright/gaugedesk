@@ -54,6 +54,15 @@ pub use resolution_recording_target::{
     NativeResolutionRecordingEvidenceTarget, NativeResolutionRecordingTarget,
 };
 
+mod import_receipt;
+mod snapshot;
+mod workflow_source;
+mod workflow_storage;
+pub use workflow_source::WorkflowSource;
+pub use workflow_storage::{
+    NativeWorkflowStorage, NativeWorkflowStores, WorkflowProtection, WorkflowProtectionMode,
+};
+
 /// Host-owned per-chat materializations are never target history. The runtime
 /// mount contains the selected archetype discipline; it is recreated from the
 /// immutable archetype version and layered read-only by the sandbox.
@@ -140,14 +149,18 @@ fn cancel_promotion_under_writers(
 /// Same-provider export envelope: raw snapshots of the native VCS and
 /// workstream-authority stores. Full fidelity (every branch, cut, op, blob,
 /// stream, membership, and branch-home receipt travels), version-stamped.
-pub const EXPORT_FORMAT: &str = "whipplescript-vcs-export-v2";
-const EXPORT_MAGIC: &[u8; 8] = b"WSVCSEX2";
+pub const EXPORT_FORMAT: &str = "whipplescript-vcs-export-v3";
+const EXPORT_MAGIC: &[u8; 8] = b"WSVCSEX3";
+pub const PROTECTED_EXPORT_FORMAT: &str = "whipplescript-vcs-export-v4";
+const PROTECTED_EXPORT_MAGIC: &[u8; 8] = b"WSVCSEX4";
+const V2_EXPORT_MAGIC: &[u8; 8] = b"WSVCSEX2";
 const LEGACY_EXPORT_MAGIC: &[u8; 8] = b"WSVCSEX1";
 
 struct ExportStores {
     branches: Vec<u8>,
     content: Vec<u8>,
     workstreams: Option<Vec<u8>>,
+    workflow: Option<workflow_storage::WorkflowSnapshot>,
 }
 
 #[derive(Debug)]
@@ -411,15 +424,40 @@ impl Instance {
     }
 
     pub fn export(&self) -> Result<WorkspaceExport> {
-        let _ = self.store()?;
+        self.export_inner(None)
+    }
+
+    /// Export one protected workflow plane under already prepared host custody.
+    pub fn export_protected_workflow(
+        &self,
+        protection: &WorkflowProtection,
+    ) -> Result<WorkspaceExport> {
+        protection.retain(|| self.export_inner(Some(protection)))
+    }
+
+    fn export_inner(&self, protection: Option<&WorkflowProtection>) -> Result<WorkspaceExport> {
+        // Export observes initialized VCS authority. Missing branches/content
+        // are an error, never an invitation to initialize replacement state.
+        let _ = NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?;
+        // Older workspaces initialize their optional workstream plane lazily.
         let _ = self.workstreams()?;
-        let branches = snapshot_sqlite(&self.store_root.join("branches.sqlite"))?;
-        let content = snapshot_sqlite(&self.store_root.join("content.sqlite"))?;
-        let workstreams = snapshot_sqlite(&self.store_root.join("workstreams.sqlite"))?;
+        let ([branches, content, workstreams], workflow) =
+            self.native_workflow_storage().snapshot_with_vcs(
+                [
+                    self.store_root.join("branches.sqlite"),
+                    self.store_root.join("content.sqlite"),
+                    self.store_root.join("workstreams.sqlite"),
+                ],
+                protection,
+            )?;
         Ok(WorkspaceExport(encode_export(
             &branches,
             &content,
             &workstreams,
+            workflow.as_ref(),
         )))
     }
 
@@ -428,30 +466,75 @@ impl Instance {
     }
 
     pub fn from_export_at(dir: impl AsRef<Path>, export: &[u8]) -> Result<Self> {
+        Self::from_export_inner(dir.as_ref(), export, None)
+    }
+
+    pub fn from_protected_export_at(
+        dir: impl AsRef<Path>,
+        export: &[u8],
+        protection: &WorkflowProtection,
+    ) -> Result<Self> {
+        protection.retain(|| Self::from_export_inner(dir.as_ref(), export, Some(protection)))
+    }
+
+    fn from_export_inner(
+        dir: &Path,
+        export: &[u8],
+        protection: Option<&WorkflowProtection>,
+    ) -> Result<Self> {
         let ExportStores {
             branches,
             content,
             workstreams,
+            workflow,
         } = parse_export(export)?;
-        let dir = dir.as_ref();
+        if protection.is_some()
+            && workflow
+                .as_ref()
+                .is_none_or(|snapshot| !snapshot.binding.is_protected())
+        {
+            return Err(WorkspaceError::msg(
+                "protected import requires a protected workflow plane",
+            ));
+        }
         let repo = dir.join("repo");
         let worktrees = dir.join("worktrees");
         let store_root = store_root_for(&repo);
+        if store_root.exists() {
+            let instance = Self {
+                repo,
+                worktrees,
+                store_root,
+            };
+            import_receipt::resume(&instance, export, workflow.as_ref(), protection)?;
+            return Ok(instance);
+        }
         std::fs::create_dir_all(&repo).map_err(WorkspaceError::io)?;
         std::fs::create_dir_all(&worktrees).map_err(WorkspaceError::io)?;
-        std::fs::create_dir_all(&store_root).map_err(WorkspaceError::io)?;
-        std::fs::write(store_root.join("branches.sqlite"), branches).map_err(WorkspaceError::io)?;
-        std::fs::write(store_root.join("content.sqlite"), content).map_err(WorkspaceError::io)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".workspace-import-")
+            .tempdir_in(dir)
+            .map_err(WorkspaceError::io)?;
+        let staged_root = staging.path();
+        std::fs::write(staged_root.join("branches.sqlite"), branches)
+            .map_err(WorkspaceError::io)?;
+        std::fs::write(staged_root.join("content.sqlite"), content).map_err(WorkspaceError::io)?;
         if let Some(workstreams) = workstreams {
-            std::fs::write(store_root.join("workstreams.sqlite"), workstreams)
+            std::fs::write(staged_root.join("workstreams.sqlite"), workstreams)
                 .map_err(WorkspaceError::io)?;
         }
-        write_substrate_stamp(&store_root)?;
-        let instance = Self {
+        write_substrate_stamp(staged_root)?;
+        let mut instance = Self {
             repo,
             worktrees,
-            store_root,
+            store_root: staged_root.to_path_buf(),
         };
+        let has_workflow = workflow.is_some();
+        if let Some(workflow) = workflow {
+            instance
+                .native_workflow_storage()
+                .restore(workflow, protection)?;
+        }
         // A legacy v1 export had no topology store. Open creates an empty one;
         // v2 opens and validates the transported authoritative state.
         let _ = instance.workstreams()?;
@@ -462,7 +545,36 @@ impl Instance {
             MAINLINE_BRANCH_ID,
             &instance.repo,
         )?;
+        drop(vcs);
         let _ = instance.reconcile_engagements()?;
+        import_receipt::write(&instance, export, has_workflow)?;
+        for name in [
+            "branches.sqlite",
+            "content.sqlite",
+            "workstreams.sqlite",
+            "substrate.json",
+            import_receipt::FILE,
+        ] {
+            let path = staged_root.join(name);
+            if path.is_file() {
+                // Windows FlushFileBuffers requires a writable file handle.
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .map_err(WorkspaceError::io)?
+                    .sync_all()
+                    .map_err(WorkspaceError::io)?;
+            }
+        }
+        import_receipt::sync_directory(staged_root)?;
+        std::fs::rename(staged_root, &store_root).map_err(WorkspaceError::io)?;
+        #[cfg(unix)]
+        std::fs::File::open(dir)
+            .map_err(WorkspaceError::io)?
+            .sync_all()
+            .map_err(WorkspaceError::io)?;
+        instance.store_root = store_root;
         Ok(instance)
     }
 
@@ -471,17 +583,21 @@ impl Instance {
     }
 
     pub fn fork_from_at(dir: impl AsRef<Path>, source: &PeerSource) -> Result<Self> {
-        let branches = snapshot_sqlite(&source.0.join("branches.sqlite"))?;
-        let content = snapshot_sqlite(&source.0.join("content.sqlite"))?;
+        let _ = NativeWorkspaceVcs::open_read_only(
+            source.0.join("branches.sqlite"),
+            source.0.join("content.sqlite"),
+        )?;
         let workstreams_path = source.0.join("workstreams.sqlite");
-        let workstreams = if workstreams_path.exists() {
-            snapshot_sqlite(&workstreams_path)?
-        } else {
+        if !workstreams_path.exists() {
             let store = WorkstreamStore::open(&workstreams_path)?;
             drop(store);
-            snapshot_sqlite(&workstreams_path)?
-        };
-        let export = encode_export(&branches, &content, &workstreams);
+        }
+        let [branches, content, workstreams] = snapshot::snapshot_stores([
+            source.0.join("branches.sqlite"),
+            source.0.join("content.sqlite"),
+            workstreams_path,
+        ])?;
+        let export = encode_export(&branches, &content, &workstreams, None);
         Self::from_export_at(dir, &export)
     }
 
@@ -2559,74 +2675,105 @@ fn render_diff(entries: &[DiffEntry]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-/// A consistent point-in-time copy of one sqlite file (WAL-safe: VACUUM
-/// INTO serializes through the connection, not the filesystem).
-fn snapshot_sqlite(path: &Path) -> Result<Vec<u8>> {
-    if !path.exists() {
-        return Err(WorkspaceError::msg(format!(
-            "no store file at {}",
-            path.display()
-        )));
+fn encode_export(
+    branches: &[u8],
+    content: &[u8],
+    workstreams: &[u8],
+    workflow: Option<&workflow_storage::WorkflowSnapshot>,
+) -> Vec<u8> {
+    let protected = workflow.is_some_and(|snapshot| snapshot.binding.is_protected());
+    let mut bytes = if protected {
+        PROTECTED_EXPORT_MAGIC
+    } else {
+        EXPORT_MAGIC
     }
-    let connection =
-        rusqlite::Connection::open(path).map_err(|error| WorkspaceError::msg(error.to_string()))?;
-    let target = path.with_extension(format!("snapshot-{:x}", now_nanos()));
-    let _ = std::fs::remove_file(&target);
-    connection
-        .execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])
-        .map_err(|error| WorkspaceError::msg(error.to_string()))?;
-    let bytes = std::fs::read(&target).map_err(WorkspaceError::io);
-    let _ = std::fs::remove_file(&target);
-    bytes
-}
-
-fn encode_export(branches: &[u8], content: &[u8], workstreams: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(
-        EXPORT_MAGIC.len()
-            + 3 * std::mem::size_of::<u64>()
-            + branches.len()
-            + content.len()
-            + workstreams.len(),
-    );
-    bytes.extend_from_slice(EXPORT_MAGIC);
+    .to_vec();
+    let mut put = |body: &[u8]| {
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(body);
+    };
     for store in [branches, content, workstreams] {
-        bytes.extend_from_slice(&(store.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(store);
+        put(store);
+    }
+    if let Some(workflow) = workflow {
+        if protected {
+            put(&serde_json::to_vec(&workflow.binding).expect("workflow binding serializes"));
+        } else {
+            put(workflow.binding.workspace_id.as_bytes());
+        }
+        for store in &workflow.stores {
+            put(store);
+        }
+    } else {
+        put(&[]);
     }
     bytes
 }
 
 fn parse_export(export: &[u8]) -> Result<ExportStores> {
-    let need = |condition: bool| {
-        if condition {
-            Ok(())
-        } else {
-            Err(WorkspaceError::msg("malformed workspace export"))
-        }
-    };
-    need(
-        export.len() >= 16 && (&export[..8] == EXPORT_MAGIC || &export[..8] == LEGACY_EXPORT_MAGIC),
-    )?;
-    let legacy = &export[..8] == LEGACY_EXPORT_MAGIC;
-    let mut offset = 8;
-    let mut take = |bytes: &[u8]| -> Result<Vec<u8>> {
-        need(bytes.len() >= offset + 8)?;
-        let len =
-            u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("8 bytes")) as usize;
-        offset += 8;
-        need(bytes.len() >= offset + len)?;
-        let body = bytes[offset..offset + len].to_vec();
-        offset += len;
+    let malformed = || WorkspaceError::msg("malformed workspace export");
+    let magic = export.get(..8).ok_or_else(malformed)?;
+    if magic != PROTECTED_EXPORT_MAGIC
+        && magic != EXPORT_MAGIC
+        && magic != V2_EXPORT_MAGIC
+        && magic != LEGACY_EXPORT_MAGIC
+    {
+        return Err(malformed());
+    }
+    let mut remaining = &export[8..];
+    let mut take = || -> Result<Vec<u8>> {
+        let header = remaining.get(..8).ok_or_else(malformed)?;
+        let size = u64::from_le_bytes(header.try_into().map_err(|_| malformed())?);
+        let size = usize::try_from(size).map_err(|_| malformed())?;
+        let end = 8usize.checked_add(size).ok_or_else(malformed)?;
+        let body = remaining.get(8..end).ok_or_else(malformed)?.to_vec();
+        remaining = &remaining[end..];
         Ok(body)
     };
-    let branches = take(export)?;
-    let content = take(export)?;
-    let workstreams = if legacy { None } else { Some(take(export)?) };
-    need(offset == export.len())?;
+    let branches = take()?;
+    let content = take()?;
+    let workstreams = if magic == LEGACY_EXPORT_MAGIC {
+        None
+    } else {
+        Some(take()?)
+    };
+    let workflow = if magic == EXPORT_MAGIC || magic == PROTECTED_EXPORT_MAGIC {
+        let binding = take()?;
+        if binding.is_empty() {
+            if magic == PROTECTED_EXPORT_MAGIC {
+                return Err(malformed());
+            }
+            None
+        } else {
+            let binding = if magic == PROTECTED_EXPORT_MAGIC {
+                let binding: workflow_storage::Binding =
+                    serde_json::from_slice(&binding).map_err(|_| malformed())?;
+                if !binding.is_protected() {
+                    return Err(malformed());
+                }
+                binding
+            } else {
+                workflow_storage::Binding::plain(
+                    String::from_utf8(binding).map_err(|_| malformed())?,
+                )
+            };
+            binding.validate()?;
+            Some(workflow_storage::WorkflowSnapshot {
+                binding,
+                stores: [take()?, take()?, take()?, take()?],
+            })
+        }
+    } else {
+        None
+    };
+    if !remaining.is_empty() {
+        return Err(malformed());
+    }
     Ok(ExportStores {
         branches,
         content,
         workstreams,
+        workflow,
     })
 }
 
@@ -2634,6 +2781,23 @@ fn parse_export(export: &[u8]) -> Result<ExportStores> {
 // Trait surface (dyn dispatch for the app's provider registry).
 
 pub trait Workspace: Send {
+    /// Read an authorized workflow at an exact saved source revision. Adapters
+    /// that cannot provide immutable source identity refuse rather than guess.
+    fn workflow_source(&self, path: &str, cut: &str, byte_limit: usize) -> Result<WorkflowSource> {
+        let _ = (path, cut, byte_limit);
+        Err(WorkspaceError::msg(
+            "this workspace cannot bind saved workflow source",
+        ))
+    }
+
+    /// Opaque workflow storage from this actual workspace. External target
+    /// adapters do not create a second workflow authority.
+    fn native_workflow_storage(&self) -> Result<NativeWorkflowStorage> {
+        Err(WorkspaceError::msg(
+            "this workspace has no native workflow storage",
+        ))
+    }
+
     fn mainline(&self) -> &str;
     fn workstream_ref(&self, ws_id: &str) -> String;
     fn workstream_id_of(&self, target: &str) -> Option<String>;
@@ -2758,6 +2922,14 @@ pub trait Workspace: Send {
     fn promote_workstream_to_main(&self, ws_id: &str) -> Result<MergeOutcome>;
     fn seed_main(&self, files: &[(&str, &str)]) -> Result<()>;
     fn export(&self) -> Result<WorkspaceExport>;
+    fn export_protected_workflow(
+        &self,
+        _protection: &WorkflowProtection,
+    ) -> Result<WorkspaceExport> {
+        Err(WorkspaceError::msg(
+            "this workspace cannot export protected workflows",
+        ))
+    }
     fn export_format(&self) -> &'static str;
     fn peer_source(&self) -> PeerSource;
     fn pull_from(&self, src: &PeerSource) -> Result<MergeOutcome>;
@@ -2923,6 +3095,14 @@ pub trait ChatWorkspace: Send {
 }
 
 impl Workspace for Instance {
+    fn workflow_source(&self, path: &str, cut: &str, byte_limit: usize) -> Result<WorkflowSource> {
+        Self::workflow_source(self, path, cut, byte_limit)
+    }
+
+    fn native_workflow_storage(&self) -> Result<NativeWorkflowStorage> {
+        Ok(Self::native_workflow_storage(self))
+    }
+
     fn mainline(&self) -> &str {
         MAINLINE_BRANCH_ID
     }
@@ -3073,6 +3253,12 @@ impl Workspace for Instance {
     }
     fn export(&self) -> Result<WorkspaceExport> {
         Self::export(self)
+    }
+    fn export_protected_workflow(
+        &self,
+        protection: &WorkflowProtection,
+    ) -> Result<WorkspaceExport> {
+        Self::export_protected_workflow(self, protection)
     }
     fn export_format(&self) -> &'static str {
         Self::export_format(self)
@@ -3243,16 +3429,41 @@ impl ChatWorkspace for Engagement {
 
 pub trait WorkspaceProvider: Send + Sync {
     fn export_format(&self) -> &'static str;
+    fn accepts_export_format(&self, format: &str) -> bool {
+        format == self.export_format()
+    }
+
     fn init_at(&self, dir: &Path) -> Result<Box<dyn Workspace>>;
     fn open_at(&self, dir: &Path) -> Box<dyn Workspace>;
     #[allow(clippy::wrong_self_convention)]
     fn from_export_at(&self, dir: &Path, export: &[u8]) -> Result<Box<dyn Workspace>>;
+    #[allow(clippy::wrong_self_convention)]
+    fn from_protected_export_at(
+        &self,
+        _dir: &Path,
+        _export: &[u8],
+        _protection: &WorkflowProtection,
+    ) -> Result<Box<dyn Workspace>> {
+        Err(WorkspaceError::msg(
+            "this provider cannot import protected workflows",
+        ))
+    }
     fn fork_from_at(&self, dir: &Path, source: &PeerSource) -> Result<Box<dyn Workspace>>;
 }
 
 pub struct WhippleWorkspaceProvider;
 
 impl WorkspaceProvider for WhippleWorkspaceProvider {
+    fn accepts_export_format(&self, format: &str) -> bool {
+        matches!(
+            format,
+            PROTECTED_EXPORT_FORMAT
+                | EXPORT_FORMAT
+                | "whipplescript-vcs-export-v2"
+                | "whipplescript-vcs-export-v1"
+        )
+    }
+
     fn export_format(&self) -> &'static str {
         EXPORT_FORMAT
     }
@@ -3264,6 +3475,16 @@ impl WorkspaceProvider for WhippleWorkspaceProvider {
     }
     fn from_export_at(&self, dir: &Path, export: &[u8]) -> Result<Box<dyn Workspace>> {
         Ok(Box::new(Instance::from_export_at(dir, export)?))
+    }
+    fn from_protected_export_at(
+        &self,
+        dir: &Path,
+        export: &[u8],
+        protection: &WorkflowProtection,
+    ) -> Result<Box<dyn Workspace>> {
+        Ok(Box::new(Instance::from_protected_export_at(
+            dir, export, protection,
+        )?))
     }
     fn fork_from_at(&self, dir: &Path, source: &PeerSource) -> Result<Box<dyn Workspace>> {
         Ok(Box::new(Instance::fork_from_at(dir, source)?))
@@ -3909,6 +4130,57 @@ mod tests {
             std::fs::read_to_string(instance.repo().join("same.txt")).expect("unchanged"),
             "from a"
         );
+    }
+
+    #[test]
+    fn export_and_fork_refuse_missing_vcs_authority_without_reinitializing_it() {
+        for store in ["branches.sqlite", "content.sqlite"] {
+            let (_directory, instance) = instance();
+            instance
+                .seed_main(&[("retained.txt", "retained")])
+                .expect("seed");
+            instance.export().expect("initial export");
+            let missing = instance.store_root.join(store);
+            std::fs::remove_file(&missing).expect("remove authority store");
+            assert!(instance.export().is_err(), "missing {store}");
+            assert!(!missing.exists(), "export must not recreate {store}");
+            let target = tempfile::tempdir().expect("target");
+            assert!(Instance::fork_from_at(target.path(), &instance.peer_source()).is_err());
+            assert!(!missing.exists(), "fork must not recreate {store}");
+            assert!(
+                !target.path().join("repo").exists(),
+                "failed fork creates no target"
+            );
+            assert_eq!(
+                std::fs::read_to_string(instance.repo().join("retained.txt")).unwrap(),
+                "retained"
+            );
+        }
+    }
+
+    #[test]
+    fn vcs_forks_do_not_copy_workspace_tracker_or_runtime_stores() {
+        let (_directory, instance) = instance();
+        instance
+            .seed_main(&[("source.whip", "ordinary source")])
+            .expect("seed");
+        for name in ["runtime.sqlite", "coord.sqlite", "items.sqlite"] {
+            let connection = rusqlite::Connection::open(instance.store_root.join(name)).unwrap();
+            connection.execute_batch("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('workspace state');").unwrap();
+        }
+        let target = tempfile::tempdir().expect("fork target");
+        let forked = Instance::fork_from_at(target.path(), &instance.peer_source()).expect("fork");
+        assert_eq!(
+            std::fs::read_to_string(forked.repo().join("source.whip")).unwrap(),
+            "ordinary source"
+        );
+        for name in ["runtime.sqlite", "coord.sqlite", "items.sqlite"] {
+            assert!(
+                !forked.store_root.join(name).exists(),
+                "{name} is workspace state, not branch state"
+            );
+            assert!(instance.store_root.join(name).exists());
+        }
     }
 
     #[test]

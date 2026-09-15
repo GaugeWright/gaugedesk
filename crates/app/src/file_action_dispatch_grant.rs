@@ -421,6 +421,7 @@ impl Workbench {
             command,
             &command.policy,
             &[&scope],
+            NativeActionAccess::Mutate,
         )?;
         let previous = load_grant(
             self.store_ref(),
@@ -523,6 +524,7 @@ impl Workbench {
             command,
             &command.policy,
             &[grant_ref],
+            NativeActionAccess::Inspect,
         )?;
         let (grant, revoked) = load_grant(
             self.store_ref(),

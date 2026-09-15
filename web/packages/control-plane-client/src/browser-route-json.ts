@@ -20,6 +20,14 @@ export interface BrowserRouteJsonOptions {
 
 export type RouteRequest = (path: string, init?: RequestInit) => Promise<Response>;
 
+/** Preserve HTTP refusal identity without making consumers parse error prose. */
+export class RouteResponseError extends Error {
+    constructor(public readonly status: number, message: string) {
+        super(message);
+        this.name = "RouteResponseError";
+    }
+}
+
 export type RouteEventStream = (
     path: string,
     onMessage: (data: string) => void,
@@ -176,7 +184,7 @@ export function browserRouteJson(
             throw new Rejected(r.rejected ?? r.error ?? r.message ?? "unknown", r.command_status);
         }
         if (res.status === TURN_STOPPED_STATUS) throw new TurnStopped();
-        if (!res.ok) throw new Error(await routeError(method, path, res));
+        if (!res.ok) throw new RouteResponseError(res.status, await routeError(method, path, res));
         return res.status === 204 ? null : res.json();
     };
 }

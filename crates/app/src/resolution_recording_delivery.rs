@@ -70,6 +70,23 @@ impl Workbench {
         command: &HostActionCommand,
         runtime_policy: &gaugedesk_whip_runtime::PolicyEpochRef,
     ) -> Result<NativeCorrectionPreparation, String> {
+        self.prepare_native_corrections_access(
+            context,
+            inputs,
+            command,
+            runtime_policy,
+            NativeActionAccess::Mutate,
+        )
+    }
+
+    pub(in crate::file_action_factory) fn prepare_native_corrections_access(
+        &mut self,
+        context: &AuthenticatedActionContext,
+        inputs: &NativeActionInputCustody,
+        command: &HostActionCommand,
+        runtime_policy: &gaugedesk_whip_runtime::PolicyEpochRef,
+        access: NativeActionAccess,
+    ) -> Result<NativeCorrectionPreparation, String> {
         let refused = || "native correction delivery binding is invalid".to_owned();
         if command.issuer != self.authority().as_str()
             || inputs.authority_scope() != self.home_id().as_str()
@@ -111,6 +128,7 @@ impl Workbench {
         let mapping_scope =
             crate::action_input_binding::input_binding_scope(&command.issuer, input)
                 .map_err(|error| format!("correction input mapping refused: {error:?}"))?;
+        let handoff_scope = crate::federation::handoff_scope(&project);
         let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
         let mut scopes = vec![
             LIBRARY_SCOPE,
@@ -120,6 +138,7 @@ impl Workbench {
             &scope,
             &policy_scope,
             &mapping_scope,
+            &handoff_scope,
         ];
         scopes.extend(source_scope.as_deref());
         let ((authority, input_binding, policy), basis) = self
@@ -149,6 +168,8 @@ impl Workbench {
                     NativeActionKind::RecordCorrections,
                     source_policy.as_ref(),
                 )?;
+                // WHIP-3: a project with a pending handoff admits no new writes.
+                access.require_available(store, &authority.project_id)?;
                 let mapping = crate::action_input_binding::load_input_binding(
                     store,
                     &command.issuer,
@@ -227,32 +248,29 @@ impl Workbench {
         let bytes = command
             .signing_bytes()
             .map_err(|error| format!("{error:?}"))?;
-        let receipt = inputs
-            .publish(std::slice::from_ref(&command.inputs["corrections"]), || {
-                self.store_mut()
-                    .with_dispatch_basis(&prepared.basis, || {
-                        let verifier = super::super::delivery::NativeAdmissionVerifier {
-                            command,
-                            key: prepared.key.public_key(),
-                        };
-                        runtime.admit_action(
+        let receipt = self
+            .store_mut()
+            .with_dispatch_basis(&prepared.basis, || {
+                inputs.publish(std::slice::from_ref(&command.inputs["corrections"]), || {
+                    let verifier = super::super::delivery::NativeAdmissionVerifier {
+                        command,
+                        key: prepared.key.public_key(),
+                    };
+                    runtime
+                        .admit_action(
                             command.clone(),
                             recording.action(),
                             &verifier,
                             prepared.key.sign(&bytes).as_bytes(),
                         )
-                    })
-                    .map_err(|error| {
-                        whipplescript_store::StoreError::Conflict(format!(
-                            "correction delivery authority changed: {error:?}",
-                        ))
-                    })?
-                    .map_err(|error| {
-                        whipplescript_store::StoreError::Conflict(format!(
-                            "runtime correction admission refused: {error:?}",
-                        ))
-                    })
+                        .map_err(|error| {
+                            whipplescript_store::StoreError::Conflict(format!(
+                                "runtime correction admission refused: {error:?}"
+                            ))
+                        })
+                })
             })
+            .map_err(|error| format!("correction delivery authority changed: {error:?}"))?
             .map_err(|error| format!("{error:?}"))?;
         record_runtime_acknowledgment(
             self.store_mut(),

@@ -162,6 +162,8 @@ export type {
 export { ProjectModelAccessPanel } from "./ProjectModelAccessPanel";
 export type { ProjectModelAccessApi } from "./ProjectModelAccessPanel";
 export { ProjectHomePanel } from "./ProjectHomePanel";
+export { ProjectTrackerPanel } from "./ProjectTrackerPanel";
+export type { ProjectTrackerApi, PendingTrackerCompletion } from "./ProjectTrackerPanel";
 export type { ProjectHomeApi } from "./ProjectHomePanel";
 export { ForkTreePanel } from "./ForkTreePanel";
 export type { ForkTreeApi } from "./ForkTreePanel";

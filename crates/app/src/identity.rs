@@ -104,6 +104,59 @@ impl AuthenticatedActionContext {
     }
 }
 
+/// Revalidate the authentication source inside a caller's product read basis.
+/// This checks identity only. The caller separately admits the current project,
+/// resources and action, and fences every consulted scope through publication.
+pub(crate) fn revalidate_action_context(
+    store: &gaugedesk_store::Store,
+    home: &HomeId,
+    context: &AuthenticatedActionContext,
+) -> Result<Option<u64>, gaugedesk_store::AdmitError> {
+    let invalid =
+        |reason| gaugedesk_store::AdmitError::Rejected(gaugedesk_core::Rejection { reason });
+    let mut valid_until_ms = None;
+    match context.authentication() {
+        ActorAuthentication::AccountSession { session_ref } => {
+            // An unavailable source record cannot disappear from an authority
+            // fold and expose an older still-active session or grant.
+            store.retained_events(crate::account_auth::ACCOUNT_AUTH_SCOPE)?;
+            let auth = crate::account_auth::AccountAuth::rebuild(store)?;
+            let session = auth
+                .sessions
+                .get(session_ref)
+                .ok_or_else(|| invalid("account action session is not durably active"))?;
+            let expires = session
+                .issued_at_ms
+                .saturating_add(session.lifetime_secs.saturating_mul(1000));
+            valid_until_ms = Some(expires);
+            if session.account_id != context.actor().as_str()
+                || expires <= crate::account::session_now_ms()
+            {
+                return Err(invalid(
+                    "account action session is expired or belongs to another actor",
+                ));
+            }
+        }
+        ActorAuthentication::MachineController { grant_ref } => {
+            store.retained_events(crate::mobile_machine_session::SCOPE)?;
+            let grant = crate::mobile_machine_session::current_action_grant(store, grant_ref)?
+                .ok_or_else(|| invalid("controller action grant is not active"))?;
+            if &grant.machine != home || grant.device.as_str() != context.actor().as_str() {
+                return Err(invalid(
+                    "controller action grant has the wrong Home or device",
+                ));
+            }
+        }
+        ActorAuthentication::IdentityProvider => {}
+        ActorAuthentication::NativeEditorDispatchGrant { .. } => {
+            return Err(invalid(
+                "action-scoped authority requires its exact admitted command",
+            ));
+        }
+    }
+    Ok(valid_until_ms)
+}
+
 impl Workbench {
     /// Apply the optional local authority override used by self-operated
     /// federation/dev deployments. Empty values are ignored so a mis-set env var

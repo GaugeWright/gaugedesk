@@ -10,7 +10,10 @@ pub const DIGEST: &str = "b468641c9ccb6d41482c2f9c5a2c5f49258611a90fd9776dec87c3
 
 pub use whipplescript_kernel::host_action::CompiledHostAction;
 pub use whipplescript_kernel::host_facade as facade;
-pub use whipplescript_kernel::host_protocol::{action, action_result, execution, recovery};
+pub use whipplescript_kernel::host_protocol::{
+    action, action_result, execution, recovery, tracker_recovery,
+};
+pub use whipplescript_parser::IrWorkflowContractKind;
 pub use whipplescript_store::{log_append::LogAppend, native_stores::NativeStores, RuntimeStore};
 
 /// Product admission carries the runtime owner's complete command. The shell

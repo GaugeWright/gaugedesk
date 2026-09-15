@@ -770,6 +770,38 @@ export class WorkbenchControlPlane implements ControlPlane {
         );
     }
 
+    private async projectTrackerTransport(project: ProjectId): Promise<workbenchClient.WorkbenchTransport> {
+        if (!this.splitHomes) return this.workTransport;
+        try {
+            return await this.connectRoutedProject(project);
+        } catch (error) {
+            // Older projects may predate route authorship; their selected Home
+            // still admits the exact requested project at the product boundary.
+            if (String(error).includes("no granted Home route")) return this.connectSelectedHome();
+            throw error;
+        }
+    }
+
+    async listProjectTrackers(project: ProjectId) {
+        return workbenchClient.listProjectTrackers(await this.projectTrackerTransport(project), project);
+    }
+
+    async subscribeProjectTrackerChanges(project: ProjectId, onChange: () => void) {
+        return workbenchClient.subscribeProjectTrackerChanges(await this.projectTrackerTransport(project), project, onChange);
+    }
+
+    async readProjectTrackerBacklog(project: ProjectId, queue: string) {
+        return workbenchClient.readProjectTrackerBacklog(await this.projectTrackerTransport(project), project, queue);
+    }
+
+    async readProjectTrackerTasks(project: ProjectId, queue: string) {
+        return workbenchClient.readProjectTrackerTasks(await this.projectTrackerTransport(project), project, queue);
+    }
+
+    async completeProjectTrackerIssue(project: ProjectId, queue: string, item: string, intent: workbenchClient.TrackerCompletionIntent) {
+        return workbenchClient.completeProjectTrackerIssue(await this.projectTrackerTransport(project), project, queue, item, intent);
+    }
+
     getTasks(): Promise<HumanTask[]> {
         return workbenchClient.getTasks(this.workbenchTransport());
     }

@@ -139,45 +139,52 @@ pub(crate) fn retain_input_binding(
     if inputs.authority_scope() != home || home.trim().is_empty() {
         return Err(refused("input custody belongs to another Home"));
     }
-    inputs.with_resolved(input, |resolved| {
-        let statement = Statement {
-            protocol: PROTOCOL.into(),
-            issuer: issuer.into(),
-            home: home.into(),
-            input: input.clone(),
-            content_hash: resolved.content_hash.clone(),
-        };
-        let public = key.public_key();
-        if let Some(previous) = read_retained_snapshot(product, issuer, home, input, &public)? {
-            if previous.statement != statement {
-                return Err(refused("input mapping changed meaning"));
-            }
-            return Ok(previous);
-        }
-        let signed = SignedBinding {
-            signature: key.sign(&statement.signing_bytes()?).as_bytes().to_vec(),
-            statement,
-        };
-        let scope = input_binding_scope(issuer, input)?;
-        product
-            .admit_record_facts(
-                &scope,
-                KEY,
-                &signed.statement.snapshot(&public)?,
-                &[CommandRecordFact {
-                    scope_id: scope.clone(),
-                    kind: KIND.into(),
-                    payload: serde_json::to_string(&signed)?,
-                }],
-            )
-            .map_err(refused)?;
-        let retained = read_retained_snapshot(product, issuer, home, input, &public)?
-            .ok_or_else(|| refused("input mapping was not retained"))?;
-        if retained.statement != signed.statement {
-            return Err(refused("input mapping winner changed meaning"));
-        }
-        Ok(retained)
-    })
+    let reader = product.sibling().map_err(refused)?;
+    product
+        .with_record_admission(|admission| {
+            inputs.with_resolved(input, |resolved| {
+                let statement = Statement {
+                    protocol: PROTOCOL.into(),
+                    issuer: issuer.into(),
+                    home: home.into(),
+                    input: input.clone(),
+                    content_hash: resolved.content_hash.clone(),
+                };
+                let public = key.public_key();
+                if let Some(previous) =
+                    read_retained_snapshot(&reader, issuer, home, input, &public)?
+                {
+                    if previous.statement != statement {
+                        return Err(refused("input mapping changed meaning"));
+                    }
+                    return Ok(previous);
+                }
+                let signed = SignedBinding {
+                    signature: key.sign(&statement.signing_bytes()?).as_bytes().to_vec(),
+                    statement,
+                };
+                let scope = input_binding_scope(issuer, input)?;
+                admission
+                    .commit(
+                        &scope,
+                        KEY,
+                        &signed.statement.snapshot(&public)?,
+                        &[CommandRecordFact {
+                            scope_id: scope.clone(),
+                            kind: KIND.into(),
+                            payload: serde_json::to_string(&signed)?,
+                        }],
+                    )
+                    .map_err(refused)?;
+                let retained = read_retained_snapshot(&reader, issuer, home, input, &public)?
+                    .ok_or_else(|| refused("input mapping was not retained"))?;
+                if retained.statement != signed.statement {
+                    return Err(refused("input mapping winner changed meaning"));
+                }
+                Ok(retained)
+            })
+        })
+        .map_err(refused)?
 }
 
 // Preparation can race another preparer. Observe the fact and receipt from one

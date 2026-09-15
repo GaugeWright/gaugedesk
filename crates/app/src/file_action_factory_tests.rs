@@ -1893,3 +1893,166 @@ fn native_scoped_save_uses_only_admitted_knowledge_and_recovers_original_observa
 
 #[path = "resolution_recording_factory_tests.rs"]
 mod recording;
+
+#[test]
+fn pending_handoff_fences_prepared_native_writes_and_abort_resumes_them() {
+    use gaugedesk_core::handoff::HandoffEvent;
+    use gaugedesk_whip_runtime::host_actions::RuntimeStore;
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, command, inputs, token) = admitted_fixture(dir.path());
+    let mut wb = shared.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let mut runtime = editor_runtime(&wb, &command, dir.path());
+    configure_native_files(runtime.kernel().store());
+    let admission = wb
+        .deliver_editor_file_save(&context, &inputs, &command, &mut runtime)
+        .unwrap()
+        .receipt;
+    let read = wb
+        .advance_editor_file_save(&context, &inputs, &command, &admission, &mut runtime)
+        .unwrap();
+    wb.execute_editor_file_save_effect(
+        &context,
+        &inputs,
+        &command,
+        &admission,
+        &read[0],
+        &mut runtime,
+    )
+    .unwrap();
+    let writes = wb
+        .advance_editor_file_save(&context, &inputs, &command, &admission, &mut runtime)
+        .unwrap();
+    assert_eq!(writes.len(), 1);
+    let prepared = wb
+        .prepare_native_editor_action(&context, &inputs, &command, &command.policy)
+        .unwrap();
+    // A different project's handoff does not pause this project's action.
+    wb.store_mut()
+        .append_record(
+            &crate::federation::handoff_scope("another-project"),
+            "event",
+            &serde_json::to_string(&HandoffEvent::HandoffOffered).unwrap(),
+        )
+        .unwrap();
+    wb.store_mut()
+        .with_dispatch_basis(&prepared.basis, || ())
+        .unwrap();
+    let (_, project, chat): (String, String, String) =
+        serde_json::from_str(&command.scope).unwrap();
+    let scope = crate::federation::handoff_scope(&project);
+    let before = runtime
+        .kernel()
+        .store()
+        .list_events(&admission.instance_ref)
+        .unwrap();
+    let base = wb.engagements[&chat].observe().unwrap().recorded_cut;
+    for event in [HandoffEvent::HandoffOffered, HandoffEvent::LogSynced] {
+        wb.store_mut()
+            .append_record(&scope, "event", &serde_json::to_string(&event).unwrap())
+            .unwrap();
+        assert!(wb
+            .store_mut()
+            .with_dispatch_basis(&prepared.basis, || {
+                panic!("pre-handoff authority entered the runtime")
+            })
+            .is_err());
+        assert!(wb
+            .prepare_native_editor_action(&context, &inputs, &command, &command.policy)
+            .err()
+            .unwrap()
+            .contains("pending handoff"));
+        assert!(wb
+            .execute_editor_file_save_effect(
+                &context,
+                &inputs,
+                &command,
+                &admission,
+                &writes[0],
+                &mut runtime,
+            )
+            .unwrap_err()
+            .contains("pending handoff"));
+        assert!(wb
+            .advance_editor_file_save(&context, &inputs, &command, &admission, &mut runtime)
+            .unwrap_err()
+            .contains("pending handoff"));
+        wb.read_editor_file_save_result(&context, &inputs, &command, &admission, &runtime)
+            .expect("pending handoff preserves authorized evidence inspection");
+        assert_eq!(
+            runtime
+                .kernel()
+                .store()
+                .list_events(&admission.instance_ref)
+                .unwrap(),
+            before
+        );
+        assert_eq!(wb.engagements[&chat].observe().unwrap().recorded_cut, base);
+    }
+    // Restart does not discard the pause; only the admitted abort releases it.
+    drop(runtime);
+    drop(wb);
+    drop(shared);
+    let shared = crate::open_workbench(dir.path()).unwrap();
+    let mut wb = shared.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    assert!(wb
+        .prepare_native_editor_action(&context, &inputs, &command, &command.policy)
+        .is_err());
+    wb.store_mut()
+        .append_record(
+            &scope,
+            "event",
+            &serde_json::to_string(&HandoffEvent::HandoffAborted).unwrap(),
+        )
+        .unwrap();
+    let mut runtime = editor_runtime(&wb, &command, dir.path());
+    configure_native_files(runtime.kernel().store());
+    wb.execute_editor_file_save_effect(
+        &context,
+        &inputs,
+        &command,
+        &admission,
+        &writes[0],
+        &mut runtime,
+    )
+    .unwrap();
+    assert_ne!(wb.engagements[&chat].observe().unwrap().recorded_cut, base);
+}
+
+#[test]
+fn pending_handoff_refuses_new_file_admission_without_creating_an_outbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, intent, token) = setup(dir.path());
+    let mut wb = shared.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let inputs = NativeActionInputCustody::open(
+        dir.path().join("inputs.sqlite"),
+        wb.home_id().as_str(),
+        4096,
+    )
+    .unwrap();
+    let request = EditorFileSave {
+        chat_id: &intent.chat_id,
+        request_id: &intent.request_id,
+        path: &intent.path,
+        base_cut: &intent.base_cut,
+        content: &intent.content,
+    };
+    let authority = current_authority(wb.store_ref(), wb.home_id(), &context, &request).unwrap();
+    let scope = crate::federation::handoff_scope(&authority.project_id);
+    wb.store_mut()
+        .append_record(
+            &scope,
+            "event",
+            &serde_json::to_string(&gaugedesk_core::handoff::HandoffEvent::HandoffOffered).unwrap(),
+        )
+        .unwrap();
+    let before = wb.store_ref().scope_high_water_marks().unwrap();
+    assert!(wb
+        .admit_editor_file_save(&context, &inputs, &intent.identity, &request)
+        .err()
+        .unwrap()
+        .contains("pending handoff"));
+    assert_eq!(wb.store_ref().scope_high_water_marks().unwrap(), before);
+}

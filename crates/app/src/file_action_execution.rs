@@ -212,8 +212,14 @@ impl Workbench {
         admission: &ActionAdmissionReceipt,
         runtime: &GovernedHostFacade<NativeStores>,
     ) -> Result<ActionResultSnapshot, String> {
-        let prepared =
-            self.prepare_native_editor_action(context, inputs, command, runtime.policy_ref())?;
+        let prepared = self.prepare_native_editor_action_scoped(
+            context,
+            inputs,
+            command,
+            runtime.policy_ref(),
+            &[],
+            NativeActionAccess::Inspect,
+        )?;
         self.store_mut()
             .with_dispatch_basis(&prepared.basis, || {
                 read_evidence(runtime, command, admission, &prepared.key)
@@ -315,108 +321,108 @@ impl Workbench {
             dispatch_grant::with_grant_cause(command.provenance.clone(), grant_cause.as_ref());
         let action = registered_editor_workflow(command)?;
         let target = self.bind_native_editor_target(&chat_id, command)?;
+        // WHIP-3 lock order: the product writer exclusion is taken BEFORE the
+        // input resolution writer, so a relocation snapshot cannot interleave
+        // with an action already past admission.
         let policy_observer = self
             .store_ref()
             .read_only_sibling()
             .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
         let issuer = self.authority().clone();
-        inputs
-            .with_resolved(&command.inputs["content"], |resolved| {
-                self.store_mut()
-                    .with_dispatch_basis(&basis, || {
-                        ownership::require_epoch(runtime, admission, epoch)?;
-                        read_evidence(runtime, command, admission, &key)?;
-                        let effect = runtime
-                            .kernel()
-                            .claimable_effects(&scope)?
-                            .into_iter()
-                            .find(|effect| effect.effect_id == effect_id)
-                            .ok_or_else(|| runtime_error("editor effect is not claimable"))?;
-                        let resolved_hash = resolved.content_hash.clone();
-                        let binding = VersionedSaveBinding {
-                            branch_id: target.branch().into(),
-                            path: target.path().into(),
-                            base_cut_id: target.base().into(),
-                            draft: resolved.content,
-                            draft_hash: resolved.content_hash,
-                            input_label: command.inputs["content"].label_ref.clone(),
-                            executing_principal: context.actor().as_str().into(),
-                            evidence_label: command.resources["target"].label_ref.clone(),
-                            recorded_at: crate::account::session_now_ms().to_string(),
-                        };
-                        let request = ExecuteActionEffect {
-                            protocol: ACTION_EXECUTION_PROTOCOL.into(),
-                            issuer: command.issuer.clone(),
-                            scope: command.scope.clone(),
-                            admission: admission.clone(),
-                            policy: command.policy.clone(),
-                            provenance: provenance.clone(),
-                            effect_id: effect.effect_id.clone(),
-                            effect_fingerprint: effect_observation_fingerprint(&effect)
-                                .map_err(runtime_error)?,
-                        };
-                        let (target_id, _, _): (String, String, String) = serde_json::from_str(
-                            command.resources["target"]
-                                .resource
-                                .selector
-                                .as_deref()
-                                .ok_or_else(|| runtime_error("missing target"))?,
+        self.store_mut()
+            .with_dispatch_basis(&basis, || {
+                inputs.with_resolved(&command.inputs["content"], |resolved| {
+                    ownership::require_epoch(runtime, admission, epoch)?;
+                    read_evidence(runtime, command, admission, &key)?;
+                    let effect = runtime
+                        .kernel()
+                        .claimable_effects(&scope)?
+                        .into_iter()
+                        .find(|effect| effect.effect_id == effect_id)
+                        .ok_or_else(|| runtime_error("editor effect is not claimable"))?;
+                    let resolved_hash = resolved.content_hash.clone();
+                    let binding = VersionedSaveBinding {
+                        branch_id: target.branch().into(),
+                        path: target.path().into(),
+                        base_cut_id: target.base().into(),
+                        draft: resolved.content,
+                        draft_hash: resolved.content_hash,
+                        input_label: command.inputs["content"].label_ref.clone(),
+                        executing_principal: context.actor().as_str().into(),
+                        evidence_label: command.resources["target"].label_ref.clone(),
+                        recorded_at: crate::account::session_now_ms().to_string(),
+                    };
+                    let request = ExecuteActionEffect {
+                        protocol: ACTION_EXECUTION_PROTOCOL.into(),
+                        issuer: command.issuer.clone(),
+                        scope: command.scope.clone(),
+                        admission: admission.clone(),
+                        policy: command.policy.clone(),
+                        provenance: provenance.clone(),
+                        effect_id: effect.effect_id.clone(),
+                        effect_fingerprint: effect_observation_fingerprint(&effect)
+                            .map_err(runtime_error)?,
+                    };
+                    let (target_id, _, _): (String, String, String) = serde_json::from_str(
+                        command.resources["target"]
+                            .resource
+                            .selector
+                            .as_deref()
+                            .ok_or_else(|| runtime_error("missing target"))?,
+                    )
+                    .map_err(runtime_error)?;
+                    let verifier = NativeExecutionVerifier {
+                        command,
+                        request: &request,
+                        provenance: &provenance,
+                        binding: &binding,
+                        target_id: &target_id,
+                        resolved_hash: &resolved_hash,
+                        resolution_scope: &resolution_scope,
+                        key: key.public_key(),
+                    };
+                    // Authenticate and compare before opening a writer as well as
+                    // at the runtime's own dispatch boundary.
+                    let bytes = request.signing_bytes().map_err(runtime_error)?;
+                    let proof = key.sign(&bytes);
+                    verifier
+                        .authenticate(&request, &bytes, proof.as_bytes())
+                        .map_err(runtime_error)?;
+                    verifier
+                        .authorize(&request, command, &effect)
+                        .map_err(runtime_error)?;
+                    verifier
+                        .authorize_scoped_save(
+                            &request,
+                            command,
+                            &effect,
+                            &binding,
+                            &resolution_scope,
                         )
                         .map_err(runtime_error)?;
-                        let verifier = NativeExecutionVerifier {
-                            command,
-                            request: &request,
-                            provenance: &provenance,
-                            binding: &binding,
-                            target_id: &target_id,
-                            resolved_hash: &resolved_hash,
-                            resolution_scope: &resolution_scope,
-                            key: key.public_key(),
-                        };
-                        // Authenticate and compare before opening a writer as well as
-                        // at the runtime's own dispatch boundary.
-                        let bytes = request.signing_bytes().map_err(runtime_error)?;
-                        let proof = key.sign(&bytes);
-                        verifier
-                            .authenticate(&request, &bytes, proof.as_bytes())
-                            .map_err(runtime_error)?;
-                        verifier
-                            .authorize(&request, command, &effect)
-                            .map_err(runtime_error)?;
-                        verifier
-                            .authorize_scoped_save(
-                                &request,
-                                command,
-                                &effect,
-                                &binding,
-                                &resolution_scope,
-                            )
-                            .map_err(runtime_error)?;
-                        let files = target.open_scoped_versioned_save(
-                            binding.clone(),
-                            resolution_scope.clone(),
-                            std::sync::Arc::new(
-                                version_authority::NativeSaveVersionAuthority::new(
-                                    target.clone(),
-                                    policy_observer,
-                                    authority,
-                                    issuer,
-                                    key.clone(),
-                                ),
-                            ),
-                        )?;
-                        runtime
-                            .execute_scoped_save_file_effect(
-                                request.clone(),
-                                &action,
-                                &verifier,
-                                proof.as_bytes(),
-                                &files,
-                            )
-                            .map_err(runtime_error)
-                    })
-                    .map_err(runtime_error)?
+                    let files = target.open_scoped_versioned_save(
+                        binding.clone(),
+                        resolution_scope.clone(),
+                        std::sync::Arc::new(version_authority::NativeSaveVersionAuthority::new(
+                            target.clone(),
+                            policy_observer,
+                            authority,
+                            issuer,
+                            key.clone(),
+                        )),
+                    )?;
+                    runtime
+                        .execute_scoped_save_file_effect(
+                            request.clone(),
+                            &action,
+                            &verifier,
+                            proof.as_bytes(),
+                            &files,
+                        )
+                        .map_err(runtime_error)
+                })
             })
+            .map_err(|error| format!("{error:?}"))?
             .map_err(|error| format!("{error:?}"))
     }
 }

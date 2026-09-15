@@ -47,7 +47,8 @@ fn invalid(reason: &'static str) -> StoreError {
 impl NativeActionInputCustody {
     /// `path` and `authority_scope` come from trusted Home configuration. The
     /// same backing authority is shared by every native action in that Home:
-    /// its exclusion is also their first lock, ahead of product/target writes.
+    /// bounded publication takes product writer exclusion before this input
+    /// exclusion, then acquires target/runtime writers.
     /// The caller chooses a byte budget before admitting preparation; no default
     /// budget or public/raw content endpoint is supplied by this adapter.
     pub fn open(
@@ -185,6 +186,27 @@ impl<C: ContentBlobs> ActionInputCustody<C> {
             })
     }
 
+    /// Resolve a bounded set under one native input transaction. The host fences
+    /// current product authority before entry; all values remain within this
+    /// callback through native publication and its product acknowledgment.
+    pub fn with_resolved_many<T>(
+        &self,
+        references: &[ActionInput],
+        operation: impl FnOnce(Vec<ResolvedActionInput>) -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        let ids = references
+            .iter()
+            .map(|input| input.version_ref.clone())
+            .collect::<Vec<_>>();
+        self.content.publish_retained(&ids, || {
+            let values = references
+                .iter()
+                .map(|reference| self.resolve(reference))
+                .collect::<StoreResult<_>>()?;
+            operation(values)
+        })
+    }
+
     /// Hold the owner's collection/erasure exclusion while publishing references
     /// to the product log. The callback may publish references only: no payload
     /// preparation, materialization or external work. Its failure does not undo
@@ -217,6 +239,36 @@ mod tests {
     use gaugedesk_store::{command_dispatch::CommandDispatch, Store};
     use gaugedesk_whip_runtime::host_actions::ProductActionAdmission;
     use std::cell::Cell;
+
+    #[test]
+    fn several_resolved_inputs_share_one_exclusion_and_missing_one_refuses_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inputs.sqlite");
+        let custody = NativeActionInputCustody::open(&path, "workspace", 4096).unwrap();
+        let first = custody.prepare("first", "private", "one").unwrap();
+        let second = custody.prepare("second", "private", "two").unwrap();
+        let probe = rusqlite::Connection::open(&path).unwrap();
+        probe.busy_timeout(std::time::Duration::ZERO).unwrap();
+        custody
+            .with_resolved_many(&[first.clone(), second.clone()], |values| {
+                assert_eq!(
+                    values
+                        .iter()
+                        .map(|value| value.content.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["one", "two"]
+                );
+                assert!(probe.execute_batch("BEGIN IMMEDIATE").is_err());
+                Ok(())
+            })
+            .unwrap();
+        let mut unavailable = second;
+        unavailable.version_ref = "missing".into();
+        assert!(custody
+            .with_resolved_many::<()>(&[first, unavailable], |_| panic!("partial inputs escaped"))
+            .is_err());
+        probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    }
 
     #[test]
     fn native_operation_holds_input_exclusion_and_refuses_erased_bytes() {

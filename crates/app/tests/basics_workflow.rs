@@ -2,7 +2,13 @@
 //! This exercises the runtime contract, not product launch/completion admission;
 //! those remain the separate WHIP-3/4 integration obligations.
 
+use gaugedesk_app::{
+    at_rest::LoopbackKeyWrap,
+    content_vault::{ContentVault, LocalFileErasureLedger},
+};
+use gaugedesk_workspace::{Instance, WorkflowProtection};
 use serde_json::json;
+use std::sync::Arc;
 use whipplescript_kernel::{
     effect_config::EffectConfig, effect_handlers::run_queue_effect_generic,
     rule_pass::step_instance_generic, tracker_wait, workflow_input::validate_workflow_start_input,
@@ -45,14 +51,46 @@ fn settle(kernel: &mut RuntimeKernel<NativeStores>, program: &IrProgram, instanc
 
 #[test]
 fn pinned_runtime_runs_basics_source_across_restarts() {
+    run_basics(false);
+}
+
+#[test]
+fn pinned_runtime_runs_basics_with_scope_keys_across_restarts() {
+    run_basics(true);
+}
+
+fn run_basics(protected: bool) {
     let directory = tempfile::tempdir().expect("state directory");
-    let open = || {
-        NativeStores::open(
-            directory.path().join("runtime.sqlite"),
-            directory.path().join("coord.sqlite"),
-            directory.path().join("items.sqlite"),
+    let key_root = directory.path().join("keys");
+    let vault = ContentVault::new(&key_root, Box::new(LoopbackKeyWrap::new([7; 32]))).with_ledger(
+        Box::new(LocalFileErasureLedger::new(key_root.join("erased.ledger"))),
+    );
+    if protected {
+        vault.initialize_scope_key("personal:learner").unwrap();
+    }
+    let workspace = Instance::init_at(directory.path()).unwrap();
+    let storage = workspace.native_workflow_storage();
+    let protection = || {
+        WorkflowProtection::new(
+            "personal:learner",
+            Arc::new(vault.prepare_scope_key("personal:learner").unwrap()),
         )
-        .expect("workspace stores")
+        .unwrap()
+    };
+    if protected {
+        drop(storage.initialize_protected(&protection()).unwrap());
+    } else {
+        drop(storage.initialize("personal:learner").unwrap());
+    }
+    let open = || {
+        if protected {
+            storage
+                .open_existing_protected(&protection())
+                .unwrap()
+                .runtime
+        } else {
+            storage.open_existing("personal:learner").unwrap().runtime
+        }
     };
     let compiled = compile_program(SOURCE);
     assert!(
@@ -181,4 +219,33 @@ fn pinned_runtime_runs_basics_source_across_restarts() {
         4
     );
     assert_eq!(kernel.store().list_instances().expect("roots").len(), 1);
+    let canary = b"Create a chat in Personal";
+    let mut exposed = false;
+    for name in ["runtime.sqlite", "coord.sqlite", "items.sqlite"] {
+        for suffix in ["", "-wal"] {
+            let path = directory
+                .path()
+                .join(".repo.whipplescript/workflow")
+                .join(format!("{name}{suffix}"));
+            if path.exists() {
+                exposed |= std::fs::read(path)
+                    .unwrap()
+                    .windows(canary.len())
+                    .any(|bytes| bytes == canary);
+            }
+        }
+    }
+    assert_eq!(
+        exposed, !protected,
+        "the raw SQLite/WAL probe must distinguish the two storage modes"
+    );
+    if protected {
+        assert!(vault.erase_scope_key("personal:learner").unwrap());
+        assert!(kernel
+            .store()
+            .items
+            .list_items(Some("tutorials"), None)
+            .is_err());
+        assert!(vault.prepare_scope_key("personal:learner").is_err());
+    }
 }

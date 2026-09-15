@@ -1566,6 +1566,32 @@ input {
     .modal-head h3 { margin: 0; font-size: var(--fs-body); }
 }
 
+.project-tasks { width: 920px; max-height: 85vh; display: flex; flex-direction: column; }
+.project-tasks-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; padding: 16px 0; }
+.project-tasks-controls label { display: flex; align-items: center; gap: 8px; }
+.project-tasks-controls > button { margin-left: auto; }
+.project-tasks-notice { padding: 8px 12px; }
+.project-tasks-body { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(0, 2fr); min-height: 280px; overflow: auto; border-top: 1px solid var(--edge); }
+.project-tasks-list { border-right: 1px solid var(--edge); padding: 8px 12px 8px 0; }
+.project-task-row { display: flex; flex-direction: column; gap: 6px; width: 100%; text-align: left; padding: 12px; margin-bottom: 6px; overflow-wrap: anywhere; }
+.project-task-row span { color: var(--muted); font-size: var(--fs-small); }
+.project-task-row.selected { outline: 1px solid var(--ink); outline-offset: -1px; }
+.project-task-detail { padding: 16px 20px; min-width: 0; overflow-wrap: anywhere; }
+.project-task-detail h4 { margin: 0 0 16px; }
+.project-task-facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: var(--fs-small); }
+.project-task-facts dt { color: var(--muted); }
+.project-task-facts dd { margin: 0; }
+.project-task-instructions { white-space: pre-wrap; line-height: 1.6; }
+.project-task-completion { border-top: 1px solid var(--edge); margin-top: 20px; padding-top: 16px; }
+.project-task-completion label { display: block; }
+.project-task-completion textarea { display: block; box-sizing: border-box; width: 100%; min-height: 80px; margin-top: 8px; padding: 8px; background: var(--bg); color: var(--ink); border: 1px solid var(--edge); border-radius: 4px; font: inherit; }
+.project-tasks-controls select { background: var(--bg); color: var(--ink); border: 1px solid var(--edge); border-radius: 4px; padding: 4px; font: inherit; }
+@media (max-width: 640px) {
+    .project-tasks-body { grid-template-columns: 1fr; }
+    .project-tasks-list { border-right: 0; border-bottom: 1px solid var(--edge); max-height: 180px; overflow: auto; padding-right: 0; }
+    .project-task-detail { padding: 16px 4px; }
+}
+
 .config-text { width: 100%; height: 200px; background: var(--bg); color: var(--ink);
     border: 1px solid var(--edge); border-radius: 4px; padding: 8px;
     font-family: var(--mono); font-size: var(--fs-ui); margin: 6px 0; resize: vertical; }

@@ -435,6 +435,22 @@ describe("project-first Home resolution (DESK-3)", () => {
                 );
             }
             if (admission) return new Response(null, { status: 204 });
+            const tracker = url.match(/^https:\/\/([abz])\.example\/projects\/([^/]+)\/trackers(.*)$/);
+            if (tracker) {
+                worked.push(tracker[1]);
+                expect(new Headers(init?.headers).get("x-gaugewright-home-admission")).toBe(`token-${tracker[1]}`);
+                const descriptor = { project_id: tracker[2], workspace_id: `workspace-${tracker[1]}`, queue: "tutorials", resource_id: `tracker-${tracker[1]}`, can_complete: true };
+                return new Response(JSON.stringify(tracker[3].endsWith("/complete")
+                    ? { snapshot: { admission: { instance_ref: "closing-root" }, instance_status: "completed" }, executed_effect: "effect", recovered_effect: null }
+                    : tracker[3].endsWith("/tasks") ? { actor: "person", tracker: descriptor, issues: [] }
+                    : tracker[3].endsWith("/issues") ? { tracker: descriptor, issues: [] } : { trackers: [descriptor] }));
+            }
+            const events = url.match(/^https:\/\/([abz])\.example\/workspace\/events$/);
+            if (events) {
+                worked.push(events[1]);
+                expect(new Headers(init?.headers).get("x-gaugewright-home-admission")).toBe(`token-${events[1]}`);
+                return new Response(`data: ${JSON.stringify({ type: "workspacechanged", record: "project_tracker", id: `proj-${events[1]}` })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+            }
             const work = url.match(/^https:\/\/([abz])\.example\/workspace$/);
             if (work) {
                 worked.push(work[1]);
@@ -458,6 +474,38 @@ describe("project-first Home resolution (DESK-3)", () => {
         api.setCurrentProject("proj-a" as never);
         await api.getWorkspace();
         expect(worked).toEqual(["a"]);
+    });
+
+    it("opens and completes a tracker on its owning Home while another project stays selected", async () => {
+        const { api, worked } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        expect(await api.listProjectTrackers("proj-b" as never)).toHaveLength(1);
+        expect((await api.readProjectTrackerBacklog("proj-b" as never, "tutorials")).tracker.workspaceId).toBe("workspace-b");
+        expect((await api.completeProjectTrackerIssue("proj-b" as never, "tutorials", "WS-1", { subjectId: "subject", summary: "done", claim: { kind: "override" }, requestId: "original" })).status).toBe("completed");
+        await api.getWorkspace();
+        expect(worked).toEqual(["b", "b", "b", "a"]);
+    });
+
+    it("listens for tracker changes on the owning Home independently of the selected chat", async () => {
+        const { api, worked } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        let changed = 0;
+        const stop = await api.subscribeProjectTrackerChanges("proj-b" as never, () => changed++);
+        try {
+            await vi.waitFor(() => expect(changed).toBe(1));
+            await api.getWorkspace();
+            expect(worked).toEqual(["b", "a"]);
+        } finally { stop(); }
+    });
+
+    it("reads personal tracker tasks on their owning Home without changing the selected project", async () => {
+        const { api, worked } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        const tasks = await api.readProjectTrackerTasks("proj-b" as never, "tutorials");
+        expect(tasks.actor).toBe("person");
+        expect(tasks.tracker.workspaceId).toBe("workspace-b");
+        await api.getWorkspace();
+        expect(worked).toEqual(["b", "a"]);
     });
 
     it("holds several Homes at once and follows the open project between them", async () => {

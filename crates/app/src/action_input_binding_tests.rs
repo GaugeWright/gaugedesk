@@ -234,3 +234,53 @@ fn concurrent_preparation_reuses_one_receipted_statement_and_refuses_another_roo
             .is_some());
     }
 }
+
+#[test]
+fn input_binding_takes_product_exclusion_before_waiting_for_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let (product, _inputs, input, key) = setup(dir.path());
+    let mut worker_product = product.sibling().unwrap();
+    let worker_inputs =
+        NativeActionInputCustody::open(dir.path().join("inputs.sqlite"), HOME, 4096).unwrap();
+    let content = ContentStore::open(dir.path().join("inputs.sqlite")).unwrap();
+    let probe = rusqlite::Connection::open(product.path()).unwrap();
+    probe.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let version = input.version_ref.clone();
+    let (worker, saw_product_fence) = content
+        .publish_retained(&[version], || {
+            let worker = std::thread::spawn(move || {
+                retain_input_binding(
+                    &mut worker_product,
+                    &worker_inputs,
+                    ISSUER,
+                    HOME,
+                    &input,
+                    &key,
+                )
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let observed = loop {
+                match probe.execute_batch("BEGIN IMMEDIATE") {
+                    Err(rusqlite::Error::SqliteFailure(error, _))
+                        if error.code == rusqlite::ErrorCode::DatabaseBusy =>
+                    {
+                        break true
+                    }
+                    Err(error) => panic!("unexpected product probe: {error}"),
+                    Ok(()) => probe.execute_batch("ROLLBACK").unwrap(),
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            Ok((worker, observed))
+        })
+        .unwrap();
+    // Join after retention is released, including when the ordering probe fails.
+    worker.join().unwrap().unwrap();
+    assert!(
+        saw_product_fence,
+        "input binding waited for content before fencing the product"
+    );
+}

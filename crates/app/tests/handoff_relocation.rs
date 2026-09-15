@@ -54,6 +54,14 @@ fn workspace_instance(
     authority: &str,
     broker: &str,
 ) -> (Router, Arc<Mutex<Workbench>>, tempfile::TempDir) {
+    workspace_instance_with_vault(authority, broker, None)
+}
+
+fn workspace_instance_with_vault(
+    authority: &str,
+    broker: &str,
+    vault: Option<Arc<gaugedesk_app::content_vault::ContentVault>>,
+) -> (Router, Arc<Mutex<Workbench>>, tempfile::TempDir) {
     let root = tempfile::tempdir().unwrap();
     let workspace = Instance::init(root.path().join("repo"), root.path().join("wt")).unwrap();
     let fed =
@@ -62,6 +70,10 @@ fn workspace_instance(
         .with_authority(AuthorityId::new(authority))
         .with_root(root.path())
         .with_federation(fed);
+    let wb = match vault {
+        Some(vault) => wb.with_content_vault(vault),
+        None => wb,
+    };
     let shared = Arc::new(Mutex::new(wb));
     (open_control_plane(shared.clone()), shared, root)
 }
@@ -201,6 +213,18 @@ async fn a_project_home_relocates_to_a_paired_peer_with_its_log() {
                 r#"{"ev":"named","name":"Acme"}"#,
             )
             .unwrap();
+        g.store_mut()
+            .admit_record_facts(
+                "project::engagement-1::whip-policy",
+                "prepare",
+                "original policy binding",
+                &[gaugedesk_store::CommandRecordFact {
+                    scope_id: "project::engagement-1::whip-policy".into(),
+                    kind: "policy-evidence".into(),
+                    payload: "original signed document".into(),
+                }],
+            )
+            .unwrap();
         g.rebuild_library();
         g.store_mut()
             .append_record(
@@ -243,6 +267,16 @@ async fn a_project_home_relocates_to_a_paired_peer_with_its_log() {
     assert_eq!(items[0]["project"], "engagement-1");
     assert_eq!(items[0]["source"], "alice");
 
+    assert!(bob_wb
+        .lock()
+        .unwrap()
+        .store_ref()
+        .sibling()
+        .unwrap()
+        .committed_record_snapshot("project::engagement-1::whip-policy", "prepare")
+        .unwrap()
+        .is_none());
+
     // bob consents → bob imports the log, commits, and becomes home.
     let (sa, ba) = post(
         &bob,
@@ -253,6 +287,19 @@ async fn a_project_home_relocates_to_a_paired_peer_with_its_log() {
     assert_eq!(sa, StatusCode::OK);
     assert_eq!(ba["phase"], "committed");
     assert_eq!(ba["home_target"], true, "bob committed and is home");
+
+    assert_eq!(
+        bob_wb
+            .lock()
+            .unwrap()
+            .store_ref()
+            .sibling()
+            .unwrap()
+            .committed_record_snapshot("project::engagement-1::whip-policy", "prepare")
+            .unwrap()
+            .as_deref(),
+        Some("original policy binding")
+    );
 
     // The whole log relocated: bob holds every owned scope alice shipped.
     {
@@ -1005,7 +1052,7 @@ async fn relocation_carries_the_project_content_bytes_to_the_peer() {
 async fn batched_accept_admits_all_pending_handoffs_at_once() {
     let (broker, _relay) = start_broker().await;
     let (alice, alice_wb, _ra) = instance("alice", &broker);
-    let (bob, _bob_wb, _rb) = instance("bob", &broker);
+    let (bob, bob_wb, _rb) = instance("bob", &broker);
     pair(&alice, &bob).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1013,6 +1060,20 @@ async fn batched_accept_admits_all_pending_handoffs_at_once() {
     {
         let mut guard = alice_wb.lock().unwrap();
         for project in ["proj-a", "proj-b"] {
+            let scope = format!("project::{project}::policy");
+            guard
+                .store_mut()
+                .admit_record_facts(
+                    &scope,
+                    "prepare",
+                    project,
+                    &[gaugedesk_store::CommandRecordFact {
+                        scope_id: scope.clone(),
+                        kind: "policy-evidence".into(),
+                        payload: project.into(),
+                    }],
+                )
+                .unwrap();
             guard
                 .store_mut()
                 .append_record(
@@ -1051,6 +1112,18 @@ async fn batched_accept_admits_all_pending_handoffs_at_once() {
 
     // both projects are now home on bob, the queue is empty, and alice committed both.
     for p in ["proj-a", "proj-b"] {
+        assert_eq!(
+            bob_wb
+                .lock()
+                .unwrap()
+                .store_ref()
+                .sibling()
+                .unwrap()
+                .committed_record_snapshot(&format!("project::{p}::policy"), "prepare")
+                .unwrap()
+                .as_deref(),
+            Some(p)
+        );
         let (_, b) = get(&bob, &format!("/federation/handoff/status?project={p}")).await;
         assert_eq!(b["phase"], "committed", "{p} committed on bob");
         assert!(
@@ -1268,9 +1341,62 @@ async fn a_third_root_joins_an_existing_home_without_relocation_or_payload_copy(
 
 #[tokio::test]
 async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
+    relocated_workstream_chat(false).await;
+}
+
+#[tokio::test]
+async fn a_protected_workflow_relocates_through_recipient_custody() {
+    relocated_workstream_chat(true).await;
+}
+
+// A current account on each Home is authenticated independently; the original
+// source Home's session is never reused as receiving-Home authority.
+fn workflow_actor(wb: &mut Workbench) -> gaugedesk_app::identity::AuthenticatedActionContext {
+    use gaugedesk_app::org::{MembershipRecord, MembershipStatus, RecordOp, ORG_ID, ORG_SCOPE};
+    let member = MembershipRecord {
+        id: "alice".into(),
+        op: RecordOp::Upsert,
+        org_id: ORG_ID.into(),
+        authority: "alice".into(),
+        email: String::new(),
+        role: "owner".into(),
+        status: MembershipStatus::Active,
+        managed_by_scim: false,
+        team: None,
+    };
+    wb.store_mut()
+        .append_record(
+            ORG_SCOPE,
+            "membership",
+            &serde_json::to_string(&member).unwrap(),
+        )
+        .unwrap();
+    let token = wb.mint_account_session("alice", "passkey", 3600).unwrap();
+    wb.authenticate_action_context(&token).unwrap()
+}
+
+async fn relocated_workstream_chat(protected: bool) {
+    use gaugedesk_app::{
+        at_rest::LoopbackKeyWrap,
+        content_vault::{ContentVault, LocalFileErasureLedger},
+    };
+    use gaugedesk_workspace::{WorkflowProtection, WorkflowProtectionMode};
+    let alice_keys = tempfile::tempdir().unwrap();
+    let bob_keys = tempfile::tempdir().unwrap();
+    let vault = |root: &std::path::Path, kek| {
+        Arc::new(
+            ContentVault::new(root, Box::new(LoopbackKeyWrap::new([kek; 32]))).with_ledger(
+                Box::new(LocalFileErasureLedger::new(root.join("erased.ledger"))),
+            ),
+        )
+    };
+    let alice_vault = vault(alice_keys.path(), 7);
+    let bob_vault = vault(bob_keys.path(), 8);
     let (broker, _relay) = start_broker().await;
-    let (alice, alice_wb, alice_root) = workspace_instance("alice", &broker);
-    let (bob, _bob_wb, bob_root) = workspace_instance("bob", &broker);
+    let (alice, alice_wb, alice_root) =
+        workspace_instance_with_vault("alice", &broker, protected.then(|| alice_vault.clone()));
+    let (bob, bob_wb, bob_root) =
+        workspace_instance_with_vault("bob", &broker, protected.then(|| bob_vault.clone()));
 
     let (sp, project) = post(&alice, "/projects", json!({ "name": "Relocated line" })).await;
     assert_eq!(sp, StatusCode::CREATED, "project: {project}");
@@ -1389,6 +1515,204 @@ async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
     .await;
     assert_eq!(sj, StatusCode::OK, "join: {joined}");
 
+    // WHIP-3: use the actual project's collaboration binding, then carry all
+    // workflow planes through the real signed/TLS relocation alongside its VCS.
+    // The protected case also carries and resumes a real folder-launch admission.
+    use whipplescript_store::{
+        log_append::LogAppend,
+        tracker_filing::{TrackerFiling, TrackerFilings},
+        tracker_result::closing_conformance,
+        RuntimeStore,
+    };
+    let (_, source_view) = get(&alice, "/workspace").await;
+    let source_chat = source_view["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == chat_id)
+        .unwrap();
+    let workflow_workspace_id = source_chat["collaboration_workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source_workspace = Instance::open_at(
+        alice_root
+            .path()
+            .join("collaboration-workspaces")
+            .join(&workflow_workspace_id),
+    );
+    use gaugedesk_app::project_workflow::{ProjectWorkflowLaunch, ProjectWorkflowLimits};
+    let launch_limits = ProjectWorkflowLimits {
+        source_bytes: 256 * 1024,
+        input_bytes: 64 * 1024,
+    };
+    let launched = if protected {
+        let source = Instance::open_at(alice_root.path().join("targets").join(&target_id));
+        source.seed_main(&[("lessons/hello.whip", "workflow Greeting(learner: Learner) -> string\nclass Learner { authority string }\nrule greet\n  when Learner as learner\n=> { complete result learner.authority }\n")]).unwrap();
+        let mut guard = alice_wb.lock().unwrap();
+        let context = workflow_actor(&mut guard);
+        // Explicit source-party grant in the fixture; project administration
+        // alone cannot grant this human access to Home-owned source content.
+        let library = gaugedesk_app::library::Library::rebuild(guard.store_ref()).unwrap();
+        let mut target = library.work_targets[&target_id].clone();
+        if !target.parties.iter().any(|party| party == "alice") {
+            target.parties.push("alice".into());
+        }
+        guard
+            .store_mut()
+            .append_record(
+                "library",
+                "work_target",
+                &serde_json::to_string(&target).unwrap(),
+            )
+            .unwrap();
+        guard.rebuild_library();
+        Some(
+            guard
+                .launch_project_workflow(
+                    &context,
+                    &ProjectWorkflowLaunch {
+                        project: project_id.clone(),
+                        target: target_id.clone(),
+                        path: "lessons/hello.whip".into(),
+                        cut: source.current_main_cut().unwrap().unwrap(),
+                        request_id: "relocated-folder-launch".into(),
+                        inputs: std::collections::BTreeMap::from([(
+                            "learner".into(),
+                            json!({"authority":"alice"}),
+                        )]),
+                    },
+                    launch_limits,
+                )
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let workflow_scope = format!("project::{project_id}::workflow");
+    let storage = source_workspace.native_workflow_storage();
+    let mut workflow_stores = if protected {
+        alice_vault.initialize_scope_key(&workflow_scope).unwrap();
+        let protection = WorkflowProtection::new(
+            &workflow_workspace_id,
+            Arc::new(alice_vault.prepare_scope_key(&workflow_scope).unwrap()),
+        )
+        .unwrap();
+        storage.initialize_protected(&protection).unwrap()
+    } else {
+        storage.initialize(&workflow_workspace_id).unwrap()
+    };
+    assert_eq!(
+        storage.protection_mode(&workflow_workspace_id).unwrap(),
+        Some(if protected {
+            WorkflowProtectionMode::Protected
+        } else {
+            WorkflowProtectionMode::Plain
+        })
+    );
+    let fixture = closing_conformance::setup(&mut workflow_stores.runtime, "lease_expired");
+    let workflow_instance_id = fixture.closure.instance_id;
+    let workflow_events = workflow_stores
+        .runtime
+        .list_events(&workflow_instance_id)
+        .unwrap();
+    let workflow_runs = workflow_stores
+        .runtime
+        .list_runs(&workflow_instance_id)
+        .unwrap();
+    let workflow_head = workflow_stores
+        .runtime
+        .chain_head(&workflow_instance_id)
+        .unwrap();
+    let filing = TrackerFiling {
+        operation_id: "handoff:filing".into(),
+        instance_id: workflow_instance_id.clone(),
+        effect_id: "handoff:file-effect".into(),
+        actor: "alice".into(),
+        queue: "tutorials".into(),
+        title: "Create a Personal chat".into(),
+        body: "Use the normal chat action".into(),
+        labels: vec![],
+        metadata: json!({}),
+        assigned_to: Some("alice".into()),
+    };
+    let workflow_receipt = workflow_stores
+        .runtime
+        .items
+        .file_issue_once(&filing)
+        .unwrap();
+    workflow_stores
+        .runtime
+        .coord
+        .append_for_owner(
+            &workflow_workspace_id,
+            "progress",
+            "basics",
+            "{\"started\":true}",
+            "alice",
+            0,
+        )
+        .unwrap();
+    let workflow_coordination = workflow_stores
+        .runtime
+        .coord
+        .list_entries(None, None)
+        .unwrap();
+    let workflow_input = workflow_stores
+        .inputs
+        .put_text("retained tutorial input")
+        .unwrap();
+
+    // The native stores are not enough to resume a governed product command.
+    // Preserve its actual command snapshot, outbox and receipt on the new Home.
+    use gaugedesk_core::run::{RunCommand, RunState};
+    use gaugedesk_store::command_dispatch::CommandDispatch;
+    let command_scope = format!("project::{project_id}::workflow::admission");
+    use gaugedesk_app::action_policy::{
+        load_project_action_policy, prepare_project_action_policy, ActionPolicyIdentity,
+    };
+    use gaugedesk_app::key_store::{FileKeyStore, KeyStore};
+    use gaugedesk_whip_runtime::{GovernanceRootVerifier, HostGovernancePolicy};
+    let policy_identity = ActionPolicyIdentity {
+        issuer: "alice".into(),
+        scope: command_scope.clone(),
+        request_id: "start".into(),
+    };
+    let original_key =
+        FileKeyStore::new(alice_root.path().join("keys")).signing_key(&AuthorityId::new("alice"));
+    let original_policy = {
+        let mut guard = alice_wb.lock().unwrap();
+        prepare_project_action_policy(
+            guard.store_mut(),
+            &project_id,
+            &policy_identity,
+            &HostGovernancePolicy::default(),
+            &original_key,
+        )
+        .unwrap()
+    };
+    let dispatch = CommandDispatch {
+        runtime_ref: format!("workspace:{workflow_workspace_id}"),
+        command_ref: "retained-original-command".into(),
+    };
+    let original_dispatch = {
+        let mut guard = alice_wb.lock().unwrap();
+        guard
+            .store_mut()
+            .admit_with_dispatch::<RunState>(
+                &command_scope,
+                "start",
+                RunCommand::RequestRun,
+                &dispatch,
+            )
+            .unwrap();
+        guard
+            .store_mut()
+            .committed_dispatch::<RunState>(&command_scope, "start")
+            .unwrap()
+            .unwrap()
+    };
+
     let (_, invite) = post(
         &alice,
         "/federation/invite",
@@ -1407,6 +1731,58 @@ async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
         poll_committed(&bob, &project_id).await,
         "the invited project committed on bob"
     );
+
+    {
+        let guard = bob_wb.lock().unwrap();
+        let mut reopened = guard.store_ref().sibling().unwrap();
+        // Use the root established independently by invitation/pairing, not a
+        // key offered in the policy record or the receiving Home's own key.
+        let grant = guard.federation_ref().unwrap().grant_for("alice").unwrap();
+        let original_root = GovernanceRootVerifier::new(
+            AuthorityId::new("alice"),
+            grant.source_authority_root_pubkey,
+        );
+        let retained_policy = load_project_action_policy(
+            &reopened,
+            &project_id,
+            &policy_identity,
+            original_policy.policy_ref(),
+            &original_root,
+        )
+        .unwrap();
+        assert_eq!(
+            retained_policy.signed_envelope(),
+            original_policy.signed_envelope()
+        );
+        let receiving_key =
+            FileKeyStore::new(bob_root.path().join("keys")).signing_key(&AuthorityId::new("bob"));
+        assert!(load_project_action_policy(
+            &reopened,
+            &project_id,
+            &policy_identity,
+            original_policy.policy_ref(),
+            &GovernanceRootVerifier::new(AuthorityId::new("bob"), receiving_key.public_key()),
+        )
+        .is_err());
+        assert_eq!(
+            reopened
+                .committed_dispatch::<RunState>(&command_scope, "start")
+                .unwrap()
+                .unwrap(),
+            original_dispatch
+        );
+        assert!(
+            reopened
+                .admit_with_dispatch::<RunState>(
+                    &command_scope,
+                    "start",
+                    RunCommand::RequestRun,
+                    &dispatch
+                )
+                .unwrap()
+                .replayed
+        );
+    }
 
     let (sworkspace, workspace) = get(&bob, "/workspace").await;
     assert_eq!(
@@ -1434,6 +1810,118 @@ async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
     let collaboration_workspace_id = relocated_chat["collaboration_workspace_id"]
         .as_str()
         .expect("work chat names its project collaboration workspace");
+    assert_eq!(collaboration_workspace_id, workflow_workspace_id);
+    // WHIP-3: current tracker admission checks both Home bindings. A content
+    // transfer alone must not leave the workspace assigned to its former Home.
+    assert!(
+        poll_committed(&alice, &project_id).await,
+        "the origin received the committed relocation before comparing its bindings"
+    );
+    let destination_home = bob_wb.lock().unwrap().home_id().clone();
+    for workbench in [&alice_wb, &bob_wb] {
+        let guard = workbench.lock().unwrap();
+        let library = gaugedesk_app::library::Library::rebuild(guard.store_ref()).unwrap();
+        assert_eq!(library.projects[&project_id].home_id, destination_home);
+        let binding = &library.project_collaboration_workspaces[&project_id];
+        assert_eq!(binding.home_id, destination_home);
+        assert_eq!(binding.workspace_id, workflow_workspace_id);
+    }
+    if let Some(original) = launched {
+        let mut guard = bob_wb.lock().unwrap();
+        let context = workflow_actor(&mut guard);
+        let resumed = guard
+            .resume_project_workflow(
+                &context,
+                &project_id,
+                "relocated-folder-launch",
+                launch_limits,
+            )
+            .unwrap();
+        assert_eq!(resumed.command, original.command);
+        assert_eq!(resumed.admission, original.admission);
+        assert_eq!(resumed.workspace, original.workspace);
+        assert_eq!(resumed.command.issuer, "alice");
+        let progress = guard
+            .step_project_workflow(
+                &context,
+                &project_id,
+                "relocated-folder-launch",
+                launch_limits,
+            )
+            .unwrap();
+        assert_eq!(progress.snapshot.command, original.command);
+        assert_eq!(
+            progress.snapshot.instance_status,
+            gaugedesk_whip_runtime::host_actions::action_result::ActionInstanceStatus::Completed
+        );
+    }
+    let received_workspace = Instance::open_at(
+        bob_root
+            .path()
+            .join("collaboration-workspaces")
+            .join(collaboration_workspace_id),
+    );
+    let receiving_storage = received_workspace.native_workflow_storage();
+    let mut received = if protected {
+        assert!(receiving_storage
+            .open_existing(collaboration_workspace_id)
+            .is_err());
+        assert!(received_workspace.export().is_err());
+        let key = bob_vault.prepare_scope_key(&workflow_scope).unwrap();
+        let protection =
+            WorkflowProtection::new(collaboration_workspace_id, Arc::new(key)).unwrap();
+        let export = received_workspace
+            .export_protected_workflow(&protection)
+            .unwrap();
+        for needle in [
+            "Create a Personal chat",
+            "Use the normal chat action",
+            "retained tutorial input",
+        ] {
+            assert!(!export
+                .0
+                .windows(needle.len())
+                .any(|bytes| bytes == needle.as_bytes()));
+        }
+        receiving_storage
+            .open_existing_protected(&protection)
+            .unwrap()
+    } else {
+        receiving_storage
+            .open_existing(collaboration_workspace_id)
+            .unwrap()
+    };
+    assert_eq!(
+        received.runtime.list_events(&workflow_instance_id).unwrap(),
+        workflow_events
+    );
+    assert_eq!(
+        received.runtime.list_runs(&workflow_instance_id).unwrap(),
+        workflow_runs
+    );
+    assert_eq!(
+        received.runtime.chain_head(&workflow_instance_id).unwrap(),
+        workflow_head
+    );
+    assert_eq!(
+        received.runtime.items.file_issue_once(&filing).unwrap(),
+        workflow_receipt
+    );
+    assert_eq!(
+        received.runtime.coord.list_entries(None, None).unwrap(),
+        workflow_coordination
+    );
+    assert_eq!(
+        received
+            .inputs
+            .get_text(&workflow_input)
+            .unwrap()
+            .text()
+            .as_deref(),
+        Some("retained tutorial input")
+    );
+    drop(received);
+    drop(workflow_stores);
     let secondary_root = gaugedesk_app::library::target_id_path_v1(secondary_target_id).unwrap();
     let worktrees = bob_root
         .path()
@@ -1499,6 +1987,36 @@ async fn a_relocated_workstream_chat_remains_a_valid_federated_run_target() {
         "the relocated workstream member is admitted to the host queue: {placed}"
     );
     assert_eq!(placed["status"], "pending");
+    if protected {
+        use gaugedesk_app::federation::{folded_bridges, BRIDGE_SCOPE};
+        let mut guard = bob_wb.lock().unwrap();
+        let context = workflow_actor(&mut guard);
+        let mut bridge = folded_bridges(guard.store_ref())
+            .into_iter()
+            .find(|bridge| bridge.id == "alice")
+            .unwrap();
+        bridge.active = false;
+        guard
+            .store_mut()
+            .append_record(
+                BRIDGE_SCOPE,
+                "bridge",
+                &serde_json::to_string(&bridge).unwrap(),
+            )
+            .unwrap();
+        // Deliberately leave the in-memory federation projection stale. Resume
+        // must see the durable revoke, not accept its cached original root.
+        assert!(guard.federation_ref().unwrap().grant_for("alice").is_some());
+        let error = guard
+            .resume_project_workflow(
+                &context,
+                &project_id,
+                "relocated-folder-launch",
+                launch_limits,
+            )
+            .unwrap_err();
+        assert!(error.contains("not currently trusted"), "{error}");
+    }
 }
 
 #[tokio::test]

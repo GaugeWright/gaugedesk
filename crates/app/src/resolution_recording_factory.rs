@@ -123,14 +123,17 @@ impl Workbench {
             path: request.path,
         };
         let read = |store: &Store| {
-            current_target_authority_with_source(
+            let authority = current_target_authority_with_source(
                 store,
                 &home,
                 context,
                 &intent,
                 NativeActionKind::RecordCorrections,
                 source.map(|(restrictions, _)| restrictions),
-            )
+            )?;
+            // WHIP-3: a project with a pending handoff admits no new writes.
+            crate::federation::require_project_writes_available(store, &authority.project_id)?;
+            Ok(authority)
         };
         let authority_scopes = [
             LIBRARY_SCOPE,
@@ -244,7 +247,9 @@ impl Workbench {
                 .fingerprint()
                 .map_err(|error| format!("invalid correction action: {error:?}"))?,
         };
+        let handoff_scope = crate::federation::handoff_scope(&authority.project_id);
         let mut final_scopes = authority_scopes.to_vec();
+        final_scopes.push(&handoff_scope);
         final_scopes.push(&mapping_scope);
         let (current, basis) = self
             .store_ref()

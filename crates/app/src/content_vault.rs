@@ -35,6 +35,9 @@ use crate::workbench_state::Workbench;
 /// legacy/plaintext row (mixed logs and the pre-encryption history stay readable).
 const MARKER: &str = "gwenc:1:";
 
+mod scope_key;
+pub use scope_key::{PreparedScopeKey, PreparedScopeTransfer, ScopeKeyCapsule};
+
 /// The content record kinds sealed at rest by default.
 ///
 /// The set covers the durable conversation transcript plus every record kind that
@@ -100,34 +103,60 @@ pub(crate) fn configured_content_vault(
 /// Worker's object-locked R2 store, so a whole-disk restore of the Hub cannot un-erase;
 /// with neither set, a desktop / self-hosted deployment uses the co-located local file.
 /// A hosted deployment (web-account mode) that leaves the origin unset is the 4.7 gap and
-/// is warned about loudly rather than silently accepted.
+/// keeps local startup recovery, but refuses native confirmed custody.
 fn configured_erasure_ledger(root: &Path) -> Box<dyn ErasureLedger> {
-    let local = || LocalFileErasureLedger::new(root.join("content-keys").join("erased.ledger"));
     let nonempty = |suffix: &str| {
         gaugedesk_env::var(suffix)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
     };
-    let Some(origin) = nonempty("ERASURE_LEDGER_ORIGIN") else {
-        if crate::workbench_auth::web_account_mode() {
-            tracing::warn!(
-                "content-vault: hosted deployment has no out-of-band erasure ledger \
-                 (GAUGEDESK_ERASURE_LEDGER_ORIGIN unset); an erasure would not survive a \
-                 data-disk restore (finding 4.7)"
-            );
+    erasure_ledger_from_config(
+        root,
+        nonempty("ERASURE_LEDGER_ORIGIN"),
+        nonempty("ERASURE_LEDGER_TOKEN"),
+        crate::workbench_auth::web_account_mode(),
+    )
+}
+
+fn erasure_ledger_from_config(
+    root: &Path,
+    origin: Option<String>,
+    token: Option<String>,
+    hosted: bool,
+) -> Box<dyn ErasureLedger> {
+    let local = LocalFileErasureLedger::new(root.join("content-keys").join("erased.ledger"));
+    match (origin, token) {
+        (Some(origin), Some(token)) => Box::new(EdgeErasureLedger::new(&origin, token, local)),
+        (None, None) if !hosted => Box::new(local),
+        _ => {
+            tracing::error!("content-vault: remote erasure authority is not fully configured; native confirmation is unavailable, local startup recovery remains available");
+            Box::new(UnconfirmedLocalLedger { local })
         }
-        return Box::new(local());
-    };
-    match nonempty("ERASURE_LEDGER_TOKEN") {
-        Some(token) => Box::new(EdgeErasureLedger::new(&origin, token, local())),
-        None => {
-            tracing::error!(
-                "content-vault: GAUGEDESK_ERASURE_LEDGER_ORIGIN is set but \
-                 GAUGEDESK_ERASURE_LEDGER_TOKEN is missing; falling back to the local ledger, \
-                 which does NOT survive a data-disk restore (finding 4.7)"
-            );
-            Box::new(local())
-        }
+    }
+}
+
+/// Local recovery is not confirmation from an absent configured authority.
+struct UnconfirmedLocalLedger {
+    local: LocalFileErasureLedger,
+}
+impl ErasureLedger for UnconfirmedLocalLedger {
+    fn record(&self, key_id: &str) -> std::io::Result<()> {
+        self.local.record(key_id)
+    }
+    fn recorded(&self) -> std::io::Result<Vec<String>> {
+        self.local.recorded()
+    }
+    fn record_confirmed(&self, key_id: &str) -> std::io::Result<()> {
+        // Preserve pending local erasure for retry after credentials are fixed.
+        self.local.record_confirmed(key_id)?;
+        Err(std::io::Error::other(
+            "configured remote erasure authority is unavailable",
+        ))
+    }
+    fn recorded_confirmed(&self) -> std::io::Result<Vec<String>> {
+        Err(std::io::Error::other(
+            "configured remote erasure authority is unavailable",
+        ))
     }
 }
 
@@ -233,6 +262,7 @@ impl ContentVault {
         self
     }
 
+    #[cfg(test)]
     fn key_path(&self, scope: &str) -> PathBuf {
         self.dir
             .join(format!("{}.dek", crate::org::sha256_hex(scope)))
@@ -241,48 +271,22 @@ impl ContentVault {
     /// Seal private account-custody material under a per-account DEK whose only
     /// durable form is wrapped by this vault's KEK/KMS boundary.
     pub(crate) fn seal_private(&self, scope: &str, plaintext: &str) -> Option<String> {
-        let dek = self.dek_for(scope, true)?;
-        LocalAeadEncryptor::new(dek)
-            .encrypt(plaintext.as_bytes())
-            .ok()
-            .map(hex::encode)
+        self.with_legacy_key(scope, true, |dek| {
+            LocalAeadEncryptor::new(dek)
+                .encrypt(plaintext.as_bytes())
+                .ok()
+                .map(hex::encode)
+        })
     }
 
     /// Open private account-custody material. A missing/erased/wrong DEK fails
     /// closed without distinguishing the cause.
     pub(crate) fn open_private(&self, scope: &str, sealed: &str) -> Option<String> {
-        let dek = self.dek_for(scope, false)?;
         let ciphertext = hex::decode(sealed).ok()?;
-        let plaintext = LocalAeadEncryptor::new(dek).decrypt(&ciphertext).ok()?;
-        String::from_utf8(plaintext).ok()
-    }
-
-    /// The per-scope DEK. `create` mints + persists one on a miss (the write path);
-    /// the read path passes `false`, so a scope whose key file is gone (crypto-erased)
-    /// resolves to `None` — its content is unrecoverable.
-    fn dek_for(&self, scope: &str, create: bool) -> Option<[u8; 32]> {
-        if let Some(dek) = self.cache.lock().unwrap().get(scope) {
-            return Some(*dek);
-        }
-        let path = self.key_path(scope);
-        if let Ok(wrapped) = std::fs::read(&path) {
-            if let Ok(dek) = self.wrap.unwrap(&wrapped) {
-                self.cache.lock().unwrap().insert(scope.to_string(), dek);
-                return Some(dek);
-            }
-            return None; // a key file we cannot unwrap is unrecoverable, fail-closed
-        }
-        if !create {
-            return None;
-        }
-        // Mint a fresh DEK, persist it wrapped, cache it.
-        let mut dek = [0u8; 32];
-        SystemRandom::new().fill(&mut dek).ok()?;
-        let wrapped = self.wrap.wrap(&dek).ok()?;
-        std::fs::create_dir_all(&self.dir).ok()?;
-        std::fs::write(&path, &wrapped).ok()?;
-        self.cache.lock().unwrap().insert(scope.to_string(), dek);
-        Some(dek)
+        self.with_legacy_key(scope, false, |dek| {
+            let plaintext = LocalAeadEncryptor::new(dek).decrypt(&ciphertext).ok()?;
+            String::from_utf8(plaintext).ok()
+        })
     }
 
     /// **Crypto-erase** a scope (`SECAUD-6`): destroy its wrapped DEK (file + cache).
@@ -297,8 +301,14 @@ impl ContentVault {
     /// return still means only "a key file was present", unchanged by the ledger write;
     /// a ledger failure is logged but does not change the return.
     pub fn crypto_erase(&self, scope: &str) -> bool {
-        self.cache.lock().unwrap().remove(scope);
         let key_id = crate::org::sha256_hex(scope);
+        let existed = match self.erase_local_scope(&key_id) {
+            Ok(existed) => existed,
+            Err(error) => {
+                tracing::warn!(%error, "content-vault: local scope erasure failed");
+                return false;
+            }
+        };
         if let Some(ledger) = &self.ledger {
             if let Err(err) = ledger.record(&key_id) {
                 tracing::warn!(
@@ -308,7 +318,7 @@ impl ContentVault {
                 );
             }
         }
-        std::fs::remove_file(self.key_path(scope)).is_ok()
+        existed
     }
 
     /// **Re-erase-on-open sweep** (SOC 2 finding 4.7 / DR-0086): re-apply every recorded
@@ -340,18 +350,13 @@ impl ContentVault {
         let recorded: BTreeSet<String> = recorded.into_iter().collect();
         let mut count = 0;
         for key_id in &recorded {
-            let path = self.dir.join(format!("{key_id}.dek"));
-            if std::fs::remove_file(&path).is_ok() {
-                count += 1;
+            match self.erase_local_scope(key_id) {
+                Ok(true) => count += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "content-vault: local scope re-erasure failed")
+                }
             }
-        }
-        // Drop any resurrected DEK from the in-memory cache so a cached key cannot keep
-        // opening content the ledger says is erased.
-        if !recorded.is_empty() {
-            self.cache
-                .lock()
-                .unwrap()
-                .retain(|scope, _| !recorded.contains(&crate::org::sha256_hex(scope)));
         }
         count
     }
@@ -382,7 +387,7 @@ impl ContentCodec for ContentVault {
         if !self.is_content(kind) {
             return Ok(payload.to_string());
         }
-        match self.dek_for(scope, true).and_then(|dek| {
+        match self.with_legacy_key(scope, true, |dek| {
             LocalAeadEncryptor::new(dek)
                 .encrypt(payload.as_bytes())
                 .ok()
@@ -404,10 +409,11 @@ impl ContentCodec for ContentVault {
         if hexct == "UNENCRYPTABLE" {
             return None;
         }
-        let dek = self.dek_for(scope, false)?; // erased / missing key ⇒ unrecoverable
         let ct = hex::decode(hexct).ok()?;
-        let plain = LocalAeadEncryptor::new(dek).decrypt(&ct).ok()?;
-        String::from_utf8(plain).ok()
+        self.with_legacy_key(scope, false, |dek| {
+            let plain = LocalAeadEncryptor::new(dek).decrypt(&ct).ok()?;
+            String::from_utf8(plain).ok()
+        })
     }
 }
 
@@ -436,6 +442,30 @@ pub trait ErasureLedger: Send + Sync {
 
     /// Every recorded key-id (deduplicated). Order is not significant.
     fn recorded(&self) -> std::io::Result<Vec<String>>;
+
+    /// Confirm durable recording at the configured authority. Unlike `record`,
+    /// this cannot succeed merely because a remote write was queued locally.
+    /// Blocking: call during preparation, outside product/store transactions.
+    fn record_confirmed(&self, key_id: &str) -> std::io::Result<()>;
+
+    /// Read all known tombstones with confirmation from the configured authority.
+    /// Unavailable authority or malformed entries refuse; a local-only fallback
+    /// cannot establish that a hosted scope is still available.
+    fn recorded_confirmed(&self) -> std::io::Result<Vec<String>>;
+}
+
+fn require_erasure_key_id(key_id: &str) -> std::io::Result<()> {
+    if key_id.len() != 64
+        || !key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "erasure ledger contains an invalid key id",
+        ));
+    }
+    Ok(())
 }
 
 /// A [`ErasureLedger`] backed by an append-only file, one key-id per line.
@@ -461,15 +491,32 @@ impl LocalFileErasureLedger {
 
 impl ErasureLedger for LocalFileErasureLedger {
     fn record(&self, key_id: &str) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)?;
         }
         let mut f = std::fs::OpenOptions::new()
             .create(true)
+            // Windows requires read access to lock an append handle.
+            .read(true)
             .append(true)
             .open(&self.path)?;
+        f.lock()?;
         writeln!(f, "{key_id}")?;
-        f.flush()
+        f.sync_all()?;
+        #[cfg(unix)]
+        {
+            let parent = self
+                .path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 
     fn recorded(&self) -> std::io::Result<Vec<String>> {
@@ -479,6 +526,7 @@ impl ErasureLedger for LocalFileErasureLedger {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
+        file.lock_shared()?;
         let mut seen = BTreeSet::new();
         for line in std::io::BufReader::new(file).lines() {
             let line = line?;
@@ -488,6 +536,34 @@ impl ErasureLedger for LocalFileErasureLedger {
             }
         }
         Ok(seen.into_iter().collect())
+    }
+
+    fn record_confirmed(&self, key_id: &str) -> std::io::Result<()> {
+        require_erasure_key_id(key_id)?;
+        self.record(key_id)
+    }
+
+    fn recorded_confirmed(&self) -> std::io::Result<Vec<String>> {
+        let mut file = match std::fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        file.lock_shared()?;
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut file, &mut body)?;
+        if !body.is_empty() && !body.ends_with('\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "erasure ledger has an incomplete record",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for id in body.split_terminator('\n') {
+            require_erasure_key_id(id)?;
+            ids.insert(id.to_owned());
+        }
+        Ok(ids.into_iter().collect())
     }
 }
 
@@ -553,18 +629,45 @@ impl EdgeErasureLedger {
         }
         let parsed: serde_json::Value =
             serde_json::from_str(&resp).map_err(|e| format!("parse: {e}"))?;
-        let ids = parsed
+        let values = parsed
             .get("key_ids")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| "edge erasure-ledger response missing key_ids".to_string())?
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
+            .ok_or_else(|| "edge erasure-ledger response missing key_ids".to_string())?;
+        let mut ids = Vec::with_capacity(values.len());
+        for value in values {
+            let id = value.as_str().ok_or_else(|| {
+                "edge erasure-ledger response has a non-string key id".to_string()
+            })?;
+            require_erasure_key_id(id).map_err(|error| error.to_string())?;
+            ids.push(id.to_owned());
+        }
         Ok(ids)
     }
 }
 
 impl ErasureLedger for EdgeErasureLedger {
+    fn record_confirmed(&self, key_id: &str) -> std::io::Result<()> {
+        self.local.record_confirmed(key_id)?;
+        Self::push(&self.url, &self.auth(), key_id).map_err(std::io::Error::other)?;
+        if !self
+            .fetch()
+            .map_err(std::io::Error::other)?
+            .iter()
+            .any(|id| id == key_id)
+        {
+            return Err(std::io::Error::other(
+                "edge erasure-ledger did not confirm the recorded key id",
+            ));
+        }
+        Ok(())
+    }
+
+    fn recorded_confirmed(&self) -> std::io::Result<Vec<String>> {
+        let mut all: BTreeSet<String> = self.local.recorded_confirmed()?.into_iter().collect();
+        all.extend(self.fetch().map_err(std::io::Error::other)?);
+        Ok(all.into_iter().collect())
+    }
+
     fn record(&self, key_id: &str) -> std::io::Result<()> {
         // Local queue first: immediate, and durable enough to retry from on the next
         // open even if the edge push below never lands.
@@ -609,6 +712,10 @@ impl ErasureLedger for EdgeErasureLedger {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "content_vault/ledger_tests.rs"]
+mod ledger_tests;
 
 #[cfg(test)]
 mod tests {
@@ -811,15 +918,14 @@ mod tests {
         assert!(v.crypto_erase("eng-1"));
         assert_eq!(v.decode("eng-1", "transcript", &ct), None);
 
-        // SIMULATE A RESTORE: a backup restore resurrects the wrapped-DEK file on the
-        // data root. A fresh vault (no cached DEK) would now unwrap it with the ever-
-        // present KEK — decode succeeds, i.e. the erasure has been silently undone.
+        // Restoring the wrapped key alone cannot undo the local tombstone, even
+        // before startup reapplication physically removes the restored file.
         std::fs::write(v.key_path("eng-1"), &key_bytes).unwrap();
         let restored = vault_with_ledger(dir.path());
         assert_eq!(
             restored.decode("eng-1", "transcript", &ct).as_deref(),
-            Some("a private question"),
-            "a restore alone resurrects the key — this is exactly what the sweep must fix"
+            None,
+            "the local tombstone refuses a restored key before the sweep"
         );
 
         // The re-erase-on-open sweep re-applies the recorded erasure: the file is

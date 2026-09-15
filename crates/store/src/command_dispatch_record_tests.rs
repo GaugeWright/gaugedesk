@@ -296,6 +296,115 @@ fn authority_history_refuses_an_unavailable_revocation_instead_of_reactivating_t
 }
 
 #[test]
+fn retained_dispatch_commits_outbox_under_both_exclusions_and_replays_exactly() {
+    use gaugedesk_core::run::{RunCommand, RunState};
+    let mut product = Store::open_in_memory().unwrap();
+    let mut observer = product.sibling().unwrap();
+    let competing = rusqlite::Connection::open(product.path()).unwrap();
+    competing.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let mut retained = Store::open_in_memory().unwrap();
+    let eraser = rusqlite::Connection::open(retained.path()).unwrap();
+    eraser.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let dispatch = CommandDispatch {
+        runtime_ref: "native".into(),
+        command_ref: "exact".into(),
+    };
+    let (_, basis) = product.read_for_dispatch(&["grants"], |_| Ok(())).unwrap();
+    let reply = product
+        .with_dispatch_record_admission(&basis, |writer| {
+            // Product exclusion is acquired BEFORE external retention begins.
+            assert!(competing.execute_batch("BEGIN IMMEDIATE").is_err());
+            let retention = retained
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let admitted = writer
+                .commit_dispatch::<RunState>("scope", "key", RunCommand::RequestRun, &dispatch)
+                .unwrap();
+            assert!(!admitted.replayed);
+            assert!(observer
+                .committed_dispatch::<RunState>("scope", "key")
+                .unwrap()
+                .is_some());
+            assert!(eraser.execute_batch("BEGIN IMMEDIATE").is_err());
+            retention.commit().unwrap();
+            Err::<(), _>("response lost after commit")
+        })
+        .unwrap();
+    assert!(reply.is_err());
+    let replay = product
+        .with_dispatch_record_admission(&basis, |writer| {
+            writer.commit_dispatch::<RunState>("scope", "key", RunCommand::RequestRun, &dispatch)
+        })
+        .unwrap()
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(product.records("scope", DISPATCH_KIND).unwrap().len(), 1);
+    let changed = CommandDispatch {
+        command_ref: "changed".into(),
+        ..dispatch
+    };
+    assert!(product
+        .with_dispatch_record_admission(&basis, |writer| {
+            writer.commit_dispatch::<RunState>("scope", "key", RunCommand::RequestRun, &changed)
+        })
+        .unwrap()
+        .is_err());
+}
+
+#[test]
+fn retained_dispatch_failed_publication_or_commit_leaves_no_command_or_outbox() {
+    use gaugedesk_core::run::{RunCommand, RunState};
+    let mut product = Store::open_in_memory().unwrap();
+    let (_, basis) = product.read_for_dispatch(&["grants"], |_| Ok(())).unwrap();
+    let response = product
+        .with_dispatch_record_admission(&basis, |_writer| {
+            Err::<(), _>("external input is unavailable")
+        })
+        .unwrap();
+    assert!(response.is_err());
+    assert!(product.command_for_key("scope", "key").unwrap().is_none());
+    product
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_dispatch BEFORE INSERT ON events
+         WHEN NEW.kind = 'runtime_command_dispatch_v1'
+         BEGIN SELECT RAISE(ABORT, 'dispatch fault'); END;",
+        )
+        .unwrap();
+    let dispatch = CommandDispatch {
+        runtime_ref: "native".into(),
+        command_ref: "exact".into(),
+    };
+    assert!(product
+        .with_dispatch_record_admission(&basis, |writer| {
+            writer.commit_dispatch::<RunState>("scope", "key", RunCommand::RequestRun, &dispatch)
+        })
+        .unwrap()
+        .is_err());
+    assert!(product.command_for_key("scope", "key").unwrap().is_none());
+    assert!(product.events("scope").unwrap().is_empty());
+    product
+        .conn
+        .execute_batch("DROP TRIGGER reject_dispatch")
+        .unwrap();
+    assert!(
+        !product
+            .with_dispatch_record_admission(&basis, |writer| {
+                writer.commit_dispatch::<RunState>(
+                    "scope",
+                    "key",
+                    RunCommand::RequestRun,
+                    &dispatch,
+                )
+            })
+            .unwrap()
+            .unwrap()
+            .replayed
+    );
+}
+
+#[test]
 fn committed_record_snapshots_preserve_scope_identity_and_ignore_mutable_status() {
     let mut store = Store::open_in_memory().unwrap();
     assert!(store

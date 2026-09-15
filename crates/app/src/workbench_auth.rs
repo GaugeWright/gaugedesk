@@ -166,7 +166,7 @@ impl Workbench {
 
     /// Preserve the source that actually verified the credential. Used at the
     /// Home authentication boundary, never to re-authenticate in an action factory.
-    pub(crate) fn authenticate_action_context(
+    pub fn authenticate_action_context(
         &self,
         token: &str,
     ) -> Option<crate::identity::AuthenticatedActionContext> {

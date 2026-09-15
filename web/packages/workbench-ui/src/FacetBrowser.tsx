@@ -167,6 +167,7 @@ export function FacetBrowser(props: {
     onOpenEngagement: (id: ProjectId, name: string) => void;
     onOpenModelAccess: (id: ProjectId, name: string) => void;
     onOpenProjectHome: (id: ProjectId, name: string) => void;
+    onOpenProjectTasks?: (id: ProjectId, name: string) => void;
     /** Hand the exact tested placement to the managed website-deployment flow. */
     onDeployPlacement?: (selection: {
         projectId: ProjectId;
@@ -976,6 +977,7 @@ export function FacetBrowser(props: {
                 { label: "attach folder…", hint: "Fingerprint the folder and compare before every write", run: () => props.onAttachTarget?.(p.id, p.name, "external-folder" as const) },
             ] : []),
             { label: "project home…", hint: "Recent runs, outputs under review, and an audit rollup for this project", run: () => props.onOpenProjectHome(p.id, p.name) },
+            ...(props.onOpenProjectTasks ? [{ label: "tasks…", hint: "Open the project’s task backlog, including unassigned work", run: () => props.onOpenProjectTasks?.(p.id, p.name) }] : []),
             { label: "model access…", hint: "Pin a per-project LLM provider key (overrides the account default)", run: () => props.onOpenModelAccess(p.id, p.name) },
             { label: "share & hand off…", run: () => props.onOpenEngagement(p.id, p.name) },
             ...(p.isPersonal ? [] : [

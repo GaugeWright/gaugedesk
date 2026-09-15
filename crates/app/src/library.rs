@@ -890,53 +890,61 @@ fn fold_one<T>(map: &mut BTreeMap<String, T>, id: &str, op: RecordOp, rec: T) {
 impl Library {
     /// Rebuild the projection by folding all library records in position order.
     pub fn rebuild(store: &Store) -> Result<Library, AdmitError> {
+        Self::from_records(|kind| store.records(LIBRARY_SCOPE, kind))
+    }
+
+    /// Validate/fold original incoming records without publishing them as local
+    /// authority. The receiver commits original records, not this projection.
+    pub(crate) fn from_records(
+        records: impl Fn(&str) -> Result<Vec<String>, AdmitError>,
+    ) -> Result<Library, AdmitError> {
         let mut lib = Library::default();
-        for row in store.records(LIBRARY_SCOPE, "agent")? {
+        for row in records("agent")? {
             let r: AgentRecord = serde_json::from_str(&row)?;
             guard_record_schema("agent", &r.id, r.schema)?;
             fold_one(&mut lib.agents, &r.id.clone(), r.op, r);
         }
-        for row in store.records(LIBRARY_SCOPE, "project")? {
+        for row in records("project")? {
             let r: ProjectRecord = serde_json::from_str(&row)?;
             guard_record_schema("project", &r.id, r.schema)?;
             fold_one(&mut lib.projects, &r.id.clone(), r.op, r);
         }
-        for row in store.records(LIBRARY_SCOPE, "instance")? {
+        for row in records("instance")? {
             let r: InstanceRecord = serde_json::from_str(&row)?;
             guard_record_schema("instance", &r.id, r.schema)?;
             fold_one(&mut lib.instances, &r.id.clone(), r.op, r);
         }
-        for row in store.records(LIBRARY_SCOPE, "public_deployment_binding")? {
+        for row in records("public_deployment_binding")? {
             let r: PublicDeploymentBindingRecord = serde_json::from_str(&row)?;
             guard_record_schema("public_deployment_binding", &r.id, r.schema)?;
             fold_one(&mut lib.public_deployments, &r.id.clone(), r.op, r);
         }
-        for row in store.records(LIBRARY_SCOPE, "chat")? {
+        for row in records("chat")? {
             let r: ChatRecord = serde_json::from_str(&row)?;
             guard_record_schema("chat", &r.id, r.schema)?;
             lib.apply_chat(r);
         }
-        for row in store.records(LIBRARY_SCOPE, "workstream")? {
+        for row in records("workstream")? {
             let r: WorkstreamRecord = serde_json::from_str(&row)?;
             guard_record_schema("workstream", &r.id, r.schema)?;
             fold_one(&mut lib.workstreams, &r.id.clone(), r.op, r);
         }
-        for row in store.records(LIBRARY_SCOPE, "work_target")? {
+        for row in records("work_target")? {
             let r: WorkTargetRecord = serde_json::from_str(&row)?;
             guard_record_schema("work_target", &r.id, r.schema)?;
             fold_one(&mut lib.work_targets, &r.id.clone(), r.op, r);
         }
-        for row in store.records(LIBRARY_SCOPE, "placement_targets")? {
+        for row in records("placement_targets")? {
             let r: PlacementTargetsRecord = serde_json::from_str(&row)?;
             guard_record_schema("placement_targets", &r.placement_id, r.schema)?;
             fold_one(&mut lib.placement_targets, &r.placement_id.clone(), r.op, r);
         }
-        for row in store.records(LIBRARY_SCOPE, "chat_target")? {
+        for row in records("chat_target")? {
             let r: ChatTargetBindingRecord = serde_json::from_str(&row)?;
             guard_record_schema("chat_target", &r.chat_id, r.schema)?;
             fold_one(&mut lib.chat_targets, &r.chat_id.clone(), r.op, r);
         }
-        for row in store.records(LIBRARY_SCOPE, "chat_target_set")? {
+        for row in records("chat_target_set")? {
             let r: ChatTargetSetRevisionRecord = serde_json::from_str(&row)?;
             guard_record_schema("chat_target_set", &r.chat_id, r.schema)?;
             validate_target_set_revision(&r).map_err(AdmitError::Codec)?;
@@ -952,7 +960,7 @@ impl Library {
                 revisions.insert(r.revision, r);
             }
         }
-        for row in store.records(LIBRARY_SCOPE, "chat_target_basis")? {
+        for row in records("chat_target_basis")? {
             let r: ChatTargetBasisRecord = serde_json::from_str(&row)?;
             guard_record_schema("chat_target_basis", &r.chat_id, r.schema)?;
             if r.chat_id.is_empty() || r.target_id.is_empty() || r.basis.is_empty() {
@@ -962,7 +970,7 @@ impl Library {
             }
             lib.apply_chat_target_basis(r);
         }
-        for row in store.records(LIBRARY_SCOPE, "project_collaboration_workspace")? {
+        for row in records("project_collaboration_workspace")? {
             let r: ProjectCollaborationWorkspaceRecord = serde_json::from_str(&row)?;
             guard_record_schema("project_collaboration_workspace", &r.project_id, r.schema)?;
             fold_one(
@@ -972,7 +980,7 @@ impl Library {
                 r,
             );
         }
-        for row in store.records(LIBRARY_SCOPE, "workstream_root")? {
+        for row in records("workstream_root")? {
             let r: WorkstreamRootRecord = serde_json::from_str(&row)?;
             guard_record_schema("workstream_root", &r.workstream_id, r.schema)?;
             fold_one(&mut lib.workstream_roots, &r.workstream_id.clone(), r.op, r);

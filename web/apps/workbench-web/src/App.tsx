@@ -101,6 +101,8 @@ import {
     ForkTreePanel,
     OpenSettingsMenu as SettingsMenu,
     ProjectHomePanel,
+    ProjectTrackerPanel,
+    type PendingTrackerCompletion,
     ProjectModelAccessPanel,
     parseEnabledModels,
     panelManifest,
@@ -418,6 +420,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [modelAccess, setModelAccess] = createSignal<{ id: ProjectId; name: string } | null>(null);
     // UX-2: the per-project home panel (recent runs, outputs under review, audit rollup).
     const [projectHome, setProjectHome] = createSignal<{ id: ProjectId; name: string } | null>(null);
+    const [projectTasks, setProjectTasks] = createSignal<{ id: ProjectId; name: string; queue?: string; subject?: string } | null>(null);
+    const trackerActor = createMemo(() => JSON.stringify([authority(), hubSession()?.person ?? null]));
+    // A panel may close while delivery is uncertain. Its command survives in
+    // this actor's session; changing accounts creates a separate signal so even
+    // a late response cannot repopulate the next person's pending commands.
+    const trackerCompletions = createMemo(() => {
+        trackerActor();
+        return createSignal<PendingTrackerCompletion[]>([]);
+    });
+    createEffect(on(trackerActor, () => setProjectTasks(null), { defer: true }));
     // UX-8: the fork-tree panel (chat fork lineage); holds the chat that opened it.
     const [forkTreeFor, setForkTreeFor] = createSignal<EngagementId | null>(null);
     const [deployment, setDeployment] = createSignal<DeploymentSelection | null>(null);
@@ -1565,6 +1577,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onOpenEngagement={(id, name) => setEngagement({ id, name })}
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}
             onOpenProjectHome={(id, name) => setProjectHome({ id, name })}
+            onOpenProjectTasks={(id, name) => setProjectTasks({ id, name })}
             onDeployPlacement={setDeployment}
             onPreviewPanel={(agent, project) => {
                 const placement = project?.placements.find((candidate) =>
@@ -2124,6 +2137,15 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         onClose={() => setModelAccess(null)}
                     />
                 )}
+            </Show>
+
+            <Show when={projectTasks()} keyed>
+                {project => <ProjectTrackerPanel
+                    api={api} project={project.id} projectName={project.name}
+                    initialQueue={project.queue} initialSubject={project.subject}
+                    refreshKey={navRefresh()} completions={trackerCompletions()}
+                    onClose={() => setProjectTasks(null)}
+                />}
             </Show>
 
             <Show when={projectHome()}>

@@ -60,6 +60,14 @@ fn reducer_command_path(path: &str) -> bool {
         )
 }
 
+fn native_tracker_command_path(path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
+    matches!(
+        parts.as_slice(),
+        ["projects", _, "trackers", _, "issues", _, "complete"]
+    )
+}
+
 // This exact typed command owns its receipted outbox and replay. Wrapping it in
 // the legacy HTTP claim would hide its admitted result behind a second status
 // and reject a safe replay before the command's current authority checks run.
@@ -102,6 +110,10 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
     if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS)
         || reducer_command_path(request.uri().path())
         || environment_command_path(request.uri().path())
+        // This handler binds the header key to an authenticated native action
+        // and recovers its actual receipt. The generic uncertain-command cache
+        // must not prevent delivery of that original result.
+        || native_tracker_command_path(request.uri().path())
         || native_file_save_command(&method, request.uri().path())
     {
         return next.run(request).await;

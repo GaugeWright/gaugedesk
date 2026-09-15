@@ -401,6 +401,14 @@
     },
     {
       "declaration": {
+        "name": "export_protected_workflow",
+        "owner": "Workspace",
+        "signature": "fn export_protected_workflow (& self , _protection : & WorkflowProtection ,) -> Result < WorkspaceExport >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
         "name": "fork_engagement_at",
         "owner": "Workspace",
         "signature": "fn fork_engagement_at (& self , id : & str , source_branch : & str , target : & str , cut_id : & str ,) -> Result < Box < dyn ChatWorkspace > >"
@@ -430,6 +438,14 @@
         "signature": "fn mainline (& self) -> & str"
       },
       "classification": "locator"
+    },
+    {
+      "declaration": {
+        "name": "native_workflow_storage",
+        "owner": "Workspace",
+        "signature": "fn native_workflow_storage (& self) -> Result < NativeWorkflowStorage >"
+      },
+      "classification": "requires-provenance-review"
     },
     {
       "declaration": {
@@ -529,6 +545,14 @@
     },
     {
       "declaration": {
+        "name": "workflow_source",
+        "owner": "Workspace",
+        "signature": "fn workflow_source (& self , path : & str , cut : & str , byte_limit : usize) -> Result < WorkflowSource >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
         "name": "workstream",
         "owner": "Workspace",
         "signature": "fn workstream (& self , _workstream_id : & str) -> Result < Option < WorkstreamRow > >"
@@ -561,6 +585,14 @@
     },
     {
       "declaration": {
+        "name": "accepts_export_format",
+        "owner": "WorkspaceProvider",
+        "signature": "fn accepts_export_format (& self , format : & str) -> bool"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
         "name": "export_format",
         "owner": "WorkspaceProvider",
         "signature": "fn export_format (& self) -> & 'static str"
@@ -585,6 +617,14 @@
     },
     {
       "declaration": {
+        "name": "from_protected_export_at",
+        "owner": "WorkspaceProvider",
+        "signature": "fn from_protected_export_at (& self , _dir : & Path , _export : & [u8] , _protection : & WorkflowProtection ,) -> Result < Box < dyn Workspace > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
         "name": "init_at",
         "owner": "WorkspaceProvider",
         "signature": "fn init_at (& self , dir : & Path) -> Result < Box < dyn Workspace > >"
@@ -601,14 +641,6 @@
     }
   ],
   "profiles": {
-    "editor-and-import": {
-      "coverage_id": "ACTION-4",
-      "reason": "Editor, import, upload, restore and read/base helpers require exact admitted intent and evidence; existing materialization and best-effort transcript publication do not establish parity.",
-      "required_evidence": [
-        "Migrate actual HTTP and non-HTTP callers to the shared governed implementation.",
-        "Preserve conflict/resolution and exact observed bases; attribute external writes only as observed."
-      ]
-    },
     "agent-turn": {
       "coverage_id": "ACTION-5",
       "reason": "Agent turn boundaries, automatic merge and autosync mutate or observe shared workspace state and need their causal command/effect/result mapping.",
@@ -625,36 +657,20 @@
         "Bind every durable authoring change and release result to its originating authenticated command."
       ]
     },
-    "startup-and-migration": {
-      "coverage_id": "ACTION-8",
-      "reason": "Startup migration, reconciliation and recovery can import or change durable work without an HTTP request; bootstrap must not manufacture a work grant or retroactive actor.",
+    "custody-and-erasure": {
+      "coverage_id": "ACTION-6",
+      "reason": "Credential, content-key and quarantine cleanup sites share workspace method names but belong to dedicated custody/erasure authorities.",
       "required_evidence": [
-        "Declare the migration/observation boundary and preserve legacy or unknown provenance.",
-        "Map durable effects and recovery to their actual authority; classify disposable initialization separately."
+        "Verify the actual receiver and admitted custody/erasure outcome rather than inferring a workspace call from its name.",
+        "Retain permitted metadata only; secret bytes never enter generic commands or runtime evidence."
       ]
     },
-    "topology-and-settlement": {
-      "coverage_id": "ACTION-5",
-      "reason": "Workspace construction, homing, promotion and target settlement require shared command/effect/result provenance under their existing independent authorities.",
+    "editor-and-import": {
+      "coverage_id": "ACTION-4",
+      "reason": "Editor, import, upload, restore and read/base helpers require exact admitted intent and evidence; existing materialization and best-effort transcript publication do not establish parity.",
       "required_evidence": [
-        "Preserve reservations, CAS, exact candidate/target bases and compensation identity.",
-        "Qualify partial application, current authority and interrupted recovery without a second settlement machine."
-      ]
-    },
-    "native-action-boundary": {
-      "coverage_id": "ACTION-3",
-      "reason": "These are native input/target custody and action-boundary calls already exercised by the editor foundation; entry-point migration and other callers remain open.",
-      "required_evidence": [
-        "Retain current actor/policy and ownership fencing plus input/base/result exclusion.",
-        "Connect the qualified runtime evidence and product admission to live entry points without an alternate writer."
-      ]
-    },
-    "native-workspace-adapter": {
-      "coverage_id": "ACTION-5",
-      "reason": "Native workspace methods adapt the owning WhippleScript stores, including read-triggered imports, versioned changes, topology and disposable materialization.",
-      "required_evidence": [
-        "Map each effectful adapter call to an admitted operation; storage-engine writes do not recursively become commands.",
-        "Preserve exact native cuts and retention, and identify observation-only or derived paths explicitly."
+        "Migrate actual HTTP and non-HTTP callers to the shared governed implementation.",
+        "Preserve conflict/resolution and exact observed bases; attribute external writes only as observed."
       ]
     },
     "external-workspace-adapter": {
@@ -665,12 +681,59 @@
         "Keep opaque process footprints and unknown external authorship explicit; do not retry uncertain effects blindly."
       ]
     },
-    "custody-and-erasure": {
-      "coverage_id": "ACTION-6",
-      "reason": "Credential, content-key and quarantine cleanup sites share workspace method names but belong to dedicated custody/erasure authorities.",
+    "native-action-boundary": {
+      "coverage_id": "ACTION-3",
+      "reason": "These are native input/target custody and action-boundary calls already exercised by the editor foundation; entry-point migration and other callers remain open.",
       "required_evidence": [
-        "Verify the actual receiver and admitted custody/erasure outcome rather than inferring a workspace call from its name.",
-        "Retain permitted metadata only; secret bytes never enter generic commands or runtime evidence."
+        "Retain current actor/policy and ownership fencing plus input/base/result exclusion.",
+        "Connect the qualified runtime evidence and product admission to live entry points without an alternate writer."
+      ]
+    },
+    "native-action-observation-callback": {
+      "coverage_id": "ACTION-3",
+      "reason": "These private observation callbacks share the current reader and original-command authority fence. Execution-only reads drop the one-use writer; saved-source retention may consume it only after the existing exact attempt-bound target proof.",
+      "required_evidence": [
+        "Missing acknowledgment remains an evidence gap without redelivery or store initialization; retained acknowledgment requires the exact receipt, fact, command, runtime and independently verified runtime prefix.",
+        "Execution observations preserve original attribution and original/current restrictions, refuse revoked readers, and leave product and runtime history unchanged.",
+        "Saved-input observation and source retention retain their exact target proof and one-use publication fence; live entry-point migration remains open."
+      ]
+    },
+    "native-recording-boundary": {
+      "coverage_id": "ACTION-4",
+      "reason": "Native recording descriptors bind the actual selected store and namespace, with a separate read-only historical evidence adapter. Home admission retains exact input and a fenced independent command/outbox; delivery verifies original admission and current authority. Execution resolves the retained input under the Home fences and invokes the runtime-owned recording door after exact target, scope and IFC checks. Independent inspection authenticates the current reader, preserves all original and current metadata restrictions and validates the original Home input mapping before reading the actual historical batch through a read-only adapter. Reconciliation uses its independently admitted outbox and retained read policy, current investigator authority and an explicitly acquired actual-Home runtime epoch. The owner verifies the original execution, input mapping and actual historical target batch before publishing a disposition; the Home admits only the pinned runtime acknowledgment, with no recording retry or workflow advance. Product result admission independently checks the committed reconciliation/outbox/acknowledgment, undisputed Applied history and actual original batch, then records the owner's exact ordered outcomes under the current product fence. Reads return only the immutable admitted metadata under current access and all retained result restrictions, without opening runtime, target or input databases or promising body availability. Derived-input handling and activation remain open.",
+      "required_evidence": [
+        "Derive input and scope from current Home authority and invoke only the runtime-owned fixed recording profile after durable dispatch.",
+        "Preserve original attribution and first-wins outcomes without advancing file heads or reconstructing erased bodies.",
+        "Authorize an independent investigator before reading the original target receipt; do not treat an absent receipt as non-application.",
+        "Refuse stale or foreign-Home ownership, missing outboxes and revoked current investigators; recover a lost acknowledgment from the exact runtime receipt without retrying the target.",
+        "Keep original batch attribution and both merge orientations, including inserted=false for existing winners; a later investigator or result-admitting reader never becomes their original author.",
+        "Refuse missing admission, acknowledgment, target receipt or product commit receipt, and disputed runtime evidence; retain stricter historical metadata restrictions after target policy relaxation.",
+        "Recover product commit failures under the same result identity without runtime or target mutation; independently authorize read-only historical result retrieval after backing runtime or target removal."
+      ]
+    },
+    "native-workspace-adapter": {
+      "coverage_id": "ACTION-5",
+      "reason": "Native workspace methods adapt the owning WhippleScript stores, including read-triggered imports, versioned changes, topology and disposable materialization.",
+      "required_evidence": [
+        "Map each effectful adapter call to an admitted operation; storage-engine writes do not recursively become commands.",
+        "Preserve exact native cuts and retention, and identify observation-only or derived paths explicitly."
+      ]
+    },
+    "project-tracker-completion": {
+      "coverage_id": "ACTION-3",
+      "reason": "Human tracker completion retains exact input and permanent issue binding under current project tracker grants before a separate native closure action; it does not infer authority from assignment or claim-holder identity.",
+      "required_evidence": [
+        "Fence current recipient Read and Contribute grants, pending handoff, project key and retained input through original command publication and native closure.",
+        "Preserve the original actor, permanent subject and explicit claim precondition across retry and restart; recover a committed closing receipt without re-dispatch and refuse unresolved receipt loss.",
+        "An authorized colleague closes an away assignee task under their own native attribution; assignment and the tutorial root remain distinct."
+      ]
+    },
+    "project-workflow-launch": {
+      "coverage_id": "ACTION-3",
+      "reason": "Ordinary folder workflow admission retains immutable source and typed inputs under current project, source and tracker authority; native admission is distinct from subsequent effect permission.",
+      "required_evidence": [
+        "Fence current source and resource grants through protected input retention and product command publication.",
+        "Recover the original command and native instance across retry, restart and relocation; changed inputs, revoked access and erased custody refuse."
       ]
     },
     "publication-review": {
@@ -689,26 +752,20 @@
         "A handler reference is not itself proof of runtime mediation or an exemption for the handler body."
       ]
     },
-    "native-recording-boundary": {
-      "coverage_id": "ACTION-4",
-      "reason": "Native recording descriptors bind the actual selected store and namespace, with a separate read-only historical evidence adapter. Home admission retains exact input and a fenced independent command/outbox; delivery verifies original admission and current authority. Execution resolves the retained input under the Home fences and invokes the runtime-owned recording door after exact target, scope and IFC checks. Independent inspection authenticates the current reader, preserves all original and current metadata restrictions and validates the original Home input mapping before reading the actual historical batch through a read-only adapter. Reconciliation uses its independently admitted outbox and retained read policy, current investigator authority and an explicitly acquired actual-Home runtime epoch. The owner verifies the original execution, input mapping and actual historical target batch before publishing a disposition; the Home admits only the pinned runtime acknowledgment, with no recording retry or workflow advance. Product result admission independently checks the committed reconciliation/outbox/acknowledgment, undisputed Applied history and actual original batch, then records the owner's exact ordered outcomes under the current product fence. Reads return only the immutable admitted metadata under current access and all retained result restrictions, without opening runtime, target or input databases or promising body availability. Derived-input handling and activation remain open.",
+    "startup-and-migration": {
+      "coverage_id": "ACTION-8",
+      "reason": "Startup migration, reconciliation and recovery can import or change durable work without an HTTP request; bootstrap must not manufacture a work grant or retroactive actor.",
       "required_evidence": [
-        "Derive input and scope from current Home authority and invoke only the runtime-owned fixed recording profile after durable dispatch.",
-        "Preserve original attribution and first-wins outcomes without advancing file heads or reconstructing erased bodies.",
-        "Authorize an independent investigator before reading the original target receipt; do not treat an absent receipt as non-application.",
-        "Refuse stale or foreign-Home ownership, missing outboxes and revoked current investigators; recover a lost acknowledgment from the exact runtime receipt without retrying the target.",
-        "Keep original batch attribution and both merge orientations, including inserted=false for existing winners; a later investigator or result-admitting reader never becomes their original author.",
-        "Refuse missing admission, acknowledgment, target receipt or product commit receipt, and disputed runtime evidence; retain stricter historical metadata restrictions after target policy relaxation.",
-        "Recover product commit failures under the same result identity without runtime or target mutation; independently authorize read-only historical result retrieval after backing runtime or target removal."
+        "Declare the migration/observation boundary and preserve legacy or unknown provenance.",
+        "Map durable effects and recovery to their actual authority; classify disposable initialization separately."
       ]
     },
-    "native-action-observation-callback": {
-      "coverage_id": "ACTION-3",
-      "reason": "These private observation callbacks share the current reader and original-command authority fence. Execution-only reads drop the one-use writer; saved-source retention may consume it only after the existing exact attempt-bound target proof.",
+    "topology-and-settlement": {
+      "coverage_id": "ACTION-5",
+      "reason": "Workspace construction, homing, promotion and target settlement require shared command/effect/result provenance under their existing independent authorities.",
       "required_evidence": [
-        "Missing acknowledgment remains an evidence gap without redelivery or store initialization; retained acknowledgment requires the exact receipt, fact, command, runtime and independently verified runtime prefix.",
-        "Execution observations preserve original attribution and original/current restrictions, refuse revoked readers, and leave product and runtime history unchanged.",
-        "Saved-input observation and source retention retain their exact target proof and one-use publication fence; live entry-point migration remains open."
+        "Preserve reservations, CAS, exact candidate/target bases and compensation identity.",
+        "Qualify partial application, current authority and interrupted recovery without a second settlement machine."
       ]
     }
   },
@@ -765,23 +822,23 @@
     },
     {
       "site": {
-        "callable": "impl inherent for ContentVault::crypto_erase",
+        "callable": "impl inherent for ContentVault::erase_local_scope",
         "capability": "remove_file",
         "count": 1,
-        "expression": "std :: fs :: remove_file (self . key_path (scope))",
-        "file": "crates/app/src/content_vault.rs"
+        "expression": "std :: fs :: remove_file (key_path (& root , key_id))",
+        "file": "crates/app/src/content_vault/scope_key.rs"
       },
       "profile": "custody-and-erasure"
     },
     {
       "site": {
-        "callable": "impl inherent for ContentVault::reerase_recorded",
-        "capability": "remove_file",
+        "callable": "impl inherent for PreparedScopeKey::retain",
+        "capability": "publish",
         "count": 1,
-        "expression": "std :: fs :: remove_file (& path)",
-        "file": "crates/app/src/content_vault.rs"
+        "expression": "publish ()",
+        "file": "crates/app/src/content_vault/scope_key.rs"
       },
-      "profile": "custody-and-erasure"
+      "profile": "native-action-boundary"
     },
     {
       "site": {
@@ -1205,6 +1262,26 @@
     },
     {
       "site": {
+        "callable": "capture_handoff_offer",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (None)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "capture_handoff_offer",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (Some ((key , capsule)))",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
         "callable": "impl inherent for Workbench::create_default_target_engagement",
         "capability": "create_engagement",
         "count": 1,
@@ -1216,9 +1293,29 @@
     {
       "site": {
         "callable": "impl inherent for Workbench::materialize_collaboration_workspace",
+        "capability": "accepts_export_format",
+        "count": 1,
+        "expression": "provider . accepts_export_format (format)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::materialize_collaboration_workspace",
         "capability": "from_export_at",
         "count": 1,
         "expression": "provider . from_export_at (& dir , bundle)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::materialize_target",
+        "capability": "accepts_export_format",
+        "count": 1,
+        "expression": "provider . accepts_export_format (format)",
         "file": "crates/app/src/federation.rs"
       },
       "profile": "topology-and-settlement"
@@ -1240,6 +1337,66 @@
         "count": 1,
         "expression": "target . reconcile_engagements ()",
         "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "commit",
+        "capability": "accepts_export_format",
+        "count": 1,
+        "expression": "provider . accepts_export_format (& bundle . format)",
+        "file": "crates/app/src/federation_incoming_handoff.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "commit",
+        "capability": "from_export_at",
+        "count": 1,
+        "expression": "provider . from_export_at (& path , & bundle . bundle)",
+        "file": "crates/app/src/federation_incoming_handoff.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "commit",
+        "capability": "from_protected_export_at",
+        "count": 1,
+        "expression": "provider . from_protected_export_at (& path , & bundle . bundle , protection)",
+        "file": "crates/app/src/federation_incoming_handoff.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "commit",
+        "capability": "publish",
+        "count": 2,
+        "expression": "publish ()",
+        "file": "crates/app/src/federation_incoming_handoff.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "publish_views",
+        "capability": "reconcile_engagements",
+        "count": 1,
+        "expression": "workspace . reconcile_engagements ()",
+        "file": "crates/app/src/federation_incoming_handoff.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "prepare",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "workspace . native_workflow_storage ()",
+        "file": "crates/app/src/federation_workflow_keys.rs"
       },
       "profile": "topology-and-settlement"
     },
@@ -1899,6 +2056,16 @@
         "capability": "export",
         "count": 1,
         "expression": "workspace . export ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::library_project_relocation_content_bundles",
+        "capability": "export_protected_workflow",
+        "count": 1,
+        "expression": "workspace . export_protected_workflow (protection)",
         "file": "crates/app/src/library_state.rs"
       },
       "profile": "topology-and-settlement"
@@ -2585,6 +2752,46 @@
     },
     {
       "site": {
+        "callable": "impl inherent for Workbench::prepare_tracker_completion",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (& [input] , | | { admission . commit_dispatch :: < ProductActionAdmission > (scope , & request . request_id , command . clone () , & dispatch ,) . map_err (native_error) })",
+        "file": "crates/app/src/project_tracker_completion.rs"
+      },
+      "profile": "project-tracker-completion"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::launch_project_workflow",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (& retained , | | { admission . commit_dispatch :: < ProductActionAdmission > (& scope , & request . request_id , command . clone () , & dispatch ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (debug_error (error)) }) })",
+        "file": "crates/app/src/project_workflow_launch.rs"
+      },
+      "profile": "project-workflow-launch"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::launch_project_workflow",
+        "capability": "workflow_source",
+        "count": 1,
+        "expression": "target . workflow_source (& request . path , & request . cut , limits . source_bytes)",
+        "file": "crates/app/src/project_workflow_launch.rs"
+      },
+      "profile": "project-workflow-launch"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::workflow_storage",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "self . collaboration_workspaces . get (workspace) . ok_or (\"project collaboration workspace is not open\") ? . native_workflow_storage ()",
+        "file": "crates/app/src/project_workflow_launch.rs"
+      },
+      "profile": "project-workflow-launch"
+    },
+    {
+      "site": {
         "callable": "impl inherent for QuarantineStore::discard",
         "capability": "remove_file",
         "count": 1,
@@ -2598,14 +2805,14 @@
         "callable": "impl inherent for Workbench::deliver_editor_corrections",
         "capability": "publish",
         "count": 1,
-        "expression": "inputs . publish (std :: slice :: from_ref (& command . inputs [\"corrections\"]) , | | { self . store_mut () . with_dispatch_basis (& prepared . basis , | | { let verifier = super :: super :: delivery :: NativeAdmissionVerifier { command , key : prepared . key . public_key () , } ; runtime . admit_action (command . clone () , recording . action () , & verifier , prepared . key . sign (& bytes) . as_bytes () ,) }) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"correction delivery authority changed: {error:?}\" ,)) }) ? . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"runtime correction admission refused: {error:?}\" ,)) }) })",
+        "expression": "inputs . publish (std :: slice :: from_ref (& command . inputs [\"corrections\"]) , | | { let verifier = super :: super :: delivery :: NativeAdmissionVerifier { command , key : prepared . key . public_key () , } ; runtime . admit_action (command . clone () , recording . action () , & verifier , prepared . key . sign (& bytes) . as_bytes () ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"runtime correction admission refused: {error:?}\")) }) })",
         "file": "crates/app/src/resolution_recording_delivery.rs"
       },
       "profile": "native-recording-boundary"
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::prepare_native_corrections",
+        "callable": "impl inherent for Workbench::prepare_native_corrections_access",
         "capability": "native_resolution_recording_target",
         "count": 1,
         "expression": "self . engagements . get (& chat) . ok_or (\"chat workspace is unavailable\") ? . native_resolution_recording_target (& path , original_scope)",
@@ -3515,6 +3722,16 @@
     },
     {
       "site": {
+        "callable": "resume",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "instance . native_workflow_storage ()",
+        "file": "crates/workspace/src/import_receipt.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
         "callable": "clear_worktree",
         "capability": "remove_file",
         "count": 1,
@@ -3935,6 +4152,16 @@
     },
     {
       "site": {
+        "callable": "impl Workspace for Instance::export_protected_workflow",
+        "capability": "export_protected_workflow",
+        "count": 1,
+        "expression": "Self :: export_protected_workflow (self , protection)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
         "callable": "impl Workspace for Instance::fork_engagement_at",
         "capability": "fork_engagement_at",
         "count": 1,
@@ -3959,6 +4186,16 @@
         "capability": "leave_engagement_workstream",
         "count": 1,
         "expression": "Self :: leave_engagement_workstream (self , engagement_id)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::native_workflow_storage",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "Self :: native_workflow_storage (self)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
@@ -4075,6 +4312,16 @@
     },
     {
       "site": {
+        "callable": "impl Workspace for Instance::workflow_source",
+        "capability": "workflow_source",
+        "count": 1,
+        "expression": "Self :: workflow_source (self , path , cut , byte_limit)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
         "callable": "impl Workspace for Instance::workstream",
         "capability": "workstream",
         "count": 1,
@@ -4109,6 +4356,16 @@
         "capability": "from_export_at",
         "count": 1,
         "expression": "Instance :: from_export_at (dir , export)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl WorkspaceProvider for WhippleWorkspaceProvider::from_protected_export_at",
+        "capability": "from_protected_export_at",
+        "count": 1,
+        "expression": "Instance :: from_protected_export_at (dir , export , protection ,)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
@@ -4255,6 +4512,16 @@
     },
     {
       "site": {
+        "callable": "impl inherent for Instance::export_inner",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "self . native_workflow_storage ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
         "callable": "impl inherent for Instance::fork_from_at",
         "capability": "from_export_at",
         "count": 1,
@@ -4265,7 +4532,17 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Instance::from_export_at",
+        "callable": "impl inherent for Instance::from_export_inner",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "instance . native_workflow_storage ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::from_export_inner",
         "capability": "reconcile_engagements",
         "count": 1,
         "expression": "instance . reconcile_engagements ()",
@@ -4289,16 +4566,6 @@
         "capability": "remove_file",
         "count": 1,
         "expression": "std :: fs :: remove_file (scratch_cache_path (& self . store_root , & engagement_line (id)))",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
-        "callable": "snapshot_sqlite",
-        "capability": "remove_file",
-        "count": 2,
-        "expression": "std :: fs :: remove_file (& target)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"

@@ -60,10 +60,14 @@ impl LocalAeadEncryptor {
         let unbound = UnboundKey::new(&AES_256_GCM, &self.key).map_err(|_| AtRestError::BadKey)?;
         Ok(LessSafeKey::new(unbound))
     }
-}
-
-impl Encryptor for LocalAeadEncryptor {
-    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, AtRestError> {
+    /// Seal bytes while authenticating their caller-supplied storage binding.
+    /// Associated data is not encrypted or included in the ciphertext: the
+    /// caller must supply the same bytes when opening it.
+    pub fn encrypt_with_aad(
+        &self,
+        plaintext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<Vec<u8>, AtRestError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         SystemRandom::new()
             .fill(&mut nonce_bytes)
@@ -72,7 +76,7 @@ impl Encryptor for LocalAeadEncryptor {
         let mut in_out = plaintext.to_vec();
         key.seal_in_place_append_tag(
             Nonce::assume_unique_for_key(nonce_bytes),
-            Aad::empty(),
+            Aad::from(associated_data),
             &mut in_out,
         )
         .map_err(|_| AtRestError::Encrypt)?;
@@ -82,7 +86,13 @@ impl Encryptor for LocalAeadEncryptor {
         Ok(out)
     }
 
-    fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, AtRestError> {
+    /// Open only at the authenticated storage binding. A changed or missing
+    /// binding has the same failure as a changed ciphertext or wrong key.
+    pub fn decrypt_with_aad(
+        &self,
+        ciphertext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<Vec<u8>, AtRestError> {
         if ciphertext.len() < NONCE_LEN {
             return Err(AtRestError::Malformed);
         }
@@ -94,11 +104,21 @@ impl Encryptor for LocalAeadEncryptor {
         let plaintext = key
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce_arr),
-                Aad::empty(),
+                Aad::from(associated_data),
                 &mut in_out,
             )
             .map_err(|_| AtRestError::Decrypt)?;
         Ok(plaintext.to_vec())
+    }
+}
+
+impl Encryptor for LocalAeadEncryptor {
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, AtRestError> {
+        self.encrypt_with_aad(plaintext, &[])
+    }
+
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, AtRestError> {
+        self.decrypt_with_aad(ciphertext, &[])
     }
 }
 
@@ -268,6 +288,62 @@ mod tests {
         let ct = enc.encrypt(msg).unwrap();
         assert_ne!(&ct[..], &msg[..], "ciphertext is not the plaintext");
         assert_eq!(enc.decrypt(&ct).unwrap(), msg);
+    }
+
+    #[test]
+    fn associated_data_authenticates_the_exact_binding() {
+        let enc = LocalAeadEncryptor::new([7u8; 32]);
+        let binding = b"project:one/runtime/event:one";
+        let plaintext = [0, 255, 17, 128];
+        let sealed = enc.encrypt_with_aad(&plaintext, binding).unwrap();
+        assert_eq!(enc.decrypt_with_aad(&sealed, binding).unwrap(), plaintext);
+        for other in [
+            b"project:two/runtime/event:one".as_slice(),
+            b"project:one/tracker/event:one".as_slice(),
+            b"project:one/runtime/event:two".as_slice(),
+            b"".as_slice(),
+        ] {
+            assert_eq!(
+                enc.decrypt_with_aad(&sealed, other),
+                Err(AtRestError::Decrypt)
+            );
+        }
+        assert_eq!(enc.decrypt(&sealed), Err(AtRestError::Decrypt));
+        assert_eq!(
+            LocalAeadEncryptor::new([8u8; 32]).decrypt_with_aad(&sealed, binding),
+            Err(AtRestError::Decrypt)
+        );
+        let mut tampered = sealed.clone();
+        tampered[NONCE_LEN] ^= 1;
+        assert_eq!(
+            enc.decrypt_with_aad(&tampered, binding),
+            Err(AtRestError::Decrypt)
+        );
+        assert_ne!(enc.encrypt_with_aad(&plaintext, binding).unwrap(), sealed);
+    }
+
+    #[test]
+    fn associated_data_api_opens_independent_aes_gcm_fixtures() {
+        // Node/OpenSSL AES-256-GCM, key [7;32], nonce [9;12], "fixture payload".
+        // These fixed fixtures pin the existing nonce || ciphertext || tag wire
+        // format independently of this implementation's encrypt/decrypt pair.
+        let enc = LocalAeadEncryptor::new([7u8; 32]);
+        let legacy = hex::decode("09090909090909090909090941ecfce0cb82a441d003b254898bc74e0d8b6702d7d9f08a6dc993ea26621b").unwrap();
+        let bound = hex::decode("09090909090909090909090941ecfce0cb82a441d003b254898bc7b97f86ed0d215bb53041630d4b987d8f").unwrap();
+        assert_eq!(enc.decrypt(&legacy).unwrap(), b"fixture payload");
+        assert_eq!(
+            enc.decrypt_with_aad(&legacy, &[]).unwrap(),
+            b"fixture payload"
+        );
+        assert_eq!(
+            enc.decrypt_with_aad(&bound, b"runtime-binding").unwrap(),
+            b"fixture payload"
+        );
+        assert_eq!(enc.decrypt(&bound), Err(AtRestError::Decrypt));
+        assert_eq!(
+            enc.decrypt_with_aad(&legacy, b"runtime-binding"),
+            Err(AtRestError::Decrypt)
+        );
     }
 
     #[test]

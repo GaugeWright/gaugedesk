@@ -74,7 +74,14 @@ impl Workbench {
         command: &HostActionCommand,
         runtime_policy: &gaugedesk_whip_runtime::PolicyEpochRef,
     ) -> Result<NativeEditorPreparation, String> {
-        self.prepare_native_editor_action_scoped(context, inputs, command, runtime_policy, &[])
+        self.prepare_native_editor_action_scoped(
+            context,
+            inputs,
+            command,
+            runtime_policy,
+            &[],
+            NativeActionAccess::Mutate,
+        )
     }
 
     pub(super) fn prepare_native_editor_action_scoped(
@@ -84,6 +91,7 @@ impl Workbench {
         command: &HostActionCommand,
         runtime_policy: &gaugedesk_whip_runtime::PolicyEpochRef,
         extra_scopes: &[&str],
+        access: NativeActionAccess,
     ) -> Result<NativeEditorPreparation, String> {
         let refused = || "native editor delivery binding is invalid".to_owned();
         if command.issuer != self.authority().as_str()
@@ -131,6 +139,7 @@ impl Workbench {
         };
         let policy_scope = identity.storage_scope()?;
         let key = SigningKey::from_seed(&self.governance_seed()).map_err(|error| error.reason)?;
+        let handoff_scope = crate::federation::handoff_scope(&project_id);
         let mut scopes = vec![
             LIBRARY_SCOPE,
             ORG_SCOPE,
@@ -138,6 +147,7 @@ impl Workbench {
             crate::mobile_machine_session::SCOPE,
             &scope,
             &policy_scope,
+            &handoff_scope,
         ];
         scopes.extend_from_slice(extra_scopes);
         if let ActorAuthentication::NativeEditorDispatchGrant { grant_ref } =
@@ -147,21 +157,25 @@ impl Workbench {
         }
         let ((authority, grant_cause), basis) = self
             .store_ref()
-            .read_for_dispatch(&scopes, |store| match context.authentication() {
-                ActorAuthentication::NativeEditorDispatchGrant { grant_ref } => {
-                    dispatch_grant::current_granted_authority(
-                        store,
-                        &home,
-                        context,
-                        grant_ref,
-                        command,
-                        &request,
-                        &key.public_key(),
-                    )
-                    .map(|(authority, cause)| (authority, Some(cause)))
-                }
-                _ => current_authority(store, &home, context, &request)
-                    .map(|authority| (authority, None)),
+            .read_for_dispatch(&scopes, |store| {
+                let result = match context.authentication() {
+                    ActorAuthentication::NativeEditorDispatchGrant { grant_ref } => {
+                        dispatch_grant::current_granted_authority(
+                            store,
+                            &home,
+                            context,
+                            grant_ref,
+                            command,
+                            &request,
+                            &key.public_key(),
+                        )
+                        .map(|(authority, cause)| (authority, Some(cause)))
+                    }
+                    _ => current_authority(store, &home, context, &request)
+                        .map(|authority| (authority, None)),
+                }?;
+                access.require_available(store, &result.0.project_id)?;
+                Ok(result)
             })
             .map_err(|error| format!("current editor delivery authority refused: {error:?}"))?;
         if authority.project_id != project_id

@@ -53,7 +53,7 @@ use gaugedesk_core::review::{ReviewCommand, ReviewState};
 use gaugedesk_core::run::{RunCommand, RunState};
 use gaugedesk_core::signature::{verify_signature, SigningKey};
 use gaugedesk_relay_transport::{connect_one_shot, BoxedRelayByteStream, OneShotLeg};
-use gaugedesk_store::Store;
+use gaugedesk_store::{command_scope_archive::CommandScopeArchive, Store};
 
 use crate::device_enroll::{open_sealed, seal_to_subkey, SealedKey};
 use crate::key_store::{FileKeyStore, KeyStore};
@@ -187,7 +187,7 @@ impl Workbench {
     ) -> std::io::Result<()> {
         let dir = self.root.join("targets").join(target_id);
         let provider = self.workspace_provider(target_id);
-        if format != provider.export_format() {
+        if !provider.accepts_export_format(format) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -215,7 +215,7 @@ impl Workbench {
             .join("collaboration-workspaces")
             .join(workspace_id);
         let provider = self.workspace_provider(workspace_id);
-        if format != provider.export_format() {
+        if !provider.accepts_export_format(format) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "collaboration workspace export format is incompatible",
@@ -234,8 +234,9 @@ impl Workbench {
     pub(crate) fn project_relocation_content_bundles(
         &self,
         project: &str,
-    ) -> Vec<(String, String, Vec<u8>, bool)> {
-        self.library_project_relocation_content_bundles(project)
+        protection: Option<&gaugedesk_workspace::WorkflowProtection>,
+    ) -> std::io::Result<Vec<crate::library_state::ProjectRelocationContentBundle>> {
+        self.library_project_relocation_content_bundles(project, protection)
     }
 }
 
@@ -2251,8 +2252,42 @@ fn guard_root(guard: &crate::Workbench) -> std::path::PathBuf {
 
 const HANDOFF_KIND: &str = "event";
 
-fn handoff_scope(project: &str) -> String {
+pub(crate) fn handoff_scope(project: &str) -> String {
     format!("handoff::{project}")
+}
+
+/// Current write admission only; callers must include `handoff_scope(project)`
+/// in their dispatch read basis and hold that basis through the native mutation.
+/// An offered project stays Home here, but admitting new writes would let the
+/// target commit over an earlier snapshot. Abort releases this pause; commit
+/// still requires the caller's independent current-Home check.
+pub(crate) fn require_project_writes_available(
+    store: &Store,
+    project: &str,
+) -> Result<(), gaugedesk_store::AdmitError> {
+    let state = retained_handoff(store, project)?;
+    if matches!(state.phase, HandoffPhase::Offered | HandoffPhase::LogSynced) {
+        return Err(gaugedesk_store::AdmitError::Rejected(
+            gaugedesk_core::Rejection {
+                reason: "project writes are paused for pending handoff",
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn retained_handoff(
+    store: &Store,
+    project: &str,
+) -> Result<HandoffState, gaugedesk_store::AdmitError> {
+    let mut state = HandoffState::default();
+    for (_, kind, payload) in store.retained_events(&handoff_scope(project))? {
+        if kind == HANDOFF_KIND {
+            let event: HandoffEvent = serde_json::from_str(&payload)?;
+            state = handoff::evolve(&state, event);
+        }
+    }
+    Ok(state)
 }
 
 fn handoff_phase_str(p: HandoffPhase) -> &'static str {
@@ -2307,8 +2342,8 @@ fn apply_handoff(
     Ok(state)
 }
 
-/// Commit the reducer's Home flip and the concrete project→Home binding in one
-/// SQLite transaction. A crash exposes both facts or neither, never split-brain.
+/// Commit the reducer's Home flip and both project/workspace Home bindings in
+/// one SQLite transaction. Projections change only after all facts commit.
 fn commit_handoff_and_rebind(
     wb: &mut Workbench,
     project: &str,
@@ -2317,8 +2352,17 @@ fn commit_handoff_and_rebind(
     let mut state = load_handoff(wb.store_ref(), project);
     let events = handoff::decide(&state, HandoffCommand::CommitHandoff).map_err(|r| r.reason)?;
     let project_record = wb
-        .project_record_for_home_rebind(project, home)
+        .project_record_for_home_rebind(project, home.clone())
         .ok_or("handoff: project binding missing")?;
+    let workspace_record = wb
+        .library
+        .project_collaboration_workspaces
+        .get(project)
+        .cloned()
+        .map(|mut workspace| {
+            workspace.home_id = home;
+            workspace
+        });
     let scope = handoff_scope(project);
     let event_payloads: Vec<String> = events
         .iter()
@@ -2326,6 +2370,11 @@ fn commit_handoff_and_rebind(
         .collect();
     let project_payload =
         serde_json::to_string(&project_record).map_err(|_| "handoff: project serialize failed")?;
+    let workspace_payload = workspace_record
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| "handoff: collaboration workspace serialize failed")?;
     let mut records: Vec<(&str, &str, &str)> = event_payloads
         .iter()
         .map(|payload| (scope.as_str(), HANDOFF_KIND, payload.as_str()))
@@ -2335,13 +2384,16 @@ fn commit_handoff_and_rebind(
         "project",
         project_payload.as_str(),
     ));
+    if let Some(payload) = &workspace_payload {
+        records.push((LIBRARY_SCOPE, "project_collaboration_workspace", payload));
+    }
     wb.store_mut()
         .append_records_atomically(&records)
         .map_err(|_| "handoff: atomic Home commit failed")?;
     for event in events {
         state = handoff::evolve(&state, event);
     }
-    wb.apply_atomic_project_home_rebind(project_record);
+    wb.apply_atomic_project_home_rebind(project_record, workspace_record);
     Ok(state)
 }
 
@@ -2408,6 +2460,7 @@ pub async fn post_handoff_abort(
         &req.project,
         Vec::new(),
         Vec::new(),
+        None,
         None,
         None,
     )
@@ -2518,7 +2571,12 @@ struct HandoffContentBundle {
     /// work target or referenced authoring target.
     #[serde(default)]
     collaboration: bool,
+    #[serde(default)]
+    workflow_key: Option<crate::content_vault::ScopeKeyCapsule>,
 }
+
+#[path = "federation_workflow_keys.rs"]
+mod workflow_keys;
 
 /// What a handoff message asks the receiver to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2526,6 +2584,13 @@ enum HandoffMsgKind {
     /// origin → target: a relocation offer (carries the log). The target admits it —
     /// auto if pre-authorized, else it lands pending for explicit consent (`INV-13`).
     Offer,
+    /// A relocation carrying original product commands and receipts. A distinct
+    /// wire kind makes older receivers refuse before importing an event-only
+    /// view that they cannot safely resume.
+    OfferWithCommands,
+    /// Complete native protected workflow carriage. Older receivers must refuse
+    /// this kind rather than silently drop a key they do not understand.
+    OfferWithWorkflowKeys,
     /// target → origin: the target consented and committed (is now home); the origin
     /// commits its side (becomes operator).
     Committed,
@@ -2558,6 +2623,8 @@ struct HandoffWire {
     source_home: HomeId,
     #[serde(default)]
     log: Vec<HandoffLogRecord>,
+    #[serde(default)]
+    project_commands: Option<CommandScopeArchive>,
     /// The project's content bytes — one bundle per bound instance (on `Offer`).
     #[serde(default)]
     content: Vec<HandoffContentBundle>,
@@ -2992,9 +3059,22 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
 /// The origin's snapshot of a project's content: one tagged, erasure-respecting
 /// workspace export per managed target. This is the bytes behind every relocated handle; the target
 /// re-materializes each before its home commits (`STATE_BEFORE_HOME`, FED-6). An
-/// instance whose repo cannot be bundled is skipped (logged), not silently dropped.
-fn collect_project_content(wb: &Workbench, project: &str) -> Vec<HandoffContentBundle> {
-    wb.project_relocation_content_bundles(project)
+/// unavailable or unexportable workspace prevents offering an incomplete relocation.
+fn collect_project_content(
+    wb: &Workbench,
+    project: &str,
+) -> std::io::Result<Vec<HandoffContentBundle>> {
+    collect_project_content_with_custody(wb, project, None, None)
+}
+
+fn collect_project_content_with_custody(
+    wb: &Workbench,
+    project: &str,
+    protection: Option<&gaugedesk_workspace::WorkflowProtection>,
+    capsule: Option<&crate::content_vault::ScopeKeyCapsule>,
+) -> std::io::Result<Vec<HandoffContentBundle>> {
+    Ok(wb
+        .project_relocation_content_bundles(project, protection)?
         .into_iter()
         .map(
             |(target_id, format, bundle, collaboration)| HandoffContentBundle {
@@ -3002,9 +3082,14 @@ fn collect_project_content(wb: &Workbench, project: &str) -> Vec<HandoffContentB
                 format,
                 bundle,
                 collaboration,
+                workflow_key: if collaboration {
+                    capsule.cloned()
+                } else {
+                    None
+                },
             },
         )
-        .collect()
+        .collect())
 }
 
 /// Send one signed handoff message to `peer` over the cert-pinned TLS leg; returns
@@ -3024,6 +3109,7 @@ async fn send_handoff(
     content: Vec<HandoffContentBundle>,
     credential_key: Option<SealedKey>,
     shared_route: Option<crate::home::OpaqueHomeRoute>,
+    project_commands: Option<CommandScopeArchive>,
 ) -> std::io::Result<serde_json::Value> {
     let signed_bytes = handoff_bytes(project, source_home);
     let wire = HandoffWire {
@@ -3033,6 +3119,7 @@ async fn send_handoff(
         target: peer.as_str().to_string(),
         source_home: source_home.clone(),
         log,
+        project_commands,
         content,
         credential_key,
         shared_route,
@@ -3229,11 +3316,9 @@ fn handoff_oneshot_arm(
     let _ = store.append_record(HANDOFF_ONESHOT_SCOPE, "event", &rec.to_string());
 }
 
-/// Take (consume) a valid one-shot for `(source, project)` if one exists — armed,
-/// unexpired, not already consumed. Returns `true` and appends a `consume` record so it
-/// can never admit a second relocation (`SINGLE_USE` of the consent guard). Returns
-/// `false` (fail-closed) otherwise.
-fn handoff_oneshot_take(store: &mut Store, source: &str, project: &str) -> bool {
+/// Find current one-shot consent without consuming it. Receiving admission
+/// appends consumption in the same transaction as the Home change.
+fn handoff_oneshot_available(store: &Store, source: &str, project: &str) -> Option<(String, u64)> {
     let mut armed: BTreeMap<String, u64> = BTreeMap::new(); // invite_id -> expiry
     let mut consumed: BTreeSet<String> = BTreeSet::new();
     for payload in store
@@ -3261,15 +3346,9 @@ fn handoff_oneshot_take(store: &mut Store, source: &str, project: &str) -> bool 
         }
     }
     let now = now_secs();
-    if let Some((iid, _)) = armed
+    armed
         .into_iter()
-        .find(|(iid, exp)| !consumed.contains(iid) && *exp >= now)
-    {
-        let rec = serde_json::json!({ "op": "consume", "invite_id": iid });
-        let _ = store.append_record(HANDOFF_ONESHOT_SCOPE, "event", &rec.to_string());
-        return true;
-    }
-    false
+        .find(|(iid, exp)| !consumed.contains(iid) && *exp > now)
 }
 
 /// The pending incoming handoffs (offers recorded but not yet accepted/declined),
@@ -3468,6 +3547,7 @@ async fn resolve_handoffs_in_doubt(wb: &SharedWorkbench, peer: &AuthorityId) {
             Vec::new(),
             None,
             None,
+            None,
         )
         .await;
         let Ok(verdict) = asked else {
@@ -3558,98 +3638,87 @@ async fn handoff_receive_once(
     Ok(())
 }
 
-/// Import the relocated log **and** materialize the content bytes, then drive the
-/// target's handoff reducer to Committed so the target becomes home (`STATE_BEFORE_HOME`,
-/// `INV-13`). The bytes land **before** `SyncLog`/`CommitHandoff`, so the home never
-/// commits over absent content; any failure (a bad log record or an un-materializable
-/// bundle) is fail-closed — no commit, and the origin stays home (`ABORT_KEEPS_ORIGIN_HOME`).
-fn commit_incoming_handoff(
-    guard: &mut Workbench,
+/// Decode the original carriage, never reconstruct source authority from the
+/// current recipient or silently fall back to a legacy event-only offer.
+fn pending_handoff_wire(offer: &serde_json::Value) -> Result<HandoffWire, &'static str> {
+    // The retained form is written by this receiver and always includes these
+    // fields, even when empty/null. Wire compatibility defaults must not repair
+    // a damaged local receipt by silently dropping part of its carriage.
+    for field in [
+        "log",
+        "content",
+        "project_commands",
+        "credential_key",
+        "shared_route",
+        "delegation",
+    ] {
+        if offer["wire"].get(field).is_none() {
+            return Err("incoming offer is missing retained authentication or content evidence");
+        }
+    }
+    let wire: HandoffWire = serde_json::from_value(offer["wire"].clone())
+        .map_err(|_| "incoming offer lacks valid original authentication evidence")?;
+    if offer["op"].as_str() != Some("offer")
+        || offer["project"].as_str() != Some(wire.project.as_str())
+        || offer["source"].as_str() != Some(wire.source.as_str())
+        || !matches!(
+            wire.kind,
+            HandoffMsgKind::Offer
+                | HandoffMsgKind::OfferWithCommands
+                | HandoffMsgKind::OfferWithWorkflowKeys
+        )
+    {
+        return Err("incoming offer identity does not match its original evidence");
+    }
+    Ok(wire)
+}
+
+/// The new archive and legacy event projection must describe exactly the same
+/// project-owned log. Other projects and silently omitted scopes are refused.
+fn project_commands_match_log(
     project: &str,
     log: &[HandoffLogRecord],
-    content: &[HandoffContentBundle],
-    credential_key: Option<&SealedKey>,
+    archive: &CommandScopeArchive,
 ) -> bool {
-    let carries_project_credentials = log
-        .iter()
-        .any(|record| record.scope == format!("project::{project}") && record.kind == "credential");
-    let project_credential_key = match credential_key {
-        Some(sealed) => {
-            let target_key = federation_root_signing_key(guard);
-            let Some(bytes) = open_sealed(&target_key, sealed) else {
-                tracing::warn!("handoff commit: project credential key did not open for target");
-                return false;
-            };
-            let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) else {
-                tracing::warn!("handoff commit: project credential key has invalid length");
-                return false;
-            };
-            Some(key)
-        }
-        None if carries_project_credentials => {
-            tracing::warn!(
-                "handoff commit: project carries credentials without a target-sealed key"
-            );
-            return false;
-        }
-        None => None,
-    };
-    // 1. Import the relocated log (the authority — INV-5), and open the handoff.
+    if archive
+        .scope_ids()
+        .any(|scope| !is_project_scope(scope, project))
     {
-        let store = guard.store_mut();
-        for rec in log {
-            if store
-                .append_record(&rec.scope, &rec.kind, &rec.payload)
-                .is_err()
-            {
-                return false;
-            }
-        }
-    }
-    if let Err(e) = apply_handoff(guard.store_mut(), project, HandoffCommand::OfferHandoff) {
-        // Fail-closed, but say why: a silent `false` here is exactly what makes a
-        // handoff failure read as a generic "something went wrong" with no trail.
-        tracing::warn!("handoff commit: OfferHandoff failed for {project}: {e:?}");
         return false;
     }
-    // Imported target sets and collaboration-workspace bindings must be folded
-    // before workspace branches are reopened so each chat is materialized with
-    // its exact sparse roots.
-    guard.rebuild_library();
-    // 2. Materialize the content bytes behind the project's handles BEFORE the home can
-    //    commit (STATE_BEFORE_HOME). A bundle that will not lay down blocks the commit.
-    for b in content {
-        let materialized = if b.collaboration {
-            guard.materialize_collaboration_workspace(&b.target_id, &b.format, &b.bundle)
-        } else {
-            guard.materialize_target(&b.target_id, &b.format, &b.bundle)
-        };
-        if let Err(e) = materialized {
-            tracing::warn!(
-                "handoff commit: materialize instance {} failed: {e:?}",
-                b.target_id
-            );
-            return false;
+    let expected = log
+        .iter()
+        .filter(|record| is_project_scope(&record.scope, project))
+        .map(|record| {
+            (
+                record.scope.as_str(),
+                record.kind.as_str(),
+                record.payload.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let actual = archive
+        .events()
+        .map(|(scope, _, kind, payload)| (scope, kind, payload))
+        .collect::<Vec<_>>();
+    expected == actual
+}
+
+#[path = "federation_incoming_handoff.rs"]
+mod incoming_handoff;
+
+fn commit_incoming_handoff(
+    guard: &mut Workbench,
+    wire: &HandoffWire,
+    consent: incoming_handoff::Consent,
+) -> bool {
+    match incoming_handoff::commit(guard, wire, consent) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(?error, project = %wire.project, "handoff receiving admission failed");
+            false
         }
     }
-    if let Some(key) = project_credential_key {
-        if guard.install_project_credential_key(project, key).is_none() {
-            tracing::warn!("handoff commit: target could not persist project credential key");
-            return false;
-        }
-    }
-    // 3. Full state present (log + content): sync, then flip home to the target.
-    if let Err(e) = apply_handoff(guard.store_mut(), project, HandoffCommand::SyncLog) {
-        tracing::warn!("handoff commit: SyncLog failed for {project}: {e:?}");
-        return false;
-    }
-    let home = guard.home_id().clone();
-    guard.rebuild_library();
-    if let Err(e) = commit_handoff_and_rebind(guard, project, home) {
-        tracing::warn!("handoff commit: atomic Home flip failed for {project}: {e:?}");
-        return false;
-    }
-    true
 }
 
 /// A wire verdict **refusing** the request: the peer deciding no, not the peer
@@ -3699,6 +3768,72 @@ fn refusal_status(verdict: &serde_json::Value) -> StatusCode {
     }
 }
 
+/// Revalidate at the admission boundary, including after human consent waited.
+/// The retained signature proves the original project/Home claim; the envelope
+/// and its content were received together over the authenticated TLS carriage.
+fn verify_handoff(guard: &Workbench, wire: &HandoffWire) -> Result<BridgeGrant, &'static str> {
+    if wire.target != guard.federation_authority().as_str() {
+        return Err("handoff is addressed to another authority");
+    }
+    let Some(grant) = guard
+        .federation_ref()
+        .and_then(|f| f.grant_for(&wire.source))
+    else {
+        return Err("unpaired source");
+    };
+    let claimed = PublicKey::new(wire.source_pubkey.clone());
+    let Some(verify_key) = guard
+        .federation_ref()
+        .and_then(|f| effective_source_key(f, &wire.source, &grant, &claimed, &wire.delegation))
+    else {
+        return Err("bad source key");
+    };
+    if !grant.is_valid(now_secs())
+        || wire.signed_bytes != handoff_bytes(&wire.project, &wire.source_home)
+        || verify_signature(&wire.signed_bytes, &wire.signature, &verify_key) != Ok(true)
+    {
+        return Err("verification failed");
+    }
+    if wire.kind != HandoffMsgKind::Route && wire.shared_route.is_some() {
+        return Err("unexpected shared route");
+    }
+    if matches!(
+        wire.kind,
+        HandoffMsgKind::Offer
+            | HandoffMsgKind::OfferWithCommands
+            | HandoffMsgKind::OfferWithWorkflowKeys
+    ) {
+        workflow_keys::validate(wire)?;
+        if wire.kind != HandoffMsgKind::Offer && wire.project_commands.is_none() {
+            return Err("project command archive is required");
+        }
+        if let Some(archive) = &wire.project_commands {
+            if !project_commands_match_log(&wire.project, &wire.log, archive) {
+                return Err("project command archive does not match the offered log");
+            }
+        } else if wire.log.iter().any(|record| {
+            is_project_scope(&record.scope, &wire.project)
+                && record.kind == gaugedesk_store::command_dispatch::DISPATCH_KIND
+        }) {
+            return Err("original project command evidence is required");
+        }
+        // DEPLOY-4 / ITGOV-3: every offer crosses the placement floor before
+        // *any* admission branch. Standing preauthorization and a combined
+        // invite's one-shot consent reduce human friction; neither is a policy
+        // bypass. No quote travels on this leg, so attested declarations fail
+        // closed until a measurement-bearing transport exists.
+        let placement_policy = crate::org::Org::rebuild(guard.store_ref())
+            .map_err(|_| "current placement policy is unavailable")?
+            .effective_placement_policy();
+        if !handoff_placement_admitted(&placement_policy, &wire.log, &wire.project) {
+            return Err(
+                "the incoming project's deployment mode is not admitted by this org's placement policy",
+            );
+        }
+    }
+    Ok(grant)
+}
+
 /// Handle a received handoff message after authenticating it against the source's
 /// pinned grant (C-1 / INV-21 — the effective source key, an unexpired/unrevoked
 /// subkey or the pinned root, must verify the project-bound bytes). Returns the JSON
@@ -3715,70 +3850,38 @@ fn refusal_status(verdict: &serde_json::Value) -> StatusCode {
 /// - `Declined` (target→origin): roll our side back (stay home).
 fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value {
     let mut guard = wb.lock_unpoisoned();
-    let Some(grant) = guard
-        .federation_ref()
-        .and_then(|f| f.grant_for(&wire.source))
-    else {
-        return refused_verdict("unpaired source");
+    let grant = match verify_handoff(&guard, wire) {
+        Ok(grant) => grant,
+        Err(reason) => return refused_verdict(reason),
     };
-    let claimed = PublicKey::new(wire.source_pubkey.clone());
-    let Some(verify_key) = guard
-        .federation_ref()
-        .and_then(|f| effective_source_key(f, &wire.source, &grant, &claimed, &wire.delegation))
-    else {
-        return refused_verdict("bad source key");
-    };
-    if !grant.is_valid(now_secs())
-        || wire.signed_bytes != handoff_bytes(&wire.project, &wire.source_home)
-        || verify_signature(&wire.signed_bytes, &wire.signature, &verify_key) != Ok(true)
-    {
-        return refused_verdict("verification failed");
-    }
-    if wire.kind != HandoffMsgKind::Route && wire.shared_route.is_some() {
-        return refused_verdict("unexpected shared route");
-    }
-    if wire.kind == HandoffMsgKind::Offer {
-        // DEPLOY-4 / ITGOV-3: every offer crosses the placement floor before
-        // *any* admission branch. Standing preauthorization and a combined
-        // invite's one-shot consent reduce human friction; neither is a policy
-        // bypass. No quote travels on this leg, so attested declarations fail
-        // closed until a measurement-bearing transport exists.
-        let placement_policy = crate::org::Org::rebuild(guard.store_ref())
-            .map(|org| org.effective_placement_policy())
-            .unwrap_or_else(|_| gaugedesk_core::boundary_lifecycle::PlacementPolicy::open());
-        if !handoff_placement_admitted(&placement_policy, &wire.log, &wire.project) {
-            return refused_verdict(
-                "the incoming project's deployment mode is not admitted by this org's placement policy",
-            );
-        }
-    }
     // `registered` = the target imported a relocated project (its library changed).
     let (verdict, registered) = match wire.kind {
-        HandoffMsgKind::Offer => {
+        HandoffMsgKind::Offer
+        | HandoffMsgKind::OfferWithCommands
+        | HandoffMsgKind::OfferWithWorkflowKeys => {
             // Three admission paths (INV-13), all the target's: a standing per-peer
-            // pre-auth, or a one-shot from an accepted invite (consumed here, ADR 0047),
-            // else the offer lands pending an explicit accept. `||` short-circuits so a
-            // standing pre-auth never burns a one-shot.
+            // pre-auth, or a one-shot from an accepted invite (consumed with the
+            // receiving commit, ADR 0047), else explicit consent. An existing
+            // receiving receipt recovers its original admission before reimport.
             let preauth = handoff_preauthorized(guard.store_ref(), &wire.source);
-            let oneshot =
-                !preauth && handoff_oneshot_take(guard.store_mut(), &wire.source, &wire.project);
-            if preauth || oneshot {
+            let oneshot = !preauth
+                && handoff_oneshot_available(guard.store_ref(), &wire.source, &wire.project)
+                    .is_some();
+            let received = match guard
+                .store_ref()
+                .committed_record_snapshot(&handoff_scope(&wire.project), "receive")
+            {
+                Ok(receipt) => receipt.is_some(),
+                Err(_) => {
+                    return serde_json::json!({"ok": false, "reason": "receiving receipt is unavailable"})
+                }
+            };
+            if preauth || oneshot || received {
                 let committed = commit_incoming_handoff(
                     &mut guard,
-                    &wire.project,
-                    &wire.log,
-                    &wire.content,
-                    wire.credential_key.as_ref(),
+                    wire,
+                    incoming_handoff::Consent::Preauthorized,
                 );
-                if committed {
-                    // host = this authority (the target), operator = the origin.
-                    record_participants(
-                        guard.store_mut(),
-                        &wire.project,
-                        &wire.target,
-                        &wire.source,
-                    );
-                }
                 (
                     serde_json::json!({
                         "ok": committed,
@@ -3795,15 +3898,16 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                     "op": "offer",
                     "project": wire.project,
                     "source": wire.source,
-                    "log": wire.log,
-                    "content": wire.content,
-                    "credential_key": wire.credential_key,
+                    "wire": wire,
                 });
-                let _ = guard.store_mut().append_record(
+                if let Err(error) = guard.store_mut().append_record(
                     HANDOFF_INCOMING_SCOPE,
                     "event",
                     &rec.to_string(),
-                );
+                ) {
+                    tracing::warn!(?error, "handoff pending offer could not be retained");
+                    return serde_json::json!({ "ok": false, "reason": "offer could not be retained" });
+                }
                 (
                     serde_json::json!({ "ok": true, "committed": false, "pending": true }),
                     false,
@@ -3996,6 +4100,79 @@ fn relocation_verdict(verdict: &serde_json::Value) -> (StatusCode, serde_json::V
     (StatusCode::FORBIDDEN, serde_json::json!({ "error": error }))
 }
 
+#[derive(Debug)]
+enum HandoffOfferError {
+    Conflict(&'static str),
+    Content(std::io::Error),
+    Store(gaugedesk_store::AdmitError),
+}
+
+impl From<std::io::Error> for HandoffOfferError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Content(error)
+    }
+}
+
+impl From<gaugedesk_store::AdmitError> for HandoffOfferError {
+    fn from(error: gaugedesk_store::AdmitError) -> Self {
+        match error {
+            gaugedesk_store::AdmitError::Rejected(rejection) => Self::Conflict(rejection.reason),
+            error => Self::Store(error),
+        }
+    }
+}
+
+/// Capture external state while the product writer is excluded, then admit the
+/// offer and its outgoing record before releasing that exclusion. Native action
+/// mutations take this same product lock before their workspace locks. After
+/// commit they see the pending handoff; a pre-offer preparation is stale.
+/// No network work or consent wait belongs inside `snapshot`.
+fn capture_handoff_offer<T>(
+    store: &Store,
+    project: &str,
+    peer: &str,
+    transfer: Option<&crate::content_vault::PreparedScopeTransfer>,
+    snapshot: impl FnOnce(workflow_keys::RetainedCustody<'_>) -> std::io::Result<T>,
+) -> Result<T, HandoffOfferError> {
+    // A sibling retains the actual store codec/configuration while the original
+    // connection remains available for the snapshot's erasure-respecting reads.
+    let mut writer = store.sibling().map_err(gaugedesk_store::AdmitError::Db)?;
+    let scope = handoff_scope(project);
+    let (events, basis) =
+        writer.read_for_dispatch(&[&scope, LIBRARY_SCOPE, BRIDGE_SCOPE], |store| {
+            let state = retained_handoff(store, project)?;
+            handoff::decide(&state, HandoffCommand::OfferHandoff)
+                .map_err(gaugedesk_store::AdmitError::Rejected)
+        })?;
+    let mut facts = Vec::with_capacity(events.len() + 1);
+    for event in events {
+        facts.push(gaugedesk_store::CommandRecordFact {
+            scope_id: scope.clone(),
+            kind: HANDOFF_KIND.into(),
+            payload: serde_json::to_string(&event).map_err(gaugedesk_store::AdmitError::Json)?,
+        });
+    }
+    facts.push(gaugedesk_store::CommandRecordFact {
+        scope_id: HANDOFF_OUTGOING_SCOPE.into(),
+        kind: "event".into(),
+        payload: serde_json::json!({"op": "offer", "project": project, "peer": peer}).to_string(),
+    });
+    let intent =
+        serde_json::json!({"operation": "handoff.offer", "project": project, "peer": peer})
+            .to_string();
+    writer.with_dispatch_record_admission(&basis, |admission| {
+        let publish = |custody: workflow_keys::RetainedCustody<'_>| {
+            let snapshot = snapshot(custody).map_err(HandoffOfferError::Content)?;
+            admission.commit(&scope, "offer", &intent, &facts)?;
+            Ok(snapshot)
+        };
+        match transfer {
+            Some(transfer) => transfer.with_retained(|key, capsule| publish(Some((key, capsule)))),
+            None => publish(None),
+        }
+    })?
+}
+
 /// Drive a project's relocation to a paired peer over the wire — the cross-machine
 /// carriage shared by `POST …/relocate` and the combined-invite receiver
 /// ([ADR 0047](../../../specs/decisions/0047-combined-pairing-and-handoff-invite.md)).
@@ -4011,7 +4188,7 @@ async fn drive_relocate(
     project: &str,
     peer: &AuthorityId,
 ) -> (StatusCode, serde_json::Value) {
-    let (broker, me, source_home, subkey, delegation, pins, peer_key, project_credential_key) = {
+    let (broker, me, source_home, subkey, delegation, pins, peer_key) = {
         let guard = wb.lock_unpoisoned();
         let me = guard.federation_authority().clone();
         let root = federation_root_signing_key(&guard);
@@ -4029,7 +4206,6 @@ async fn drive_relocate(
                     delegation,
                     fed.pins_arc(),
                     peer_key,
-                    guard.project_credential_key_for_handoff(project),
                 )
             }
             None => {
@@ -4059,47 +4235,97 @@ async fn drive_relocate(
             );
         }
     }
-    let (log, content) = {
+    // Mark before publishing outgoing state, so reconciliation cannot inspect
+    // an offer between its durable preparation and its first send.
+    let _in_flight = OfferInFlight::mark(peer.as_str(), project);
+    let (log, content, credential_key, project_commands) = {
         let guard = wb.lock_unpoisoned();
-        (
-            collect_project_log(guard.store_ref(), project),
-            collect_project_content(&guard, project),
-        )
-    };
-    let credential_key = match project_credential_key {
-        Some(key) => match seal_to_subkey(&peer_key, &key) {
-            Some(sealed) => Some(sealed),
-            None => {
+        let workflow = match workflow_keys::prepare(&guard, project, peer.as_str(), &peer_key) {
+            Ok(workflow) => workflow,
+            Err(error) => {
+                tracing::warn!(%error, %project, "handoff workflow preparation refused");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({"error":"project content is unavailable for relocation"}),
+                );
+            }
+        };
+        match capture_handoff_offer(
+            guard.store_ref(),
+            project,
+            peer.as_str(),
+            workflow.as_ref().map(|(_, transfer)| transfer),
+            |custody| {
+                let protection = custody
+                    .map(|(key, _)| {
+                        gaugedesk_workspace::WorkflowProtection::new(
+                            &workflow.as_ref().expect("retained prepared workflow").0,
+                            key.clone(),
+                        )
+                    })
+                    .transpose()
+                    .map_err(std::io::Error::other)?;
+                let content = match custody {
+                    Some((_, capsule)) => collect_project_content_with_custody(
+                        &guard,
+                        project,
+                        protection.as_ref(),
+                        Some(capsule),
+                    )?,
+                    None => collect_project_content(&guard, project)?,
+                };
+                let credential_key = guard
+                    .project_credential_key_for_handoff(project)
+                    .map(|key| {
+                        seal_to_subkey(&peer_key, &key).ok_or_else(|| {
+                            std::io::Error::other("could not seal project credential key to target")
+                        })
+                    })
+                    .transpose()?;
+                workflow_keys::check_recipient(&guard, peer.as_str(), &peer_key)?;
+                Ok((
+                    collect_project_log(guard.store_ref(), project),
+                    content,
+                    credential_key,
+                    guard
+                        .store_ref()
+                        .export_command_scopes(|scope| is_project_scope(scope, project))
+                        .map_err(|error| {
+                            std::io::Error::other(format!(
+                                "project command capture failed: {error:?}"
+                            ))
+                        })?,
+                ))
+            },
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(HandoffOfferError::Content(error)) => {
+                tracing::warn!("handoff: cannot collect project {project}: {error}");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({"error": "project content is unavailable for relocation"}),
+                );
+            }
+            Err(HandoffOfferError::Conflict(reason)) => {
+                return (
+                    StatusCode::CONFLICT,
+                    serde_json::json!({"error": format!("handoff offer: {reason}")}),
+                );
+            }
+            Err(HandoffOfferError::Store(error)) => {
+                tracing::warn!("handoff: cannot prepare offer for {project}: {error:?}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({ "error": "could not seal project credential key to target" }),
-                )
+                    serde_json::json!({"error": "handoff offer could not be committed"}),
+                );
             }
-        },
-        None => None,
+        }
     };
-    // Origin offers — it stays home until the peer commits (INV-13).
-    {
-        let mut guard = wb.lock_unpoisoned();
-        if let Err(e) = apply_handoff(guard.store_mut(), project, HandoffCommand::OfferHandoff) {
-            return (
-                StatusCode::CONFLICT,
-                serde_json::json!({ "error": format!("handoff offer: {e}") }),
-            );
-        }
-        if let Err(error) =
-            record_outgoing_handoff(guard.store_mut(), "offer", project, peer.as_str())
-        {
-            let _ = apply_handoff(guard.store_mut(), project, HandoffCommand::AbortHandoff);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                serde_json::json!({ "error": error }),
-            );
-        }
-    }
-    // Held across the send and dropped on every exit from it, so a reconcile
-    // cannot ask about an offer that has not arrived yet (ADR 0156 §1).
-    let _in_flight = OfferInFlight::mark(peer.as_str(), project);
+    let kind = if content.iter().any(|bundle| bundle.workflow_key.is_some()) {
+        HandoffMsgKind::OfferWithWorkflowKeys
+    } else {
+        HandoffMsgKind::OfferWithCommands
+    };
     match send_handoff(
         &broker,
         &me,
@@ -4108,12 +4334,13 @@ async fn drive_relocate(
         &delegation,
         peer,
         pins,
-        HandoffMsgKind::Offer,
+        kind,
         project,
         log,
         content,
         credential_key,
         None,
+        Some(project_commands),
     )
     .await
     {
@@ -5622,8 +5849,9 @@ pub async fn get_handoff_incoming(State(wb): State<SharedWorkbench>) -> impl Int
         .into_iter()
         .map(|o| {
             let project = o["project"].as_str().unwrap_or_default();
-            let log: Vec<HandoffLogRecord> =
-                serde_json::from_value(o["log"].clone()).unwrap_or_default();
+            let log = pending_handoff_wire(&o)
+                .map(|wire| wire.log)
+                .unwrap_or_else(|_| serde_json::from_value(o["log"].clone()).unwrap_or_default());
             let deployment_mode = incoming_deployment_mode(&log, project)
                 .unwrap_or_else(gaugedesk_core::boundary_lifecycle::Placement::local);
             serde_json::json!({
@@ -5698,51 +5926,15 @@ pub async fn post_handoff_accept(
             )
                 .into_response();
         };
-        let log: Vec<HandoffLogRecord> =
-            serde_json::from_value(offer["log"].clone()).unwrap_or_default();
-        let content: Vec<HandoffContentBundle> =
-            serde_json::from_value(offer["content"].clone()).unwrap_or_default();
-        let credential_key: Option<SealedKey> =
-            serde_json::from_value(offer["credential_key"].clone())
-                .ok()
-                .flatten();
-        let me = guard.federation_authority().as_str().to_string();
-        // ITGOV-3(a): a relocated project's declared deployment mode must satisfy this org's
-        // placement policy before the target admits it — the handoff analog of the
-        // boundary-accept gate (`accept_boundary`). No attestation quote is exchanged over the
-        // handoff, so an attested-required policy refuses a handoff that cannot prove it
-        // (`pairing_admitted(..., measurement_verified = false)`), fail-closed. An open org
-        // floor admits the local/unattested default but does not fabricate measurement proof
-        // for an engagement that declares attested placement.
-        let placement_policy = crate::org::Org::rebuild(guard.store_ref())
-            .map(|o| o.effective_placement_policy())
-            .unwrap_or_else(|_| gaugedesk_core::boundary_lifecycle::PlacementPolicy::open());
-        if !handoff_placement_admitted(&placement_policy, &log, req.project.as_str()) {
-            return (
-                StatusCode::FORBIDDEN,
-                "the incoming project's deployment mode is not admitted by this org's placement policy",
-            )
-                .into_response();
+        let wire = match pending_handoff_wire(&offer) {
+            Ok(wire) => wire,
+            Err(reason) => return (StatusCode::CONFLICT, reason).into_response(),
+        };
+        if let Err(reason) = verify_handoff(&guard, &wire) {
+            return (StatusCode::FORBIDDEN, reason).into_response();
         }
-        let committed = commit_incoming_handoff(
-            &mut guard,
-            &req.project,
-            &log,
-            &content,
-            credential_key.as_ref(),
-        );
-        if committed {
-            // host = this authority (consented), operator = the origin.
-            record_participants(guard.store_mut(), &req.project, &me, &req.source);
-        }
-        resolve_incoming_handoff(
-            guard.store_mut(),
-            &req.project,
-            if committed { "committed" } else { "failed" },
-        );
-        if committed {
-            guard.rebuild_library(); // the relocated project now appears in our library
-        }
+        let committed =
+            commit_incoming_handoff(&mut guard, &wire, incoming_handoff::Consent::Pending);
         let notify = handoff_notify_material(&guard, &req.source);
         (committed, notify)
     };
@@ -5799,13 +5991,6 @@ pub async fn post_handoff_accept_all(
         if let Err((code, msg)) = guard.authenticate_request(crate::net_http::bearer(&headers)) {
             return (code, msg).into_response();
         }
-        let me = guard.federation_authority().as_str().to_string();
-        // ITGOV-3(a): the same org placement policy `post_handoff_accept` enforces, applied per
-        // offer in the batch — a non-compliant relocated project is skipped (left pending, not
-        // committed), the bulk analog of the single-accept 403. Rebuilt once (org-wide).
-        let placement_policy = crate::org::Org::rebuild(guard.store_ref())
-            .map(|o| o.effective_placement_policy())
-            .unwrap_or_else(|_| gaugedesk_core::boundary_lifecycle::PlacementPolicy::open());
         let mut accepted: Vec<String> = Vec::new();
         let mut notifies: Vec<(HandoffNotify, String)> = Vec::new();
         for offer in pending_incoming(guard.store_ref()) {
@@ -5814,34 +5999,16 @@ pub async fn post_handoff_accept_all(
             if project.is_empty() || source.is_empty() {
                 continue;
             }
-            let log: Vec<HandoffLogRecord> =
-                serde_json::from_value(offer["log"].clone()).unwrap_or_default();
-            let content: Vec<HandoffContentBundle> =
-                serde_json::from_value(offer["content"].clone()).unwrap_or_default();
-            let credential_key: Option<SealedKey> =
-                serde_json::from_value(offer["credential_key"].clone())
-                    .ok()
-                    .flatten();
-            // Fail-closed: a project whose declared deployment mode the org policy won't admit is
-            // not committed and not marked resolved — it stays pending (`INV-20`).
-            if !handoff_placement_admitted(&placement_policy, &log, &project) {
+            let Ok(wire) = pending_handoff_wire(&offer) else {
+                continue;
+            };
+            // Invalid or no-longer-authorized offers remain pending. Batch
+            // consent does not weaken the same gate used by individual accept.
+            if verify_handoff(&guard, &wire).is_err() {
                 continue;
             }
-            let committed = commit_incoming_handoff(
-                &mut guard,
-                &project,
-                &log,
-                &content,
-                credential_key.as_ref(),
-            );
-            if committed {
-                record_participants(guard.store_mut(), &project, &me, &source);
-            }
-            resolve_incoming_handoff(
-                guard.store_mut(),
-                &project,
-                if committed { "committed" } else { "failed" },
-            );
+            let committed =
+                commit_incoming_handoff(&mut guard, &wire, incoming_handoff::Consent::Pending);
             if committed {
                 notifies.push((handoff_notify_material(&guard, &source), project.clone()));
                 accepted.push(project);
@@ -6182,6 +6349,7 @@ async fn notify_origin(n: HandoffNotify, kind: HandoffMsgKind, project: &str) {
         vec![], // Committed/Declined carry no content — the origin already holds it.
         None,
         None,
+        None,
     )
     .await;
 }
@@ -6327,6 +6495,7 @@ fn distribute_home_routes(
                 Vec::new(),
                 None,
                 Some(route),
+                None,
             )
             .await
             {
@@ -6508,6 +6677,34 @@ mod handoff_routes_tests {
 
     fn mem_store() -> Store {
         Store::open_in_memory().expect("in-memory store")
+    }
+
+    #[test]
+    fn pending_handoff_write_authority_requires_retained_parseable_history() {
+        struct MissingHistory;
+        impl gaugedesk_store::ContentCodec for MissingHistory {
+            fn encode(&self, _: &str, _: &str, payload: &str) -> Result<String, String> {
+                Ok(payload.into())
+            }
+            fn decode(&self, _: &str, _: &str, _: &str) -> Option<String> {
+                None
+            }
+        }
+        let mut store = mem_store();
+        assert!(require_project_writes_available(&store, "project").is_ok());
+        apply_handoff(&mut store, "project", HandoffCommand::OfferHandoff).unwrap();
+        assert!(require_project_writes_available(&store, "project").is_err());
+        // A missing event cannot turn an offered project into a fresh writable one.
+        let store = store.with_codec(std::sync::Arc::new(MissingHistory));
+        assert!(matches!(
+            require_project_writes_available(&store, "project"),
+            Err(gaugedesk_store::AdmitError::Codec(_))
+        ));
+        let mut store = mem_store();
+        store
+            .append_record(&handoff_scope("project"), HANDOFF_KIND, "malformed")
+            .unwrap();
+        assert!(require_project_writes_available(&store, "project").is_err());
     }
 
     fn seed_relocation_agent(store: &mut Store, protected: bool) {
@@ -6766,6 +6963,7 @@ mod handoff_routes_tests {
             log: Vec::new(),
             content: Vec::new(),
             credential_key: None,
+            project_commands: None,
             shared_route: Some(route.clone()),
             signature: subkey.sign(&signed_bytes),
             source_pubkey: subkey.public_key().as_str().into(),
@@ -6899,23 +7097,14 @@ mod handoff_routes_tests {
         use std::sync::{Arc, Mutex};
         use tower::ServiceExt;
 
-        let mut wb = crate::Workbench::new(mem_store());
-        // Org policy requires attested placements; a handoff carries no attestation quote, so
-        // it cannot satisfy it (fail-closed) — the mirror of the boundary-accept gate.
+        let (shared, wire, _source_dir, _target_dir) = handoff_consent_tests::fixture();
+        assert_eq!(admit_handoff(&shared, &wire)["pending"], true);
+        let mut wb = Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
         wb.store_mut()
             .append_record(
                 "org",
                 "placement_policy",
                 &serde_json::json!({"id":"","op":"upsert","policy":{"require_attested":true,"allowed_operators":[]}})
-                    .to_string(),
-            )
-            .unwrap();
-        // A pending incoming handoff for a project that declares no (attested) deployment mode.
-        wb.store_mut()
-            .append_record(
-                "handoff::incoming",
-                "event",
-                &serde_json::json!({"op":"offer","project":"p1","source":"peer","log":[],"content":[]})
                     .to_string(),
             )
             .unwrap();
@@ -6931,7 +7120,7 @@ mod handoff_routes_tests {
             .method("POST")
             .uri("/federation/handoff/accept")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"project":"p1","source":"peer"}"#))
+            .body(Body::from(r#"{"project":"p1","source":"alice"}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(
@@ -7004,22 +7193,14 @@ mod handoff_routes_tests {
         use std::sync::{Arc, Mutex};
         use tower::ServiceExt;
 
-        let mut wb = crate::Workbench::new(mem_store());
-        // Attested-required org policy; a handoff carries no attestation quote (fail-closed).
+        let (shared, wire, _source_dir, _target_dir) = handoff_consent_tests::fixture();
+        assert_eq!(admit_handoff(&shared, &wire)["pending"], true);
+        let mut wb = Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
         wb.store_mut()
             .append_record(
                 "org",
                 "placement_policy",
                 &serde_json::json!({"id":"","op":"upsert","policy":{"require_attested":true,"allowed_operators":[]}})
-                    .to_string(),
-            )
-            .unwrap();
-        // A pending incoming handoff for a project that declares no (attested) deployment mode.
-        wb.store_mut()
-            .append_record(
-                "handoff::incoming",
-                "event",
-                &serde_json::json!({"op":"offer","project":"p1","source":"peer","log":[],"content":[]})
                     .to_string(),
             )
             .unwrap();
@@ -7219,6 +7400,14 @@ mod run_place_floor_tests {
         assert!(!run_place_floor_admits(&store, &counterparty, "p2"));
     }
 }
+
+#[cfg(test)]
+#[path = "federation_handoff_consent_tests.rs"]
+mod handoff_consent_tests;
+
+#[cfg(test)]
+#[path = "federation_relocation_content_tests.rs"]
+mod relocation_content_tests;
 
 #[cfg(test)]
 mod relocation_verdict_tests {
