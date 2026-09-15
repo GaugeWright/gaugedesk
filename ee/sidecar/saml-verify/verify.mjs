@@ -6,7 +6,10 @@
 //
 //   request : { "saml_response": <base64 POST-binding SAMLResponse>,
 //               "idp_cert": <IdP signing cert PEM>,
-//               "audience": <SP entity id> }
+//               "audience": <SP entity id>,
+//               "request_id"?: <exact SP AuthnRequest id>,
+//               "callback_url"?: <exact ACS>,
+//               "idp_issuer"?: <exact metadata issuer> }
 //   verdict : { "ok": true, "subject": <NameID>, "attributes": { name: [values] } }
 //           | { "ok": false, "error": <reason> }
 
@@ -53,6 +56,26 @@ function assertionMeta(profile) {
     return { id, notOnOrAfterMs };
 }
 
+// The Recipient and SubjectConfirmationData InResponseTo live inside the signed
+// assertion. Node-SAML validates the response/request correlation but does not
+// compare Recipient with callbackUrl, so the browser-test path adds that exact
+// delivery check after signature verification.
+function assertionHasDelivery(profile, callbackUrl, requestId) {
+    const first = (v) => (Array.isArray(v) ? v[0] : v);
+    try {
+        const doc = profile.getAssertion && profile.getAssertion();
+        const assertion = first(doc && doc.Assertion);
+        const subject = assertion && first(assertion.Subject);
+        const confirmations = (subject && subject.SubjectConfirmation) || [];
+        return (Array.isArray(confirmations) ? confirmations : [confirmations]).some((confirmation) => {
+            const data = first(confirmation && confirmation.SubjectConfirmationData);
+            return data?.$?.Recipient === callbackUrl && data?.$?.InResponseTo === requestId;
+        });
+    } catch {
+        return false;
+    }
+}
+
 // node-saml puts each attribute on profile.attributes as a scalar (one value) or an
 // array (many). The Rust contract is always name → string[]; normalize here.
 function normalizeAttributes(profile) {
@@ -73,10 +96,22 @@ async function main() {
     } catch {
         return emit({ ok: false, error: "invalid request json" });
     }
-    const { saml_response, idp_cert, audience } = req || {};
+    const { saml_response, idp_cert, audience, request_id, callback_url, idp_issuer } = req || {};
     if (!saml_response || !idp_cert) {
         return emit({ ok: false, error: "missing saml_response or idp_cert" });
     }
+    const browserFields = [request_id, callback_url, idp_issuer];
+    const browserBound = browserFields.every((value) => typeof value === "string" && value.length > 0);
+    if (!browserBound && browserFields.some((value) => value != null)) {
+        return emit({ ok: false, error: "incomplete browser response binding" });
+    }
+
+    const requestCreatedAt = new Date().toISOString();
+    const requestCache = {
+        async saveAsync() { return null; },
+        async getAsync(key) { return browserBound && key === request_id ? requestCreatedAt : null; },
+        async removeAsync(key) { return browserBound && key === request_id ? key : null; },
+    };
 
     let saml;
     try {
@@ -85,9 +120,10 @@ async function main() {
             issuer: audience || "gaugewright-sp",
             // Check the assertion's AudienceRestriction contains our SP entity id.
             audience: audience || false,
-            callbackUrl: "http://localhost/saml/acs",
-            // Stateless verify: we hold no prior AuthnRequest id to match.
-            validateInResponseTo: "never",
+            callbackUrl: browserBound ? callback_url : "http://localhost/saml/acs",
+            validateInResponseTo: browserBound ? "always" : "never",
+            requestIdExpirationPeriodMs: 10 * 60 * 1000,
+            cacheProvider: requestCache,
             // Require the assertion to be signed; the outer Response need not be.
             wantAssertionsSigned: true,
             wantAuthnResponseSigned: false,
@@ -100,6 +136,12 @@ async function main() {
         const { profile } = await saml.validatePostResponseAsync({ SAMLResponse: saml_response });
         if (!profile || !profile.nameID) {
             return emit({ ok: false, error: "no subject in assertion" });
+        }
+        if (browserBound && profile.issuer !== idp_issuer) {
+            return emit({ ok: false, error: "assertion issuer mismatch" });
+        }
+        if (browserBound && !assertionHasDelivery(profile, callback_url, request_id)) {
+            return emit({ ok: false, error: "assertion delivery binding mismatch" });
         }
         const meta = assertionMeta(profile);
         emit({

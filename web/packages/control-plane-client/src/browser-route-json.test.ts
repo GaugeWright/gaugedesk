@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { browserRouteEventStream, browserRouteJson, RouteResponseError } from "./browser-route-json";
+import {
+    browserRouteEventStream,
+    browserRouteJson,
+    openReconnectingEventStream,
+    RouteHttpError,
+    type RouteEventClose,
+    type RouteEventStream,
+} from "./browser-route-json";
 import { Rejected } from "./control-plane-domain";
 
 /** Stub `fetch` with a canned Response for the one call under test. */
@@ -10,15 +17,101 @@ function stubFetch(res: Response) {
     );
 }
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+});
+
+describe("reconnecting event streams", () => {
+    it("re-resolves after close, reports each open, and stops retrying after disposal", async () => {
+        vi.useFakeTimers();
+        const attempts: Array<{ close?: (reason?: RouteEventClose) => void; stop: ReturnType<typeof vi.fn> }> = [];
+        const source: RouteEventStream = (_path, _message, open, close) => {
+            const attempt = { close, stop: vi.fn() };
+            attempts.push(attempt);
+            open?.();
+            return attempt.stop;
+        };
+        const resolve = vi.fn(async () => source);
+        const opened = vi.fn();
+        const subscription = openReconnectingEventStream(
+            resolve,
+            "/workspace/events",
+            () => undefined,
+            opened,
+            undefined,
+            { delaysMs: [10] },
+        );
+        await vi.waitFor(() => expect(attempts).toHaveLength(1));
+
+        attempts[0]?.close?.();
+        await vi.advanceTimersByTimeAsync(10);
+        expect(resolve).toHaveBeenCalledTimes(2);
+        expect(opened).toHaveBeenCalledTimes(2);
+
+        attempts[1]?.close?.();
+        subscription.close();
+        await vi.advanceTimersByTimeAsync(100);
+        expect(resolve).toHaveBeenCalledTimes(2);
+    });
+
+    it("backs off failed route resolution and can be restarted immediately", async () => {
+        vi.useFakeTimers();
+        const stop = vi.fn();
+        const source: RouteEventStream = (_path, _message, open) => {
+            open?.();
+            return stop;
+        };
+        const resolve = vi.fn()
+            .mockRejectedValueOnce(new Error("offline"))
+            .mockRejectedValueOnce(new Error("still offline"))
+            .mockResolvedValue(source);
+        const subscription = openReconnectingEventStream(
+            resolve,
+            "/events",
+            () => undefined,
+            undefined,
+            undefined,
+            { delaysMs: [10, 20] },
+        );
+        await vi.waitFor(() => expect(resolve).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(10);
+        expect(resolve).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(19);
+        expect(resolve).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(resolve).toHaveBeenCalledTimes(3);
+
+        subscription.reconnect();
+        await vi.waitFor(() => expect(resolve).toHaveBeenCalledTimes(4));
+        expect(stop).toHaveBeenCalledOnce();
+        subscription.close();
+    });
+});
 
 describe("browserRouteJson error surfacing", () => {
+    it("preserves the HTTP status for admission recovery without changing the message", async () => {
+        stubFetch(new Response(JSON.stringify({ error: "session is stale" }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+        }));
+        const error = await browserRouteJson("http://cp")("GET", "/gaugeapps/administration/updates")
+            .catch((value: unknown) => value);
+        expect(error).toBeInstanceOf(RouteHttpError);
+        expect(error).toMatchObject({
+            status: 401,
+            method: "GET",
+            path: "/gaugeapps/administration/updates",
+            message: "GET /gaugeapps/administration/updates: 401 session is stale",
+        });
+    });
+
     it("retains HTTP status separately from the existing error message", async () => {
         for (const status of [401, 403, 503]) {
             stubFetch(new Response(JSON.stringify({ error: "read refused" }), { status }));
             const failure = await browserRouteJson("http://cp")("GET", "/projects/p/trackers").catch(error => error);
-            expect(failure).toBeInstanceOf(RouteResponseError);
-            if (!(failure instanceof RouteResponseError)) throw new Error("Expected an HTTP response error");
+            expect(failure).toBeInstanceOf(RouteHttpError);
+            if (!(failure instanceof RouteHttpError)) throw new Error("Expected an HTTP response error");
             expect(failure.status).toBe(status);
             expect(failure.message).toContain("read refused");
         }
@@ -73,6 +166,50 @@ describe("browserRouteJson error surfacing", () => {
             expect(headers.get("x-gaugewright-home-admission")).toBe("home-secret");
             expect(headers.get("x-gaugewright-machine-session")).toBe("machine-session");
         }
+    });
+
+    it("reports an unexpected SSE close so a resumable client can reconnect", async () => {
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream({
+            start(controller) {
+                controller.enqueue(encoder.encode('data: {"type":"ready"}\n\n'));
+                controller.close();
+            },
+        });
+        stubFetch(new Response(stream, { status: 200 }));
+        const closed = vi.fn();
+
+        browserRouteEventStream("https://home.example")(
+            "/workspace/events",
+            () => undefined,
+            undefined,
+            closed,
+        );
+
+        await vi.waitFor(() => expect(closed).toHaveBeenCalledOnce());
+    });
+
+    it("identifies the exact expired-Home refusal without generalizing other 401s", async () => {
+        const body = JSON.stringify({ error: "target Home admission required" });
+        stubFetch(new Response(body, {
+            status: 401,
+            headers: {
+                "content-type": "application/json",
+                "content-length": String(new TextEncoder().encode(body).byteLength),
+            },
+        }));
+        const closed = vi.fn();
+        browserRouteEventStream("https://home.example")(
+            "/workspace/events",
+            () => undefined,
+            undefined,
+            closed,
+        );
+
+        await vi.waitFor(() => expect(closed).toHaveBeenCalledWith({
+            status: 401,
+            detail: "target Home admission required",
+        }));
     });
 
     it("carries tenant context as a header, never as a URL or authority claim", async () => {

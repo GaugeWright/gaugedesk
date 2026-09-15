@@ -406,6 +406,10 @@ describe("project-first Home resolution (DESK-3)", () => {
     function twoHomes() {
         const admitted: string[] = [];
         const worked: string[] = [];
+        const streamed: string[] = [];
+        let includeNewProject = false;
+        let homeGeneration = 1;
+        let workRefusal: string | null = null;
         const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             if (url === "https://hub.example/account/home-routes") {
@@ -414,6 +418,9 @@ describe("project-first Home resolution (DESK-3)", () => {
                         routes: [
                             { project: "proj-a", home_id: "home:a", endpoint: "https://a.example" },
                             { project: "proj-b", home_id: "home:b", endpoint: "https://b.example" },
+                            ...(includeNewProject
+                                ? [{ project: "proj-c", home_id: "home:c", endpoint: "https://c.example" }]
+                                : []),
                         ],
                     }),
                 );
@@ -426,11 +433,11 @@ describe("project-first Home resolution (DESK-3)", () => {
                     }),
                 );
             }
-            const admission = url.match(/^https:\/\/([abz])\.example\/home\/admissions$/);
+            const admission = url.match(/^https:\/\/([abcz])\.example\/home\/admissions$/);
             if (admission && init?.method === "POST") {
                 admitted.push(admission[1]);
                 return new Response(
-                    JSON.stringify({ home: `home:${admission[1]}`, admission: `token-${admission[1]}` }),
+                    JSON.stringify({ home: `home:${admission[1]}`, admission: `token-${admission[1]}-${homeGeneration}` }),
                     { status: 201 },
                 );
             }
@@ -438,21 +445,45 @@ describe("project-first Home resolution (DESK-3)", () => {
             const tracker = url.match(/^https:\/\/([abz])\.example\/projects\/([^/]+)\/trackers(.*)$/);
             if (tracker) {
                 worked.push(tracker[1]);
-                expect(new Headers(init?.headers).get("x-gaugewright-home-admission")).toBe(`token-${tracker[1]}`);
+                // This fixture mints admissions with a generation, so the tracker
+                // lane asserts the same shape the workspace lanes do.
+                expect(new Headers(init?.headers).get("x-gaugewright-home-admission")).toBe(`token-${tracker[1]}-${homeGeneration}`);
                 const descriptor = { project_id: tracker[2], workspace_id: `workspace-${tracker[1]}`, queue: "tutorials", resource_id: `tracker-${tracker[1]}`, can_complete: true };
                 return new Response(JSON.stringify(tracker[3].endsWith("/complete")
                     ? { snapshot: { admission: { instance_ref: "closing-root" }, instance_status: "completed" }, executed_effect: "effect", recovered_effect: null }
                     : tracker[3].endsWith("/tasks") ? { actor: "person", tracker: descriptor, issues: [] }
                     : tracker[3].endsWith("/issues") ? { tracker: descriptor, issues: [] } : { trackers: [descriptor] }));
             }
-            const events = url.match(/^https:\/\/([abz])\.example\/workspace\/events$/);
+            const events = url.match(/^https:\/\/([abcz])\.example\/workspace\/events$/);
             if (events) {
+                const presented = new Headers(init?.headers).get("x-gaugewright-home-admission");
+                if (presented !== `token-${events[1]}-${homeGeneration}`) {
+                    const body = JSON.stringify({ error: "target Home admission required" });
+                    return new Response(body, {
+                        status: 401,
+                        headers: { "content-type": "application/json", "content-length": String(body.length) },
+                    });
+                }
+                streamed.push(events[1]);
                 worked.push(events[1]);
-                expect(new Headers(init?.headers).get("x-gaugewright-home-admission")).toBe(`token-${events[1]}`);
                 return new Response(`data: ${JSON.stringify({ type: "workspacechanged", record: "project_tracker", id: `proj-${events[1]}` })}\n\n`, { headers: { "content-type": "text/event-stream" } });
             }
-            const work = url.match(/^https:\/\/([abz])\.example\/workspace$/);
+            const work = url.match(/^https:\/\/([abcz])\.example\/workspace$/);
             if (work) {
+                if (workRefusal) {
+                    return new Response(JSON.stringify({ error: workRefusal }), {
+                        status: 401,
+                        headers: { "content-type": "application/json" },
+                    });
+                }
+                const presented = new Headers(init?.headers).get("x-gaugewright-home-admission");
+                if (presented !== `token-${work[1]}-${homeGeneration}`) {
+                    const body = JSON.stringify({ error: "target Home admission required" });
+                    return new Response(body, {
+                        status: 401,
+                        headers: { "content-type": "application/json", "content-length": String(body.length) },
+                    });
+                }
                 worked.push(work[1]);
                 return new Response(
                     JSON.stringify({
@@ -461,12 +492,32 @@ describe("project-first Home resolution (DESK-3)", () => {
                     }),
                 );
             }
+            const file = url.match(/^https:\/\/([abcz])\.example\/chats\/chat\/file\?path=file$/);
+            if (file) {
+                const presented = new Headers(init?.headers).get("x-gaugewright-home-admission");
+                if (presented !== `token-${file[1]}-${homeGeneration}`) {
+                    const body = JSON.stringify({ error: "target Home admission required" });
+                    return new Response(body, {
+                        status: 401,
+                        headers: { "content-type": "application/json", "content-length": String(body.length) },
+                    });
+                }
+                return new Response("contents");
+            }
             throw new Error(`unexpected fetch ${url}`);
         });
         vi.stubGlobal("fetch", fetch);
         const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
         api.setBearer("person-token");
-        return { api, admitted, worked };
+        return {
+            api,
+            admitted,
+            worked,
+            streamed,
+            publishNewProject: () => { includeNewProject = true; },
+            restartHomes: () => { homeGeneration += 1; },
+            refuseWork: (reason: string) => { workRefusal = reason; },
+        };
     }
 
     it("sends a project's work to that project's Home, not to a selected one", async () => {
@@ -521,6 +572,69 @@ describe("project-first Home resolution (DESK-3)", () => {
         await api.getWorkspace();
         expect(worked).toEqual(["a", "b", "a"]);
         expect(admitted).toEqual(["a", "b"]);
+    });
+
+    it("moves a live workspace subscription when the open project changes Home", async () => {
+        const { api, admitted, streamed } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        const stop = api.subscribeWorkspace(() => undefined);
+        await vi.waitFor(() => expect(streamed).toEqual(["a"]));
+
+        api.setCurrentProject("proj-b" as never);
+        await vi.waitFor(() => expect(streamed).toEqual(["a", "b"]));
+        expect(admitted).toEqual(["a", "b"]);
+        stop();
+    });
+
+    it("re-admits once when a Home restart expires its admission", async () => {
+        const { api, admitted, worked, restartHomes } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        await api.getWorkspace();
+        restartHomes();
+
+        await expect(api.getWorkspace()).resolves.toBeDefined();
+        expect(worked).toEqual(["a", "a"]);
+        expect(admitted).toEqual(["a", "a"]);
+    });
+
+    it("re-admits before retrying a raw Home read after restart", async () => {
+        const { api, admitted, restartHomes } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        await api.getWorkspace();
+        restartHomes();
+
+        const file = await api.getFileBytes("chat" as never, "file");
+        expect(new TextDecoder().decode(file.bytes)).toBe("contents");
+        expect(admitted).toEqual(["a", "a"]);
+    });
+
+    it("does not turn an account-authentication refusal into a Home reconnect", async () => {
+        const { api, admitted, refuseWork } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        refuseWork("authenticate to access your account");
+
+        await expect(api.getWorkspace()).rejects.toThrow(/authenticate to access your account/);
+        expect(admitted).toEqual(["a"]);
+    });
+
+    it("bounds an expired-admission recovery to one retry", async () => {
+        const { api, admitted, refuseWork } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        refuseWork("target Home admission required");
+
+        await expect(api.getWorkspace()).rejects.toThrow(/target Home admission required/);
+        expect(admitted).toEqual(["a", "a"]);
+    });
+
+    it("refreshes the route projection before opening a project created after the pool", async () => {
+        const { api, admitted, worked, publishNewProject } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        await api.getWorkspace();
+        publishNewProject();
+        api.setCurrentProject("proj-c" as never);
+        await api.getWorkspace();
+        expect(worked).toEqual(["a", "c"]);
+        expect(admitted).toEqual(["a", "c"]);
     });
 
     it("falls back to the selected Home for a project with no granted route", async () => {

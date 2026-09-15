@@ -296,7 +296,7 @@ impl ContentVault {
         let lease = shared(&root, &key_id).ok()?;
         available(&root, &key_id).ok()?;
         if key_path(&root, &key_id).is_file() {
-            let cached = self.cache.lock().unwrap().get(scope).copied();
+            let cached = self.key_state.lock().unwrap().cache.get(scope).copied();
             if let Some(key) = cached {
                 return use_key(key);
             }
@@ -309,13 +309,28 @@ impl ContentVault {
                 available(&root, &key_id).ok()?;
                 let wrapped = self.existing_or_new_key(&root, &key_id, true).ok()?;
                 let key = self.wrap.unwrap(&wrapped).ok()?;
-                self.cache.lock().unwrap().insert(scope.to_owned(), key);
+                {
+                    // The fence and the cache share a lock so a writer either
+                    // completes before erasure or observes the fence; minting a
+                    // replacement key after erasure would resurrect the scope.
+                    let mut state = self.key_state.lock().unwrap();
+                    if state.erased_key_ids.contains(&key_id) {
+                        return None;
+                    }
+                    state.cache.insert(scope.to_owned(), key);
+                }
                 return use_key(key);
             }
             Err(_) => return None,
         };
         let key = self.wrap.unwrap(&wrapped).ok()?;
-        self.cache.lock().unwrap().insert(scope.to_owned(), key);
+        {
+            let mut state = self.key_state.lock().unwrap();
+            if state.erased_key_ids.contains(&key_id) {
+                return None;
+            }
+            state.cache.insert(scope.to_owned(), key);
+        }
         use_key(key)
     }
 
@@ -324,10 +339,17 @@ impl ContentVault {
         let root = std::fs::canonicalize(&self.dir)?;
         let _exclusive = exclusive(&root, key_id)?;
         mark_erased(&root, key_id)?;
-        self.cache
-            .lock()
-            .unwrap()
-            .retain(|scope, _| crate::org::sha256_hex(scope) != key_id);
+        {
+            // Raise the in-process fence under the same lock that drops the live
+            // key, so a writer racing this erasure cannot mint a replacement:
+            // main's durable tombstone survives restart, this stops the window
+            // inside one.
+            let mut state = self.key_state.lock().unwrap();
+            state.erased_key_ids.insert(key_id.to_owned());
+            state
+                .cache
+                .retain(|scope, _| crate::org::sha256_hex(scope) != key_id);
+        }
         let existed = match std::fs::remove_file(key_path(&root, key_id)) {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,

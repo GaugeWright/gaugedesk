@@ -5068,6 +5068,12 @@ fn erasing_an_account_is_refused_while_it_solely_owns_an_organization() {
     .unwrap();
     let scope = crate::org::tenant_scope(&tenant.id);
 
+    assert_eq!(
+        wb.account_erase_blockers_in(ROOT, &account_scope).unwrap(),
+        vec![tenant.id.clone()],
+        "the non-mutating preflight reports the same organization the erase refuses"
+    );
+
     let refusal = wb
         .erase_account_in(ROOT, &account_scope)
         .unwrap()
@@ -5190,6 +5196,9 @@ fn erasing_an_account_crypto_erases_own_scopes_and_deprovisions_memberships() {
 
     // Erase succeeds.
     wb.erase_account_in(ROOT, &account_scope).unwrap().unwrap();
+    // A process that lost its outer phase receipt after the final key
+    // destruction can retry without attempting to rebuild erased content.
+    wb.erase_account_in(ROOT, &account_scope).unwrap().unwrap();
 
     // (i) The account scope's content is crypto-erased: a fresh erase finds no key,
     // and the encrypted setting no longer decodes.
@@ -5197,6 +5206,7 @@ fn erasing_an_account_crypto_erases_own_scopes_and_deprovisions_memberships() {
         !wb.crypto_erase_content(&account_scope),
         "the erase already destroyed the account scope's content key"
     );
+    assert!(wb.content_scope_erased(&account_scope));
     assert!(
         wb.store_ref()
             .records(&account_scope, "setting")
@@ -5210,6 +5220,7 @@ fn erasing_an_account_crypto_erases_own_scopes_and_deprovisions_memberships() {
         !wb.crypto_erase_content(&personal_scope),
         "the erase already destroyed the personal tenant scope's content key"
     );
+    assert!(wb.content_scope_erased(&personal_scope));
     assert!(
         wb.store_ref()
             .records(&personal_scope, "membership")

@@ -17,7 +17,7 @@
 // build's wasm loaders for every host that renders `App`, not just the
 // standalone entry (see wasm-modules.ts).
 import "./wasm-modules";
-import { createEffect, createMemo, createResource, createSignal, For, on, onCleanup, Show, untrack, type Accessor } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, on, onCleanup, onMount, Show, untrack, type Accessor, type JSX } from "solid-js";
 import {
     authority,
     bearer,
@@ -25,8 +25,14 @@ import {
     clientRequestId,
     consumeCallbackToken,
     endSession,
+    finishAccountRecovery,
+    finishPasskeyAccountCreation,
+    refreshHostedAccountSession,
     startSessionRefresh,
     reportedClientBuild,
+    startAccountRecovery,
+    startPasskeyAccountCreation,
+    signInWithPasskey,
     type ArchetypeId,
     type ArchetypeNode,
     type AgentKind,
@@ -35,6 +41,7 @@ import {
     type EngagementId,
     type ProjectId,
     type ProjectNode,
+    type ProjectShareCandidate,
     Rejected,
     scopeId,
     type MergeAction,
@@ -49,6 +56,7 @@ import {
     type PlacementId,
     type WorkTargetId,
     type WorkTargetNode,
+    workEmailLoginTarget,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
@@ -56,6 +64,7 @@ import { desktopUpdateAllowed } from "./desktop-update";
 import { openExternal } from "./open-external";
 import "@gaugewright/gw-embed";
 import {
+    AccountEntry,
     AgentSettings,
     BASIC_COMPOSER_CAPABILITIES,
     ChatPanel,
@@ -96,14 +105,20 @@ import {
     type ComposerMode,
     modelAcceptsImages,
     modelKey,
+    servedModelLabel,
     modelOptions,
     type ModelOption,
     ForkTreePanel,
     OpenSettingsMenu as SettingsMenu,
+    type SettingsGaugeAppAction,
+    type MenuIdentity,
     ProjectHomePanel,
     ProjectTrackerPanel,
     type PendingTrackerCompletion,
     ProjectModelAccessPanel,
+    ProjectSettingsContent,
+    ProjectSettingsMenu,
+    type ProjectSettingsPage,
     parseEnabledModels,
     panelManifest,
     pendingUserAfterSnapshot,
@@ -212,6 +227,45 @@ export interface WorkbenchAppProps {
      * this as its single primary act (DESK-4): installing GaugeDesk and signing
      * in there makes that computer the person's first Home. */
     readonly downloadUrl?: string;
+    /** Hosted first-party management destinations mounted into this same shell.
+     * The open workbench owns the composition seam but no management authority. */
+    readonly gaugeApps?: WorkbenchGaugeApps;
+}
+
+export interface WorkbenchGaugeApps {
+    /** True only while one admitted GaugeApp is selected. */
+    readonly active: Accessor<boolean>;
+    /** Person-scoped pages flattened into the existing account menu. */
+    readonly accountActions: Accessor<readonly SettingsGaugeAppAction[]>;
+    /** Identity projected by the admitted account authority, independent of Home login. */
+    readonly accountIdentity: Accessor<MenuIdentity | null>;
+    /** Organization context and its admitted Administration/Commercial branches. */
+    readonly organizationSelector: () => JSX.Element;
+    readonly chat: (controls: { readonly mobile: boolean; readonly onCollapse: () => void }) => JSX.Element;
+    readonly content: () => JSX.Element;
+    readonly menu: () => JSX.Element;
+    readonly titles: Accessor<{ readonly chat: string; readonly content: string; readonly files: string }>;
+    readonly onNewChat: () => void;
+    /** A management project reference crosses back into ordinary Work only as
+     * an opaque id. The Workbench then resolves and admits its exact Home before
+     * reading the project summary. */
+    readonly projectRequest?: Accessor<{ readonly id: string; readonly name: string } | null>;
+    readonly clearProjectRequest?: () => void;
+    /** The account plane supplies safe organization identities; the Project
+     * Home remains authoritative for the invitation itself. */
+    readonly projectShareCandidates?: () => Promise<readonly ProjectShareCandidate[]>;
+    readonly openOrganizationPeople?: () => void;
+    /** Ordinary work navigation selects the preserved work surface again. */
+    readonly close: () => void;
+    /** Native mobile account sessions arrive through the OS-vault handoff
+     * rather than a same-origin browser cookie. The enterprise host receives
+     * the in-memory bearer so the same GaugeApp controllers can re-admit their
+     * server sessions; the phone shell never becomes their authority. */
+    readonly onMobileAccountToken?: (token: string | null) => void | Promise<void>;
+    /** Native desktop custody stays in the co-resident control plane. This
+     * notification carries only linked/signed-out state so the hosted
+     * GaugeApp controller can re-admit through the sealed local proxy. */
+    readonly onNativeAccountSessionChanged?: (linked: boolean) => void | Promise<void>;
 }
 
 function WorkbenchApp(props: WorkbenchAppProps = {}) {
@@ -219,7 +273,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // `?mobile=1` / `#mobile`, composing the committed D-MOBILE islands (pairing,
     // carousel, composer, connection banner) over the real control plane. It is a
     // sibling entry to the desktop workbench, not a media-query variant of it.
-    if (isMobileHarness()) return <MobileApp />;
+    if (isMobileHarness()) return <MobileApp gaugeApps={props.gaugeApps} />;
 
     const [homeState, { refetch: refetchHome }] = createResource(() =>
         captureHomeDiscovery(() => api.bootstrapHome()),
@@ -234,7 +288,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [homeBusy, setHomeBusy] = createSignal(false);
     const [homeInvite, setHomeInvite] = createSignal(initialHomeInvitation);
     const signOutAccount = async () => {
+        // A native desktop session lives in the local control plane, not this
+        // page's cookie jar. Both logout routes are idempotent: clear that
+        // sealed custody as well as any hosted browser session before the
+        // shell is rebuilt signed out.
+        if (hubSession()?.linked === true) await api.hubSessionSignOut();
         await endSession(controlPlaneBase());
+        await props.gaugeApps?.onNativeAccountSessionChanged?.(false);
         // A reload drops every memory-only Home admission and authenticated projection along
         // with the now-expired account cookie, returning the shell to Home discovery/login.
         window.location.replace("/");
@@ -343,6 +403,37 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [hubSession, { refetch: refetchHubSession }] = createResource(() =>
         api.hubSessionStatus().catch(() => null),
     );
+    // Native GaugeApps can race the first account admission against the local
+    // session-status read. Wake the integration whenever server truth changes
+    // from unlinked to linked, including when GaugeDesk starts already signed
+    // in. This boolean carries no authority or credential; the integration
+    // must re-admit through the sealed local account-plane proxy.
+    let nativeAccountLinked = false;
+    createEffect(() => {
+        const status = hubSession();
+        const linked = status?.linked === true && !status.expired;
+        if (linked === nativeAccountLinked) return;
+        nativeAccountLinked = linked;
+        void props.gaugeApps?.onNativeAccountSessionChanged?.(linked);
+    });
+    const beginAccountAdmission = async (): Promise<void> => {
+        if (accountLoginAvailable) {
+            beginLogin(controlPlaneBase());
+            return;
+        }
+        // Desktop: the control plane mints and holds the verifier and returns the
+        // account login URL for the system browser; gaugewright:// completes the
+        // native handoff through the shell seam. A dev web return instead lands
+        // back on this origin, so the round trip must stay in this tab.
+        const { url, webReturn } = await api.hubSessionStart();
+        if (webReturn) {
+            window.location.assign(url);
+            return;
+        }
+        if (!await openExternal(url)) {
+            throw new Error("Your browser could not be opened. Try Sign in again.");
+        }
+    };
     if (typeof window !== "undefined") {
         const keepAlive = window.setInterval(() => void refetchHubSession(), 5 * 60 * 1000);
         onCleanup(() => window.clearInterval(keepAlive));
@@ -352,6 +443,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // address is split so the trigger carries a name and the menu head the proof of
     // which account it is, rather than printing the same string twice.
     const menuIdentity = createMemo(() => {
+        // Hosted GaugeApps project identity from their admitted account
+        // session. A native desktop keeps that opaque session sealed in its
+        // co-resident control plane, so the same menu falls back to the
+        // non-secret native status projection until the hosted Account pages
+        // are reachable. Neither path makes the browser an identity authority.
+        const gaugeAppIdentity = props.gaugeApps?.accountIdentity();
+        if (gaugeAppIdentity) return gaugeAppIdentity;
         // The label (email, else name) is the display; the opaque IdP subject
         // is a last resort for sessions sealed before the label existed.
         const person = authority() ?? hubSession()?.label ?? hubSession()?.person ?? null;
@@ -420,6 +518,23 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [modelAccess, setModelAccess] = createSignal<{ id: ProjectId; name: string } | null>(null);
     // UX-2: the per-project home panel (recent runs, outputs under review, audit rollup).
     const [projectHome, setProjectHome] = createSignal<{ id: ProjectId; name: string } | null>(null);
+    const [projectSettings, setProjectSettings] = createSignal<{ id: ProjectId; name: string } | null>(null);
+    const [projectSettingsPage, setProjectSettingsPage] = createSignal<ProjectSettingsPage>("people");
+    const [routedProject, setRoutedProject] = createSignal<ProjectId | null>(null);
+    createEffect(() => {
+        const request = props.gaugeApps?.projectRequest?.();
+        if (!request) return;
+        const id = request.id as ProjectId;
+        // Set the route before mounting the summary resource: its first read
+        // must go to this project's admitted Home, never the account's current
+        // default Home by accident.
+        setRoutedProject(id);
+        api.setCurrentProject(id);
+        props.gaugeApps?.close();
+        setProjectSettings({ id, name: request.name });
+        setProjectSettingsPage("people");
+        props.gaugeApps?.clearProjectRequest?.();
+    });
     const [projectTasks, setProjectTasks] = createSignal<{ id: ProjectId; name: string; queue?: string; subject?: string } | null>(null);
     const trackerActor = createMemo(() => JSON.stringify([authority(), hubSession()?.person ?? null]));
     // A panel may close while delivery is uncertain. Its command survives in
@@ -453,10 +568,43 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // per keystroke-ish action and churned the tree (round-13 follow-up).
     const [navTick, setNavTick] = createSignal(0);
     const bumpNav = () => setNavTick((k) => k + 1);
+    const [projectSettingsWorkspace, { refetch: refetchProjectSettings }] = createResource(
+        () => projectSettings() ? ([projectSettings()!.id, navTick()] as const) : false,
+        async ([id]) => {
+            const workspace = await api.getWorkspace();
+            const project = workspace.projects.find((candidate) => candidate.id === id);
+            if (!project) throw new Error("This project is no longer available from its Home.");
+            return { project, library: workspace.archetypes };
+        },
+    );
+    const currentProjectSettingsWorkspace = () => {
+        const request = projectSettings();
+        if (projectSettingsWorkspace.error) return undefined;
+        const workspace = projectSettingsWorkspace();
+        return request && workspace?.project.id === request.id ? workspace : undefined;
+    };
+    createEffect(() => {
+        if (currentProjectSettingsWorkspace()?.project.isPersonal && projectSettingsPage() === "people") {
+            setProjectSettingsPage("work-data");
+        }
+    });
+    const closeProjectSettings = () => {
+        setProjectSettings(null);
+        setProjectSettingsPage("people");
+        setRoutedProject(null);
+    };
+    const refreshProjectSettings = async () => {
+        bumpNav();
+        await refetchProjectSettings();
+    };
     createEffect(() => {
         const home = homeState();
         if (!home || home.kind === "none" || home.kind === "failure") return;
-        const stop = api.subscribeWorkspace(bumpNav);
+        let opened = false;
+        const stop = api.subscribeWorkspace(bumpNav, () => {
+            if (opened) bumpNav();
+            opened = true;
+        });
         onCleanup(stop);
     });
 
@@ -673,6 +821,30 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     );
     // The current pin as the `<select>` value: `provider:id`, or "" for Default.
     const modelValue = () => (paneModel().id ? modelKey(paneModel()) : "");
+    // An organization-funded project decides its model in Settings → Model
+    // access, and the engine binds the turn to that selection rather than to
+    // anything the composer holds. Read it so the composer can report the
+    // served model instead of offering a pin that would be discarded. A
+    // failure leaves this null: the ordinary picker is the honest fallback
+    // when we cannot establish that a connection funds the project.
+    const [organizationModelSelection] = createResource(
+        () => currentProject()?.id ?? null,
+        async (project) => {
+            try {
+                return await api.projectOrganizationModelSelection(project as ProjectId);
+            } catch {
+                return null;
+            }
+        },
+    );
+    const servedModel = createMemo(() => {
+        const selection = organizationModelSelection();
+        if (!selection) return undefined;
+        return {
+            label: servedModelLabel(selection.model, selection.provider, modelCatalog()),
+            connection: selection.connection,
+        };
+    });
     // The reasoning-effort options follow the pinned model; the toggle only shows when the
     // model supports thinking (more than just "off"). "" = the model's own default effort.
     const effortLevels = createMemo(() =>
@@ -861,7 +1033,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // project's Home rather than one selected Home (DESK-3). Several Homes stay
     // connected at once; this only decides which one serves the work in hand.
     createEffect(() => {
-        api.setCurrentProject((currentProject()?.id ?? null) as ProjectId | null);
+        const requested = projectSettings()?.id
+            ?? (projectHome()?.id === routedProject() ? routedProject() : null);
+        api.setCurrentProject((requested ?? currentProject()?.id ?? null) as ProjectId | null);
     });
     const [networkBusy, setNetworkBusy] = createSignal(false);
     async function toggleNetworkIsolated() {
@@ -1062,7 +1236,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 else if (ev.type === "tool") setActivity("using a tool…");
                 else if (ev.type === "blocked") setActivity("effect blocked by the membrane");
             },
-            () => setStreamReady(true),
+            () => {
+                setStreamReady(true);
+                // The transcript stream cannot replay events missed during a
+                // disconnect. Reconcile with its durable server snapshot on
+                // every open; the request is harmless on the initial open.
+                void loadSnapshot(id);
+            },
         );
         onCleanup(unsubscribe);
     });
@@ -1086,6 +1266,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // exists before we focus it.)
     let composerEl: HTMLTextAreaElement | undefined;
     function openChat(id: EngagementId) {
+        closeProjectSettings();
         setSelected(id);
         // UX-4: mirror the selection into the URL (`?chat=<id>`) so it's deep-linkable.
         if (typeof window !== "undefined") {
@@ -1561,7 +1742,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         kind: "external-vcs" | "external-folder",
     ) {
         if (!isTauri()) {
-            setStatus("attaching an existing machine folder is available in the desktop app");
+            setStatus("attaching an existing Project Host folder is available in the desktop app");
             return;
         }
         const { open } = await import("@tauri-apps/plugin-dialog");
@@ -1595,7 +1776,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onOpenArchetypeSettings={(id, name, kind) => setAgentSettings({ id, name, kind })}
             onOpenEngagement={(id, name) => setEngagement({ id, name })}
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}
-            onOpenProjectHome={(id, name) => setProjectHome({ id, name })}
+            onOpenProjectHome={(id, name) => {
+                setRoutedProject(id);
+                api.setCurrentProject(id);
+                setProjectSettings({ id, name });
+                setProjectSettingsPage("people");
+            }}
             onOpenProjectTasks={(id, name) => setProjectTasks({ id, name })}
             onDeployPlacement={setDeployment}
             onPreviewPanel={(agent, project) => {
@@ -1675,6 +1861,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         {/* The account menu sits at the very foot of the column, on its own row: the
             trigger *is* the identity, so it needs the full width the network strip beside
             it would not have left it. */}
+        <Show when={props.gaugeApps}>
+            {(gaugeApps) => <div class="organization-bar">{gaugeApps().organizationSelector()}</div>}
+        </Show>
         <div class="account-bar">
             <SettingsMenu
                 api={api}
@@ -1689,8 +1878,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 openModels={modelsRequest}
                 onAccountChanged={refreshModelAccess}
                 openInvite={inviteDeepLink}
+                onSignIn={
+                    props.gaugeApps
+                        ? beginAccountAdmission
+                        : accountLoginAvailable
+                            ? () => beginLogin(controlPlaneBase())
+                            : undefined
+                }
                 onSignOut={signOutAccount}
                 environmentAction={props.environmentAction}
+                gaugeAppActions={props.gaugeApps?.accountActions}
                 openExternal={openExternal}
             />
         </div>
@@ -1707,6 +1904,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onPickEffort={(level) => void pickThinking(level)}
             stacked={stacked}
             onAddModel={() => setModelsRequest((n) => n + 1)}
+            served={servedModel()}
         />
     );
 
@@ -2143,6 +2341,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         project={e().id}
                         projectName={e().name}
                         onClose={() => setEngagement(null)}
+                        onOpenPeopleAndSharing={() => {
+                            setEngagement(null);
+                            setProjectSettings({ id: e().id, name: e().name });
+                            setProjectSettingsPage("people");
+                        }}
                     />
                 )}
             </Show>
@@ -2174,10 +2377,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         project={e().id}
                         projectName={e().name}
                         onOpenChat={(chat) => {
+                            setRoutedProject(null);
                             setProjectHome(null);
                             openChat(chat as EngagementId);
                         }}
-                        onClose={() => setProjectHome(null)}
+                        onClose={() => {
+                            setRoutedProject(null);
+                            setProjectHome(null);
+                        }}
                     />
                 )}
             </Show>
@@ -2499,8 +2706,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     <Show when={props.environmentAction?.available()}>
                         <div class="homegate-cloud">
                             <div>
-                                <strong>Manage machines</strong>
-                                <span>Connect a self-managed machine or add a managed machine in Administration.</span>
+                                <strong>Manage Project Hosts</strong>
+                                <span>Connect a self-managed Project Host or add a managed Project Host in Administration.</span>
                             </div>
                             <button type="button" onClick={() => props.environmentAction?.open()}>
                                 Open Administration
@@ -2509,7 +2716,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     </Show>
                     <p class="homegate-auth-note">
                         {localDevLogin
-                            ? "This isolated local account never contacts Google or the production GaugeWright Hub."
+                            ? "This isolated local account never contacts Google or the production account service."
                             : "Google sign-in identifies your GaugeWright account. Connecting OpenAI or another model provider is a separate authorization in Account settings."}
                     </p>
                     <Show when={homeError()}>
@@ -2532,33 +2739,75 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             <Show when={homeFailure()}>
                 <div class="homegate-scrim" data-home-error>
                     <section class="homegate-card">
-                        <h1>{homeNeedsLogin() ? "Sign in to find your Home" : "We couldn’t load your Homes"}</h1>
-                        <p class="homegate-lede">
-                            {homeNeedsLogin()
-                                ? localDevLogin
-                                    ? "Enter the isolated local account, then Home discovery will continue automatically."
-                                    : "Your GaugeWright session is missing or expired. Sign in with Google, then Home discovery will continue automatically."
-                                : "The account Hub could not be reached. Retry when the connection is available."}
-                        </p>
-                        <div class="homegate-connect-row">
-                            <Show when={homeNeedsLogin()}>
+                        <Show
+                            when={homeNeedsLogin()}
+                            fallback={
+                                <>
+                                    <h1>We couldn’t load your Homes</h1>
+                                    <p class="homegate-lede">
+                                        The account service could not be reached. Retry when the connection is available.
+                                    </p>
+                                </>
+                            }
+                        >
+                            <p class="homegate-kicker">GaugeDesk</p>
+                            <h1>Sign in</h1>
+                            <p class="homegate-lede">
+                                Choose your personal account or find the sign-in provided by your organization.
+                            </p>
+                            <AccountEntry
+                                personalLabel={localDevLogin ? "Enter local dev account" : "Continue with Google"}
+                                onPersonal={() => beginLogin(controlPlaneBase())}
+                                recovery={localDevLogin ? undefined : {
+                                    start: (email) => startAccountRecovery(controlPlaneBase(), email),
+                                    finish: async (challengeId, emailCode, recoveryCode) => {
+                                        await finishAccountRecovery(controlPlaneBase(), challengeId, emailCode, recoveryCode);
+                                    },
+                                    complete: () => {
+                                        // Recovery establishes the durable HttpOnly session. Rebuild
+                                        // the signed-in shell from that server authority so no
+                                        // recovery input or stale signed-out resource survives in
+                                        // client memory. Refresh first when an OIDC-backed Home grant
+                                        // exists; independent passkey/recovery sessions still re-enter
+                                        // through their opaque account cookie on reload.
+                                        void refreshHostedAccountSession(controlPlaneBase())
+                                            .finally(() => window.location.reload());
+                                    },
+                                }}
+                                passkey={localDevLogin ? undefined : {
+                                    signIn: async (email) => {
+                                        await signInWithPasskey(controlPlaneBase(), email);
+                                    },
+                                    beginCreation: (email) => startPasskeyAccountCreation(controlPlaneBase(), email),
+                                    finishCreation: async (challengeId, code, name) => {
+                                        await finishPasskeyAccountCreation(
+                                            controlPlaneBase(),
+                                            challengeId,
+                                            code,
+                                            name,
+                                        );
+                                    },
+                                    complete: () => {
+                                        void refreshHostedAccountSession(controlPlaneBase())
+                                            .finally(() => window.location.reload());
+                                    },
+                                }}
+                                workEmailAction={localDevLogin
+                                    ? undefined
+                                    : workEmailLoginTarget(controlPlaneBase())}
+                            />
+                        </Show>
+                        <Show when={!homeNeedsLogin()}>
+                            <div class="homegate-connect-row">
                                 <button
                                     class="firstrun-connect"
-                                    data-home-sign-in
                                     type="button"
-                                    onClick={() => beginLogin(controlPlaneBase())}
+                                    onClick={() => void refetchHome()}
                                 >
-                                    {localDevLogin ? "Enter local dev account" : "Sign in with Google"}
+                                    Retry
                                 </button>
-                            </Show>
-                            <button
-                                class="firstrun-connect"
-                                type="button"
-                                onClick={() => void refetchHome()}
-                            >
-                                Retry
-                            </button>
-                        </div>
+                            </div>
+                        </Show>
                     </section>
                 </div>
             </Show>
@@ -2590,30 +2839,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             import.meta.env.VITE_HOME_SPLIT === "true" ||
                             (hubSession()?.linked === true && !hubSession()?.expired),
                         subject: () => authority() ?? hubSession()?.label ?? hubSession()?.person ?? null,
-                        begin: () => {
-                            if (accountLoginAvailable) {
-                                beginLogin(controlPlaneBase());
-                                return;
-                            }
-                            // Desktop: the control plane mints and holds the verifier and
-                            // returns the Hub login URL for the system browser; the
-                            // gaugewright:// return completes the handoff. A dev web
-                            // return (ADR 0140) instead lands back on this origin, so
-                            // the round trip must stay in this tab.
-                            void api
-                                .hubSessionStart()
-                                .then(({ url, webReturn }) => {
-                                    if (webReturn) {
-                                        window.location.assign(url);
-                                        return;
-                                    }
-                                    // Through the shell seam, not `window.open` — the
-                                    // Tauri webview drops the latter silently. Settings
-                                    // carries the copy-link/paste-return fallback.
-                                    void openExternal(url);
-                                })
-                                .catch(() => {});
-                        },
+                        begin: beginAccountAdmission,
                     } : undefined}
                     onConnected={() => {
                         void refetchStartupCreds();
@@ -2626,43 +2852,102 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             <Show when={!homeState.loading && !homeFailure() && homeState()?.kind !== "none"}>
                 <WorkbenchShell
                     state={workbenchShell}
+                    titles={props.gaugeApps?.active() ? {
+                        ...props.gaugeApps.titles(),
+                        nav: "Navigate",
+                    } : undefined}
                     // Captions are empty-state placeholders, replaced by the working
                     // rows once there is content: the chat's own header supplants CHAT
                     // when a chat is open, and the facet tabs are always the nav's top
                     // row so NAVIGATE never shows. The Admin Environment keeps shell
                     // defaults — its navigator has no tabs, so its title carries.
-                    headings={{ nav: false, chat: !selected() }}
+                    headings={{ nav: false, chat: !selected() && !props.gaugeApps?.active(), content: false, files: false }}
                     taskBar={() => (
                         <TaskBar
                             api={api}
                             selected={selected()}
                             refreshKey={navRefresh()}
-                            onSelect={openChat}
+                            onSelect={(item) => {
+                                props.gaugeApps?.close();
+                                openChat(item);
+                            }}
                             onReviewInbound={(project, id) => setReviewingProject(project, id)}
                         />
                     )}
-                    nav={navPane}
+                    nav={() => <div
+                        style={{ height: "100%" }}
+                        onClick={() => {
+                            if (props.gaugeApps?.active()) props.gaugeApps.close();
+                        }}
+                    >{navPane()}</div>}
                     navFooter={navFooter}
-                    chat={chatPane}
-                    content={contentPane}
-                    files={filesPane}
+                    chat={() => <>
+                        <div hidden={props.gaugeApps?.active()} style={{ height: "100%" }} data-work-chat-slot>
+                            {chatPane()}
+                        </div>
+                        <Show when={props.gaugeApps?.active()}>{props.gaugeApps?.chat({
+                            mobile: workbenchShell.isMobile(),
+                            onCollapse: () => workbenchShell.setCollapsed("chat", true),
+                        })}</Show>
+                    </>}
+                    content={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={projectSettings()} fallback={contentPane()}>
+                        <Show when={currentProjectSettingsWorkspace()} fallback={
+                            <Show when={projectSettingsWorkspace.error} fallback={<p class="project-settings-empty" role="status">Loading project settings…</p>}>
+                                {(error) => <div class="project-settings-empty" role="alert">
+                                    <p>Project settings unavailable: {String(error())}</p>
+                                    <button type="button" onClick={() => void refetchProjectSettings()}>Retry</button>
+                                </div>}
+                            </Show>
+                        }>
+                            {(workspace) => <ProjectSettingsContent
+                                api={api}
+                                project={workspace().project}
+                                library={workspace().library}
+                                page={projectSettingsPage()}
+                                onClose={closeProjectSettings}
+                                onChanged={refreshProjectSettings}
+                                onAttachTarget={isTauri()
+                                    ? (kind) => void attachTarget(workspace().project.id, workspace().project.name, kind)
+                                    : undefined}
+                                onManageDeployment={setDeployment}
+                                projectShareCandidates={props.gaugeApps?.projectShareCandidates}
+                                onOpenOrganizationPeople={props.gaugeApps?.openOrganizationPeople}
+                            />}
+                        </Show>
+                    </Show>}>
+                        {props.gaugeApps?.content()}
+                    </Show>}
+                    files={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={projectSettings()} fallback={filesPane()}>
+                        {(request) => <ProjectSettingsMenu
+                            projectName={request().name}
+                            isPersonal={currentProjectSettingsWorkspace()?.project.isPersonal}
+                            page={projectSettingsPage()}
+                            onSelect={setProjectSettingsPage}
+                            onClose={closeProjectSettings}
+                        />}
+                    </Show>}>
+                        {props.gaugeApps?.menu()}
+                    </Show>}
                     overlays={overlays}
-                    onNewChat={() => void startNewChat()}
+                    onNewChat={() => props.gaugeApps?.active()
+                        ? props.gaugeApps.onNewChat()
+                        : void startNewChat()}
                 />
             </Show>
         </>
     );
 }
 
-/** GaugeDesk is the workbench on both desktop and web. Account, organization,
- * Home, billing, backup, and deployment management live in GaugeWright Hub;
- * the hosted transport flag changes routing only, never the application shell.
+/** GaugeDesk is the workbench on both desktop and web. The hosted transport
+ * flag changes routing only, never the application shell.
  */
 export function App(props: WorkbenchAppProps = {}) {
-    if (isMobileHarness()) return <MobileApp />;
+    if (isMobileHarness()) return <MobileApp gaugeApps={props.gaugeApps} />;
     const tenant = typeof window === "undefined"
         ? null
         : new URLSearchParams(window.location.search).get("tenant");
-    createEffect(() => props.onTenantContextChange?.(tenant));
+    // Seed from the URL once. Tracking the parent's callback would subscribe
+    // this effect to its selection and reset every later picker choice.
+    onMount(() => props.onTenantContextChange?.(tenant));
     return <WorkbenchApp {...props} />;
 }

@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use gaugedesk_store::{AdmitError, Store};
+use gaugedesk_store::{AdmitError, CommandRecordFact, Store};
 
 use crate::account::ACCOUNT_SCOPE;
 use crate::org::{
@@ -446,7 +446,16 @@ pub enum DeleteOrganizationRefusal {
     FacilitiesRemain(usize),
 }
 
-/// Delete one organization the caller owns and is alone in.
+/// The exact cross-scope facts for one admitted organization deletion. Keeping
+/// planning separate lets a higher-level command commit these tombstones in the
+/// same transaction as its idempotency receipt and audit link.
+#[derive(Clone, Debug)]
+pub struct DeleteOrganizationPlan {
+    pub tenant: TenantRef,
+    pub facts: Vec<CommandRecordFact>,
+}
+
+/// Plan deletion of one organization the caller owns and is alone in.
 ///
 /// The counterpart to [`provision_organization`]. Without it an organization
 /// created by mistake was permanent: nothing removed one, and
@@ -472,12 +481,12 @@ pub enum DeleteOrganizationRefusal {
 /// caller's membership is deprovisioned; and the switcher entry is tombstoned.
 /// Future-only revocation throughout (`INV-18`) — nothing is erased, so the
 /// audit trail stays intact.
-pub fn delete_organization_in(
-    store: &mut Store,
+pub fn plan_delete_organization_in(
+    store: &Store,
     authority: &str,
     account_scope: &str,
     tenant_id: &str,
-) -> Result<Result<TenantRef, DeleteOrganizationRefusal>, AdmitError> {
+) -> Result<Result<DeleteOrganizationPlan, DeleteOrganizationRefusal>, AdmitError> {
     let tenancy = Tenancy::rebuild_in(store, account_scope)?;
     let Some(tenant) = tenancy.tenants.get(tenant_id).cloned() else {
         return Ok(Err(DeleteOrganizationRefusal::NoSuchOrganization));
@@ -529,15 +538,54 @@ pub fn delete_organization_in(
         ..tenant.clone()
     };
 
-    let directory_json = serde_json::to_string(&directory)?;
-    let retired_json = serde_json::to_string(&retired)?;
-    let dropped_json = serde_json::to_string(&dropped)?;
-    store.append_records_atomically(&[
-        (scope.as_str(), "org", directory_json.as_str()),
-        (scope.as_str(), "membership", retired_json.as_str()),
-        (account_scope, TENANT_REF_KIND, dropped_json.as_str()),
-    ])?;
-    Ok(Ok(tenant))
+    Ok(Ok(DeleteOrganizationPlan {
+        tenant,
+        facts: vec![
+            CommandRecordFact {
+                scope_id: scope.clone(),
+                kind: "org".into(),
+                payload: serde_json::to_string(&directory)?,
+            },
+            CommandRecordFact {
+                scope_id: scope,
+                kind: "membership".into(),
+                payload: serde_json::to_string(&retired)?,
+            },
+            CommandRecordFact {
+                scope_id: account_scope.to_owned(),
+                kind: TENANT_REF_KIND.into(),
+                payload: serde_json::to_string(&dropped)?,
+            },
+        ],
+    }))
+}
+
+/// Apply the narrow deletion plan immediately. GaugeApp callers use
+/// [`plan_delete_organization_in`] so the same facts commit with their command
+/// receipt; the legacy account route retains this convenience wrapper.
+pub fn delete_organization_in(
+    store: &mut Store,
+    authority: &str,
+    account_scope: &str,
+    tenant_id: &str,
+) -> Result<Result<TenantRef, DeleteOrganizationRefusal>, AdmitError> {
+    let plan = match plan_delete_organization_in(store, authority, account_scope, tenant_id)? {
+        Ok(plan) => plan,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    let records = plan
+        .facts
+        .iter()
+        .map(|fact| {
+            (
+                fact.scope_id.as_str(),
+                fact.kind.as_str(),
+                fact.payload.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    store.append_records_atomically(&records)?;
+    Ok(Ok(plan.tenant))
 }
 
 #[cfg(test)]

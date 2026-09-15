@@ -1,7 +1,7 @@
 /**
  * The per-row **status gem** (WS-H): a compact kind glyph that doubles as the row's
  * status light. Chats use a robot glyph while its tooltip says whether it is a
- * **work** or **edit** chat; its colour says the single most important *state* — a sync
+ * **work**, **edit**, or **management** chat; its colour says the single most important *state* — a sync
  * **conflict** to resolve, the agent **working**, a turn that **errored**, or changes
  * waiting for **review**; and a conflict carries a `!` mark.
  *
@@ -18,7 +18,7 @@ import { type ChatRunTone, runDotTitle } from "./chat-run-state";
 import { Icon } from "./icons";
 
 /** The kind of row a gem sits on — a chat's kind is its root (ADR 0035). */
-export type GemKind = "work" | "edit" | "project";
+export type GemKind = "work" | "edit" | "management" | "project";
 
 /** The single state the gem paints, most-urgent first (see {@link gemState}). */
 export type GemState = "idle" | "working" | "review" | "error" | "conflict";
@@ -26,6 +26,7 @@ export type GemState = "idle" | "working" | "review" | "error" | "conflict";
 const KIND_TITLE: Record<GemKind, string> = {
     work: "work chat — uses the method to do the project's work",
     edit: "edit chat — changes what the method itself does",
+    management: "management chat — helps manage this account or organization",
     project: "project",
 };
 const STATE_TITLE: Record<GemState, string | null> = {

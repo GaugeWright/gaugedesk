@@ -201,6 +201,39 @@
     color-scheme: dark;
 }
 
+:root[data-gw-interface-scale="large"] {
+    --fs-label: 11px;
+    --fs-small: 12px;
+    --fs-ui: 14px;
+    --fs-body: 15px;
+    --fs-title: 17px;
+}
+
+:root[data-gw-contrast="high"] {
+    --edge: var(--gw-default-muted);
+    --muted: var(--gw-default-ink);
+}
+
+:root[data-gw-motion="reduced"] *,
+:root[data-gw-motion="reduced"] *::before,
+:root[data-gw-motion="reduced"] *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    :root[data-gw-motion="system"] *,
+    :root[data-gw-motion="system"] *::before,
+    :root[data-gw-motion="system"] *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+        transition-duration: 0.01ms !important;
+    }
+}
+
 /* Shared primitives live in a cascade layer, and unlayered rules outrank every layer
    regardless of source order. Without this, specializing a primitive meant winning a
    position fight: `.modal` is defined near the end of this sheet, so `.settings-modal`
@@ -560,7 +593,9 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     border-top: 1px solid var(--edge); padding: 6px 12px;
     font-size: var(--fs-small); }
 /* The account row, flush to the very bottom corner of the column. */
+.organization-bar { padding: 5px 8px 0; border-top: 1px solid var(--edge); }
 .account-bar { padding: 5px 8px 6px; border-top: 1px solid var(--edge); }
+.organization-bar + .account-bar { border-top: 0; }
 .network-bar-status { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }
 .network-version { color: var(--muted); padding: 0 4px; font-size: var(--fs-label); line-height: 1.35; }
 .desktop-update { margin: 1px 4px 0; padding: 1px 4px; border: 1px solid var(--accent);
@@ -608,6 +643,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     text-align: left; background: transparent; border: none; border-radius: 5px;
     padding: 7px 10px; cursor: pointer; color: var(--ink); font-size: var(--fs-ui); }
 .account-menu-item:hover { background: var(--edge); }
+.account-menu-item:disabled { opacity: 0.62; cursor: progress; }
 .account-menu-item.danger { color: var(--bad); }
 .account-menu-label { flex: 1 1 auto; min-width: 0; }
 /* A shortcut or reported value; quiet, because it is never the reason you opened
@@ -770,8 +806,9 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     white-space: nowrap; justify-self: end; }
 .settings-room-body .model-also-via { grid-column: 2; color: var(--muted);
     font-size: var(--fs-label); white-space: nowrap; justify-self: end; }
-.settings-menu-error { max-width: 220px; padding: 4px 10px 7px; color: var(--bad);
-    font-size: var(--fs-label); line-height: 1.35; }
+.account-menu-status { margin: 4px 10px 8px; padding: 7px 9px;
+    border-left: 2px solid var(--bad); background: color-mix(in srgb, var(--bad) 8%, transparent);
+    color: var(--bad); font-size: var(--fs-label); line-height: 1.35; }
 /* The single Devices modal. */
 .devices-modal { min-width: 420px; max-width: 560px; max-height: 85vh; overflow-y: auto; }
 .devices-sep { border: none; border-top: 1px solid var(--edge); margin: 14px 0; }
@@ -1297,6 +1334,13 @@ input {
 .composer-menu-btn:hover, .composer-menu-btn[aria-expanded="true"] { color: var(--ink);
     background: color-mix(in srgb, var(--ink) 9%, transparent); }
 .composer-menu-btn > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A served model is reported, not operated: no hover wash, no pointer, no
+   chevron. It sits in the same register as the picker it replaces so the row
+   keeps one grammar, and the difference a reader has to notice is that there
+   is nothing to press. */
+.composer-menu-btn.served { cursor: default; }
+.composer-menu-btn.served:hover { color: var(--muted);
+    background: transparent; }
 .composer-menu-btn .chev { width: 10px; height: 10px; flex: 0 0 auto; opacity: 0.7; }
 .composer-menu { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 61;
     min-width: 220px; max-height: 44vh; overflow: auto; padding: 4px;
@@ -1484,13 +1528,6 @@ input {
 .tab { padding: 4px 10px; cursor: pointer; color: var(--muted); text-transform: capitalize;
     border-bottom: 2px solid transparent; }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-.environment-content-tab { background: transparent; border: 0; border-bottom: 2px solid transparent;
-    font: inherit; }
-.environment-content-tab.active { border-bottom-color: var(--accent); }
-.environment-help-dialog { max-height: min(720px, 85vh); overflow: auto; }
-.environment-help-dialog .modal-head { position: sticky; top: -14px; z-index: 1;
-    margin: -14px -14px 12px; padding: 12px 14px; background: var(--panel);
-    border-bottom: 1px solid var(--edge); }
 
 .shelf h3 { font-family: var(--serif); font-size: var(--fs-small); font-weight: 400; text-transform: uppercase;
     letter-spacing: 0.08em; color: #c5d1e2; margin: 0 0 6px; }
@@ -2123,6 +2160,29 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     color: var(--muted); border-top: 1px solid var(--edge); max-height: 25vh; overflow: auto; }
 .mobile-log li { padding: 1px 0; }
 .mobile-nav, .mobile-files, .mobile-content { padding: 12px; }
+.mobile-nav:has(.mobile-project-settings) { padding: 0; min-height: 0; }
+.mobile-project-settings { height: 100%; overflow: auto; }
+.mobile-project-settings > .project-settings-menu {
+    position: sticky; top: 0; z-index: 2; background: var(--bg);
+    border-bottom: 1px solid var(--edge);
+}
+.mobile-project-settings > .project-settings-menu-compact {
+    display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: end;
+    gap: 8px; padding: 6px 8px;
+}
+.mobile-project-settings > .project-settings-menu-compact label {
+    display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center;
+    gap: 7px; color: var(--muted); font-size: var(--fs-small);
+}
+.mobile-project-settings > .project-settings-menu-compact select {
+    min-width: 0; height: 28px; padding: 3px 7px; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--edge); font: inherit;
+}
+.mobile-project-settings > .project-settings-menu-compact .project-settings-menu-close {
+    width: auto; margin: 0; white-space: nowrap;
+}
+.mobile-project-settings > .project-settings-content { height: auto; overflow: visible; }
+.mobile-project-settings .project-settings-page-head > button { display: none; }
 /* The mobile nav chat list (MOB-F1) + the chat-pane transcript (MOB-F2). */
 .mobile-file-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; }
 .mobile-file { display: block; width: 100%; text-align: left; font-family: var(--mono); font-size: var(--fs-body);
@@ -2190,8 +2250,6 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .wizard-steps li.done { color: #3a9; }
 .wizard-pane { display: flex; flex-direction: column; gap: 8px; }
 .wizard-nav { display: flex; justify-content: space-between; margin-top: 14px; }
-.scim-token { display: block; word-break: break-all; background: var(--bg); border: 1px solid var(--edge);
-    border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; font-family: var(--mono, monospace); font-size: var(--fs-small); }
 .admin-section .muted, .muted { color: var(--muted); }
 
 /* UX-3: inline notice for the agent's pending approvals (held until you grant). */
@@ -2301,6 +2359,53 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .homegate-link { padding: 0; border: 0; background: none; cursor: pointer; color: var(--accent);
   font: inherit; text-decoration: underline; }
 
+/* Account entry is intentionally compact and architectural: two routes share one
+   measured frame, while the gold rule calls attention to the primary act without
+   turning every control into a large call-to-action. */
+.account-entry { display: flex; flex-direction: column; border: 1px solid var(--edge);
+  background: var(--bg); }
+.account-entry__route { display: grid; grid-template-columns: minmax(120px, .78fr) minmax(220px, 1.22fr);
+  align-items: start; gap: 16px; padding: 14px 16px; }
+.account-entry__route + .account-entry__route { border-top: 1px solid var(--edge); }
+.account-entry__copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.account-entry__copy h2 { margin: 0; color: var(--ink); font-size: var(--fs-body);
+  font-weight: 600; line-height: 1.3; }
+.account-entry__copy p, .account-entry__privacy { margin: 0; color: var(--muted);
+  font-size: var(--fs-small); line-height: 1.4; }
+.account-entry__button { min-height: 32px; padding: 5px 13px; border: 1px solid var(--edge);
+  border-radius: 3px; background: var(--surface-2); color: var(--ink); font: inherit;
+  font-size: var(--fs-ui); cursor: pointer; }
+.account-entry__button:hover { border-color: var(--accent); }
+.account-entry__button--primary { justify-self: stretch; border-color: color-mix(in srgb, var(--accent) 68%, var(--edge));
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface-2)); }
+.account-entry__personal { display: flex; flex-direction: column; align-items: stretch; gap: 7px; }
+.account-entry__quiet { align-self: center; padding: 1px 3px; border: 0; background: transparent;
+  color: var(--muted); font: inherit; font-size: var(--fs-small); cursor: pointer; }
+.account-entry__quiet:hover { color: var(--accent); }
+.account-entry__recovery { grid-column: 2; display: flex; flex-direction: column; gap: 8px;
+  padding-top: 11px; border-top: 1px solid var(--edge); }
+.account-entry__recovery-proofs { display: grid; grid-template-columns: minmax(92px, .65fr) minmax(142px, 1.35fr) auto;
+  align-items: end; gap: 8px; }
+.account-entry__recovery-proofs .account-entry__button { white-space: nowrap; }
+.account-entry__status { margin: 0; color: var(--muted); font-size: var(--fs-small); line-height: 1.4; }
+.account-entry__work { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end; gap: 8px; }
+.account-entry__field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.account-entry__label { color: var(--muted); font-size: var(--fs-label); text-transform: uppercase;
+  letter-spacing: .065em; }
+.account-entry__field input { width: 100%; min-height: 32px; padding: 5px 9px;
+  border: 1px solid var(--edge); border-radius: 3px; background: var(--panel);
+  color: var(--ink); font: inherit; font-size: var(--fs-ui); }
+.account-entry__field input:focus { outline: 1px solid var(--accent); outline-offset: 1px;
+  border-color: var(--accent); }
+.account-entry__privacy { grid-column: 2; margin-top: -8px; padding: 0 16px 13px; }
+@media (max-width: 560px) {
+  .account-entry__route { grid-template-columns: 1fr; gap: 9px; }
+  .account-entry__recovery { grid-column: 1; }
+  .account-entry__recovery-proofs { grid-template-columns: 1fr; }
+  .account-entry__privacy { grid-column: 1; margin-top: -4px; }
+}
+
 /* The conflict fold (SUB-6): regions to resolve after a conflicted save. */
 .conflict-fold { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow: auto; }
 .conflict-fold-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -2313,35 +2418,6 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .fold-option label { display: flex; gap: 6px; align-items: center; font-size: var(--fs-ui); cursor: pointer; }
 .fold-custom summary { font-size: var(--fs-ui); cursor: pointer; opacity: 0.8; }
 .fold-custom textarea { width: 100%; min-height: 60px; margin-top: 6px; }
-
-/* ADR 0107 constrained document Views. Layout is shared by Hub,
-   Administration, and Vend; Environment-specific CSS stays in the navigator. */
-.environment-document-view { position: relative; display: flex; flex-direction: column;
-    gap: 12px; min-height: 100%; padding: 18px; overflow: auto; }
-.environment-help { position: absolute; top: 12px; right: 14px; padding: 4px 8px;
-    border: 1px solid var(--edge); border-radius: 5px; background: transparent;
-    color: var(--muted); font-size: var(--fs-small); cursor: pointer; }
-.environment-help:hover { color: var(--ink); border-color: var(--muted); }
-.environment-grid { display: grid;
-    grid-template-columns: repeat(var(--environment-columns, 2), minmax(0, 1fr)); gap: 10px; }
-.environment-tabs { display: flex; flex-direction: column; gap: 10px; }
-.environment-metric, .environment-field { display: flex; flex-direction: column; gap: 5px;
-    min-width: 0; padding: 12px; border: 1px solid var(--edge); border-radius: 8px;
-    background: var(--surface-2, var(--panel)); }
-.environment-metric span, .environment-field span { color: var(--muted); font-size: var(--fs-label);
-    text-transform: uppercase; letter-spacing: .07em; }
-.environment-metric strong { color: var(--ink); font-size: 20px; font-weight: 400; }
-.environment-field code { color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
-.environment-notice { padding: 10px 12px; border: 1px solid var(--edge);
-    border-radius: 8px; color: var(--muted); font-size: var(--fs-ui); line-height: 1.45; }
-.environment-notice[data-tone="warning"] { border-color: var(--warn, #b58900); }
-.environment-command { display: flex; align-items: center; gap: 8px; }
-.environment-table { width: 100%; border-collapse: collapse; font-size: var(--fs-ui); }
-.environment-table th, .environment-table td { padding: 8px; border-bottom: 1px solid var(--edge);
-    text-align: left; vertical-align: top; overflow-wrap: anywhere; }
-.environment-table th { color: var(--muted); font-size: var(--fs-label); font-weight: 400;
-    text-transform: uppercase; letter-spacing: .06em; }
-@media (max-width: 760px) { .environment-grid { grid-template-columns: 1fr; } }
 
 /* The review surface (ADR 0110 §7, GATE-6). An index, never a document: rows of
    provenance, and a payload only when a person opens one. Deliberately plain —

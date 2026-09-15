@@ -1,29 +1,36 @@
 # authenticated-production-bundle
 @transport
-Feature: Admin Environment
+Feature: Administration GaugeApp
 
-  Administration is an enterprise Environment in the same workbench shell as the
-  ordinary desktop. The enterprise workbench supplies an administrative resource
-  tree and special renderings of selected secret-free canonical configuration
-  documents while reusing the shared agent chat and responsive shell. Server
-  capabilities remain authoritative, and Home inventory appears only after target
-  admission.
+  Administration is a tenant-scoped GaugeApp in the ordinary GaugeDesk workbench.
+  It contributes server-admitted pages to the organization menu, owns a distinct
+  persistent management conversation, and renders purpose-built controls in the
+  content pane. Server capabilities and page models remain authoritative.
 
   @transport @authenticated
   Scenario: Administration rejects missing identity and missing capability
     Given the authenticated enterprise tenant is reset
     Then the Administration route family enforces identity and capability
 
-  Scenario: the Admin Environment is hidden in the solo collapse
-    Given the workbench is open
-    When I open the settings menu
+  # admin-capability-production-client-lifecycle
+  # admin-sso-production-client-lifecycle
+  # admin-audit-export-production-client-lifecycle
+  # placement-policy-enrolled-client-production-journey
+  @transport @authenticated
+  Scenario: supporting enterprise routes remain capability gated
+    Given the enterprise workbench is open for an administered tenant
+    Then the supporting enterprise routes expose capability, integration, audit, policy, and SSO diagnostics
+
+  Scenario: Administration is absent without an admitted organization
+    Given the authenticated enterprise tenant is reset
+    When I open the enterprise workbench without identity
     Then the organization admin entry is not offered
 
-  # admin-capability-production-client-lifecycle
+  # gaugeapp-administration-production-client-lifecycle
   @transport @authenticated
-  Scenario: the Admin Environment uses the shared workbench shape
+  Scenario: Administration uses the shared workbench shape
     Given the enterprise workbench is open for an administered tenant
-    Then the Admin Environment shows its resource navigator, agent, dashboard, and configuration workspace
+    Then Administration shows its menu, agent, and People workspace
 
   # roster-assignment-authenticated-production-client
   @transport @authenticated
@@ -44,41 +51,27 @@ Feature: Admin Environment
   Scenario: an admitted administrator switches between Work and Administration
     Given the enterprise workbench is open for an administered tenant
     When I return to work
-    Then the ordinary Work Environment is shown
-    When I open the settings menu
+    Then ordinary project work is shown
+    When I open the organization menu
     Then the Administration entry is offered
     When I choose Administration
-    Then the Admin Environment is shown
+    Then the Administration GaugeApp is shown
 
   @transport @authenticated
-  Scenario: invite a member and see the action audited
+  Scenario: invite a member through review and receive an addressed link
     Given the enterprise workbench is open for an administered tenant
     When I invite member "alice@acme.com" as "admin"
-    Then the member "alice@acme.com" is pending review and not yet admitted
+    Then the invitation for "alice@acme.com" is pending review and not yet created
     When I apply the pending Administration change
-    Then the member "alice@acme.com" appears in the directory
-    And the audit log shows the "member.invite" action
-
-  # admin-audit-export-production-client-lifecycle
-  @transport @authenticated
-  Scenario: filter and export the tenant audit timeline
-    Given the enterprise workbench is open for an administered tenant
-    When I invite member "exported@acme.com" as "member"
-    And I apply the pending Administration change
-    And I filter the audit timeline to action "member.invite"
-    Then every visible audit row has action "member.invite"
-    When I export the filtered audit timeline as "CSV"
-    Then the downloaded audit export contains "member.invite"
-    When I export the filtered audit timeline as "JSON"
-    Then the downloaded audit export contains "member.invite"
+    Then the invitation for "alice@acme.com" appears with its one-time link
 
   @transport @authenticated
   Scenario: rejecting an Administration proposal has no domain effect
     Given the enterprise workbench is open for an administered tenant
     When I invite member "rejected@acme.com" as "member"
-    Then the member "rejected@acme.com" is pending review and not yet admitted
+    Then the invitation for "rejected@acme.com" is pending review and not yet created
     When I reject the pending Administration change
-    Then the member "rejected@acme.com" remains absent
+    Then the invitation for "rejected@acme.com" remains absent
 
   @transport @authenticated
   Scenario: the Administration agent uses the same proposal and review path
@@ -86,45 +79,13 @@ Feature: Admin Environment
     When I ask the Administration agent to propose inviting "agent@acme.com"
     Then the Administration agent opens a reviewable member proposal for "agent@acme.com"
     When I apply the pending Administration change
-    Then the member "agent@acme.com" appears in the directory
+    Then the invitation for "agent@acme.com" appears with its one-time link
 
   @authenticated
-  Scenario: canonical configuration documents are secret-free records
-    Given the enterprise workbench is open for an administered tenant
-    Then the Admin Environment exposes canonical configuration documents
-
-  @authenticated
-  Scenario: a special Admin file owns both its derived and raw views
-    Given the enterprise workbench is open for an administered tenant
-    When I open the "policy.json" configuration file
-    Then its derived policy view is shown
-    When I open the raw configuration editor
-    Then the editor shows the canonical policy JSON
-
-  @authenticated
-  Scenario: Admin help and agent boundaries are inspectable workspace files
-    Given the enterprise workbench is open for an administered tenant
-    When I open help for the selected Admin file
-    Then its linked Markdown guide is shown
-    And the Admin supporting files are hidden from the ordinary Files list
-    When I reveal internal Admin files
-    Then the Admin agent definition files are visible
-    When I open the Admin agent tool manifest
-    Then it contains only governance tools and no shell or web tools
-
-  @authenticated
-  Scenario: the Admin session admits no upload capability
+  Scenario: the Administration conversation admits no upload capability
     Given the enterprise workbench is open for an administered tenant
     Then the Admin composer offers no attachment control
     And the Admin agent upload API is unavailable
-
-  @authenticated
-  Scenario: software admission and reported clients are ordinary Admin files
-    Given the enterprise workbench is open for an administered tenant
-    When I open the "software-policy.json" configuration file
-    Then its derived software admission view is shown
-    When I open the "clients.json" configuration file
-    Then its reported clients view is shown
 
   # software-policy-desktop-updater-production-client
   @transport @authenticated
@@ -133,29 +94,11 @@ Feature: Admin Environment
     When I reload the administered workbench as a desktop client
     Then the shipped desktop updater reads the tenant software policy
 
-  # placement-policy-enrolled-client-production-journey
-  @transport @authenticated
-  Scenario: the enrolled desktop refuses an engagement outside organization placement policy
-    Given the enterprise workbench has an attested-only placement policy
-    When I preview an unattested engagement in the shipped Devices UI
-    Then the enrolled client reads the placement floor and refuses the engagement locally
-
-  # admin-sso-production-client-lifecycle
-  @transport @authenticated
-  Scenario: the guided SSO wizard walks through the steps
-    Given the enterprise workbench is open for an administered tenant
-    When I launch the SSO setup wizard
-    Then the SSO wizard shows the connect step
-    When I advance the SSO wizard
-    Then the SSO wizard shows the test step
-    When I test the incomplete SSO connection
-    Then the SSO test reports the incomplete configuration
-
   # saml-metadata-external-provider-lifecycle
   @transport @authenticated
-  Scenario: an authenticated administrator advertises usable SAML metadata
+  Scenario: Enterprise Identity advertises usable SAML metadata
     Given the enterprise workbench is open for an administered tenant
-    When I launch the SSO setup wizard
+    When I open Enterprise Identity setup
     Then an identity provider can register from the advertised SAML metadata
 
   # scim-external-provider-lifecycle
@@ -166,13 +109,6 @@ Feature: Admin Environment
     Then the external SCIM provider provisions, suspends, restores, and deletes a member
 
   @authenticated
-  Scenario: the Admin Environment shows the active-sessions roster
+  Scenario: Administration shows the active-sessions roster
     Given the enterprise workbench is open for an administered tenant
     Then the admin console shows the active sessions roster
-
-  @authenticated
-  Scenario: Machines use target-admitted Home projections
-    Given the enterprise workbench is open for an administered tenant
-    Then the Admin Environment shows the serving machine as live
-    When I ask the admin agent about Machines
-    Then the admin agent answers from admitted Home projections

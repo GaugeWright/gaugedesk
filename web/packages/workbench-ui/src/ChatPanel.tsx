@@ -169,6 +169,7 @@ export function SessionComposer(props: {
             queue={hasQueue() ? controller.queue() : []}
             attachments={controller.attachments()}
             busy={controller.busy()}
+            canSteer={canSteer()}
             blocked={controller.blocked()}
             mode={controller.mode()}
             onPickMode={controller.setMode}

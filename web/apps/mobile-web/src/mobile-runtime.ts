@@ -335,7 +335,7 @@ export async function resolveMobileRouteEndpoint(
 ): Promise<string> {
     if (!route.relay || !isNativeMobile()) {
         if (!route.endpoint) {
-            throw new Error("This relay-only Machine requires the native GaugeDesk app");
+            throw new Error("This relay-only Project Host requires the native GaugeDesk app");
         }
         return route.endpoint;
     }
@@ -375,10 +375,10 @@ export function normalizeMachineEndpoint(raw: string): string {
     try {
         url = new URL(endpoint);
     } catch {
-        throw new Error("Use an HTTPS Machine endpoint");
+        throw new Error("Use an HTTPS Project Host endpoint");
     }
     if (url.protocol !== "https:" || url.username !== "" || url.password !== "") {
-        throw new Error("Use an HTTPS Machine endpoint");
+        throw new Error("Use an HTTPS Project Host endpoint");
     }
     return endpoint;
 }
@@ -419,7 +419,7 @@ export function parseMachineCredentialRegistry(
     raw: NativeMachineCredentialRegistryResponse,
 ): MachineCredential[] {
     if (raw.version !== 1 || !Array.isArray(raw.credentials)) {
-        throw new Error("Native Machine credential registry is malformed");
+        throw new Error("Native Project Host credential registry is malformed");
     }
     const byMachine = new Map<string, MachineCredential>();
     for (const item of raw.credentials) {
@@ -433,7 +433,7 @@ export function parseMachineCredentialRegistry(
             || typeof credential.credential !== "string"
             || !credential.credential
         ) {
-            throw new Error("Native Machine credential registry is malformed");
+            throw new Error("Native Project Host credential registry is malformed");
         }
         const normalized = {
             machine: credential.machine,
@@ -442,7 +442,7 @@ export function parseMachineCredentialRegistry(
             credential: credential.credential,
         };
         if (byMachine.has(normalized.machine)) {
-            throw new Error(`Native Machine credential registry repeats ${normalized.machine}`);
+            throw new Error(`Native Project Host credential registry repeats ${normalized.machine}`);
         }
         byMachine.set(normalized.machine, normalized);
     }
@@ -494,7 +494,7 @@ export async function loadMobileRuntime(
     }
     const [stored, storedAccount] = await Promise.all([
         boundedNativeCall(
-            "Opening the Machine credential registry",
+            "Opening the Project Host credential registry",
             call<NativeMachineCredentialRegistryResponse>(
                 "plugin:gaugedesk-device-identity|list_machine_credentials",
             ),
@@ -548,7 +548,7 @@ export async function loadMobileRuntime(
         pendingInvitation,
         signChallenge: async (challenge) => {
             const signed = await boundedNativeCall(
-                "Signing the Machine challenge",
+                "Signing the Project Host challenge",
                 call<NativeChallengeSignature>(
                     "plugin:gaugedesk-device-identity|sign_challenge",
                     { payload: { challenge } },
@@ -561,7 +561,7 @@ export async function loadMobileRuntime(
         },
         storeCredential: async (next) => {
             await boundedNativeCall(
-                "Saving the Machine credential",
+                "Saving the Project Host credential",
                 call(
                     "plugin:gaugedesk-device-identity|store_machine_credential",
                     { payload: { ...next } },
@@ -570,7 +570,7 @@ export async function loadMobileRuntime(
         },
         removeCredential: async (machine) => {
             await boundedNativeCall(
-                "Removing the Machine credential",
+                "Removing the Project Host credential",
                 call(
                     "plugin:gaugedesk-device-identity|remove_machine_credential",
                     { payload: { machine } },
@@ -579,7 +579,7 @@ export async function loadMobileRuntime(
         },
         clearCredentials: async () => {
             await boundedNativeCall(
-                "Clearing the Machine credential registry",
+                "Clearing the Project Host credential registry",
                 call("plugin:gaugedesk-device-identity|clear_machine_credential"),
             );
         },

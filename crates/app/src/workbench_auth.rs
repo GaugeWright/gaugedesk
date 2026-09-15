@@ -21,6 +21,14 @@ pub fn web_account_mode() -> bool {
         .unwrap_or(false)
 }
 
+fn web_account_uses_account_admission(
+    web_account: bool,
+    hosted_home: bool,
+    organization_provisioned: bool,
+) -> bool {
+    web_account && !hosted_home && !organization_provisioned
+}
+
 /// Which projects a request's caller may **see** in the nav/list projections (`ENTSEC-2`).
 /// This is the projection-visibility complement to the per-route [`Workbench::authorize_scope`]
 /// gate: the gate refuses *access* to another project's data; this stops another project even
@@ -154,14 +162,42 @@ pub fn throttle_scope(
 }
 
 impl Workbench {
-    /// Resolve the provider-neutral Hub account session first, then optional
+    /// Resolve the provider-neutral GaugeDesk account session first, then optional
     /// OIDC. Both yield the same durable account/authority type; neither
     /// credential becomes the identity.
     pub fn authenticate_bearer(&self, token: &str) -> Option<gaugedesk_core::ids::AuthorityId> {
-        self.account_sessions
-            .resolve_now(token)
+        self.resolve_account_session(token)
+            .map(|(account_id, _)| account_id)
             .map(gaugedesk_core::ids::AuthorityId::new)
             .or_else(|| self.idp.as_ref().and_then(|idp| idp.authenticate(token)))
+    }
+
+    /// Resolve an opaque account session and enforce its durable trusted-device
+    /// binding, when present. The hot cache proves possession and expiry; the
+    /// append-only account projections decide whether that bearer may still be
+    /// used after its device has been revoked.
+    pub fn resolve_account_session(&self, token: &str) -> Option<(String, String)> {
+        let resolved = self.account_sessions.resolve_session(token)?;
+        let session_id = crate::account_session::session_id(token);
+        let Ok(auth) = crate::account_auth::AccountAuth::rebuild(self.store_ref()) else {
+            return None;
+        };
+        let Some(record) = auth.sessions.get(&session_id) else {
+            // Session durability is deliberately best-effort. A hot session whose
+            // index write failed remains valid for this process, but can never be
+            // device-bound or restored after restart.
+            return Some(resolved);
+        };
+        if record.account_id != resolved.0 || record.device_id.is_empty() {
+            return (record.account_id == resolved.0).then_some(resolved);
+        }
+        let scope = crate::account::account_scope(&record.account_id);
+        let account = crate::account::Account::rebuild_in(self.store_ref(), &scope).ok()?;
+        account
+            .devices
+            .get(&record.device_id)
+            .is_some_and(|device| device.status == crate::account::DeviceStatus::Active)
+            .then_some(resolved)
     }
 
     /// Preserve the source that actually verified the credential. Used at the
@@ -224,6 +260,35 @@ impl Workbench {
         Some(token)
     }
 
+    /// Bind an already-minted opaque account session to the trusted device that
+    /// received it. The durable session index is authoritative for route use,
+    /// including sessions that have no provider refresh grant.
+    pub fn bind_account_session_device(
+        &mut self,
+        session_id: &str,
+        account_id: &str,
+        device_id: &str,
+    ) -> bool {
+        let Ok(auth) = crate::account_auth::AccountAuth::rebuild(self.store_ref()) else {
+            return false;
+        };
+        let Some(mut record) = auth.sessions.get(session_id).cloned() else {
+            return false;
+        };
+        if record.account_id != account_id
+            || (!record.device_id.is_empty() && record.device_id != device_id)
+            || device_id.trim().is_empty()
+        {
+            return false;
+        }
+        record.device_id = device_id.to_owned();
+        crate::account_auth::append_facts(
+            self.store_mut(),
+            &[crate::account_auth::AccountAuthFact::Session(record)],
+        )
+        .is_ok()
+    }
+
     /// Revoke the opaque session `token` names (`ADR 0147` §3): evict it from the hot
     /// cache and tombstone its durable index record (future-only, `INV-18`), so the
     /// token stops resolving now and after a restart. Returns whether a live cache
@@ -231,12 +296,21 @@ impl Workbench {
     /// grant keyed by the same session id.
     pub fn revoke_account_session(&mut self, token: &str) -> bool {
         let session_id = crate::account_session::session_id(token);
-        let removed = Arc::clone(&self.account_sessions).revoke(token);
+        self.revoke_account_session_id(&session_id)
+    }
+
+    /// Revoke an opaque session by its durable digest id. Account and device
+    /// management surfaces never possess another session's raw bearer, so this
+    /// is the revocation primitive they use to evict the hot entry and append the
+    /// same future-only tombstone as caller logout (`ADR 0147` §3).
+    pub fn revoke_account_session_id(&mut self, session_id: &str) -> bool {
+        let removed = Arc::clone(&self.account_sessions).revoke_id(session_id);
         let tombstone = crate::account_auth::AccountSessionRecord {
-            id: session_id,
+            id: session_id.to_owned(),
             op: crate::account_auth::RecordOp::Tombstone,
             account_id: String::new(),
             method: String::new(),
+            device_id: String::new(),
             issued_at_ms: 0,
             last_seen_ms: 0,
             lifetime_secs: 0,
@@ -246,6 +320,20 @@ impl Workbench {
             &[crate::account_auth::AccountAuthFact::Session(tombstone)],
         );
         removed
+    }
+
+    /// Evict an already-durably-revoked session from the request-path cache.
+    /// The caller owns the tombstone transaction; this method deliberately does
+    /// not append a second auth fact.
+    pub fn evict_account_session_id(&self, session_id: &str) -> bool {
+        self.account_sessions.revoke_id(session_id)
+    }
+
+    /// Evict every request-path bearer for an account after a global erasure
+    /// fence has won. No durable tombstone is required for authority: the fence
+    /// itself blocks the account before any encrypted auth fact can be read.
+    pub fn evict_account_sessions(&self, account_id: &str) -> Vec<String> {
+        self.account_sessions.revoke_account(account_id)
     }
 
     /// Re-seat live opaque sessions into the hot cache from the durable index on
@@ -261,6 +349,16 @@ impl Workbench {
             let expires_ms = record.issued_at_ms.saturating_add(lifetime_ms);
             if expires_ms <= now_ms {
                 continue;
+            }
+            if !record.device_id.is_empty() {
+                let scope = crate::account::account_scope(&record.account_id);
+                let admitted = crate::account::Account::rebuild_in(self.store_ref(), &scope)
+                    .ok()
+                    .and_then(|account| account.devices.get(&record.device_id).cloned())
+                    .is_some_and(|device| device.status == crate::account::DeviceStatus::Active);
+                if !admitted {
+                    continue;
+                }
             }
             self.account_sessions.insert_loaded(
                 &record.id,
@@ -302,6 +400,33 @@ impl Workbench {
     pub fn session_roster(&self) -> Vec<crate::session_activity::SessionInfo> {
         let now = self.session_activity.now_ms();
         self.session_activity.roster(now)
+    }
+
+    /// Stable public id for one bearer in one exact organization. The bearer is
+    /// first reduced to its one-way key, then domain-separated again with the tenant
+    /// scope; neither value can authenticate a request.
+    pub fn organization_session_id_for(&self, bearer: &str, org_scope: &str) -> Option<String> {
+        if bearer.trim().is_empty() {
+            return None;
+        }
+        let key = org::sha256_hex(bearer);
+        Some(crate::session_activity::organization_session_id(
+            org_scope, &key,
+        ))
+    }
+
+    /// Exact-scope live roster with durably revoked sessions folded out. Freshness
+    /// remains process-live evidence, while refusal survives restart in the org
+    /// store.
+    pub fn organization_session_roster_in(
+        &self,
+        org_scope: &str,
+    ) -> Result<Vec<crate::session_activity::SessionInfo>, gaugedesk_store::AdmitError> {
+        let org = org::Org::rebuild_in(self.store_ref(), org_scope)?;
+        let now = self.session_activity.now_ms();
+        let mut sessions = self.session_activity.roster_in(org_scope, now);
+        sessions.retain(|session| !org.organization_session_revoked(&session.id));
+        Ok(sessions)
     }
 
     /// Wire an [`identity::IdentityProvider`] (enterprise mode, `RBAC-5`): the
@@ -373,6 +498,16 @@ impl Workbench {
             self.authority().as_str().to_string()
         };
 
+        if bearer
+            .and_then(|token| self.organization_session_id_for(token, org_scope))
+            .is_some_and(|id| org.organization_session_revoked(&id))
+        {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "organization session was revoked; re-authenticate",
+            ));
+        }
+
         let Some(role) = org.role_of(&authority) else {
             return Ok(Vec::new());
         };
@@ -436,6 +571,15 @@ impl Workbench {
         let Some(authority) = bearer.and_then(|t| self.authenticate_bearer(t)) else {
             return Err((StatusCode::UNAUTHORIZED, "authenticate to administer"));
         };
+        if bearer
+            .and_then(|token| self.organization_session_id_for(token, org_scope))
+            .is_some_and(|id| org.organization_session_revoked(&id))
+        {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "organization session was revoked; re-authenticate",
+            ));
+        }
         let Some(role) = org.role_of(authority.as_str()) else {
             return Err((StatusCode::FORBIDDEN, "not an active member"));
         };
@@ -540,23 +684,29 @@ impl Workbench {
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let authority = bearer.and_then(|t| self.authenticate_bearer(t));
+        let provisioned = org
+            .members
+            .values()
+            .any(|m| m.status == org::MembershipStatus::Active);
         // Hosted web account (ADR 0077): an opaque GaugeDesk session or legacy verified id-token
-        // (header or shared `.gaugewright.com` cookie) is the authorization. Every request must
-        // carry one; there is **no bootstrap-passthrough** here, because the "directory" is per-person
-        // tenants, not the default org scope (so the `provisioned` check below is always false and
-        // would otherwise leave `/account/*` open to anonymous callers). Fail-closed (`INV-20`).
-        // The authenticated authority IS the person; per-person account-scope isolation is layered
-        // by the routes on top of this gate.
-        if web_account_mode() && !self.hosted_home_mode() {
+        // (header or shared `.gaugewright.com` cookie) is the authorization for an unprovisioned
+        // per-person account scope. Every request must carry one; there is **no
+        // bootstrap-passthrough** here, because otherwise `/account/*` would be anonymous.
+        //
+        // A provisioned organization scope is different: it must continue through exact
+        // membership, revocation, session-lifetime, software-posture, and activity checks below.
+        // Returning here for those scopes made hosted Administration appear authorized while
+        // silently omitting its organization session from the live roster.
+        if web_account_uses_account_admission(
+            web_account_mode(),
+            self.hosted_home_mode(),
+            provisioned,
+        ) {
             return authority.map(|a| a.as_str().to_string()).ok_or((
                 StatusCode::UNAUTHORIZED,
                 "authenticate to access your account",
             ));
         }
-        let provisioned = org
-            .members
-            .values()
-            .any(|m| m.status == org::MembershipStatus::Active);
         if !provisioned && self.hosted_home_mode() {
             return Err((StatusCode::FORBIDDEN, "Home has no active owner"));
         }
@@ -572,6 +722,21 @@ impl Workbench {
                 "authenticate to access this workspace",
             ));
         };
+        // ADR 0146 §7: once organization SSO is required, neither a personal
+        // account session nor a directly presented provider token is ordinary
+        // organization admission. Only an opaque session minted by this exact
+        // enterprise connection may enter. Independent passkey recovery is
+        // exposed through `admit_sso_recovery`, never through this data path.
+        if org.sso_enforced()
+            && !bearer
+                .and_then(|token| self.resolve_account_session(token))
+                .is_some_and(|(_, method)| org.enterprise_session_method_matches(&method))
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "this organization requires corporate sign-in",
+            ));
+        }
         if org.role_of(authority.as_str()).is_none() {
             return Err((StatusCode::FORBIDDEN, "not an active member"));
         }
@@ -584,6 +749,13 @@ impl Workbench {
         // so the roster is populated even with no timeout policy; a violated bound is a `401`.
         let (lifetime_ms, idle_ms) = org.session_bounds_ms();
         let key = org::sha256_hex(bearer.unwrap_or_default());
+        let session_id = crate::session_activity::organization_session_id(org_scope, &key);
+        if org.organization_session_revoked(&session_id) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "organization session was revoked; re-authenticate",
+            ));
+        }
         let now = self.session_activity.now_ms();
         let now_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -594,10 +766,12 @@ impl Workbench {
             &client,
             now_unix_ms,
         );
-        if let Err(expiry) = self.session_activity.check_and_touch_client(
+        if let Err(expiry) = self.session_activity.check_and_touch_client_in(
             &key,
+            org_scope,
             authority.as_str(),
             now,
+            now_unix_ms,
             lifetime_ms,
             idle_ms,
             client,
@@ -619,6 +793,64 @@ impl Workbench {
             }
         }
         Ok(authority.as_str().to_string())
+    }
+
+    /// Admit the one narrow lockout-recovery channel retained when organization
+    /// SSO is enforced. This proves an opaque passkey session for an active owner
+    /// whose account still has both an independent WebAuthn method and an unused
+    /// recovery code. It grants no project/data access; the Administration
+    /// adapter uses it only to expose Enterprise Identity and the disable-SSO
+    /// command, whose reviewed mutation is separately audited.
+    pub fn admit_sso_recovery(
+        &self,
+        bearer: Option<&str>,
+        org_scope: &str,
+    ) -> Result<String, (StatusCode, &'static str)> {
+        let token = bearer.ok_or((
+            StatusCode::UNAUTHORIZED,
+            "authenticate with an independent passkey to recover SSO",
+        ))?;
+        let (account_id, method) = self.resolve_account_session(token).ok_or((
+            StatusCode::UNAUTHORIZED,
+            "authenticate with an independent passkey to recover SSO",
+        ))?;
+        if method != "passkey" {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "SSO recovery requires an independent passkey session",
+            ));
+        }
+        let org = org::Org::rebuild_in(self.store_ref(), org_scope)
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
+        if !org.sso_enforced()
+            || org.role_of(&account_id) != Some(gaugedesk_core::abac::Role::owner())
+        {
+            return Err((StatusCode::FORBIDDEN, "SSO recovery is not admitted"));
+        }
+        if self
+            .organization_session_id_for(token, org_scope)
+            .is_some_and(|id| org.organization_session_revoked(&id))
+        {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "organization session was revoked; re-authenticate",
+            ));
+        }
+        let auth = crate::account_auth::AccountAuth::rebuild(self.store_ref()).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "account recovery unavailable",
+            )
+        })?;
+        if auth.active_webauthn_count(&account_id) == 0
+            || auth.unused_recovery_code_count(&account_id) == 0
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "owner recovery methods are incomplete",
+            ));
+        }
+        Ok(account_id)
     }
 
     /// Authenticate a bearer to its durable authority without granting Home
@@ -1030,9 +1262,33 @@ impl Workbench {
 }
 
 #[cfg(test)]
+mod web_account_admission_tests {
+    use super::web_account_uses_account_admission;
+
+    #[test]
+    fn hosted_hub_bypasses_org_admission_only_for_unprovisioned_account_scopes() {
+        assert!(web_account_uses_account_admission(true, false, false));
+        assert!(
+            !web_account_uses_account_admission(true, false, true),
+            "a provisioned organization must reach membership and session checks"
+        );
+        assert!(!web_account_uses_account_admission(false, false, false));
+        assert!(!web_account_uses_account_admission(true, true, false));
+    }
+}
+
+#[cfg(test)]
 mod provider_neutral_identity_tests {
     use super::*;
+    use crate::account_auth::{
+        append_facts, AccountAuthFact, RecoveryBatchRecord, RecoveryBatchStatus,
+        RecoveryCodeRecord, WebAuthnMethodRecord,
+    };
     use crate::app_support::LockUnpoisoned;
+    use crate::org::{
+        MembershipRecord, MembershipStatus, RecordOp, SsoConnectionRecord, SsoProtocol, ORG_ID,
+        ORG_SCOPE,
+    };
     use gaugedesk_core::abac::{AuthorityAttributes, Role};
     use std::collections::BTreeSet;
 
@@ -1124,6 +1380,169 @@ mod provider_neutral_identity_tests {
         assert!(wb.authenticate_action_context(&account_token).is_none());
     }
 
+    fn enforced_org_workbench() -> Workbench {
+        let idp = crate::identity::LoopbackIdentityProvider::new().enroll(
+            "corporate-token",
+            gaugedesk_core::ids::AuthorityId::new("person-root"),
+            AuthorityAttributes::default(),
+        );
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
+            .with_identity_provider(Arc::new(idp));
+        let membership = MembershipRecord {
+            id: "owner".into(),
+            op: RecordOp::Upsert,
+            org_id: ORG_ID.into(),
+            authority: "person-root".into(),
+            email: "owner@example.test".into(),
+            role: "owner".into(),
+            status: MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        };
+        let mut connection = SsoConnectionRecord {
+            id: ORG_ID.into(),
+            op: RecordOp::Upsert,
+            protocol: SsoProtocol::Oidc,
+            issuer: "https://idp.example.test".into(),
+            audiences: vec!["gaugedesk".into()],
+            enforce_sso: true,
+            ..Default::default()
+        };
+        connection.seal_revision();
+        wb.store_mut()
+            .append_records_atomically(&[
+                (
+                    ORG_SCOPE,
+                    "membership",
+                    serde_json::to_string(&membership).unwrap().as_str(),
+                ),
+                (
+                    ORG_SCOPE,
+                    "sso",
+                    serde_json::to_string(&connection).unwrap().as_str(),
+                ),
+            ])
+            .unwrap();
+        wb
+    }
+
+    #[test]
+    fn enforced_sso_rejects_personal_sessions_and_accepts_the_exact_enterprise_connection() {
+        let wb = enforced_org_workbench();
+        let now = crate::account_session::unix_now();
+        let passkey = wb
+            .account_sessions()
+            .issue_with_method("person-root", "passkey", now, 60)
+            .unwrap();
+        let consumer = wb
+            .account_sessions()
+            .issue_with_method("person-root", "oidc", now, 60)
+            .unwrap();
+        let wrong_org = wb
+            .account_sessions()
+            .issue_with_method("person-root", "enterprise-oidc:other-org", now, 60)
+            .unwrap();
+        let corporate = wb
+            .account_sessions()
+            .issue_with_method("person-root", "enterprise-oidc:org:org", now, 60)
+            .unwrap();
+
+        for token in [&passkey, &consumer, &wrong_org] {
+            assert_eq!(
+                wb.admit_data_request_with_client(
+                    Some(token),
+                    None,
+                    ORG_SCOPE,
+                    crate::client_admission::ClientBuild::default(),
+                    false,
+                ),
+                Err((
+                    StatusCode::FORBIDDEN,
+                    "this organization requires corporate sign-in"
+                ))
+            );
+        }
+        assert!(wb
+            .admit_data_request_with_client(
+                Some(&corporate),
+                None,
+                ORG_SCOPE,
+                crate::client_admission::ClientBuild::default(),
+                false,
+            )
+            .is_ok());
+        assert_eq!(
+            wb.admit_data_request_with_client(
+                Some("corporate-token"),
+                None,
+                ORG_SCOPE,
+                crate::client_admission::ClientBuild::default(),
+                false,
+            ),
+            Err((
+                StatusCode::FORBIDDEN,
+                "this organization requires corporate sign-in"
+            )),
+        );
+    }
+
+    #[test]
+    fn break_glass_requires_a_passkey_owner_with_unused_recovery() {
+        let mut wb = enforced_org_workbench();
+        let now = crate::account_session::unix_now();
+        let passkey = wb
+            .account_sessions()
+            .issue_with_method("person-root", "passkey", now, 60)
+            .unwrap();
+        let consumer = wb
+            .account_sessions()
+            .issue_with_method("person-root", "oidc", now, 60)
+            .unwrap();
+        assert!(wb.admit_sso_recovery(Some(&passkey), ORG_SCOPE).is_err());
+
+        let credential = WebAuthnMethodRecord::new(
+            "person-root",
+            "credential-1",
+            "public verifier",
+            "Security key",
+            1,
+        )
+        .unwrap();
+        let recovery =
+            RecoveryCodeRecord::prepare("person-root", "recovery-batch", "salt", "one-use-code")
+                .unwrap();
+        append_facts(
+            wb.store_mut(),
+            &[
+                AccountAuthFact::WebAuthn(credential),
+                AccountAuthFact::RecoveryBatch(RecoveryBatchRecord {
+                    id: "recovery-batch".into(),
+                    op: RecordOp::Upsert,
+                    account_id: "person-root".into(),
+                    created_at: 1,
+                    status: RecoveryBatchStatus::Active,
+                }),
+                AccountAuthFact::RecoveryCode(recovery),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            wb.admit_sso_recovery(Some(&passkey), ORG_SCOPE).unwrap(),
+            "person-root"
+        );
+        assert!(wb.admit_sso_recovery(Some(&consumer), ORG_SCOPE).is_err());
+        assert!(wb
+            .admit_data_request_with_client(
+                Some(&passkey),
+                None,
+                ORG_SCOPE,
+                crate::client_admission::ClientBuild::default(),
+                false,
+            )
+            .is_err());
+    }
+
     #[test]
     fn a_durable_opaque_session_survives_a_restart_and_revoke_is_future_only() {
         let root = tempfile::tempdir().unwrap();
@@ -1198,6 +1617,44 @@ mod provider_neutral_identity_tests {
         assert_eq!(
             wb.account_sessions().resolve_session(&second).unwrap().1,
             "passkey"
+        );
+    }
+
+    #[test]
+    fn device_bound_session_is_admitted_only_while_its_device_is_active() {
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        let token = wb
+            .mint_account_session("person-root", "passkey", 3600)
+            .unwrap();
+        let session_id = crate::account_session::session_id(&token);
+        let scope = crate::account::account_scope("person-root");
+        let device = crate::account::DeviceRecord {
+            id: "phone-1".into(),
+            op: crate::account::RecordOp::Upsert,
+            label: "Alice's phone".into(),
+            kind: crate::account::DeviceKind::Phone,
+            subkey_pubkey: "device-subkey".into(),
+            status: crate::account::DeviceStatus::Active,
+            enrolled_at: 1,
+        };
+        wb.upsert_account_device_in(&scope, &device).unwrap();
+
+        assert!(wb.bind_account_session_device(&session_id, "person-root", &device.id));
+        assert_eq!(
+            wb.resolve_account_session(&token),
+            Some(("person-root".into(), "passkey".into()))
+        );
+
+        wb.revoke_account_device_in(&scope, &device.id).unwrap();
+        assert!(wb.resolve_account_session(&token).is_none());
+        assert!(wb.authenticate_bearer(&token).is_none());
+        assert!(wb.account_sessions().resolve_now(&token).is_none());
+        assert!(
+            !crate::account_auth::AccountAuth::rebuild(wb.store_ref())
+                .unwrap()
+                .sessions
+                .contains_key(&session_id),
+            "a no-refresh session bound directly to the device stays revoked after restart",
         );
     }
 }

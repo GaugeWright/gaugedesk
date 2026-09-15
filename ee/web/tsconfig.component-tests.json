@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "resolveJsonModule": true },
+  "include": [],
+  "files": ["e2e/model-providers/page.tsx", "e2e/gaugeapp-workspace/page.tsx"]
+}

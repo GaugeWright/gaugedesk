@@ -4,7 +4,7 @@
 //! These drive `POST /account/tenants/{tenant}/managed-inference/entitlement`
 //! through the mounted control plane and assert its refusals: a caller who does
 //! not administer the tenant, a plan that is not active, a malformed publisher
-//! key, and a Hub with no signing key configured (fail-closed). The signing and
+//! key, and an account service with no signing key configured (fail-closed). The signing and
 //! verification of a well-formed entitlement is covered byte-for-byte by the
 //! `managed_entitlement` module's own tests; here the concern is that the route
 //! guards the way its handler intends before it ever reaches the signer.
@@ -19,21 +19,24 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
+use axum::{Extension, Router};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use gaugedesk_app::account::ACCOUNT_SCOPE;
+use gaugedesk_app::managed_funding::{FundingAuthority, FundingEnvironment};
 use gaugedesk_app::managed_inference::MANAGED_PLAN_KIND;
 use gaugedesk_app::open_control_plane;
 use gaugedesk_app::org::tenant_scope;
 use gaugedesk_app::tenancy::TENANT_REF_KIND;
 use gaugedesk_app::Workbench;
+use gaugedesk_core::ids::AuthorityId;
 use gaugedesk_store::Store;
 use gaugedesk_workspace::Instance;
 
 const TENANT: &str = "acme";
+const FUNDING_ISSUER: &str = "test:verified-subscription";
 
 /// A fixed, well-formed uncompressed-SEC1 P-256 publisher key (130 lowercase
 /// hex, `0x04` prefix) that is a genuine point on the curve — generated once
@@ -43,6 +46,19 @@ const PUBLISHER_KEY: &str =
     "047d635b1ba948fd02d7e02b1697893647cc39cf4178902e58e7a7507577ea367afec4bd02cec38a75daf17f5cff1b19b8714e7b89b2d5e5cda45c42bde45ed15b";
 
 fn app_with(seed: impl FnOnce(&mut Store)) -> (tempfile::TempDir, Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    seed(&mut store);
+    let wb = Workbench::with_target("inst-test", instance, store);
+    let app = open_control_plane(Arc::new(Mutex::new(wb))).layer(Extension(FundingAuthority::new(
+        AuthorityId::new(FUNDING_ISSUER),
+        FundingEnvironment::Test,
+    )));
+    (dir, app)
+}
+
+fn app_without_funding_authority(seed: impl FnOnce(&mut Store)) -> (tempfile::TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();
     let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
     let mut store = Store::open_in_memory().unwrap();
@@ -67,13 +83,27 @@ fn seed_membership(store: &mut Store, tenant: &str, role: &str) {
 
 /// Give `tenant` a managed plan with `status` (`active` | `suspended` |
 /// `lapsed`).
-fn seed_plan(store: &mut Store, tenant: &str, status: &str) {
+fn seed_plan_in(store: &mut Store, tenant: &str, status: &str, environment: &str, verified: bool) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let record = json!({
         "id": "managed-inference",
         "op": "upsert",
         "plan": "managed-monthly",
         "status": status,
         "included_tokens": 1000,
+        "provenance": verified.then(|| json!({
+            "v": 1,
+            "issuer": FUNDING_ISSUER,
+            "scope": tenant_scope(tenant),
+            "source_id": "sub_verified_1",
+            "environment": environment,
+            "verified_at": now,
+            "valid_from": now.saturating_sub(60),
+            "valid_until": now.saturating_add(3600),
+        })),
     });
     store
         .append_record(
@@ -82,6 +112,10 @@ fn seed_plan(store: &mut Store, tenant: &str, status: &str) {
             &record.to_string(),
         )
         .unwrap();
+}
+
+fn seed_plan(store: &mut Store, tenant: &str, status: &str) {
+    seed_plan_in(store, tenant, status, "test", true);
 }
 
 async fn mint(app: &Router, tenant: &str, publisher_key: &str) -> (StatusCode, Value) {
@@ -179,4 +213,34 @@ async fn mint_fails_closed_when_signing_is_not_configured() {
     });
     let (status, _) = mint(&app, TENANT, PUBLISHER_KEY).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn mint_fails_closed_when_route_composition_names_no_funding_authority() {
+    let (_dir, app) = app_without_funding_authority(|store| {
+        seed_membership(store, TENANT, "owner");
+        seed_plan(store, TENANT, "active");
+    });
+    let (status, _) = mint(&app, TENANT, PUBLISHER_KEY).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn mint_refuses_a_legacy_plan_without_verified_provenance() {
+    let (_dir, app) = app_with(|store| {
+        seed_membership(store, TENANT, "owner");
+        seed_plan_in(store, TENANT, "active", "test", false);
+    });
+    let (status, _) = mint(&app, TENANT, PUBLISHER_KEY).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn mint_refuses_funding_from_another_processor_environment() {
+    let (_dir, app) = app_with(|store| {
+        seed_membership(store, TENANT, "owner");
+        seed_plan_in(store, TENANT, "active", "live", true);
+    });
+    let (status, _) = mint(&app, TENANT, PUBLISHER_KEY).await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }

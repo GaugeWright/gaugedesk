@@ -2,7 +2,19 @@ import type { APIRequestContext, APIResponse, Page, Response } from "@playwright
 import { aliceCP, bobCP, enterpriseCP } from "./ports.mjs";
 
 const APPLICATION_SERVICE_ORIGINS = new Set(
-    [aliceCP, bobCP, enterpriseCP].map((value) => new URL(value).origin),
+    [aliceCP, bobCP, enterpriseCP].flatMap((value) => {
+        const url = new URL(value);
+        const origins = [url.origin];
+        // WebAuthn requires a domain RP id. The passkey acceptance journey uses
+        // the browser-sanctioned `localhost` alias for the same isolated
+        // loopback listener, so transport fidelity must recognize that exact
+        // alias without broadening the application-service set.
+        if (url.hostname === "127.0.0.1") {
+            url.hostname = "localhost";
+            origins.push(url.origin);
+        }
+        return origins;
+    }),
 );
 const API_METHODS = ["fetch", "get", "post", "put", "patch", "delete", "head"] as const;
 

@@ -1,4 +1,4 @@
-//! Hub-signed managed-inference entitlements (SOC 2 finding F-5.3 / DR-0089).
+//! Account-service-signed managed-inference entitlements (SOC 2 finding F-5.3 / DR-0089).
 //!
 //! An authenticated account owner who holds an **active** managed-inference plan
 //! asks the Hub to mint a short-lived, signed entitlement bound to the publisher
@@ -14,10 +14,10 @@
 //! The serialized entitlement is JSON `{ "claims": { … }, "sig": "<128 hex>" }`.
 //! The claims are:
 //!
-//! - `v` — format version, always `1`.
-//! - `scope` — the funding scope the plan was folded from (an account or tenant
-//!   store scope). Arbitrary bytes, so it is hex-encoded in the preimage.
-//! - `plan` — the plan name. Arbitrary bytes, so it too is hex-encoded.
+//! - `v` — format version, always `2`.
+//! - `funding_ref` — the exact v2 verified-funding reference. It binds scope,
+//!   plan, issuer, processor environment, and source id; arbitrary bytes are
+//!   hex-encoded in the preimage.
 //! - `authority` — the deploying publisher's uncompressed-SEC1 P-256 public key,
 //!   lowercase hex (130 chars, `0x04` prefix). Already hex; used verbatim.
 //! - `max_spend_cents`, `max_session_spend_cents`, `max_turn_spend_cents` — the
@@ -33,13 +33,12 @@
 //!
 //! ## Canonical signing preimage
 //!
-//! Exactly these nine parts joined by a single `0x0a` newline, with **no**
+//! Exactly these eight parts joined by a single `0x0a` newline, with **no**
 //! trailing newline:
 //!
 //! ```text
-//! "gw-managed-entitlement.v1"
-//! hex(scope_utf8_bytes)
-//! hex(plan_utf8_bytes)
+//! "gw-managed-entitlement.v2"
+//! hex(funding_ref_utf8_bytes)
 //! authority                       (already lowercase hex, 130 chars)
 //! dec(max_spend_cents)
 //! dec(max_session_spend_cents)
@@ -67,13 +66,13 @@ use p256::ecdsa::{Signature as P256Sig, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// The domain-separation tag prefixed to every entitlement preimage.
-pub const ENTITLEMENT_DOMAIN: &str = "gw-managed-entitlement.v1";
+pub const ENTITLEMENT_DOMAIN: &str = "gw-managed-entitlement.v2";
 
 /// The fixed entitlement lifetime: one day, in seconds.
 pub const ENTITLEMENT_TTL_SECS: u64 = 86_400;
 
 /// The current entitlement claim-set version.
-pub const ENTITLEMENT_VERSION: u8 = 1;
+pub const ENTITLEMENT_VERSION: u8 = 2;
 
 /// The machine-secret environment variable carrying the Hub's entitlement
 /// signing key, as a **32-byte P-256 private scalar in lowercase hex** (64 hex
@@ -94,8 +93,9 @@ const SIGNATURE_LEN: usize = 64;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct EntitlementClaims {
     pub v: u8,
-    pub scope: String,
-    pub plan: String,
+    /// Exact verified-funding reference selected at mint time. The runtime must
+    /// re-resolve this reference against current evidence before spending.
+    pub funding_ref: String,
     /// The deploying publisher's uncompressed-SEC1 P-256 public key, lowercase
     /// hex (130 chars). This is the key the entitlement authorizes.
     pub authority: String,
@@ -122,6 +122,8 @@ pub enum EntitlementError {
     /// The publisher authority is not a 130-char lowercase hex uncompressed-SEC1
     /// P-256 public key.
     InvalidAuthority,
+    /// The claim does not carry a v2 verified-funding reference.
+    InvalidFundingReference,
     /// The claim set is not the version this code understands.
     UnsupportedVersion,
     /// The entitlement JSON could not be parsed.
@@ -140,6 +142,9 @@ impl EntitlementError {
     pub fn message(self) -> &'static str {
         match self {
             EntitlementError::InvalidAuthority => "publisher key is not a P-256 public key",
+            EntitlementError::InvalidFundingReference => {
+                "entitlement does not carry a verified funding reference"
+            }
             EntitlementError::UnsupportedVersion => "unsupported entitlement version",
             EntitlementError::Malformed => "entitlement is malformed",
             EntitlementError::InvalidVerifyingKey => "verifying key is not a P-256 public key",
@@ -183,8 +188,7 @@ pub fn valid_authority(authority: &str) -> bool {
 pub fn canonical_preimage(claims: &EntitlementClaims) -> Vec<u8> {
     [
         ENTITLEMENT_DOMAIN.to_string(),
-        hex::encode(claims.scope.as_bytes()),
-        hex::encode(claims.plan.as_bytes()),
+        hex::encode(claims.funding_ref.as_bytes()),
         claims.authority.clone(),
         claims.max_spend_cents.to_string(),
         claims.max_session_spend_cents.to_string(),
@@ -199,11 +203,10 @@ pub fn canonical_preimage(claims: &EntitlementClaims) -> Vec<u8> {
 /// Build the claim set the Hub signs. `iat` is the mint instant (unix seconds);
 /// `exp` is fixed at `iat + `[`ENTITLEMENT_TTL_SECS`]. The spend caps are signed
 /// as `0` — see the module docs on why the plan model carries none today.
-pub fn build_claims(scope: &str, plan: &str, authority: &str, iat: u64) -> EntitlementClaims {
+pub fn build_claims(funding_ref: &str, authority: &str, iat: u64) -> EntitlementClaims {
     EntitlementClaims {
         v: ENTITLEMENT_VERSION,
-        scope: scope.to_owned(),
-        plan: plan.to_owned(),
+        funding_ref: funding_ref.to_owned(),
         authority: authority.to_owned(),
         max_spend_cents: 0,
         max_session_spend_cents: 0,
@@ -222,6 +225,12 @@ pub fn sign(
 ) -> Result<String, EntitlementError> {
     if claims.v != ENTITLEMENT_VERSION {
         return Err(EntitlementError::UnsupportedVersion);
+    }
+    if !claims
+        .funding_ref
+        .starts_with(crate::managed_funding::FUNDING_REFERENCE_PREFIX)
+    {
+        return Err(EntitlementError::InvalidFundingReference);
     }
     if !valid_authority(&claims.authority) {
         return Err(EntitlementError::InvalidAuthority);
@@ -304,8 +313,7 @@ mod tests {
 
     fn sample_claims() -> EntitlementClaims {
         build_claims(
-            "account::alice",
-            "managed-monthly",
+            "gaugedesk:managed-plan:v2:6163636f756e743a3a616c696365:6d616e616765642d6d6f6e74686c79:697373756572:test:7375625f31",
             &publisher_authority(),
             1_700_000_000,
         )
@@ -317,9 +325,8 @@ mod tests {
     #[test]
     fn canonical_preimage_is_stable() {
         let claims = EntitlementClaims {
-            v: 1,
-            scope: "account::alice".to_owned(),
-            plan: "managed-monthly".to_owned(),
+            v: 2,
+            funding_ref: "gaugedesk:managed-plan:v2:6163636f756e743a3a616c696365:6d616e616765642d6d6f6e74686c79:697373756572:test:7375625f31".to_owned(),
             // A deterministic 130-char authority literal keeps the vector fixed
             // without depending on a key derivation.
             authority: format!("04{}", "ab".repeat(64)),
@@ -330,16 +337,15 @@ mod tests {
             exp: 1_700_086_400,
         };
         let preimage = canonical_preimage(&claims);
-        // "gw-managed-entitlement.v1\n" + hex("account::alice") + "\n"
-        //   + hex("managed-monthly") + "\n" + authority + "\n0\n0\n0\n"
-        //   + "1700000000\n1700086400". The scope/plan hex are pinned literals;
+        // "gw-managed-entitlement.v2\n" + hex(funding_ref) + "\n"
+        //   + authority + "\n0\n0\n0\n"
+        //   + "1700000000\n1700086400". The reference hex is pinned literally;
         // the authority is echoed from the claim so the readable form cannot
         // drift on a miscount. The fully independent regression pin is the
         // preimage hex asserted just below.
         let expected = format!(
-            "gw-managed-entitlement.v1\n\
-             6163636f756e743a3a616c696365\n\
-             6d616e616765642d6d6f6e74686c79\n\
+            "gw-managed-entitlement.v2\n\
+             67617567656465736b3a6d616e616765642d706c616e3a76323a363136333633366637353665373433613361363136633639363336353a3664363136653631363736353634326436643666366537343638366337393a3639373337333735363537323a746573743a37333735363235663331\n\
              {}\n\
              0\n0\n0\n\
              1700000000\n1700086400",
@@ -352,7 +358,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(&preimage),
-            "67772d6d616e616765642d656e7469746c656d656e742e76310a363136333633366637353665373433613361363136633639363336350a3664363136653631363736353634326436643666366537343638366337390a303461626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261620a300a300a300a313730303030303030300a31373030303836343030",
+            "67772d6d616e616765642d656e7469746c656d656e742e76320a3637363137353637363536343635373336623361366436313665363136373635363432643730366336313665336137363332336133363331333633333336333333363636333733353336363533373334333336313333363133363331333636333336333933363333333633353361333636343336333133363635333633313336333733363335333633343332363433363634333636363336363533373334333633383336363333373339336133363339333733333337333333373335333633353337333233613734363537333734336133373333333733353336333233353636333333310a303461626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261620a300a300a300a313730303030303030300a31373030303836343030",
             "canonical preimage hex drifted from the pinned vector",
         );
     }
@@ -372,8 +378,8 @@ mod tests {
         let key = hub_key();
         let claims = sample_claims();
         let entitlement = sign(&key, &claims).expect("sign");
-        // Flip the plan name inside the serialized claims without re-signing.
-        let tampered = entitlement.replace("managed-monthly", "managed-yearlyy");
+        // Flip the source id inside the serialized reference without re-signing.
+        let tampered = entitlement.replace("7375625f31", "7375625f32");
         assert_ne!(tampered, entitlement);
         let pubkey = public_key_hex(&key);
         assert_eq!(
@@ -423,7 +429,11 @@ mod tests {
 
     #[test]
     fn exp_is_one_day_after_iat() {
-        let claims = build_claims("account::alice", "p", &publisher_authority(), 1_700_000_000);
+        let claims = build_claims(
+            "gaugedesk:managed-plan:v2:61:70:69:test:73",
+            &publisher_authority(),
+            1_700_000_000,
+        );
         assert_eq!(claims.exp, claims.iat + ENTITLEMENT_TTL_SECS);
     }
 

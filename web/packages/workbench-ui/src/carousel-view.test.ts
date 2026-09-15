@@ -27,6 +27,11 @@ describe("toggle segments (the canonical labelled control)", () => {
         expect(segments.map((s) => s.pane)).toEqual([...PANE_ORDER]);
     });
 
+    it("uses environment vocabulary for a repurposed pane", () => {
+        const segments = toggleSegments(at("nav", withFile), { files: "Menu" });
+        expect(segments.find((segment) => segment.pane === "files")?.label).toBe("Menu");
+    });
+
     it("boxes exactly the current pane", () => {
         const segments = toggleSegments(at("files", withFile));
         expect(segments.filter((s) => s.current).map((s) => s.pane)).toEqual(["files"]);

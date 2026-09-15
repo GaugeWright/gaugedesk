@@ -38,7 +38,7 @@ export interface FundingFields {
  *  mints it and the edge's `isManagedFunding` recognises it. Duplicated across
  *  three languages now; `managed_inference::cross_language_prefix` is the test
  *  that catches drift. */
-export const MANAGED_PLAN_PREFIX = "gaugedesk:managed-plan:v1:";
+export const MANAGED_PLAN_PREFIX = "gaugedesk:managed-plan:v2:";
 
 export function isManagedPlanRef(reference: string): boolean {
     return reference.startsWith(MANAGED_PLAN_PREFIX);

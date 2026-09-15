@@ -46,6 +46,7 @@ export async function runNativeAccountSession(
     const storageState = providerStorageState(environment);
     const chromium = browserType ?? await defaultBrowserType();
     const browser = await chromium.launch({ headless: true });
+    let nativeSession = null;
 
     const issueHandoff = async (challenge) => {
         const context = await browser.newContext({ storageState, locale: "en-US" });
@@ -114,9 +115,11 @@ export async function runNativeAccountSession(
             body: { code, verifier },
         });
         assert.equal(exchanged.status, 200, `native exchange returned ${exchanged.status}`);
-        assert.equal(typeof exchanged.body?.id_token, "string", "native exchange returned no token");
-        assert(exchanged.body.id_token.length > 100, "native session token is malformed");
+        assert.equal(typeof exchanged.body?.account_session, "string", "native exchange returned no session");
+        assert.match(exchanged.body.account_session, /^[A-Za-z0-9_-]{43}$/, "native session is not opaque");
+        assert.equal(exchanged.body?.id_token, undefined, "native exchange exposed the provider token");
         assert.equal(exchanged.body?.token_type, "Bearer", "native exchange token type drifted");
+        nativeSession = exchanged.body.account_session;
 
         const replay = await mobileRoute(fetchImpl, apiOrigin, "/auth/mobile/exchange", {
             body: { code, verifier },
@@ -124,10 +127,11 @@ export async function runNativeAccountSession(
         assert.equal(replay.status, 401, "a redeemed handoff code was replayed");
 
         const refreshed = await mobileRoute(fetchImpl, apiOrigin, "/auth/mobile/refresh", {
-            token: exchanged.body.id_token,
+            token: exchanged.body.account_session,
         });
         assert.equal(refreshed.status, 200, `native refresh returned ${refreshed.status}`);
-        assert.equal(typeof refreshed.body?.id_token, "string", "native refresh returned no token");
+        assert.equal(refreshed.body?.refreshed, true, "native refresh did not confirm renewal");
+        assert.equal(refreshed.body?.id_token, undefined, "native refresh exposed the provider token");
         assert.equal(typeof refreshed.body?.person, "string", "native refresh named no person");
 
         const anonymousRefresh = await mobileRoute(fetchImpl, apiOrigin, "/auth/mobile/refresh", {
@@ -135,12 +139,30 @@ export async function runNativeAccountSession(
         });
         assert.equal(anonymousRefresh.status, 401, "an invalid native bearer was refreshed");
 
+        const logout = await mobileRoute(fetchImpl, apiOrigin, "/auth/logout", {
+            token: nativeSession,
+        });
+        assert.equal(logout.status, 204, `native session logout returned ${logout.status}`);
+        const revokedRefresh = await mobileRoute(fetchImpl, apiOrigin, "/auth/mobile/refresh", {
+            token: nativeSession,
+        });
+        assert.equal(revokedRefresh.status, 401, "logout left the native session refreshable");
+        nativeSession = null;
+
         return {
             exchangeStatus: exchanged.status,
             refreshStatus: refreshed.status,
             person: refreshed.body.person,
         };
     } finally {
+        // A failed assertion after exchange must not strand a reusable native
+        // bearer. Logout is idempotent, so retrying it after an uncertain
+        // response is both safe and preferable to relying on natural expiry.
+        if (nativeSession) {
+            await mobileRoute(fetchImpl, apiOrigin, "/auth/logout", {
+                token: nativeSession,
+            }).catch(() => {});
+        }
         await browser.close().catch(() => {});
     }
 }

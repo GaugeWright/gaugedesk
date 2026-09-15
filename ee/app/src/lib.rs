@@ -16,7 +16,7 @@
 // The auth shell and OIDC protocol client are core (ADR 0122); re-exported
 // so enterprise callers and the conformance lanes keep their paths.
 pub use gaugedesk_app::auth_oidc;
-pub mod environment_routes;
+pub mod gaugeapp_routes;
 pub use gaugedesk_app::identity_oidc;
 pub mod identity_saml;
 pub mod login_fold;

@@ -1202,6 +1202,7 @@ export function subscribe(
 export function subscribeWorkspace(
     transport: WorkbenchTransport,
     onChange: (change: WorkspaceChange) => void,
+    onOpen?: () => void,
 ): () => void {
     const accept = (data: string) => {
         try {
@@ -1222,8 +1223,9 @@ export function subscribeWorkspace(
             /* ignore malformed frames */
         }
     };
-    if (transport.events) return transport.events("/workspace/events", accept);
+    if (transport.events) return transport.events("/workspace/events", accept, onOpen);
     const es = new EventSource(`${transport.base}/workspace/events`, { withCredentials: true });
+    if (onOpen) es.onopen = onOpen;
     es.onmessage = (m) => accept(m.data);
     return () => es.close();
 }

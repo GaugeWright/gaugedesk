@@ -55,6 +55,37 @@ is needed.
 
 ## Adding a story
 
+### Model Providers component checks
+
+From the repository root:
+
+```sh
+web/node_modules/.bin/playwright test --config web/e2e/model-providers/playwright.config.ts
+```
+
+This isolated lane mounts the native Solid Model Providers page with synthetic,
+typed authority replies. It checks proposal payloads, exact member/project caps,
+credential-field disposal, scope and revision changes, disclosure persistence,
+read-only controls and wide/narrow layouts. Its Vite entrypoint lives under
+`ee/web/e2e/model-providers/` and is not a production composition. It is component
+evidence, not authenticated backend, provider-verification or release evidence;
+the Cloud model-provider HTTP suite owns those service-boundary checks.
+
+### Workbench stories
+
+The isolated GaugeApp workspace lane exercises the production controller and
+native page/menu/chat controls with delayed synthetic authority replies:
+
+```sh
+web/node_modules/.bin/playwright test --config web/e2e/gaugeapp-workspace/playwright.config.ts
+```
+
+It covers one-time-result disposal, page/scope/authorization changes, denied
+reads, late success/error and A → B → A, concurrent busy states, passkey abort,
+personal-key field disposal and embedded payment-session cleanup. Its test-only
+Stripe adapter makes no processor request. This is browser lifetime evidence,
+not an authenticated service or payment-provider journey.
+
 1. Write/extend a `.feature` file with Given/When/Then.
 2. Reuse a step in `steps/steps.ts`, or add a new one (drive the UI by visible
    label or `data-testid`; assert on rendered text/projections).

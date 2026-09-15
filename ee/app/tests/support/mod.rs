@@ -18,7 +18,7 @@ async fn request(
     tenant: Option<&str>,
     token: Option<&str>,
     body: Value,
-    keyed: bool,
+    key: Option<&str>,
 ) -> (StatusCode, Value) {
     let mut builder = Request::builder()
         .method(method)
@@ -30,14 +30,8 @@ async fn request(
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
-    if keyed {
-        builder = builder.header(
-            "idempotency-key",
-            format!(
-                "environment-integration-{}",
-                NEXT_KEY.fetch_add(1, Ordering::Relaxed)
-            ),
-        );
+    if let Some(key) = key {
+        builder = builder.header("idempotency-key", key);
     }
     let response = app
         .clone()
@@ -51,99 +45,109 @@ async fn request(
 }
 
 /// Submit and human-accept one Administration command through the real shared
-/// Environment routes. Integration tests use this instead of resurrecting the
+/// GaugeApp routes. Integration tests use this instead of resurrecting the
 /// retired `/admin/*` mutation surface.
 pub async fn administration_command(
     app: &Router,
     tenant: Option<&str>,
     token: Option<&str>,
-    document_id: &str,
+    page_id: &str,
     command_id: &str,
     payload: Value,
 ) -> (StatusCode, Value) {
     let (status, opened) = request(
         app,
         "POST",
-        "/environments/administration/sessions",
+        "/gaugeapps/administration/sessions",
         tenant,
         token,
         json!({}),
-        false,
+        None,
     )
     .await;
     if status != StatusCode::OK {
         return (status, opened);
     }
     let session = &opened["session"];
-    let Some(grant) = session["documents"].as_array().and_then(|documents| {
-        documents
-            .iter()
-            .find(|document| document["id"] == document_id)
-    }) else {
+    let Some(grant) = session["pages"]
+        .as_array()
+        .and_then(|pages| pages.iter().find(|page| page["id"] == page_id))
+    else {
         return (
             StatusCode::FORBIDDEN,
-            json!({ "error": "document not admitted" }),
+            json!({ "error": "page not admitted" }),
         );
     };
+    let proposal_key = format!(
+        "gaugeapp-integration-{}",
+        NEXT_KEY.fetch_add(1, Ordering::Relaxed)
+    );
     let envelope = json!({
         "session_id": session["id"],
-        "environment": "administration",
+        "generation": session["generation"],
+        "app": "administration",
         "scope": session["scope"],
-        "document_id": document_id,
+        "page_id": page_id,
         "command_id": command_id,
-        "base_revision": grant["revision"],
+        "expected_basis": grant["resource_basis"],
+        "idempotency_key": proposal_key,
         "payload": payload,
-        "client": "cli",
+        "client": "desktop",
     });
     let (status, proposed) = request(
         app,
         "POST",
-        "/environments/administration/commands",
+        "/gaugeapps/administration/commands",
         tenant,
         token,
         envelope,
-        true,
+        Some(&proposal_key),
     )
     .await;
     if status != StatusCode::OK {
         return (status, proposed);
     }
-    let Some(change_id) = proposed["change"]["id"].as_str() else {
+    let Some(change_id) = proposed["proposal"]["id"].as_str() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, proposed);
     };
+    let review_key = format!(
+        "gaugeapp-integration-review-{}",
+        NEXT_KEY.fetch_add(1, Ordering::Relaxed)
+    );
     request(
         app,
         "POST",
-        &format!("/environments/administration/changes/{change_id}/review"),
+        &format!("/gaugeapps/administration/proposals/{change_id}/review"),
         tenant,
         token,
         json!({
             "session_id": session["id"],
-            "environment": "administration",
+            "generation": session["generation"],
+            "app": "administration",
             "scope": session["scope"],
             "decision": "accept",
-            "client": "cli",
+            "client": "desktop",
         }),
-        true,
+        Some(&review_key),
     )
     .await
 }
 
-/// Read one admitted Administration document using the same exact session.
+/// Read one admitted Administration page using the same exact session.
 pub async fn administration_document(
     app: &Router,
     tenant: Option<&str>,
     token: Option<&str>,
-    document_id: &str,
+    page_id: &str,
 ) -> (StatusCode, Value) {
     let (status, opened) = request(
         app,
         "POST",
-        "/environments/administration/sessions",
+        "/gaugeapps/administration/sessions",
         tenant,
         token,
         json!({}),
-        false,
+        None,
     )
     .await;
     if status != StatusCode::OK {
@@ -151,11 +155,12 @@ pub async fn administration_document(
     }
     let session = &opened["session"];
     let uri = format!(
-        "/environments/administration/documents/{document_id}?session={}&scope={}",
+        "/gaugeapps/administration/pages/{page_id}?session={}&generation={}&scope={}",
         session["id"].as_str().unwrap(),
+        session["generation"].as_str().unwrap(),
         session["scope"]["id"].as_str().unwrap(),
     );
-    request(app, "GET", &uri, tenant, token, Value::Null, false).await
+    request(app, "GET", &uri, tenant, token, Value::Null, None).await
 }
 
 /// Read the deterministic DNS challenge through the admitted Administration
@@ -169,11 +174,11 @@ pub async fn administration_domain_challenge(
     let (status, opened) = request(
         app,
         "POST",
-        "/environments/administration/sessions",
+        "/gaugeapps/administration/sessions",
         tenant,
         token,
         json!({}),
-        false,
+        None,
     )
     .await;
     if status != StatusCode::OK {
@@ -181,18 +186,19 @@ pub async fn administration_domain_challenge(
     }
     let session = &opened["session"];
     let query = format!(
-        "session={}&scope={}&domain={domain}",
+        "session={}&generation={}&scope={}&domain={domain}",
         session["id"].as_str().unwrap(),
+        session["generation"].as_str().unwrap(),
         session["scope"]["id"].as_str().unwrap(),
     );
     request(
         app,
         "GET",
-        &format!("/environments/administration/domain-verification?{query}"),
+        &format!("/gaugeapps/administration/organization/domain-verification?{query}"),
         tenant,
         token,
         Value::Null,
-        false,
+        None,
     )
     .await
 }

@@ -26,6 +26,15 @@ export interface SettingsEnvironmentAction {
     readonly open: () => void;
 }
 
+/** Person-scoped GaugeApp destinations supplied by a hosted composition.
+ * When present they replace the legacy modal rows rather than being added beside
+ * them: Account Settings is the replacement surface, not a second settings UI. */
+export interface SettingsGaugeAppAction {
+    readonly id: string;
+    readonly label: string;
+    readonly open: () => void;
+}
+
 /** A settings modal that throws during render must degrade to a visible,
  *  closable failure notice — a silent dead click is indistinguishable from a
  *  broken button and leaves no way back (the Devices crash of 2026-07-31). */
@@ -92,8 +101,14 @@ export function SettingsMenu(props: {
     openInvite?: Accessor<string>;
     /** End the authenticated account session. Omitted on surfaces without account login. */
     onSignOut?: () => void | Promise<void>;
+    /** Begin the composition-owned account ceremony. GaugeApp compositions use
+     * this instead of reopening the retired local Settings account room. */
+    onSignIn?: () => void | Promise<void>;
     /** A capability-gated Environment action supplied by the app composition. */
     environmentAction?: SettingsEnvironmentAction;
+    /** Server-discovered Account Settings pages. An empty admitted list is
+     * rendered as empty; it never falls back to the retired modal. */
+    gaugeAppActions?: Accessor<readonly SettingsGaugeAppAction[]>;
     /** Authenticated org floor supplied only by an enrolled composition. */
     placementPolicy?: Accessor<PlacementPolicy | undefined>;
     /** How this runtime opens a URL in the person's browser — the desktop shell's
@@ -113,8 +128,20 @@ export function SettingsMenu(props: {
         setSettingsOpen(true);
     };
     const [inviteSeed, setInviteSeed] = createSignal("");
+    const [signInBusy, setSignInBusy] = createSignal(false);
+    const [signInError, setSignInError] = createSignal("");
     const [signOutBusy, setSignOutBusy] = createSignal(false);
     const [signOutError, setSignOutError] = createSignal("");
+
+    const toggleMenu = () => {
+        if (!menuOpen()) {
+            // A failure belongs to the opening in which it happened. Reopening
+            // starts a fresh attempt instead of resurrecting an obsolete alert.
+            setSignInError("");
+            setSignOutError("");
+        }
+        setMenuOpen((open) => !open);
+    };
 
     const composition = () => props.composition ?? "desktop";
     // `desk` reaches an account's work without holding the account (ADR 0130/0131), so
@@ -135,27 +162,52 @@ export function SettingsMenu(props: {
         }
     };
 
+    const signIn = async () => {
+        if (!props.onSignIn || signInBusy()) return;
+        setSignInBusy(true);
+        setSignInError("");
+        try {
+            await props.onSignIn();
+            setMenuOpen(false);
+        } catch (error) {
+            setSignInError(error instanceof Error ? error.message : "Sign in could not be started. Please try again.");
+        } finally {
+            setSignInBusy(false);
+        }
+    };
+
     const items = (): AccountMenuItem[] => {
-        const rows: AccountMenuItem[] = [
-            {
-                id: "settings",
-                label: "Settings",
+        const supplied = props.gaugeAppActions;
+        const rows: AccountMenuItem[] = supplied
+            ? supplied().map((action) => ({
+                id: `gaugeapp-${action.id}`,
+                label: action.label,
                 submenu: true,
                 run: () => {
                     setMenuOpen(false);
-                    openSettingsAt("account");
+                    action.open();
                 },
-            },
-            {
-                id: "devices",
-                label: "Add a device or party",
-                submenu: true,
-                run: () => {
-                    setMenuOpen(false);
-                    setDevicesOpen(true);
+            }))
+            : [
+                {
+                    id: "settings",
+                    label: "Settings",
+                    submenu: true,
+                    run: () => {
+                        setMenuOpen(false);
+                        openSettingsAt("account");
+                    },
                 },
-            },
-        ];
+                {
+                    id: "devices",
+                    label: "Add a device or party",
+                    submenu: true,
+                    run: () => {
+                        setMenuOpen(false);
+                        setDevicesOpen(true);
+                    },
+                },
+            ];
         if (props.environmentAction?.available()) {
             rows.push({
                 id: "environment",
@@ -176,10 +228,14 @@ export function SettingsMenu(props: {
                 // The trigger reads "Sign in"; this is where that promise is kept.
                 rows.push({
                     id: "sign-in",
-                    label: "Sign in",
+                    label: signInBusy() ? "Starting sign in…" : "Sign in",
+                    disabled: signInBusy(),
                     run: () => {
-                        setMenuOpen(false);
-                        openSettingsAt("account");
+                        if (props.onSignIn) void signIn();
+                        else {
+                            setMenuOpen(false);
+                            openSettingsAt("account");
+                        }
                     },
                 });
             } else if (props.onSignOut) {
@@ -187,6 +243,7 @@ export function SettingsMenu(props: {
                     id: "sign-out",
                     label: signOutBusy() ? "Signing out…" : "Sign out",
                     danger: true,
+                    disabled: signOutBusy(),
                     run: () => void signOut(),
                 });
             }
@@ -242,12 +299,10 @@ export function SettingsMenu(props: {
                 version={props.version ?? ""}
                 reach={props.reach}
                 items={items()}
+                status={signInError() || signOutError()}
                 open={menuOpen()}
-                onToggle={() => setMenuOpen((o) => !o)}
+                onToggle={toggleMenu}
             />
-            <Show when={signOutError()}>
-                <div class="settings-menu-error" role="alert">{signOutError()}</div>
-            </Show>
 
             <Show when={devicesOpen()}>
                 <SettingsModalBoundary

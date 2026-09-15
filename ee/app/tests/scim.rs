@@ -50,22 +50,27 @@ fn workbench() -> (tempfile::TempDir, Router) {
     (dir, enterprise_control_plane(Arc::new(Mutex::new(wb))))
 }
 
+async fn scim_credential(app: &Router, tenant: Option<&str>, command: &str) -> (StatusCode, Value) {
+    administration_command(app, tenant, None, "enterprise-identity", command, json!({})).await
+}
+
+async fn issue_token(app: &Router, tenant: Option<&str>) -> (StatusCode, Value) {
+    scim_credential(app, tenant, "enterprise-identity.scim-credential.issue").await
+}
+
 async fn rotate_token(app: &Router, tenant: Option<&str>) -> (StatusCode, Value) {
-    administration_command(
-        app,
-        tenant,
-        None,
-        "administration.identity",
-        "scim-token.rotate",
-        json!({}),
-    )
-    .await
+    scim_credential(app, tenant, "enterprise-identity.scim-credential.rotate").await
 }
 
 async fn access_document(app: &Router) -> (StatusCode, Value) {
+    let (status, response) = administration_document(app, None, None, "people").await;
+    (status, response["page"]["model"].clone())
+}
+
+async fn identity_document(app: &Router, tenant: Option<&str>) -> (StatusCode, Value) {
     let (status, response) =
-        administration_document(app, None, None, "administration.access").await;
-    (status, response["document"]["content"].clone())
+        administration_document(app, tenant, None, "enterprise-identity").await;
+    (status, response["page"]["model"].clone())
 }
 
 async fn send(
@@ -229,11 +234,11 @@ async fn scim_tokens_are_tenant_isolated() {
     // DEPLOY-6 tail: a SCIM token issued for one tenant must NOT authenticate for another,
     // and provisioning lands in the issuing tenant's directory.
     let (_dir, app) = workbench();
-    let token_a = rotate_token(&app, Some("acme")).await.1["result"]["token"]
+    let token_a = issue_token(&app, Some("acme")).await.1["result"]["token"]
         .as_str()
         .unwrap()
         .to_string();
-    let token_g = rotate_token(&app, Some("globex")).await.1["result"]["token"]
+    let token_g = issue_token(&app, Some("globex")).await.1["result"]["token"]
         .as_str()
         .unwrap()
         .to_string();
@@ -279,7 +284,7 @@ async fn scim_provision_and_deprovision() {
     let (_dir, app) = workbench();
 
     // Administration issues a SCIM token after human review; plaintext returns once.
-    let (s, body) = rotate_token(&app, None).await;
+    let (s, body) = issue_token(&app, None).await;
     assert_eq!(s, StatusCode::OK);
     let token = body["result"]["token"]
         .as_str()
@@ -366,8 +371,8 @@ async fn scim_groups_map_to_roles() {
         &app,
         None,
         None,
-        "administration.identity",
-        "group-mapping.set",
+        "enterprise-identity",
+        "enterprise-identity.group-mapping.add",
         json!({"group":"Leads","role":"admin","team":"eng"}),
     )
     .await;
@@ -382,14 +387,14 @@ async fn scim_groups_map_to_roles() {
         &app,
         None,
         None,
-        "administration.identity",
-        "group-mapping.set",
+        "enterprise-identity",
+        "enterprise-identity.group-mapping.add",
         json!({"group":"Engineering","role":"viewer","team":"eng"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
 
-    let (_s, body) = rotate_token(&app, None).await;
+    let (_s, body) = issue_token(&app, None).await;
     let token = body["result"]["token"].as_str().unwrap().to_string();
 
     // A user provisioned with that group takes the mapped role/team.
@@ -437,7 +442,7 @@ async fn scim_groups_map_to_roles() {
 #[tokio::test]
 async fn rotating_the_token_invalidates_the_old_one() {
     let (_dir, app) = workbench();
-    let (_s, body) = rotate_token(&app, None).await;
+    let (_s, body) = issue_token(&app, None).await;
     let first = body["result"]["token"].as_str().unwrap().to_string();
     let (_s, body) = rotate_token(&app, None).await;
     let second = body["result"]["token"].as_str().unwrap().to_string();
@@ -470,7 +475,7 @@ async fn rotating_the_token_invalidates_the_old_one() {
 #[tokio::test]
 async fn scim_patchop_envelope_deprovisions() {
     let (_dir, app) = workbench();
-    let (_, body) = rotate_token(&app, None).await;
+    let (_, body) = issue_token(&app, None).await;
     let token = body["result"]["token"].as_str().unwrap().to_string();
 
     // Provision an active member.
@@ -519,4 +524,99 @@ async fn scim_patchop_envelope_deprovisions() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "no active op ⇒ 400");
+}
+
+#[tokio::test]
+async fn authenticated_scim_sync_and_unresolved_errors_are_projected() {
+    let (_dir, app) = workbench();
+    let (_, body) = issue_token(&app, Some("acme")).await;
+    let token = body["result"]["token"].as_str().unwrap().to_string();
+
+    let (status, _) = send_t(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        "acme",
+        Some("not-the-issued-token"),
+        Some(r#"{"userName":"attacker@acme.test"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (_, identity) = identity_document(&app, Some("acme")).await;
+    assert_eq!(identity["scim"]["status"]["last_sync_at_ms"], Value::Null);
+    assert!(identity["scim"]["status"]["errors"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let (status, _) = send_t(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        "acme",
+        Some(&token),
+        Some(r#"{"userName":"sync@acme.test"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, identity) = identity_document(&app, Some("acme")).await;
+    let first_sync = identity["scim"]["status"]["last_sync_at_ms"]
+        .as_u64()
+        .expect("successful sync time");
+    assert!(identity["scim"]["status"]["errors"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let (status, _) = send_t(
+        &app,
+        "PATCH",
+        "/scim/v2/Users/sync@acme.test",
+        "acme",
+        Some(&token),
+        Some(r#"{"Operations":[{"op":"replace","path":"displayName","value":"Changed"}]}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, identity) = identity_document(&app, Some("acme")).await;
+    let errors = identity["scim"]["status"]["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["subject"], "sync@acme.test");
+    assert_eq!(errors[0]["operation"], "update");
+    assert_eq!(errors[0]["code"], "unsupported-change");
+
+    let (_, other_identity) = identity_document(&app, Some("globex")).await;
+    assert_eq!(
+        other_identity["scim"]["status"]["last_sync_at_ms"],
+        Value::Null
+    );
+    assert!(other_identity["scim"]["status"]["errors"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let (status, _) = send_t(
+        &app,
+        "PATCH",
+        "/scim/v2/Users/sync@acme.test",
+        "acme",
+        Some(&token),
+        Some(r#"{"Operations":[{"op":"replace","path":"active","value":false}]}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, identity) = identity_document(&app, Some("acme")).await;
+    assert!(
+        identity["scim"]["status"]["last_sync_at_ms"]
+            .as_u64()
+            .unwrap()
+            >= first_sync
+    );
+    assert!(
+        identity["scim"]["status"]["errors"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a later successful operation for the same subject resolves its error"
+    );
 }

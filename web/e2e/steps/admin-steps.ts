@@ -1,6 +1,6 @@
 /**
- * Admin Environment steps (ADR 0092): drive the enterprise composition of the
- * shared workbench shell inside one capability-gated enterprise composition.
+ * Administration GaugeApp steps: drive its tenant-scoped pages and management
+ * conversation inside the ordinary capability-gated GaugeDesk composition.
  */
 
 import { expect, type APIRequestContext } from "@playwright/test";
@@ -16,9 +16,7 @@ let issuedScimToken: string | null = null;
 let advertisedIntegration: {
     saml: { sp_entity_id: string; acs_url: string; metadata_url: string };
 } | null = null;
-let downloadedAuditExport = "";
 let desktopSoftwarePolicy: unknown = null;
-let enrolledPlacementPolicy: unknown = null;
 const generatedWrongIdentities = [
     "wrong",
     "wrong:delimiter:tenant",
@@ -30,9 +28,7 @@ const generatedWrongIdentities = [
 async function resetAuthenticatedEnterprise(request: APIRequestContext): Promise<void> {
     issuedScimToken = null;
     advertisedIntegration = null;
-    downloadedAuditExport = "";
     desktopSoftwarePolicy = null;
-    enrolledPlacementPolicy = null;
     const res = await request.post(`${enterpriseCP}/test/reset`, { headers: mutationHeaders() });
     if (!res.ok()) {
         throw new Error(`enterprise control-plane reset failed: ${res.status()} ${await res.text()}`);
@@ -51,17 +47,8 @@ Given("the enterprise workbench is open for an administered tenant", async ({ pa
         httpOnly: true,
         sameSite: "Lax",
     }]);
-    const capabilityResponse = page.waitForResponse((response) =>
-        new URL(response.url()).pathname === "/admin/capabilities"
-        && response.request().method() === "GET"
-    );
-    await page.goto(`${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}&environment=admin`);
-    const capability = await capabilityResponse;
-    expect(capability.status()).toBe(200);
-    const capabilityBody = await capability.json();
-    expect(Array.isArray(capabilityBody.capabilities)).toBe(true);
-    expect(capabilityBody.capabilities.length).toBeGreaterThan(0);
-    await expect(page.locator("[data-environment-document]")).toBeVisible();
+    await page.goto(`${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}&gaugeapp=administration&page=people&tenant=org`);
+    await expect(page.locator('[data-gaugeapp-page="people"]')).toBeVisible();
 });
 
 Given("the authenticated enterprise tenant is reset", async ({ page, request }) => {
@@ -128,30 +115,6 @@ Given("the authenticated enterprise workbench has a withheld context source", as
     );
 });
 
-Given("the enterprise workbench has an attested-only placement policy", async ({ page, request }) => {
-    const reset = await request.post(
-        `${enterpriseCP}/test/reset?attested_placement_policy=true`,
-        { headers: mutationHeaders() },
-    );
-    expect(reset.status()).toBe(200);
-    enrolledPlacementPolicy = null;
-    await page.context().addCookies([{
-        name: "gw_session",
-        value: ownerToken,
-        url: enterpriseCP,
-        httpOnly: true,
-        sameSite: "Lax",
-    }]);
-    const policyResponse = page.waitForResponse((response) =>
-        response.request().method() === "GET"
-        && new URL(response.url()).pathname === "/admin/placement-policy"
-    );
-    await page.goto(`${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}`);
-    const response = await policyResponse;
-    expect(response.status()).toBe(200);
-    enrolledPlacementPolicy = await response.json();
-});
-
 // authority-matrix
 // admin-bootstrap-authority-matrix
 // generated-identity-encoding-state
@@ -163,33 +126,48 @@ Then("the Administration route family enforces identity and capability", async (
         data?: Record<string, unknown>;
     };
     const operations = (identity: string): ReadonlyArray<Operation> => {
-        const scope = { kind: "organization", id: `organization:${identity}` };
-        const session = `environment-session:${identity}`;
-        const query = new URLSearchParams({ session, scope: scope.id });
+        const scope = { kind: "tenant", id: `organization:${identity}` };
+        const session = `gaugeapp-session:${identity}`;
+        const generation = `generation:${identity}`;
+        const query = new URLSearchParams({ session, generation, scope: scope.id });
+        const envelope = {
+            session_id: session,
+            generation,
+            app: "administration",
+            scope,
+            page_id: "people",
+            command_id: "people.invitation.create",
+            expected_basis: `basis:${identity}`,
+            idempotency_key: `e2e-${identity}`,
+            payload: { authority: identity, role: "member" },
+            client: "web",
+        };
         return [
-            { id: "administration.session.open", method: "POST", path: "/environments/administration/sessions", data: { scope } },
-            { id: "administration.document.read", method: "GET", path: `/environments/administration/documents/administration.access?${query}` },
-            { id: "administration.agent.read", method: "GET", path: `/environments/administration/agent/messages?${query}` },
-            { id: "administration.agent.send", method: "POST", path: "/environments/administration/agent/messages", data: { session_id: session, scope, message: identity } },
-            { id: "administration.domain-verification.read", method: "GET", path: `/environments/administration/domain-verification?${query}&domain=${encodeURIComponent(`${identity}.example.test`)}` },
-            { id: "administration.command.submit", method: "POST", path: "/environments/administration/commands", data: { session_id: session, environment: "administration", scope, document_id: "administration.access", command_id: "member.invite", base_revision: `revision:${identity}`, payload: { authority: identity }, client: "browser" } },
-            { id: "administration.change.list", method: "GET", path: `/environments/administration/changes?${query}` },
-            { id: "administration.change.propose", method: "POST", path: "/environments/administration/changes", data: { session_id: session, environment: "administration", scope, document_id: "administration.access", command_id: "member.invite", base_revision: `revision:${identity}`, payload: { authority: identity }, client: "browser" } },
-            { id: "administration.change.review", method: "POST", path: `/environments/administration/changes/${encodeURIComponent(`change:${identity}`)}/review`, data: { session_id: session, environment: "administration", scope, decision: "accept", client: "browser" } },
+            { id: "administration.session.open", method: "POST", path: "/gaugeapps/administration/sessions", data: { scope } },
+            { id: "administration.page.read", method: "GET", path: `/gaugeapps/administration/pages/people?${query}` },
+            { id: "administration.updates.read", method: "GET", path: `/gaugeapps/administration/updates?${query}&after=older` },
+            { id: "administration.agent.read", method: "GET", path: `/gaugeapps/administration/agent/messages?${query}` },
+            { id: "administration.agent.send", method: "POST", path: "/gaugeapps/administration/agent/messages", data: { session_id: session, generation, scope, idempotency_key: `message-${identity}`, message: identity } },
+            { id: "administration.domain-verification.read", method: "GET", path: `/gaugeapps/administration/organization/domain-verification?${query}&domain=${encodeURIComponent(`${identity}.example.test`)}` },
+            { id: "administration.command.submit", method: "POST", path: "/gaugeapps/administration/commands", data: envelope },
+            { id: "administration.proposal.list", method: "GET", path: `/gaugeapps/administration/proposals?${query}` },
+            { id: "administration.proposal.prepare", method: "POST", path: "/gaugeapps/administration/proposals", data: { ...envelope, client: "agent" } },
+            { id: "administration.proposal.review", method: "POST", path: `/gaugeapps/administration/proposals/${encodeURIComponent(`change:${identity}`)}/review`, data: { session_id: session, generation, app: "administration", scope, decision: "accept", client: "web" } },
         ];
     };
 
     const ownerHeaders = { authorization: `Bearer ${ownerToken}` };
     const baselineSessionResponse = await request.post(
-        `${enterpriseCP}/environments/administration/sessions`,
-        { headers: ownerHeaders, data: {} },
+        `${enterpriseCP}/gaugeapps/administration/sessions`,
+        { headers: ownerHeaders, data: { scope: { kind: "tenant", id: "org" } } },
     );
     expect(baselineSessionResponse.status()).toBe(200);
     const baselineSession = (await baselineSessionResponse.json()).session;
     const snapshotPath =
-        `/environments/administration/documents/administration.access?`
+        `/gaugeapps/administration/pages/people?`
         + new URLSearchParams({
             session: baselineSession.id,
+            generation: baselineSession.generation,
             scope: baselineSession.scope.id,
         }).toString();
     const snapshot = async () => {
@@ -199,10 +177,25 @@ Then("the Administration route family enforces identity and capability", async (
         expect(response.status()).toBe(200);
         return response.text();
     };
-    const before = await snapshot();
+    const stableSnapshot = async () => {
+        const value = JSON.parse(await snapshot());
+        // Session presence and freshness are operational observations. Denied
+        // requests may authenticate a bearer without gaining Administration;
+        // compare the governed People state and its stable resource basis.
+        delete value.page.model.sessions;
+        return value;
+    };
+    const before = await stableSnapshot();
     let generatedCases = 0;
     for (const identity of generatedWrongIdentities) {
         for (const operation of operations(identity)) {
+            const mutation = operation.method === "POST"
+                ? mutationHeaders({
+                    "idempotency-key": typeof operation.data?.idempotency_key === "string"
+                        ? operation.data.idempotency_key
+                        : `e2e-${operation.id}-${identity}`,
+                })
+                : {};
             for (const [variant, headers, expected] of [
                 ["anonymous", undefined, 401],
                 ["invalid-identity", { authorization: "Bearer not-a-valid-test-identity" }, 401],
@@ -213,7 +206,7 @@ Then("the Administration route family enforces identity and capability", async (
                     {
                         method: operation.method,
                         data: operation.data,
-                        ...(headers ? { headers } : {}),
+                        headers: { ...mutation, ...(headers ?? {}) },
                     },
                 );
                 if (expected === undefined) {
@@ -309,227 +302,142 @@ Then("the Administration route family enforces identity and capability", async (
         }
         generatedCases += 1;
     }
-    expect(await snapshot(), `${generatedCases} authority cases changed Administration state`)
-        .toBe(before);
-    const incapable = await request.post(`${enterpriseCP}/environments/administration/sessions`, {
+    expect(await stableSnapshot(), `${generatedCases} authority cases changed Administration state`)
+        .toEqual(before);
+    const incapable = await request.post(`${enterpriseCP}/gaugeapps/administration/sessions`, {
         headers: { authorization: `Bearer ${memberToken}` },
-        data: {},
+        data: { scope: { kind: "tenant", id: "org" } },
     });
     expect(incapable.status()).toBe(403);
 });
+
+Then(
+    "the supporting enterprise routes expose capability, integration, audit, policy, and SSO diagnostics",
+    async ({ request }) => {
+        const headers = { authorization: `Bearer ${ownerToken}` };
+        const capabilities = await request.get(`${enterpriseCP}/admin/capabilities`, { headers });
+        expect(capabilities.status()).toBe(200);
+        expect(await capabilities.json()).toMatchObject({ capabilities: expect.any(Array) });
+
+        const integration = await request.get(`${enterpriseCP}/admin/integration`, { headers });
+        expect(integration.status()).toBe(200);
+        expect(await integration.json()).toMatchObject({
+            oidc: { redirect_uri: expect.stringContaining("/auth/callback") },
+            saml: { metadata_url: expect.stringContaining("/saml/metadata") },
+            scim: { base_url: expect.stringContaining("/scim/v2") },
+        });
+
+        const audit = await request.get(`${enterpriseCP}/admin/audit?format=json`, { headers });
+        expect(audit.status()).toBe(200);
+        expect(audit.headers()["content-type"]).toContain("application/json");
+
+        const placement = await request.get(`${enterpriseCP}/admin/placement-policy`, { headers });
+        expect(placement.status()).toBe(200);
+        expect(await placement.json()).toHaveProperty("placement_policy");
+
+        const diagnostic = await request.post(`${enterpriseCP}/admin/sso/test`, {
+            headers: { ...headers, ...mutationHeaders() },
+            data: {},
+        });
+        expect(diagnostic.status()).toBe(200);
+        expect(await diagnostic.json()).toMatchObject({
+            ok: false,
+            detail: expect.stringContaining("incomplete OIDC connection"),
+        });
+    },
+);
 
 When("I open the settings menu", async ({ page }) => {
     await openAccountMenu(page);
 });
 
 Then("the organization admin entry is not offered", async ({ page }) => {
-    await expect(page.locator('[data-account-menu-item="environment"]')).toHaveCount(0);
+    await expect(page.locator("[data-gaugeapp-page]")).toHaveCount(0);
+    await expect(page.locator(".organization-menu-branch").filter({ hasText: "Administration" })).toHaveCount(0);
+});
+
+When("I open the enterprise workbench without identity", async ({ page }) => {
+    await page.goto(`${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}&gaugeapp=administration&page=people&tenant=org`);
 });
 
 When("I return to work", async ({ page }) => {
-    await page.locator("[data-admin-return]").click();
+    await page.locator(".organization-trigger").click();
+    await page.locator(".organization-popover").getByRole("button", { name: "Work", exact: true }).click();
 });
 
-Then("the ordinary Work Environment is shown", async ({ page }) => {
-    await expect(page.locator("[data-work-environment]")).toBeVisible();
-    await expect(page.locator("[data-admin-environment]")).toBeHidden();
+Then("ordinary project work is shown", async ({ page }) => {
+    await expect(page.locator("[data-work-chat-slot]")).toBeVisible();
+    await expect(page.locator("[data-gaugeapp-page]")).toHaveCount(0);
+});
+
+When("I open the organization menu", async ({ page }) => {
+    await page.locator(".organization-trigger").click();
 });
 
 Then("the Administration entry is offered", async ({ page }) => {
-    await expect(page.locator('[data-account-menu-item="environment"]')).toHaveText("Administration");
+    const branch = page.locator(".organization-menu-branch").filter({ hasText: "Administration" });
+    await expect(branch).toBeVisible();
+    await expect(branch.getByRole("button", { name: "People", exact: true })).toBeVisible();
 });
 
 When("I choose Administration", async ({ page }) => {
-    await page.locator('[data-account-menu-item="environment"]').click();
+    await page.locator(".organization-menu-branch")
+        .filter({ hasText: "Administration" })
+        .getByRole("button", { name: "People", exact: true })
+        .click();
 });
 
-Then("the Admin Environment is shown", async ({ page }) => {
-    await expect(page.locator("[data-admin-environment]")).toBeVisible();
-    await expect(page.locator("[data-admin-navigator]")).toBeVisible();
+Then("the Administration GaugeApp is shown", async ({ page }) => {
+    await expect(page.locator('[data-gaugeapp-page="people"]')).toBeVisible();
+    await expect(page.getByRole("navigation", { name: "Administration pages" })).toBeVisible();
 });
 
 When("I invite member {string} as {string}", async ({ page }, authority: string, role: string) => {
-    await page.getByRole("button", { name: "People & access", exact: true }).click();
-    await page.locator("[data-admin-invite-authority]").fill(authority);
-    await page.locator("[data-admin-invite] select").selectOption(role);
-    await page.locator("[data-admin-invite] button").click();
+    await page.getByRole("button", { name: "Invite", exact: true }).click();
+    await page.getByRole("textbox", { name: "Email addresses" }).fill(authority);
+    await page.getByRole("combobox", { name: "Role" }).selectOption(role);
+    await page.getByRole("button", { name: "Create invitations", exact: true }).click();
 });
 
-Then("the member {string} is pending review and not yet admitted", async ({ page }, authority: string) => {
-    const review = page.locator(".environment-change-review");
-    await expect(review).toContainText("member.invite");
-    await expect(page.locator(`[data-member="${authority}"]`)).toHaveCount(0);
+Then("the invitation for {string} is pending review and not yet created", async ({ page }, authority: string) => {
+    const review = page.getByRole("region", { name: "Pending changes" });
+    await expect(review).toContainText(authority);
+    await expect(page.locator(".gaugeapp-people-list").getByText(authority, { exact: true })).toHaveCount(0);
 });
 
 When("I apply the pending Administration change", async ({ page }) => {
-    await page.locator(".environment-change-review").getByRole("button", { name: "apply change" }).click();
-    await expect(page.locator(".environment-change-review")).toHaveCount(0);
+    await page.getByRole("region", { name: "Pending changes" }).getByRole("button", { name: "Accept", exact: true }).click();
+    await expect(page.getByRole("region", { name: "Pending changes" })).toHaveCount(0);
 });
 
 When("I reject the pending Administration change", async ({ page }) => {
-    await page.locator(".environment-change-review").getByRole("button", { name: "reject" }).click();
-    await expect(page.locator(".environment-change-review")).toHaveCount(0);
+    await page.getByRole("region", { name: "Pending changes" }).getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(page.getByRole("region", { name: "Pending changes" })).toHaveCount(0);
 });
 
-Then("the member {string} remains absent", async ({ page }, authority: string) => {
-    await expect(page.locator(`[data-member="${authority}"]`)).toHaveCount(0);
+Then("the invitation for {string} remains absent", async ({ page }, authority: string) => {
+    await expect(page.locator(".gaugeapp-people-list").getByText(authority, { exact: true })).toHaveCount(0);
 });
 
-Then("the member {string} appears in the directory", async ({ page }, authority: string) => {
-    await expect(page.locator(`[data-member="${authority}"]`)).toBeVisible();
+Then("the invitation for {string} appears with its one-time link", async ({ page }, authority: string) => {
+    await expect(page.locator(".gaugeapp-people-list").getByText(authority, { exact: true })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Organization invitation links" })).toContainText(authority);
 });
 
-Then("the audit log shows the {string} action", async ({ page }, action: string) => {
-    await page.getByRole("button", { name: "Audit", exact: true }).click();
-    await expect(page.locator("[data-audit-list]")).toContainText(action);
-});
-
-When("I filter the audit timeline to action {string}", async ({ page }, action: string) => {
-    await page.getByRole("button", { name: "Audit", exact: true }).click();
-    await page.locator("[data-audit-action]").fill(action);
-});
-
-Then("every visible audit row has action {string}", async ({ page }, action: string) => {
-    const rows = page.locator("[data-audit-list] .resource-row");
-    expect(await rows.count()).toBeGreaterThan(0);
-    for (let index = 0; index < await rows.count(); index += 1) {
-        await expect(rows.nth(index).locator(".resource-title")).toHaveText(action);
+Then("Administration shows its menu, agent, and People workspace", async ({ page }) => {
+    await expect(page.locator(".workbench:not(.mobile)")).toBeVisible();
+    await expect(page.getByRole("navigation", { name: "Administration pages" })).toBeVisible();
+    await expect(page.getByPlaceholder("ask administration…")).toBeVisible();
+    await expect(page.locator('[data-gaugeapp-page="people"]')).toBeVisible();
+    await expect(page.locator("[data-embed-composer]")).toHaveCount(0);
+    for (const retired of ["Overview", "Audit", "Deployments", "Automations"]) {
+        await expect(page.getByRole("navigation", { name: "Administration pages" }).getByRole("button", { name: retired, exact: true })).toHaveCount(0);
     }
 });
 
-When("I export the filtered audit timeline as {string}", async ({ page }, format: string) => {
-    const normalized = format.toLowerCase();
-    expect(["csv", "json"]).toContain(normalized);
-    const responsePromise = page.waitForResponse((response) => {
-        const url = new URL(response.url());
-        return url.pathname === "/admin/audit"
-            && url.searchParams.get("format") === normalized
-            && url.searchParams.get("action") === "member.invite";
-    });
-    const downloadPromise = page.waitForEvent("download");
-    await page.locator(`[data-audit-export="${normalized}"]`).click();
-    const [response, download] = await Promise.all([responsePromise, downloadPromise]);
-    expect(response.status()).toBe(200);
-    expect(download.suggestedFilename()).toBe(`gaugewright-audit.${normalized}`);
-    const stream = await download.createReadStream();
-    const chunks: Buffer[] = [];
-    for await (const chunk of stream) chunks.push(Buffer.from(chunk));
-    downloadedAuditExport = Buffer.concat(chunks).toString("utf8");
-    expect(downloadedAuditExport).toBe((await response.body()).toString("utf8"));
-});
-
-Then("the downloaded audit export contains {string}", async ({}, value: string) => {
-    expect(downloadedAuditExport).toContain(value);
-});
-
-Then("the Admin Environment shows its resource navigator, agent, dashboard, and configuration workspace", async ({ page }) => {
-    await expect(page.locator("[data-admin-environment] .workbench:not(.mobile)")).toBeVisible();
-    await expect(page.locator("[data-admin-navigator]")).toBeVisible();
-    await expect(page.getByPlaceholder("task the admin agent…")).toBeVisible();
-    await expect(page.locator("[data-admin-dashboard=overview]")).toBeVisible();
-    await expect(page.locator("[data-worktree]")).toBeVisible();
-    await expect(page.locator("[data-embed-composer]")).toHaveCount(0);
-});
-
-Then("the Admin Environment exposes canonical configuration documents", async ({ page }) => {
-    const workspace = page.locator("[data-worktree]");
-    await expect(workspace).toContainText("organization.json");
-    await expect(workspace).toContainText("access.json");
-    await expect(workspace).toContainText("identity.json");
-    await expect(workspace).toContainText("software-policy.json");
-    await expect(workspace).toContainText("clients.json");
-    await expect(workspace).toContainText("machines.json");
-    await expect(workspace).not.toContainText("token_sha256");
-    await expect(workspace).not.toContainText("metadata\"");
-});
-
-When("I open the {string} configuration file", async ({ page }, path: string) => {
-    await page.locator("[data-worktree]").getByText(path, { exact: true }).click();
-});
-
-Then("its derived policy view is shown", async ({ page }) => {
-    await expect(page.locator('[data-environment-document="administration.policy"]')).toBeVisible();
-    await expect(page.locator("[data-admin-dashboard=policy]")).toContainText("Require MFA");
-});
-
-Then("its derived software admission view is shown", async ({ page }) => {
-    await expect(page.locator('[data-environment-document="administration.software-policy"]')).toBeVisible();
-    await expect(page.locator("[data-admin-dashboard=software-policy]")).toContainText("Minimum GaugeDesk version");
-});
-
-Then("its reported clients view is shown", async ({ page }) => {
-    await expect(page.locator('[data-environment-document="administration.clients"]')).toBeVisible();
-    await expect(page.locator("[data-admin-dashboard=clients]")).toContainText("Client sessions");
-    await expect(page.locator("[data-admin-dashboard=clients]")).toContainText("not device attestation");
-});
-
-When("I open the raw configuration editor", async ({ page }) => {
-    await page.locator('[data-tab="edit"]').click();
-});
-
-Then("the editor shows the canonical policy JSON", async ({ page }) => {
-    const editor = page.locator("[data-file-edit]");
-    await expect(editor).toBeVisible();
-    await expect(editor).toHaveValue(/"security"/);
-});
-
-When("I open help for the selected Admin file", async ({ page }) => {
-    await page.locator(".environment-help").click();
-});
-
-Then("its linked Markdown guide is shown", async ({ page }) => {
-    const view = page.locator("[data-file-view]");
-    await expect(view).toBeVisible();
-    await expect(view).toContainText("Overview");
-    await expect(view).toContainText("overview.json");
-});
-
-Then("the Admin supporting files are hidden from the ordinary Files list", async ({ page }) => {
-    const workspace = page.locator("[data-worktree]");
-    await expect(workspace).not.toContainText(".environment/help/");
-    await expect(workspace).not.toContainText(".environment/agent/");
-    await expect(page.locator("[data-show-internal]")).toBeVisible();
-});
-
-When("I reveal internal Admin files", async ({ page }) => {
-    await page.locator("[data-show-internal]").click();
-});
-
-Then("the Admin agent definition files are visible", async ({ page }) => {
-    const workspace = page.locator("[data-worktree]");
-    await expect(workspace).toContainText(".environment/manifest.json");
-    await expect(workspace).toContainText(".environment/agent/SYSTEM.md");
-    await expect(workspace).toContainText(".environment/agent/skills/administration/SKILL.md");
-    await expect(workspace).toContainText(".environment/agent/TOOLS.json");
-});
-
-When("I open the Admin agent tool manifest", async ({ page }) => {
-    await page.locator("[data-worktree]").getByText(".environment/agent/TOOLS.json", { exact: true }).click();
-});
-
-Then("it contains only governance tools and no shell or web tools", async ({ page }) => {
-    const manifest = page.locator("[data-file-view]");
-    await expect(manifest).toContainText("environment.files.list");
-    await expect(manifest).toContainText("environment.files.read");
-    await expect(manifest).toContainText("environment.projections.query");
-    await expect(manifest).toContainText("environment.changes.propose");
-    // ADR 0113 replaces ambient suspension with an addressed, turn-settling
-    // question capability.
-    await expect(manifest).not.toContainText("human.ask");
-    await expect(manifest).toContainText("question.ask");
-    await expect(manifest).not.toContainText("bash");
-    await expect(manifest).not.toContainText("shell");
-    await expect(manifest).not.toContainText("web");
-    await expect(manifest).not.toContainText("http");
-    await expect(manifest).not.toContainText("upload");
-    await expect(manifest).not.toContainText("attach");
-    await expect(manifest).not.toContainText("ingest");
-});
-
 Then("the Admin composer offers no attachment control", async ({ page }) => {
-    const admin = page.locator("[data-admin-environment]");
-    await expect(admin.getByRole("button", { name: "Attach files" })).toHaveCount(0);
-    await expect(admin.locator("[data-attach-input]")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Attach files" })).toHaveCount(0);
+    await expect(page.locator("[data-attach-input]:visible")).toHaveCount(0);
 });
 
 Then("the Admin agent upload API is unavailable", async ({ request }) => {
@@ -555,14 +463,14 @@ Then("the Admin agent upload API is unavailable", async ({ request }) => {
     expect(response.status()).toBe(404);
 });
 
-When("I launch the SSO setup wizard", async ({ page }) => {
-    await page.getByRole("button", { name: "Identity", exact: true }).click();
-    const integrationResponse = page.waitForResponse((response) =>
-        new URL(response.url()).pathname === "/admin/integration"
-        && response.request().method() === "GET"
-    );
-    await page.locator("[data-admin-sso-wizard]").click();
-    const integration = await integrationResponse;
+When("I open Enterprise Identity setup", async ({ page }) => {
+    await page.getByRole("navigation", { name: "Administration pages" })
+        .getByRole("button", { name: "Enterprise Identity", exact: true })
+        .click();
+    await expect(page.locator('[data-gaugeapp-page="enterprise-identity"]')).toBeVisible();
+    const integration = await page.request.get(`${enterpriseCP}/admin/integration`, {
+        headers: { authorization: `Bearer ${ownerToken}` },
+    });
     expect(integration.status()).toBe(200);
     const integrationBody = await integration.json();
     expect(integrationBody).toMatchObject({
@@ -571,7 +479,6 @@ When("I launch the SSO setup wizard", async ({ page }) => {
         scim: { base_url: expect.stringContaining("/scim/v2") },
     });
     advertisedIntegration = integrationBody;
-    await expect(page.locator("[data-sso-wizard]")).toBeVisible();
 });
 
 // saml-metadata-public-authority
@@ -594,24 +501,26 @@ Then("an identity provider can register from the advertised SAML metadata", asyn
 });
 
 When("I issue a SCIM credential through Administration review", async ({ page }) => {
-    await page.getByRole("button", { name: "Identity", exact: true }).click();
+    await page.getByRole("navigation", { name: "Administration pages" })
+        .getByRole("button", { name: "Enterprise Identity", exact: true })
+        .click();
     const proposalResponse = page.waitForResponse((response) =>
-        new URL(response.url()).pathname === "/environments/administration/commands"
+        new URL(response.url()).pathname === "/gaugeapps/administration/commands"
         && response.request().method() === "POST"
     );
-    await page.getByRole("button", { name: "propose SCIM token rotation", exact: true }).click();
+    await page.getByRole("button", { name: "Issue credential", exact: true }).click();
     expect((await proposalResponse).status()).toBe(200);
-    const review = page.locator(".environment-change-review");
-    await expect(review).toContainText("scim-token.rotate");
+    const review = page.getByRole("region", { name: "Pending changes" });
+    await expect(review).toContainText("SCIM");
 
     const reviewResponse = page.waitForResponse((response) =>
-        new URL(response.url()).pathname.startsWith("/environments/administration/changes/")
+        new URL(response.url()).pathname.startsWith("/gaugeapps/administration/proposals/")
         && new URL(response.url()).pathname.endsWith("/review")
         && response.request().method() === "POST"
     );
-    await review.getByRole("button", { name: "apply change" }).click();
+    await review.getByRole("button", { name: "Accept", exact: true }).click();
     expect((await reviewResponse).status()).toBe(200);
-    const oneTimeSecret = page.locator(".environment-one-time-secret code");
+    const oneTimeSecret = page.getByRole("region", { name: "New SCIM credential" }).locator("code");
     await expect(oneTimeSecret).toBeVisible();
     issuedScimToken = (await oneTimeSecret.textContent())?.trim() ?? null;
     expect(issuedScimToken).toBeTruthy();
@@ -655,8 +564,9 @@ Then(
                     .toBe(401);
             }
         }
-        await page.getByRole("button", { name: "People & access", exact: true }).click();
-        await expect(page.locator(`[data-member="${user}"]`)).toHaveCount(0);
+        await page.getByRole("navigation", { name: "Administration pages" })
+            .getByRole("button", { name: "People", exact: true }).click();
+        await expect(page.locator(".gaugeapp-person-row").filter({ hasText: user })).toHaveCount(0);
 
         const created = await send("POST", usersPath, issuedScimToken, { userName: user });
         expect(created.status()).toBe(201);
@@ -669,20 +579,22 @@ Then(
 
         const refreshAccess = async () => {
             await page.reload();
-            await expect(page.locator("[data-environment-document]")).toBeVisible();
-            await page.getByRole("button", { name: "People & access", exact: true }).click();
-            return page.locator(`[data-member="${user}"]`);
+            await expect(page.locator("[data-gaugeapp-page]")).toBeVisible();
+            await page.getByRole("navigation", { name: "Administration pages" })
+                .getByRole("button", { name: "People", exact: true }).click();
+            return page.locator(".gaugeapp-person-row").filter({ hasText: user });
         };
         let member = await refreshAccess();
         await expect(member).toBeVisible();
-        await expect(member.locator("select")).toBeDisabled();
-        await expect(member.locator(".resource-availability")).toHaveText("active");
+        await expect(member.locator("select")).toHaveCount(0);
+        await expect(member).toContainText("Identity provider");
 
         const suspended = await send("PATCH", userPath, issuedScimToken, patchBody(false));
         expect(suspended.status()).toBe(200);
         expect(await suspended.json()).toMatchObject({ id: user, active: false });
         member = await refreshAccess();
-        await expect(member.locator(".resource-availability")).toHaveText("deprovisioned");
+        await expect(page.getByText("Deprovisioned", { exact: true })).toBeVisible();
+        await expect(member).toBeVisible();
 
         const restored = await send("PATCH", userPath, issuedScimToken, patchBody(true));
         expect(restored.status()).toBe(200);
@@ -692,50 +604,17 @@ Then(
         expect(deleted.status()).toBe(200);
         expect(await deleted.json()).toMatchObject({ id: user, active: false });
         member = await refreshAccess();
-        await expect(member.locator(".resource-availability")).toHaveText("deprovisioned");
+        await expect(page.getByText("Deprovisioned", { exact: true })).toBeVisible();
+        await expect(member).toBeVisible();
     },
 );
 
-Then("the SSO wizard shows the connect step", async ({ page }) => {
-    await expect(page.locator("[data-wizard-connect]")).toBeVisible();
-    await expect(page.locator("[data-wizard-connect]")).toContainText("/auth/callback");
-});
-
-When("I advance the SSO wizard", async ({ page }) => {
-    await page.locator("[data-wizard-next]").click();
-});
-
-Then("the SSO wizard shows the test step", async ({ page }) => {
-    await expect(page.locator("[data-wizard-test]")).toBeVisible();
-    await expect(page.locator("[data-wizard-test-btn]")).toBeVisible();
-});
-
-When("I test the incomplete SSO connection", async ({ page }) => {
-    const testResponse = page.waitForResponse((response) =>
-        new URL(response.url()).pathname === "/admin/sso/test"
-        && response.request().method() === "POST"
-    );
-    await page.locator("[data-wizard-test-btn]").click();
-    const response = await testResponse;
-    expect(response.status()).toBe(200);
-    expect(await response.json()).toMatchObject({
-        ok: false,
-        detail: expect.stringContaining("incomplete OIDC connection"),
-    });
-});
-
-Then("the SSO test reports the incomplete configuration", async ({ page }) => {
-    await expect(page.locator("[data-wizard-test-result]")).toContainText(
-        "incomplete OIDC connection",
-    );
-});
-
 // ITGOV-2: the IT session roster is surfaced in the admin console.
 Then("the admin console shows the active sessions roster", async ({ page }) => {
-    await page.getByRole("button", { name: "People & access", exact: true }).click();
-    const panel = page.locator("[data-sessions]");
-    await expect(panel).toBeVisible();
-    await expect(panel).toContainText("Active sessions");
+    await page.getByRole("navigation", { name: "Administration pages" })
+        .getByRole("button", { name: "Sessions", exact: true }).click();
+    await expect(page.locator('[data-gaugeapp-page="sessions"]')).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Organization sessions", exact: true })).toBeVisible();
 });
 
 When("I reload the administered workbench as a desktop client", async ({ page }) => {
@@ -763,76 +642,19 @@ Then("the shipped desktop updater reads the tenant software policy", async () =>
     });
 });
 
-When("I preview an unattested engagement in the shipped Devices UI", async ({ page }) => {
-    await openAccountMenu(page);
-    await page.locator('[data-account-menu-item="devices"]').click();
-    const payload = JSON.stringify({
-        invite_id: "policy-client-journey",
-        ticket: { authority: "counterparty" },
-        project: "policy-client-project",
-        project_name: "Policy client project",
-        manifest: [],
-        confirm_code: "1-2-3",
-        deployment_mode: { operator: "local", attested: false },
-    });
-    const hex = Array.from(new TextEncoder().encode(payload), (byte) =>
-        byte.toString(16).padStart(2, "0")).join("");
-    await page.locator("[data-pd-invite-link]").fill(`gaugewright://invite?d=${hex}`);
-});
-
-Then(
-    "the enrolled client reads the placement floor and refuses the engagement locally",
-    async ({ page }) => {
-        expect(enrolledPlacementPolicy).toMatchObject({
-            placement_policy: {
-                require_attested: true,
-                allowed_operators: [],
-            },
-        });
-        await expect(page.locator("[data-placement-policy]")).toContainText(
-            "attestation required",
-        );
-        await expect(page.locator("[data-pd-invite-deployment]")).toContainText(
-            "local-operated · unattested",
-        );
-        await expect(page.locator("[data-pd-policy-refusal]")).toBeVisible();
-        await expect(page.locator("[data-pd-invite-accept]")).toBeDisabled();
-    },
-);
-
-Then("the Admin Environment shows the serving machine as live", async ({ page }) => {
-    await page.getByRole("button", { name: "Machines", exact: true }).first().click();
-    const dashboard = page.locator("[data-admin-dashboard=machines]");
-    await expect(dashboard).toContainText("home:local-user");
-    await expect(dashboard).toContainText("live");
-});
-
-When("I ask the admin agent about Machines", async ({ page }) => {
-    const composer = page.getByPlaceholder("task the admin agent…");
-    await composer.fill("Which Machines, Homes, projects, and placements are under control?");
-    // ⏎ follows the composer's mode; see `sendDraft` in steps.ts for why the
-    // primary button is not clicked here.
-    await composer.press("Enter");
-});
-
-Then("the admin agent answers from admitted Home projections", async ({ page }) => {
-    await expect(page.locator("[data-admin-environment] .transcript")).toContainText(
-        "registered Homes have live target-admitted projections",
-    );
-});
-
 When("I ask the Administration agent to propose inviting {string}", async ({ page }, authority: string) => {
-    const composer = page.getByPlaceholder("task the admin agent…");
-    await composer.fill(`/propose member.invite ${JSON.stringify({ authority, email: authority, role: "member" })}`);
+    const composer = page.getByPlaceholder("ask administration…");
+    await composer.fill(`/propose people.invitation.create ${JSON.stringify({ emails: [authority], role: "member" })}`);
     // ⏎ follows the composer's mode; see `sendDraft` in steps.ts for why the
     // primary button is not clicked here.
     await composer.press("Enter");
 });
 
 Then("the Administration agent opens a reviewable member proposal for {string}", async ({ page }, authority: string) => {
-    await expect(page.locator("[data-admin-environment] .transcript")).toContainText(
-        "I opened a reviewable member.invite proposal",
-    );
-    await expect(page.locator(".environment-change-review")).toContainText("member.invite");
-    await expect(page.locator(`[data-member="${authority}"]`)).toHaveCount(0);
+    await expect(page.getByText(
+        "I opened a reviewable people.invitation.create proposal. It is not applied until you review it.",
+        { exact: true },
+    )).toBeVisible();
+    await expect(page.getByRole("region", { name: "Pending changes" })).toContainText(authority);
+    await expect(page.locator(".gaugeapp-people-list").getByText(authority, { exact: true })).toHaveCount(0);
 });

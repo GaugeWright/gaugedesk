@@ -23,6 +23,11 @@ mod support;
 use support::{administration_command, administration_document, administration_domain_challenge};
 
 fn workbench() -> (tempfile::TempDir, Router) {
+    let (dir, app, _) = workbench_with_handle();
+    (dir, app)
+}
+
+fn workbench_with_handle() -> (tempfile::TempDir, Router, Arc<Mutex<Workbench>>) {
     let dir = tempfile::tempdir().unwrap();
     let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
     let mut store = Store::open_in_memory().unwrap();
@@ -46,8 +51,66 @@ fn workbench() -> (tempfile::TempDir, Router) {
             )
             .unwrap();
     }
-    let wb = Workbench::with_target("inst-test", instance, store);
-    (dir, enterprise_control_plane(Arc::new(Mutex::new(wb))))
+    let wb = Arc::new(Mutex::new(Workbench::with_target(
+        "inst-test",
+        instance,
+        store,
+    )));
+    (dir, enterprise_control_plane(wb.clone()), wb)
+}
+
+fn seed_member(workbench: &Arc<Mutex<Workbench>>, tenant: &str, id: &str, email: &str, role: &str) {
+    workbench
+        .lock()
+        .unwrap()
+        .store_mut()
+        .append_record(
+            &tenant_scope(tenant),
+            "membership",
+            &serde_json::to_string(&MembershipRecord {
+                id: id.into(),
+                op: RecordOp::Upsert,
+                org_id: ORG_ID.into(),
+                authority: id.into(),
+                email: email.into(),
+                role: role.into(),
+                status: MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+fn seed_member_with_status(
+    workbench: &Arc<Mutex<Workbench>>,
+    tenant: &str,
+    id: &str,
+    email: &str,
+    status: MembershipStatus,
+) {
+    workbench
+        .lock()
+        .unwrap()
+        .store_mut()
+        .append_record(
+            &tenant_scope(tenant),
+            "membership",
+            &serde_json::to_string(&MembershipRecord {
+                id: id.into(),
+                op: RecordOp::Upsert,
+                org_id: ORG_ID.into(),
+                authority: id.into(),
+                email: email.into(),
+                role: "member".into(),
+                status,
+                managed_by_scim: false,
+                team: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
 }
 
 async fn command(
@@ -71,7 +134,7 @@ async fn tenant_command(
 
 async fn document(app: &Router, tenant: Option<&str>, id: &str) -> (StatusCode, Value) {
     let (status, response) = administration_document(app, tenant, None, id).await;
-    (status, response["document"]["content"].clone())
+    (status, response["page"]["model"].clone())
 }
 
 async fn tenant_get(app: &Router, tenant: &str, uri: &str) -> (StatusCode, Value) {
@@ -95,17 +158,58 @@ async fn tenant_get(app: &Router, tenant: &str, uri: &str) -> (StatusCode, Value
     )
 }
 
+#[tokio::test]
+async fn project_share_picker_is_exact_tenant_and_active_members_only() {
+    let (_dir, app, workbench) = workbench_with_handle();
+    seed_member_with_status(
+        &workbench,
+        "acme",
+        "authority:active",
+        "active@example.test",
+        MembershipStatus::Active,
+    );
+    seed_member_with_status(
+        &workbench,
+        "acme",
+        "authority:inactive",
+        "inactive@example.test",
+        MembershipStatus::Deprovisioned,
+    );
+
+    let (status, body) = tenant_get(
+        &app,
+        "acme",
+        "/account/tenants/acme/project-share-candidates",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["candidates"],
+        json!([{
+            "authority": "authority:active",
+            "label": "active@example.test",
+        }])
+    );
+
+    let (status, _) = tenant_get(
+        &app,
+        "globex",
+        "/account/tenants/acme/project-share-candidates",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 async fn update_policy(
     app: &Router,
     security: Option<Value>,
     placement: Option<Value>,
 ) -> (StatusCode, Value) {
-    let (status, document) =
-        administration_document(app, None, None, "administration.policy").await;
+    let (status, document) = administration_document(app, None, None, "organization-policy").await;
     if status != StatusCode::OK {
         return (status, document);
     }
-    let mut content = document["document"]["content"].clone();
+    let mut content = document["page"]["model"].clone();
     if !content["security"].is_object() {
         content["security"] = json!({});
     }
@@ -118,7 +222,13 @@ async fn update_policy(
     if let Some(placement) = placement {
         content["placement"] = placement;
     }
-    command(app, "administration.policy", "policy.update", content).await
+    command(
+        app,
+        "organization-policy",
+        "organization-policy.set",
+        content,
+    )
+    .await
 }
 
 async fn send(app: &Router, method: &str, uri: &str, body: Option<&str>) -> (StatusCode, Value) {
@@ -154,9 +264,9 @@ async fn multi_tenant_admin_surfaces_are_scope_isolated() {
         tenant_command(
             &app,
             "acme",
-            "administration.organization",
-            "organization.update",
-            json!({"display_name":"Acme", "verified_domains":[], "default_region":null, "kind":"client"})
+            "organization",
+            "organization.display-name.set",
+            json!({"display_name":"Acme"})
         )
         .await
         .0,
@@ -166,49 +276,50 @@ async fn multi_tenant_admin_surfaces_are_scope_isolated() {
         tenant_command(
             &app,
             "globex",
-            "administration.organization",
-            "organization.update",
-            json!({"display_name":"Globex", "verified_domains":[], "default_region":null, "kind":"client"})
+            "organization",
+            "organization.display-name.set",
+            json!({"display_name":"Globex"})
         )
         .await
         .0,
         StatusCode::OK
     );
     // a member added under acme must not appear for globex (the isolation contract).
-    tenant_command(
+    let (status, _) = tenant_command(
         &app,
         "acme",
-        "administration.access",
-        "member.invite",
-        json!({"authority":"u1","email":"u1@acme.com","role":"member"}),
+        "people",
+        "people.invitation.create",
+        json!({"emails":["u1@acme.com"],"role":"member"}),
     )
     .await;
+    assert_eq!(status, StatusCode::OK);
 
-    let (_, a) = document(&app, Some("acme"), "administration.organization").await;
+    let (_, a) = document(&app, Some("acme"), "organization").await;
     assert_eq!(a["display_name"], "Acme");
-    let (_, g) = document(&app, Some("globex"), "administration.organization").await;
+    let (_, g) = document(&app, Some("globex"), "organization").await;
     assert_eq!(g["display_name"], "Globex"); // not Acme — scope-isolated
-    let (_, am) = document(&app, Some("acme"), "administration.access").await;
-    let (_, gm) = document(&app, Some("globex"), "administration.access").await;
-    assert!(am["members"]
+    let (_, am) = document(&app, Some("acme"), "people").await;
+    let (_, gm) = document(&app, Some("globex"), "people").await;
+    assert!(am["invitations"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|m| m["authority"] == "u1"));
+        .any(|invitation| invitation["email"] == "u1@acme.com"));
     assert!(
-        !gm["members"]
+        !gm["invitations"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|member| member["authority"] == "u1"),
-        "globex has no acme member: {gm}",
+            .any(|invitation| invitation["email"] == "u1@acme.com"),
+        "globex has no acme invitation: {gm}",
     );
     tenant_command(
         &app,
         "acme",
-        "administration.access",
-        "member.invite",
-        json!({"authority":"acme-audit-only","role":"member"}),
+        "people",
+        "people.invitation.create",
+        json!({"emails":["audit@acme.com"],"role":"member"}),
     )
     .await;
     let (status, acme_audit) = tenant_get(&app, "acme", "/admin/audit?format=json").await;
@@ -219,22 +330,16 @@ async fn multi_tenant_admin_surfaces_are_scope_isolated() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|entry| entry["target"] == "acme-audit-only"));
+        .any(|entry| entry["action"] == "people.invitation.create"));
     assert!(!globex_audit["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|entry| entry["target"] == "acme-audit-only"));
-    let (_, acme_audit_document) = document(&app, Some("acme"), "administration.audit").await;
-    let (_, globex_audit_document) = document(&app, Some("globex"), "administration.audit").await;
-    assert_eq!(acme_audit_document["integrity"]["ok"], true);
-    assert_eq!(globex_audit_document["integrity"]["ok"], true);
-    assert_ne!(
-        acme_audit_document["integrity"]["entries"],
-        globex_audit_document["integrity"]["entries"]
-    );
+        .any(|entry| entry["action"] == "people.invitation.create"));
+    // Audit evidence remains tenant-scoped authority, but ADR 0161 deliberately
+    // exposes no low-information Audit GaugeApp page.
     // the default tenant (no header) is independent — untouched by either named tenant.
-    let (_, d) = document(&app, None, "administration.organization").await;
+    let (_, d) = document(&app, None, "organization").await;
     assert!(d.is_null(), "default tenant unaffected: {d}");
 }
 
@@ -243,128 +348,80 @@ async fn org_settings_round_trip() {
     let (_dir, app) = workbench();
     let (status, _) = command(
         &app,
-        "administration.organization",
-        "organization.update",
-        json!({"display_name":"Acme","verified_domains":[],"default_region":"eu","kind":"client"}),
+        "organization",
+        "organization.display-name.set",
+        json!({"display_name":"Acme"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = document(&app, None, "administration.organization").await;
+    let (status, body) = document(&app, None, "organization").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["display_name"], "Acme");
-    assert!(body["verified_domains"].as_array().unwrap().is_empty());
-    assert_eq!(body["default_region"], "eu");
+    assert!(body["domains"].as_array().unwrap().is_empty());
+    assert_eq!(body["kind"], "client");
+    assert_eq!(body["owner"]["authority"], "local-user");
 }
 
 #[tokio::test]
-async fn an_incomplete_organization_edit_is_refused_and_changes_nothing() {
-    // `organization.update` replaces the whole `administration.organization`
-    // document, so a payload missing a field is a client defect and is refused.
-    // It used to parse — every field was `#[serde(default)]` — and the omitted
-    // ones were written back as `Default`, blanking the display name and
-    // resetting the tenant's recorded party to `client`. The org fold is
-    // latest-wins, so that loss was permanent.
+async fn organization_display_name_rejects_unowned_fields_and_preserves_truth() {
     let (_dir, app) = workbench();
     let (status, _) = command(
         &app,
-        "administration.organization",
-        "organization.update",
-        json!({"display_name":"Expert LLC","verified_domains":[],"default_region":"eu","kind":"consultant"}),
+        "organization",
+        "organization.display-name.set",
+        json!({"display_name":"Expert LLC"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    for partial in [
-        json!({"default_region":"us"}),
-        json!({"display_name":"Expert LLC","verified_domains":[],"kind":"consultant"}),
-        json!({"verified_domains":[],"default_region":"eu","kind":"consultant"}),
-        json!({"display_name":"Expert LLC","default_region":"eu","kind":"consultant"}),
-        json!({"display_name":"Expert LLC","verified_domains":[],"default_region":"eu"}),
-        json!({}),
-    ] {
-        let (status, body) = command(
-            &app,
-            "administration.organization",
-            "organization.update",
-            partial.clone(),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "incomplete organization payload {partial} was accepted: {body}"
-        );
-    }
-
-    // Every field the refused payloads omitted still holds its configured value.
-    let (status, body) = document(&app, None, "administration.organization").await;
+    let (status, body) = command(
+        &app,
+        "organization",
+        "organization.display-name.set",
+        json!({"display_name":"Changed","kind":"consultant"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, body) = document(&app, None, "organization").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["display_name"], "Expert LLC");
-    assert_eq!(body["kind"], "consultant");
-    assert_eq!(body["default_region"], "eu");
-}
-
-#[tokio::test]
-async fn a_complete_organization_edit_replaces_every_field() {
-    // The other half of the replace contract: a field the caller does send is
-    // written verbatim, including a cleared `default_region`.
-    let (_dir, app) = workbench();
-    let (status, _) = command(
-        &app,
-        "administration.organization",
-        "organization.update",
-        json!({"display_name":"Acme","verified_domains":[],"default_region":"eu","kind":"consultant"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (status, _) = command(
-        &app,
-        "administration.organization",
-        "organization.update",
-        json!({"display_name":"Acme Holdings","verified_domains":[],"default_region":null,"kind":"client"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (status, body) = document(&app, None, "administration.organization").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["display_name"], "Acme Holdings");
     assert_eq!(body["kind"], "client");
-    assert!(
-        body["default_region"].is_null(),
-        "an explicit null clears the region: {body}"
-    );
 }
 
 #[tokio::test]
 async fn invite_list_and_change_role() {
-    let (_dir, app) = workbench();
+    let (_dir, app, workbench) = workbench_with_handle();
 
     let (status, _) = command(
         &app,
-        "administration.access",
-        "member.invite",
-        json!({"authority":"alice-auth","email":"alice@acme.com","role":"member"}),
+        "people",
+        "people.invitation.create",
+        json!({"emails":["alice@acme.com"],"role":"member"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = document(&app, None, "administration.access").await;
+    let (status, body) = document(&app, None, "people").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["members"].as_array().unwrap().len(), 2);
+    assert_eq!(body["members"].as_array().unwrap().len(), 1);
+    assert_eq!(body["invitations"].as_array().unwrap().len(), 1);
+    assert_eq!(body["invitations"][0]["email"], "alice@acme.com");
+
+    // Acceptance is handled by the account-facing Cloud route. Seed its durable
+    // result here so this GaugeDesk test can continue through member governance.
+    seed_member(&workbench, "", "alice-auth", "alice@acme.com", "member");
 
     // Promote alice to admin.
     let (status, _) = command(
         &app,
-        "administration.access",
-        "member.role.set",
+        "people",
+        "people.role.change",
         json!({"id":"alice-auth","role":"admin"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let (_, body) = document(&app, None, "administration.access").await;
+    let (_, body) = document(&app, None, "people").await;
     assert_eq!(
         body["members"]
             .as_array()
@@ -381,9 +438,9 @@ async fn unknown_role_is_rejected() {
     let (_dir, app) = workbench();
     let (status, _) = command(
         &app,
-        "administration.access",
-        "member.invite",
-        json!({"authority":"x","role":"superuser"}),
+        "people",
+        "people.invitation.create",
+        json!({"emails":["x@example.test"],"role":"superuser"}),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -391,24 +448,18 @@ async fn unknown_role_is_rejected() {
 
 #[tokio::test]
 async fn deactivate_marks_deprovisioned() {
-    let (_dir, app) = workbench();
-    command(
-        &app,
-        "administration.access",
-        "member.invite",
-        json!({"authority":"bob-auth","role":"member"}),
-    )
-    .await;
+    let (_dir, app, workbench) = workbench_with_handle();
+    seed_member(&workbench, "", "bob-auth", "bob@example.test", "member");
 
     let (status, _) = command(
         &app,
-        "administration.access",
-        "member.deactivate",
+        "people",
+        "people.member.deactivate",
         json!({"id":"bob-auth"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let (_, body) = document(&app, None, "administration.access").await;
+    let (_, body) = document(&app, None, "people").await;
     assert_eq!(
         body["members"]
             .as_array()
@@ -426,8 +477,8 @@ async fn cannot_deactivate_or_demote_the_last_owner() {
     // Demote the only owner → refused.
     let (status, _) = command(
         &app,
-        "administration.access",
-        "member.role.set",
+        "people",
+        "people.role.change",
         json!({"id":"local-user","role":"admin"}),
     )
     .await;
@@ -436,8 +487,8 @@ async fn cannot_deactivate_or_demote_the_last_owner() {
     // Deactivate the only owner → refused.
     let (status, _) = command(
         &app,
-        "administration.access",
-        "member.deactivate",
+        "people",
+        "people.member.deactivate",
         json!({"id":"local-user"}),
     )
     .await;
@@ -445,38 +496,32 @@ async fn cannot_deactivate_or_demote_the_last_owner() {
 }
 
 #[tokio::test]
-async fn billing_round_trips_and_is_not_authority() {
+async fn billing_state_is_read_only_and_conveys_no_authority() {
     let (_dir, app) = workbench();
-    // Set a plan with seats; seats_used reflects active membership.
+    let (status, body) = document(&app, None, "billing").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["billing"], Value::Null);
+    assert_eq!(body["seats_used"], 1);
+    assert_eq!(body["managed_usage"]["runs"], 0);
+
+    // Subscription state is supplied by its owning authority. Administration
+    // cannot forge a plan, seat allowance, or managed-inference entitlement.
     let (status, _) = command(
         &app,
-        "administration.billing",
+        "billing",
         "billing.update",
         json!({"billing":{"plan":"business","seats":10,"managed_inference":{"plan":"org-managed","status":"active","included_tokens":1000000}}}),
     ).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
-    let (status, body) = document(&app, None, "administration.billing").await;
+    let (status, body) = document(&app, None, "billing").await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["billing"], Value::Null);
     assert_eq!(body["seats_used"], 1);
-    assert_eq!(body["billing"]["managed_inference"]["status"], "active");
     assert_eq!(body["managed_usage"]["runs"], 0);
-    assert_eq!(body["managed_usage"]["included_tokens"], 1_000_000);
 
-    // BILL-3: lapse the plan to zero seats — it confers/revokes no authority.
-    // The payload is the whole document: `billing.update` replaces the record,
-    // so clearing the managed-inference subscription is said explicitly rather
-    // than by omission.
-    let (status, body) = command(
-        &app,
-        "administration.billing",
-        "billing.update",
-        json!({"billing":{"plan":"free","seats":0,"managed_inference":null}}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    // The active owner's role/status is untouched by billing.
-    let (_s, body) = document(&app, None, "administration.access").await;
+    // A forged billing mutation neither grants nor revokes organization authority.
+    let (_s, body) = document(&app, None, "people").await;
     let owner = body["members"]
         .as_array()
         .unwrap()
@@ -489,15 +534,20 @@ async fn billing_round_trips_and_is_not_authority() {
 }
 
 #[tokio::test]
-async fn security_policy_round_trips() {
+async fn organization_session_policy_round_trips() {
     let (_dir, app) = workbench();
-    let (status, _) = update_policy(&app, Some(json!({"require_mfa":true,"session_lifetime_secs":3600,"idle_timeout_secs":900,"residency_region":"eu"})), None).await;
+    let (status, _) = update_policy(
+        &app,
+        Some(json!({"session_lifetime_secs":3600,"idle_timeout_secs":900})),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = document(&app, None, "administration.policy").await;
+    let (status, body) = document(&app, None, "organization-policy").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["security"]["session_lifetime_secs"], 3600);
-    assert_eq!(body["security"]["residency_region"], "eu");
+    assert_eq!(body["security"]["idle_timeout_secs"], 900);
 }
 
 #[tokio::test]
@@ -518,58 +568,57 @@ async fn audit_retention_min_guarantee_defaults_to_a_year_and_is_configurable() 
     assert_eq!(status, StatusCode::OK);
     let (_, body) = send(&app, "GET", "/admin/audit", None).await;
     assert_eq!(body["retention_min_days"], 2555);
-    let (_, sec) = document(&app, None, "administration.policy").await;
+    let (_, sec) = document(&app, None, "organization-policy").await;
     assert_eq!(sec["security"]["audit_retention_min_days"], 2555);
 }
 
 #[tokio::test]
-async fn org_kind_defaults_to_client_and_accepts_consultant() {
+async fn organization_kind_is_projected_but_not_user_editable() {
     let (_dir, app) = workbench();
-    // Default kind is client (the existing single-org path is unchanged).
     let (status, _) = command(
         &app,
-        "administration.organization",
-        "organization.update",
-        json!({"display_name":"Acme","verified_domains":[],"default_region":null,"kind":"client"}),
+        "organization",
+        "organization.display-name.set",
+        json!({"display_name":"Acme"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let (_, body) = document(&app, None, "administration.organization").await;
+    let (_, body) = document(&app, None, "organization").await;
     assert_eq!(body["kind"], "client");
 
-    // A consultant org is the same primitive, different party (DEPLOY-6, ADR 0061).
-    let (status, _) = command(
+    let (status, body) = command(
         &app,
-        "administration.organization",
-        "organization.update",
-        json!({"display_name":"Expert LLC","verified_domains":[],"default_region":null,"kind":"consultant"}),
+        "organization",
+        "organization.display-name.set",
+        json!({"display_name":"Expert LLC","kind":"consultant"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let (_, body) = document(&app, None, "administration.organization").await;
-    assert_eq!(body["kind"], "consultant");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (_, body) = document(&app, None, "organization").await;
+    assert_eq!(body["kind"], "client");
 }
 
 #[tokio::test]
 async fn placement_policy_round_trips() {
     let (_dir, app) = workbench();
     // Default (no record): the open policy — admits everything.
-    let (status, body) = document(&app, None, "administration.policy").await;
+    let (status, body) = document(&app, None, "organization-policy").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["placement"]["require_attested"], false);
 
-    // Tighten: require attested, restrict to counterparty-hosted.
+    // Tighten to counterparty-hosted. Attestation is deliberately not an
+    // Organization Policy control: reported client posture is not attestation.
     let (status, _) = update_policy(
         &app,
         None,
-        Some(json!({"require_attested":true,"allowed_operators":["counterparty"]})),
+        Some(json!({"require_attested":false,"allowed_operators":["counterparty"]})),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = document(&app, None, "administration.policy").await;
+    let (status, body) = document(&app, None, "organization-policy").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["placement"]["require_attested"], true);
+    assert_eq!(body["placement"]["require_attested"], false);
     assert_eq!(body["placement"]["allowed_operators"][0], "counterparty");
 }
 
@@ -578,13 +627,13 @@ async fn sso_connection_round_trips() {
     let (_dir, app) = workbench();
     let (status, _) = command(
         &app,
-        "administration.identity",
-        "sso.configure",
+        "enterprise-identity",
+        "enterprise-identity.connection.set",
         json!({"protocol":"oidc","issuer":"https://idp.example.com","audiences":["client-1"],"enforce_sso":true}),
     ).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = document(&app, None, "administration.identity").await;
+    let (status, body) = document(&app, None, "enterprise-identity").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["sso"]["issuer"], "https://idp.example.com");
     assert_eq!(body["sso"]["audiences"][0], "client-1");
@@ -595,9 +644,9 @@ async fn domain_capture_has_no_unauthenticated_public_mutation_route() {
     let (_dir, app) = workbench();
     let (status, _) = command(
         &app,
-        "administration.organization",
-        "organization.update",
-        json!({"display_name":"Acme","verified_domains":["acme.com"],"default_region":null,"kind":"client"}),
+        "organization",
+        "organization.display-name.set",
+        json!({"display_name":"Acme","domains":["acme.com"]}),
     )
     .await;
     assert_eq!(
@@ -616,24 +665,18 @@ async fn domain_capture_has_no_unauthenticated_public_mutation_route() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (_, access) = document(&app, None, "administration.access").await;
+    let (_, access) = document(&app, None, "people").await;
     assert_eq!(access["members"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn audit_timeline_records_governance_actions() {
-    let (_dir, app) = workbench();
+    let (_dir, app, workbench) = workbench_with_handle();
+    seed_member(&workbench, "", "alice", "alice@example.test", "member");
     command(
         &app,
-        "administration.access",
-        "member.invite",
-        json!({"authority":"alice","role":"member"}),
-    )
-    .await;
-    command(
-        &app,
-        "administration.access",
-        "member.role.set",
+        "people",
+        "people.role.change",
         json!({"id":"alice","role":"admin"}),
     )
     .await;
@@ -645,10 +688,10 @@ async fn audit_timeline_records_governance_actions() {
     let entries = body["entries"].as_array().unwrap();
     assert!(entries
         .iter()
-        .any(|e| e["action"] == "member.role" && e["target"] == "alice"));
+        .any(|e| e["action"] == "people.role.change" && e["target"] == "alice"));
 
     // Filter by action.
-    let (status, body) = send(&app, "GET", "/admin/audit?action=member.role", None).await;
+    let (status, body) = send(&app, "GET", "/admin/audit?action=people.role.change", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["entries"].as_array().unwrap().len(), 1);
 }
@@ -658,8 +701,8 @@ async fn role_change_on_missing_member_is_404() {
     let (_dir, app) = workbench();
     let (status, _) = command(
         &app,
-        "administration.access",
-        "member.role.set",
+        "people",
+        "people.role.change",
         json!({"id":"ghost","role":"admin"}),
     )
     .await;
@@ -668,26 +711,25 @@ async fn role_change_on_missing_member_is_404() {
 
 #[tokio::test]
 async fn configuring_oidc_sso_with_an_unreachable_issuer_surfaces_an_error_and_does_not_lock_out() {
-    // Enterprise-mode activation (`ID-3`): reviewed sso.configure rebuilds wb.idp from the
+    // Enterprise-mode activation (`ID-3`): the reviewed connection command rebuilds wb.idp from the
     // connection. A bogus/unreachable issuer must NOT clobber the existing verifier
     // (here: none) — a bad runtime edit can't lock admins out — and the activation
     // error is surfaced so the operator sees it.
     let (_dir, app) = workbench();
     let (status, _) = command(
         &app,
-        "administration.identity",
-        "sso.configure",
+        "enterprise-identity",
+        "enterprise-identity.connection.set",
         json!({"protocol":"oidc","issuer":"http://127.0.0.1:9/realms/x","audiences":["client-1"]}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "the connection is still saved");
-    let (_, body) = document(&app, None, "administration.identity").await;
+    let (_, body) = document(&app, None, "enterprise-identity").await;
     assert_eq!(body["sso"]["issuer"], "http://127.0.0.1:9/realms/x");
 
     // The verifier was left untouched (none) → admin stays ungated, not bricked: a
     // read without any bearer still succeeds.
-    let (status, _) =
-        administration_document(&app, None, None, "administration.organization").await;
+    let (status, _) = administration_document(&app, None, None, "organization").await;
     assert_eq!(
         status,
         StatusCode::OK,

@@ -41,10 +41,7 @@ pub async fn publish_deployment(
             request.managed_tenant_id = Some(tenant_id);
             request.funding_entitlement = entitlement;
             if let Some(entitlement) = &request.funding_entitlement {
-                request.funding_ref = crate::managed_inference::funding_ref_for(
-                    &entitlement.claims.scope,
-                    &entitlement.claims.plan,
-                );
+                request.funding_ref = entitlement.claims.funding_ref.clone();
             }
         }
         None => {}
@@ -82,10 +79,7 @@ pub async fn publish_deployment(
             .await
         {
             Ok(entitlement) => {
-                request.funding_ref = crate::managed_inference::funding_ref_for(
-                    &entitlement.claims.scope,
-                    &entitlement.claims.plan,
-                );
+                request.funding_ref = entitlement.claims.funding_ref.clone();
                 request.funding_entitlement = Some(entitlement);
             }
             Err((status, message)) => {
@@ -164,10 +158,7 @@ pub async fn start_panel_preview(
             request.managed_tenant_id = Some(tenant_id);
             request.funding_entitlement = entitlement;
             if let Some(entitlement) = &request.funding_entitlement {
-                request.funding_ref = crate::managed_inference::funding_ref_for(
-                    &entitlement.claims.scope,
-                    &entitlement.claims.plan,
-                );
+                request.funding_ref = entitlement.claims.funding_ref.clone();
             }
         }
         None => {}
@@ -205,10 +196,7 @@ pub async fn start_panel_preview(
             .await
         {
             Ok(entitlement) => {
-                request.funding_ref = crate::managed_inference::funding_ref_for(
-                    &entitlement.claims.scope,
-                    &entitlement.claims.plan,
-                );
+                request.funding_ref = entitlement.claims.funding_ref.clone();
                 request.funding_entitlement = Some(entitlement);
             }
             Err((status, message)) => {

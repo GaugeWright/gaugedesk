@@ -110,16 +110,24 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         }
     }
     void loadSnapshot();
-    const unsubscribe = api.subscribe(id, (ev) => {
-        setLive((t) => reduce(t, ev));
-        if (ev.type !== "text" || !api.recordFirstTextRendered) return;
-        const record = () => api.recordFirstTextRendered?.();
-        if (typeof globalThis.requestAnimationFrame === "function") {
-            globalThis.requestAnimationFrame(record);
-        } else {
-            globalThis.queueMicrotask(record);
-        }
-    });
+    let streamOpened = false;
+    const unsubscribe = api.subscribe(
+        id,
+        (ev) => {
+            setLive((t) => reduce(t, ev));
+            if (ev.type !== "text" || !api.recordFirstTextRendered) return;
+            const record = () => api.recordFirstTextRendered?.();
+            if (typeof globalThis.requestAnimationFrame === "function") {
+                globalThis.requestAnimationFrame(record);
+            } else {
+                globalThis.queueMicrotask(record);
+            }
+        },
+        () => {
+            if (streamOpened) void loadSnapshot();
+            streamOpened = true;
+        },
+    );
 
     // Engagement-scoped read projections (the desktop's `createResource`s, here for
     // one fixed engagement).

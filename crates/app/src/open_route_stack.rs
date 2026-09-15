@@ -33,6 +33,10 @@ fn compose(
         .merge(local_routes::routes(federation_on))
         .merge(crate::home_routes::routes())
         .merge(account_routes::routes())
+        // Desktop Account Settings is still owned by the hosted person
+        // authority. These exact aliases attach the co-resident sealed account
+        // session; the WebView receives only ordinary GaugeApp projections.
+        .merge(crate::account_signin::gaugeapp_proxy_routes())
         // Facilities, tenants and invitations. `facility_routes` already
         // describes itself as "ungated on loopback; the hub adds auth on top",
         // and its `/account/tenants` note describes what the *solo desktop

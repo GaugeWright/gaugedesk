@@ -14,18 +14,18 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::account::{seal_token, HomeRouteRecord, RecordOp, RegisteredHomeRecord, SettingRecord};
 #[cfg(debug_assertions)]
-use crate::account::{DeviceRecord, DeviceStatus};
+use crate::account::{DeviceKind, DeviceRecord, DeviceStatus};
 use crate::codex_oauth;
 use crate::xai_oauth;
 use crate::{err_response, net_http, LockUnpoisoned, SharedWorkbench};
-use gaugedesk_core::ids::HomeId;
+use gaugedesk_core::ids::{HomeId, ScopeId};
 
 /// Split account route surface. Local device/settings/credential ownership stays
 /// open; hosted token brokerage and account-ledger operation are split later.
@@ -70,10 +70,6 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
             "/account/devices/enroll/join/{session}",
             get(get_enroll_join),
         )
-        // Self-erase (SOC 2 finding 4.4a / DR-0086): the authenticated person
-        // crypto-erases their own account. Refuse-and-require-cleanup — see
-        // `erase_account`.
-        .route("/account/erase", delete(erase_account))
         .route("/account/settings", get(get_settings))
         .route("/account/settings/{key}", put(put_setting))
         .route("/account/homes", get(get_homes).post(post_home))
@@ -692,17 +688,18 @@ pub struct MintEntitlementBody {
     publisher_key: String,
 }
 
-/// Mint a Hub-signed managed-inference entitlement for `tenant`, bound to the
+/// Mint an account-service-signed managed-inference entitlement for `tenant`, bound to the
 /// caller-supplied publisher key (SOC 2 finding F-5.3 / DR-0089).
 ///
 /// The caller must be an authenticated owner/admin of `tenant` and the tenant's
 /// resolved managed plan must be active. The signed entitlement carries the
-/// funding scope, plan, publisher authority, spend caps, and a one-day validity
-/// window; the public edge verifies the Hub signature before serving a
+/// exact verified funding reference, publisher authority, spend caps, and a
+/// one-day validity window; the public edge verifies the account-service signature before serving a
 /// managed-funded deployment. Signing fails closed (`503`) when the Hub is not
 /// configured with a signing key, so an unsigned entitlement is never returned.
 pub async fn post_managed_entitlement(
     State(wb): State<SharedWorkbench>,
+    funding_authority: Option<Extension<crate::managed_funding::FundingAuthority>>,
     headers: HeaderMap,
     Path(tenant): Path<String>,
     Json(body): Json<MintEntitlementBody>,
@@ -745,21 +742,36 @@ pub async fn post_managed_entitlement(
             .into_response();
     }
 
-    // Resolve the plan that funds this tenant (org billing, then the tenant's own
-    // plan, then the caller's account plan) and require it to be active.
-    let tenant_scope = crate::org::tenant_scope(&tenant);
-    let resolved =
-        match crate::managed_inference::resolve_plan(wb.store_ref(), &account_scope, &tenant_scope)
-        {
-            Ok(resolved) => resolved,
-            Err(error) => return err_response(error),
-        };
-    let Some((plan, funding_scope)) = resolved else {
-        return (StatusCode::CONFLICT, "no active managed plan").into_response();
+    // Route composition, never this request, selects the authenticated funding
+    // producer and processor environment. A plain/local Hub therefore cannot
+    // turn legacy billing state into spend authority.
+    let Some(Extension(funding_authority)) = funding_authority else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "verified funding admission is not configured",
+        )
+            .into_response();
     };
-    if !plan.admits_future_run() {
-        return (StatusCode::CONFLICT, "no active managed plan").into_response();
-    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+
+    // Resolve organization-first billing from current, provenance-bearing
+    // evidence. Any legacy, wrong-mode, expired, revoked, or malformed record is
+    // deliberately indistinguishable from no active funding at this boundary.
+    let account_scope = ScopeId::new(account_scope);
+    let tenant_scope = ScopeId::new(crate::org::tenant_scope(&tenant));
+    let grant = match crate::managed_funding::resolve_plan(
+        wb.store_ref(),
+        &account_scope,
+        &tenant_scope,
+        &funding_authority.context(now),
+    ) {
+        Ok(Ok(grant)) => grant,
+        Ok(Err(_)) => return (StatusCode::CONFLICT, "no active managed plan").into_response(),
+        Err(error) => return err_response(error),
+    };
 
     // Only once the caller is authorized and entitled do we consult signing
     // configuration, so an unauthenticated or unentitled caller never learns
@@ -773,16 +785,8 @@ pub async fn post_managed_entitlement(
             .into_response();
     };
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    let claims = crate::managed_entitlement::build_claims(
-        &funding_scope,
-        &plan.plan,
-        &body.publisher_key,
-        now,
-    );
+    let claims =
+        crate::managed_entitlement::build_claims(&grant.reference(), &body.publisher_key, now);
     match crate::managed_entitlement::sign(&signing_key, &claims) {
         Ok(entitlement_json) => {
             match serde_json::from_str::<serde_json::Value>(&entitlement_json) {
@@ -1435,6 +1439,7 @@ pub async fn post_test_device_fixture(
         id: body.id,
         op: RecordOp::Upsert,
         label: body.label,
+        kind: DeviceKind::Unknown,
         subkey_pubkey: body.subkey_pubkey,
         status: DeviceStatus::Active,
         enrolled_at: crate::account::device_enrolled_at_now(),
@@ -1511,6 +1516,7 @@ pub async fn post_session_revoke(
         Ok(None) => return (StatusCode::NOT_FOUND, "no such session").into_response(),
         Err(e) => return err_response(e),
     };
+    wb.revoke_account_session_id(&id);
     (
         StatusCode::OK,
         Json(json!({ "session": session_view(&record) })),
@@ -2049,99 +2055,6 @@ async fn carry_to_box(
         // would say the fault is here.
         Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
     }
-}
-
-#[derive(Deserialize)]
-pub struct EraseAccountBody {
-    #[serde(default)]
-    pub confirm: bool,
-}
-
-/// Erase the authenticated person's own account (SOC 2 finding 4.4a / DR-0086).
-///
-/// The customer-facing self-erase entry point. It requires an explicit
-/// `{ "confirm": true }`: a destructive, irreversible crypto-erase must never fire
-/// on an empty or accidental request (`422` without it). The authenticated actor
-/// is the account owner, so no capability beyond being that person is needed; the
-/// scope erased is exactly that person's own `account_scope_for(actor)`.
-///
-/// Refuse-and-require-cleanup: `409` while the person still solely owns an
-/// organization (or one still has an active billable facility) — those are wound
-/// down through the tenant-delete path first. On success the account scope and the
-/// person's personal tenant scope are crypto-erased and their non-owner
-/// memberships deprovisioned (see [`crate::Workbench::erase_account_in`]).
-///
-/// 4.4b — erasing a remote Home's workbench content the person provisioned — is out
-/// of scope and blocked on DR-0061 (the Hub has no signed Hub→Home provisioning
-/// channel).
-pub async fn erase_account(
-    State(wb): State<SharedWorkbench>,
-    headers: HeaderMap,
-    Json(body): Json<EraseAccountBody>,
-) -> impl IntoResponse {
-    use crate::account::AccountEraseRefusal as Refusal;
-    // Validate (authentication + explicit confirm) and capture what a directory retraction will
-    // need — the account root and whether it has a published entry — under a short lock, before
-    // any destructive work.
-    let (actor, account_scope, root, published) = {
-        let wb = wb.lock_unpoisoned();
-        let actor = wb.actor(net_http::bearer(&headers));
-        if actor == "anonymous" {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "authenticate to erase your account",
-            )
-                .into_response();
-        }
-        if !body.confirm {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "confirm is required to erase your account",
-            )
-                .into_response();
-        }
-        let account_scope = wb.account_scope_for(net_http::bearer(&headers));
-        (
-            actor,
-            account_scope,
-            wb.library_sync_root(),
-            wb.library_sync_active(),
-        )
-    };
-    // Crypto-erase under the lock. A refusal (still owns orgs) leaves the account intact, so the
-    // directory entry must *not* be retracted in that case — fall through to the retraction only
-    // on a successful erase.
-    {
-        let mut wb = wb.lock_unpoisoned();
-        match wb.erase_account_in(&actor, &account_scope) {
-            Ok(Ok(())) => {}
-            Ok(Err(Refusal::OwnsOrganizations(_))) => {
-                return (
-                    StatusCode::CONFLICT,
-                    "delete the organizations you own through the tenant-delete path before \
-                     erasing your account",
-                )
-                    .into_response()
-            }
-            Err(e) => return err_response(e),
-        }
-    }
-    // Only now that the account is erased, withdraw its published routing (ADR 0153 §4). The
-    // on-disk root key survives the crypto-erase, so the retraction is still signable; the
-    // captured root means it needs none of the erased account state. Best-effort and owed: a
-    // directory the client cannot reach never fails a completed erase — the retraction is
-    // idempotent/retryable through `POST /account/library-sync/retract`.
-    if published {
-        let base = crate::directory_sync::directory_url_from_env();
-        if let Err(error) = retract_published_entry(&wb, &base, &root).await {
-            tracing::warn!(
-                %error,
-                "account erased but its blind-directory entry could not be retracted; \
-                 retraction owed (idempotent/retryable via POST /account/library-sync/retract)"
-            );
-        }
-    }
-    StatusCode::NO_CONTENT.into_response()
 }
 
 pub async fn delete_credential(

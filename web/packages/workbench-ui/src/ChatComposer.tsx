@@ -77,6 +77,19 @@ const STABLE_KEYS: Record<ComposerDestination, string> = {
     fork: "Ctrl Alt ⏎",
 };
 
+export function immediateDestinationPresentation(canSteer: boolean, busy: boolean, canQueue: boolean) {
+    if (canSteer) return {
+        label: "Steer",
+        detail: busy ? "Run it now, interrupting the turn in flight" : "Run it now",
+    } as const;
+    return {
+        label: "Send",
+        detail: busy
+            ? canQueue ? "Add it to the queue" : "Wait for the current turn to finish"
+            : "Send it now",
+    } as const;
+}
+
 export interface ComposerQueueItem {
     readonly id: number | string;
     readonly text: string;
@@ -97,6 +110,10 @@ export interface ChatComposerProps {
     readonly queue?: readonly ComposerQueueItem[];
     readonly attachments?: readonly Attachment[];
     readonly busy: boolean;
+    /** Whether the immediate destination can interrupt an active turn. A host
+     *  without steering gets ordinary Send language, not a control that claims
+     *  a capability it does not have. */
+    readonly canSteer?: boolean;
     /** The mode the composer rests in: what the primary button and Enter do, and
      *  which glyph the primary wears. It is a standing choice about the turn in
      *  flight — where a message written while the agent is working goes — so it
@@ -197,10 +214,11 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
     // Nothing to command with: no queue, no stop. Say so instead of offering a
     // primary that cannot land.
     const inert = () => props.busy && !hasQueueCommands() && !props.onStop;
-    // Steering means the same thing either way — deliver this now — but while a
-    // turn is in flight, "now" means cutting into it, and that is worth saying.
-    const steerDetail = () =>
-        props.busy ? "Run it now, interrupting the turn in flight" : "Run it now";
+    const immediatePresentation = () => immediateDestinationPresentation(
+        props.canSteer !== false,
+        props.busy,
+        canQueue(),
+    );
     // Queueing likewise reaches one destination — the line — and what that costs
     // depends only on whether anything is ahead of it.
     const queueDetail = () =>
@@ -208,7 +226,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
         : props.busy ? "Run on its own once the current turn finishes"
         : "Join the line — nothing is ahead of it, so it runs";
     const primaryDetail = () =>
-        mode() === "steer" ? steerDetail()
+        mode() === "steer" ? immediatePresentation().detail
         : mode() === "queue" ? queueDetail()
         : MODE_BY_ID.get(mode())!.detail;
 
@@ -230,7 +248,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
             ...(props.onFork ? [{ id: "fork" as const, label: "Fork", detail: "Send down a new branch, leaving this chat as it is" }] : []),
             ...(canStash() ? [{ id: "stash" as const, label: "Stash", detail: "Join the queue held — nothing runs it until you release it" }] : []),
             ...(canQueue() ? [{ id: "queue" as const, label: "Queue", detail: queueDetail() }] : []),
-            { id: "steer" as const, label: "Steer", detail: steerDetail() },
+            { id: "steer" as const, ...immediatePresentation() },
         ].map((entry) => ({
             ...entry,
             // The shortest key that gets there from here. ⏎ when the mode owns
@@ -274,7 +292,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
     const modeSetting = (stacked?: boolean) => (
         <Show when={props.onPickMode && offeredModes().length > 1}>
             <ComposerMenuButton
-                label={MODE_BY_ID.get(mode())!.label.toLowerCase()}
+                label={(mode() === "steer" ? immediatePresentation().label : MODE_BY_ID.get(mode())!.label).toLowerCase()}
                 title="What the send button and Enter do with the message you are typing"
                 testAttr="mode"
                 rowLabel="Mode"
@@ -553,8 +571,8 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                                 data-testid={mode() !== "steer"
                                     ? `${mode()}-msg`
                                     : props.busy ? "steer-turn" : "send-msg"}
-                                aria-label={`${MODE_BY_ID.get(mode())!.label} — ${primaryDetail()}`}
-                                title={`${MODE_BY_ID.get(mode())!.label} ⏎ — ${primaryDetail()} · also ${STABLE_KEYS[mode()]}`}
+                                aria-label={`${mode() === "steer" ? immediatePresentation().label : MODE_BY_ID.get(mode())!.label} — ${primaryDetail()}`}
+                                title={`${mode() === "steer" ? immediatePresentation().label : MODE_BY_ID.get(mode())!.label} ⏎ — ${primaryDetail()} · also ${STABLE_KEYS[mode()]}`}
                                 disabled={unreachable(mode())}
                                 onClick={() => dispatch(mode())}
                             >

@@ -7,18 +7,18 @@
 //! plaintext, OIDC token, client secret, or plaintext account-root seed. The
 //! private Hub may retain only an envelope-encrypted root seed for recovery.
 //!
-//! All links share one Hub-owned scope. That is intentional: uniqueness of a
-//! `(connection, issuer, subject)` or WebAuthn credential id must be decided
-//! against one ordered projection, not independently inside two account scopes.
-//! The account id on every record keeps the fact attributable and lets the
-//! person-scoped Account surface select only its own methods (`INV-1`/`INV-22`).
+//! Legacy links share one Hub-owned scope. ADR 0170 replaces that payload
+//! custody with independently keyed account-auth scopes while retaining an
+//! opaque global admission order. During migration, readers fold the legacy
+//! projection first and the exact account-scoped facts second; migrated writers
+//! never add personal authentication payloads to the legacy scope.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use gaugedesk_store::{AdmitError, Store};
+use gaugedesk_store::{AdmitError, CommandRecordFact, Store};
 
 pub use crate::account::RecordOp;
 
@@ -30,6 +30,7 @@ const WEBAUTHN_KIND: &str = "account_auth_webauthn";
 const SUBJECT_KIND: &str = "account_auth_subject";
 const RECOVERY_BATCH_KIND: &str = "account_auth_recovery_batch";
 const RECOVERY_CODE_KIND: &str = "account_auth_recovery_code";
+const RECOVERY_ATTEMPT_KIND: &str = "account_auth_recovery_attempt";
 const ROOT_CUSTODY_KIND: &str = "account_auth_root_custody";
 const SESSION_KIND: &str = "account_auth_session";
 
@@ -256,7 +257,54 @@ impl RecoveryCodeRecord {
     }
 }
 
-/// One durable, opaque Hub account session (`ADR 0147` §1). The record resolves a
+/// Secret-free audit result for one account-recovery attempt. Invalid proofs
+/// are distinct from service/custody failure so the former can enforce a
+/// bounded retry window without an infrastructure outage locking a person out.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryAttemptOutcome {
+    Succeeded,
+    InvalidProof,
+    RateLimited,
+    CustodyUnavailable,
+}
+
+/// One append-only recovery audit fact. `target_id` is a domain-separated
+/// digest of the normalized verified contact, so an invalid attempt records
+/// neither the email challenge nor the recovery code. `account_id` is present
+/// only when the verified contact resolved to an existing account.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryAttemptRecord {
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    pub target_id: String,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub attempted_at: u64,
+    pub outcome: RecoveryAttemptOutcome,
+}
+
+impl RecoveryAttemptRecord {
+    pub fn new(
+        id: &str,
+        target_id: &str,
+        account_id: Option<&str>,
+        attempted_at: u64,
+        outcome: RecoveryAttemptOutcome,
+    ) -> Result<Self, AuthRejection> {
+        Ok(Self {
+            id: required(id)?,
+            op: RecordOp::Upsert,
+            target_id: required(target_id)?,
+            account_id: account_id.map(required).transpose()?,
+            attempted_at,
+            outcome,
+        })
+    }
+}
+
+/// One durable, opaque GaugeDesk account session (`ADR 0147` §1). The record resolves a
 /// session token's digest to the account it authenticates **before the person is
 /// known** — so `authenticate_bearer` can admit an opaque bearer against one global,
 /// ordered projection exactly as the external-subject link resolves a subject. The
@@ -272,10 +320,19 @@ pub struct AccountSessionRecord {
     #[serde(default)]
     pub op: RecordOp,
     pub account_id: String,
-    /// The sign-in method that minted this session — `"oidc"` or `"passkey"`. The
-    /// session surface reports it; it is a projection of how the session began, not a
-    /// durable linked-method fact.
+    /// The sign-in method that minted this session. Independent methods are
+    /// `"passkey"` and `"recovery"`; a linked consumer session binds its exact
+    /// connection as `"consumer-oidc:<connection>"`. Corporate sessions bind
+    /// the exact organization connection as `"enterprise-oidc:<connection>"`
+    /// or `"enterprise-saml:<connection>"`. The session surface reports only
+    /// its safe family label while admission reads the exact value.
     pub method: String,
+    /// The trusted device this opaque session was bound to after a completed,
+    /// root-authorized enrollment. Empty for an ordinary browser session. Once
+    /// present, every use of the bearer is admitted only while that exact device
+    /// remains active in the person's account registry.
+    #[serde(default)]
+    pub device_id: String,
     /// Milliseconds since the Unix epoch when the session was minted.
     #[serde(default)]
     pub issued_at_ms: u64,
@@ -305,6 +362,7 @@ impl AccountSessionRecord {
             op: RecordOp::Upsert,
             account_id: required(account_id)?,
             method: required(method)?,
+            device_id: String::new(),
             issued_at_ms,
             last_seen_ms: issued_at_ms,
             lifetime_secs,
@@ -312,7 +370,7 @@ impl AccountSessionRecord {
     }
 }
 
-/// Rebuildable Hub account-auth projection (`INV-5`).
+/// Rebuildable GaugeDesk account-auth projection (`INV-5`).
 #[derive(Default, Clone, Debug)]
 pub struct AccountAuth {
     pub roots: BTreeMap<String, CustodiedAccountRootRecord>,
@@ -321,63 +379,149 @@ pub struct AccountAuth {
     pub external_subjects: BTreeMap<String, ExternalSubjectRecord>,
     pub recovery_batches: BTreeMap<String, RecoveryBatchRecord>,
     pub recovery_codes: BTreeMap<String, RecoveryCodeRecord>,
+    pub recovery_attempts: BTreeMap<String, RecoveryAttemptRecord>,
     /// Live opaque account sessions, keyed by session id (token digest). Tombstoned
     /// (revoked) sessions have folded out (`ADR 0147` §1/§3).
     pub sessions: BTreeMap<String, AccountSessionRecord>,
 }
 
 impl AccountAuth {
+    /// Rebuild the authoritative transition projection. The admitted custody
+    /// catalog, never the caller, selects independently keyed account scopes.
     pub fn rebuild(store: &Store) -> Result<Self, AdmitError> {
+        Self::rebuild_current(store)
+    }
+
+    /// Rebuild only the legacy global projection. This exists for the operated
+    /// migration copy and verification path; product readers use [`rebuild`].
+    pub fn rebuild_legacy(store: &Store) -> Result<Self, AdmitError> {
         let mut state = Self::default();
-        for row in store.records(ACCOUNT_AUTH_SCOPE, ROOT_CUSTODY_KIND)? {
-            let record: CustodiedAccountRootRecord = serde_json::from_str(&row)?;
-            fold(&mut state.roots, record.id.clone(), record.op, record);
+        state.fold_scope(store, ACCOUNT_AUTH_SCOPE)?;
+        Ok(state)
+    }
+
+    /// Rebuild the bounded transition projection: legacy current truth first,
+    /// then each independently keyed account scope. Account-scoped upserts and
+    /// tombstones therefore take precedence without editing legacy history.
+    pub fn rebuild_with_account_scopes<'a>(
+        store: &Store,
+        account_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, AdmitError> {
+        let mut state = Self::rebuild_legacy(store)?;
+        let account_ids: Vec<&str> = account_ids.into_iter().collect();
+        // A migrated account must never fall back to legacy payload after its
+        // independently keyed scope becomes unreadable or is crypto-erased.
+        // Remove its legacy projection first, then fold only what its current
+        // account scope can authoritatively disclose.
+        for account_id in &account_ids {
+            state.remove_account(account_id);
         }
-        for row in store.records(ACCOUNT_AUTH_SCOPE, EMAIL_KIND)? {
-            let record: VerifiedEmailRecord = serde_json::from_str(&row)?;
-            fold(&mut state.emails, record.id.clone(), record.op, record);
-        }
-        for row in store.records(ACCOUNT_AUTH_SCOPE, WEBAUTHN_KIND)? {
-            let record: WebAuthnMethodRecord = serde_json::from_str(&row)?;
-            fold(
-                &mut state.webauthn_methods,
-                record.id.clone(),
-                record.op,
-                record,
-            );
-        }
-        for row in store.records(ACCOUNT_AUTH_SCOPE, SUBJECT_KIND)? {
-            let record: ExternalSubjectRecord = serde_json::from_str(&row)?;
-            fold(
-                &mut state.external_subjects,
-                record.id.clone(),
-                record.op,
-                record,
-            );
-        }
-        for row in store.records(ACCOUNT_AUTH_SCOPE, RECOVERY_BATCH_KIND)? {
-            let record: RecoveryBatchRecord = serde_json::from_str(&row)?;
-            fold(
-                &mut state.recovery_batches,
-                record.id.clone(),
-                record.op,
-                record,
-            );
-        }
-        for row in store.records(ACCOUNT_AUTH_SCOPE, RECOVERY_CODE_KIND)? {
-            let record: RecoveryCodeRecord = serde_json::from_str(&row)?;
-            fold(
-                &mut state.recovery_codes,
-                record.id.clone(),
-                record.op,
-                record,
-            );
-        }
-        for row in store.records(ACCOUNT_AUTH_SCOPE, SESSION_KIND)? {
-            let record: AccountSessionRecord = serde_json::from_str(&row)?;
-            fold(&mut state.sessions, record.id.clone(), record.op, record);
+        for account_id in account_ids {
+            let scope = crate::account_auth_custody::account_auth_scope(account_id)
+                .map_err(|_| AdmitError::Codec("invalid account-auth scope identity".into()))?;
+            state.fold_scope(store, &scope)?;
         }
         Ok(state)
+    }
+
+    /// Rebuild the authoritative transition projection from the opaque custody
+    /// catalog. Callers do not choose whether legacy or account-scoped data is
+    /// current; the admitted migration marker does.
+    pub fn rebuild_current(store: &Store) -> Result<Self, AdmitError> {
+        let catalog = crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild(store)?;
+        let account_scoped = catalog.account_scoped_account_ids();
+        let authenticatable = catalog.authenticatable_account_scoped_account_ids();
+        let mut state = Self::rebuild_with_account_scopes(store, account_scoped)?;
+        // A fence must beat every concurrent authentication before any slower
+        // continuation evicts hot bearers or destroys the account key. Removing
+        // the account here also prevents an erased account from falling back to
+        // legacy history while migration-era rows remain retained.
+        let authenticatable: BTreeSet<&str> = authenticatable.into_iter().collect();
+        for account_id in catalog.account_scoped_account_ids() {
+            if !authenticatable.contains(account_id) {
+                state.remove_account(account_id);
+            }
+        }
+        Ok(state)
+    }
+
+    fn fold_scope(&mut self, store: &Store, scope: &str) -> Result<(), AdmitError> {
+        for row in store.records(scope, ROOT_CUSTODY_KIND)? {
+            let record: CustodiedAccountRootRecord = serde_json::from_str(&row)?;
+            fold(&mut self.roots, record.id.clone(), record.op, record);
+        }
+        for row in store.records(scope, EMAIL_KIND)? {
+            let record: VerifiedEmailRecord = serde_json::from_str(&row)?;
+            fold(&mut self.emails, record.id.clone(), record.op, record);
+        }
+        for row in store.records(scope, WEBAUTHN_KIND)? {
+            let record: WebAuthnMethodRecord = serde_json::from_str(&row)?;
+            fold(
+                &mut self.webauthn_methods,
+                record.id.clone(),
+                record.op,
+                record,
+            );
+        }
+        for row in store.records(scope, SUBJECT_KIND)? {
+            let record: ExternalSubjectRecord = serde_json::from_str(&row)?;
+            fold(
+                &mut self.external_subjects,
+                record.id.clone(),
+                record.op,
+                record,
+            );
+        }
+        for row in store.records(scope, RECOVERY_BATCH_KIND)? {
+            let record: RecoveryBatchRecord = serde_json::from_str(&row)?;
+            fold(
+                &mut self.recovery_batches,
+                record.id.clone(),
+                record.op,
+                record,
+            );
+        }
+        for row in store.records(scope, RECOVERY_CODE_KIND)? {
+            let record: RecoveryCodeRecord = serde_json::from_str(&row)?;
+            fold(
+                &mut self.recovery_codes,
+                record.id.clone(),
+                record.op,
+                record,
+            );
+        }
+        for row in store.records(scope, RECOVERY_ATTEMPT_KIND)? {
+            let record: RecoveryAttemptRecord = serde_json::from_str(&row)?;
+            fold(
+                &mut self.recovery_attempts,
+                record.id.clone(),
+                record.op,
+                record,
+            );
+        }
+        for row in store.records(scope, SESSION_KIND)? {
+            let record: AccountSessionRecord = serde_json::from_str(&row)?;
+            fold(&mut self.sessions, record.id.clone(), record.op, record);
+        }
+        Ok(())
+    }
+
+    fn remove_account(&mut self, account_id: &str) {
+        self.roots.retain(|_, record| record.id != account_id);
+        self.emails
+            .retain(|_, record| record.account_id != account_id);
+        self.webauthn_methods
+            .retain(|_, record| record.account_id != account_id);
+        self.external_subjects
+            .retain(|_, record| record.account_id != account_id);
+        self.recovery_batches
+            .retain(|_, record| record.account_id != account_id);
+        self.recovery_codes
+            .retain(|_, record| record.account_id != account_id);
+        self.recovery_attempts
+            .retain(|_, record| record.account_id.as_deref() != Some(account_id));
+        self.sessions
+            .retain(|_, record| record.account_id != account_id);
     }
 
     /// Stable, person-scoped method projection for the Account surface.
@@ -399,6 +543,26 @@ impl AccountAuth {
                 .filter(|record| record.account_id == account_id)
                 .collect(),
         }
+    }
+
+    /// Resolve one already-verified external subject through the exact active
+    /// link. Email is deliberately not an input and revoked links never
+    /// authenticate.
+    pub fn active_external_subject(
+        &self,
+        connection_id: &str,
+        issuer: &str,
+        subject: &str,
+        kind: ExternalSubjectKind,
+    ) -> Option<&ExternalSubjectRecord> {
+        let id = external_subject_id(connection_id, issuer, subject);
+        self.external_subjects.get(&id).filter(|record| {
+            record.status == AuthMethodStatus::Active
+                && record.connection_id == connection_id
+                && record.issuer == issuer
+                && record.subject == subject
+                && record.kind == kind
+        })
     }
 
     pub fn active_webauthn_count(&self, account_id: &str) -> usize {
@@ -450,6 +614,125 @@ impl AccountAuth {
                 )
         })
     }
+
+    /// Count only bad recovery-code proofs in the current throttle window.
+    /// Rate-limit observations and custody outages are audited but do not
+    /// extend the window or turn an outage into a self-sustaining lockout.
+    pub fn invalid_recovery_attempts_since(&self, target_id: &str, since: u64) -> usize {
+        self.recovery_attempts
+            .values()
+            .filter(|attempt| {
+                attempt.target_id == target_id
+                    && attempt.attempted_at >= since
+                    && attempt.outcome == RecoveryAttemptOutcome::InvalidProof
+            })
+            .count()
+    }
+
+    /// Current authentication payloads belonging to one account, suitable for
+    /// an encrypted migration copy. Revoked methods remain current facts;
+    /// unresolved recovery attempts are deliberately absent because they have
+    /// no account scope.
+    pub fn facts_for_account(&self, account_id: &str) -> Vec<AccountAuthFact> {
+        let mut facts = Vec::new();
+        facts.extend(
+            self.roots
+                .values()
+                .filter(|record| record.id == account_id)
+                .cloned()
+                .map(AccountAuthFact::RootCustody),
+        );
+        facts.extend(
+            self.emails
+                .values()
+                .filter(|record| record.account_id == account_id)
+                .cloned()
+                .map(AccountAuthFact::Email),
+        );
+        facts.extend(
+            self.webauthn_methods
+                .values()
+                .filter(|record| record.account_id == account_id)
+                .cloned()
+                .map(AccountAuthFact::WebAuthn),
+        );
+        facts.extend(
+            self.external_subjects
+                .values()
+                .filter(|record| record.account_id == account_id)
+                .cloned()
+                .map(AccountAuthFact::ExternalSubject),
+        );
+        facts.extend(
+            self.recovery_batches
+                .values()
+                .filter(|record| record.account_id == account_id)
+                .cloned()
+                .map(AccountAuthFact::RecoveryBatch),
+        );
+        facts.extend(
+            self.recovery_codes
+                .values()
+                .filter(|record| record.account_id == account_id)
+                .cloned()
+                .map(AccountAuthFact::RecoveryCode),
+        );
+        facts.extend(
+            self.recovery_attempts
+                .values()
+                .filter(|record| record.account_id.as_deref() == Some(account_id))
+                .cloned()
+                .map(AccountAuthFact::RecoveryAttempt),
+        );
+        facts.extend(
+            self.sessions
+                .values()
+                .filter(|record| record.account_id == account_id)
+                .cloned()
+                .map(AccountAuthFact::Session),
+        );
+        facts
+    }
+
+    /// Every resolved account represented in this projection. Unresolved
+    /// recovery attempts deliberately name no account and cannot create one.
+    pub fn account_ids(&self) -> BTreeSet<String> {
+        self.roots
+            .values()
+            .map(|record| record.id.clone())
+            .chain(self.emails.values().map(|record| record.account_id.clone()))
+            .chain(
+                self.webauthn_methods
+                    .values()
+                    .map(|record| record.account_id.clone()),
+            )
+            .chain(
+                self.external_subjects
+                    .values()
+                    .map(|record| record.account_id.clone()),
+            )
+            .chain(
+                self.recovery_batches
+                    .values()
+                    .map(|record| record.account_id.clone()),
+            )
+            .chain(
+                self.recovery_codes
+                    .values()
+                    .map(|record| record.account_id.clone()),
+            )
+            .chain(
+                self.recovery_attempts
+                    .values()
+                    .filter_map(|record| record.account_id.clone()),
+            )
+            .chain(
+                self.sessions
+                    .values()
+                    .map(|record| record.account_id.clone()),
+            )
+            .collect()
+    }
 }
 
 pub struct AccountMethods<'a> {
@@ -468,6 +751,7 @@ pub enum AccountAuthFact {
     ExternalSubject(ExternalSubjectRecord),
     RecoveryBatch(RecoveryBatchRecord),
     RecoveryCode(RecoveryCodeRecord),
+    RecoveryAttempt(RecoveryAttemptRecord),
     Session(AccountSessionRecord),
 }
 
@@ -480,6 +764,7 @@ impl AccountAuthFact {
             Self::ExternalSubject(_) => SUBJECT_KIND,
             Self::RecoveryBatch(_) => RECOVERY_BATCH_KIND,
             Self::RecoveryCode(_) => RECOVERY_CODE_KIND,
+            Self::RecoveryAttempt(_) => RECOVERY_ATTEMPT_KIND,
             Self::Session(_) => SESSION_KIND,
         }
     }
@@ -492,7 +777,24 @@ impl AccountAuthFact {
             Self::ExternalSubject(record) => serde_json::to_string(record),
             Self::RecoveryBatch(record) => serde_json::to_string(record),
             Self::RecoveryCode(record) => serde_json::to_string(record),
+            Self::RecoveryAttempt(record) => serde_json::to_string(record),
             Self::Session(record) => serde_json::to_string(record),
+        }
+    }
+
+    /// The exact account whose encrypted scope may hold this payload. An
+    /// unresolved invalid recovery attempt has no account and therefore cannot
+    /// enter durable migrated custody through this API.
+    fn account_id(&self) -> Option<&str> {
+        match self {
+            Self::RootCustody(record) => Some(&record.id),
+            Self::Email(record) => Some(&record.account_id),
+            Self::WebAuthn(record) => Some(&record.account_id),
+            Self::ExternalSubject(record) => Some(&record.account_id),
+            Self::RecoveryBatch(record) => Some(&record.account_id),
+            Self::RecoveryCode(record) => Some(&record.account_id),
+            Self::RecoveryAttempt(record) => record.account_id.as_deref(),
+            Self::Session(record) => Some(&record.account_id),
         }
     }
 }
@@ -502,12 +804,42 @@ pub enum AuthRejection {
     InvalidAccount,
     InvalidEmail,
     InvalidVerifierMaterial,
+    CustodyUnavailable,
     CredentialAlreadyLinked,
     SubjectAlreadyLinked,
     MethodNotFound,
     LastIndependentMethod,
     RecoveryBatchNotActive,
     RecoveryCodeAlreadyConsumed,
+}
+
+/// Mint a new independent GaugeDesk account root and prepare its encrypted
+/// custody fact. It follows the same root-custody boundary as passkey-first
+/// registration and is used by admitted first-time enterprise sign-in: an
+/// external IdP subject may authenticate a new account, but it never becomes
+/// that account's durable identity.
+///
+/// The seed exists only in this stack frame and the returned fact contains only
+/// the Hub-encrypted envelope. The caller commits it atomically with the exact
+/// verified external-subject link and any admitted organization membership.
+pub fn create_custodied_account_root(
+    wb: &crate::Workbench,
+    created_at: u64,
+) -> Result<(String, AccountAuthFact), AuthRejection> {
+    for _ in 0..16 {
+        let mut seed = [0_u8; 32];
+        getrandom::getrandom(&mut seed).map_err(|_| AuthRejection::CustodyUnavailable)?;
+        let Ok(signing) = gaugedesk_core::signature::SigningKey::from_seed(&seed) else {
+            continue;
+        };
+        let account_id = signing.public_key().as_str().to_owned();
+        let sealed_seed = wb
+            .seal_custodied_account_root(&account_id, &hex::encode(seed))
+            .ok_or(AuthRejection::CustodyUnavailable)?;
+        let record = CustodiedAccountRootRecord::new(&account_id, &sealed_seed, created_at)?;
+        return Ok((account_id, AccountAuthFact::RootCustody(record)));
+    }
+    Err(AuthRejection::CustodyUnavailable)
 }
 
 /// Verify a contact without using it to locate or merge another account.
@@ -568,6 +900,69 @@ pub fn decide_link_external_subject(
         }
     }
     Ok(vec![AccountAuthFact::ExternalSubject(record)])
+}
+
+/// Back-link a legacy consumer sign-in so this initiative's linking rule does not
+/// lock its own users out (GAUGEAPP-9).
+///
+/// Before [`ADR 0146`] an account's identity *was* the verified OIDC subject, so a
+/// hosted account obtained by Google sign-in carries that subject as its id, holds no
+/// passkey, and has no [`ExternalSubjectRecord`]. The callback now resolves such a
+/// record before minting a session, and the only route that creates one requires a
+/// live passkey-or-recovery session — which that account cannot obtain. Without this
+/// it could never sign in again.
+///
+/// The reconstruction is exact rather than a guess: the legacy id *is* the subject.
+///
+/// An account is legacy only when it holds no active authentication method at all.
+/// Nothing else can reach that state: a passkey account has a WebAuthn method, an
+/// enterprise account has an `EnterpriseOidc` subject from the login fold, and a
+/// recovery-capable account has an active batch. Restricting it this way matters —
+/// minting a subject link for an account that was *not* born of this provider would
+/// invent a credential, so the rule refuses everything it cannot prove.
+///
+/// Returns no fact when the account already resolves, so the pass is idempotent and
+/// safe to repeat on every boot.
+pub fn decide_backlink_legacy_consumer_subject(
+    state: &AccountAuth,
+    account_id: &str,
+    connection_id: &str,
+    issuer: &str,
+    now_ms: u64,
+) -> Option<AccountAuthFact> {
+    if account_id.trim().is_empty() {
+        return None;
+    }
+    let holds_active_method = state
+        .webauthn_methods
+        .values()
+        .any(|m| m.account_id == account_id && m.status == AuthMethodStatus::Active)
+        || state
+            .external_subjects
+            .values()
+            .any(|x| x.account_id == account_id && x.status == AuthMethodStatus::Active)
+        || state
+            .recovery_batches
+            .values()
+            .any(|b| b.account_id == account_id && b.status == RecoveryBatchStatus::Active);
+    if holds_active_method {
+        return None;
+    }
+    let record = ExternalSubjectRecord::new(
+        account_id,
+        connection_id,
+        issuer,
+        account_id,
+        ExternalSubjectKind::ConsumerOidc,
+        now_ms,
+    )
+    .ok()?;
+    // A record whose id is already taken by another account is refused rather than
+    // overwritten: two accounts cannot claim one subject.
+    match decide_link_external_subject(state, record) {
+        Ok(mut facts) if facts.len() == 1 => facts.pop(),
+        _ => None,
+    }
 }
 
 pub fn decide_unlink_external_subject(
@@ -660,17 +1055,101 @@ pub fn decide_consume_recovery_code(
 
 /// Append one pure decision's facts in a single SQLite transaction.
 pub fn append_facts(store: &mut Store, facts: &[AccountAuthFact]) -> Result<(), AdmitError> {
-    let encoded: Result<Vec<(&str, String)>, serde_json::Error> = facts
-        .iter()
-        .map(|fact| Ok((fact.kind(), fact.json()?)))
-        .collect();
-    let encoded = encoded?;
+    let encoded = current_command_record_facts(store, facts)?;
     let borrowed: Vec<(&str, &str, &str)> = encoded
         .iter()
-        .map(|(kind, payload)| (ACCOUNT_AUTH_SCOPE, *kind, payload.as_str()))
+        .map(|fact| {
+            (
+                fact.scope_id.as_str(),
+                fact.kind.as_str(),
+                fact.payload.as_str(),
+            )
+        })
         .collect();
     store.append_records_atomically(&borrowed)?;
     Ok(())
+}
+
+/// Encode an authentication decision for admission beside another authoritative
+/// command's facts. This is the GaugeApp seam: the caller may atomically commit
+/// the auth mutation, command receipt, and change record without learning the
+/// private record-kind vocabulary or bypassing the pure reducer.
+pub fn command_record_facts(
+    facts: &[AccountAuthFact],
+) -> Result<Vec<CommandRecordFact>, AdmitError> {
+    facts
+        .iter()
+        .map(|fact| {
+            Ok(CommandRecordFact {
+                scope_id: ACCOUNT_AUTH_SCOPE.to_owned(),
+                kind: fact.kind().to_owned(),
+                payload: fact.json()?,
+            })
+        })
+        .collect()
+}
+
+/// Encode authentication facts for the exact person's encrypted account-auth
+/// scope. This is the ADR 0170 migrated-write seam. It refuses cross-account
+/// batches and unresolved recovery attempts before they reach storage.
+pub fn account_scoped_command_record_facts(
+    account_id: &str,
+    facts: &[AccountAuthFact],
+) -> Result<Vec<CommandRecordFact>, AdmitError> {
+    let scope = crate::account_auth_custody::account_auth_scope(account_id)
+        .map_err(|_| AdmitError::Codec("invalid account-auth scope identity".into()))?;
+    facts
+        .iter()
+        .map(|fact| {
+            if fact.account_id() != Some(account_id) {
+                return Err(AdmitError::Codec(
+                    "account-auth fact is unscoped or belongs to another account".into(),
+                ));
+            }
+            Ok(CommandRecordFact {
+                scope_id: scope.clone(),
+                kind: fact.kind().to_owned(),
+                payload: fact.json()?,
+            })
+        })
+        .collect()
+}
+
+/// Encode each authentication fact into the scope selected by the admitted
+/// custody catalog. This lets one atomic higher-level command span legacy and
+/// migrated accounts during rollout without allowing its caller to choose a
+/// weaker custody location.
+pub fn current_command_record_facts(
+    store: &Store,
+    facts: &[AccountAuthFact],
+) -> Result<Vec<CommandRecordFact>, AdmitError> {
+    let catalog = crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild(store)?;
+    let scoped: BTreeSet<&str> = catalog.account_scoped_account_ids().into_iter().collect();
+    facts
+        .iter()
+        .map(|fact| {
+            if let Some(account_id) = fact.account_id() {
+                if !catalog.account(account_id).may_authenticate() {
+                    return Err(AdmitError::Codec(
+                        "account-auth mutation refused after erasure fence".into(),
+                    ));
+                }
+            }
+            let scope_id = match fact.account_id() {
+                Some(account_id) if scoped.contains(account_id) => {
+                    crate::account_auth_custody::account_auth_scope(account_id).map_err(|_| {
+                        AdmitError::Codec("invalid account-auth scope identity".into())
+                    })?
+                }
+                _ => ACCOUNT_AUTH_SCOPE.to_owned(),
+            };
+            Ok(CommandRecordFact {
+                scope_id,
+                kind: fact.kind().to_owned(),
+                payload: fact.json()?,
+            })
+        })
+        .collect()
 }
 
 fn fold<T>(map: &mut BTreeMap<String, T>, id: String, op: RecordOp, record: T) {
@@ -701,6 +1180,17 @@ pub fn normalize_email_contact(value: &str) -> Option<String> {
         && !local.chars().any(char::is_whitespace)
         && !domain.chars().any(char::is_whitespace))
     .then_some(normalized)
+}
+
+/// Stable throttle/audit key for a normalized recovery contact. The private
+/// account service already holds the verified contact itself; this avoids
+/// copying it into every attempt record.
+pub fn recovery_target_id(email: &str) -> Option<String> {
+    let email = normalize_email_contact(email)?;
+    Some(digest_id(
+        b"gaugedesk:account-recovery-target:v1",
+        &[email.as_bytes()],
+    ))
 }
 
 fn external_subject_id(connection_id: &str, issuer: &str, subject: &str) -> String {
@@ -804,6 +1294,12 @@ mod tests {
                     record.op,
                     record.clone(),
                 ),
+                AccountAuthFact::RecoveryAttempt(record) => fold(
+                    &mut state.recovery_attempts,
+                    record.id.clone(),
+                    record.op,
+                    record.clone(),
+                ),
                 AccountAuthFact::Session(record) => fold(
                     &mut state.sessions,
                     record.id.clone(),
@@ -812,6 +1308,130 @@ mod tests {
                 ),
             }
         }
+    }
+
+    const LEGACY_CONNECTION: &str = "google-consumer";
+    const LEGACY_ISSUER: &str = "https://accounts.google.com";
+
+    fn backlink(state: &AccountAuth, account_id: &str) -> Option<AccountAuthFact> {
+        decide_backlink_legacy_consumer_subject(
+            state,
+            account_id,
+            LEGACY_CONNECTION,
+            LEGACY_ISSUER,
+            99,
+        )
+    }
+
+    #[test]
+    fn a_legacy_consumer_account_is_back_linked_to_the_subject_that_was_its_id() {
+        // Before ADR 0146 the verified subject *was* the account id, so the link
+        // is reconstructed exactly rather than guessed.
+        let state = AccountAuth::default();
+        let Some(AccountAuthFact::ExternalSubject(record)) =
+            backlink(&state, "110378459139719984149")
+        else {
+            panic!("a legacy account with no method must be back-linked");
+        };
+        assert_eq!(record.account_id, "110378459139719984149");
+        assert_eq!(record.subject, "110378459139719984149");
+        assert_eq!(record.kind, ExternalSubjectKind::ConsumerOidc);
+        assert_eq!(record.issuer, LEGACY_ISSUER);
+        assert_eq!(record.status, AuthMethodStatus::Active);
+    }
+
+    #[test]
+    fn the_pass_is_idempotent_across_boots() {
+        // It runs on every startup, so a second pass must add nothing.
+        let mut state = AccountAuth::default();
+        let first = backlink(&state, "subject-legacy").expect("first pass links");
+        apply(&mut state, std::slice::from_ref(&first));
+        assert!(
+            backlink(&state, "subject-legacy").is_none(),
+            "an already-linked account must not be linked twice",
+        );
+    }
+
+    #[test]
+    fn an_account_holding_any_active_method_is_not_legacy() {
+        // Each active method independently proves the account was not born of
+        // consumer sign-in, so none of them may be overwritten with a subject.
+        let mut webauthn = AccountAuth::default();
+        apply(
+            &mut webauthn,
+            &[AccountAuthFact::WebAuthn(
+                WebAuthnMethodRecord::new("passkey-person", "cred-1", "{}", "key", 10).unwrap(),
+            )],
+        );
+        assert!(
+            backlink(&webauthn, "passkey-person").is_none(),
+            "a passkey account must never gain a consumer subject",
+        );
+
+        let mut enterprise = AccountAuth::default();
+        let corporate = ExternalSubjectRecord::new(
+            "corporate-person",
+            "org-acme-oidc",
+            "https://idp.example",
+            "subject-42",
+            ExternalSubjectKind::EnterpriseOidc,
+            10,
+        )
+        .unwrap();
+        apply(
+            &mut enterprise,
+            &[AccountAuthFact::ExternalSubject(corporate)],
+        );
+        assert!(
+            backlink(&enterprise, "corporate-person").is_none(),
+            "an enterprise account must not gain a consumer subject",
+        );
+    }
+
+    #[test]
+    fn a_revoked_method_does_not_keep_an_account_out_of_the_migration() {
+        // A revoked passkey authenticates nothing, so such an account is still
+        // locked out and still needs its link.
+        let mut state = AccountAuth::default();
+        apply(
+            &mut state,
+            &[AccountAuthFact::WebAuthn({
+                let mut revoked =
+                    WebAuthnMethodRecord::new("subject-legacy", "cred-1", "{}", "key", 10).unwrap();
+                revoked.status = AuthMethodStatus::Revoked;
+                revoked
+            })],
+        );
+        assert!(
+            backlink(&state, "subject-legacy").is_some(),
+            "a revoked method leaves the account unable to sign in",
+        );
+    }
+
+    #[test]
+    fn a_subject_another_account_already_holds_is_refused() {
+        // Two accounts cannot claim one subject; the migration must not
+        // overwrite an existing link to reach that state.
+        let mut state = AccountAuth::default();
+        let held = ExternalSubjectRecord::new(
+            "someone-else",
+            LEGACY_CONNECTION,
+            LEGACY_ISSUER,
+            "subject-legacy",
+            ExternalSubjectKind::ConsumerOidc,
+            10,
+        )
+        .unwrap();
+        apply(&mut state, &[AccountAuthFact::ExternalSubject(held)]);
+        assert!(
+            backlink(&state, "subject-legacy").is_none(),
+            "the migration must not take a subject another account holds",
+        );
+    }
+
+    #[test]
+    fn an_empty_account_id_is_refused() {
+        assert!(backlink(&AccountAuth::default(), "   ").is_none());
     }
 
     #[test]
@@ -943,6 +1563,16 @@ mod tests {
                 status: RecoveryBatchStatus::Active,
             }),
             AccountAuthFact::RecoveryCode(code),
+            AccountAuthFact::RecoveryAttempt(
+                RecoveryAttemptRecord::new(
+                    "attempt-1",
+                    &recovery_target_id("person@example.com").unwrap(),
+                    Some("person"),
+                    2,
+                    RecoveryAttemptOutcome::InvalidProof,
+                )
+                .unwrap(),
+            ),
         ];
         append_facts(&mut store, &facts).unwrap();
 
@@ -960,6 +1590,7 @@ mod tests {
             WEBAUTHN_KIND,
             RECOVERY_BATCH_KIND,
             RECOVERY_CODE_KIND,
+            RECOVERY_ATTEMPT_KIND,
         ] {
             for row in store.records(ACCOUNT_AUTH_SCOPE, kind).unwrap() {
                 assert!(!row.contains("SECRET-CODE"));
@@ -968,6 +1599,8 @@ mod tests {
                 assert!(!row.contains("id_token"));
             }
         }
+        let target = recovery_target_id("person@example.com").unwrap();
+        assert_eq!(state.invalid_recovery_attempts_since(&target, 0), 1);
     }
 
     #[test]
@@ -989,5 +1622,256 @@ mod tests {
             decide_verify_email(&state, bob_email),
             Err(AuthRejection::CredentialAlreadyLinked)
         );
+    }
+
+    #[test]
+    fn migrated_fact_builder_refuses_foreign_and_unresolved_payloads() {
+        let alice = AccountAuthFact::Email(
+            VerifiedEmailRecord::new("alice", "alice@example.com", 1).unwrap(),
+        );
+        let encoded = account_scoped_command_record_facts("alice", &[alice]).unwrap();
+        assert_eq!(
+            encoded[0].scope_id,
+            crate::account_auth_custody::account_auth_scope("alice").unwrap()
+        );
+        assert_eq!(encoded[0].kind, EMAIL_KIND);
+
+        let bob =
+            AccountAuthFact::Email(VerifiedEmailRecord::new("bob", "bob@example.com", 1).unwrap());
+        assert!(matches!(
+            account_scoped_command_record_facts("alice", &[bob]),
+            Err(AdmitError::Codec(_))
+        ));
+
+        let unresolved = AccountAuthFact::RecoveryAttempt(
+            RecoveryAttemptRecord::new(
+                "attempt",
+                "legacy-target-digest",
+                None,
+                1,
+                RecoveryAttemptOutcome::InvalidProof,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            account_scoped_command_record_facts("alice", &[unresolved]),
+            Err(AdmitError::Codec(_))
+        ));
+    }
+
+    #[test]
+    fn migration_snapshot_contains_only_the_exact_accounts_current_facts() {
+        let mut state = AccountAuth::default();
+        for fact in [
+            AccountAuthFact::Email(
+                VerifiedEmailRecord::new("alice", "alice@example.com", 1).unwrap(),
+            ),
+            AccountAuthFact::Email(VerifiedEmailRecord::new("bob", "bob@example.com", 1).unwrap()),
+            AccountAuthFact::Session(
+                AccountSessionRecord::new("alice-session", "alice", "passkey", 1, 60).unwrap(),
+            ),
+        ] {
+            apply(&mut state, &[fact]);
+        }
+        apply(
+            &mut state,
+            &[AccountAuthFact::RecoveryAttempt(
+                RecoveryAttemptRecord::new(
+                    "unknown-attempt",
+                    "legacy-target-digest",
+                    None,
+                    1,
+                    RecoveryAttemptOutcome::InvalidProof,
+                )
+                .unwrap(),
+            )],
+        );
+
+        let alice = state.facts_for_account("alice");
+        assert_eq!(alice.len(), 2);
+        assert!(alice.iter().all(|fact| fact.account_id() == Some("alice")));
+        assert!(account_scoped_command_record_facts("alice", &alice).is_ok());
+    }
+
+    #[test]
+    fn migrated_scope_is_encrypted_and_never_falls_back_after_erasure() {
+        use std::sync::Arc;
+
+        use crate::at_rest::LoopbackKeyWrap;
+        use crate::content_vault::ContentVault;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("account-auth.sqlite");
+        let vault = Arc::new(ContentVault::new(
+            dir.path().join("keys"),
+            Box::new(LoopbackKeyWrap::new([9_u8; 32])),
+        ));
+        let mut store = Store::open(db.to_str().unwrap())
+            .unwrap()
+            .with_codec(vault.clone());
+
+        let alice = AccountAuthFact::Email(
+            VerifiedEmailRecord::new("alice", "alice@example.com", 1).unwrap(),
+        );
+        let bob =
+            AccountAuthFact::Email(VerifiedEmailRecord::new("bob", "bob@example.com", 1).unwrap());
+        append_facts(&mut store, &[alice.clone(), bob]).unwrap();
+
+        let migrated = account_scoped_command_record_facts("alice", &[alice]).unwrap();
+        let records: Vec<(&str, &str, &str)> = migrated
+            .iter()
+            .map(|fact| {
+                (
+                    fact.scope_id.as_str(),
+                    fact.kind.as_str(),
+                    fact.payload.as_str(),
+                )
+            })
+            .collect();
+        store.append_records_atomically(&records).unwrap();
+
+        let projection = AccountAuth::rebuild_with_account_scopes(&store, ["alice"]).unwrap();
+        assert_eq!(projection.methods_for("alice").emails.len(), 1);
+        assert_eq!(projection.methods_for("bob").emails.len(), 1);
+
+        let scope = crate::account_auth_custody::account_auth_scope("alice").unwrap();
+        let raw = Store::open(db.to_str().unwrap()).unwrap();
+        let stored = raw.records(&scope, EMAIL_KIND).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].starts_with("gwenc:1:"));
+        assert!(!stored[0].contains("alice@example.com"));
+
+        assert!(vault.crypto_erase(&scope));
+        let after_erasure = AccountAuth::rebuild_with_account_scopes(&store, ["alice"]).unwrap();
+        assert!(after_erasure.methods_for("alice").emails.is_empty());
+        assert_eq!(after_erasure.methods_for("bob").emails.len(), 1);
+    }
+
+    #[test]
+    fn custody_catalog_selects_current_reads_and_writes_per_account() {
+        use crate::account_auth_custody::{
+            command_record_facts as custody_record_facts, AccountAuthCustody, CustodyCommand,
+        };
+
+        let mut store = Store::open_in_memory().unwrap();
+        let alice_legacy = AccountAuthFact::Email(
+            VerifiedEmailRecord::new("alice", "old-alice@example.com", 1).unwrap(),
+        );
+        let bob_legacy =
+            AccountAuthFact::Email(VerifiedEmailRecord::new("bob", "bob@example.com", 1).unwrap());
+        for fact in command_record_facts(&[alice_legacy, bob_legacy]).unwrap() {
+            store
+                .append_record(&fact.scope_id, &fact.kind, &fact.payload)
+                .unwrap();
+        }
+        let started = custody_record_facts(
+            "alice",
+            &AccountAuthCustody::default(),
+            CustodyCommand::BeginMigration {
+                operation_id: "migration-alice".into(),
+                source_basis: "legacy-position-1".into(),
+            },
+        )
+        .unwrap();
+        for fact in started {
+            store
+                .append_record(&fact.scope_id, &fact.kind, &fact.payload)
+                .unwrap();
+        }
+
+        let alice_current = AccountAuthFact::Email(
+            VerifiedEmailRecord::new("alice", "new-alice@example.com", 2).unwrap(),
+        );
+        let bob_current = AccountAuthFact::Email(
+            VerifiedEmailRecord::new("bob", "new-bob@example.com", 2).unwrap(),
+        );
+        let encoded =
+            current_command_record_facts(&store, &[alice_current.clone(), bob_current.clone()])
+                .unwrap();
+        assert_eq!(
+            encoded[0].scope_id,
+            crate::account_auth_custody::account_auth_scope("alice").unwrap()
+        );
+        assert_eq!(encoded[1].scope_id, ACCOUNT_AUTH_SCOPE);
+        append_facts(&mut store, &[alice_current, bob_current]).unwrap();
+
+        let current = AccountAuth::rebuild_current(&store).unwrap();
+        assert_eq!(
+            current.methods_for("alice").emails[0].email,
+            "new-alice@example.com"
+        );
+        assert_eq!(
+            current.methods_for("bob").emails[0].email,
+            "new-bob@example.com"
+        );
+        assert_eq!(
+            current.account_ids(),
+            BTreeSet::from(["alice".to_owned(), "bob".to_owned()])
+        );
+        let bob_email_count = current.methods_for("bob").emails.len();
+
+        let copying = crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild(&store)
+            .unwrap()
+            .account("alice");
+        for fact in custody_record_facts(
+            "alice",
+            &copying,
+            CustodyCommand::CompleteMigration {
+                operation_id: "migration-alice".into(),
+                destination_basis: "account-position-1".into(),
+                evidence_id: "copy-verified".into(),
+            },
+        )
+        .unwrap()
+        {
+            store
+                .append_record(&fact.scope_id, &fact.kind, &fact.payload)
+                .unwrap();
+        }
+        let migrated = crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild(&store)
+            .unwrap()
+            .account("alice");
+        for fact in custody_record_facts(
+            "alice",
+            &migrated,
+            CustodyCommand::FenceErasure {
+                operation_id: "erase-alice".into(),
+                authorization_id: "fresh-passkey-proof".into(),
+                review_id: "review-alice".into(),
+                blocking_organization_ids: Vec::new(),
+            },
+        )
+        .unwrap()
+        {
+            store
+                .append_record(&fact.scope_id, &fact.kind, &fact.payload)
+                .unwrap();
+        }
+
+        // The account key still exists at this crash point, but the fence is
+        // already authoritative. Explicit migration verification can inspect
+        // the copied scope; ordinary authentication and Account reads cannot.
+        assert_eq!(
+            AccountAuth::rebuild_with_account_scopes(&store, ["alice"])
+                .unwrap()
+                .methods_for("alice")
+                .emails
+                .len(),
+            1
+        );
+        let fenced = AccountAuth::rebuild_current(&store).unwrap();
+        assert!(fenced.methods_for("alice").emails.is_empty());
+        assert_eq!(fenced.methods_for("bob").emails.len(), bob_email_count);
+        assert!(!fenced.account_ids().contains("alice"));
+        assert!(matches!(
+            current_command_record_facts(
+                &store,
+                &[AccountAuthFact::Session(
+                    AccountSessionRecord::new("late", "alice", "passkey", 3, 60).unwrap()
+                )]
+            ),
+            Err(AdmitError::Codec(message))
+                if message == "account-auth mutation refused after erasure fence"
+        ));
     }
 }

@@ -88,6 +88,48 @@ Then("the paired environment is shown", async ({ page }) => {
     await expect(page.locator("[data-paired-environment]")).not.toHaveText("—");
 });
 
+// ---- project settings ------------------------------------------------------
+
+When("I open Personal project settings on the device", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const project = page.locator("[data-project]", { hasText: "Personal" });
+    await project.locator("[data-row-menu]").click();
+    await page.locator(".menu-item-label", { hasText: /^project settings…$/ }).click();
+});
+
+Then("the device shows the Personal project settings", async ({ page }) => {
+    await expect(page.locator(".mobile-project-settings")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Personal", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Work & data", exact: true })).toBeVisible();
+});
+
+Then("Personal project settings do not offer sharing", async ({ page }) => {
+    const picker = page.getByLabel("Settings page for Personal");
+    await expect(picker.locator("option")).toHaveText([
+        "Work & data",
+        "Agents & placements",
+        "Model access",
+    ]);
+    await expect(picker.locator('option[value="people"]')).toHaveCount(0);
+});
+
+When("I switch the device project settings to {string}", async ({ page }, pageName: string) => {
+    await page.getByLabel("Settings page for Personal").selectOption({ label: pageName });
+});
+
+Then("the device shows project {string}", async ({ page }, pageName: string) => {
+    await expect(page.getByRole("heading", { name: pageName, exact: true })).toBeVisible();
+});
+
+When("I leave device project settings", async ({ page }) => {
+    await page.getByRole("button", { name: "Back to projects" }).click();
+});
+
+Then("the device shows the Projects browser", async ({ page }) => {
+    await expect(page.locator(".mobile-project-settings")).toHaveCount(0);
+    await expect(page.locator("[data-project]", { hasText: "Personal" })).toBeVisible();
+});
+
 // ---- cross-surface: the device and desktop are one workspace ----------------
 
 When("I start a new chat on the device", async ({ page }) => {
@@ -199,4 +241,3 @@ Then("the device's turn ends promptly", async ({ page }) => {
 });
 
 // ---- the human task queue (the top bar's Next ③ affordance) ------------------
-

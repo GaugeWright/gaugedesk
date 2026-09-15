@@ -261,7 +261,7 @@ export interface PublicDeploymentInput {
     readonly per_visitor_turn_limit: number;
     readonly max_concurrent_sessions: number;
     /** Product-facing funding choice. Managed funding names an authenticated
-     * account/tenant; the Hub-signed claims derive the hosted funding reference. */
+     * account/tenant; the account-service-signed claims carry the hosted funding reference. */
     readonly funding: {
         readonly kind: "managed";
         readonly tenant_id: string;

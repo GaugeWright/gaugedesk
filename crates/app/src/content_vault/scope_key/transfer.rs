@@ -147,7 +147,7 @@ impl ContentVault {
             .open(&path)?
             .sync_all()?;
         sync_directory(&root)?;
-        self.cache.lock().unwrap().remove(expected_scope);
+        self.key_state.lock().unwrap().cache.remove(expected_scope);
         Ok(PreparedScopeKey {
             root,
             scope: expected_scope.into(),

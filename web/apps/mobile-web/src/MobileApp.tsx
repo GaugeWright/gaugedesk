@@ -75,7 +75,10 @@ import {
     PairingFlow,
     parsePairingStatus,
     parseTicket,
+    ProjectSettingsContent,
+    ProjectSettingsMenu,
     type PairingState,
+    type ProjectSettingsPage,
     QueueSheet,
     reduceCarousel,
     reduceChatApproval,
@@ -87,6 +90,7 @@ import {
     type Transcript,
     type CarouselState,
     type PaneKind,
+    type SettingsGaugeAppAction,
 } from "@gaugewright/workbench-ui";
 import { createMobileSession } from "./mobile-session";
 import { MobileControlPlane } from "./mobile-control-plane";
@@ -127,11 +131,51 @@ import "./mobile-scanner.css";
  *  delegates here on that flag so the two shells share one entry point. */
 export function isMobileHarness(): boolean {
     if (typeof window === "undefined") return false;
+    if (import.meta.env.MODE === "mobile") return true;
     const p = new URLSearchParams(window.location.search);
     return p.get("mobile") === "1" || window.location.hash.replace(/^#/, "") === "mobile";
 }
 
-export function MobileApp(): JSX.Element {
+/** The management composition remains owned by the enterprise host. Mobile
+ * receives only the same presentation/controller seam as the desktop shell;
+ * it does not open a second GaugeApp session or own a copy of management
+ * state. */
+export interface MobileGaugeApps {
+    readonly active: () => boolean;
+    readonly accountActions: () => readonly SettingsGaugeAppAction[];
+    readonly organizationSelector: () => JSX.Element;
+    readonly chat: (controls: { readonly mobile: boolean; readonly onCollapse: () => void }) => JSX.Element;
+    readonly content: () => JSX.Element;
+    readonly menu: () => JSX.Element;
+    readonly titles: () => { readonly chat: string; readonly content: string; readonly files: string };
+    readonly close: () => void;
+    readonly onMobileAccountToken?: (token: string | null) => void | Promise<void>;
+}
+
+/** Phone-sized projection of one already-admitted GaugeApp. Page, persistent
+ * conversation, and page menu are three views of the same controller and stay
+ * mounted under one management destination. */
+export function MobileGaugeAppSurface(props: { readonly gaugeApps: MobileGaugeApps }): JSX.Element {
+    const [pane, setPane] = createSignal<"content" | "chat" | "menu">("content");
+    return <div class="mobile-gaugeapp" data-mobile-gaugeapp>
+        <header class="mobile-gaugeapp-head">
+            <button type="button" onClick={props.gaugeApps.close}>Back</button>
+            <h1>{props.gaugeApps.titles().content}</h1>
+        </header>
+        <nav class="mobile-gaugeapp-tabs" aria-label="Management view">
+            <button type="button" classList={{ active: pane() === "content" }} onClick={() => setPane("content")}>Page</button>
+            <button type="button" classList={{ active: pane() === "chat" }} onClick={() => setPane("chat")}>Conversation</button>
+            <button type="button" classList={{ active: pane() === "menu" }} onClick={() => setPane("menu")}>Menu</button>
+        </nav>
+        <div class="mobile-gaugeapp-body">
+            <Show when={pane() === "content"}>{props.gaugeApps.content()}</Show>
+            <Show when={pane() === "chat"}>{props.gaugeApps.chat({ mobile: true, onCollapse: () => setPane("content") })}</Show>
+            <Show when={pane() === "menu"}>{props.gaugeApps.menu()}</Show>
+        </div>
+    </div>;
+}
+
+export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}): JSX.Element {
     const [runtime, runtimeActions] = createResource(() => loadMobileRuntime());
     const [accessMode, setAccessMode] = createSignal<"account" | "direct" | null>(null);
     const [accountToken, setAccountToken] = createSignal<string | null>(null);
@@ -181,6 +225,7 @@ export function MobileApp(): JSX.Element {
                 setAccountError("Your session expired. Sign in again to reconnect.");
             } else {
                 setAccountToken(token);
+                void props.gaugeApps?.onMobileAccountToken?.(token);
                 setAccessMode("account");
             }
         }
@@ -201,7 +246,11 @@ export function MobileApp(): JSX.Element {
             setMachineEndpoint(loaded.endpoint);
             setAccessMode("direct");
         }
-        if (!loaded.native && accessMode() === null) {
+        // The standalone projection harness still enters direct pairing for
+        // its machine-protocol tests. The actual GaugeDesk composition has an
+        // account authority, so its first page must preserve Sign in as the
+        // primary act instead of silently selecting the secondary direct path.
+        if (!loaded.native && !props.gaugeApps && accessMode() === null) {
             setAccessMode("direct");
             setMachineEndpoint(loaded.endpoint);
         }
@@ -221,6 +270,7 @@ export function MobileApp(): JSX.Element {
                 await loaded.storeAccountToken(token);
                 accountSignedOut = false;
                 setAccountToken(token);
+                await props.gaugeApps?.onMobileAccountToken?.(token);
                 setAccountError(null);
                 setAccessMode("account");
             })
@@ -296,7 +346,7 @@ export function MobileApp(): JSX.Element {
             }
             if (permission !== "granted") {
                 setCameraSettingsNeeded(permission === "denied");
-                throw new Error("Camera access is required to scan a Machine invitation.");
+                throw new Error("Camera access is required to scan a Project Host invitation.");
             }
 
             const scanned = await scan({
@@ -307,7 +357,7 @@ export function MobileApp(): JSX.Element {
             const invitation = parseMachineInvitationLink(scanned.content);
             if (!invitation) {
                 throw new Error(
-                    "That QR code is not a current GaugeDesk Machine invitation.",
+                    "That QR code is not a current GaugeDesk Project Host invitation.",
                 );
             }
             setPendingInvitation(invitation);
@@ -349,8 +399,8 @@ export function MobileApp(): JSX.Element {
                             <div class="pairing-head">GaugeDesk</div>
                             <div class="status">
                                 {signedIn()
-                                    ? "Pair a Machine to open its projects and chats."
-                                    : "Sign in to open your projects wherever their Machines run."}
+                                    ? "Pair a Project Host to open its projects and chats."
+                                    : "Sign in to open your projects wherever their Project Hosts run."}
                             </div>
                             <Show when={!signedIn()}>
                                 <button
@@ -372,7 +422,7 @@ export function MobileApp(): JSX.Element {
                                 </div>
                             </Show>
                             <div class="mobile-enrollment-or">
-                                <span>pair a Machine</span>
+                                <span>pair a Project Host</span>
                             </div>
                             <Show when={loaded.credentials.length > 0}>
                                 <div class="mobile-saved-machines">
@@ -395,7 +445,7 @@ export function MobileApp(): JSX.Element {
                             </Show>
                             <div class="status">
                                 Scan the one-use invitation shown by GaugeDesk on the
-                                Machine you want this phone to follow.
+                                Project Host you want this phone to follow.
                             </div>
                             <Show when={loaded.native}>
                                 <button
@@ -417,8 +467,8 @@ export function MobileApp(): JSX.Element {
                                 autocomplete="url"
                                 class="pairing-code-input"
                                 data-machine-endpoint
-                                placeholder="https://machine.example.com"
-                                aria-label="Machine endpoint"
+                                placeholder="https://project-host.example.com"
+                                aria-label="Project Host endpoint"
                             />
                             <Show when={enrollmentError()}>
                                 <div class="status mobile-enrollment-error" role="alert">
@@ -510,7 +560,7 @@ export function MobileApp(): JSX.Element {
                                             setMachineEndpoint(null);
                                             setAccessMode(null);
                                             setEnrollmentError(
-                                                "This Machine no longer trusts this device. Pair it again.",
+                                                "This Project Host no longer trusts this device. Pair it again.",
                                             );
                                             void runtimeActions.refetch();
                                         }}
@@ -538,6 +588,7 @@ export function MobileApp(): JSX.Element {
                                 setAccessMode(null);
                             }}
                             onPairMachine={() => setAccessMode(null)}
+                            gaugeApps={props.gaugeApps}
                         />
                     </Show>
                 )}
@@ -567,6 +618,7 @@ function MobileAccountShell(props: {
     readonly onToken: (token: string) => void;
     readonly onSignOut: () => void;
     readonly onPairMachine: () => void;
+    readonly gaugeApps?: MobileGaugeApps;
 }): JSX.Element {
     const owner = decodeSubject(props.token) ?? "account:unresolved";
     let deviceStorage: Storage | null = null;
@@ -760,7 +812,7 @@ function MobileAccountShell(props: {
                                 freshness: {
                                     marker: "stale",
                                     generatedAt: cached.updatedAt,
-                                    repairHint: "Reconnect to this Machine to refresh.",
+                                    repairHint: "Reconnect to this Project Host to refresh.",
                                 },
                                 clientRequestId: null,
                             });
@@ -812,6 +864,7 @@ function MobileAccountShell(props: {
             );
             await props.runtime.storeAccountToken(token);
             props.onToken(token);
+            await props.gaugeApps?.onMobileAccountToken?.(token);
         } finally {
             refreshingAccount = false;
         }
@@ -843,11 +896,12 @@ function MobileAccountShell(props: {
         draftCache.clearAll();
         routeCache.clear();
         await props.runtime.clearAccountToken();
+        await props.gaugeApps?.onMobileAccountToken?.(null);
         props.onSignOut();
     }
 
     return (
-        <Show
+        <Show when={!props.gaugeApps?.active()} fallback={<MobileGaugeAppSurface gaugeApps={props.gaugeApps!} />}><Show
             when={selected() && activeConnection()}
             keyed
             fallback={
@@ -859,6 +913,14 @@ function MobileAccountShell(props: {
                         </button>
                     </header>
                     <main class="mobile-project-browser-body">
+                        <Show when={props.gaugeApps}>
+                            {(gaugeApps) => <section class="mobile-management-menu" aria-label="Account and organization management">
+                                {gaugeApps().organizationSelector()}
+                                <div class="mobile-account-actions">
+                                    <For each={gaugeApps().accountActions()}>{(action) => <button type="button" onClick={action.open}>{action.label}</button>}</For>
+                                </div>
+                            </section>}
+                        </Show>
                         <Show
                             when={!routes.loading && !projects.loading}
                             fallback={<div class="status">finding your projects…</div>}
@@ -880,7 +942,7 @@ function MobileAccountShell(props: {
                                                     No projects connected
                                                 </div>
                                                 <div class="status">
-                                                    Pair a Machine to open its projects,
+                                                    Pair a Project Host to open its projects,
                                                     chats, files, and tasks here.
                                                 </div>
                                                 <button
@@ -888,7 +950,7 @@ function MobileAccountShell(props: {
                                                     class="pairing-submit"
                                                     onClick={props.onPairMachine}
                                                 >
-                                                    pair a Machine
+                                                    pair a Project Host
                                                 </button>
                                             </div>
                                         }
@@ -957,7 +1019,7 @@ function MobileAccountShell(props: {
                     }}
                 />
             )}
-        </Show>
+        </Show></Show>
     );
 }
 
@@ -1016,7 +1078,7 @@ function MobileSession(props: {
                 setConnection((state) =>
                     reduceConnection(state, { kind: "relay", reachable: false }),
                 );
-                append("Machine session rejected; proving this device again…");
+                append("Project Host session rejected; proving this device again…");
             },
         });
     const browseApi = createMemo(() => {
@@ -1078,6 +1140,49 @@ function MobileSession(props: {
     // tree itself consumes reference-resolved deltas inside FacetBrowser (UX-12),
     // rather than using this key to refetch the whole workspace.
     const [wsKey, setWsKey] = createSignal(0);
+    const [projectSettings, setProjectSettings] = createSignal<{
+        readonly id: ProjectId;
+        readonly name: string;
+    } | null>(null);
+    const [projectSettingsPage, setProjectSettingsPage] =
+        createSignal<ProjectSettingsPage>("people");
+    const [projectSettingsWorkspace, { refetch: refetchProjectSettings }] = createResource(
+        () => {
+            const request = projectSettings();
+            return request ? ([request.id, wsKey()] as const) : false;
+        },
+        async ([id]) => {
+            const workspace = (await browseApi().getWorkspaceCarriage()).value;
+            const project = workspace.projects.find((candidate) => candidate.id === id);
+            if (!project) throw new Error("This project is no longer available from its Home.");
+            return { project, library: workspace.archetypes };
+        },
+    );
+    const currentProjectSettingsWorkspace = () => {
+        const request = projectSettings();
+        if (!request || projectSettingsWorkspace.error) return undefined;
+        const workspace = projectSettingsWorkspace();
+        return workspace?.project.id === request.id ? workspace : undefined;
+    };
+    createEffect(() => {
+        if (
+            currentProjectSettingsWorkspace()?.project.isPersonal
+            && projectSettingsPage() === "people"
+        ) {
+            setProjectSettingsPage("work-data");
+        }
+    });
+    const closeProjectSettings = () => {
+        setProjectSettings(null);
+        setProjectSettingsPage("people");
+    };
+    const openProjectSettings = (id: ProjectId, name: string) => {
+        setProjectSettings({ id, name });
+        setProjectSettingsPage("people");
+    };
+    const refreshProjectSettings = () => {
+        setWsKey((key) => key + 1);
+    };
 
     // The selected chat's worktree files (MOB-F: the Files pane mirrors the host's
     // worktree for the open chat, not a stub). `filesKey` bumps after a turn so a
@@ -1121,7 +1226,7 @@ function MobileSession(props: {
             signature,
         });
         if (opened.machine !== stored.machine) {
-            throw new Error("The session was issued by a different Machine");
+            throw new Error("The session was issued by a different Project Host");
         }
         setMachineSession(opened.session);
         setMachineSessionExpiresAt(opened.expiresAt);
@@ -1213,8 +1318,8 @@ function MobileSession(props: {
                     reducePairing(state, {
                         kind: "error",
                         reason: definitivelyUntrusted
-                            ? "This Machine no longer trusts this device. Pair it again."
-                            : "This Machine could not be reached. Your pairing is still saved.",
+                            ? "This Project Host no longer trusts this device. Pair it again."
+                            : "This Project Host could not be reached. Your pairing is still saved.",
                     }),
                 );
             })
@@ -1350,7 +1455,7 @@ function MobileSession(props: {
                 setPairing((s) => reducePairing(s, { kind: "status", status }));
                 if (status.paired) {
                     if (status.bound?.device !== DEVICE.id) {
-                        throw new Error("The Machine approved a different device identity");
+                        throw new Error("The Project Host approved a different device identity");
                     }
                     completePairing(ticket.environment, opened.bridgeGrant);
                     return;
@@ -1375,13 +1480,13 @@ function MobileSession(props: {
                 || !invitation.endpoint
                 || invitation.endpoint.replace(/\/+$/, "") !== props.runtime.endpoint
             ) {
-                throw new Error("invitation does not match this Machine");
+                throw new Error("invitation does not match this Project Host");
             }
         } catch (error) {
             setPairing((state) =>
                 reducePairing(state, {
                     kind: "error",
-                    reason: error instanceof Error ? error.message : "invalid Machine invitation",
+                    reason: error instanceof Error ? error.message : "invalid Project Host invitation",
                 }),
             );
             return;
@@ -1418,7 +1523,7 @@ function MobileSession(props: {
                     invitation.secret,
                 );
                 if (status.status === "rejected" || status.status === "revoked") {
-                    throw new Error(`Machine enrollment was ${status.status}`);
+                    throw new Error(`Project Host enrollment was ${status.status}`);
                 }
                 if (status.status === "granted" && status.grantId && status.credential) {
                     const stored: MachineCredential = {
@@ -1434,7 +1539,7 @@ function MobileSession(props: {
                 }
                 await new Promise((resolve) => setTimeout(resolve, 1_000));
             }
-            throw new Error("Machine approval timed out");
+            throw new Error("Project Host approval timed out");
         } catch (error) {
             setPairing((state) =>
                 reducePairing(state, {
@@ -1659,6 +1764,7 @@ function MobileSession(props: {
     const panes = (): Record<PaneKind, JSX.Element> => ({
         nav: (
             <div class="mobile-nav" data-pane="nav">
+                <Show when={projectSettings()} fallback={<>
                 {/* A small connection header (the e2e reads `data-paired-environment`). */}
                 <div
                     class="mobile-nav-head status"
@@ -1679,7 +1785,7 @@ function MobileSession(props: {
                     </Show>
                     <Show when={!props.account && props.runtime.native && storedCredential()}>
                         <button type="button" onClick={() => props.onChangeMachine?.()}>
-                            Machines
+                            Project Hosts
                         </button>
                         <button type="button" onClick={() => void forgetDirectMachine()}>
                             forget on this phone
@@ -1700,7 +1806,7 @@ function MobileSession(props: {
                     onOpenArchetypeSettings={() => undefined}
                     onOpenEngagement={() => undefined}
                     onOpenModelAccess={() => undefined}
-                    onOpenProjectHome={() => undefined}
+                    onOpenProjectHome={openProjectSettings}
                     onOpenForkTree={() => undefined}
                     onChatDeleted={(id) => {
                         if (engagement() === id) {
@@ -1717,6 +1823,43 @@ function MobileSession(props: {
                     deltaSync={!props.account}
                     onWorkspaceChange={() => setWsKey((k) => k + 1)}
                 />
+                </>}>
+                    <Show
+                        when={currentProjectSettingsWorkspace()}
+                        fallback={
+                            <Show
+                                when={projectSettingsWorkspace.error}
+                                fallback={<p class="project-settings-empty" role="status">Loading project settings…</p>}
+                            >
+                                {(error) => <div class="project-settings-empty" role="alert">
+                                    <p>Project settings unavailable: {String(error())}</p>
+                                    <button type="button" onClick={() => void refetchProjectSettings()}>Retry</button>
+                                    <button type="button" onClick={closeProjectSettings}>Back to projects</button>
+                                </div>}
+                            </Show>
+                        }
+                    >
+                        {(workspace) => <div class="mobile-project-settings">
+                            <ProjectSettingsMenu
+                                projectName={workspace().project.name}
+                                isPersonal={workspace().project.isPersonal}
+                                page={projectSettingsPage()}
+                                onSelect={setProjectSettingsPage}
+                                onClose={closeProjectSettings}
+                                closeLabel="Back to projects"
+                                compact
+                            />
+                            <ProjectSettingsContent
+                                api={api}
+                                project={workspace().project}
+                                library={workspace().library}
+                                page={projectSettingsPage()}
+                                onClose={closeProjectSettings}
+                                onChanged={refreshProjectSettings}
+                            />
+                        </div>}
+                    </Show>
+                </Show>
             </div>
         ),
         chat: (
@@ -1809,7 +1952,7 @@ function MobileSession(props: {
                             <div class="mobile-machine-current">
                                 <span>{props.runtime.endpoint}</span>
                                 <button type="button" onClick={() => props.onChangeMachine?.()}>
-                                    change Machine
+                                    change Project Host
                                 </button>
                             </div>
                         </Show>

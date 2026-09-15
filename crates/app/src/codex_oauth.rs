@@ -199,6 +199,27 @@ fn codex_status(wb: &SharedWorkbench, headers: &HeaderMap, hosted: bool) -> Json
     }))
 }
 
+/// Secret-free hosted status for an already authenticated exact account scope.
+/// GaugeApp adapters use this instead of rebuilding provider OAuth state.
+pub fn home_status_for_scope(wb: &crate::Workbench, scope: &str) -> Value {
+    let credential = credentials_in_scope(wb.store_ref(), scope)
+        .remove(PROVIDER)
+        .filter(|record| {
+            record.authentication == CredentialAuthentication::OAuth
+                && record.admits(ModelExecutionClass::PrivateHome)
+        })
+        .and_then(|record| wb.unseal_account_secret(&record.sealed_token))
+        .and_then(|encoded| serde_json::from_str::<CodexOAuthCredential>(&encoded).ok());
+    let expires = credential.as_ref().map(|value| value.expires);
+    json!({
+        "provider": PROVIDER,
+        "linked": credential.is_some(),
+        "expires": expires,
+        "expired": expires.is_some_and(|value| value <= now_ms()),
+        "login": device_login_for_scope(scope).map(|login| login.projection()),
+    })
+}
+
 fn node_bin() -> String {
     gaugedesk_env::var("NODE_BIN").unwrap_or_else(|| "node".to_owned())
 }
@@ -592,39 +613,19 @@ fn start_device_login_blocking(wb: SharedWorkbench, scope: String) -> Result<Val
     Ok(projection)
 }
 
-pub async fn post_home_codex_login_start(
-    State(wb): State<SharedWorkbench>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let scope = wb
-        .lock_unpoisoned()
-        .account_scope_for(net_http::bearer(&headers));
-    match tokio::task::spawn_blocking(move || start_device_login_blocking(wb, scope)).await {
-        Ok(Ok(login)) => Json(json!({ "mode": "device", "login": login })).into_response(),
-        Ok(Err(error)) => {
-            (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response()
-        }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Codex device-login task panicked",
-        )
-            .into_response(),
-    }
+pub async fn start_home_login_for_scope(
+    wb: SharedWorkbench,
+    scope: String,
+) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || start_device_login_blocking(wb, scope))
+        .await
+        .map_err(|_| "Codex device-login task panicked".to_owned())?
 }
 
-pub async fn post_home_codex_login_cancel(
-    State(wb): State<SharedWorkbench>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let scope = wb
-        .lock_unpoisoned()
-        .account_scope_for(net_http::bearer(&headers));
-    let login = device_login_for_scope(&scope).filter(DeviceLogin::active);
-    let Some(login) = login else {
-        return StatusCode::NO_CONTENT.into_response();
+pub fn cancel_home_login_for_scope(scope: &str) -> Result<(), String> {
+    let Some(login) = device_login_for_scope(scope).filter(DeviceLogin::active) else {
+        return Ok(());
     };
-    // Mark cancellation before the RPC write: a fast app-server may emit the
-    // completion notification before this handler regains the state lock.
     set_device_login_state(&login.login_id, DeviceLoginState::Cancelling, None);
     let sent = login
         .stdin
@@ -641,19 +642,41 @@ pub async fn post_home_codex_login_cancel(
             )
         });
     match sent {
-        Some(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Some(Ok(())) => Ok(()),
         _ => {
             set_device_login_state(
                 &login.login_id,
                 DeviceLoginState::Failed,
                 Some("could not cancel Codex device login".to_owned()),
             );
-            (
-                StatusCode::BAD_GATEWAY,
-                "could not cancel Codex device login",
-            )
-                .into_response()
+            Err("could not cancel Codex device login".into())
         }
+    }
+}
+
+pub async fn post_home_codex_login_start(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let scope = wb
+        .lock_unpoisoned()
+        .account_scope_for(net_http::bearer(&headers));
+    match start_home_login_for_scope(wb, scope).await {
+        Ok(login) => Json(json!({ "mode": "device", "login": login })).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response(),
+    }
+}
+
+pub async fn post_home_codex_login_cancel(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let scope = wb
+        .lock_unpoisoned()
+        .account_scope_for(net_http::bearer(&headers));
+    match cancel_home_login_for_scope(&scope) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
     }
 }
 
@@ -1320,7 +1343,10 @@ IFS= read -r done
         std::env::remove_var("GAUGEDESK_CODEX_BIN");
         assert_eq!(projection["user_code"], "ABCD-1234");
 
-        for _ in 0..100 {
+        // Completion is observed from the helper reader thread. This is a test
+        // synchronization bound, not a product deadline, so leave enough room
+        // for a loaded gate host to schedule that thread.
+        for _ in 0..1000 {
             if device_login_for_scope(&scope)
                 .is_some_and(|login| login.state == DeviceLoginState::Linked)
             {

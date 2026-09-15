@@ -35,6 +35,10 @@ pub const HIBERNATABLE_WEBSOCKET: &str = "hibernatable_websocket";
 pub const PUBLISHER_PROTOCOL: &str = "gaugewright.publisher.v1";
 const PUBLIC_PUBLISHER_KEY_SUFFIX: &str = "::public-publisher";
 const DEFAULT_PUBLIC_TURN_RESERVE_CENTS: u64 = 5;
+/// Account-plan allowance held for one public managed turn. This is a bounded
+/// accounting reservation; the provider-side request cutoff remains a
+/// separate runtime enforcement boundary.
+const DEFAULT_MANAGED_TURN_RESERVE_TOKENS: u64 = 8_192;
 
 fn reservation_cents_for_spend_guards(
     max_spend_cents: Option<u64>,
@@ -183,7 +187,7 @@ pub type PublishAudienceOidc = DeploymentAudienceOidc;
 
 /// Product-facing funding choice. The managed variant names the authenticated
 /// tenant, never a forgeable funding reference; the reference is derived from
-/// the Hub-signed claims after minting. Legacy request fields remain readable
+/// the account-service-signed claims after minting. Legacy request fields remain readable
 /// below for old automation during the migration window.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -227,7 +231,7 @@ pub struct PublishDeploymentRequest {
     /// from the Hub; it is never written into the hosted deployment config.
     #[serde(default)]
     pub managed_tenant_id: Option<String>,
-    /// A fresh Hub-signed entitlement bound to this Workbench's public
+    /// A fresh account-service-signed entitlement bound to this Workbench's public
     /// publisher key. Hosted compositions mint it in the authenticated browser
     /// plane; the desktop route may acquire it from its sealed Hub session.
     #[serde(default)]
@@ -1088,6 +1092,11 @@ impl Workbench {
                     "managed preview entitlement is not bound to this publisher",
                 ));
             }
+            if entitlement.claims.funding_ref != request.funding_ref {
+                return Err(invalid(
+                    "managed preview entitlement does not match the funding reference",
+                ));
+            }
             if entitlement.claims.exp <= now.as_secs() {
                 return Err(invalid("managed preview entitlement has expired"));
             }
@@ -1142,6 +1151,7 @@ impl Workbench {
             "max_session_spend_cents": PREVIEW_SESSION_CENTS,
             "max_turn_spend_cents": PREVIEW_TURN_CENTS,
             "reserve_cents_per_turn": DEFAULT_PUBLIC_TURN_RESERVE_CENTS,
+            "reserve_tokens_per_turn": DEFAULT_MANAGED_TURN_RESERVE_TOKENS,
             "per_visitor_turn_limit": 20,
             "max_concurrent_sessions": 1,
             "funding_ref": request.funding_ref,
@@ -1425,6 +1435,11 @@ impl Workbench {
                     "managed funding entitlement is not bound to this publisher",
                 ));
             }
+            if entitlement.claims.funding_ref != request.funding_ref {
+                return Err(invalid(
+                    "managed funding entitlement does not match the funding reference",
+                ));
+            }
             if entitlement.claims.exp
                 <= SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -1553,6 +1568,7 @@ impl Workbench {
             "max_session_spend_cents": request.max_session_spend_cents,
             "max_turn_spend_cents": max_turn_spend_cents,
             "reserve_cents_per_turn": reserve_cents_per_turn,
+            "reserve_tokens_per_turn": DEFAULT_MANAGED_TURN_RESERVE_TOKENS,
             "per_visitor_turn_limit": request.per_visitor_turn_limit,
             "max_concurrent_sessions": request.max_concurrent_sessions,
             "funding_ref": request.funding_ref.clone(),

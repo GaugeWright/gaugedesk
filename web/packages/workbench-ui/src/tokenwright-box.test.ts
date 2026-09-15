@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ManagementEnvironmentSession } from "@gaugewright/control-plane-client";
+import type { TokenWrightSession } from "@gaugewright/control-plane-client";
 import { setTokenWrightDesired, tokenwrightCommandsFrom } from "./tokenwright-box";
 
 function fakeJson(response: unknown) {
@@ -11,7 +11,7 @@ function fakeJson(response: unknown) {
     return { json: json as never, calls };
 }
 
-const session: ManagementEnvironmentSession = {
+const session: TokenWrightSession = {
     id: "sess_1",
     environment: "tokenwright",
     scope: { kind: "tenant", id: "tenant-a" },
@@ -64,7 +64,7 @@ describe("binding a TokenWright session to runnable controls", () => {
     });
 
     it("offers nothing for a document whose grant carries no commands", () => {
-        const readOnly: ManagementEnvironmentSession = {
+        const readOnly: TokenWrightSession = {
             ...session,
             documents: session.documents.map((d) => ({ ...d, commands: [] })),
         };
@@ -72,8 +72,8 @@ describe("binding a TokenWright session to runnable controls", () => {
             json: fakeJson(receipt("applied")).json, session: readOnly,
             revisionOf: () => "rev-1",
         });
-        // The renderer draws these as "Unavailable in this session" rather than
-        // as a button that fails when pressed.
+        // A native panel can render these as unavailable without manufacturing
+        // a runnable action.
         expect(Object.keys(commands)).toEqual([]);
     });
 
@@ -168,19 +168,9 @@ describe("selecting a model, which is a literal edit", () => {
         engine: { name: "FreeToken", status: "running" },
     };
 
-    it("sends ONLY the editable block, never a projected field", async () => {
-        // The bug this replaces: the whole document went back with `desired`
-        // swapped, which echoed live projections — relay and direct status,
-        // and every key's `last_used_at` — straight back at the box. The box
-        // compares what the client SENT against what it now holds, so any
-        // projection that moved in the window between read and write turned a
-        // perfectly ordinary edit into a 422. `last_used_at` is stamped at
-        // whole-second granularity, so it fired when an edit happened to
-        // straddle a second boundary and passed otherwise.
-        //
-        // Sending only `desired` makes that race structurally impossible
-        // rather than rare, which is why this asserts on the ABSENCE of the
-        // other keys and not merely on `desired` being right.
+    it("sends only the editable block, never a projected field", async () => {
+        // A projection may change during authentication. Its absence from
+        // the edit must be structural, not dependent on wall-clock timing.
         const route = fakeJson({ receipt: { id: "rcpt_2", status: "applied" } });
         await setTokenWrightDesired(route.json, {
             session, documentId: "tokenwright.inference", baseRevision: "rev-1",
@@ -193,7 +183,7 @@ describe("selecting a model, which is a literal edit", () => {
     });
 
     it("is refused when the grant does not mark the document editable", async () => {
-        const readOnly: ManagementEnvironmentSession = {
+        const readOnly: TokenWrightSession = {
             ...session,
             documents: session.documents.map((d) => ({ ...d, editable: false })),
         };

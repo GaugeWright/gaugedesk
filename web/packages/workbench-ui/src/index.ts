@@ -16,6 +16,13 @@ export type {
     SettingsSurfaceProps,
 } from "./SettingsSurface";
 export { AccountMenu } from "./AccountMenu";
+export { AccountEntry } from "./AccountEntry";
+export type { AccountEntryProps, AccountRecoveryActions, PasskeyAccountActions } from "./AccountEntry";
+export { gaugeAppMenuIdentity } from "./gaugeapp-identity";
+export { createGaugeAppResource, refreshGaugeAppResources } from "./gaugeapp-resource";
+export { createGaugeAppOperations, gaugeAppContextChanged, type GaugeAppOperation } from "./gaugeapp-operations";
+export { createGaugeAppUpdateChannel, GAUGEAPP_UPDATE_INTERVAL_MS, GAUGEAPP_UPDATE_RETRY_MS } from "./gaugeapp-update-channel";
+export type { GaugeAppUpdateScheduler } from "./gaugeapp-update-channel";
 export type { AccountMenuItem, AccountMenuProps, MenuComposition, MenuIdentity } from "./AccountMenu";
 export { FirstRunOverlay } from "./FirstRunOverlay";
 export type { FirstRunAccount, FirstRunApi } from "./FirstRunOverlay";
@@ -91,35 +98,21 @@ export {
     MANAGED_PLAN_PREFIX,
 } from "./deployment-funding";
 export type { FundingDraft, FundingFields, FundingMode } from "./deployment-funding";
-export { BUILTIN_COMPONENTS, EnvironmentDocumentView } from "./EnvironmentDocumentView";
-export type {
-    EnvironmentComplexView,
-    EnvironmentComplexViewProps,
-    EnvironmentViewCommand,
-    EnvironmentViewRegistry,
-} from "./EnvironmentDocumentView";
-export {
-    EnvironmentViewError,
-    manifestDocumentForPath,
-    parseEnvironmentManifest,
-    parseEnvironmentView,
-    resolveDocumentPath,
-} from "./environment-view";
 export {
     TOKENWRIGHT_COMMANDS,
-    TOKENWRIGHT_HELP_SOURCES,
-    TOKENWRIGHT_MANIFEST,
+    TOKENWRIGHT_DOCUMENTS,
     TOKENWRIGHT_SCHEMAS,
-    TOKENWRIGHT_VIEW_SOURCES,
-    tokenwrightViewRegistry,
 } from "./tokenwright-environment";
-export type { TokenWrightCommandDeclaration } from "./tokenwright-environment";
+export type {
+    TokenWrightCommandDeclaration,
+    TokenWrightDocumentDeclaration,
+    TokenWrightDocumentValidator,
+} from "./tokenwright-environment";
 export {
     setTokenWrightDesired,
     tokenwrightCommandsFrom,
-    tokenwrightRegistryFor,
 } from "./tokenwright-box";
-export type { TokenWrightCommandBinding } from "./tokenwright-box";
+export type { TokenWrightCommandAction, TokenWrightCommandBinding } from "./tokenwright-box";
 export { TokenWrightBoxesSection } from "./TokenWrightBoxesSection";
 export { TokenWrightBoxPanel } from "./TokenWrightBoxPanel";
 export type { TokenWrightBoxPanelProps } from "./TokenWrightBoxPanel";
@@ -131,11 +124,6 @@ export type {
     TokenWrightProviderRow,
     TokenWrightReachability,
 } from "./tokenwright-provider";
-export type {
-    EnvironmentDocumentBinding,
-    EnvironmentManifest,
-    EnvironmentViewNode,
-} from "./environment-view";
 export { defaultContentMode, isSettledPhase, keptLabel, phaseLabel, shouldShowViewOnSelect } from "./content-view";
 export type { ChatKind as ContentChatKind } from "./content-view";
 export { ContextMenu } from "./ContextMenu";
@@ -160,7 +148,10 @@ export type {
     SessionBinding,
 } from "./environment";
 export { ProjectModelAccessPanel } from "./ProjectModelAccessPanel";
+export { ProjectModelAccessContent } from "./ProjectModelAccessPanel";
 export type { ProjectModelAccessApi } from "./ProjectModelAccessPanel";
+export { ProjectSettingsContent, ProjectSettingsMenu } from "./ProjectSettings";
+export type { ProjectSettingsApi, ProjectSettingsPage } from "./ProjectSettings";
 export { ProjectHomePanel } from "./ProjectHomePanel";
 export { ProjectTrackerPanel } from "./ProjectTrackerPanel";
 export type { ProjectTrackerApi, PendingTrackerCompletion } from "./ProjectTrackerPanel";
@@ -173,8 +164,6 @@ export { archetypeVisible, childrenFor, groupChatsByArchetype, hit, lineageVarie
 export type { ChatGroup, FilterArchetype, FilterChat, FilterPlacement, FilterProject, MatchSplit, RecentChat } from "./facet-filter";
 export { forkSource, isFork } from "./fork-lineage";
 export { FreshnessBanner } from "./FreshnessBanner";
-export { EnvironmentContentViewer } from "./EnvironmentContentViewer";
-export type { EnvironmentContentViewerProps } from "./EnvironmentContentViewer";
 export { Icon } from "./icons";
 export type { IconName } from "./icons";
 export { LoadError } from "./LoadError";
@@ -189,10 +178,13 @@ export type { AccessPhase, FileNode, FilePresentation } from "./mobile-files";
 export { ADVANCEMENT_RULES_SETTING, parseAdvancementScopes, serializeAdvancementScopes } from "./advancement";
 export { ATTENTION_RULES_SETTING, ATTENTION_SIGNALS, parseAttentionRules, serializeAttentionRules } from "./attention";
 export type { AttentionLevel, AttentionSignal, AttentionSignalMeta } from "./attention";
-export { catalogWithEndpointModels, declaredModelsFor, defaultOption, defaultVisibleKeys, DEFAULT_OPTION, ENABLED_MODELS_SETTING, ENDPOINT_MODELS_SETTING, isDefaultVisible, modelAcceptsImages, modelKey, modelOptions, parseEnabledModels, parseEndpointModels, pickableModels, providerTakesCustomModel, providerTakesEndpoint, serializeEnabledModels, serializeEndpointModels, thinkingLevelsFor, withDeclaredModels } from "./model-picker";
+export { catalogWithEndpointModels, declaredModelsFor, defaultOption, defaultVisibleKeys, DEFAULT_OPTION, ENABLED_MODELS_SETTING, ENDPOINT_MODELS_SETTING, isDefaultVisible, modelAcceptsImages, modelKey, modelOptions, parseEnabledModels, parseEndpointModels, pickableModels, providerTakesCustomModel, providerTakesEndpoint, servedModelLabel, serializeEnabledModels, serializeEndpointModels, thinkingLevelsFor, withDeclaredModels } from "./model-picker";
 export type { DeclaredModels, ModelOption, PickableModel, ResolvedDefault } from "./model-picker";
 export { SettingsMenu as OpenSettingsMenu } from "./OpenSettingsMenu";
-export type { SettingsMenuApi as OpenSettingsMenuApi } from "./OpenSettingsMenu";
+export type {
+    SettingsGaugeAppAction,
+    SettingsMenuApi as OpenSettingsMenuApi,
+} from "./OpenSettingsMenu";
 export { OutputCatalog } from "./OutputCatalog";
 export { deriveStep as derivePairingStep, initialPairing, pairingTicket, parsePairingStatus, parseTicket, presentPairing, reducePairing } from "./pairing";
 export type { PairingPhase, PairingState, PairingStatus, PairingStep, PairingTicket, TicketSource } from "./pairing";
@@ -206,6 +198,8 @@ export type { PolicyNote, PolicyReading } from "./policy-diff";
 export { DEFAULT_DECAY, ProjectionCache, cacheKey, decayFreshness } from "./projection-cache";
 export type { CacheStorage, DecayPolicy } from "./projection-cache";
 export { qrSvg } from "./qr-code";
+export { browserRecoveryHolder, ensureBrowserRecoveryHolder, rewrapBackupPointKey } from "./backup-recovery";
+export type { BrowserRecoveryHolder, OpaqueBackupWrap } from "./backup-recovery";
 export { availabilityLabel, availabilityOf, contextSources, exportPhaseLabel, isContextSource, isOutput, kindLabel, outputProtectionLabel, outputs, resourceTitle, reviewPhaseLabel } from "./resource-catalog";
 export type { Availability } from "./resource-catalog";
 export { DevicesModal } from "./DevicesModal";

@@ -1,7 +1,7 @@
 //! Enterprise governance projections and external protocol routes (`ORG-1`,
 //! B10/B11). Administration reads fold the tenant's records on demand (`INV-5`).
 //! Durable human management writes are deliberately absent from `/admin/*`: they
-//! enter through [`crate::environment_routes`], which binds the authenticated actor,
+//! enter through [`crate::gaugeapp_routes`], which binds the authenticated actor,
 //! exact tenant scope, capability, document base, idempotency key, and review.
 //! SCIM remains a separate external-actor protocol. Verified-domain JIT admission
 //! happens inside the authenticated OIDC callback and has no public mutation route.
@@ -11,21 +11,22 @@
 
 use axum::routing::{get, patch, post};
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use gaugedesk_core::abac::Policy;
 use gaugedesk_core::rbac::Capability;
 
 use gaugedesk_app::org::{
-    is_privileged_role, is_valid_role, ArchetypeApprovalPolicyRecord, GroupMappingRecord,
-    MemberGrantRecord, MembershipRecord, MembershipStatus, Org, OrgRecord, PolicyRecord, RecordOp,
-    SecurityPolicyRecord, SoftwarePolicyRecord, SsoConnectionRecord, ORG_ID,
+    is_privileged_role, is_valid_role, tenant_scope, ArchetypeApprovalPolicyRecord,
+    GroupMappingRecord, MemberGrantRecord, MembershipRecord, MembershipStatus, Org, OrgRecord,
+    PolicyRecord, RecordOp, SecurityPolicyRecord, SoftwarePolicyRecord, SsoBrowserTestRecord,
+    SsoConnectionRecord, SsoProtocol, ORG_ID, SSO_BROWSER_TEST_KIND,
 };
 use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 
@@ -41,7 +42,16 @@ use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 /// connection attaches the OIDC verifier before any request is served — the
 /// same pre-request timing the pre-split workbench-open activation had.
 pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
-    crate::auth_oidc::activate_configured_idp(&mut wb.lock_unpoisoned());
+    {
+        let mut guard = wb.lock_unpoisoned();
+        crate::auth_oidc::activate_configured_idp(&mut guard);
+        // GAUGEAPP-9: repair legacy consumer sign-in before the router exists, so no
+        // account that predates the linking rule meets a refusal it cannot resolve.
+        let linked = gaugedesk_app::auth_oidc::backlink_legacy_consumer_accounts(&mut guard);
+        if linked > 0 {
+            println!("account-auth: back-linked {linked} legacy consumer sign-in(s)");
+        }
+    }
     // ENTSEC-1: the middleware needs its own handle to the workbench (the router
     // moves `wb` into `.with_state`).
     let auth_wb = wb.clone();
@@ -58,6 +68,11 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
         // operation signs/opens with the co-resident desktop's root key.
         .merge(gaugedesk_app::account_routes::hub_routes())
         .merge(gaugedesk_app::account_routes::runtime_credential_routes())
+        // Native Desk reaches the independently deployed person account plane
+        // through its co-resident sealed-session proxy. Hosted Cloud mounts the
+        // real Account Settings handlers instead and never installs this route
+        // set or marker.
+        .merge(gaugedesk_app::account_signin::gaugeapp_proxy_routes())
         .merge(gaugedesk_app::facility_routes::routes())
         .merge(gaugedesk_app::mobile_machine_session::routes())
         // Materialize non-environment mutation idempotency inside the
@@ -72,6 +87,7 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
             auth_wb,
             enterprise_auth,
         ))
+        .layer(Extension(gaugedesk_app::account_signin::NativeAccountPlane))
         .layer(gaugedesk_app::net_http::cors_layer())
         .with_state(wb.clone())
         .layer(axum::middleware::from_fn(
@@ -88,13 +104,136 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
 /// pending-login store) and hands it to the `/auth/*` handlers as an
 /// `Extension`, so the pending-login lifetime spans requests.
 pub fn routes() -> Router<SharedWorkbench> {
+    routes_with_auth_state(auth_shell_state())
+}
+
+/// One hosted composition owns one authentication shell. Cloud passes this
+/// same handle to the login routes and Account Settings GaugeApp so transient
+/// passkey ceremonies cannot split across two process-local stores.
+pub fn auth_shell_state() -> crate::auth_oidc::AuthShellState {
     // The enterprise composition registers its login fold (ADR 0122 §3):
-    // verified-domain JIT membership. The shell itself carries no membership
-    // consequences.
-    let enterprise_auth_state = crate::auth_oidc::AuthShellState::new()
-        .with_login_fold(crate::login_fold::hub_login_fold());
+    // exact subject-to-account resolution plus the organization's explicit
+    // invited-only, verified-domain JIT, or SCIM admission policy. The shell
+    // verifies the assertion and mints a session only after this returns.
+    crate::auth_oidc::AuthShellState::new()
+        .with_login_fold(crate::login_fold::hub_login_fold())
+        .with_enterprise_connection_test_fold(std::sync::Arc::new(fold_enterprise_connection_test))
+}
+
+/// Admit successful OIDC browser-test evidence without turning the verified
+/// subject into a login or membership. The pending state proves who initiated
+/// the test; this fold rechecks that actor's live capability and the exact
+/// connection revision after the provider round trip.
+fn fold_enterprise_connection_test(
+    wb: &mut Workbench,
+    pending: &crate::auth_oidc::PendingEnterpriseConnectionTest,
+    verified: &crate::auth_oidc::VerifiedOidcIdentity,
+) -> Result<(), String> {
+    record_enterprise_connection_test(
+        wb,
+        pending,
+        SsoProtocol::Oidc,
+        &verified.authority,
+        &verified.attributes,
+    )
+}
+
+pub(crate) fn record_enterprise_connection_test(
+    wb: &mut Workbench,
+    pending: &crate::auth_oidc::PendingEnterpriseConnectionTest,
+    protocol: SsoProtocol,
+    authority: &gaugedesk_core::ids::AuthorityId,
+    attributes: &gaugedesk_core::abac::AuthorityAttributes,
+) -> Result<(), String> {
+    let org = Org::rebuild_in(wb.store_ref(), &pending.store_scope)
+        .map_err(|_| "organization directory unavailable".to_owned())?;
+    let connection = org
+        .sso
+        .as_ref()
+        .ok_or_else(|| "corporate sign-in is no longer configured".to_owned())?;
+    if connection.id != pending.connection_id
+        || connection.current_revision() != pending.connection_revision
+        || connection.protocol != protocol
+    {
+        return Err("corporate sign-in changed during the browser test".to_owned());
+    }
+    let role = org
+        .role_of(&pending.actor)
+        .ok_or_else(|| "the initiating administrator is no longer active".to_owned())?;
+    if !gaugedesk_core::rbac::role_can(&role, Capability::ConfigureSso) {
+        return Err("the initiating administrator can no longer configure sign-in".to_owned());
+    }
+    let record = SsoBrowserTestRecord {
+        id: pending.id.clone(),
+        connection_id: pending.connection_id.clone(),
+        connection_revision: pending.connection_revision.clone(),
+        protocol,
+        subject: authority.as_str().to_owned(),
+        mapped_roles: attributes
+            .roles
+            .iter()
+            .map(|role| role.as_str().to_owned())
+            .collect(),
+        mapped_region: attributes
+            .region
+            .as_ref()
+            .map(|region| region.as_str().to_owned()),
+        mapped_tenant: attributes
+            .affiliation
+            .as_ref()
+            .map(|tenant| tenant.as_str().to_owned()),
+        initiated_by: pending.actor.clone(),
+        tested_at_ms: gaugedesk_app::account::session_now_ms(),
+    };
+    wb.store_mut()
+        .append_record(
+            &pending.store_scope,
+            SSO_BROWSER_TEST_KIND,
+            &serde_json::to_string(&record).map_err(|_| "test evidence did not serialize")?,
+        )
+        .map_err(|_| "test evidence could not be recorded".to_owned())?;
+    gaugedesk_app::audit::record_in(
+        wb,
+        &pending.store_scope,
+        &pending.actor,
+        "enterprise-identity.connection.browser-tested",
+        &pending.connection_id,
+    );
+    wb.notify_library_changed(SSO_BROWSER_TEST_KIND, &record.id, "append");
+    Ok(())
+}
+
+pub fn routes_with_auth_state(
+    enterprise_auth_state: crate::auth_oidc::AuthShellState,
+) -> Router<SharedWorkbench> {
+    let saml_state = crate::identity_saml::SamlBrowserState::default();
+    let saml_login_state = saml_state.clone();
+    let enterprise_auth_state =
+        enterprise_auth_state.with_enterprise_saml_start(std::sync::Arc::new(move |request| {
+            let base = request.public_base.clone();
+            let sp = sp_entity_id(&base);
+            let acs = format!("{base}/auth/saml/acs");
+            saml_login_state
+                .begin_login(request, &sp, &acs)
+                .map(|launch| launch.launch_url)
+                .map_err(|error| match error {
+                    crate::identity_saml::SamlBrowserError::Metadata(error) => {
+                        error.message().to_owned()
+                    }
+                    crate::identity_saml::SamlBrowserError::NotSaml => {
+                        "the selected connection is not SAML".to_owned()
+                    }
+                    crate::identity_saml::SamlBrowserError::Request => {
+                        "could not build the SAML sign-in request".to_owned()
+                    }
+                })
+        }));
     Router::new()
-        .merge(crate::environment_routes::routes())
+        .merge(
+            crate::gaugeapp_routes::routes()
+                .layer(Extension(enterprise_auth_state.clone()))
+                .layer(Extension(saml_state.clone())),
+        )
         // Capability-gated entry to the Administration Environment (`ADMIN-ENV-2`).
         // This read is available to every authenticated active member; an incapable
         // role receives an empty list rather than access to another Admin surface.
@@ -113,9 +252,20 @@ pub fn routes() -> Router<SharedWorkbench> {
         // Enrolled members must evaluate the tenant placement floor before pairing.
         // This is not an Administration projection: it is a client enforcement input.
         .route("/admin/placement-policy", get(get_placement_policy))
+        // Member-readable picker projection for ordinary Project settings. The
+        // Home, not this directory, owns the resulting project invitation.
+        .route(
+            "/account/tenants/{tenant}/project-share-candidates",
+            get(get_project_share_candidates),
+        )
         // The consumer login shell is core (ADR 0122); this composition mounts
         // it with the enterprise login fold registered above.
-        .merge(crate::auth_oidc::auth_routes(enterprise_auth_state))
+        .merge(crate::auth_oidc::auth_routes(enterprise_auth_state.clone()))
+        .merge(
+            crate::identity_saml::browser_routes()
+                .layer(Extension(enterprise_auth_state))
+                .layer(Extension(saml_state)),
+        )
         // SCIM provisioning is an external protocol actor. Administration issues
         // its token and group mappings only through the shared Environment command path.
         .route("/scim/v2/Users", post(crate::scim_routes::post_scim_user))
@@ -123,6 +273,239 @@ pub fn routes() -> Router<SharedWorkbench> {
             "/scim/v2/Users/{id}",
             patch(crate::scim_routes::patch_scim_user).delete(crate::scim_routes::delete_scim_user),
         )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ProjectShareCandidate {
+    authority: String,
+    label: String,
+}
+
+fn project_share_candidates(org: &Org, actor: &str) -> Vec<ProjectShareCandidate> {
+    let mut candidates: Vec<_> = org
+        .members
+        .values()
+        .filter(|member| {
+            member.status == MembershipStatus::Active
+                && member.authority != actor
+                && !member.authority.trim().is_empty()
+        })
+        .map(|member| ProjectShareCandidate {
+            authority: member.authority.clone(),
+            label: if member.email.trim().is_empty() {
+                member.authority.clone()
+            } else {
+                member.email.clone()
+            },
+        })
+        .collect();
+    candidates.sort_by(|left, right| {
+        left.label
+            .to_lowercase()
+            .cmp(&right.label.to_lowercase())
+            .then_with(|| left.authority.cmp(&right.authority))
+    });
+    candidates
+}
+
+async fn get_project_share_candidates(
+    State(wb): State<SharedWorkbench>,
+    Path(tenant): Path<String>,
+    Extension(actor): Extension<gaugedesk_app::identity::AuthenticatedActor>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    if tenant_scope(&tenant) != req_scope(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "tenant mismatch" })),
+        )
+            .into_response();
+    }
+    match Org::rebuild_in(wb.store_ref(), &req_scope(&headers)) {
+        Ok(org) => (
+            StatusCode::OK,
+            Json(json!({
+                "candidates": project_share_candidates(&org, actor.0.as_str())
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "tenant directory unavailable" })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod project_share_directory_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use gaugedesk_app::identity::LoopbackIdentityProvider;
+    use gaugedesk_app::open_workbench;
+    use gaugedesk_app::org::{MembershipRecord, MembershipStatus, Org, RecordOp};
+    use gaugedesk_app::tenancy::provision_personal_tenant;
+    use gaugedesk_app::LockUnpoisoned;
+    use gaugedesk_core::abac::AuthorityAttributes;
+    use gaugedesk_core::ids::AuthorityId;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use super::{
+        enterprise_auth, get_project_share_candidates, project_share_candidates,
+        ProjectShareCandidate,
+    };
+
+    fn member(authority: &str, email: &str, status: MembershipStatus) -> MembershipRecord {
+        MembershipRecord {
+            id: authority.into(),
+            op: RecordOp::Upsert,
+            org_id: "organization:example".into(),
+            authority: authority.into(),
+            email: email.into(),
+            role: "member".into(),
+            status,
+            managed_by_scim: false,
+            team: None,
+        }
+    }
+
+    #[test]
+    fn picker_projects_only_other_active_account_identities() {
+        let org = Org {
+            members: BTreeMap::from([
+                (
+                    "owner".into(),
+                    member(
+                        "authority:owner",
+                        "owner@example.test",
+                        MembershipStatus::Active,
+                    ),
+                ),
+                (
+                    "active".into(),
+                    member(
+                        "authority:active",
+                        "active@example.test",
+                        MembershipStatus::Active,
+                    ),
+                ),
+                (
+                    "inactive".into(),
+                    member(
+                        "authority:inactive",
+                        "inactive@example.test",
+                        MembershipStatus::Deprovisioned,
+                    ),
+                ),
+            ]),
+            ..Org::default()
+        };
+        assert_eq!(
+            project_share_candidates(&org, "authority:owner"),
+            vec![ProjectShareCandidate {
+                authority: "authority:active".into(),
+                label: "active@example.test".into(),
+            },]
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_active_members_can_read_the_picker_but_outsiders_cannot() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = open_workbench(root.path()).unwrap();
+        let tenant = {
+            let mut guard = workbench.lock_unpoisoned();
+            guard.set_identity_provider(Some(Arc::new(
+                LoopbackIdentityProvider::new()
+                    .enroll(
+                        "owner-login",
+                        AuthorityId::new("authority:owner"),
+                        AuthorityAttributes::default(),
+                    )
+                    .enroll(
+                        "member-login",
+                        AuthorityId::new("authority:member"),
+                        AuthorityAttributes::default(),
+                    )
+                    .enroll(
+                        "outsider-login",
+                        AuthorityId::new("authority:outsider"),
+                        AuthorityAttributes::default(),
+                    ),
+            )));
+            let tenant = provision_personal_tenant(
+                guard.store_mut(),
+                "authority:owner",
+                "Example Organization",
+            )
+            .unwrap();
+            let member = member(
+                "authority:member",
+                "member@example.test",
+                MembershipStatus::Active,
+            );
+            guard
+                .store_mut()
+                .append_record(
+                    &gaugedesk_app::org::tenant_scope(&tenant),
+                    "membership",
+                    &serde_json::to_string(&MembershipRecord {
+                        org_id: tenant.clone(),
+                        ..member
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            tenant
+        };
+        let app = Router::new()
+            .route(
+                "/account/tenants/{tenant}/project-share-candidates",
+                get(get_project_share_candidates),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                workbench.clone(),
+                enterprise_auth,
+            ))
+            .with_state(workbench);
+        let path = format!("/account/tenants/{tenant}/project-share-candidates");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(&path)
+                    .header("authorization", "Bearer member-login")
+                    .header("x-gaugewright-tenant", &tenant)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(value["candidates"][0]["authority"], "authority:owner");
+
+        let forbidden = app
+            .oneshot(
+                Request::get(&path)
+                    .header("authorization", "Bearer outsider-login")
+                    .header("x-gaugewright-tenant", &tenant)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    }
 }
 
 // ---- helpers -------------------------------------------------------------
@@ -208,6 +591,7 @@ fn entsec_exempt(path: &str) -> bool {
         // Stripe authenticates delivery with its signed webhook header. The route must
         // reach that verifier without a browser/member bearer; it grants no account access.
         || path == "/stripe/webhook"
+        || path == "/stripe/connect/webhook"
         || path.starts_with("/auth/")
         || path.starts_with("/scim/")
         || path.starts_with("/saml/")
@@ -222,6 +606,13 @@ fn entsec_exempt(path: &str) -> bool {
         // an invitation impossible to accept.
         || path == "/account/invitations"
         || path.starts_with("/account/invitations/")
+        // A commercial proposal link carries its own one-use recipient proof.
+        // Preview grants only that proposal's commercial terms; acceptance
+        // additionally verifies the addressed GaugeDesk account when present.
+        // Requiring provider-tenant membership in this outer layer would hand
+        // the acceptance boundary back to the provider or make it unreachable.
+        || path == "/commercial/proposals/preview"
+        || path == "/commercial/proposals/accept"
         // ADR 0109 pre-auth controller ceremony. Each route owns a one-use
         // invitation/challenge/credential proof and grants no account/admin API.
         || path == "/mobile/enrollment/claim"
@@ -230,6 +621,37 @@ fn entsec_exempt(path: &str) -> bool {
         || path == "/mobile/sessions/challenge"
         || path == "/mobile/sessions"
         || path.starts_with("/test/")
+}
+
+/// Exact Administration GaugeApp routes that rebuild the recovery-restricted
+/// session before projecting or mutating anything. Keep this allowlist closed:
+/// a future route under the same prefix must choose recovery deliberately.
+fn administration_sso_recovery_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/gaugeapps/administration/sessions"
+            | "/gaugeapps/administration/updates"
+            | "/gaugeapps/administration/commands"
+            | "/gaugeapps/administration/enterprise-identity/credential"
+            | "/gaugeapps/administration/proposals"
+            | "/gaugeapps/administration/agent/messages"
+            | "/gaugeapps/administration/agent/events"
+            | "/gaugeapps/administration/agent/stop"
+            | "/gaugeapps/administration/agent/erase"
+    ) || path.starts_with("/gaugeapps/administration/pages/")
+        || (path.starts_with("/gaugeapps/administration/proposals/") && path.ends_with("/review"))
+}
+
+/// Person-owned account routes authenticate the GaugeDesk account but do not
+/// require membership in whichever organization happens to be selected. The
+/// project-share directory is the exception: it reads an exact tenant's member
+/// roster and therefore stays on the ordinary organization gate. Tenant-bound
+/// account commands (for example managed funding) perform their explicit role
+/// check inside the handler against the person's admitted tenant index.
+fn person_account_path(path: &str) -> bool {
+    path.starts_with("/account/")
+        && !path.ends_with("/project-share-candidates")
+        && !path.starts_with("/account/hub-session")
 }
 
 /// ENTSEC-1 middleware ([ADR 0065]): in **enterprise mode** (an `IdentityProvider` is attached
@@ -270,7 +692,7 @@ pub async fn enterprise_auth(
                 .into_response();
         }
     }
-    let bearer = bearer(req.headers());
+    let bearer = bearer(req.headers()).map(str::to_owned);
     let path = req.uri().path().to_string();
     let method = req.method().clone();
     let client = gaugedesk_app::client_admission::ClientBuild::from_headers(req.headers());
@@ -279,6 +701,48 @@ pub async fn enterprise_auth(
     // desktop updater can discover the policy that blocked its current build.
     // Tenant membership admission above is the complete authority check.
     let enforce_software = path != "/admin/software-policy";
+    let native_account_path = path.starts_with("/gaugeapps/account-settings/")
+        || matches!(
+            path.as_str(),
+            "/auth/account/authorization/start"
+                | "/auth/account/authorization/finish"
+                | "/auth/account/consumer-oidc/link/start"
+        );
+    if req
+        .extensions()
+        .get::<gaugedesk_app::account_signin::NativeAccountPlane>()
+        .is_some()
+        && native_account_path
+        && bearer.is_none()
+    {
+        let Some(actor) = gaugedesk_app::account_signin::hub_session_actor(&wb) else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "sign in to access Account Settings" })),
+            )
+                .into_response();
+        };
+        req.extensions_mut()
+            .insert(gaugedesk_app::identity::AuthenticatedActor(
+                gaugedesk_core::ids::AuthorityId::new(actor),
+            ));
+        return next.run(req).await;
+    }
+    if person_account_path(&path) {
+        let actor = wb.lock_unpoisoned().actor(bearer.as_deref());
+        if actor == "anonymous" {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "authenticate to access your account" })),
+            )
+                .into_response();
+        }
+        req.extensions_mut()
+            .insert(gaugedesk_app::identity::AuthenticatedActor(
+                gaugedesk_core::ids::AuthorityId::new(&actor),
+            ));
+        return next.run(req).await;
+    }
     {
         let mut guard = wb.lock_unpoisoned();
         // ENTSEC-1 + ENTSEC-2 + SECAUD-7: one fold-once admission — authenticate the bearer,
@@ -288,14 +752,29 @@ pub async fn enterprise_auth(
         // org twice opened a TOCTOU window between membership and scope (CC6.1).
         let project = guard.scope_project_of_path(&path);
         let actor = match guard.admit_data_request_with_client(
-            bearer,
+            bearer.as_deref(),
             project.as_deref(),
             &org_scope,
             client,
             enforce_software,
         ) {
             Ok(actor) => actor,
-            Err((code, msg)) => return (code, Json(json!({ "error": msg }))).into_response(),
+            Err((code, msg)) => {
+                // Enforced-SSO break glass is intentionally smaller than
+                // ordinary Home admission: only the Administration GaugeApp can
+                // reach its own recovery projection. That adapter independently
+                // restricts the session to Enterprise Identity + disable SSO.
+                if administration_sso_recovery_path(&path) {
+                    match guard.admit_sso_recovery(bearer.as_deref(), &org_scope) {
+                        Ok(actor) => actor,
+                        Err(_) => {
+                            return (code, Json(json!({ "error": msg }))).into_response();
+                        }
+                    }
+                } else {
+                    return (code, Json(json!({ "error": msg }))).into_response();
+                }
+            }
         };
         // ENTSEC-4 (ADR 0065): audit data-route *actions* (mutating methods) to the org trail —
         // the "what did this consultant do" record (references only, `INV-10`). `/admin/*` audits
@@ -366,8 +845,8 @@ pub async fn get_org(State(wb): State<SharedWorkbench>, headers: HeaderMap) -> i
 // `post_org` stood here as the `/admin/org` façade. The route is retired — see
 // `retired_legacy_management_facades_are_unreachable` — and the handler was left
 // behind unmounted, carrying the same all-optional body that let an incomplete
-// payload blank the org. `organization.update` is the one way to write these
-// settings, and it now requires the whole document.
+// payload blank the org. GaugeApp now exposes narrow named operations such as
+// `organization.display-name.set`, which preserves every field it does not own.
 
 // ---- members (B11) -------------------------------------------------------
 
@@ -460,7 +939,19 @@ pub async fn post_member(
         managed_by_scim: body.managed_by_scim,
         team: body.team,
     };
-    write_membership(&mut wb, &req_scope(&headers), &record);
+    let scope = req_scope(&headers);
+    if record.status == MembershipStatus::Active {
+        let org = match Org::rebuild_in(wb.store_ref(), &scope) {
+            Ok(org) => org,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response()
+            }
+        };
+        if !org.seat_available_for(&record.id) {
+            return (StatusCode::CONFLICT, "purchased seat capacity is full").into_response();
+        }
+    }
+    write_membership(&mut wb, &scope, &record);
     let actor = wb.actor(bearer(&headers));
     gaugedesk_app::audit::record(&mut wb, &actor, "member.invite", &record.id);
     (StatusCode::OK, Json(json!({ "member": record }))).into_response()
@@ -825,6 +1316,9 @@ pub async fn post_auto_join(
         managed_by_scim: false,
         team: None,
     };
+    if !org.seat_available_for(&record.id) {
+        return (StatusCode::CONFLICT, "purchased seat capacity is full").into_response();
+    }
     write_membership(&mut wb, &req_scope(&headers), &record);
     (StatusCode::OK, Json(json!({ "member": record }))).into_response()
 }
@@ -1031,13 +1525,10 @@ pub async fn get_billing(
     }
 }
 
-// `post_billing` stood here as the `/admin/billing` façade. The route is retired
-// — see `retired_legacy_management_facades_are_unreachable` — and the handler was
-// left behind unmounted, deserializing the request body straight into
-// `BillingRecord`, whose `#[serde(default)]` fields exist for the log rather than
-// for a wire body. Any body it did not recognise wrote an all-default record.
-// `billing.update` is the one way to write billing state, and it now requires the
-// whole document.
+// `post_billing` stood here as the `/admin/billing` façade. It and the later
+// GaugeApp `billing.update` command are retired: plan, seat, and managed-inference
+// state arrives from the subscription authority and is read-only here. The only
+// organization-owned Billing edit is the separately scoped billing contact.
 
 // ---- security policy (B15 / SEC-1/2/3) -----------------------------------
 
@@ -1148,13 +1639,38 @@ fn write_sso(wb: &mut Workbench, scope: &str, r: &SsoConnectionRecord) {
     wb.notify_library_changed("sso", &r.id, op);
 }
 
+fn public_sso(
+    record: Option<&SsoConnectionRecord>,
+    client_secret_configured: bool,
+) -> serde_json::Value {
+    record.map_or(serde_json::Value::Null, |record| {
+        json!({
+            "id": record.id,
+            "revision": record.current_revision(),
+            "protocol": record.protocol,
+            "issuer": record.issuer,
+            "audiences": record.audiences,
+            "metadata": record.metadata,
+            "enforce_sso": record.enforce_sso,
+            "claim_mapping": record.claim_mapping,
+            "client_secret_configured": client_secret_configured,
+        })
+    })
+}
+
 pub async fn get_sso(State(wb): State<SharedWorkbench>, headers: HeaderMap) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
     if let Some(resp) = deny(&wb, &headers, None) {
         return resp;
     }
     match Org::rebuild_in(wb.store_ref(), &req_scope(&headers)) {
-        Ok(org) => (StatusCode::OK, Json(json!({ "sso": org.sso }))).into_response(),
+        Ok(org) => (
+            StatusCode::OK,
+            Json(json!({
+                "sso": public_sso(org.sso.as_ref(), org.current_sso_credential().is_some())
+            })),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
     }
 }
@@ -1164,6 +1680,7 @@ pub async fn post_sso(
     headers: HeaderMap,
     Json(mut record): Json<SsoConnectionRecord>,
 ) -> impl IntoResponse {
+    let client_secret_configured;
     {
         let mut wbg = wb.lock_unpoisoned();
         if let Some(resp) = deny(&wbg, &headers, Some(Capability::ConfigureSso)) {
@@ -1171,6 +1688,37 @@ pub async fn post_sso(
         }
         record.id = ORG_ID.to_string();
         record.op = RecordOp::Upsert;
+        match record.protocol {
+            gaugedesk_app::org::SsoProtocol::Oidc => {
+                record.saml_sp_entity_id.clear();
+                record.saml_acs_url.clear();
+            }
+            gaugedesk_app::org::SsoProtocol::Saml => {
+                let base = public_base(&headers);
+                record.saml_sp_entity_id = sp_entity_id(&base);
+                record.saml_acs_url = format!("{base}/auth/saml/acs");
+            }
+        }
+        let current_org = match Org::rebuild_in(wbg.store_ref(), &req_scope(&headers)) {
+            Ok(org) => org,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response()
+            }
+        };
+        let current = current_org.sso.as_ref();
+        let retains_credential = current.is_some_and(|current| {
+            current.protocol == record.protocol
+                && current.issuer == record.issuer
+                && current.audiences == record.audiences
+        });
+        record.credential_revision = current.as_ref().and_then(|current| {
+            retains_credential
+                .then(|| current.credential_revision.clone())
+                .flatten()
+        });
+        client_secret_configured =
+            retains_credential && current_org.current_sso_credential().is_some();
+        record.seal_revision();
         write_sso(&mut wbg, &req_scope(&headers), &record);
         let actor = wbg.actor(bearer(&headers));
         gaugedesk_app::audit::record(&mut wbg, &actor, "sso.configure", "sso");
@@ -1186,7 +1734,7 @@ pub async fn post_sso(
     (
         StatusCode::OK,
         Json(json!({
-            "sso": record,
+            "sso": public_sso(Some(&record), client_secret_configured),
             "oidc_active": activation.oidc_active,
             "activation_error": activation.activation_error,
         })),
@@ -1198,23 +1746,30 @@ pub async fn post_sso(
 
 /// The control plane's public base URL — what the admin's IdP must reach. An explicit
 /// `GAUGEDESK_PUBLIC_URL` wins (the deployment's canonical externally-visible URL);
-/// otherwise it is derived from the request (`X-Forwarded-Proto` + `Host`), so a
-/// default loopback run works unconfigured.
+/// otherwise it is derived from the request (`X-Forwarded-Proto` +
+/// `X-Forwarded-Host`/`Host`), so a default loopback run works unconfigured.
 fn public_base(headers: &HeaderMap) -> String {
-    if let Some(u) = gaugedesk_env::var("PUBLIC_URL") {
-        if !u.trim().is_empty() {
-            return u.trim_end_matches('/').to_string();
-        }
-    }
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost:7878");
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("http");
-    format!("{scheme}://{host}")
+    crate::auth_oidc::request_public_base(headers)
+}
+
+pub(crate) fn enterprise_integration(headers: &HeaderMap) -> serde_json::Value {
+    let base = public_base(headers);
+    let sp = sp_entity_id(&base);
+    json!({
+        "base_url": base,
+        "oidc": {
+            "redirect_uri": format!("{base}/auth/callback"),
+            "login_url": format!("{base}/auth/login"),
+        },
+        "saml": {
+            "sp_entity_id": sp,
+            "acs_url": format!("{base}/auth/saml/acs"),
+            "metadata_url": format!("{base}/saml/metadata"),
+        },
+        "scim": {
+            "base_url": format!("{base}/scim/v2"),
+        },
+    })
 }
 
 fn sp_entity_id(base: &str) -> String {
@@ -1235,30 +1790,7 @@ pub async fn get_integration(
     if let Some(resp) = deny(&wb, &headers, None) {
         return resp;
     }
-    let base = public_base(&headers);
-    let sp = sp_entity_id(&base);
-    (
-        StatusCode::OK,
-        Json(json!({
-            "base_url": base,
-            "oidc": {
-                "redirect_uri": format!("{base}/auth/callback"),
-                "login_url": format!("{base}/auth/login"),
-            },
-            "saml": {
-                "sp_entity_id": sp,
-                "acs_url": format!("{base}/auth/saml/acs"),
-                "metadata_url": format!("{base}/saml/metadata"),
-                // SP metadata is publishable now (pre-register the SP); the SP-initiated
-                // ACS receiver + SAML session is the ADR 0058 follow-on.
-                "status": "metadata available; SP-initiated ACS is a follow-on (ADR 0058)",
-            },
-            "scim": {
-                "base_url": format!("{base}/scim/v2"),
-            },
-        })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(enterprise_integration(&headers))).into_response()
 }
 
 /// `GET /saml/metadata` (`ONB-1`) — the SP metadata descriptor an IdP consumes to
@@ -1518,6 +2050,174 @@ mod onb5_tests {
 }
 
 #[cfg(test)]
+mod public_origin_tests {
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::public_base;
+
+    #[test]
+    fn trusted_forwarded_origin_wins_over_the_loopback_upstream() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("127.0.0.1:5293"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("desk.gw.localhost:7563"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(public_base(&headers), "https://desk.gw.localhost:7563");
+    }
+}
+
+#[cfg(test)]
+mod enterprise_connection_test_tests {
+    use gaugedesk_app::auth_oidc::{PendingEnterpriseConnectionTest, VerifiedOidcIdentity};
+    use gaugedesk_app::org::{
+        MembershipRecord, MembershipStatus, Org, SsoConnectionRecord, SsoProtocol, ORG_ID,
+        ORG_SCOPE,
+    };
+    use gaugedesk_app::Workbench;
+    use gaugedesk_core::abac::{AuthorityAttributes, Role};
+    use gaugedesk_core::ids::AuthorityId;
+    use gaugedesk_store::Store;
+    use gaugedesk_workspace::Instance;
+
+    use super::{fold_enterprise_connection_test, write_membership, write_sso, RecordOp};
+
+    fn fixture() -> (tempfile::TempDir, Workbench, SsoConnectionRecord) {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let mut workbench =
+            Workbench::with_target("inst-test", instance, Store::open_in_memory().unwrap());
+        write_membership(
+            &mut workbench,
+            ORG_SCOPE,
+            &MembershipRecord {
+                id: "owner".into(),
+                op: RecordOp::Upsert,
+                org_id: ORG_ID.into(),
+                authority: "authority:owner".into(),
+                email: "owner@example.test".into(),
+                role: "owner".into(),
+                status: MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            },
+        );
+        let mut connection = SsoConnectionRecord {
+            id: ORG_ID.into(),
+            protocol: SsoProtocol::Oidc,
+            issuer: "https://idp.example.test".into(),
+            audiences: vec!["gaugedesk".into()],
+            ..Default::default()
+        };
+        connection.seal_revision();
+        write_sso(&mut workbench, ORG_SCOPE, &connection);
+        (dir, workbench, connection)
+    }
+
+    #[test]
+    fn browser_test_records_evidence_without_creating_membership() {
+        let (_dir, mut workbench, connection) = fixture();
+        let pending = PendingEnterpriseConnectionTest {
+            id: "ssotest-1".into(),
+            store_scope: ORG_SCOPE.into(),
+            actor: "authority:owner".into(),
+            connection_id: ORG_ID.into(),
+            connection_revision: connection.current_revision(),
+        };
+        let mut attributes = AuthorityAttributes::default();
+        attributes.roles.insert(Role::new("engineering"));
+        let verified = VerifiedOidcIdentity {
+            authority: AuthorityId::new("corporate-subject"),
+            id_token: "not-persisted".into(),
+            refresh_token: Some("not-persisted".into()),
+            attributes,
+        };
+
+        fold_enterprise_connection_test(&mut workbench, &pending, &verified).unwrap();
+        let org = Org::rebuild(workbench.store_ref()).unwrap();
+        let evidence = org.current_sso_browser_test().unwrap();
+        assert_eq!(evidence.subject, "corporate-subject");
+        assert_eq!(evidence.mapped_roles, vec!["engineering"]);
+        assert_eq!(
+            org.members.len(),
+            1,
+            "the test never provisions its subject"
+        );
+        let stored = workbench
+            .store_ref()
+            .records(ORG_SCOPE, gaugedesk_app::org::SSO_BROWSER_TEST_KIND)
+            .unwrap()
+            .join("\n");
+        assert!(
+            !stored.contains("not-persisted"),
+            "no external token is stored"
+        );
+    }
+
+    #[test]
+    fn browser_test_refuses_a_changed_connection_revision() {
+        let (_dir, mut workbench, connection) = fixture();
+        let pending = PendingEnterpriseConnectionTest {
+            id: "ssotest-stale".into(),
+            store_scope: ORG_SCOPE.into(),
+            actor: "authority:owner".into(),
+            connection_id: ORG_ID.into(),
+            connection_revision: connection.current_revision(),
+        };
+        let mut changed = connection;
+        changed.audiences = vec!["replacement".into()];
+        changed.seal_revision();
+        write_sso(&mut workbench, ORG_SCOPE, &changed);
+        let verified = VerifiedOidcIdentity {
+            authority: AuthorityId::new("corporate-subject"),
+            id_token: String::new(),
+            refresh_token: None,
+            attributes: AuthorityAttributes::default(),
+        };
+
+        assert!(fold_enterprise_connection_test(&mut workbench, &pending, &verified).is_err());
+        assert!(Org::rebuild(workbench.store_ref())
+            .unwrap()
+            .sso_browser_tests
+            .is_empty());
+    }
+
+    #[test]
+    fn saml_browser_result_uses_the_same_revision_and_non_membership_contract() {
+        let (_dir, mut workbench, mut connection) = fixture();
+        connection.protocol = SsoProtocol::Saml;
+        connection.issuer = "https://saml-idp.example.test".into();
+        connection.audiences.clear();
+        connection.seal_revision();
+        write_sso(&mut workbench, ORG_SCOPE, &connection);
+        let pending = PendingEnterpriseConnectionTest {
+            id: "ssotest-saml".into(),
+            store_scope: ORG_SCOPE.into(),
+            actor: "authority:owner".into(),
+            connection_id: ORG_ID.into(),
+            connection_revision: connection.current_revision(),
+        };
+        let attributes = AuthorityAttributes::default();
+
+        super::record_enterprise_connection_test(
+            &mut workbench,
+            &pending,
+            SsoProtocol::Saml,
+            &AuthorityId::new("signed-name-id"),
+            &attributes,
+        )
+        .unwrap();
+        let org = Org::rebuild(workbench.store_ref()).unwrap();
+        assert_eq!(
+            org.current_sso_browser_test().unwrap().subject,
+            "signed-name-id"
+        );
+        assert_eq!(org.members.len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod authenticated_actor_tests {
     use std::sync::{Arc, Mutex};
 
@@ -1529,15 +2229,25 @@ mod authenticated_actor_tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    use axum::http::StatusCode;
+    use gaugedesk_app::account_auth::{
+        append_facts as append_account_auth_facts, AccountAuthFact, RecoveryBatchRecord,
+        RecoveryBatchStatus, RecoveryCodeRecord, WebAuthnMethodRecord,
+    };
     use gaugedesk_app::identity::{AuthenticatedActor, LoopbackIdentityProvider};
-    use gaugedesk_app::org::{MembershipRecord, MembershipStatus, ORG_SCOPE};
+    use gaugedesk_app::org::{
+        MembershipRecord, MembershipStatus, SsoConnectionRecord, SsoProtocol, ORG_ID, ORG_SCOPE,
+    };
     use gaugedesk_app::Workbench;
     use gaugedesk_core::abac::AuthorityAttributes;
     use gaugedesk_core::ids::AuthorityId;
     use gaugedesk_store::Store;
     use gaugedesk_workspace::Instance;
 
-    use super::{enterprise_auth, entsec_exempt, write_membership, RecordOp};
+    use super::{
+        administration_sso_recovery_path, enterprise_auth, entsec_exempt, person_account_path,
+        write_membership, RecordOp,
+    };
 
     async fn who_am_i(Extension(actor): Extension<AuthenticatedActor>) -> String {
         actor.0.as_str().to_owned()
@@ -1593,6 +2303,128 @@ mod authenticated_actor_tests {
         assert_eq!(&body[..], b"authority:alice");
     }
 
+    #[tokio::test]
+    async fn enforced_sso_exposes_only_the_gaugeapp_recovery_entry_to_a_passkey_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let mut workbench =
+            Workbench::with_target("inst-recovery", instance, Store::open_in_memory().unwrap())
+                .with_identity_provider(Arc::new(LoopbackIdentityProvider::new()));
+        write_membership(
+            &mut workbench,
+            ORG_SCOPE,
+            &MembershipRecord {
+                id: "owner".to_owned(),
+                op: RecordOp::Upsert,
+                org_id: ORG_ID.to_owned(),
+                authority: "person-root".to_owned(),
+                email: "owner@example.test".to_owned(),
+                role: "owner".to_owned(),
+                status: MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            },
+        );
+        let mut connection = SsoConnectionRecord {
+            id: ORG_ID.to_owned(),
+            op: RecordOp::Upsert,
+            protocol: SsoProtocol::Oidc,
+            issuer: "https://idp.example.test".to_owned(),
+            audiences: vec!["gaugedesk".to_owned()],
+            enforce_sso: true,
+            ..Default::default()
+        };
+        connection.seal_revision();
+        workbench
+            .store_mut()
+            .append_record(
+                ORG_SCOPE,
+                "sso",
+                &serde_json::to_string(&connection).unwrap(),
+            )
+            .unwrap();
+        let credential = WebAuthnMethodRecord::new(
+            "person-root",
+            "owner-passkey",
+            "public verifier",
+            "Security key",
+            1,
+        )
+        .unwrap();
+        let recovery =
+            RecoveryCodeRecord::prepare("person-root", "owner-recovery", "salt", "one-use-code")
+                .unwrap();
+        append_account_auth_facts(
+            workbench.store_mut(),
+            &[
+                AccountAuthFact::WebAuthn(credential),
+                AccountAuthFact::RecoveryBatch(RecoveryBatchRecord {
+                    id: "owner-recovery".to_owned(),
+                    op: RecordOp::Upsert,
+                    account_id: "person-root".to_owned(),
+                    created_at: 1,
+                    status: RecoveryBatchStatus::Active,
+                }),
+                AccountAuthFact::RecoveryCode(recovery),
+            ],
+        )
+        .unwrap();
+        let passkey = workbench
+            .mint_account_session("person-root", "passkey", 3600)
+            .unwrap();
+        let shared = Arc::new(Mutex::new(workbench));
+        let app = Router::new()
+            .route("/whoami", get(who_am_i))
+            .route("/gaugeapps/administration/sessions", get(who_am_i))
+            .route_layer(axum::middleware::from_fn_with_state(
+                shared.clone(),
+                enterprise_auth,
+            ))
+            .with_state(shared);
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/whoami")
+                    .header("authorization", format!("Bearer {passkey}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let admitted = app
+            .oneshot(
+                Request::builder()
+                    .uri("/gaugeapps/administration/sessions")
+                    .header("authorization", format!("Bearer {passkey}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let body = admitted.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"person-root");
+    }
+
+    #[test]
+    fn stripe_callbacks_bypass_member_auth_only_at_exact_verifier_paths() {
+        assert!(entsec_exempt("/stripe/webhook"));
+        assert!(entsec_exempt("/stripe/connect/webhook"));
+        for path in [
+            "/stripe",
+            "/stripe/connect",
+            "/stripe/connect/webhook-extra",
+            "/stripe/connect/webhook/anything",
+            "/stripe/accounts",
+        ] {
+            assert!(!entsec_exempt(path), "{path}");
+        }
+    }
+
     #[test]
     fn pending_tenant_invitation_routes_bypass_membership_gate_only_for_acceptance() {
         assert!(entsec_exempt("/account/invitations"));
@@ -1608,5 +2440,53 @@ mod authenticated_actor_tests {
         assert!(!entsec_exempt("/gaugewright-release.json.map"));
         assert!(!entsec_exempt("/account/tenants"));
         assert!(!entsec_exempt("/account/invitations-extra"));
+    }
+
+    #[test]
+    fn person_account_routes_do_not_inherit_the_selected_organization_gate() {
+        for path in [
+            "/account/settings",
+            "/account/homes",
+            "/account/model-access",
+            "/account/sessions",
+        ] {
+            assert!(person_account_path(path), "{path}");
+        }
+        for path in [
+            "/account/project-share-candidates",
+            "/account/home/project-share-candidates",
+            "/account/hub-session",
+            "/account/hub-session/redeem",
+            "/accounts/settings",
+        ] {
+            assert!(!person_account_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn sso_recovery_allowlist_names_only_routes_that_rebuild_the_restricted_session() {
+        for path in [
+            "/gaugeapps/administration/sessions",
+            "/gaugeapps/administration/pages/enterprise-identity",
+            "/gaugeapps/administration/updates",
+            "/gaugeapps/administration/commands",
+            "/gaugeapps/administration/proposals",
+            "/gaugeapps/administration/proposals/change-1/review",
+            "/gaugeapps/administration/agent/messages",
+            "/gaugeapps/administration/agent/events",
+            "/gaugeapps/administration/agent/stop",
+            "/gaugeapps/administration/agent/erase",
+        ] {
+            assert!(administration_sso_recovery_path(path), "{path}");
+        }
+        for path in [
+            "/gaugeapps/administration",
+            "/gaugeapps/administration/recovery",
+            "/gaugeapps/administration/organization/domain-verification",
+            "/gaugeapps/administration/proposals/change-1",
+            "/admin/software-policy",
+        ] {
+            assert!(!administration_sso_recovery_path(path), "{path}");
+        }
     }
 }

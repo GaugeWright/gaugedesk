@@ -9,14 +9,15 @@ use std::collections::BTreeSet;
 
 pub mod host_actions;
 use std::fmt;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use gaugedesk_core::ids::{AuthorityId, PublicKey};
+use gaugedesk_core::ids::{AuthorityId, ModelAttemptId, PublicKey};
+use gaugedesk_core::model_connection::AuthorityBinding;
 use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
 use gaugedesk_harness::sandbox::Network;
 use gaugedesk_harness::{
@@ -309,6 +310,559 @@ pub mod gate_runner;
 pub mod sansio_types {
     pub use whipplescript_kernel::sansio::{HttpRequest, HttpResponse, TransportError};
 }
+
+/// One turn-scoped path from a project Home to the organization-owned final
+/// fetch authority. The account session authenticates the actor to Hub; it is
+/// never sent to the provider authority or serialized into runtime state.
+/// Provider credentials are not fields of this value and never enter Desk.
+// gaugedesk-peer-demand: POST /projects/:p/organization-model-invocations
+// gaugedesk-peer-demand: POST /v1/model-providers/private-fetch
+#[derive(Clone)]
+pub struct OrganizationModelBrokerConfig {
+    hub_origin: String,
+    account_session: Arc<str>,
+    organization: String,
+    project: String,
+    chat: String,
+    binding: AuthorityBinding,
+}
+
+impl fmt::Debug for OrganizationModelBrokerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OrganizationModelBrokerConfig")
+            .field("hub_origin", &self.hub_origin)
+            .field("account_session", &"[REDACTED]")
+            .field("organization", &self.organization)
+            .field("project", &self.project)
+            .field("chat", &self.chat)
+            .field("binding", &self.binding)
+            .finish()
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrganizationModelPrepareReply {
+    v: u8,
+    binding: AuthorityBinding,
+    attempt: ModelAttemptId,
+    fetch_url: String,
+    ticket: String,
+    expires_at: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrganizationModelFetchReply {
+    v: u8,
+    attempt: ModelAttemptId,
+    status: u16,
+    body: serde_json::Value,
+}
+
+impl OrganizationModelBrokerConfig {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        hub_origin: impl Into<String>,
+        account_session: impl Into<String>,
+        organization: impl Into<String>,
+        project: impl Into<String>,
+        chat: impl Into<String>,
+        binding: AuthorityBinding,
+    ) -> io::Result<Self> {
+        let hub_origin = admitted_service_origin(&hub_origin.into())?.to_string();
+        let account_session = account_session.into();
+        let organization = organization.into();
+        let project = project.into();
+        let chat = chat.into();
+        for (name, value, maximum) in [
+            ("account session", account_session.as_str(), 16 * 1024),
+            ("organization", organization.as_str(), 512),
+            ("project", project.as_str(), 512),
+            ("chat", chat.as_str(), 512),
+        ] {
+            if value.is_empty()
+                || value.trim() != value
+                || value.len() > maximum
+                || value.chars().any(char::is_control)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("organization model {name} is invalid"),
+                ));
+            }
+        }
+        if binding.organization.as_str() != organization {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "organization model authority binding does not match the selected organization",
+            ));
+        }
+        Ok(Self {
+            hub_origin,
+            account_session: Arc::from(account_session),
+            organization,
+            project,
+            chat,
+            binding,
+        })
+    }
+
+    fn fetch(
+        &self,
+        request: &sansio_types::HttpRequest,
+    ) -> Result<sansio_types::HttpResponse, sansio_types::TransportError> {
+        // A provider body can be close to WhippleScript's 32 MiB response
+        // limit before JSON string escaping. Leave room for the escaped body
+        // and the small signed-attempt envelope without silently reducing the
+        // runtime's admitted response size.
+        const MAX_REPLY: u64 = 70 * 1024 * 1024;
+        let request_digest = organization_model_request_digest(request)
+            .map_err(|_| organization_transport("provider request could not be identified"))?;
+        let mut prepare_url = admitted_service_origin(&self.hub_origin)
+            .map_err(|_| organization_transport("Hub origin is unavailable"))?;
+        {
+            let mut segments = prepare_url
+                .path_segments_mut()
+                .map_err(|_| organization_transport("Hub origin is unavailable"))?;
+            segments.pop_if_empty();
+            segments.extend([
+                "projects",
+                self.project.as_str(),
+                "organization-model-invocations",
+            ]);
+        }
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(Duration::from_secs(130))
+            .build();
+        let prepared = post_json_value(
+            &agent,
+            prepare_url.as_str(),
+            &[
+                ("authorization", format!("Bearer {}", self.account_session)),
+                ("x-gaugewright-tenant", self.organization.clone()),
+            ],
+            &serde_json::json!({
+                "v": 1,
+                "chat": self.chat,
+                "request_digest": request_digest,
+            }),
+            128 * 1024,
+        )?;
+        let prepared: OrganizationModelPrepareReply = serde_json::from_value(prepared)
+            .map_err(|_| organization_transport("Hub returned an incompatible invocation"))?;
+        if prepared.v != 1
+            || prepared.binding != self.binding
+            || prepared.ticket.is_empty()
+            || prepared.ticket.len() > 16 * 1024
+            || prepared.expires_at <= unix_now()
+        {
+            return Err(organization_transport(
+                "Hub returned an invalid organization model invocation",
+            ));
+        }
+        let fetch_url = admitted_final_fetch(&prepared.fetch_url)
+            .map_err(|_| organization_transport("final fetch authority is unavailable"))?;
+        let fetched = post_json_value(
+            &agent,
+            fetch_url.as_str(),
+            &[("authorization", format!("Bearer {}", prepared.ticket))],
+            &serde_json::json!({
+                "url": request.url,
+                "headers": request.headers,
+                "body": request.body,
+            }),
+            MAX_REPLY,
+        )?;
+        let fetched: OrganizationModelFetchReply = serde_json::from_value(fetched)
+            .map_err(|_| organization_transport("final fetch returned an incompatible response"))?;
+        if fetched.v != 1
+            || fetched.attempt != prepared.attempt
+            || !(100..=599).contains(&fetched.status)
+        {
+            return Err(organization_transport(
+                "final fetch returned a different provider attempt",
+            ));
+        }
+        Ok(sansio_types::HttpResponse {
+            status: fetched.status,
+            body: fetched.body,
+        })
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(u64::MAX)
+}
+
+fn organization_transport(message: &str) -> sansio_types::TransportError {
+    sansio_types::TransportError::Transport(message.to_owned())
+}
+
+fn admitted_service_origin(value: &str) -> io::Result<url::Url> {
+    let mut url = url::Url::parse(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid service origin"))?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host.ends_with(".localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "service origin must be TLS or loopback and contain no credentials, query, or fragment",
+        ));
+    }
+    url.set_query(None);
+    Ok(url)
+}
+
+fn admitted_final_fetch(value: &str) -> io::Result<url::Url> {
+    let url = admitted_service_origin(value)?;
+    if url.path() != "/v1/model-providers/private-fetch" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "organization model final fetch path is invalid",
+        ));
+    }
+    Ok(url)
+}
+
+fn post_json_value(
+    agent: &ureq::Agent,
+    url: &str,
+    headers: &[(&str, String)],
+    body: &serde_json::Value,
+    maximum: u64,
+) -> Result<serde_json::Value, sansio_types::TransportError> {
+    let mut outgoing = agent.post(url).set("content-type", "application/json");
+    for (name, value) in headers {
+        outgoing = outgoing.set(name, value);
+    }
+    let response = match outgoing.send_json(body) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, _)) => {
+            return Err(organization_transport(
+                "organization model authority refused the request",
+            ))
+        }
+        Err(ureq::Error::Transport(error)) => {
+            return Err(
+                if error.to_string().to_ascii_lowercase().contains("timeout") {
+                    sansio_types::TransportError::Timeout
+                } else {
+                    organization_transport("organization model authority is unreachable")
+                },
+            )
+        }
+    };
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| organization_transport("organization model authority response failed"))?;
+    if bytes.len() as u64 > maximum {
+        return Err(organization_transport(
+            "organization model authority response is too large",
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| organization_transport("organization model authority response is malformed"))
+}
+
+struct OrganizationModelHostDriver<'a>(&'a OrganizationModelBrokerConfig);
+
+impl whipplescript_kernel::sansio::HostDriver for OrganizationModelHostDriver<'_> {
+    fn fulfill(
+        &self,
+        request: &whipplescript_kernel::sansio::IoRequest,
+    ) -> whipplescript_kernel::sansio::IoResult {
+        let whipplescript_kernel::sansio::IoRequest::Http(request) = request;
+        whipplescript_kernel::sansio::IoResult::Http(self.0.fetch(request))
+    }
+}
+
+/// The deliberately non-secret value placed in WhippleScript's provider-auth
+/// header when an operated organization broker will perform final fetch. The
+/// broker accepts exactly this marker, removes it, and injects the current
+/// credential only after the organization attempt has been dispatched. It is
+/// not a bearer credential and grants nothing by itself.
+pub const ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER: &str =
+    "gaugewright-organization-model-broker-v1";
+
+/// The one operated no-cost provider endpoint and model used to prove the
+/// deployed organization credential path. These are not compatibility hooks:
+/// request admission matches both exact values and rejects every other
+/// non-native endpoint. The serving process independently requires the closed
+/// disposable credential shape and performs no outbound request.
+pub const ORGANIZATION_MODEL_CANARY_ENDPOINT: &str =
+    "https://models.gaugewright.com/_canary/openai/v1";
+pub const ORGANIZATION_MODEL_CANARY_MODEL: &str = "gaugewright-canary-model-v1";
+pub const ORGANIZATION_MODEL_CANARY_TOKEN_BOUND: u64 = 1_024;
+
+/// Stable identity of the exact provider request WhippleScript constructed.
+/// The project Home obtains a dispatch ticket for this digest without sending
+/// prompt content to the account Hub; the final-fetch authority recomputes it
+/// from the request body before it can reserve or dispatch allowance.
+pub fn organization_model_request_digest(
+    request: &sansio_types::HttpRequest,
+) -> io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = serde_json::to_vec(&(
+        "gaugewright:whipplescript-provider-request:v1",
+        &request.url,
+        &request.headers,
+        &request.body,
+    ))
+    .map_err(io::Error::other)?;
+    if bytes.len() > 9 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "organization model request is too large to identify",
+        ));
+    }
+    Ok(Sha256::digest(bytes).into())
+}
+
+/// Conservative token admission for one exact WhippleScript-built provider
+/// request. The context window is the smallest provider-owned ceiling that
+/// covers the complete request and response without estimating tokens from
+/// member-controlled text. A trusted final-fetch adapter may reserve this
+/// bound; a tighter future bound must remain a WhippleScript provider fact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrganizationModelRequestAdmission {
+    pub token_bound: u64,
+    pub request_digest: [u8; 32],
+}
+
+/// Validate the provider-facing part of a private organization model request.
+///
+/// WhippleScript still owns request construction. This function checks only
+/// the axes the credential/spend authority must enforce before replacing the
+/// non-secret auth marker: exact native provider endpoint, selected model,
+/// closed headers, bounded JSON, and the provider's conservative context
+/// ceiling. It intentionally supports only the native OpenAI Responses,
+/// Anthropic Messages, and fixed-host xAI Chat Completions adapters plus the
+/// exact operated synthetic canary.
+pub fn admit_organization_model_request(
+    binding: &gaugedesk_core::model_connection::ProviderBinding,
+    model: &str,
+    request: &sansio_types::HttpRequest,
+) -> io::Result<OrganizationModelRequestAdmission> {
+    use gaugedesk_core::model_connection::AuthenticationKind;
+    use whipplescript_kernel::coerce_native::CoerceProvider;
+
+    if binding.authentication != AuthenticationKind::ApiKey || model.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "organization model request has an unsupported authentication or model",
+        ));
+    }
+    let (provider, expected_url, auth_header, auth_value, required_header) = match (
+        binding.provider.as_str(),
+        binding.endpoint.trim_end_matches('/'),
+    ) {
+        ("openai", "https://api.openai.com/v1") => (
+            CoerceProvider::OpenAi,
+            "https://api.openai.com/v1/responses",
+            "authorization",
+            format!("Bearer {ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER}"),
+            None,
+        ),
+        ("openai", ORGANIZATION_MODEL_CANARY_ENDPOINT)
+            if model == ORGANIZATION_MODEL_CANARY_MODEL =>
+        {
+            (
+                CoerceProvider::OpenAi,
+                "https://models.gaugewright.com/_canary/openai/v1/responses",
+                "authorization",
+                format!("Bearer {ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER}"),
+                None,
+            )
+        }
+        ("anthropic", "https://api.anthropic.com/v1") => (
+            CoerceProvider::Anthropic,
+            "https://api.anthropic.com/v1/messages",
+            "x-api-key",
+            ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER.to_owned(),
+            Some(("anthropic-version", "2023-06-01")),
+        ),
+        ("xai", "https://api.x.ai/v1") => (
+            CoerceProvider::Xai,
+            "https://api.x.ai/v1/chat/completions",
+            "authorization",
+            format!("Bearer {ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER}"),
+            None,
+        ),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "organization model request uses an unsupported provider endpoint",
+            ));
+        }
+    };
+    if request.url != expected_url
+        || request
+            .body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            != Some(model)
+        || !request.body.is_object()
+        || serde_json::to_vec(&request.body)
+            .map_err(io::Error::other)?
+            .len()
+            > 8 * 1024 * 1024
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "organization model request does not match its admitted provider and model",
+        ));
+    }
+    let mut headers = std::collections::BTreeMap::<String, String>::new();
+    for (name, value) in &request.headers {
+        let name = name.to_ascii_lowercase();
+        if name.is_empty()
+            || name.len() > 100
+            || value.len() > 1024
+            || name.chars().any(char::is_control)
+            || value.chars().any(char::is_control)
+            || headers.insert(name, value.clone()).is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "organization model request has malformed or duplicate headers",
+            ));
+        }
+    }
+    let allowed = match provider {
+        CoerceProvider::OpenAi | CoerceProvider::Xai => {
+            ["authorization", "content-type", "idempotency-key", "accept"].as_slice()
+        }
+        CoerceProvider::Anthropic => [
+            "x-api-key",
+            "anthropic-version",
+            "content-type",
+            "idempotency-key",
+            "accept",
+        ]
+        .as_slice(),
+        _ => unreachable!("closed provider match"),
+    };
+    if headers.keys().any(|name| !allowed.contains(&name.as_str()))
+        || headers.get(auth_header) != Some(&auth_value)
+        || headers.get("content-type").map(String::as_str) != Some("application/json")
+        || required_header
+            .is_some_and(|(name, value)| headers.get(name).map(String::as_str) != Some(value))
+        || headers
+            .get("accept")
+            .is_some_and(|value| value != "text/event-stream")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "organization model request headers are not the admitted WhippleScript shape",
+        ));
+    }
+    let token_bound = if binding.endpoint.trim_end_matches('/')
+        == ORGANIZATION_MODEL_CANARY_ENDPOINT
+        && model == ORGANIZATION_MODEL_CANARY_MODEL
+    {
+        ORGANIZATION_MODEL_CANARY_TOKEN_BOUND
+    } else {
+        whipplescript_kernel::harness_model::model_context_window(provider.into(), model)
+    };
+    if token_bound == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "organization model request has no enforceable token bound",
+        ));
+    }
+    Ok(OrganizationModelRequestAdmission {
+        token_bound,
+        request_digest: organization_model_request_digest(request)?,
+    })
+}
+
+/// Read provider usage through the same WhippleScript response parser that
+/// advances the model loop. Missing, malformed, or non-success usage is not
+/// converted to zero; the caller must retain the conservative reservation as
+/// an unknown outcome.
+pub fn organization_model_response_tokens(
+    binding: &gaugedesk_core::model_connection::ProviderBinding,
+    model: &str,
+    response: sansio_types::HttpResponse,
+) -> io::Result<u64> {
+    use whipplescript_kernel::{
+        coerce_native::CoerceProvider, harness_loop::HttpModelClient,
+        harness_model::MessagesApiClient,
+    };
+
+    let (provider, base_url) = match (
+        binding.provider.as_str(),
+        binding.endpoint.trim_end_matches('/'),
+    ) {
+        ("openai", "https://api.openai.com/v1") => {
+            (CoerceProvider::OpenAi, "https://api.openai.com")
+        }
+        ("openai", ORGANIZATION_MODEL_CANARY_ENDPOINT)
+            if model == ORGANIZATION_MODEL_CANARY_MODEL =>
+        {
+            (
+                CoerceProvider::OpenAi,
+                "https://models.gaugewright.com/_canary/openai",
+            )
+        }
+        ("anthropic", "https://api.anthropic.com/v1") => {
+            (CoerceProvider::Anthropic, "https://api.anthropic.com")
+        }
+        ("xai", "https://api.x.ai/v1") => (CoerceProvider::Xai, "https://api.x.ai/v1"),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "organization model response uses an unsupported provider endpoint",
+            ));
+        }
+    };
+    let client = MessagesApiClient::new(
+        provider,
+        ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER,
+        model,
+        base_url,
+        None,
+        None,
+    );
+    let reply = client
+        .parse_response(Ok(response))
+        .map_err(|_| io::Error::other("WhippleScript could not admit provider usage"))?;
+    let input = reply
+        .usage
+        .get("input_tokens")
+        .or_else(|| reply.usage.get("prompt_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| io::Error::other("provider response did not report input usage"))?;
+    let output = reply
+        .usage
+        .get("output_tokens")
+        .or_else(|| reply.usage.get("completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| io::Error::other("provider response did not report output usage"))?;
+    input
+        .checked_add(output)
+        .ok_or_else(|| io::Error::other("provider usage overflowed"))
+}
 mod hosted;
 pub use hosted::{DoHostConfig, DoHostRequest, DoHostResponse, DoHostTransport};
 
@@ -570,6 +1124,7 @@ pub struct WhipHarnessFactory {
     signing_key: SigningKey,
     runtime_root: PathBuf,
     hosted: Option<DoHostConfig>,
+    organization_model_broker: Option<OrganizationModelBrokerConfig>,
 }
 
 impl WhipHarnessFactory {
@@ -583,12 +1138,32 @@ impl WhipHarnessFactory {
             signing_key,
             runtime_root: runtime_root.into(),
             hosted: None,
+            organization_model_broker: None,
         }
     }
 
     pub fn with_do_host(mut self, config: DoHostConfig) -> Self {
         self.hosted = Some(config);
         self
+    }
+
+    /// Route WhippleScript-built provider requests through one exact
+    /// organization final-fetch authority for this turn factory. Hosted DO
+    /// placements have their own Home callback and therefore reject this
+    /// native transport attachment instead of serializing an account session
+    /// into the remote runtime.
+    pub fn with_organization_model_broker(
+        mut self,
+        config: OrganizationModelBrokerConfig,
+    ) -> io::Result<Self> {
+        if self.hosted.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hosted organization model final fetch must be composed at the Home broker",
+            ));
+        }
+        self.organization_model_broker = Some(config);
+        Ok(self)
     }
 
     fn runtime_for_chat(
@@ -812,6 +1387,7 @@ impl WhipHarnessFactory {
             cancellation: Arc::new(Mutex::new(None)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             pursuing_cancel: Arc::new(AtomicBool::new(false)),
+            organization_model_broker: self.organization_model_broker.clone(),
         })
     }
 }
@@ -834,6 +1410,14 @@ impl HarnessFactory for WhipHarnessFactory {
     }
 
     fn reuse_across_turns(&self) -> bool {
+        // The final-fetch path binds current actor session, organization,
+        // project selection and broker admission. Reopen the persistent
+        // runtime for each turn so none of those ephemeral inputs becomes a
+        // cached authorization fact; the SQLite WhippleScript instance still
+        // supplies transcript continuity.
+        if self.organization_model_broker.is_some() {
+            return false;
+        }
         self.hosted
             .as_ref()
             .map(DoHostConfig::reuse_across_turns)
@@ -1010,6 +1594,7 @@ struct WhipHarness {
     /// Whether a deferred pursuit is already running, so pressing Stop twice
     /// does not start a second one.
     pursuing_cancel: Arc<AtomicBool>,
+    organization_model_broker: Option<OrganizationModelBrokerConfig>,
 }
 
 impl Harness for WhipHarness {
@@ -1055,10 +1640,19 @@ impl Harness for WhipHarness {
         // and the answer arrives as the next turn's context.
         let command = self.new_turn_command(prompt, images, nonce, admitted_command_id);
         self.install_cancellation(&command);
-        let execution = self
-            .runtime
-            .run_turn(&command, &self.package, &self.provider, &resources)
-            .map_err(turn_failure);
+        let execution = match &self.organization_model_broker {
+            Some(broker) => self.runtime.run_turn_with_driver(
+                &command,
+                &self.package,
+                &self.provider,
+                &resources,
+                &OrganizationModelHostDriver(broker),
+            ),
+            None => self
+                .runtime
+                .run_turn(&command, &self.package, &self.provider, &resources),
+        }
+        .map_err(turn_failure);
         self.clear_cancellation();
         let execution = execution?;
         let evidence_pointers = execution.evidence_pointers();
@@ -2516,6 +3110,402 @@ mod tests {
 
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn organization_broker_admits_only_the_exact_whipplescript_request_and_usage() {
+        use gaugedesk_core::model_connection::{AuthenticationKind, ProviderBinding};
+        use whipplescript_kernel::{
+            coerce_native::CoerceProvider,
+            harness_loop::{ChatMessage, HttpModelClient},
+            harness_model::MessagesApiClient,
+        };
+
+        let openai = ProviderBinding {
+            provider: "openai".into(),
+            endpoint: "https://api.openai.com/v1/".into(),
+            authentication: AuthenticationKind::ApiKey,
+        };
+        let client = MessagesApiClient::new(
+            CoerceProvider::OpenAi,
+            ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER,
+            "gpt-5-mini",
+            "https://api.openai.com",
+            None,
+            None,
+        );
+        let request = client.build_request(
+            &[ChatMessage::User {
+                text: "hello".into(),
+                images: Vec::new(),
+            }],
+            &[],
+        );
+        let admitted = admit_organization_model_request(&openai, "gpt-5-mini", &request).unwrap();
+        assert_eq!(admitted.token_bound, 128_000);
+        assert_eq!(
+            admitted.request_digest,
+            organization_model_request_digest(&request).unwrap()
+        );
+
+        let mut wrong_model = request.clone();
+        wrong_model.body["model"] = serde_json::json!("copied-model");
+        assert!(admit_organization_model_request(&openai, "gpt-5-mini", &wrong_model).is_err());
+        assert_ne!(
+            organization_model_request_digest(&request).unwrap(),
+            organization_model_request_digest(&wrong_model).unwrap()
+        );
+        let mut secret_bearing = request.clone();
+        secret_bearing.headers[0].1 = "Bearer raw-provider-key".into();
+        assert!(admit_organization_model_request(&openai, "gpt-5-mini", &secret_bearing).is_err());
+        assert_eq!(
+            organization_model_response_tokens(
+                &openai,
+                "gpt-5-mini",
+                sansio_types::HttpResponse {
+                    status: 200,
+                    body: serde_json::json!({
+                        "output_text": "hello",
+                        "usage": {"input_tokens": 7, "output_tokens": 3}
+                    }),
+                },
+            )
+            .unwrap(),
+            10
+        );
+
+        let xai = ProviderBinding {
+            provider: "xai".into(),
+            endpoint: "https://api.x.ai/v1/".into(),
+            authentication: AuthenticationKind::ApiKey,
+        };
+        let client = MessagesApiClient::new(
+            CoerceProvider::Xai,
+            ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER,
+            "grok-4.6",
+            "https://api.x.ai/v1",
+            None,
+            None,
+        );
+        let request = client.build_request(
+            &[ChatMessage::User {
+                text: "hello".into(),
+                images: Vec::new(),
+            }],
+            &[],
+        );
+        let admitted = admit_organization_model_request(&xai, "grok-4.6", &request).unwrap();
+        assert_eq!(request.url, "https://api.x.ai/v1/chat/completions");
+        assert_eq!(admitted.token_bound, 256_000);
+        assert_eq!(
+            organization_model_response_tokens(
+                &xai,
+                "grok-4.6",
+                sansio_types::HttpResponse {
+                    status: 200,
+                    body: serde_json::json!({
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hello"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16}
+                    }),
+                },
+            )
+            .unwrap(),
+            16
+        );
+        let mut wrong_xai_url = request;
+        wrong_xai_url.url = "https://compatible.example/v1/chat/completions".into();
+        assert!(admit_organization_model_request(&xai, "grok-4.6", &wrong_xai_url).is_err());
+
+        let canary = ProviderBinding {
+            provider: "openai".into(),
+            endpoint: ORGANIZATION_MODEL_CANARY_ENDPOINT.into(),
+            authentication: AuthenticationKind::ApiKey,
+        };
+        let canary_request = sansio_types::HttpRequest {
+            url: format!("{ORGANIZATION_MODEL_CANARY_ENDPOINT}/responses"),
+            headers: vec![
+                (
+                    "authorization".into(),
+                    format!("Bearer {ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER}"),
+                ),
+                ("content-type".into(), "application/json".into()),
+            ],
+            body: serde_json::json!({
+                "model": ORGANIZATION_MODEL_CANARY_MODEL,
+                "input": "Return the bounded GaugeWright production canary response."
+            }),
+        };
+        assert_eq!(
+            admit_organization_model_request(
+                &canary,
+                ORGANIZATION_MODEL_CANARY_MODEL,
+                &canary_request,
+            )
+            .unwrap()
+            .token_bound,
+            ORGANIZATION_MODEL_CANARY_TOKEN_BOUND
+        );
+        assert_eq!(
+            hex::encode(organization_model_request_digest(&canary_request).unwrap()),
+            "147b66dcaf03287b8f6fdea4ade836ec7fa59a6b2b7a1a82b3a6b92003527a85",
+            "the production runner computes this cross-language request identity",
+        );
+        assert_eq!(
+            organization_model_response_tokens(
+                &canary,
+                ORGANIZATION_MODEL_CANARY_MODEL,
+                sansio_types::HttpResponse {
+                    status: 200,
+                    body: serde_json::json!({
+                        "output_text": "synthetic response",
+                        "usage": {"input_tokens": 7, "output_tokens": 3}
+                    }),
+                },
+            )
+            .unwrap(),
+            10
+        );
+        let mut copied_canary = canary_request.clone();
+        copied_canary.body["model"] = serde_json::json!("copied-model");
+        assert!(admit_organization_model_request(
+            &canary,
+            ORGANIZATION_MODEL_CANARY_MODEL,
+            &copied_canary,
+        )
+        .is_err());
+        let copied_endpoint = ProviderBinding {
+            endpoint: "https://models.gaugewright.com/_canary/openai/v2".into(),
+            ..canary.clone()
+        };
+        assert!(admit_organization_model_request(
+            &copied_endpoint,
+            ORGANIZATION_MODEL_CANARY_MODEL,
+            &canary_request,
+        )
+        .is_err());
+
+        let anthropic = ProviderBinding {
+            provider: "anthropic".into(),
+            endpoint: "https://api.anthropic.com/v1".into(),
+            authentication: AuthenticationKind::ApiKey,
+        };
+        let client = MessagesApiClient::new(
+            CoerceProvider::Anthropic,
+            ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER,
+            "claude-sonnet-4-6",
+            "https://api.anthropic.com",
+            None,
+            None,
+        );
+        let request = client.build_request(
+            &[ChatMessage::User {
+                text: "hello".into(),
+                images: Vec::new(),
+            }],
+            &[],
+        );
+        assert_eq!(
+            admit_organization_model_request(&anthropic, "claude-sonnet-4-6", &request)
+                .unwrap()
+                .token_bound,
+            1_000_000
+        );
+        assert_eq!(
+            organization_model_response_tokens(
+                &anthropic,
+                "claude-sonnet-4-6",
+                sansio_types::HttpResponse {
+                    status: 200,
+                    body: serde_json::json!({
+                        "content": [{"type": "text", "text": "hello"}],
+                        "usage": {"input_tokens": 11, "output_tokens": 5}
+                    }),
+                },
+            )
+            .unwrap(),
+            16
+        );
+        assert!(organization_model_response_tokens(
+            &anthropic,
+            "claude-sonnet-4-6",
+            sansio_types::HttpResponse {
+                status: 200,
+                body: serde_json::json!({"content": []}),
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn organization_model_driver_sends_only_a_digest_to_hub_then_the_exact_request_to_fetch() {
+        use gaugedesk_core::ids::ScopeId;
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use whipplescript_kernel::{
+            coerce_native::CoerceProvider,
+            harness_loop::{ChatMessage, HttpModelClient},
+            harness_model::MessagesApiClient,
+        };
+
+        fn read_request(
+            stream: &mut std::net::TcpStream,
+        ) -> (String, Vec<(String, String)>, Vec<u8>) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0, "request ended before its headers");
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let header = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+            let mut lines = header.split("\r\n");
+            let request_line = lines.next().unwrap().to_owned();
+            let headers = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+                .collect::<Vec<_>>();
+            let content_length = headers
+                .iter()
+                .find(|(name, _)| name == "content-length")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .unwrap();
+            while bytes.len() - header_end < content_length {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0, "request ended before its body");
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            (
+                request_line,
+                headers,
+                bytes[header_end..header_end + content_length].to_vec(),
+            )
+        }
+
+        fn write_json(stream: &mut std::net::TcpStream, value: serde_json::Value) {
+            let body = serde_json::to_vec(&value).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        }
+
+        let binding = AuthorityBinding {
+            authority: AuthorityId::new("authority:model"),
+            organization: ScopeId::new("organization:acme"),
+            environment: "test".to_owned(),
+        };
+        let client = MessagesApiClient::new(
+            CoerceProvider::OpenAi,
+            ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER,
+            "gpt-5-mini",
+            "https://api.openai.com",
+            None,
+            None,
+        );
+        let request = client.build_request(
+            &[ChatMessage::User {
+                text: "private project prompt".to_owned(),
+                images: Vec::new(),
+            }],
+            &[],
+        );
+        let expected_request = request.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server_origin = origin.clone();
+        let server_binding = binding.clone();
+        let server = std::thread::spawn(move || {
+            let (mut prepare, _) = listener.accept().unwrap();
+            let (line, headers, body) = read_request(&mut prepare);
+            assert_eq!(
+                line,
+                "POST /projects/project:one/organization-model-invocations HTTP/1.1"
+            );
+            assert!(headers.iter().any(|(name, value)| {
+                name == "authorization" && value == "Bearer account-session"
+            }));
+            assert!(headers.iter().any(|(name, value)| {
+                name == "x-gaugewright-tenant" && value == "organization:acme"
+            }));
+            let prepared: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(prepared.get("v"), Some(&serde_json::json!(1)));
+            assert_eq!(prepared.get("chat"), Some(&serde_json::json!("chat:one")));
+            assert!(prepared.get("prompt").is_none());
+            assert_eq!(
+                prepared.get("request_digest"),
+                Some(
+                    &serde_json::to_value(
+                        organization_model_request_digest(&expected_request).unwrap()
+                    )
+                    .unwrap()
+                )
+            );
+            write_json(
+                &mut prepare,
+                serde_json::json!({
+                    "v": 1,
+                    "binding": server_binding,
+                    "attempt": "attempt:one",
+                    "fetch_url": format!("{server_origin}/v1/model-providers/private-fetch"),
+                    "ticket": "signed-ticket",
+                    "expires_at": unix_now() + 30,
+                }),
+            );
+
+            let (mut fetch, _) = listener.accept().unwrap();
+            let (line, headers, body) = read_request(&mut fetch);
+            assert_eq!(line, "POST /v1/model-providers/private-fetch HTTP/1.1");
+            assert!(headers.iter().any(|(name, value)| {
+                name == "authorization" && value == "Bearer signed-ticket"
+            }));
+            let fetched: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(fetched["url"], expected_request.url);
+            assert_eq!(
+                fetched["headers"],
+                serde_json::json!(expected_request.headers)
+            );
+            assert_eq!(fetched["body"], expected_request.body);
+            write_json(
+                &mut fetch,
+                serde_json::json!({
+                    "v": 1,
+                    "attempt": "attempt:one",
+                    "status": 200,
+                    "body": {
+                        "output": [],
+                        "output_text": "answer",
+                        "usage": {"input_tokens": 7, "output_tokens": 3}
+                    }
+                }),
+            );
+        });
+
+        let broker = OrganizationModelBrokerConfig::new(
+            origin,
+            "account-session",
+            "organization:acme",
+            "project:one",
+            "chat:one",
+            binding,
+        )
+        .unwrap();
+        let response = broker.fetch(&request).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["output_text"], "answer");
+        server.join().unwrap();
+    }
 
     #[derive(Debug)]
     struct TestCredentialCapability {

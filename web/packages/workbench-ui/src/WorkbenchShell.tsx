@@ -311,6 +311,7 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
                 onState={props.state.setCarousel}
                 panes={panes()}
                 paneOrder={props.files ? undefined : ["nav", "chat", "content"]}
+                paneLabels={{ files: title("files") }}
                 onNewChat={props.onNewChat}
             />
             {props.overlays?.()}

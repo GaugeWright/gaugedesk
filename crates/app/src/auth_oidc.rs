@@ -11,10 +11,11 @@
 //!   endpoint ([`exchange_code`], presenting the verifier so an intercepted code is
 //!   useless), then verify the returned id-token against the issuer's live JWKS.
 //!
-//! The verified **id-token is the bearer** the control plane already accepts
-//! (`Workbench::authorize` → `idp.authenticate`), so the shell hands it back to the
-//! client rather than minting a second credential — one home for the session truth
-//! (the signed, self-expiring token), no parallel session table to keep in sync.
+//! Every provider callback resolves an exact external-subject link to an
+//! independent GaugeDesk account and mints an opaque, revocable account
+//! session. Native handoff returns the same account session after its
+//! PKCE-bound exchange; external provider tokens remain server-side and are
+//! used only to maintain that session's bound refresh authority.
 //!
 //! The HTTP-touching logic lives in two seam-generic functions ([`start_login`],
 //! [`finish_callback`]) tested against a mock OP; the axum handlers are the thin
@@ -27,7 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Extension, Query, State},
+    extract::{Extension, Form, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect},
     Json,
@@ -45,7 +46,7 @@ use crate::identity_oidc::{
     ClaimMapping, HttpForm, HttpGet, OidcIdentityProvider, Pkce,
 };
 use crate::net_http::HttpClient;
-use crate::org::{Org, RecordOp, SsoConnectionRecord, SsoProtocol, ORG_ID};
+use crate::org::{Org, RecordOp, SsoConnectionRecord, SsoProtocol, ORG_SCOPE};
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
 use base64::Engine as _;
 
@@ -87,6 +88,100 @@ pub struct PendingAuth {
     /// App-generated S256 challenge binding a native handoff to the GaugeDesk
     /// instance that initiated it. Required whenever `native_return` is set.
     pub native_handoff_challenge: Option<String>,
+    /// Exact organization connection selected on the authorize leg. `None`
+    /// identifies the consumer-provider fallback; an enterprise callback may
+    /// not recover tenant or connection identity from callback input.
+    pub login_context: Option<PendingEnterpriseLogin>,
+    /// Why this browser ceremony was started. A corporate connection test uses
+    /// the same registered callback as ordinary OIDC sign-in, but its verified
+    /// result is folded as revision-bound evidence and must never mint a login,
+    /// account, or membership.
+    pub purpose: PendingAuthPurpose,
+}
+
+/// Server-held context for an isolated corporate browser test. None of these
+/// values comes back from the browser or IdP: the random OIDC `state` selects
+/// this record, binding the return to the initiating administrator, tenant, and
+/// exact saved connection revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingEnterpriseConnectionTest {
+    pub id: String,
+    pub store_scope: String,
+    pub actor: String,
+    pub connection_id: String,
+    pub connection_revision: String,
+}
+
+/// Server-held context for an ordinary corporate sign-in. The IdP callback
+/// carries only the random `state`; tenant and connection identity are pinned
+/// here at the authorize leg and rechecked before subject resolution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingEnterpriseLogin {
+    pub store_scope: String,
+    pub connection_id: String,
+    pub connection_revision: String,
+    pub protocol: SsoProtocol,
+}
+
+/// Server-held authority for linking one consumer OIDC subject to an existing
+/// GaugeDesk account. The initiating opaque session is named by its digest so
+/// the system browser never needs to share the Desk webview's cookie. The
+/// callback rechecks that exact durable session and provider revision before it
+/// admits the link.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingConsumerOidcLink {
+    pub account_id: String,
+    pub session_id: String,
+    pub connection_id: String,
+    pub connection_revision: String,
+}
+
+/// All server-held inputs the enterprise composition needs to begin an
+/// ordinary SAML login. The returned URL carries only a random RelayState;
+/// tenant, connection revision, native handoff, and trust material stay here.
+#[derive(Clone, Debug)]
+pub struct EnterpriseSamlStartRequest {
+    pub connection: SsoConnectionRecord,
+    pub login_context: PendingEnterpriseLogin,
+    pub public_base: String,
+    pub native_return: Option<String>,
+    pub native_handoff_challenge: Option<String>,
+}
+
+/// Enterprise-owned SAML protocol launcher registered into the shared account
+/// shell. Core owns discovery and post-login session delivery; the enterprise
+/// band owns SAML metadata, AuthnRequest construction, and assertion verify.
+pub type EnterpriseSamlStart =
+    Arc<dyn Fn(EnterpriseSamlStartRequest) -> Result<String, String> + Send + Sync>;
+
+/// The callback consequence selected on the authorize leg. `Login` retains the
+/// existing session path; a connection test is deliberately non-login.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PendingAuthPurpose {
+    #[default]
+    Login,
+    ConsumerOidcLink(PendingConsumerOidcLink),
+    EnterpriseConnectionTest(PendingEnterpriseConnectionTest),
+}
+
+/// Verified OIDC return material made available to the composition callback.
+/// The external token remains internal; the enterprise test fold consumes only
+/// the subject and mapped, non-secret attributes.
+pub struct VerifiedOidcIdentity {
+    pub authority: AuthorityId,
+    pub id_token: String,
+    pub refresh_token: Option<String>,
+    pub attributes: AuthorityAttributes,
+}
+
+/// Provider-neutral corporate identity passed to the organization admission
+/// fold after protocol verification. The work-email discovery input never
+/// appears here: `verified_email` comes only from the signed OIDC claims or
+/// signed SAML assertion.
+#[derive(Clone, Debug)]
+pub struct VerifiedEnterpriseIdentity {
+    pub authority: AuthorityId,
+    pub verified_email: Option<String>,
 }
 
 /// How long a minted `state` may await its callback. A browser crossing the
@@ -189,10 +284,23 @@ pub fn auth_routes(state: AuthShellState) -> axum::Router<SharedWorkbench> {
     use axum::routing::{get, post};
     axum::Router::new()
         // `/auth/login` redirects the browser to the configured IdP;
-        // `/auth/callback` redeems the code and hands back the verified
-        // id-token (the bearer the gated routes accept).
+        // `/auth/callback` redeems the code. Hosted corporate login resolves
+        // the verified subject to an independent GaugeDesk account before it
+        // mints the opaque browser session.
         .route("/auth/login", get(get_login))
+        // Work-email discovery is a POST so the address never rides in a URL.
+        // The server selects one DNS-verified organization connection and puts
+        // that exact scope/revision in the ordinary pending-login state.
+        .route("/auth/work-email", post(post_work_email_login))
         .route("/auth/callback", get(get_callback))
+        // Consumer OIDC is an optional authenticator on an existing account.
+        // Desk starts it over the authenticated API, then opens the returned
+        // authorize URL in the system browser; that browser need not share the
+        // Desk webview's cookie.
+        .route(
+            "/auth/account/consumer-oidc/link/start",
+            post(post_consumer_oidc_link_start),
+        )
         // Safe current-session projection for the Account menu. This is not a
         // linked-method or recovery/custody declaration.
         .route("/auth/session", get(get_session))
@@ -224,17 +332,55 @@ pub struct AuthShellState {
     pending_auth: Arc<Mutex<PendingAuthStore>>,
     native_handoffs: Arc<Mutex<NativeHandoffStore>>,
     login_fold: Option<LoginFold>,
+    enterprise_test_fold: Option<EnterpriseConnectionTestFold>,
+    enterprise_saml_start: Option<EnterpriseSamlStart>,
     account_auth: Option<Arc<crate::account_auth_ceremony::AccountAuthRuntime>>,
 }
 
-/// What the composition folds after a verified login (ADR 0122 §3). The shell
-/// verifies identity, mints the session, audits, and handles the hosted
-/// web-account/session machinery itself; **membership consequences** — folding
-/// the authenticated subject into an org directory (verified-domain JIT) — are
-/// the composition's, registered here. `(workbench, tenant scope, authority,
-/// verified id-token)`. A composition without a fold gets a login with no
-/// membership side effects.
-pub type LoginFold = Arc<dyn Fn(&mut Workbench, &str, &str, &str) + Send + Sync>;
+/// What the composition resolves after a provider assertion is verified and
+/// before any session is minted (ADR 0122 §3). Corporate subject→account links
+/// and explicit organization admission are the composition's responsibility;
+/// the shell owns the resulting account session. A consumer-provider fallback
+/// has no enterprise login context and therefore does not invoke this fold.
+pub type LoginFold = Arc<
+    dyn Fn(
+            &mut Workbench,
+            &PendingEnterpriseLogin,
+            &VerifiedEnterpriseIdentity,
+        ) -> Result<LoginResolution, LoginFoldRefusal>
+        + Send
+        + Sync,
+>;
+
+/// Account identity and exact method produced by a composition-owned corporate
+/// login fold. The external subject is never used as the account id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginResolution {
+    pub account_id: String,
+    pub session_method: String,
+}
+
+/// Closed callback refusal classes. The browser receives a bounded product
+/// message rather than reducer internals or identity-provider material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginFoldRefusal {
+    NotAdmitted,
+    StaleConnection,
+    Unavailable,
+}
+
+/// Composition-owned durable consequence of a successful isolated browser
+/// test. Keeping the hook here lets the shared OIDC shell verify one callback
+/// route while the enterprise band owns organization evidence and policy.
+pub type EnterpriseConnectionTestFold = Arc<
+    dyn Fn(
+            &mut Workbench,
+            &PendingEnterpriseConnectionTest,
+            &VerifiedOidcIdentity,
+        ) -> Result<(), String>
+        + Send
+        + Sync,
+>;
 
 impl AuthShellState {
     /// Empty shell state (no composition fold).
@@ -251,6 +397,21 @@ impl AuthShellState {
         self
     }
 
+    /// Register the enterprise band's non-login callback consequence.
+    pub fn with_enterprise_connection_test_fold(
+        mut self,
+        fold: EnterpriseConnectionTestFold,
+    ) -> Self {
+        self.enterprise_test_fold = Some(fold);
+        self
+    }
+
+    /// Register the enterprise band's ordinary SAML authorize leg.
+    pub fn with_enterprise_saml_start(mut self, start: EnterpriseSamlStart) -> Self {
+        self.enterprise_saml_start = Some(start);
+        self
+    }
+
     /// Install the provider-neutral GaugeDesk account ceremony runtime.
     pub fn with_account_auth(
         mut self,
@@ -260,9 +421,7 @@ impl AuthShellState {
         self
     }
 
-    pub(crate) fn account_auth(
-        &self,
-    ) -> Option<Arc<crate::account_auth_ceremony::AccountAuthRuntime>> {
+    pub fn account_auth(&self) -> Option<Arc<crate::account_auth_ceremony::AccountAuthRuntime>> {
         self.account_auth.clone()
     }
 
@@ -278,10 +437,42 @@ impl AuthShellState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
+
+    fn begin_enterprise_saml(&self, request: EnterpriseSamlStartRequest) -> Result<String, String> {
+        self.enterprise_saml_start
+            .as_ref()
+            .ok_or_else(|| "SAML sign-in is unavailable on this server".to_owned())?(request)
+    }
+
+    /// Resolve a verified corporate subject through the composition-owned
+    /// organization admission fold. Both OIDC and SAML use this exact seam.
+    pub fn resolve_enterprise_login(
+        &self,
+        wb: &mut Workbench,
+        context: &PendingEnterpriseLogin,
+        identity: &VerifiedEnterpriseIdentity,
+    ) -> Result<LoginResolution, LoginFoldRefusal> {
+        self.login_fold
+            .as_ref()
+            .ok_or(LoginFoldRefusal::Unavailable)?(wb, context, identity)
+    }
 }
 
 struct NativeHandoff {
-    id_token: crate::secret::Secret,
+    /// Independent GaugeDesk account resolved before the handoff was issued.
+    /// Native device enrollment is account-scoped and must not derive this
+    /// identity again from the external token's `sub` claim.
+    account_id: String,
+    /// Exact method that resolved the account. The opaque native session carries
+    /// the same method as a browser session from this callback.
+    session_method: String,
+    /// A non-secret, human-recognizable label projected from the already-verified
+    /// assertion. The external token itself never crosses the native exchange.
+    label: String,
+    /// Expiry of the already-verified provider token. It bounds a session for
+    /// which the provider issued no refresh grant and schedules renewal when one
+    /// exists; it is not used as native identity evidence.
+    provider_expires_at_ms: u64,
     /// The offline-access refresh token captured at the same callback, carried so
     /// the exchange can seal the native session its own durable grant (ADR 0147 §2)
     /// — independent of the browser `web` grant, which a prior logout may already
@@ -291,11 +482,37 @@ struct NativeHandoff {
     expires_at: Instant,
 }
 
-/// What a redeemed native handoff yields: the id-token the native client presents
-/// as its bearer, and the refresh token (if any) to seal into its device-bound grant.
+/// What a redeemed native handoff yields. Provider credentials remain inside the
+/// Hub; the native client receives a separately minted opaque account session.
 struct RedeemedHandoff {
-    id_token: String,
+    account_id: String,
+    session_method: String,
+    label: String,
+    provider_expires_at_ms: u64,
     refresh_token: Option<String>,
+}
+
+struct NativeHandoffIssue {
+    account_id: String,
+    session_method: String,
+    label: String,
+    provider_expires_at_ms: u64,
+    refresh_token: Option<String>,
+    challenge: String,
+}
+
+/// Provider-neutral inputs for delivering a verified corporate login after
+/// the organization fold resolved its independent GaugeDesk account. Protocol
+/// credentials stay server-side; the browser or native client receives only a
+/// durable opaque account session (or a one-time native handoff code).
+pub struct EnterpriseLoginDelivery {
+    pub login_context: PendingEnterpriseLogin,
+    pub resolution: LoginResolution,
+    pub display_label: String,
+    pub provider_expires_at_ms: u64,
+    pub refresh_token: Option<String>,
+    pub native_return: Option<String>,
+    pub native_handoff_challenge: Option<String>,
 }
 
 #[derive(Default)]
@@ -304,22 +521,19 @@ struct NativeHandoffStore {
 }
 
 impl NativeHandoffStore {
-    fn issue(
-        &mut self,
-        id_token: String,
-        refresh_token: Option<String>,
-        challenge: String,
-        now: Instant,
-    ) -> String {
+    fn issue(&mut self, issue: NativeHandoffIssue, now: Instant) -> String {
         self.by_code.retain(|_, handoff| handoff.expires_at > now);
         let code = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(crate::session::random_bytes::<32>());
         self.by_code.insert(
             code.clone(),
             NativeHandoff {
-                id_token: id_token.into(),
-                refresh_token: refresh_token.map(Into::into),
-                challenge,
+                account_id: issue.account_id,
+                session_method: issue.session_method,
+                label: issue.label,
+                provider_expires_at_ms: issue.provider_expires_at_ms,
+                refresh_token: issue.refresh_token.map(Into::into),
+                challenge: issue.challenge,
                 expires_at: now + Duration::from_secs(5 * 60),
             },
         );
@@ -334,12 +548,126 @@ impl NativeHandoffStore {
             return None;
         }
         Some(RedeemedHandoff {
-            id_token: handoff.id_token.expose().to_string(),
+            account_id: handoff.account_id,
+            session_method: handoff.session_method,
+            label: handoff.label,
+            provider_expires_at_ms: handoff.provider_expires_at_ms,
             refresh_token: handoff
                 .refresh_token
                 .as_ref()
                 .map(|token| token.expose().to_string()),
         })
+    }
+}
+
+impl AuthShellState {
+    /// Complete one corporate login through the shared account-session
+    /// authority. OIDC and SAML call this only after assertion verification and
+    /// the same organization admission fold; no provider credential is exposed.
+    pub fn deliver_enterprise_login(
+        &self,
+        wb: &SharedWorkbench,
+        delivery: EnterpriseLoginDelivery,
+    ) -> axum::response::Response {
+        let EnterpriseLoginDelivery {
+            login_context,
+            resolution,
+            display_label,
+            provider_expires_at_ms,
+            refresh_token,
+            native_return,
+            native_handoff_challenge,
+        } = delivery;
+        let account_id = resolution.account_id;
+        let session_method = resolution.session_method;
+
+        {
+            let mut guard = wb.lock_unpoisoned();
+            crate::audit::record_in(
+                &mut guard,
+                &login_context.store_scope,
+                &account_id,
+                "auth.login",
+                &account_id,
+            );
+            provision_web_account(&mut guard, &account_id, web_account_mode());
+        }
+
+        if let Some(native_return) = native_return {
+            let Some(challenge) = native_handoff_challenge else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "native handoff challenge was lost",
+                )
+                    .into_response();
+            };
+            let code = self.native_handoffs_mut().issue(
+                NativeHandoffIssue {
+                    account_id,
+                    session_method,
+                    label: display_label,
+                    provider_expires_at_ms,
+                    refresh_token,
+                    challenge,
+                },
+                Instant::now(),
+            );
+            return Redirect::to(&format!("{native_return}#code={code}")).into_response();
+        }
+
+        let token = {
+            let mut guard = wb.lock_unpoisoned();
+            let Some(token) = guard.mint_account_session(
+                &account_id,
+                &session_method,
+                crate::account::SESSION_ABSOLUTE_LIFETIME_MS / 1000,
+            ) else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not create the account session",
+                )
+                    .into_response();
+            };
+            if web_account_mode() {
+                if let Some(refresh_token) = refresh_token.as_deref() {
+                    let session_id = crate::account_session::session_id(&token);
+                    store_refresh_token(
+                        &mut guard,
+                        &account_id,
+                        refresh_token,
+                        crate::account::RefreshBinding::Web,
+                        &session_id,
+                        "",
+                    );
+                }
+            }
+            token
+        };
+
+        if web_account_mode() {
+            let post_login = gaugedesk_env::var("OIDC_POST_LOGIN_URL")
+                .filter(|url| !url.trim().is_empty())
+                .unwrap_or_else(|| "/".to_owned());
+            let mut response = Redirect::to(&post_login).into_response();
+            append_session_cookies(&mut response, &token);
+            return response;
+        }
+
+        if let Some(url) = gaugedesk_env::var("OIDC_POST_LOGIN_URL") {
+            if !url.trim().is_empty() {
+                return Redirect::to(&format!("{url}#id_token={token}&token_type=Bearer"))
+                    .into_response();
+            }
+        }
+        (
+            StatusCode::OK,
+            Json(json!({
+                "authority": account_id,
+                "id_token": token,
+                "token_type": "Bearer",
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -417,6 +745,8 @@ pub fn start_login(
         client_secret: None,
         native_return: None,
         native_handoff_challenge: None,
+        login_context: None,
+        purpose: PendingAuthPurpose::Login,
     };
     Ok((url, state, pending))
 }
@@ -442,6 +772,22 @@ pub fn finish_callback(
     code: &str,
     http: &(impl HttpForm + HttpGet),
 ) -> Result<(AuthorityId, String, Option<String>), CallbackError> {
+    let verified = finish_callback_verified(pending, code, http)?;
+    Ok((
+        verified.authority,
+        verified.id_token,
+        verified.refresh_token,
+    ))
+}
+
+/// Complete and verify an OIDC return while retaining the mapped claim result
+/// for an enterprise test-purpose callback. Ordinary callers keep using
+/// [`finish_callback`], whose wire-compatible tuple deliberately omits it.
+pub fn finish_callback_verified(
+    pending: &PendingAuth,
+    code: &str,
+    http: &(impl HttpForm + HttpGet),
+) -> Result<VerifiedOidcIdentity, CallbackError> {
     let client_id = pending
         .audiences
         .first()
@@ -475,9 +821,15 @@ pub fn finish_callback(
     if id_token_nonce(&id_token).as_deref() != Some(pending.nonce.as_str()) {
         return Err(CallbackError::NotVerified);
     }
+    let attributes = idp.claims(&authority);
     // The refresh token (present only on an offline-access consent grant) rides back so the
     // callback can seal it for the session-refresh leg (ADR 0077).
-    Ok((authority, id_token, refresh_token))
+    Ok(VerifiedOidcIdentity {
+        authority,
+        id_token,
+        refresh_token,
+        attributes,
+    })
 }
 
 /// The `nonce` claim of an **already-verified** id-token (its signature and registered
@@ -485,15 +837,65 @@ pub fn finish_callback(
 /// payload segment for the login-session binding check in [`finish_callback`]. `None` if
 /// the token carries no readable `nonce`.
 fn id_token_nonce(id_token: &str) -> Option<String> {
+    id_token_claims(id_token)?
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Claims from an already-verified id-token. This is projection only: callers
+/// reach it after signature and registered-claim verification, and no value read
+/// here is accepted as a fresh credential.
+fn id_token_claims(id_token: &str) -> Option<serde_json::Value> {
     let payload = id_token.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Human-recognizable label for a native account session. Email is preferred,
+/// then name; an opaque provider subject is deliberately not surfaced.
+fn id_token_display_label(id_token: &str) -> Option<String> {
+    let claims = id_token_claims(id_token)?;
+    ["email", "name"].iter().find_map(|key| {
+        claims
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Email admitted from an already-verified OIDC token. Organization admission
+/// requires the provider to mark it verified; the address submitted for
+/// discovery is deliberately never consulted here.
+fn id_token_verified_email(id_token: &str) -> Option<String> {
+    let claims = id_token_claims(id_token)?;
+    if claims
+        .get("email_verified")
+        .and_then(|value| value.as_bool())
+        != Some(true)
+    {
+        return None;
+    }
     claims
-        .get("nonce")
-        .and_then(|v| v.as_str())
+        .get("email")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// Provider-token expiry in epoch milliseconds. The token was already verified
+/// on the callback leg; native code uses this only to schedule server-side
+/// renewal or to bound a no-refresh-grant session.
+fn id_token_expiry_ms(id_token: &str) -> Option<u64> {
+    id_token_claims(id_token)?
+        .get("exp")
+        .and_then(|value| value.as_u64())
+        .map(|seconds| seconds.saturating_mul(1000))
 }
 
 // ---- enterprise-mode activation (wb.idp from the SSO connection) ---------
@@ -836,10 +1238,17 @@ pub fn login_ceremony_skippable(web_account: bool, native_login: bool, actor: &s
     web_account && !native_login && actor != "anonymous"
 }
 
+/// Every browser/programmatic callback delivers an opaque GaugeDesk session.
+/// Native handoff delays that mint until its PKCE-bound one-time code is
+/// redeemed. An external provider token is never an account session.
+fn requires_account_session(native_login: bool) -> bool {
+    !native_login
+}
+
 /// Post-login account reconciliation for the hosted web account (`ADR 0077` §9): provision the
-/// authenticated person's **personal tenant-of-one** (idempotent), so a Google login lands them in
-/// the Console with their own space. The authenticated `authority` (the OIDC subject) *is* the
-/// person root. No-op unless `web_account` — the enterprise/desktop login paths are untouched.
+/// authenticated person's **personal tenant-of-one** (idempotent), so hosted sign-in lands them in
+/// the Console with their own space. `person` is the independently resolved account root, never
+/// the OIDC subject. No-op unless `web_account` — the enterprise/desktop login paths are untouched.
 /// Returns the personal tenant id when provisioned. Best-effort: a store error yields `None` and
 /// the login still succeeds (the person retries; provisioning self-heals, `tenancy::…`).
 pub fn provision_web_account(
@@ -910,21 +1319,18 @@ fn admit_browser_refresh(
     Ok(grant)
 }
 
-/// Admit (or refuse) a **native** refresh for `person` at `now_ms` (ADR 0147 §2/§4,
-/// SOC 2 F-4.2). The native client presents only its bearer — no device header — so
-/// admission resolves the person's durable native grant and reads the device it is
-/// bound to from the **stored** record, then requires that device to still be
-/// admitted and the grant to be within bounds. Because the bound device comes from
-/// the record and never from a request header, a caller cannot bypass device
-/// revocation by omitting or forging `x-gw-device`; the header is not consulted at
-/// all. A revoked device (whose grant the revocation cascade tombstones) refuses.
-/// Returns the live grant on success.
+/// Admit (or refuse) a **native** refresh for `person`'s opaque `session_id` at
+/// `now_ms` (ADR 0147 §2/§4, SOC 2 F-4.2). The bearer digest selects that exact
+/// durable grant; its stored device binding must still be admitted and the grant
+/// must be within bounds. No request header can substitute either relationship.
+/// A revoked session or device folds the grant out and therefore refuses.
 fn admit_native_refresh(
     wb: &Workbench,
     person: &str,
+    session_id: &str,
     now_ms: u64,
 ) -> Result<crate::account::RefreshRecord, &'static str> {
-    let grant = resolve_refresh_grant(wb, person, crate::account::NATIVE_REFRESH_BINDING)
+    let grant = resolve_refresh_grant(wb, person, session_id)
         .ok_or("no refresh token on file; sign in again")?;
     if !native_device_admitted(wb, person, &grant.device_id) {
         return Err("this device's account session was revoked");
@@ -932,6 +1338,10 @@ fn admit_native_refresh(
     crate::account::refresh_within_bounds(&grant, now_ms)?;
     Ok(grant)
 }
+
+/// Stable provider-connection identity for the configured consumer Google
+/// adapter. It is intentionally outside the organization connection namespace.
+pub const CONSUMER_GOOGLE_CONNECTION_ID: &str = "consumer-google";
 
 /// A Google (or any OIDC) SSO connection for the hosted web account, from env — so the hub
 /// offers "Continue with Google" without a manual `/admin/sso` POST. `GAUGEDESK_GOOGLE_CLIENT_ID`
@@ -948,20 +1358,81 @@ pub fn web_account_sso_from_env() -> Option<SsoConnectionRecord> {
     Some(google_sso(&issuer, &client_id))
 }
 
+/// Back-link every legacy consumer account once, before this composition serves a
+/// request (GAUGEAPP-9).
+///
+/// This initiative made the callback resolve an external-subject link before minting a
+/// session. An account created by consumer sign-in under the previous rule carries the
+/// verified subject as its id and holds no method, so without this it can never sign in
+/// again and no route can repair it: linking requires a live passkey-or-recovery
+/// session it cannot obtain.
+///
+/// Runs where configured IdP activation already runs, so the repair lands before the
+/// router exists rather than racing the first sign-in. It is a no-op when consumer
+/// sign-in is unconfigured, and idempotent, so repeated boots cost one read.
+pub fn backlink_legacy_consumer_accounts(wb: &mut Workbench) -> usize {
+    let Some(connection) = web_account_sso_from_env() else {
+        return 0;
+    };
+    let Ok(state) = crate::account_auth::AccountAuth::rebuild(wb.store_ref()) else {
+        return 0;
+    };
+    let Ok(catalog) =
+        crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild(wb.store_ref())
+    else {
+        return 0;
+    };
+    // Only accounts this composition would actually authenticate. A pending erasure or
+    // an unmigrated custody scope is not a sign-in problem to solve here.
+    let candidates: Vec<String> = catalog
+        .authenticatable_account_scoped_account_ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let facts: Vec<crate::account_auth::AccountAuthFact> = candidates
+        .iter()
+        .filter_map(|account_id| {
+            crate::account_auth::decide_backlink_legacy_consumer_subject(
+                &state,
+                account_id,
+                &connection.id,
+                &connection.issuer,
+                crate::account::session_now_ms(),
+            )
+        })
+        .collect();
+    if facts.is_empty() {
+        return 0;
+    }
+    let linked = facts.len();
+    match crate::account_auth::append_facts(wb.store_mut(), &facts) {
+        Ok(_) => linked,
+        // A failure here must not stop the composition from serving: the accounts that
+        // were already fine still are, and the next boot retries the rest.
+        Err(_) => 0,
+    }
+}
+
 /// Build an OIDC SSO connection record for `issuer` + `client_id` (pure; the env wrapper is
-/// [`web_account_sso_from_env`]). Singleton id, no enforce-SSO (the hosted account is opt-in
+/// [`web_account_sso_from_env`]). Stable consumer id, no enforce-SSO (the hosted account is opt-in
 /// login, not a locked-down org).
 pub fn google_sso(issuer: &str, client_id: &str) -> SsoConnectionRecord {
-    SsoConnectionRecord {
-        id: ORG_ID.to_string(),
+    let mut connection = SsoConnectionRecord {
+        id: CONSUMER_GOOGLE_CONNECTION_ID.to_string(),
         op: RecordOp::Upsert,
+        revision: String::new(),
+        credential_revision: None,
         protocol: SsoProtocol::Oidc,
         issuer: issuer.to_string(),
         audiences: vec![client_id.to_string()],
         metadata: String::new(),
+        saml_sp_entity_id: String::new(),
+        saml_acs_url: String::new(),
         enforce_sso: false,
         claim_mapping: Default::default(),
-    }
+    };
+    connection.seal_revision();
+    connection
 }
 
 /// A safe label for the already-authenticated sign-in session. This is a
@@ -987,7 +1458,10 @@ fn session_method(sso: Option<&SsoConnectionRecord>) -> (&'static str, &'static 
 /// default for a server-minted opaque session.
 fn session_label_for_method(method: &str) -> (&'static str, &'static str) {
     match method {
-        "oidc" => ("oidc", "Single sign-on (OIDC)"),
+        method if method.starts_with("consumer-oidc:") => ("google", "Google"),
+        method if method.starts_with("enterprise-oidc:") => ("oidc", "Corporate sign-in (OIDC)"),
+        method if method.starts_with("enterprise-saml:") => ("saml", "Corporate sign-in (SAML)"),
+        "recovery" => ("recovery", "Recovery code"),
         _ => ("passkey", "Passkey or security key"),
     }
 }
@@ -1005,7 +1479,7 @@ pub async fn get_session(
     // (ADR 0147 §1) — read from the durable session record, never hardcoded. An
     // OIDC-derived session is "oidc"; a passkey ceremony session is "passkey".
     if let Some((method, label)) = bearer
-        .and_then(|token| wb.account_sessions().resolve_session(token))
+        .and_then(|token| wb.resolve_account_session(token))
         .map(|(_, method)| session_label_for_method(&method))
     {
         return (
@@ -1185,6 +1659,37 @@ fn callback_redirect_uri(headers: &HeaderMap) -> String {
     format!("http://{host}/auth/callback")
 }
 
+/// Canonical externally visible origin used when an enterprise protocol needs
+/// absolute launch and callback URLs. The explicit deployment value wins;
+/// otherwise trusted proxy headers precede Host for the loopback/dev path.
+pub fn request_public_base(headers: &HeaderMap) -> String {
+    if let Some(url) = gaugedesk_env::var("PUBLIC_URL") {
+        if !url.trim().is_empty() {
+            return url.trim_end_matches('/').to_owned();
+        }
+    }
+    let host = headers
+        .get("x-forwarded-host")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            headers
+                .get(axum::http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or("localhost:7878");
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http");
+    format!("{scheme}://{host}")
+}
+
 fn login_err(e: LoginError) -> axum::response::Response {
     let (code, msg) = match e {
         LoginError::NotConfigured => (
@@ -1206,6 +1711,194 @@ fn login_err(e: LoginError) -> axum::response::Response {
         ),
     };
     (code, msg).into_response()
+}
+
+/// Resolve an untrusted work-email routing hint to exactly one configured
+/// organization connection. The address is used only for discovery: the IdP
+/// callback must independently assert and verify its own email before the
+/// organization admission fold may act.
+///
+/// DNS-verified domain ownership is the lookup authority. Ambiguous domains,
+/// incomplete admission configuration, invalid addresses, and protocols whose
+/// ordinary login journey is not yet implemented all produce the same absence.
+fn enterprise_sso_for_work_email(
+    store: &gaugedesk_store::Store,
+    email: &str,
+) -> Result<Option<(SsoConnectionRecord, PendingEnterpriseLogin)>, gaugedesk_store::AdmitError> {
+    let Some(email) = crate::account_auth::normalize_email_contact(email) else {
+        return Ok(None);
+    };
+    let mut matches = Vec::new();
+    for scope in store.scope_ids()? {
+        if scope != ORG_SCOPE && !scope.starts_with("org::") {
+            continue;
+        }
+        let org = Org::rebuild_in(store, &scope)?;
+        if org.org.is_none() || org.sso_admission.is_none() || !org.domain_is_verified(&email) {
+            continue;
+        }
+        let Some(connection) = org.sso else {
+            continue;
+        };
+        matches.push((scope, connection));
+    }
+    if matches.len() != 1 {
+        return Ok(None);
+    }
+    let (store_scope, connection) = matches.pop().expect("one discovery match");
+    let context = PendingEnterpriseLogin {
+        store_scope,
+        connection_id: connection.id.clone(),
+        connection_revision: connection.current_revision(),
+        protocol: connection.protocol,
+    };
+    Ok(Some((connection, context)))
+}
+
+/// Resolve a confidential OIDC client secret from the exact organization
+/// connection. A configured-but-missing, stale, or undecryptable credential
+/// fails closed; it never falls back to the consumer Google environment secret.
+pub fn organization_oidc_client_secret(
+    wb: &Workbench,
+    org: &Org,
+    connection: &SsoConnectionRecord,
+) -> Result<Option<crate::secret::Secret>, &'static str> {
+    if connection.protocol != SsoProtocol::Oidc || connection.credential_revision.is_none() {
+        return Ok(None);
+    }
+    let current = org
+        .sso
+        .as_ref()
+        .filter(|current| {
+            current.id == connection.id
+                && current.protocol == connection.protocol
+                && current.current_revision() == connection.current_revision()
+        })
+        .ok_or("the organization sign-in connection changed")?;
+    let credential = org
+        .current_sso_credential()
+        .ok_or("the organization OIDC client secret is unavailable")?;
+    let binding = current
+        .credential_binding()
+        .ok_or("the organization OIDC credential binding is unavailable")?;
+    let secret = wb
+        .unseal_organization_secret(&org.scope, &binding, &credential.sealed_secret)
+        .ok_or("the organization OIDC client secret could not be opened")?;
+    Ok(Some(crate::secret::Secret::new(secret)))
+}
+
+async fn begin_enterprise_browser_login(
+    auth: AuthShellState,
+    headers: &HeaderMap,
+    connection: SsoConnectionRecord,
+    login_context: PendingEnterpriseLogin,
+    client_secret: Option<crate::secret::Secret>,
+    native_return: Option<String>,
+    native_handoff_challenge: Option<String>,
+) -> axum::response::Response {
+    match connection.protocol {
+        SsoProtocol::Oidc => {
+            begin_oidc_browser_login(
+                auth,
+                headers,
+                connection,
+                OidcBrowserOptions {
+                    authority: OidcConnectionAuthority::Enterprise {
+                        login_context,
+                        client_secret,
+                    },
+                    native_return,
+                    native_handoff_challenge,
+                    purpose: PendingAuthPurpose::Login,
+                },
+            )
+            .await
+        }
+        SsoProtocol::Saml => {
+            let request = EnterpriseSamlStartRequest {
+                connection,
+                login_context,
+                public_base: request_public_base(headers),
+                native_return,
+                native_handoff_challenge,
+            };
+            match auth.begin_enterprise_saml(request) {
+                Ok(url) => Redirect::to(&url).into_response(),
+                Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+            }
+        }
+    }
+}
+
+enum OidcConnectionAuthority {
+    Consumer,
+    Enterprise {
+        login_context: PendingEnterpriseLogin,
+        client_secret: Option<crate::secret::Secret>,
+    },
+}
+
+struct OidcBrowserOptions {
+    authority: OidcConnectionAuthority,
+    native_return: Option<String>,
+    native_handoff_challenge: Option<String>,
+    purpose: PendingAuthPurpose,
+}
+
+async fn begin_oidc_browser_login(
+    auth: AuthShellState,
+    headers: &HeaderMap,
+    sso: SsoConnectionRecord,
+    options: OidcBrowserOptions,
+) -> axum::response::Response {
+    match prepare_oidc_browser_login(auth, headers, sso, options).await {
+        Ok(url) => Redirect::to(&url).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn prepare_oidc_browser_login(
+    auth: AuthShellState,
+    headers: &HeaderMap,
+    sso: SsoConnectionRecord,
+    options: OidcBrowserOptions,
+) -> Result<String, axum::response::Response> {
+    let redirect_uri = callback_redirect_uri(headers);
+    let scope =
+        gaugedesk_env::var("OIDC_SCOPE").unwrap_or_else(|| "openid profile email".to_string());
+    let mapping = claim_mapping_for(&sso);
+
+    // Discovery touches the network — run it off the async runtime (ureq is blocking).
+    let started = tokio::task::spawn_blocking(move || {
+        let http = HttpClient::new();
+        start_login(&sso, &redirect_uri, &scope, mapping, &http)
+    })
+    .await;
+    let (url, state, mut pending) = match started {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => return Err(login_err(error)),
+        Err(_) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "login task panicked").into_response())
+        }
+    };
+    // Consumer login retains the deployment-level Google credential. An
+    // enterprise login receives only the exact organization credential
+    // resolved before this function; it never falls back across authorities.
+    let (enterprise_login, client_secret) = match options.authority {
+        OidcConnectionAuthority::Consumer => (None, google_client_secret_from_env()),
+        OidcConnectionAuthority::Enterprise {
+            login_context,
+            client_secret,
+        } => (Some(login_context), client_secret),
+    };
+    pending.client_secret = client_secret;
+    pending.native_return = options.native_return;
+    pending.native_handoff_challenge = options.native_handoff_challenge;
+    pending.login_context = enterprise_login;
+    pending.purpose = options.purpose;
+    auth.pending_auth_mut()
+        .begin(state, pending, Instant::now());
+    Ok(url)
 }
 
 /// `GET /auth/login` — begin OIDC login: discover, mint PKCE + state, stash, and
@@ -1242,48 +1935,278 @@ pub async fn get_login(
             return resp;
         }
     }
-    let sso = {
+    let store_scope = crate::workbench_auth::req_scope(&headers);
+    let stored_sso = {
         let wb = wb.lock_unpoisoned();
-        match Org::rebuild_in(wb.store_ref(), &crate::workbench_auth::req_scope(&headers)) {
-            Ok(org) => org.sso,
+        match Org::rebuild_in(wb.store_ref(), &store_scope) {
+            Ok(org) => match org.sso.clone() {
+                Some(connection) => match organization_oidc_client_secret(&wb, &org, &connection) {
+                    Ok(secret) => Some((connection, secret)),
+                    Err(message) => {
+                        return (StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+                    }
+                },
+                None => None,
+            },
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
         }
     };
+    if let Some((connection, client_secret)) = stored_sso {
+        let login_context = PendingEnterpriseLogin {
+            store_scope,
+            connection_id: connection.id.clone(),
+            connection_revision: connection.current_revision(),
+            protocol: connection.protocol,
+        };
+        return begin_enterprise_browser_login(
+            auth,
+            &headers,
+            connection,
+            login_context,
+            client_secret,
+            native_return,
+            query.handoff_challenge,
+        )
+        .await;
+    }
     // Hosted web account: fall back to the Google connection from env, so the hub offers
     // "Continue with Google" without a stored /admin/sso record (ADR 0077).
-    let sso = sso.or_else(web_account_sso_from_env);
+    let sso = web_account_sso_from_env();
     let Some(sso) = sso else {
         return (StatusCode::CONFLICT, "no SSO connection configured").into_response();
     };
+    begin_oidc_browser_login(
+        auth,
+        &headers,
+        sso,
+        OidcBrowserOptions {
+            authority: OidcConnectionAuthority::Consumer,
+            native_return,
+            native_handoff_challenge: query.handoff_challenge,
+            purpose: PendingAuthPurpose::Login,
+        },
+    )
+    .await
+}
 
-    let redirect_uri = callback_redirect_uri(&headers);
-    let scope =
-        gaugedesk_env::var("OIDC_SCOPE").unwrap_or_else(|| "openid profile email".to_string());
-    // The claim mapping comes from the connection record (env-fallback) — the same
-    // resolution the durable verifier uses, so the shell and `wb.idp` agree (`ID-3`).
-    let mapping = claim_mapping_for(&sso);
+fn independent_account_method(method: &str) -> bool {
+    matches!(method, "passkey" | "recovery")
+}
 
-    // Discovery touches the network — run it off the async runtime (ureq is blocking).
-    let started = tokio::task::spawn_blocking(move || {
-        let http = HttpClient::new();
-        start_login(&sso, &redirect_uri, &scope, mapping, &http)
+fn durable_independent_session(
+    state: &crate::account_auth::AccountAuth,
+    session_id: &str,
+    account_id: &str,
+    now_ms: u64,
+) -> bool {
+    state.roots.contains_key(account_id)
+        && state.sessions.get(session_id).is_some_and(|session| {
+            session.account_id == account_id
+                && independent_account_method(&session.method)
+                && session
+                    .issued_at_ms
+                    .checked_add(session.lifetime_secs.saturating_mul(1000))
+                    .is_some_and(|expires_at| expires_at > now_ms)
+        })
+}
+
+fn resolve_consumer_oidc_account(
+    state: &crate::account_auth::AccountAuth,
+    connection: &SsoConnectionRecord,
+    verified_issuer: &str,
+    subject: &str,
+) -> Option<LoginResolution> {
+    if connection.protocol != SsoProtocol::Oidc || connection.issuer != verified_issuer {
+        return None;
+    }
+    let link = state.active_external_subject(
+        &connection.id,
+        verified_issuer,
+        subject,
+        crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+    )?;
+    Some(LoginResolution {
+        account_id: link.account_id.clone(),
+        session_method: format!("consumer-oidc:{}", connection.id),
     })
-    .await;
-    let (url, state, mut pending) = match started {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return login_err(e),
-        Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "login task panicked").into_response()
+}
+
+/// Begin linking the configured consumer provider to the account authenticated
+/// by this request. The returned authorization URL is opened by the Desk in a
+/// real browser; the provider callback needs no access to the Desk webview's
+/// cookie because the exact initiating session digest lives in pending state.
+pub async fn post_consumer_oidc_link_start(
+    State(wb): State<SharedWorkbench>,
+    Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if crate::net_http::bearer(&headers).is_none()
+        && crate::account_signin::hub_session_actor(&wb).is_some()
+    {
+        return crate::account_signin::proxy_account_authority(
+            &wb,
+            axum::http::Method::POST,
+            "/auth/account/consumer-oidc/link/start".to_owned(),
+            headers,
+            axum::body::Bytes::new(),
+        )
+        .await;
+    }
+    let Some(token) = crate::net_http::bearer(&headers).map(str::to_owned) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "authenticate with a passkey or recovery code before linking Google",
+        )
+            .into_response();
+    };
+    let session_id = crate::account_session::session_id(&token);
+    let account_id = {
+        let guard = wb.lock_unpoisoned();
+        let Some((account_id, method)) = guard.resolve_account_session(&token) else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "the account session is not active",
+            )
+                .into_response();
+        };
+        if !independent_account_method(&method) {
+            return (
+                StatusCode::CONFLICT,
+                "sign in with a passkey or recovery code before linking Google",
+            )
+                .into_response();
+        }
+        let account_auth = match crate::account_auth::AccountAuth::rebuild(guard.store_ref()) {
+            Ok(state) => state,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "account authentication state is unavailable",
+                )
+                    .into_response()
+            }
+        };
+        if !durable_independent_session(
+            &account_auth,
+            &session_id,
+            &account_id,
+            crate::account::session_now_ms(),
+        ) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "the independent account session is no longer current",
+            )
+                .into_response();
+        }
+        account_id
+    };
+
+    let Some(connection) = web_account_sso_from_env() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Google account linking is not configured",
+        )
+            .into_response();
+    };
+    let purpose = PendingAuthPurpose::ConsumerOidcLink(PendingConsumerOidcLink {
+        account_id,
+        session_id,
+        connection_id: connection.id.clone(),
+        connection_revision: connection.current_revision(),
+    });
+    match prepare_oidc_browser_login(
+        auth,
+        &headers,
+        connection,
+        OidcBrowserOptions {
+            authority: OidcConnectionAuthority::Consumer,
+            native_return: None,
+            native_handoff_challenge: None,
+            purpose,
+        },
+    )
+    .await
+    {
+        Ok(authorization_url) => (
+            StatusCode::OK,
+            Json(json!({ "authorization_url": authorization_url })),
+        )
+            .into_response(),
+        Err(response) => response,
+    }
+}
+
+/// Submitted by the signed-out account entry point. POST keeps the work email
+/// out of browser history and intermediary request URLs; the handler uses it
+/// only to select exactly one DNS-verified organization, then starts the same
+/// PKCE flow as `/auth/login`. Tenant, connection, protocol, and revision live
+/// only in server-held pending state from this point onward.
+#[derive(Deserialize)]
+pub struct WorkEmailLoginForm {
+    email: String,
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    handoff_challenge: Option<String>,
+}
+
+pub async fn post_work_email_login(
+    State(wb): State<SharedWorkbench>,
+    Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
+    Form(form): Form<WorkEmailLoginForm>,
+) -> impl IntoResponse {
+    let native_return = match native_return_uri(
+        form.return_to.as_deref(),
+        form.handoff_challenge.as_deref(),
+        dev_web_return_enabled(),
+    ) {
+        Ok(value) => value,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let discovered = {
+        let guard = wb.lock_unpoisoned();
+        match enterprise_sso_for_work_email(guard.store_ref(), &form.email) {
+            Ok(Some((connection, context))) => {
+                match Org::rebuild_in(guard.store_ref(), &context.store_scope) {
+                    Ok(org) => organization_oidc_client_secret(&guard, &org, &connection)
+                        .map(|secret| Some((connection, context, secret))),
+                    Err(_) => Err("corporate sign-in discovery is unavailable"),
+                }
+            }
+            Ok(None) => Ok(None),
+            Err(_) => Err("corporate sign-in discovery is unavailable"),
         }
     };
-    // Inject the confidential-client secret (Google) for the token exchange, if configured.
-    pending.client_secret = google_client_secret_from_env();
-    pending.native_return = native_return;
-    pending.native_handoff_challenge = query.handoff_challenge;
-
-    auth.pending_auth_mut()
-        .begin(state, pending, Instant::now());
-    Redirect::to(&url).into_response()
+    let Some((connection, context, client_secret)) = (match discovered {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "corporate sign-in discovery is unavailable",
+            )
+                .into_response()
+        }
+    }) else {
+        // One response covers invalid, absent, incomplete, unsupported, and
+        // ambiguous matches. Discovery is routing, not an organization or
+        // invitation enumeration surface.
+        return (
+            StatusCode::NOT_FOUND,
+            "corporate sign-in is not available for that work email",
+        )
+            .into_response();
+    };
+    begin_enterprise_browser_login(
+        auth,
+        &headers,
+        connection,
+        context,
+        client_secret,
+        native_return,
+        form.handoff_challenge,
+    )
+    .await
 }
 
 #[derive(Default, Deserialize)]
@@ -1502,12 +2425,16 @@ pub async fn get_callback(
     let native_return = pending.native_return.clone();
     let native_handoff_challenge = pending.native_handoff_challenge.clone();
 
+    let purpose = pending.purpose.clone();
+    let enterprise_login = pending.login_context.clone();
+    let pending_issuer = pending.issuer.clone();
+    let pending_audiences = pending.audiences.clone();
     let finished = tokio::task::spawn_blocking(move || {
         let http = HttpClient::new();
-        finish_callback(&pending, &code, &http)
+        finish_callback_verified(&pending, &code, &http)
     })
     .await;
-    let (authority, id_token, refresh_token) = match finished {
+    let verified = match finished {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             if let Some(key) = &throttle_key {
@@ -1525,40 +2452,286 @@ pub async fn get_callback(
         throttle.record_success(key);
     }
 
-    // The opaque session token minted for a hosted browser login (ADR 0147 §1). It —
-    // never the external id-token — is set as the session cookie below.
-    let mut web_session_token: Option<String> = None;
+    // Consumer-provider linking is an account mutation, not a login. The
+    // callback rechecks the provider revision and the exact independent
+    // session that initiated the ceremony before committing the subject link.
+    // It mints no session, provisions no tenant, stores no refresh grant, and
+    // exposes no provider credential.
+    if let PendingAuthPurpose::ConsumerOidcLink(context) = &purpose {
+        let Some(connection) = web_account_sso_from_env() else {
+            return (
+                StatusCode::CONFLICT,
+                "Google account linking is no longer configured",
+            )
+                .into_response();
+        };
+        if connection.id != context.connection_id
+            || connection.current_revision() != context.connection_revision
+            || connection.issuer != pending_issuer
+            || connection.audiences != pending_audiences
+        {
+            return (
+                StatusCode::CONFLICT,
+                "Google sign-in changed while you were linking it; return to GaugeDesk and start again",
+            )
+                .into_response();
+        }
 
-    // Attribute the login to the authenticated authority (`AUD-1` / `INV-21`), then
-    // run the composition's registered fold (ADR 0122 §3 — e.g. verified-domain
-    // JIT membership on the enterprise composition; nothing on a solo shell).
+        let linked = {
+            let mut guard = wb.lock_unpoisoned();
+            let account_auth = match crate::account_auth::AccountAuth::rebuild(guard.store_ref()) {
+                Ok(state) => state,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account authentication state is unavailable",
+                    )
+                        .into_response()
+                }
+            };
+            if !durable_independent_session(
+                &account_auth,
+                &context.session_id,
+                &context.account_id,
+                crate::account::session_now_ms(),
+            ) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "the independent account session that started this link is no longer current",
+                )
+                    .into_response();
+            }
+            let record = match crate::account_auth::ExternalSubjectRecord::new(
+                &context.account_id,
+                &connection.id,
+                &connection.issuer,
+                verified.authority.as_str(),
+                crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+                crate::account::session_now_ms(),
+            ) {
+                Ok(record) => record,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "the Google sign-in result could not be linked",
+                    )
+                        .into_response()
+                }
+            };
+            let facts =
+                match crate::account_auth::decide_link_external_subject(&account_auth, record) {
+                    Ok(facts) => facts,
+                    Err(crate::account_auth::AuthRejection::SubjectAlreadyLinked) => {
+                        return (
+                            StatusCode::CONFLICT,
+                            "this Google account is already linked to another GaugeDesk account",
+                        )
+                            .into_response()
+                    }
+                    Err(_) => {
+                        return (StatusCode::CONFLICT, "this Google account cannot be linked")
+                            .into_response()
+                    }
+                };
+            if crate::account_auth::append_facts(guard.store_mut(), &facts).is_err() {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the Google account link could not be saved",
+                )
+                    .into_response();
+            }
+            crate::audit::record_in(
+                &mut guard,
+                crate::account_auth::ACCOUNT_AUTH_SCOPE,
+                &context.account_id,
+                "account.consumer-oidc.link",
+                &connection.id,
+            );
+            true
+        };
+        debug_assert!(linked);
+        return (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Google linked</title></head><body><main><h1>Google linked</h1><p>You can close this window and return to GaugeDesk.</p></main></body></html>",
+        )
+            .into_response();
+    }
+
+    // A connection test proves the real browser callback and mapped subject,
+    // but it is explicitly not account sign-in. It never runs the login fold,
+    // provisions a person or membership, mints a session/cookie, stores a
+    // refresh token, or returns the external token to the browser.
+    if let PendingAuthPurpose::EnterpriseConnectionTest(context) = &purpose {
+        let Some(fold) = &auth.enterprise_test_fold else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "enterprise connection-test callback is not configured",
+            )
+                .into_response();
+        };
+        let folded = {
+            let mut guard = wb.lock_unpoisoned();
+            fold(&mut guard, context, &verified)
+        };
+        if folded.is_err() {
+            return (
+                StatusCode::CONFLICT,
+                "this corporate sign-in test is no longer current; return to GaugeDesk and start again",
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Sign-in test complete</title></head><body><main><h1>Sign-in test complete</h1><p>The verified result is now available in GaugeDesk. You can close this window.</p></main></body></html>",
+        )
+            .into_response();
+    }
+
+    // A corporate login passes through the enterprise admission fold. Consumer
+    // OIDC resolves only through an exact active link created from an
+    // independently authenticated account session; provider subject and email
+    // are never GaugeDesk account identity.
+    let resolution = if let Some(context) = enterprise_login.as_ref() {
+        let Some(fold) = &auth.login_fold else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "corporate account admission is not configured",
+            )
+                .into_response();
+        };
+        let corporate_identity = VerifiedEnterpriseIdentity {
+            authority: verified.authority.clone(),
+            verified_email: id_token_verified_email(&verified.id_token),
+        };
+        let folded = {
+            let mut guard = wb.lock_unpoisoned();
+            fold(&mut guard, context, &corporate_identity)
+        };
+        match folded {
+            Ok(resolution) => {
+                let now_ms = crate::account::session_now_ms();
+                let display_label = id_token_display_label(&verified.id_token)
+                    .unwrap_or_else(|| resolution.account_id.clone());
+                let provider_expires_at_ms = id_token_expiry_ms(&verified.id_token)
+                    .unwrap_or_else(|| now_ms.saturating_add(60 * 60 * 1000));
+                return auth.deliver_enterprise_login(
+                    &wb,
+                    EnterpriseLoginDelivery {
+                        login_context: context.clone(),
+                        resolution,
+                        display_label,
+                        provider_expires_at_ms,
+                        refresh_token: verified.refresh_token.clone(),
+                        native_return,
+                        native_handoff_challenge,
+                    },
+                );
+            }
+            Err(LoginFoldRefusal::NotAdmitted) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "this corporate account is not admitted to the organization",
+                )
+                    .into_response()
+            }
+            Err(LoginFoldRefusal::StaleConnection) => {
+                return (
+                    StatusCode::CONFLICT,
+                    "corporate sign-in changed while you were signing in; start again",
+                )
+                    .into_response()
+            }
+            Err(LoginFoldRefusal::Unavailable) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "corporate account admission is unavailable",
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        let Some(connection) = web_account_sso_from_env() else {
+            return (
+                StatusCode::CONFLICT,
+                "consumer sign-in is no longer configured",
+            )
+                .into_response();
+        };
+        if connection.issuer != pending_issuer || connection.audiences != pending_audiences {
+            return (
+                StatusCode::CONFLICT,
+                "consumer sign-in changed while you were signing in; start again",
+            )
+                .into_response();
+        }
+        let account_auth = {
+            let guard = wb.lock_unpoisoned();
+            match crate::account_auth::AccountAuth::rebuild(guard.store_ref()) {
+                Ok(state) => state,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account authentication state is unavailable",
+                    )
+                        .into_response()
+                }
+            }
+        };
+        let Some(resolution) = resolve_consumer_oidc_account(
+            &account_auth,
+            &connection,
+            &pending_issuer,
+            verified.authority.as_str(),
+        ) else {
+            return (
+                StatusCode::FORBIDDEN,
+                "this Google account is not linked; sign in with a passkey or recovery code, then link Google in Account Settings",
+            )
+                .into_response();
+        };
+        resolution
+    };
+
+    let VerifiedOidcIdentity {
+        id_token,
+        refresh_token,
+        ..
+    } = verified;
+    let account_id = resolution.account_id;
+    let session_method = resolution.session_method;
+
+    // Browser and programmatic corporate callbacks mint here. A native handoff
+    // delays the same opaque-session mint until its PKCE-bound code is redeemed,
+    // when the Hub can bind that exact session to the enrolling device.
+    let account_session_required = requires_account_session(native_return.is_some());
+    let mut account_session_token: Option<String> = None;
+
+    // Attribute the login to the resolved GaugeDesk account (`AUD-1` /
+    // `INV-21`). Corporate membership consequences were committed by the fold
+    // above before any session exists.
     {
         let mut wb = wb.lock_unpoisoned();
-        let actor = authority.as_str().to_string();
-        let store_scope = crate::workbench_auth::req_scope(&headers);
-        crate::audit::record_in(
-            &mut wb,
-            &store_scope,
-            &actor,
-            "auth.login",
-            authority.as_str(),
-        );
-        if let Some(fold) = &auth.login_fold {
-            fold(&mut wb, &store_scope, authority.as_str(), &id_token);
-        }
+        let actor = account_id.clone();
+        let store_scope = enterprise_login
+            .as_ref()
+            .map(|context| context.store_scope.clone())
+            .unwrap_or_else(|| crate::workbench_auth::req_scope(&headers));
+        crate::audit::record_in(&mut wb, &store_scope, &actor, "auth.login", &account_id);
         // Hosted web account (ADR 0077 §9): a successful login provisions the person's personal
         // tenant-of-one (idempotent) so they land in the Console with their own space. No-op on
         // the enterprise/desktop paths (web-account mode off).
-        provision_web_account(&mut wb, authority.as_str(), web_account_mode());
+        provision_web_account(&mut wb, &account_id, web_account_mode());
         // Hosted browser session (ADR 0147 §1): mint a durable, opaque, per-session
         // revocable session token. That token — never the external id-token — becomes
         // the `gw_session` cookie. The external id-token stops being the session; the
         // browser holds a fresh short-lived one in memory (obtained from /auth/refresh)
         // as its Home access credential.
-        if web_account_mode() {
+        if account_session_required {
             if let Some(token) = wb.mint_account_session(
-                authority.as_str(),
-                "oidc",
+                &account_id,
+                &session_method,
                 crate::account::SESSION_ABSOLUTE_LIFETIME_MS / 1000,
             ) {
                 // Seal the offline-access refresh token as this session's OWN durable,
@@ -1568,19 +2741,28 @@ pub async fn get_callback(
                 // native client's device-bound grant is written at /auth/mobile/exchange.
                 // Best-effort.
                 let session_id = crate::account_session::session_id(&token);
-                if let Some(rt) = &refresh_token {
-                    store_refresh_token(
-                        &mut wb,
-                        authority.as_str(),
-                        rt,
-                        crate::account::RefreshBinding::Web,
-                        &session_id,
-                        "",
-                    );
+                if web_account_mode() {
+                    if let Some(rt) = &refresh_token {
+                        store_refresh_token(
+                            &mut wb,
+                            &account_id,
+                            rt,
+                            crate::account::RefreshBinding::Web,
+                            &session_id,
+                            "",
+                        );
+                    }
                 }
-                web_session_token = Some(token);
+                account_session_token = Some(token);
             }
         }
+    }
+    if account_session_required && account_session_token.is_none() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create the account session",
+        )
+            .into_response();
     }
 
     // The custom-scheme redirect carries only a one-time opaque code. The app
@@ -1594,10 +2776,19 @@ pub async fn get_callback(
             )
                 .into_response();
         };
+        let now_ms = crate::account::session_now_ms();
+        let label = id_token_display_label(&id_token).unwrap_or_else(|| account_id.clone());
+        let provider_expires_at_ms =
+            id_token_expiry_ms(&id_token).unwrap_or_else(|| now_ms.saturating_add(60 * 60 * 1000));
         let code = auth.native_handoffs_mut().issue(
-            id_token,
-            refresh_token.clone(),
-            challenge,
+            NativeHandoffIssue {
+                account_id: account_id.clone(),
+                session_method,
+                label,
+                provider_expires_at_ms,
+                refresh_token: refresh_token.clone(),
+                challenge,
+            },
             Instant::now(),
         );
         let target = format!("{native_return}#code={code}");
@@ -1615,27 +2806,34 @@ pub async fn get_callback(
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| "/".to_string());
         let mut resp = Redirect::to(&post_login).into_response();
-        if let Some(token) = &web_session_token {
+        if let Some(token) = &account_session_token {
             append_session_cookies(&mut resp, token);
         }
         return resp;
     }
 
-    // Enterprise / programmatic clients: deliver the bearer. With a configured client URL, 302
-    // there with the token in the URL *fragment* (not a query param — fragments are never sent to
-    // servers, so the token stays out of access logs / `Referer`); otherwise return JSON.
+    // Programmatic clients receive only an opaque GaugeDesk account bearer.
+    // With a configured client URL, deliver it in the URL fragment (never a
+    // query parameter or Referer-visible value).
+    let Some(delivered_token) = account_session_token else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not deliver the account session",
+        )
+            .into_response();
+    };
     if let Some(url) = gaugedesk_env::var("OIDC_POST_LOGIN_URL") {
         if !url.trim().is_empty() {
-            // A JWT is base64url + `.` — all URL-fragment-safe, no escaping needed.
-            let target = format!("{url}#id_token={id_token}&token_type=Bearer");
+            // Both JWT and opaque session alphabets are base64url and fragment-safe.
+            let target = format!("{url}#id_token={delivered_token}&token_type=Bearer");
             return Redirect::to(&target).into_response();
         }
     }
     (
         StatusCode::OK,
         Json(json!({
-            "authority": authority.as_str(),
-            "id_token": id_token,
+            "authority": account_id,
+            "id_token": delivered_token,
             "token_type": "Bearer",
         })),
     )
@@ -1735,9 +2933,10 @@ pub async fn get_refresh(
         .into_response()
 }
 
-/// Refresh a native GaugeDesk account session. A still-valid short-lived
-/// id-token identifies the person; the platform uses the refresh token sealed
-/// in that person's account scope and returns only a replacement id-token.
+/// Refresh a native GaugeDesk account session. The opaque account bearer names
+/// both the person and the exact device-bound refresh grant. The Hub renews its
+/// provider authority server-side, discards the external id-token, and returns
+/// only non-secret scheduling metadata; the native bearer remains unchanged.
 pub async fn post_native_refresh(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
@@ -1751,18 +2950,22 @@ pub async fn post_native_refresh(
     // presents only its bearer — no device header — and admission reads the bound
     // device from the STORED native grant, so omitting or forging `x-gw-device`
     // cannot bypass revocation (SOC 2 F-4.2). The header is not consulted here.
-    let (person, refresh_token) = {
+    let (person, session_id, refresh_token) = {
         let g = wb.lock_unpoisoned();
         let person = g.actor(bearer.as_deref());
         if person == "anonymous" {
             return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
         }
-        let grant = match admit_native_refresh(&g, &person, now_ms) {
+        let Some(token) = bearer.as_deref() else {
+            return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
+        };
+        let session_id = crate::account_session::session_id(token);
+        let grant = match admit_native_refresh(&g, &person, &session_id, now_ms) {
             Ok(grant) => grant,
             Err(reason) => return (StatusCode::UNAUTHORIZED, reason).into_response(),
         };
         match g.unseal_account_secret(&grant.sealed) {
-            Some(token) => (person, token),
+            Some(token) => (person, session_id, token),
             None => {
                 return (
                     StatusCode::UNAUTHORIZED,
@@ -1792,23 +2995,19 @@ pub async fn post_native_refresh(
     })
     .await;
     match refreshed {
-        Ok(Ok(id_token)) => {
+        Ok(Ok(_id_token)) => {
             // An admitted refresh resets the native grant's idle clock (ADR 0147 §4).
             {
                 let mut g = wb.lock_unpoisoned();
                 let scope = crate::account::account_scope(&person);
-                let _ = g.touch_account_refresh_in(
-                    &scope,
-                    crate::account::NATIVE_REFRESH_BINDING,
-                    now_ms,
-                );
+                let _ = g.touch_account_refresh_in(&scope, &session_id, now_ms);
             }
             (
                 StatusCode::OK,
                 Json(json!({
+                    "refreshed": true,
                     "person": person,
-                    "id_token": id_token,
-                    "token_type": "Bearer",
+                    "refresh_after_ms": now_ms.saturating_add(50 * 60 * 1000),
                 })),
             )
                 .into_response()
@@ -1831,22 +3030,6 @@ pub struct NativeHandoffExchange {
     device_label: Option<String>,
 }
 
-/// The `sub` claim of an **already-verified** id-token (the callback verified
-/// signature + claims before the handoff stored it) — projection, not
-/// verification.
-fn subject_claim(id_token: &str) -> Option<String> {
-    let payload = id_token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    claims
-        .get("sub")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-}
-
 /// Record the redeeming native client in the person's trusted-devices registry
 /// (ADR 0123 §4 / ADR 0053): the handoff session is device-bound, so the
 /// account surface can see and revoke it. Returns the minted device id.
@@ -1859,6 +3042,7 @@ pub fn record_native_device(wb: &SharedWorkbench, person: &str, label: &str) -> 
         id: id.clone(),
         op: RecordOp::Upsert,
         label: label.chars().take(64).collect(),
+        kind: crate::account::DeviceKind::Computer,
         subkey_pubkey: String::new(),
         status: crate::account::DeviceStatus::Active,
         enrolled_at: crate::account::device_enrolled_at_now(),
@@ -1880,26 +3064,28 @@ pub fn record_native_device(wb: &SharedWorkbench, person: &str, label: &str) -> 
 fn bind_native_refresh_grant(
     wb: &SharedWorkbench,
     person: &str,
+    session_id: &str,
     device_id: &str,
     refresh_token: Option<&str>,
-) {
+) -> bool {
     let Some(refresh_token) = refresh_token else {
-        return;
+        return true;
     };
     let mut g = wb.lock_unpoisoned();
     let Some(sealed) = g.seal_account_secret(refresh_token) else {
-        return;
+        return false;
     };
     let scope = crate::account::account_scope(person);
     let now_ms = crate::account::session_now_ms();
-    let _ = g.upsert_account_refresh_in(
+    g.upsert_account_refresh_in(
         &scope,
-        crate::account::NATIVE_REFRESH_BINDING,
+        session_id,
         crate::account::RefreshBinding::Device,
         device_id,
         &sealed,
         now_ms,
-    );
+    )
+    .is_ok()
 }
 
 /// Whether `device_id` may continue this person's account session: it must be
@@ -1918,10 +3104,10 @@ pub fn native_device_admitted(wb: &Workbench, person: &str, device_id: &str) -> 
 }
 
 /// Redeem a single-use native login handoff. Neither the OIDC id-token nor its
-/// refresh authority rides the custom-scheme URL. The redeeming client is
-/// recorded in the person's trusted-devices registry and receives its
-/// `device_id` — presenting it on refresh binds the session to the device
-/// (LOGIN-3); revoking the device from the account surface stops refresh.
+/// refresh authority rides the custom-scheme URL or exchange response. The Hub
+/// mints an opaque account session and binds its digest-keyed refresh grant to
+/// the newly recorded trusted device. Revoking either the session or device
+/// stops future use (`ADR 0147` §2–3).
 pub async fn post_native_exchange(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
@@ -1935,31 +3121,94 @@ pub async fn post_native_exchange(
             .redeem(&request.code, &request.verifier, Instant::now());
     match redeemed {
         Some(RedeemedHandoff {
-            id_token,
+            account_id,
+            session_method,
+            label,
+            provider_expires_at_ms,
             refresh_token,
         }) => {
-            let device_id = subject_claim(&id_token).and_then(|person| {
-                let label = request
-                    .device_label
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|label| !label.is_empty())
-                    .unwrap_or("Native device");
-                let device_id = record_native_device(&wb, &person, label)?;
-                // Establish the native session's own durable refresh grant (ADR 0147
-                // §2), sealing the refresh token the handoff carried and binding it to
-                // this device. It does not depend on the browser `web` grant, which a
-                // prior logout may have tombstoned (F-1.3); admission later reads the
-                // bound device from this record, never a request header (F-4.2).
-                bind_native_refresh_grant(&wb, &person, &device_id, refresh_token.as_deref());
-                Some(device_id)
-            });
+            let now_ms = crate::account::session_now_ms();
+            let has_refresh_grant = refresh_token.is_some();
+            let lifetime_ms = if has_refresh_grant {
+                crate::account::SESSION_ABSOLUTE_LIFETIME_MS
+            } else {
+                provider_expires_at_ms
+                    .saturating_sub(now_ms)
+                    .min(crate::account::SESSION_ABSOLUTE_LIFETIME_MS)
+            };
+            if lifetime_ms < 1000 {
+                return (StatusCode::UNAUTHORIZED, "the native handoff expired").into_response();
+            }
+            let lifetime_secs = (lifetime_ms / 1000).max(1);
+            let account_session = {
+                let mut guard = wb.lock_unpoisoned();
+                guard.mint_account_session(&account_id, &session_method, lifetime_secs)
+            };
+            let Some(account_session) = account_session else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not create the account session",
+                )
+                    .into_response();
+            };
+            let device_label = request
+                .device_label
+                .as_deref()
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .unwrap_or("Native device");
+            let Some(device_id) = record_native_device(&wb, &account_id, device_label) else {
+                wb.lock_unpoisoned()
+                    .revoke_account_session(&account_session);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not enroll the native device",
+                )
+                    .into_response();
+            };
+            let session_id = crate::account_session::session_id(&account_session);
+            let bound_session = wb.lock_unpoisoned().bind_account_session_device(
+                &session_id,
+                &account_id,
+                &device_id,
+            );
+            if !bound_session
+                || !bind_native_refresh_grant(
+                    &wb,
+                    &account_id,
+                    &session_id,
+                    &device_id,
+                    refresh_token.as_deref(),
+                )
+            {
+                let mut guard = wb.lock_unpoisoned();
+                let scope = crate::account::account_scope(&account_id);
+                let _ = guard.revoke_account_device_in(&scope, &device_id);
+                guard.revoke_account_session(&account_session);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not bind the native account session",
+                )
+                    .into_response();
+            }
+            let expires_at_ms = now_ms.saturating_add(lifetime_secs.saturating_mul(1000));
+            let refresh_after_ms = if has_refresh_grant {
+                provider_expires_at_ms
+                    .saturating_sub(10 * 60 * 1000)
+                    .max(now_ms)
+            } else {
+                0
+            };
             (
                 StatusCode::OK,
                 Json(json!({
-                    "id_token": id_token,
+                    "account_id": account_id,
+                    "account_session": account_session,
                     "token_type": "Bearer",
                     "device_id": device_id,
+                    "label": label,
+                    "expires_at_ms": expires_at_ms,
+                    "refresh_after_ms": refresh_after_ms,
                 })),
             )
                 .into_response()
@@ -2018,6 +3267,7 @@ pub async fn post_logout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::org::ORG_ID;
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2168,6 +3418,131 @@ iqlTEKVISscuchxZtKQJ4k8=
         }
     }
 
+    fn seed_discovery_org(
+        store: &mut gaugedesk_store::Store,
+        tenant: &str,
+        domain: &str,
+        protocol: SsoProtocol,
+        with_admission: bool,
+    ) -> String {
+        use crate::org::{
+            tenant_scope, OrgRecord, SsoAdmissionMode, SsoAdmissionRecord, SSO_ADMISSION_KIND,
+        };
+
+        let scope = tenant_scope(tenant);
+        store
+            .append_record(
+                &scope,
+                "org",
+                &serde_json::to_string(&OrgRecord {
+                    id: tenant.to_owned(),
+                    op: RecordOp::Upsert,
+                    display_name: format!("{tenant} company"),
+                    verified_domains: vec![domain.to_owned()],
+                    default_region: None,
+                    kind: Default::default(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let mut connection = SsoConnectionRecord {
+            id: ORG_ID.to_owned(),
+            op: RecordOp::Upsert,
+            protocol,
+            issuer: format!("https://{tenant}.idp.example.test"),
+            audiences: vec![format!("{tenant}-client")],
+            metadata: format!("https://{tenant}.idp.example.test/metadata"),
+            ..Default::default()
+        };
+        connection.seal_revision();
+        store
+            .append_record(&scope, "sso", &serde_json::to_string(&connection).unwrap())
+            .unwrap();
+        if with_admission {
+            store
+                .append_record(
+                    &scope,
+                    SSO_ADMISSION_KIND,
+                    &serde_json::to_string(&SsoAdmissionRecord {
+                        id: ORG_ID.to_owned(),
+                        op: RecordOp::Upsert,
+                        mode: SsoAdmissionMode::InvitedOnly,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        scope
+    }
+
+    #[test]
+    fn work_email_discovery_selects_one_verified_organization_server_side() {
+        let mut store = gaugedesk_store::Store::open_in_memory().unwrap();
+        let scope = seed_discovery_org(
+            &mut store,
+            "organization:acme",
+            "acme.example",
+            SsoProtocol::Oidc,
+            true,
+        );
+
+        let (connection, context) = enterprise_sso_for_work_email(&store, "  Alice@Acme.Example ")
+            .unwrap()
+            .expect("one configured verified-domain connection");
+        assert_eq!(context.store_scope, scope);
+        assert_eq!(context.connection_id, connection.id);
+        assert_eq!(context.connection_revision, connection.current_revision());
+        assert_eq!(context.protocol, SsoProtocol::Oidc);
+    }
+
+    #[test]
+    fn work_email_discovery_supports_saml_and_refuses_incomplete_or_ambiguous_matches() {
+        let mut incomplete = gaugedesk_store::Store::open_in_memory().unwrap();
+        seed_discovery_org(
+            &mut incomplete,
+            "organization:acme",
+            "acme.example",
+            SsoProtocol::Oidc,
+            false,
+        );
+        assert!(
+            enterprise_sso_for_work_email(&incomplete, "alice@acme.example")
+                .unwrap()
+                .is_none()
+        );
+        assert!(enterprise_sso_for_work_email(&incomplete, "not-an-email")
+            .unwrap()
+            .is_none());
+
+        let mut saml = gaugedesk_store::Store::open_in_memory().unwrap();
+        seed_discovery_org(
+            &mut saml,
+            "organization:acme",
+            "acme.example",
+            SsoProtocol::Saml,
+            true,
+        );
+        assert!(enterprise_sso_for_work_email(&saml, "alice@acme.example")
+            .unwrap()
+            .is_some());
+
+        let mut ambiguous = gaugedesk_store::Store::open_in_memory().unwrap();
+        for tenant in ["organization:alpha", "organization:beta"] {
+            seed_discovery_org(
+                &mut ambiguous,
+                tenant,
+                "shared.example",
+                SsoProtocol::Oidc,
+                true,
+            );
+        }
+        assert!(
+            enterprise_sso_for_work_email(&ambiguous, "person@shared.example")
+                .unwrap()
+                .is_none()
+        );
+    }
+
     fn pending_auth() -> PendingAuth {
         PendingAuth {
             verifier: "v".into(),
@@ -2181,6 +3556,8 @@ iqlTEKVISscuchxZtKQJ4k8=
             client_secret: None,
             native_return: None,
             native_handoff_challenge: None,
+            login_context: None,
+            purpose: PendingAuthPurpose::Login,
         }
     }
 
@@ -2396,37 +3773,38 @@ iqlTEKVISscuchxZtKQJ4k8=
         let challenge = crate::identity_oidc::s256_challenge(verifier);
         let now = Instant::now();
         let mut store = NativeHandoffStore::default();
-        let code = store.issue(
-            "id-token".to_string(),
-            Some("rt-native".to_string()),
-            challenge.clone(),
-            now,
-        );
+        let issue = |refresh_token: Option<&str>, challenge: String| NativeHandoffIssue {
+            account_id: "account-7".to_string(),
+            session_method: "oidc".to_string(),
+            label: "alice@example.test".to_string(),
+            provider_expires_at_ms: 4_102_444_800_000,
+            refresh_token: refresh_token.map(str::to_string),
+            challenge,
+        };
+        let code = store.issue(issue(Some("rt-native"), challenge.clone()), now);
         assert!(store.redeem(&code, "wrong-verifier", now).is_none());
         assert!(
             store.redeem(&code, verifier, now).is_none(),
             "a failed proof consumes the code"
         );
 
-        let code = store.issue(
-            "id-token".to_string(),
-            Some("rt-native".to_string()),
-            challenge.clone(),
-            now,
-        );
+        let code = store.issue(issue(Some("rt-native"), challenge.clone()), now);
         let redeemed = store
             .redeem(&code, verifier, now)
             .expect("redeemed handoff");
-        // The handoff carries both the id-token bearer and the refresh token the
-        // native grant seals — the browser grant is not consulted (ADR 0147 §2).
-        assert_eq!(redeemed.id_token, "id-token");
+        // The handoff carries account/session metadata and the server-held
+        // refresh grant, never the external token the native client used to get.
+        assert_eq!(redeemed.account_id, "account-7");
+        assert_eq!(redeemed.session_method, "oidc");
+        assert_eq!(redeemed.label, "alice@example.test");
+        assert_eq!(redeemed.provider_expires_at_ms, 4_102_444_800_000);
         assert_eq!(redeemed.refresh_token.as_deref(), Some("rt-native"));
         assert!(
             store.redeem(&code, verifier, now).is_none(),
             "a redeemed code is single-use"
         );
 
-        let code = store.issue("id-token".to_string(), None, challenge, now);
+        let code = store.issue(issue(None, challenge), now);
         assert!(store
             .redeem(&code, verifier, now + Duration::from_secs(301))
             .is_none());
@@ -2453,6 +3831,55 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert_eq!(m.roles_claim.as_deref(), Some("groups"));
         assert_eq!(m.region_claim.as_deref(), Some("locale"));
         assert_eq!(m.subject_claim, "sub");
+    }
+
+    #[tokio::test]
+    async fn corporate_protocols_share_one_opaque_account_session_delivery() {
+        let shared = Arc::new(Mutex::new(Workbench::new(
+            gaugedesk_store::Store::open_in_memory().unwrap(),
+        )));
+        let auth = AuthShellState::new();
+        let response = auth.deliver_enterprise_login(
+            &shared,
+            EnterpriseLoginDelivery {
+                login_context: PendingEnterpriseLogin {
+                    store_scope: "org::organization:acme".into(),
+                    connection_id: "org".into(),
+                    connection_revision: "revision".into(),
+                    protocol: SsoProtocol::Saml,
+                },
+                resolution: LoginResolution {
+                    account_id: "account:alice".into(),
+                    session_method: "enterprise-saml:org::organization:acme:org".into(),
+                },
+                display_label: "alice@acme.example".into(),
+                provider_expires_at_ms: crate::account::session_now_ms()
+                    + crate::account::SESSION_ABSOLUTE_LIFETIME_MS,
+                refresh_token: None,
+                native_return: None,
+                native_handoff_challenge: None,
+            },
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let bearer = payload["id_token"].as_str().unwrap();
+        assert!(
+            !bearer.contains('.'),
+            "the SAML assertion is not the session"
+        );
+        assert_eq!(
+            shared
+                .lock_unpoisoned()
+                .account_sessions()
+                .resolve_session(bearer),
+            Some((
+                "account:alice".into(),
+                "enterprise-saml:org::organization:acme:org".into()
+            ))
+        );
     }
 
     #[test]
@@ -2533,6 +3960,69 @@ iqlTEKVISscuchxZtKQJ4k8=
     }
 
     #[test]
+    fn every_non_native_provider_callback_requires_an_account_session() {
+        assert!(requires_account_session(false));
+        assert!(!requires_account_session(true));
+    }
+
+    #[test]
+    fn consumer_link_requires_the_exact_live_independent_session() {
+        let mut state = crate::account_auth::AccountAuth::default();
+        state.roots.insert(
+            "account:alice".into(),
+            crate::account_auth::CustodiedAccountRootRecord::new(
+                "account:alice",
+                "sealed-root",
+                1_000,
+            )
+            .unwrap(),
+        );
+        let passkey = crate::account_auth::AccountSessionRecord::new(
+            "session-passkey",
+            "account:alice",
+            "passkey",
+            1_000,
+            60,
+        )
+        .unwrap();
+        state.sessions.insert(passkey.id.clone(), passkey);
+        assert!(durable_independent_session(
+            &state,
+            "session-passkey",
+            "account:alice",
+            2_000,
+        ));
+        assert!(!durable_independent_session(
+            &state,
+            "session-passkey",
+            "account:bob",
+            2_000,
+        ));
+        assert!(!durable_independent_session(
+            &state,
+            "session-passkey",
+            "account:alice",
+            61_001,
+        ));
+
+        let provider = crate::account_auth::AccountSessionRecord::new(
+            "session-provider",
+            "account:alice",
+            "consumer-oidc:consumer-google",
+            1_000,
+            60,
+        )
+        .unwrap();
+        state.sessions.insert(provider.id.clone(), provider);
+        assert!(!durable_independent_session(
+            &state,
+            "session-provider",
+            "account:alice",
+            2_000,
+        ));
+    }
+
+    #[test]
     fn session_hint_cookie_is_js_readable_and_carries_no_credential() {
         let c = session_hint_cookie_value(Some(".gaugewright.com"), true);
         assert!(c.starts_with("gw_session_hint=1;"));
@@ -2601,6 +4091,7 @@ iqlTEKVISscuchxZtKQJ4k8=
             "client-xyz.apps.googleusercontent.com",
         );
         assert_eq!(sso.protocol, SsoProtocol::Oidc);
+        assert_eq!(sso.id, CONSUMER_GOOGLE_CONNECTION_ID);
         assert_eq!(sso.issuer, "https://accounts.google.com");
         assert_eq!(sso.audiences, vec!["client-xyz.apps.googleusercontent.com"]);
         assert!(
@@ -2722,6 +4213,36 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(seen
             .iter()
             .any(|(k, v)| k == "code" && v == "auth-code-xyz"));
+    }
+
+    #[test]
+    fn verified_callback_retains_mapped_attributes_for_a_non_login_test() {
+        let login_op = mock_op(String::new());
+        let (_url, _state, pending) = start_login(
+            &oidc_sso(),
+            "http://localhost:1421/auth/callback",
+            "openid",
+            ClaimMapping {
+                roles_claim: Some("roles".into()),
+                ..ClaimMapping::default()
+            },
+            &login_op,
+        )
+        .unwrap();
+        let id_token = mint_id_token_with_nonce(&pending.nonce);
+        let op = mock_op(json!({ "id_token": id_token, "token_type": "Bearer" }).to_string());
+
+        let verified = finish_callback_verified(&pending, "test-code", &op).unwrap();
+        assert_eq!(verified.authority.as_str(), "alice@example.test");
+        assert_eq!(
+            verified
+                .attributes
+                .roles
+                .iter()
+                .map(|role| role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["admin"]
+        );
     }
 
     #[test]
@@ -2926,19 +4447,6 @@ iqlTEKVISscuchxZtKQJ4k8=
         let root = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(root.path()).unwrap();
         let person = "google-sub-777";
-        let token = {
-            use base64::Engine as _;
-            let b64 = |v: &serde_json::Value| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .encode(serde_json::to_vec(v).unwrap())
-            };
-            format!(
-                "{}.{}.sig",
-                b64(&json!({ "alg": "none" })),
-                b64(&json!({ "sub": person }))
-            )
-        };
-        assert_eq!(subject_claim(&token).as_deref(), Some(person));
 
         // The exchange path records the device in the person's own scope…
         let device_id = record_native_device(&wb, person, "GaugeDesk on testhost").unwrap();
@@ -2981,8 +4489,8 @@ iqlTEKVISscuchxZtKQJ4k8=
     #[test]
     fn refresh_records_fold_and_enforce_bounds() {
         use crate::account::{
-            account_scope, RefreshBinding, RefreshRecord, NATIVE_REFRESH_BINDING,
-            SESSION_ABSOLUTE_LIFETIME_MS, SESSION_IDLE_MS, WEB_REFRESH_BINDING,
+            account_scope, RefreshBinding, RefreshRecord, SESSION_ABSOLUTE_LIFETIME_MS,
+            SESSION_IDLE_MS, WEB_REFRESH_BINDING,
         };
         let root = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(root.path()).unwrap();
@@ -3026,18 +4534,22 @@ iqlTEKVISscuchxZtKQJ4k8=
                 .unwrap();
         }
 
-        // A native exchange establishes the native session's OWN grant, sealing the
-        // refresh token the handoff carried — not a copy of the (now-tombstoned)
-        // browser grant. It is keyed by the stable native binding and carries the
-        // enrolled device as a stored field.
+        // A native exchange establishes the opaque session and its OWN grant,
+        // sealing the refresh token the handoff carried — not a copy of the
+        // (now-tombstoned) browser grant. The grant is keyed by the opaque
+        // session digest and carries the enrolled device as a stored field.
         let device_id = record_native_device(&wb, person, "GaugeDesk native").unwrap();
-        bind_native_refresh_grant(&wb, person, &device_id, Some("rt-native"));
+        let session_token = wb
+            .lock_unpoisoned()
+            .mint_account_session(person, "oidc", SESSION_ABSOLUTE_LIFETIME_MS / 1000)
+            .unwrap();
+        let session_id = crate::account_session::session_id(&session_token);
+        bind_native_refresh_grant(&wb, person, &session_id, &device_id, Some("rt-native"));
         {
             let g = wb.lock_unpoisoned();
-            let native =
-                resolve_refresh_grant(&g, person, NATIVE_REFRESH_BINDING).expect("native grant");
+            let native = resolve_refresh_grant(&g, person, &session_id).expect("native grant");
             assert_eq!(native.binding, RefreshBinding::Device);
-            assert_eq!(native.id, NATIVE_REFRESH_BINDING);
+            assert_eq!(native.id, session_id);
             assert_eq!(native.device_id, device_id);
             // Its own captured token, independent of the browser grant.
             assert_eq!(
@@ -3052,7 +4564,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         {
             let g = wb.lock_unpoisoned();
             let now = crate::account::session_now_ms();
-            assert!(admit_native_refresh(&g, person, now).is_ok());
+            assert!(admit_native_refresh(&g, person, &session_id, now).is_ok());
         }
 
         // F-4.2: revoking the device stops native refresh. The cascade tombstones the
@@ -3065,10 +4577,18 @@ iqlTEKVISscuchxZtKQJ4k8=
         {
             let g = wb.lock_unpoisoned();
             let now = crate::account::session_now_ms();
-            assert!(resolve_refresh_grant(&g, person, NATIVE_REFRESH_BINDING).is_none());
+            assert!(resolve_refresh_grant(&g, person, &session_id).is_none());
             assert_eq!(
-                admit_native_refresh(&g, person, now),
+                admit_native_refresh(&g, person, &session_id, now),
                 Err("no refresh token on file; sign in again"),
+            );
+            assert!(g.account_sessions().resolve_now(&session_token).is_none());
+            assert!(
+                !crate::account_auth::AccountAuth::rebuild(g.store_ref())
+                    .unwrap()
+                    .sessions
+                    .contains_key(&session_id),
+                "device revocation must survive a process restart",
             );
         }
 
@@ -3155,10 +4675,14 @@ iqlTEKVISscuchxZtKQJ4k8=
     #[test]
     fn an_opaque_session_reports_its_true_minting_method() {
         // ADR 0147 §1: the session surface reports the method the durable session
-        // record stores — an OIDC-derived session is "oidc", not a hardcoded label.
+        // record stores — provider families never expose their exact connection id.
         assert_eq!(
-            session_label_for_method("oidc"),
-            ("oidc", "Single sign-on (OIDC)")
+            session_label_for_method("consumer-oidc:consumer-google"),
+            ("google", "Google")
+        );
+        assert_eq!(
+            session_label_for_method("recovery"),
+            ("recovery", "Recovery code")
         );
         assert_eq!(
             session_label_for_method("passkey"),
@@ -3169,6 +4693,53 @@ iqlTEKVISscuchxZtKQJ4k8=
             session_label_for_method("mystery"),
             ("passkey", "Passkey or security key")
         );
+    }
+
+    #[test]
+    fn consumer_login_resolves_only_an_exact_active_subject_link() {
+        let connection = google_sso("https://accounts.google.com", "client");
+        let mut state = crate::account_auth::AccountAuth::default();
+        let link = crate::account_auth::ExternalSubjectRecord::new(
+            "account:alice",
+            &connection.id,
+            &connection.issuer,
+            "google-subject-7",
+            crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+            1_000,
+        )
+        .unwrap();
+        state
+            .external_subjects
+            .insert(link.id.clone(), link.clone());
+
+        let resolved = resolve_consumer_oidc_account(
+            &state,
+            &connection,
+            &connection.issuer,
+            "google-subject-7",
+        )
+        .expect("exact active link resolves");
+        assert_eq!(resolved.account_id, "account:alice");
+        assert_ne!(resolved.account_id, "google-subject-7");
+        assert_eq!(resolved.session_method, "consumer-oidc:consumer-google");
+        assert!(resolve_consumer_oidc_account(
+            &state,
+            &connection,
+            "https://other.example",
+            "google-subject-7",
+        )
+        .is_none());
+
+        let mut revoked = link;
+        revoked.status = crate::account_auth::AuthMethodStatus::Revoked;
+        state.external_subjects.insert(revoked.id.clone(), revoked);
+        assert!(resolve_consumer_oidc_account(
+            &state,
+            &connection,
+            &connection.issuer,
+            "google-subject-7",
+        )
+        .is_none());
     }
 
     #[test]

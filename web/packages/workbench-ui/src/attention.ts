@@ -17,7 +17,7 @@ export const ATTENTION_RULES_SETTING = "attention.rules";
 export type AttentionLevel = "queue" | "badge" | "mute";
 
 /** The signals a chat's durable state can raise, in server priority order. */
-export type AttentionSignal = "question" | "conflict" | "changes" | "turn-settled";
+export type AttentionSignal = "question" | "conflict" | "turn-settled";
 
 export interface AttentionSignalMeta {
     readonly signal: AttentionSignal;
@@ -40,12 +40,6 @@ export const ATTENTION_SIGNALS: readonly AttentionSignalMeta[] = [
         signal: "conflict",
         label: "A merge conflicts",
         hint: "The chat's work no longer merges cleanly and needs repair.",
-        defaultAttention: "queue",
-    },
-    {
-        signal: "changes",
-        label: "Changes wait for your review",
-        hint: "A finished turn produced work to keep or discard.",
         defaultAttention: "queue",
     },
     {
@@ -84,7 +78,7 @@ export function parseAttentionRules(
     return levels;
 }
 
-/** Serialize a per-signal map as the rules document (all four rules written
+/** Serialize a per-signal map as the rules document (all rules written
  *  explicitly, signal order stable, so the stored doc is self-describing). */
 export function serializeAttentionRules(
     levels: Record<AttentionSignal, AttentionLevel>,

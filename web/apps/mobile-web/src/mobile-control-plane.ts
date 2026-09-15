@@ -16,6 +16,14 @@ import type {
     WorkspaceChange,
     WorkspaceDelta,
     ProjectionCarriage,
+    CreatedHomeInvitation,
+    FederationPeer,
+    HandoffStatus,
+    LinkedProvider,
+    OrganizationModelAuthorityBinding,
+    Participant,
+    ProjectOrganizationModelOptions,
+    ProjectOrganizationModelSelection,
 } from "@gaugewright/control-plane-client";
 import {
     browserRouteJson,
@@ -48,6 +56,21 @@ export const MOBILE_CONTROL_PLANE_INVENTORY = {
     deleteProject: "command",
     placeArchetype: "command",
     removePlacement: "command",
+    ensureCollectionRecipient: "command",
+    handoffStatus: "projection",
+    handoffParticipants: "projection",
+    listPeers: "projection",
+    handoffRelocate: "command",
+    handoffRevoke: "command",
+    createHomeInvitation: "command",
+    setProjectNetworkIsolated: "command",
+    projectCredentials: "projection",
+    linkProjectCredential: "command",
+    unlinkProjectCredential: "command",
+    projectOrganizationModelOptions: "projection",
+    projectOrganizationModelSelection: "projection",
+    selectProjectOrganizationModel: "command",
+    clearProjectOrganizationModelSelection: "command",
     createChatUnderArchetype: "command",
     createChatUnderPlacement: "command",
     reviseChatTargets: "command",
@@ -230,6 +253,101 @@ export class MobileControlPlane implements FacetBrowserApi {
         return workbenchClient.removePlacement(this.workbenchTransport(), pid, placementId);
     }
 
+    ensureCollectionRecipient(recipientId: string): Promise<workbenchClient.CollectionRecipient> {
+        return workbenchClient.ensureCollectionRecipient(this.workbenchTransport(), recipientId);
+    }
+
+    handoffStatus(project: ProjectId): Promise<HandoffStatus> {
+        return workbenchClient.handoffStatus(this.routeJson(), project);
+    }
+
+    handoffParticipants(project: ProjectId): Promise<Participant[]> {
+        return workbenchClient.handoffParticipants(this.routeJson(), project);
+    }
+
+    listPeers(): Promise<FederationPeer[]> {
+        return workbenchClient.listPeers(this.routeJson());
+    }
+
+    handoffRelocate(project: ProjectId, peer: string): Promise<HandoffStatus> {
+        return workbenchClient.handoffRelocate(this.routeJson(), project, peer);
+    }
+
+    handoffRevoke(project: ProjectId, authority: string, owns: string): Promise<void> {
+        return workbenchClient.handoffRevoke(this.routeJson(), project, authority, owns);
+    }
+
+    createHomeInvitation(
+        authority: string,
+        project: ProjectId,
+        role: "member" | "viewer" = "member",
+    ): Promise<CreatedHomeInvitation> {
+        return workbenchClient.createHomeInvitation(this.routeJson(), {
+            authority: authority.trim(),
+            project,
+            endpoint: this.base,
+            role,
+        });
+    }
+
+    setProjectNetworkIsolated(project: ProjectId, isolated: boolean): Promise<void> {
+        return workbenchClient.setProjectNetworkIsolated(
+            this.workbenchTransport(),
+            project,
+            isolated,
+        );
+    }
+
+    projectCredentials(project: string): Promise<LinkedProvider[]> {
+        return workbenchClient.projectCredentials(this.routeJson(), project);
+    }
+
+    linkProjectCredential(
+        project: string,
+        provider: string,
+        token: string,
+        baseUrl?: string,
+    ): Promise<void> {
+        return workbenchClient.linkProjectCredential(
+            this.routeJson(),
+            project,
+            provider,
+            token,
+            baseUrl,
+        );
+    }
+
+    unlinkProjectCredential(project: string, provider: string): Promise<void> {
+        return workbenchClient.unlinkProjectCredential(this.routeJson(), project, provider);
+    }
+
+    projectOrganizationModelOptions(project: string): Promise<ProjectOrganizationModelOptions> {
+        return workbenchClient.projectOrganizationModelOptions(this.routeJson(), project);
+    }
+
+    projectOrganizationModelSelection(
+        project: string,
+    ): Promise<ProjectOrganizationModelSelection | null> {
+        return workbenchClient.projectOrganizationModelSelection(this.routeJson(), project);
+    }
+
+    selectProjectOrganizationModel(
+        project: string,
+        input: {
+            readonly binding: OrganizationModelAuthorityBinding;
+            readonly connection: string;
+            readonly model: string;
+            readonly privateBroker: string;
+            readonly admitPrivatePlaintext: true;
+        },
+    ): Promise<ProjectOrganizationModelSelection> {
+        return workbenchClient.selectProjectOrganizationModel(this.routeJson(), project, input);
+    }
+
+    clearProjectOrganizationModelSelection(project: string): Promise<void> {
+        return workbenchClient.clearProjectOrganizationModelSelection(this.routeJson(), project);
+    }
+
     createChatUnderArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId> {
         return workbenchClient.createChatUnderArchetype(this.workbenchTransport(), archetypeId, title);
     }
@@ -356,8 +474,8 @@ export class MobileControlPlane implements FacetBrowserApi {
         return workbenchClient.subscribe(this.workbenchTransport(), id, onEvent, onOpen);
     }
 
-    subscribeWorkspace(onChange: (change: WorkspaceChange) => void): () => void {
-        return workbenchClient.subscribeWorkspace(this.workbenchTransport(), onChange);
+    subscribeWorkspace(onChange: (change: WorkspaceChange) => void, onOpen?: () => void): () => void {
+        return workbenchClient.subscribeWorkspace(this.workbenchTransport(), onChange, onOpen);
     }
 
     openPairing(device: string, bridgeGrant: string | null): Promise<{ pairingId: string; bridgeGrant: string }> {

@@ -10,7 +10,7 @@
       "method": "GET",
       "path": "/admin/capabilities",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
       "scope": "active-tenant-membership",
       "capability": "discover-administration-capabilities",
@@ -46,7 +46,7 @@
       "method": "GET",
       "path": "/admin/integration",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
       "scope": "tenant-administration-console",
       "capability": "administration-console",
@@ -82,7 +82,7 @@
       "method": "GET",
       "path": "/admin/audit",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
       "scope": "tenant-administration-console",
       "capability": "view-audit",
@@ -190,7 +190,7 @@
       "method": "POST",
       "path": "/admin/sso/test",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
       "scope": "tenant-administration-console",
       "capability": "configure-sso",
@@ -368,14 +368,14 @@
       "jurisdiction": "administration-tenant",
       "transport": "http-json",
       "method": "POST",
-      "path": "/environments/administration/sessions",
+      "path": "/gaugeapps/administration/sessions",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
-      "scope": "tenant-environment-session",
-      "capability": "administration-environment",
-      "requestSchema": "rust:gaugedesk-ee/environment_routes/OpenBody",
-      "responseSchema": "gw://schemas/environment/session/v1",
+      "scope": "tenant-gaugeapp-session",
+      "capability": "administration-gaugeapp",
+      "requestSchema": "rust:gaugedesk-ee/gaugeapp_routes/OpenBody",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppSession",
       "sideEffect": "session",
       "risk": "critical",
       "compatibility": {
@@ -400,18 +400,54 @@
       }
     },
     {
-      "id": "administration.document.read",
+      "id": "administration.page.read",
       "jurisdiction": "administration-tenant",
       "transport": "http-json",
       "method": "GET",
-      "path": "/environments/administration/documents/:id",
+      "path": "/gaugeapps/administration/pages/:id",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
-      "scope": "tenant-environment-session",
+      "scope": "tenant-gaugeapp-session",
       "capability": null,
-      "requestSchema": "rust:gaugedesk-ee/environment_routes/SessionQuery",
-      "responseSchema": "gw://schemas/environment/document/v1",
+      "requestSchema": "rust:gaugedesk-ee/gaugeapp_routes/SessionQuery",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppPageModel",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "ee/web/e2e/features/admin.feature#authenticated-production-bundle"
+        ],
+        "authority": [
+          "web/e2e/steps/admin-steps.ts#authority-matrix"
+        ],
+        "journey": [
+          "ee/web/e2e/features/admin.feature#authenticated-production-bundle"
+        ],
+        "deployed": [],
+        "property": [
+          "web/e2e/steps/admin-steps.ts#generated-identity-encoding-state"
+        ]
+      }
+    },
+    {
+      "id": "administration.updates.read",
+      "jurisdiction": "administration-tenant",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/gaugeapps/administration/updates",
+      "producer": "gaugedesk-ee enterprise_control_plane",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
+      "authentication": "enterprise-account-session",
+      "scope": "tenant-gaugeapp-session",
+      "capability": null,
+      "requestSchema": "rust:gaugedesk-ee/gaugeapp_routes/UpdatesQuery",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppUpdateSnapshot",
       "sideEffect": "none",
       "risk": "important",
       "compatibility": {
@@ -440,15 +476,51 @@
       "jurisdiction": "administration-tenant",
       "transport": "http-json",
       "method": "GET",
-      "path": "/environments/administration/agent/messages",
+      "path": "/gaugeapps/administration/agent/messages",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
-      "scope": "tenant-environment-session",
+      "scope": "tenant-gaugeapp-session",
       "capability": null,
-      "requestSchema": "rust:gaugedesk-ee/environment_routes/SessionQuery",
-      "responseSchema": "gw://schemas/environment/agent-transcript/v1",
+      "requestSchema": "rust:gaugedesk-ee/gaugeapp_routes/SessionQuery",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppAgentMessage[]",
       "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "ee/web/e2e/features/admin.feature#authenticated-production-bundle"
+        ],
+        "authority": [
+          "web/e2e/steps/admin-steps.ts#authority-matrix"
+        ],
+        "journey": [
+          "ee/web/e2e/features/admin.feature#authenticated-production-bundle"
+        ],
+        "deployed": [],
+        "property": [
+          "web/e2e/steps/admin-steps.ts#generated-identity-encoding-state"
+        ]
+      }
+    },
+    {
+      "id": "administration.agent.events",
+      "jurisdiction": "administration-tenant",
+      "transport": "sse",
+      "method": "GET",
+      "path": "/gaugeapps/administration/agent/events",
+      "producer": "gaugedesk-ee enterprise_control_plane",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
+      "authentication": "enterprise-account-session",
+      "scope": "tenant-gaugeapp-session",
+      "capability": null,
+      "requestSchema": "rust:gaugedesk-ee/gaugeapp_routes/AgentMessagesQuery",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppAgentLiveFrame",
+      "sideEffect": "stream",
       "risk": "important",
       "compatibility": {
         "contractVersion": 1,
@@ -476,15 +548,87 @@
       "jurisdiction": "administration-tenant",
       "transport": "http-json",
       "method": "POST",
-      "path": "/environments/administration/agent/messages",
+      "path": "/gaugeapps/administration/agent/messages",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
-      "scope": "tenant-environment-session",
-      "capability": "environment-agent",
-      "requestSchema": "rust:gaugedesk-ee/environment_routes/AgentMessageBody",
-      "responseSchema": "gw://schemas/environment/agent-turn/v1",
+      "scope": "tenant-gaugeapp-session",
+      "capability": "gaugeapp-agent",
+      "requestSchema": "rust:gaugedesk-ee/gaugeapp_routes/AgentMessageBody",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppAgentTurn",
       "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "ee/web/e2e/features/admin.feature#authenticated-production-bundle"
+        ],
+        "authority": [
+          "web/e2e/steps/admin-steps.ts#authority-matrix"
+        ],
+        "journey": [
+          "ee/web/e2e/features/admin.feature#authenticated-production-bundle"
+        ],
+        "deployed": [],
+        "property": [
+          "web/e2e/steps/admin-steps.ts#generated-identity-encoding-state"
+        ]
+      }
+    },
+    {
+      "id": "administration.agent.stop",
+      "jurisdiction": "administration-tenant",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/gaugeapps/administration/agent/stop",
+      "producer": "gaugedesk-ee enterprise_control_plane",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
+      "authentication": "enterprise-account-session",
+      "scope": "tenant-gaugeapp-session",
+      "capability": "gaugeapp-agent",
+      "requestSchema": "rust:gaugedesk-ee/gaugeapp_routes/AgentStopBody",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppAgentStopResult",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "ee/web/e2e/features/admin.feature#authenticated-production-bundle"
+        ],
+        "authority": [
+          "web/e2e/steps/admin-steps.ts#authority-matrix"
+        ],
+        "journey": [
+          "ee/web/e2e/features/admin.feature#authenticated-production-bundle"
+        ],
+        "deployed": [],
+        "property": [
+          "web/e2e/steps/admin-steps.ts#generated-identity-encoding-state"
+        ]
+      }
+    },
+    {
+      "id": "administration.agent.erase",
+      "jurisdiction": "administration-tenant",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/gaugeapps/administration/agent/erase",
+      "producer": "gaugedesk-ee enterprise_control_plane",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
+      "authentication": "enterprise-account-session",
+      "scope": "tenant-gaugeapp-session",
+      "capability": "gaugeapp-agent",
+      "requestSchema": "rust:gaugedesk-ee/gaugeapp_routes/AgentEraseBody",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppAgentErasureReceipt",
+      "sideEffect": "erasure",
       "risk": "critical",
       "compatibility": {
         "contractVersion": 1,
@@ -512,13 +656,13 @@
       "jurisdiction": "administration-tenant",
       "transport": "http-json",
       "method": "GET",
-      "path": "/environments/administration/domain-verification",
+      "path": "/gaugeapps/administration/organization/domain-verification",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
-      "scope": "tenant-environment-session",
+      "scope": "tenant-gaugeapp-session",
       "capability": "manage-identity",
-      "requestSchema": "rust:gaugedesk-ee/environment_routes/DomainVerificationQuery",
+      "requestSchema": "rust:gaugedesk-ee/gaugeapp_routes/DomainChallengeQuery",
       "responseSchema": "gw://schemas/administration/domain-verification/v1",
       "sideEffect": "none",
       "risk": "important",
@@ -548,14 +692,14 @@
       "jurisdiction": "administration-tenant",
       "transport": "http-json",
       "method": "POST",
-      "path": "/environments/administration/commands",
+      "path": "/gaugeapps/administration/commands",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
-      "scope": "tenant-environment-session",
+      "scope": "tenant-gaugeapp-session",
       "capability": "command-declared",
-      "requestSchema": "gw://schemas/environment/command-envelope/v1",
-      "responseSchema": "gw://schemas/environment/command-receipt/v1",
+      "requestSchema": "ts:@gaugewright/control-plane-client/GaugeAppCommandEnvelope",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppReceipt",
       "sideEffect": "mutation",
       "risk": "critical",
       "compatibility": {
@@ -580,18 +724,18 @@
       }
     },
     {
-      "id": "administration.change.list",
+      "id": "administration.proposal.list",
       "jurisdiction": "administration-tenant",
       "transport": "http-json",
       "method": "GET",
-      "path": "/environments/administration/changes",
+      "path": "/gaugeapps/administration/proposals",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
-      "scope": "tenant-environment-session",
+      "scope": "tenant-gaugeapp-session",
       "capability": null,
-      "requestSchema": "rust:gaugedesk-ee/environment_routes/SessionQuery",
-      "responseSchema": "gw://schemas/environment/change-list/v1",
+      "requestSchema": "rust:gaugedesk-ee/gaugeapp_routes/SessionQuery",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppProposal[]",
       "sideEffect": "none",
       "risk": "important",
       "compatibility": {
@@ -616,18 +760,18 @@
       }
     },
     {
-      "id": "administration.change.propose",
+      "id": "administration.proposal.prepare",
       "jurisdiction": "administration-tenant",
       "transport": "http-json",
       "method": "POST",
-      "path": "/environments/administration/changes",
+      "path": "/gaugeapps/administration/proposals",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
-      "scope": "tenant-environment-session",
-      "capability": "document-command-declared",
-      "requestSchema": "gw://schemas/environment/document-change/v1",
-      "responseSchema": "gw://schemas/environment/command-receipt/v1",
+      "scope": "tenant-gaugeapp-session",
+      "capability": "agent-and-command-declared",
+      "requestSchema": "ts:@gaugewright/control-plane-client/GaugeAppCommandEnvelope",
+      "responseSchema": "ts:@gaugewright/control-plane-client/GaugeAppReceipt",
       "sideEffect": "mutation",
       "risk": "critical",
       "compatibility": {
@@ -652,18 +796,18 @@
       }
     },
     {
-      "id": "administration.change.review",
+      "id": "administration.proposal.review",
       "jurisdiction": "administration-tenant",
       "transport": "http-json",
       "method": "POST",
-      "path": "/environments/administration/changes/:id/review",
+      "path": "/gaugeapps/administration/proposals/:id/review",
       "producer": "gaugedesk-ee enterprise_control_plane",
-      "consumer": "AdministrationApp via @gaugewright/enterprise-client",
+      "consumer": "GaugeDesk Administration via @gaugewright/enterprise-client",
       "authentication": "enterprise-account-session",
-      "scope": "tenant-environment-session",
-      "capability": "review-change",
-      "requestSchema": "gw://schemas/environment/change-review/v1",
-      "responseSchema": "gw://schemas/environment/change-review-result/v1",
+      "scope": "tenant-gaugeapp-session",
+      "capability": "review-proposal",
+      "requestSchema": "gw://schemas/gaugeapp/proposal-review/v1",
+      "responseSchema": "gw://schemas/gaugeapp/proposal-review-result/v1",
       "sideEffect": "mutation",
       "risk": "critical",
       "compatibility": {
@@ -2190,6 +2334,186 @@
       }
     },
     {
+      "id": "account.recovery.start",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/recovery/start",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser recovery flow",
+      "authentication": "public-bounded-recovery-email-proof-initiation",
+      "scope": "single-use-account-recovery-email-challenge",
+      "capability": "begin-own-account-recovery",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/BeginEmailRequest",
+      "responseSchema": "gw://schemas/account/recovery-email-challenge/v1",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#verified_email_and_one_recovery_code_restore_the_same_custodied_account"
+        ],
+        "authority": [
+          "crates/app/src/account_auth_ceremony.rs#recovery_attempts_are_one_challenge_each_audited_secret_free_and_rate_limited"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#verified_email_and_one_recovery_code_restore_the_same_custodied_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_auth_ceremony.rs#recovery_email_cannot_be_replayed_as_account_registration_proof"
+        ]
+      }
+    },
+    {
+      "id": "account.recovery.finish",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/recovery/finish",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser recovery flow",
+      "authentication": "single-use-recovery-email-proof-and-unused-recovery-code",
+      "scope": "same-custodied-account-root-and-one-new-opaque-session",
+      "capability": "recover-own-account-session",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/FinishRecoveryRequest",
+      "responseSchema": "gw://schemas/account/session/v1",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#verified_email_and_one_recovery_code_restore_the_same_custodied_account"
+        ],
+        "authority": [
+          "crates/app/src/account_auth_ceremony.rs#verified_email_and_one_recovery_code_restore_the_same_custodied_account"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#verified_email_and_one_recovery_code_restore_the_same_custodied_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_auth_ceremony.rs#recovery_attempts_are_one_challenge_each_audited_secret_free_and_rate_limited"
+        ]
+      }
+    },
+    {
+      "id": "account.consumer-oidc.link.start",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/consumer-oidc/link/start",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk Account Settings consumer-provider linking flow",
+      "authentication": "live-independent-passkey-or-recovery-account-session",
+      "scope": "exact-account-session-and-configured-consumer-provider-revision",
+      "capability": "link-consumer-oidc-to-own-account",
+      "requestSchema": "http/empty",
+      "responseSchema": "gw://schemas/account/consumer-oidc-authorization/v1",
+      "sideEffect": "pending-account-authenticator-link",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/auth_oidc.rs#consumer_login_resolves_only_an_exact_active_subject_link"
+        ],
+        "authority": [
+          "crates/app/src/auth_oidc.rs#consumer_link_requires_the_exact_live_independent_session"
+        ],
+        "journey": [
+          "crates/app/src/auth_oidc.rs#consumer_login_resolves_only_an_exact_active_subject_link"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/auth_oidc.rs#consumer_link_requires_the_exact_live_independent_session"
+        ]
+      }
+    },
+    {
+      "id": "account.authorization.start",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/authorization/start",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser using the WebAuthn API",
+      "authentication": "current-account-session",
+      "scope": "active-passkeys-for-exact-account-and-operation",
+      "capability": "begin-fresh-operation-authorization",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/StartAuthorizationRequest",
+      "responseSchema": "webauthn/PublicKeyCredentialRequestOptions",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "authority": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ]
+      }
+    },
+    {
+      "id": "account.authorization.finish",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/authorization/finish",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser using the WebAuthn API",
+      "authentication": "current-account-session-and-verified-webauthn-assertion",
+      "scope": "single-use-account-and-operation-bound-authorization-proof",
+      "capability": "complete-fresh-operation-authorization",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/FinishAuthorizationRequest",
+      "responseSchema": "gw://schemas/account/fresh-authorization/v1",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "authority": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_auth_ceremony.rs#real_passkey_round_trip_creates_and_reauthenticates_the_same_account"
+        ]
+      }
+    },
+    {
       "id": "account.mobile-session.exchange",
       "jurisdiction": "native-person-account-session",
       "transport": "http-json",
@@ -2957,42 +3281,6 @@
       "scope": "authenticated-person-account",
       "capability": "delete-own-organization-tenant-when-sole-active-member",
       "requestSchema": "http/path-tenant-id",
-      "responseSchema": "http/no-content",
-      "sideEffect": "mutation",
-      "risk": "critical",
-      "compatibility": {
-        "contractVersion": 1,
-        "minimumConsumer": 1,
-        "maximumConsumer": null
-      },
-      "evidence": {
-        "contract": [
-          "web/e2e/authenticated-account-session.mjs#production-authenticated-account-mutation-readback"
-        ],
-        "authority": [
-          "web/e2e/authenticated-account-session.mjs#account-mutation-cookie-authority-properties"
-        ],
-        "journey": [
-          "web/e2e/authenticated-account-session.mjs#production-authenticated-account-mutation-readback"
-        ],
-        "deployed": [],
-        "property": [
-          "web/e2e/authenticated-account-session.mjs#account-mutation-cookie-authority-properties"
-        ]
-      }
-    },
-    {
-      "id": "account.erase",
-      "jurisdiction": "hosted-person-account",
-      "transport": "http-json",
-      "method": "DELETE",
-      "path": "/account/erase",
-      "producer": "gaugedesk-app account_routes",
-      "consumer": "eraseAccount via @gaugewright/control-plane-client",
-      "authentication": "valid-account-session-cookie-or-bearer",
-      "scope": "authenticated-person-account",
-      "capability": "erase-own-account",
-      "requestSchema": "rust:gaugedesk-app/account_routes/EraseAccountBody",
       "responseSchema": "http/no-content",
       "sideEffect": "mutation",
       "risk": "critical",
@@ -8600,6 +8888,114 @@
       }
     },
     {
+      "id": "home.project-organization-model-selection.read",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/projects/:id/organization-model-selection",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-organization-model-authority",
+      "capability": "read-project-organization-model-selection",
+      "requestSchema": "http/path-project-id",
+      "responseSchema": "rust:gaugedesk-app/project_model_selection/SelectionProjection",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:server/src/model_provider_service_tests.rs#project_organization_model_selection_crosses_hub_and_home_authorities"
+        ],
+        "authority": [
+          "crates/app/src/project_model_selection.rs#copied_or_stale_option_cannot_select"
+        ],
+        "journey": [
+          "gaugewright-cloud:server/src/model_provider_service_tests.rs#project_organization_model_selection_crosses_hub_and_home_authorities"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_model_selection.rs#copied_or_stale_option_cannot_select"
+        ]
+      }
+    },
+    {
+      "id": "home.project-organization-model-selection.select",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "PUT",
+      "path": "/projects/:id/organization-model-selection",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-organization-model-authority",
+      "capability": "select-admitted-project-organization-model",
+      "requestSchema": "rust:gaugedesk-app/project_model_selection/SelectOrganizationModel",
+      "responseSchema": "rust:gaugedesk-app/project_model_selection/SelectionProjection",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:server/src/model_provider_service_tests.rs#project_organization_model_selection_crosses_hub_and_home_authorities"
+        ],
+        "authority": [
+          "crates/app/src/project_model_selection.rs#copied_or_stale_option_cannot_select"
+        ],
+        "journey": [
+          "gaugewright-cloud:server/src/model_provider_service_tests.rs#project_organization_model_selection_crosses_hub_and_home_authorities"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_model_selection.rs#copied_or_stale_option_cannot_select"
+        ]
+      }
+    },
+    {
+      "id": "home.project-organization-model-selection.clear",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "DELETE",
+      "path": "/projects/:id/organization-model-selection",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project",
+      "capability": "clear-project-organization-model-selection",
+      "requestSchema": "http/path-project-id",
+      "responseSchema": "gw://schemas/project/organization-model-selection-cleared/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:server/src/model_provider_service_tests.rs#project_organization_model_selection_crosses_hub_and_home_authorities"
+        ],
+        "authority": [
+          "crates/app/src/project_model_selection.rs#copied_or_stale_option_cannot_select"
+        ],
+        "journey": [
+          "gaugewright-cloud:server/src/model_provider_service_tests.rs#project_organization_model_selection_crosses_hub_and_home_authorities"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_model_selection.rs#copied_or_stale_option_cannot_select"
+        ]
+      }
+    },
+    {
       "id": "home.chat.create",
       "jurisdiction": "private-home",
       "transport": "http-json",
@@ -9203,6 +9599,13 @@
       "expires": "2026-10-31"
     },
     {
+      "method": "GET",
+      "path": "/account/tenants/{tenant}/project-share-candidates",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
       "method": "POST",
       "path": "/archetypes/{id}/copy-as-panel",
       "owner": "gaugedesk",
@@ -9224,6 +9627,13 @@
       "expires": "2026-10-31"
     },
     {
+      "method": "POST",
+      "path": "/auth/work-email",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
       "method": "GET",
       "path": "/chats/{id}/context-usage",
       "owner": "gaugedesk",
@@ -9233,6 +9643,13 @@
     {
       "method": "POST",
       "path": "/chats/{id}/context/stream",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/gaugeapps/administration/enterprise-identity/credential",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"

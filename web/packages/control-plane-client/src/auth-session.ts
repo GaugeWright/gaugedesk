@@ -31,6 +31,12 @@
 import { createSignal } from "solid-js";
 import { browserRouteRequest } from "./browser-route-json";
 import { newIdempotencyKey } from "./control-plane-transport";
+import {
+    authenticationCredentialJSON,
+    publicKeyCreationOptions,
+    publicKeyRequestOptions,
+    registrationCredentialJSON,
+} from "./webauthn-browser";
 
 /**
  * Parse an OIDC callback URL fragment for the delivered id-token. Accepts the
@@ -94,7 +100,8 @@ export function signedIn(): boolean {
 
 /**
  * On app load: if the URL fragment carries a callback id-token, store it and strip the
- * fragment from the address bar (so a reload or copied URL can't leak / replay it).
+ * OIDC fields from the address bar (so a reload or copied URL can't leak / replay it).
+ * Other fragment-scoped capabilities are left for their owning consumer to remove.
  * Returns whether a token was consumed. Safe to call when there is no `window`.
  */
 export function consumeCallbackToken(): boolean {
@@ -103,7 +110,15 @@ export function consumeCallbackToken(): boolean {
     if (!tok) return false;
     setBearer(tok);
     try {
-        history.replaceState(null, "", window.location.pathname + window.location.search);
+        const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+        fragment.delete("id_token");
+        fragment.delete("token_type");
+        const remaining = fragment.toString();
+        history.replaceState(
+            null,
+            "",
+            `${window.location.pathname}${window.location.search}${remaining ? `#${remaining}` : ""}`,
+        );
     } catch {
         /* ignore — the token is stored regardless */
     }
@@ -118,7 +133,246 @@ export function consumeCallbackToken(): boolean {
  */
 export function beginLogin(controlPlaneBase: string): void {
     if (typeof window === "undefined") return;
-    window.location.href = `${controlPlaneBase}/auth/login`;
+    window.location.href = `${controlPlaneBase.replace(/\/+$/, "")}/auth/login`;
+}
+
+export interface AccountRecoveryChallenge {
+    readonly challengeId: string;
+    readonly expiresIn: number;
+}
+
+export interface AccountEmailChallenge {
+    readonly challengeId: string;
+    readonly expiresIn: number;
+}
+
+type CredentialContainer = Pick<CredentialsContainer, "create" | "get">;
+
+/** The account-auth authority uses passkey-auth's deliberately smaller finish
+ * payload, while Account Settings commands retain the browser-standard nested
+ * credential JSON. Both share the same binary codec but not a wire envelope. */
+function accountRegistrationResponse(credential: PublicKeyCredential): Record<string, unknown> {
+    const encoded = registrationCredentialJSON(credential);
+    const response = encoded.response as Record<string, unknown>;
+    return {
+        id: encoded.rawId,
+        transports: response.transports,
+        attestationObject: response.attestationObject,
+        clientDataJSON: response.clientDataJSON,
+    };
+}
+
+function accountAuthenticationResponse(credential: PublicKeyCredential): Record<string, unknown> {
+    const encoded = authenticationCredentialJSON(credential);
+    const response = encoded.response as Record<string, unknown>;
+    return {
+        id: encoded.rawId,
+        authenticatorData: response.authenticatorData,
+        signature: response.signature,
+        clientDataJSON: response.clientDataJSON,
+        userHandle: response.userHandle,
+    };
+}
+
+async function accountAuthResponse(
+    controlPlaneBase: string,
+    path: string,
+    body: unknown,
+): Promise<Response> {
+    const request = browserRouteRequest(controlPlaneBase.replace(/\/+$/, ""));
+    return request(path, {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+    });
+}
+
+async function accountAuthJson(
+    controlPlaneBase: string,
+    path: string,
+    body: unknown,
+    failure: string,
+): Promise<Record<string, unknown>> {
+    const response = await accountAuthResponse(controlPlaneBase, path, body);
+    if (!response.ok) throw new Error(failure);
+    let value: unknown;
+    try {
+        value = await response.json();
+    } catch {
+        throw new Error("Account authentication response is malformed.");
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    return value as Record<string, unknown>;
+}
+
+/** Begin the single-use verified-email proof used only for first-account
+ * passkey registration. It creates neither an account nor a session. */
+export async function startPasskeyAccountCreation(
+    controlPlaneBase: string,
+    email: string,
+): Promise<AccountEmailChallenge> {
+    const body = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/email/start",
+        { email },
+        "Could not send the verification code. Check the address and try again.",
+    );
+    if (typeof body.challenge_id !== "string" || !body.challenge_id
+        || typeof body.expires_in !== "number" || !Number.isSafeInteger(body.expires_in)
+        || body.expires_in <= 0) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    return { challengeId: body.challenge_id, expiresIn: body.expires_in };
+}
+
+/** Finish email proof and immediately create the first passkey. The verified
+ * email ticket and WebAuthn response remain in this call stack only. Success is
+ * the server-set HttpOnly session cookie, never a JavaScript bearer. */
+export async function finishPasskeyAccountCreation(
+    controlPlaneBase: string,
+    challengeId: string,
+    code: string,
+    displayName: string,
+    credentials: CredentialContainer = navigator.credentials,
+): Promise<string> {
+    const verified = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/email/complete",
+        { challenge_id: challengeId, code },
+        "That verification code was not accepted. Start again with a new code.",
+    );
+    if (typeof verified.email_verification !== "string" || !verified.email_verification) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    const started = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/passkey/register/start",
+        { email_verification: verified.email_verification, display_name: displayName },
+        "Could not start passkey creation. Request a new email code and try again.",
+    );
+    if (typeof started.ceremony_id !== "string" || !started.ceremony_id) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    const credential = await credentials.create({ publicKey: publicKeyCreationOptions(started.public_key) });
+    if (!credential || credential.type !== "public-key") throw new Error("Passkey creation was cancelled.");
+    const finished = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/passkey/register/finish",
+        {
+            ceremony_id: started.ceremony_id,
+            label: "Passkey",
+            credential: accountRegistrationResponse(credential as PublicKeyCredential),
+        },
+        "The passkey could not be verified. Start account creation again.",
+    );
+    if (typeof finished.account_id !== "string" || !finished.account_id) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    return finished.account_id;
+}
+
+/** Authenticate an existing passkey account. Account discovery uses the
+ * verified address only as ceremony input; success is an HttpOnly session. */
+export async function signInWithPasskey(
+    controlPlaneBase: string,
+    email: string,
+    credentials: CredentialContainer = navigator.credentials,
+): Promise<string> {
+    const started = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/passkey/login/start",
+        { email },
+        "No passkey account could be opened for that address.",
+    );
+    if (typeof started.ceremony_id !== "string" || !started.ceremony_id) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    const credential = await credentials.get({ publicKey: publicKeyRequestOptions(started.public_key) });
+    if (!credential || credential.type !== "public-key") throw new Error("Passkey sign-in was cancelled.");
+    const finished = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/passkey/login/finish",
+        {
+            ceremony_id: started.ceremony_id,
+            credential: accountAuthenticationResponse(credential as PublicKeyCredential),
+        },
+        "That passkey was not accepted. Try again.",
+    );
+    if (typeof finished.account_id !== "string" || !finished.account_id) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    return finished.account_id;
+}
+
+/** Begin the verified-email half of account recovery. The email and challenge
+ * are ceremony inputs only; neither becomes client-owned account state. */
+export async function startAccountRecovery(
+    controlPlaneBase: string,
+    email: string,
+): Promise<AccountRecoveryChallenge> {
+    const request = browserRouteRequest(controlPlaneBase.replace(/\/+$/, ""));
+    const response = await request("/auth/account/recovery/start", {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email }),
+    });
+    if (!response.ok) {
+        throw new Error(response.status === 429
+            ? "Recovery is temporarily limited. Wait a few minutes and try again."
+            : "Could not start account recovery. Check the address and try again.");
+    }
+    const body = await response.json() as { challenge_id?: unknown; expires_in?: unknown };
+    if (typeof body.challenge_id !== "string" || !body.challenge_id
+        || typeof body.expires_in !== "number" || !Number.isSafeInteger(body.expires_in)
+        || body.expires_in <= 0) {
+        throw new Error("Account recovery response is malformed.");
+    }
+    return { challengeId: body.challenge_id, expiresIn: body.expires_in };
+}
+
+/** Finish one single-use recovery attempt. Success is represented by the
+ * server-set HttpOnly account cookie; secret proofs are never returned. */
+export async function finishAccountRecovery(
+    controlPlaneBase: string,
+    challengeId: string,
+    emailCode: string,
+    recoveryCode: string,
+): Promise<string> {
+    const request = browserRouteRequest(controlPlaneBase.replace(/\/+$/, ""));
+    const response = await request("/auth/account/recovery/finish", {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            challenge_id: challengeId,
+            email_code: emailCode,
+            recovery_code: recoveryCode,
+        }),
+    });
+    if (!response.ok) {
+        throw new Error(response.status === 429
+            ? "Recovery is temporarily limited. Wait a few minutes and try again."
+            : "Those recovery proofs were not accepted. Start again with a new email code.");
+    }
+    const body = await response.json() as { account_id?: unknown };
+    if (typeof body.account_id !== "string" || !body.account_id) {
+        throw new Error("Account recovery response is malformed.");
+    }
+    return body.account_id;
+}
+
+/**
+ * The server endpoint for organization sign-in discovery. Kept as a pure URL
+ * helper so the account entry can use an ordinary HTML POST form: the address
+ * stays out of the URL, redirects to an external IdP work normally, and no
+ * JavaScript state participates in routing or admission.
+ */
+export function workEmailLoginTarget(controlPlaneBase: string): string {
+    return `${controlPlaneBase.replace(/\/+$/, "")}/auth/work-email`;
 }
 
 /** Sign out locally: drop the bearer (the server-side id-token still self-expires). */
@@ -145,8 +399,9 @@ export async function endSession(controlPlaneBase: string): Promise<void> {
 
 /** Exchange a native login handoff through the shared browser transport. The
  * custom-scheme callback carries only an opaque single-use code; the verifier
- * is supplied from the initiating device and the returned account token never
- * appears in a URL. */
+ * is supplied from the initiating device and the returned opaque GaugeDesk
+ * account session never appears in a URL. External provider tokens remain in
+ * the Hub. */
 export async function exchangeMobileAccountHandoff(
     controlPlaneBase: string,
     code: string,
@@ -161,15 +416,17 @@ export async function exchangeMobileAccountHandoff(
     if (!response.ok) {
         throw new Error(`Mobile sign-in handoff failed (${response.status})`);
     }
-    const body = await response.json() as { id_token?: unknown };
-    if (typeof body.id_token !== "string" || !body.id_token) {
+    const body = await response.json() as { account_session?: unknown };
+    if (typeof body.account_session !== "string" || !body.account_session) {
         throw new Error("Mobile sign-in handoff response is malformed");
     }
-    return body.id_token;
+    return body.account_session;
 }
 
-/** Proactively refresh a still-valid native account session through the same
- * credentialed request owner used by every other browser control-plane call. */
+/** Renew the server-held provider grant behind a still-valid native account
+ * session. The opaque bearer is stable: a successful response confirms the
+ * Hub admitted and touched this exact device-bound session but returns no
+ * external credential. */
 export async function refreshMobileAccountToken(
     controlPlaneBase: string,
     token: string,
@@ -181,11 +438,11 @@ export async function refreshMobileAccountToken(
     if (!response.ok) {
         throw new Error(`Mobile account refresh failed (${response.status})`);
     }
-    const body = await response.json() as { id_token?: unknown };
-    if (typeof body.id_token !== "string" || !body.id_token) {
+    const body = await response.json() as { refreshed?: unknown };
+    if (body.refreshed !== true) {
         throw new Error("Mobile account refresh response is malformed");
     }
-    return body.id_token;
+    return token;
 }
 
 /** Proactively refresh one hosted account session (ADR 0147 §1). The opaque session

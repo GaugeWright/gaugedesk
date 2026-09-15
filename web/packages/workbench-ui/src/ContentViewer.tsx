@@ -21,8 +21,6 @@ import { useSession } from "./session-context";
 import { changedUserFiles, diffHasFiles } from "./changed-files";
 import { defaultContentMode, isSettledPhase, phaseLabel as phaseLabelFor, shouldShowViewOnSelect } from "./content-view";
 import { readPolicyDiff } from "./policy-diff";
-import { EnvironmentDocumentView, type EnvironmentViewRegistry } from "./EnvironmentDocumentView";
-import { manifestDocumentForPath } from "./environment-view";
 import { isWhipProgram, tabsForPath, programForPath, programsFromV1} from "./whip-view";
 import { WhipInstancesView, WhipStructureView } from "./WhipViews";
 import { ImageFileView, MediaFileView, OpaqueFileView } from "./FileMediaView";
@@ -73,8 +71,6 @@ export interface ContentViewerProps {
      * Edit remains the literal file source, so a rendered dashboard and its
      * canonical document are two views of one selected Workspace file. */
     readonly renderers?: readonly SpecialFileRenderer[];
-    /** ADR 0107 manifest-linked, schema-validated constrained document Views. */
-    readonly environmentView?: EnvironmentViewRegistry;
     /** Optional Environment-owned revision for virtual/canonical file sources. */
     readonly refreshKey?: () => unknown;
 }
@@ -177,12 +173,6 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     const specialRenderer = () => {
         const path = file();
         return path ? props.renderers?.find((renderer) => renderer.matches(path)) : undefined;
-    };
-    const environmentDocument = () => {
-        const path = file();
-        return path && props.environmentView
-            ? manifestDocumentForPath(props.environmentView.manifest, path)
-            : undefined;
     };
     // Unsaved work exists only when the buffer actually differs from the file —
     // typing something and undoing it back leaves nothing to save. Save/discard
@@ -580,15 +570,10 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                         </div>
                     </Show>
                     <Show when={!content.loading} fallback={<div class="status">loading…</div>}>
-                        {/* Manifest-linked Environment Views take precedence. They
-                            resolve exact document ids and schemas, never suffixes. */}
                         <Show
-                            when={environmentDocument()}
+                            when={specialRenderer()}
                             fallback={
-                                <Show
-                                    when={specialRenderer()}
-                                    fallback={
-                                        <Switch fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
+                                <Switch fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
                                             {/* A file we know is not text: name the format
                                                 rather than paint its bytes as characters. */}
                                             <Match when={viewerFile().kind === "opaque"}>
@@ -694,19 +679,10 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                                                     mediaType="application/octet-stream"
                                                 />
                                             </Match>
-                                        </Switch>
-                                    }
-                                >
-                                    {(renderer) => renderer().render({ path: file()!, content: content() ?? "" })}
-                                </Show>
+                                </Switch>
                             }
                         >
-                            <EnvironmentDocumentView
-                                registry={props.environmentView!}
-                                path={file()!}
-                                content={content() ?? ""}
-                                onSelectFile={(path) => session.selectFile(path)}
-                            />
+                            {(renderer) => renderer().render({ path: file()!, content: content() ?? "" })}
                         </Show>
                     </Show>
                 </Show>

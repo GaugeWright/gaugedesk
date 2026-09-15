@@ -28,6 +28,12 @@ stream** (`api.subscribe`), so model tokens render token-by-token; the task
 composer drives a real WhippleScript turn; the content panel shows the diff with a
 keep → `main` action.
 
+The ordinary chat and workspace SSE routes are reference channels, not durable
+history. Their browser transport reconnects with bounded backoff, resolves the
+current project Home again on every attempt, and refreshes the authoritative
+transcript/workspace projection after reopening. Disposal cancels pending retries;
+changing projects immediately moves live subscriptions to the new project Home.
+
 **Built on Solid 1.x.** Solid 2.0 (`2.0.0-experimental.16`) ships no client DOM
 renderer yet — only the reactive core + SSR — and `vite-plugin-solid` targets
 1.x, so a DOM app isn't buildable on 2.0 today. The shell relies only on the

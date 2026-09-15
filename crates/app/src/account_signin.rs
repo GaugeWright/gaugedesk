@@ -6,12 +6,13 @@
 //! PKCE-style challenge, the Hub authenticates the person and 302s to
 //! `gaugewright://auth/callback#code=<single-use>`, and this module redeems the
 //! code — with the verifier that never left this process — at the Hub's
-//! exchange endpoint. The verified id-token (the account bearer) is sealed at
-//! rest (`SEC-4`) in the local account scope; the webview only ever sees the
-//! one-time code and non-secret status projections. Signing out deletes the
-//! sealed record and is idempotent; a session close to expiry is refreshed
-//! proactively when its status is read (the account surfaces poll status, so a
-//! live desktop keeps itself signed in without a background daemon).
+//! exchange endpoint. The Hub returns a durable opaque account session; that
+//! bearer is sealed at rest (`SEC-4`) in the local account scope while external
+//! provider tokens remain inside the Hub. The webview sees only the one-time
+//! code and non-secret status projections. Signing out appends a tombstone and
+//! is idempotent; the device-bound provider grant is renewed proactively when
+//! status is read (the account surfaces poll status, so a live desktop keeps
+//! the Hub authority current without a background daemon).
 //!
 //! The Hub endpoint is deployment configuration, not edition:
 //! `GAUGEDESK_ACCOUNT_HUB_URL` overrides the production default, and an
@@ -19,13 +20,16 @@
 //! `available: false`, and the welcome/account UIs show their local-only
 //! wording instead of a dead button).
 
+use std::io::Read as _;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::body::{Body, Bytes};
+use axum::extract::{OriginalUri, State};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::Deserialize;
@@ -36,10 +40,81 @@ use crate::account::ACCOUNT_SCOPE;
 use crate::net_http::HttpClient;
 use crate::{LockUnpoisoned, SharedWorkbench};
 
+/// Marks the co-resident desktop composition. The hosted account authority
+/// never installs this marker; it authenticates GaugeApp requests from its own
+/// HttpOnly cookie or explicit bearer instead.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeAccountPlane;
+
+/// Exact native aliases for the hosted Account Settings GaugeApp. The browser
+/// calls the ordinary product paths; this co-resident boundary attaches the
+/// sealed account session and forwards them to the independently deployed
+/// account authority. No catch-all is intentional: adding a hosted operation
+/// requires adding its native custody boundary deliberately too.
+pub fn gaugeapp_proxy_routes() -> Router<SharedWorkbench> {
+    Router::new()
+        .route(
+            "/gaugeapps/account-settings/sessions",
+            post(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/pages/{id}",
+            get(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/updates",
+            get(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/agent/messages",
+            get(proxy_account_gaugeapp).post(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/agent/events",
+            get(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/agent/stop",
+            post(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/agent/erase",
+            post(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/commands",
+            post(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/provider-connections/secrets",
+            post(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/device-links/claim",
+            post(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/device-links/{id}",
+            get(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/device-links/{id}/complete",
+            post(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/proposals",
+            get(proxy_account_gaugeapp).post(proxy_account_gaugeapp),
+        )
+        .route(
+            "/gaugeapps/account-settings/proposals/{id}/review",
+            post(proxy_account_gaugeapp),
+        )
+}
+
 /// Latest-wins record family holding the sealed Hub session in the account scope.
 const RECORD_KIND: &str = "hub-session";
 const RECORD_ID: &str = "session";
-/// Refresh when the id-token has less than this long to live (it lives ~1h).
+/// Refresh when the Hub's next provider-renewal time is within this window.
 const REFRESH_SKEW_MS: i64 = 10 * 60 * 1000;
 /// A started sign-in that was never completed expires after this long.
 const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
@@ -69,6 +144,198 @@ fn hub_tenant_url(hub: &str, tenant: &str, suffix: &[&str]) -> Result<String, St
         path.extend(suffix.iter().copied());
     }
     Ok(url.to_string())
+}
+
+struct AccountAuthorityResponse {
+    status: u16,
+    content_type: Option<String>,
+    cache_control: Option<String>,
+    reader: Box<dyn std::io::Read + Send + Sync + 'static>,
+}
+
+fn open_account_authority_request(
+    method: &str,
+    url: &str,
+    bearer: &str,
+    forwarded_headers: &[(String, String)],
+    body: &[u8],
+) -> Result<AccountAuthorityResponse, String> {
+    // Credential-bearing proxy calls never follow redirects. A redirect could
+    // otherwise carry the sealed account bearer outside the configured account
+    // origin. The account authority returns explicit JSON launch URLs instead.
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(45))
+        .build();
+    let mut request = agent
+        .request(method, url)
+        .set("authorization", &format!("Bearer {bearer}"));
+    for (name, value) in forwarded_headers {
+        request = request.set(name, value);
+    }
+    let response = match if body.is_empty() {
+        request.call()
+    } else {
+        request.send_bytes(body)
+    } {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(ureq::Error::Transport(error)) => {
+            return Err(format!("account authority transport: {error}"))
+        }
+    };
+    Ok(AccountAuthorityResponse {
+        status: response.status(),
+        content_type: response.header("content-type").map(str::to_owned),
+        cache_control: response.header("cache-control").map(str::to_owned),
+        reader: response.into_reader(),
+    })
+}
+
+fn forwarded_account_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    [
+        "content-type",
+        "idempotency-key",
+        "x-gaugedesk-client-version",
+        "x-gaugedesk-client-protocol",
+        "x-gaugedesk-client-channel",
+        "x-gaugedesk-client-platform",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| (name.to_owned(), value.to_owned()))
+    })
+    .collect()
+}
+
+/// Forward one exact Account Settings request through the local sealed-session
+/// boundary. The caller supplies a product-owned path, never a URL; only the
+/// configured account origin is addressable. Browser cookies, Authorization,
+/// Origin, and arbitrary headers are deliberately not forwarded.
+pub async fn proxy_account_authority(
+    wb: &SharedWorkbench,
+    method: Method,
+    path_and_query: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(hub) = hub_base() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "account sign-in is not configured for this runtime" })),
+        )
+            .into_response();
+    };
+    let Some(bearer) = hub_session_token(wb) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "sign in to access Account Settings" })),
+        )
+            .into_response();
+    };
+    let url = format!("{hub}{path_and_query}");
+    let forwarded = forwarded_account_headers(&headers);
+    let method_name = method.as_str().to_owned();
+    let response = tokio::task::spawn_blocking(move || {
+        open_account_authority_request(&method_name, &url, &bearer, &forwarded, &body)
+    })
+    .await;
+    let mut response = match response {
+        Ok(Ok(response)) => response,
+        Ok(Err(message)) => {
+            return (StatusCode::BAD_GATEWAY, Json(json!({ "error": message }))).into_response()
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "account authority task failed" })),
+            )
+                .into_response()
+        }
+    };
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response.content_type.take();
+    let cache_control = response.cache_control.take();
+    let stream = content_type
+        .as_deref()
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let body = if stream {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+        tokio::task::spawn_blocking(move || {
+            let mut reader = response.reader;
+            let mut buffer = vec![0u8; 8 * 1024];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if sender
+                            .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..count])))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.blocking_send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
+    } else {
+        match tokio::task::spawn_blocking(move || {
+            let mut bytes = Vec::new();
+            response
+                .reader
+                .take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+        })
+        .await
+        {
+            Ok(Ok(bytes)) if bytes.len() <= 8 * 1024 * 1024 => Body::from(bytes),
+            _ => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": "account authority returned an unreadable response" })),
+                )
+                    .into_response()
+            }
+        }
+    };
+    let mut builder = Response::builder().status(status);
+    if let Some(value) = content_type.as_deref() {
+        builder = builder.header("content-type", value);
+    }
+    if let Some(value) = cache_control.as_deref() {
+        builder = builder.header("cache-control", value);
+    }
+    builder.body(body).unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "could not build account authority response" })),
+        )
+            .into_response()
+    })
+}
+
+async fn proxy_account_gaugeapp(
+    State(wb): State<SharedWorkbench>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let path = uri
+        .path_and_query()
+        .map(|value| value.as_str().to_owned())
+        .unwrap_or_else(|| uri.path().to_owned());
+    proxy_account_authority(&wb, method, path, headers, body).await
 }
 
 /// Mint a fresh Hub entitlement through the desktop's sealed account session.
@@ -240,24 +507,6 @@ fn validate_web_return(raw: Option<String>) -> Result<Option<String>, &'static s
     }
 }
 
-/// Decode a claims field from an (already server-verified) JWT for projection —
-/// never verification; the Hub verified the token before handing it over.
-fn jwt_claim(token: &str, claim: &str) -> Option<Value> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let claims: Value = serde_json::from_slice(&bytes).ok()?;
-    claims.get(claim).cloned()
-}
-
-fn jwt_subject(token: &str) -> Option<String> {
-    jwt_claim(token, "sub")?.as_str().map(str::to_string)
-}
-
-/// `exp` in epoch milliseconds, `None` when the token carries none.
-fn jwt_expiry_ms(token: &str) -> Option<i64> {
-    jwt_claim(token, "exp")?.as_i64().map(|secs| secs * 1000)
-}
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -273,16 +522,20 @@ struct SessionRecord {
     id: String,
     sealed: String,
     person: String,
+    /// Absolute expiry of the opaque Hub account session.
     expires: i64,
-    /// The Hub-minted trusted-device id this session is bound to (LOGIN-3);
-    /// presented on refresh so revocation from the account surface bites.
+    /// Next time the Hub asks this native client to renew the server-held
+    /// provider grant. Zero means the session has no renewable provider grant.
+    #[serde(default)]
+    refresh_after: i64,
+    /// The Hub-minted trusted-device id this session is bound to (LOGIN-3),
+    /// projected for the local account surface. Refresh authorization comes
+    /// from the Hub's stored session-to-device binding, never this field.
     #[serde(default)]
     device: String,
-    /// The human display of the signed-in subject — the id-token's `email`
-    /// (else `name`) claim. The IdP's `sub` stays the identity (`person`); a
-    /// Google `sub` is an opaque number no surface should show. Defaulted so
-    /// records sealed before this field read back; the projection falls back
-    /// to `person`.
+    /// Human display projected by the Hub from the verified assertion. The
+    /// account id stays the identity (`person`) and external subjects never
+    /// become local identity or display truth. Defaulted for older records.
     #[serde(default)]
     label: String,
 }
@@ -315,47 +568,53 @@ pub fn hub_session_token(wb: &SharedWorkbench) -> Option<String> {
     workbench.unseal_account_secret(&record.sealed)
 }
 
-fn seal_session(
+/// The actor bound to the sealed Hub session. Project-owned organization model
+/// selection uses this beside the unsealed bearer so a local loopback identity
+/// cannot be mistaken for the remote organization member it is acting for.
+pub fn hub_session_actor(wb: &SharedWorkbench) -> Option<String> {
+    latest_session(wb).map(|record| record.person)
+}
+
+fn store_session(
     wb: &SharedWorkbench,
-    id_token: &str,
+    account_session: &str,
+    person: &str,
+    label: &str,
+    expires: i64,
+    refresh_after: i64,
     device: &str,
 ) -> Result<SessionRecord, String> {
-    let person = jwt_subject(id_token).unwrap_or_default();
-    let label = jwt_display_label(id_token).unwrap_or_else(|| person.clone());
-    let expires = jwt_expiry_ms(id_token).unwrap_or(0);
     let sealed = {
         let workbench = wb.lock_unpoisoned();
         workbench
-            .seal_account_secret(id_token)
+            .seal_account_secret(account_session)
             .ok_or_else(|| "could not seal the Hub session".to_string())?
     };
     let record = SessionRecord {
         id: RECORD_ID.to_string(),
         sealed,
-        person,
+        person: person.to_string(),
         expires,
+        refresh_after,
         device: device.to_string(),
-        label,
+        label: label.to_string(),
     };
     write_session(wb, &record)?;
     Ok(record)
 }
 
-/// The subject as a person would recognize it: the `email` claim, else `name`.
-/// `None` when the token carries neither (the caller falls back to `sub`).
-fn jwt_display_label(token: &str) -> Option<String> {
-    ["email", "name"].iter().find_map(|claim| {
-        jwt_claim(token, claim)?
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
-}
-
 /// Redeem the deep-linked single-use code at the Hub. Blocking (ureq) — run off
 /// the async runtime.
-fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<(String, String), String> {
+struct RedeemedHubSession {
+    account_session: String,
+    person: String,
+    label: String,
+    expires: i64,
+    refresh_after: i64,
+    device: String,
+}
+
+fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<RedeemedHubSession, String> {
     let http = HttpClient::new();
     let body = json!({
         "code": code,
@@ -379,18 +638,46 @@ fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<(String, Strin
     }
     let parsed: Value =
         serde_json::from_str(&response).map_err(|_| "malformed Hub response".to_string())?;
-    let id_token = parsed
-        .get("id_token")
+    let account_session = parsed
+        .get("account_session")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
         .ok_or_else(|| "malformed Hub response".to_string())?;
+    let person = parsed
+        .get("account_id")
+        .and_then(Value::as_str)
+        .filter(|person| !person.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "malformed Hub response".to_string())?;
+    let label = parsed
+        .get("label")
+        .and_then(Value::as_str)
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or(&person)
+        .to_string();
+    let expires = parsed
+        .get("expires_at_ms")
+        .and_then(Value::as_i64)
+        .filter(|expires| *expires > 0)
+        .ok_or_else(|| "malformed Hub response".to_string())?;
+    let refresh_after = parsed
+        .get("refresh_after_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let device = parsed
         .get("device_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    Ok((id_token, device))
+    Ok(RedeemedHubSession {
+        account_session,
+        person,
+        label,
+        expires,
+        refresh_after,
+        device,
+    })
 }
 
 /// How this desktop names itself in the person's trusted-devices registry.
@@ -405,14 +692,9 @@ fn device_label() -> String {
 }
 
 /// Refresh a still-valid session at the Hub. Blocking — run off the async runtime.
-fn refresh_at_hub(hub: &str, bearer: &str, device: &str) -> Result<String, String> {
+fn refresh_at_hub(hub: &str, bearer: &str) -> Result<i64, String> {
     let http = HttpClient::new();
-    let mut headers = vec![("authorization".to_string(), format!("Bearer {bearer}"))];
-    if !device.is_empty() {
-        // LOGIN-3: bind the refresh to the registered device, so revoking it
-        // from the account surface stops this session's renewal.
-        headers.push(("x-gw-device".to_string(), device.to_string()));
-    }
+    let headers = [("authorization".to_string(), format!("Bearer {bearer}"))];
     let (status, response) = http
         .post_json_headers(&format!("{hub}/auth/mobile/refresh"), &headers, "{}")
         .map_err(|error| format!("the Hub was unreachable: {error}"))?;
@@ -421,11 +703,13 @@ fn refresh_at_hub(hub: &str, bearer: &str, device: &str) -> Result<String, Strin
     }
     let parsed: Value =
         serde_json::from_str(&response).map_err(|_| "malformed Hub response".to_string())?;
+    if parsed.get("refreshed").and_then(Value::as_bool) != Some(true) {
+        return Err("malformed Hub response".to_string());
+    }
     parsed
-        .get("id_token")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-        .map(str::to_string)
+        .get("refresh_after_ms")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
         .ok_or_else(|| "malformed Hub response".to_string())
 }
 
@@ -482,6 +766,7 @@ fn status_json(record: Option<&SessionRecord>, available: bool) -> Value {
             "label": if record.label.is_empty() { &record.person } else { &record.label },
             "expires": record.expires,
             "expired": record.expires <= now_ms(),
+            "refresh_after": record.refresh_after,
             "device": record.device,
         }),
         None => json!({ "available": available, "linked": false }),
@@ -559,8 +844,8 @@ pub async fn post_signin_callback(
     let code = request.code.trim().to_string();
     let redeemed =
         tokio::task::spawn_blocking(move || redeem_at_hub(&hub, &code, &taken.verifier)).await;
-    let (id_token, device) = match redeemed {
-        Ok(Ok(token)) => token,
+    let session = match redeemed {
+        Ok(Ok(session)) => session,
         Ok(Err(message)) => {
             tracing::warn!("hub-session exchange failed: {message}");
             return (StatusCode::BAD_GATEWAY, message).into_response();
@@ -570,7 +855,15 @@ pub async fn post_signin_callback(
             return (StatusCode::INTERNAL_SERVER_ERROR, "sign-in task panicked").into_response();
         }
     };
-    match seal_session(&wb, &id_token, &device) {
+    match store_session(
+        &wb,
+        &session.account_session,
+        &session.person,
+        &session.label,
+        session.expires,
+        session.refresh_after,
+        &session.device,
+    ) {
         Ok(record) => Json(status_json(Some(&record), true)).into_response(),
         Err(message) => {
             tracing::warn!("hub-session seal failed: {message}");
@@ -580,21 +873,25 @@ pub async fn post_signin_callback(
 }
 
 /// `GET /account/hub-session` — non-secret status. A session inside the
-/// refresh window is refreshed here, proactively: the account surfaces poll
-/// this route, so an open desktop renews itself before the ~1h token lapses.
+/// provider-renewal window is refreshed here, proactively: the account surfaces
+/// poll this route, so an open desktop keeps the Hub-held provider grant current
+/// without ever receiving an external token.
 pub async fn get_signin_status(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
     let available = hub_base().is_some();
     let Some(record) = latest_session(&wb) else {
         return Json(status_json(None, available)).into_response();
     };
-    let due = record.expires > now_ms() && record.expires - now_ms() < REFRESH_SKEW_MS;
+    let current_ms = now_ms();
+    let due = record.refresh_after > 0
+        && record.refresh_after <= current_ms.saturating_add(REFRESH_SKEW_MS);
     if available && due {
         if let (Some(hub), Some(bearer)) = (hub_base(), hub_session_token(&wb)) {
-            let device = record.device.clone();
             let refreshed =
-                tokio::task::spawn_blocking(move || refresh_at_hub(&hub, &bearer, &device)).await;
-            if let Ok(Ok(token)) = refreshed {
-                if let Ok(updated) = seal_session(&wb, &token, &record.device) {
+                tokio::task::spawn_blocking(move || refresh_at_hub(&hub, &bearer)).await;
+            if let Ok(Ok(refresh_after)) = refreshed {
+                let mut updated = record.clone();
+                updated.refresh_after = refresh_after;
+                if write_session(&wb, &updated).is_ok() {
                     return Json(status_json(Some(&updated), available)).into_response();
                 }
             }
@@ -666,6 +963,7 @@ pub async fn post_signin_logout(State(wb): State<SharedWorkbench>) -> impl IntoR
         sealed: String::new(),
         person: String::new(),
         expires: 0,
+        refresh_after: 0,
         device: String::new(),
         label: String::new(),
     };
@@ -748,62 +1046,36 @@ mod tests {
         );
     }
 
-    fn test_jwt(claims: serde_json::Value) -> String {
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
-        format!("{header}.{payload}.sig")
-    }
-
-    #[test]
-    fn jwt_projection_reads_subject_and_expiry() {
-        let token = test_jwt(json!({ "sub": "alice@example.test", "exp": 1000 }));
-        assert_eq!(jwt_subject(&token).as_deref(), Some("alice@example.test"));
-        assert_eq!(jwt_expiry_ms(&token), Some(1_000_000));
-        assert_eq!(jwt_subject("not-a-jwt"), None);
-        assert_eq!(jwt_expiry_ms("not-a-jwt"), None);
-    }
-
-    #[test]
-    fn display_label_prefers_email_then_name_never_the_opaque_sub() {
-        // A Google id-token: `sub` is an opaque number; email is the display.
-        let google = test_jwt(json!({
-            "sub": "109305974930518687474",
-            "email": "alice@example.test",
-            "name": "Alice Example",
-        }));
-        assert_eq!(
-            jwt_display_label(&google).as_deref(),
-            Some("alice@example.test")
-        );
-        let name_only = test_jwt(json!({ "sub": "1093", "name": "Alice Example" }));
-        assert_eq!(
-            jwt_display_label(&name_only).as_deref(),
-            Some("Alice Example")
-        );
-        let bare = test_jwt(json!({ "sub": "1093" }));
-        assert_eq!(jwt_display_label(&bare), None);
-        assert_eq!(jwt_display_label(&test_jwt(json!({ "email": " " }))), None);
-    }
-
     #[test]
     fn session_seals_projects_and_clears_without_leaking_the_token() {
         let root = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(root.path()).unwrap();
-        let token = test_jwt(json!({ "sub": "alice@example.test", "exp": 4_102_444_800i64 }));
+        let token = "opaque-account-session";
 
-        let record = seal_session(&wb, &token, "native-abc123").unwrap();
-        assert_eq!(record.person, "alice@example.test");
+        let record = store_session(
+            &wb,
+            token,
+            "account-root",
+            "alice@example.test",
+            4_102_444_800_000,
+            4_102_441_800_000,
+            "native-abc123",
+        )
+        .unwrap();
+        assert_eq!(record.person, "account-root");
         assert_eq!(record.expires, 4_102_444_800_000);
+        assert_eq!(record.refresh_after, 4_102_441_800_000);
         assert_eq!(record.device, "native-abc123");
         assert!(
-            !record.sealed.contains(&token),
+            !record.sealed.contains(token),
             "the stored form is sealed, not plaintext"
         );
-        assert_eq!(hub_session_token(&wb).as_deref(), Some(token.as_str()));
+        assert_eq!(hub_session_token(&wb).as_deref(), Some(token));
 
         let projection = status_json(Some(&record), true);
         assert_eq!(projection["linked"], true);
-        assert_eq!(projection["person"], "alice@example.test");
+        assert_eq!(projection["person"], "account-root");
+        assert_eq!(projection["label"], "alice@example.test");
         assert_eq!(projection["expired"], false);
         assert_eq!(projection["device"], "native-abc123");
         assert!(
@@ -817,6 +1089,7 @@ mod tests {
             sealed: String::new(),
             person: String::new(),
             expires: 0,
+            refresh_after: 0,
             device: String::new(),
             label: String::new(),
         };
@@ -836,11 +1109,41 @@ mod tests {
             sealed: "sealed".to_string(),
             person: "alice".to_string(),
             expires: 1,
+            refresh_after: 0,
             device: String::new(),
             label: "alice@example.test".to_string(),
         };
         let projection = status_json(Some(&record), true);
         assert_eq!(projection["linked"], true);
         assert_eq!(projection["expired"], true);
+    }
+
+    #[test]
+    fn account_proxy_forwards_only_product_protocol_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("idempotency-key", "attempt-1".parse().unwrap());
+        headers.insert("x-gaugedesk-client-version", "0.4.9".parse().unwrap());
+        headers.insert("authorization", "Bearer browser-secret".parse().unwrap());
+        headers.insert("cookie", "session=browser-secret".parse().unwrap());
+        headers.insert("origin", "https://untrusted.example".parse().unwrap());
+        headers.insert("x-forwarded-host", "untrusted.example".parse().unwrap());
+
+        let forwarded = forwarded_account_headers(&headers);
+        assert_eq!(
+            forwarded,
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("idempotency-key".to_string(), "attempt-1".to_string()),
+                (
+                    "x-gaugedesk-client-version".to_string(),
+                    "0.4.9".to_string()
+                ),
+            ]
+        );
+        assert!(forwarded.iter().all(|(name, _)| !matches!(
+            name.as_str(),
+            "authorization" | "cookie" | "origin" | "x-forwarded-host"
+        )));
     }
 }

@@ -1427,6 +1427,26 @@ fn is_host_managed_provider(provider: &str) -> bool {
     matches!(provider, "cloudflare-ai-gateway" | "cloudflare-workers-ai")
 }
 
+/// Opaque, non-secret identity carried through WhippleScript's existing
+/// provider-binding slot for an organization-funded turn. Each component is
+/// hex encoded so the Home broker can recover exact identities without
+/// delimiter ambiguity; it confers no authority and is re-admitted at every
+/// final fetch.
+fn organization_model_credential_ref(
+    actor: &str,
+    project: &str,
+    chat: &str,
+    connection: &str,
+) -> String {
+    format!(
+        "gaugedesk:organization-model:v1:{}:{}:{}:{}",
+        hex::encode(actor),
+        hex::encode(project),
+        hex::encode(chat),
+        hex::encode(connection),
+    )
+}
+
 /// Fail-closed check for managed-Home model providers: the private host
 /// validates and injects provider-specific config, then
 /// reports a generic readiness flag to the open engine. Pure (takes a `get`
@@ -1552,6 +1572,11 @@ pub struct EngagementTurnInput<'a> {
     pub account_scope: &'a str,
     /// Scope of the current tenant's organization-funded subscription.
     pub tenant_scope: &'a str,
+    /// Current account-Hub bearer when this turn entered over HTTP. Desktop
+    /// may instead use its memory-only signed-in Hub session. This credential
+    /// authenticates only the prompt-free invocation preparation call; it is
+    /// never a provider credential or durable runtime input.
+    pub account_bearer: Option<&'a str>,
     /// Stable Home-admitted command identity for unattended execution. A retry
     /// reuses this exact WhippleScript command/receipt. Foreground turns omit it.
     pub runtime_command_id: Option<&'a str>,
@@ -1701,6 +1726,7 @@ fn run_claimed_engagement_turn(
         contribution_by,
         account_scope,
         tenant_scope,
+        account_bearer,
         runtime_command_id,
         harness_factory,
     } = input;
@@ -1775,6 +1801,114 @@ fn run_claimed_engagement_turn(
     };
 
     stop_checkpoint(id)?;
+
+    // Resolve an organization-funded project selection before choosing the
+    // real runtime factory. A selected connection never falls through to a
+    // personal/project key: wrong organization context, missing Hub identity,
+    // or an unsupported placement is a visible refusal.
+    let scripted = harness_factory
+        .as_ref()
+        .is_some_and(|factory| factory.kind() == ScriptedFakeFactory::KIND)
+        || (harness_factory.is_none() && gaugedesk_env::var("FAKE_AGENT").is_some());
+    let mut organization_selection = None;
+    let mut organization_selection_error = None;
+    let mut whip_factory = whip_factory;
+    if !scripted {
+        let selected = {
+            let guard = wb.lock_unpoisoned();
+            guard
+                .library_project_of_chat(id)
+                .map(|project| {
+                    crate::project_model_selection::current_selection(&guard, &project)
+                        .map(|selection| selection.map(|selection| (project, selection)))
+                })
+                .transpose()
+                .map_err(str::to_owned)
+                .map(Option::flatten)
+        };
+        match selected {
+            Err(reason) => organization_selection_error = Some(reason),
+            Ok(Some((project, selection))) => {
+                let expected_scope =
+                    crate::org::tenant_scope(selection.binding.organization.as_str());
+                let (home_authority, home_id) = {
+                    let guard = wb.lock_unpoisoned();
+                    (guard.authority().clone(), guard.home_id().clone())
+                };
+                if expected_scope != tenant_scope {
+                    organization_selection_error = Some(
+                        "This project uses an organization model connection. Select that organization before running the Agent."
+                            .to_owned(),
+                    );
+                } else if selection.project.authority != home_authority
+                    || selection.project.id.as_str() != project
+                    || selection.home != home_id
+                {
+                    organization_selection_error = Some(
+                        "The project's organization model selection no longer matches this Home. Choose model access again."
+                            .to_owned(),
+                    );
+                } else if harness_factory
+                    .as_ref()
+                    .is_some_and(|factory| factory.kind() != "whip-do")
+                {
+                    organization_selection_error = Some(
+                        "This execution placement does not yet support organization-owned model connections."
+                            .to_owned(),
+                    );
+                } else if harness_factory.is_some() {
+                    // Hosted WhippleScript receives only the opaque
+                    // organization-model credential reference and inert auth
+                    // marker below. Its authenticated callback returns to the
+                    // project Home, where the current selection and exact
+                    // request are re-admitted before final fetch; an account
+                    // session is neither needed nor serialized into the DO.
+                    organization_selection = Some((project, selection));
+                } else {
+                    let stored_identity = crate::account_signin::hub_session_actor(wb);
+                    let stored_session = crate::account_signin::hub_session_token(wb);
+                    let session = match (stored_identity, stored_session) {
+                        (Some(identity), Some(session)) if identity == actor.as_str() => {
+                            Some(session)
+                        }
+                        (Some(_), Some(_)) => None,
+                        _ => account_bearer.map(str::to_owned),
+                    };
+                    let configured = crate::account_signin::hub_base()
+                        .zip(session)
+                        .ok_or_else(|| {
+                            "Sign in to your GaugeWright account before using this organization's model connection."
+                                .to_owned()
+                        })
+                        .and_then(|(origin, session)| {
+                            gaugedesk_whip_runtime::OrganizationModelBrokerConfig::new(
+                                origin,
+                                session,
+                                selection.binding.organization.as_str().to_owned(),
+                                project.clone(),
+                                id.to_owned(),
+                                selection.binding.clone(),
+                            )
+                            .map_err(|error| error.to_string())
+                        })
+                        .and_then(|broker| {
+                            whip_factory
+                                .clone()
+                                .with_organization_model_broker(broker)
+                                .map_err(|error| error.to_string())
+                        });
+                    match configured {
+                        Ok(factory) => {
+                            whip_factory = factory;
+                            organization_selection = Some((project, selection));
+                        }
+                        Err(reason) => organization_selection_error = Some(reason),
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+    }
 
     // The one harness decision point (SUB-0): which adapter drives this turn.
     // Consulted per turn — tests flip `GAUGEDESK_FAKE_AGENT` against a live
@@ -1863,20 +1997,37 @@ fn run_claimed_engagement_turn(
             process_declaration,
         )?
     } else {
+        if let Some(reason) = organization_selection_error {
+            let _ = sender.send(ServerEvent::Error {
+                reason: reason.clone(),
+                code: Some("organization_model_unavailable".into()),
+            });
+            let mut guard = wb.lock_unpoisoned();
+            return record_precheck_failure(
+                &mut guard.store,
+                id,
+                task,
+                reason,
+                "organization_model_unavailable",
+            );
+        }
         // The private composition may override the authored provider/model. Public
         // releases do not execute through this GaugeDesk engine.
         let (provider, effective_execution_class) = {
             let g = wb.lock_unpoisoned();
             let class = g.model_execution_class();
-            let linked = g.linked_providers_for_chat_in_class(id, actor.as_str(), class);
-            (
-                resolve_turn_provider(
-                    gaugedesk_env::var("MODEL_PROVIDER"),
-                    config.provider.clone(),
-                    &linked,
-                ),
-                class,
-            )
+            let provider = organization_selection.as_ref().map_or_else(
+                || {
+                    let linked = g.linked_providers_for_chat_in_class(id, actor.as_str(), class);
+                    resolve_turn_provider(
+                        gaugedesk_env::var("MODEL_PROVIDER"),
+                        config.provider.clone(),
+                        &linked,
+                    )
+                },
+                |(_, selection)| selection.provider.clone(),
+            );
+            (provider, class)
         };
         if provider == "openai-codex"
             && effective_execution_class == crate::account::ModelExecutionClass::LocalInteractive
@@ -1899,16 +2050,32 @@ fn run_claimed_engagement_turn(
         // The credential legs are the widest part of startup — two provider
         // round trips before anything interruptible exists.
         stop_checkpoint(id)?;
-        let credential_ref = {
-            let g = wb.lock_unpoisoned();
-            g.credential_ref_for_chat_in_class(
-                id,
-                &provider,
-                actor.as_str(),
-                effective_execution_class,
-            )
-        };
-        let credential_capability = if provider == "openai-codex" {
+        let credential_ref = organization_selection.as_ref().map_or_else(
+            || {
+                let guard = wb.lock_unpoisoned();
+                guard.credential_ref_for_chat_in_class(
+                    id,
+                    &provider,
+                    actor.as_str(),
+                    effective_execution_class,
+                )
+            },
+            |(project, selection)| {
+                organization_model_credential_ref(
+                    actor.as_str(),
+                    project,
+                    id,
+                    selection.connection.as_str(),
+                )
+            },
+        );
+        let credential_capability = if organization_selection.is_some() {
+            Some(crate::account::resolved_credential_capability(
+                credential_ref.clone(),
+                gaugedesk_whip_runtime::ORGANIZATION_MODEL_BROKER_CREDENTIAL_PLACEHOLDER.to_owned(),
+                None,
+            ))
+        } else if provider == "openai-codex" {
             match crate::codex_oauth::resolve_turn_credential(
                 wb,
                 actor.as_str(),
@@ -1974,11 +2141,17 @@ fn run_claimed_engagement_turn(
         stop_checkpoint(id)?;
         // A provider with no shipped catalog runs the operator's first declared
         // model when the chat pins none — the same id the picker names as default.
-        let model =
-            resolve_turn_model(gaugedesk_env::var("MODEL"), config.model.clone()).or_else(|| {
-                wb.lock_unpoisoned()
-                    .declared_default_model_for_actor(actor.as_str(), &provider)
-            });
+        let model = organization_selection.as_ref().map_or_else(
+            || {
+                resolve_turn_model(gaugedesk_env::var("MODEL"), config.model.clone()).or_else(
+                    || {
+                        wb.lock_unpoisoned()
+                            .declared_default_model_for_actor(actor.as_str(), &provider)
+                    },
+                )
+            },
+            |(_, selection)| Some(selection.model.clone()),
+        );
         // openai-generic (ADR 0083) carries its endpoint with the linked credential;
         // resolve it nearest-scope-wins so the descriptor derives the admitted host
         // from the same base_url the request will use. Other providers ignore it.
@@ -2222,6 +2395,9 @@ fn run_claimed_engagement_turn(
                 model: provider_descriptor.model.clone(),
                 base_url: provider_descriptor.base_url.clone(),
                 credential_ref,
+                private_model_broker: organization_selection
+                    .as_ref()
+                    .map(|(_, selection)| selection.private_broker.authority.as_str().to_owned()),
                 wire: provider_descriptor.wire.to_owned(),
                 placement_kind: if factory.kind() == "whip-do" {
                     "do".to_owned()
@@ -3780,6 +3956,7 @@ mod tests {
                 settled: 1,
                 released: 0,
                 outstanding: 0,
+                outstanding_tokens: 0,
             }
         );
         let kinds = store
@@ -3886,6 +4063,7 @@ mod tests {
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
+                account_bearer: None,
                 runtime_command_id: None,
                 harness_factory: None,
             },
@@ -3955,6 +4133,7 @@ mod tests {
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
+                account_bearer: None,
                 runtime_command_id: None,
                 harness_factory: None,
             },
@@ -4026,6 +4205,7 @@ mod tests {
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
+                account_bearer: None,
                 runtime_command_id: None,
                 harness_factory: None,
             },

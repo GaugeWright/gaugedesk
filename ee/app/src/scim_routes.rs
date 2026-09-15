@@ -24,7 +24,8 @@ use serde_json::json;
 use gaugedesk_core::rbac::Capability;
 
 use gaugedesk_app::org::{
-    sha256_hex, MembershipRecord, MembershipStatus, Org, RecordOp, ScimTokenRecord, ORG_ID,
+    sha256_hex, MembershipRecord, MembershipStatus, Org, RecordOp, ScimSyncError,
+    ScimSyncOperation, ScimSyncRecord, ScimSyncStatus, ScimTokenRecord, ORG_ID, SCIM_SYNC_KIND,
 };
 use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 
@@ -107,6 +108,55 @@ fn scim_user(rec: &MembershipRecord) -> serde_json::Value {
     })
 }
 
+const MAX_SCIM_SUBJECT_BYTES: usize = 320;
+
+fn scim_subject(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= MAX_SCIM_SUBJECT_BYTES).then(|| value.to_owned())
+}
+
+fn scim_operation(active: bool) -> ScimSyncOperation {
+    if active {
+        ScimSyncOperation::Provision
+    } else {
+        ScimSyncOperation::Deprovision
+    }
+}
+
+/// Record only authenticated, bounded SCIM operating evidence. Invalid bearer
+/// attempts are deliberately absent: they neither identify a real IdP action
+/// nor get to fill a customer's Administration surface with attacker traffic.
+fn record_scim_sync(
+    wb: &mut Workbench,
+    scope: &str,
+    operation: ScimSyncOperation,
+    subject: Option<String>,
+    error: Option<ScimSyncError>,
+) {
+    let status = if error.is_some() {
+        ScimSyncStatus::Failed
+    } else {
+        ScimSyncStatus::Succeeded
+    };
+    let record = ScimSyncRecord {
+        operation,
+        subject: subject.clone(),
+        status,
+        error,
+        observed_at_ms: gaugedesk_app::account::session_now_ms(),
+    };
+    let _ = wb.store_mut().append_record(
+        scope,
+        SCIM_SYNC_KIND,
+        &serde_json::to_string(&record).expect("SCIM sync record serializes"),
+    );
+    wb.notify_library_changed(
+        SCIM_SYNC_KIND,
+        subject.as_deref().unwrap_or("request"),
+        "upsert",
+    );
+}
+
 // ---- token issue / rotate (admin, B13) -----------------------------------
 
 /// Issue (or rotate) the SCIM bearer token. Admin-gated (`ConfigureProvisioning`).
@@ -171,24 +221,56 @@ pub async fn post_scim_user(
     if let Err((code, msg)) = scim_guard(&wb, &headers, peer) {
         return (code, msg).into_response();
     }
-    if body.user_name.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "userName is required").into_response();
-    }
-    let mut rec = membership_from(&body.user_name, body.active);
+    let store_scope = crate::org_routes::req_scope(&headers);
+    let Some(subject) = scim_subject(&body.user_name) else {
+        record_scim_sync(
+            &mut wb,
+            &store_scope,
+            scim_operation(body.active),
+            None,
+            Some(ScimSyncError::InvalidUserName),
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "userName is required and must be bounded",
+        )
+            .into_response();
+    };
+    let mut rec = membership_from(&subject, body.active);
     // SCIM-3: map the user's groups to a role/team if a mapping matches.
     let group_names: Vec<String> = body
         .groups
         .iter()
         .filter_map(|g| g.value.clone().or_else(|| g.display.clone()))
         .collect();
-    let store_scope = crate::org_routes::req_scope(&headers);
-    if let Ok(org) = Org::rebuild_in(wb.store_ref(), &store_scope) {
-        if let Some((role, team)) = org.role_for_groups(&group_names) {
-            rec.role = role;
-            rec.team = team;
+    let org = match Org::rebuild_in(wb.store_ref(), &store_scope) {
+        Ok(org) => org,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response()
         }
+    };
+    if let Some((role, team)) = org.role_for_groups(&group_names) {
+        rec.role = role;
+        rec.team = team;
+    }
+    if rec.status == MembershipStatus::Active && !org.seat_available_for(&rec.id) {
+        record_scim_sync(
+            &mut wb,
+            &store_scope,
+            ScimSyncOperation::Provision,
+            Some(subject),
+            Some(ScimSyncError::SeatCapacity),
+        );
+        return (StatusCode::CONFLICT, "purchased seat capacity is full").into_response();
     }
     write_membership(&mut wb, &store_scope, &rec);
+    record_scim_sync(
+        &mut wb,
+        &store_scope,
+        scim_operation(body.active),
+        Some(subject),
+        None,
+    );
     gaugedesk_app::audit::record_in(&mut wb, &store_scope, "scim", "scim.provision", &rec.id);
     (StatusCode::CREATED, Json(scim_user(&rec))).into_response()
 }
@@ -252,16 +334,35 @@ pub async fn patch_scim_user(
     if let Err((code, msg)) = scim_guard(&wb, &headers, peer) {
         return (code, msg).into_response();
     }
+    let scope = crate::org_routes::req_scope(&headers);
+    let Some(subject) = scim_subject(&id) else {
+        record_scim_sync(
+            &mut wb,
+            &scope,
+            ScimSyncOperation::Provision,
+            None,
+            Some(ScimSyncError::InvalidUserName),
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "user id is required and must be bounded",
+        )
+            .into_response();
+    };
     let active = match parse_scim_patch(&body) {
         Ok(active) => active,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        Err(msg) => {
+            record_scim_sync(
+                &mut wb,
+                &scope,
+                ScimSyncOperation::Update,
+                Some(subject),
+                Some(ScimSyncError::UnsupportedChange),
+            );
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
     };
-    set_active(
-        &mut wb,
-        &crate::org_routes::req_scope(&headers),
-        &id,
-        active,
-    )
+    set_active(&mut wb, &scope, &subject, active)
 }
 
 /// Delete a user — deprovisions them (offboarding → access-revoked, `SCIM-2`).
@@ -275,7 +376,22 @@ pub async fn delete_scim_user(
     if let Err((code, msg)) = scim_guard(&wb, &headers, peer) {
         return (code, msg).into_response();
     }
-    set_active(&mut wb, &crate::org_routes::req_scope(&headers), &id, false)
+    let scope = crate::org_routes::req_scope(&headers);
+    let Some(subject) = scim_subject(&id) else {
+        record_scim_sync(
+            &mut wb,
+            &scope,
+            ScimSyncOperation::Deprovision,
+            None,
+            Some(ScimSyncError::InvalidUserName),
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "user id is required and must be bounded",
+        )
+            .into_response();
+    };
+    set_active(&mut wb, &scope, &subject, false)
 }
 
 fn membership_from(user_name: &str, active: bool) -> MembershipRecord {
@@ -304,6 +420,13 @@ fn set_active(wb: &mut Workbench, scope: &str, id: &str, active: bool) -> axum::
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
     };
     let Some(existing) = org.members.get(id) else {
+        record_scim_sync(
+            wb,
+            scope,
+            scim_operation(active),
+            Some(id.to_owned()),
+            Some(ScimSyncError::UnknownUser),
+        );
         return (StatusCode::NOT_FOUND, "no such user").into_response();
     };
     let mut rec = existing.clone();
@@ -314,6 +437,16 @@ fn set_active(wb: &mut Workbench, scope: &str, id: &str, active: bool) -> axum::
         MembershipStatus::Deprovisioned
     };
     rec.managed_by_scim = true;
+    if active && !org.seat_available_for(&rec.id) {
+        record_scim_sync(
+            wb,
+            scope,
+            ScimSyncOperation::Provision,
+            Some(id.to_owned()),
+            Some(ScimSyncError::SeatCapacity),
+        );
+        return (StatusCode::CONFLICT, "purchased seat capacity is full").into_response();
+    }
     write_membership(wb, scope, &rec);
     let action = if active {
         "scim.provision"
@@ -321,6 +454,7 @@ fn set_active(wb: &mut Workbench, scope: &str, id: &str, active: bool) -> axum::
         "scim.deprovision"
     };
     gaugedesk_app::audit::record_in(wb, scope, "scim", action, &rec.id);
+    record_scim_sync(wb, scope, scim_operation(active), Some(id.to_owned()), None);
     (StatusCode::OK, Json(scim_user(&rec))).into_response()
 }
 

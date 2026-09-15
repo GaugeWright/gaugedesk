@@ -14,8 +14,10 @@ import {
     parseFacility,
     parseInvitation,
     parseAccountSignInMethod,
+    parseProjectShareCandidate,
     parseTenant,
     tenantFacilities,
+    tenantProjectShareCandidates,
 } from "./control-plane-tenant";
 import type { RouteJson } from "./control-plane-transport";
 
@@ -197,6 +199,22 @@ describe("control-plane-tenant (ADR 0077 §7/§9)", () => {
         expect(calls).toEqual([["GET", "/auth/session", undefined]]);
     });
 
+    it("reads project-share candidates from the exact encoded tenant", async () => {
+        const { json, calls } = fakeJson({
+            candidates: [
+                { authority: "authority:alex", label: "alex@example.test" },
+                { authority: "", label: "malformed" },
+            ],
+        });
+        await expect(tenantProjectShareCandidates(json, "organization/acme")).resolves.toEqual([{
+            authority: "authority:alex",
+            label: "alex@example.test",
+        }]);
+        expect(calls).toEqual([[
+            "GET", "/account/tenants/organization%2Facme/project-share-candidates", undefined,
+        ]]);
+    });
+
     it("is total: garbage / empty envelopes degrade to empty lists, never throw", async () => {
         expect(await accountFacilities(fakeJson(null).json)).toEqual([]);
         expect(await accountFacilities(fakeJson({ facilities: "nope" }).json)).toEqual([]);
@@ -205,5 +223,6 @@ describe("control-plane-tenant (ADR 0077 §7/§9)", () => {
         expect(parseTenant(undefined).personal).toBe(false);
         expect(parseInvitation(undefined).tenantId).toBe("");
         expect(parseAccountSignInMethod(undefined)).toEqual({ method: "", label: "" });
+        expect(parseProjectShareCandidate(undefined)).toEqual({ authority: "", label: "" });
     });
 });

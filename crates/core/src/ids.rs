@@ -138,6 +138,35 @@ id_newtype!(
     Nonce
 );
 
+id_newtype!(
+    /// An organization-owned provider connection, never a credential itself.
+    ModelConnectionId
+);
+id_newtype!(
+    /// An immutable candidate/activated credential version within a connection.
+    CredentialVersionId
+);
+id_newtype!(
+    /// Non-secret custody handle. Possession conveys no resolution authority.
+    SecretHandleId
+);
+id_newtype!(
+    /// A reference to evidence authenticated by the owning admission shell.
+    ObservationId
+);
+id_newtype!(
+    /// A project identity within its explicitly named owning authority.
+    ProjectId
+);
+id_newtype!(
+    /// An organization model-usage grant; not itself a credential or dispatch.
+    ModelGrantId
+);
+id_newtype!(
+    /// One chargeable provider attempt, including any bounded unknown outcome.
+    ModelAttemptId
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

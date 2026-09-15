@@ -1,0 +1,97 @@
+{
+  "availability": "available",
+  "binding": {
+    "authority": "credential-authority",
+    "organization": "example-organization",
+    "environment": "test"
+  },
+  "management_revision": "5",
+  "as_of": "8",
+  "period": {
+    "year": "1970",
+    "month": 1
+  },
+  "connections": [
+    {
+      "id": "connection-a",
+      "name": "Team provider",
+      "provider": "isolated-provider",
+      "endpoint": "https://provider.invalid/v1",
+      "authentication": "api_key",
+      "status": "active",
+      "current_version": "version-a",
+      "erasure_requested": false,
+      "overrun_pending": false,
+      "policy": {
+        "models": [
+          "model-a"
+        ],
+        "execution_classes": [
+          "private_broker"
+        ]
+      },
+      "versions": [
+        {
+          "id": "version-a",
+          "phase": "activated",
+          "material": "held",
+          "expires_at": "1000",
+          "verification": {
+            "check": "model_catalog_read",
+            "observed_at": "3"
+          }
+        }
+      ]
+    }
+  ],
+  "grants": [
+    {
+      "id": "grant-a",
+      "connection": "connection-a",
+      "subject": {
+        "kind": "member",
+        "id": "member-a"
+      },
+      "revision": "1",
+      "status": "active",
+      "policy": {
+        "models": [
+          "model-a"
+        ],
+        "execution_classes": [
+          "private_broker"
+        ]
+      },
+      "audiences": [
+        "member"
+      ],
+      "caps": {
+        "tokens": "18446744073709551615",
+        "money": null
+      },
+      "usage": {
+        "measured": {
+          "tokens": "0",
+          "money": [],
+          "unknown_money": false
+        },
+        "reserved": {
+          "tokens": "5",
+          "money": [],
+          "unknown_money": true
+        },
+        "accounted_at_bound": {
+          "tokens": "0",
+          "money": [],
+          "unknown_money": false
+        },
+        "unknown_outcomes": "0"
+      }
+    }
+  ],
+  "default_model": null,
+  "setup": {
+    "api_key_intake": false,
+    "providers": []
+  }
+}

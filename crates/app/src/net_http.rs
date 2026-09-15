@@ -211,6 +211,17 @@ impl HttpClient {
             agent: ureq::AgentBuilder::new().timeout(timeout).build(),
         }
     }
+
+    /// Credential-bearing authority calls must never carry their bearer across
+    /// a redirect. The caller also validates the exact configured origin.
+    pub fn with_timeout_no_redirects(timeout: Duration) -> Self {
+        Self {
+            agent: ureq::AgentBuilder::new()
+                .redirects(0)
+                .timeout(timeout)
+                .build(),
+        }
+    }
 }
 
 impl Default for HttpClient {

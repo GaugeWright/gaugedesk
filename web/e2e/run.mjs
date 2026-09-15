@@ -96,6 +96,14 @@ if (process.env.GW_E2E_LIVE) {
 // serves the combined enterprise workbench at the preview origin and skips the
 // @open-only features (surfaces that ship only in the open bundle).
 const enterpriseLane = process.env.GW_E2E_COMPOSITION === "enterprise";
+const accountEntryLane = process.env.GW_E2E_ACCOUNT_ENTRY === "1";
+if (accountEntryLane) {
+    // The combined enterprise bundle is also the hosted desk.gaugewright.com
+    // composition. Its dedicated account-entry lane turns the account/Home split
+    // on so signed-out entry, recovery, and cookie re-entry are exercised without
+    // changing the established signed-in fixtures in the ordinary enterprise lane.
+    env.VITE_HOME_SPLIT = "true";
+}
 
 console.log(
     `[e2e] ports → alice:${alice} bob:${bob} broker:${broker} preview:${preview} ` +
@@ -110,9 +118,12 @@ const passthrough = process.argv.slice(2);
 const invert = [
     ...(process.env.GW_E2E_LIVE ? [] : ["@live-provider"]),
     ...(enterpriseLane ? ["@open-only"] : []),
+    ...(enterpriseLane ? [] : ["@enterprise-composition"]),
+    ...(accountEntryLane ? [] : ["@account-entry"]),
 ];
 const grep = [
     ...(process.env.GW_E2E_LIVE ? ["--grep", "@live-provider"] : []),
+    ...(accountEntryLane ? ["--grep", "@account-entry"] : []),
     ...(invert.length ? ["--grep-invert", invert.join("|")] : []),
 ];
 

@@ -1075,6 +1075,7 @@ fn engine_peer_turn(
             contribution_by,
             account_scope: crate::account::ACCOUNT_SCOPE,
             tenant_scope: crate::org::ORG_SCOPE,
+            account_bearer: None,
             runtime_command_id: None,
             harness_factory: None,
         },

@@ -450,7 +450,7 @@ fn the_session_cutover_instruction_reaches_both_edge_mutation_shapes() {
 }
 
 #[test]
-fn a_hub_signed_managed_entitlement_is_carried_to_the_edge_configuration() {
+fn an_account_service_signed_managed_entitlement_is_carried_to_the_edge_configuration() {
     let dir = tempfile::tempdir().unwrap();
     let workbench = open_workbench(dir.path()).unwrap();
     let route = gaugedesk_app::managed_inference::metered_route("gpt-5.6-terra");
@@ -469,12 +469,8 @@ fn a_hub_signed_managed_entitlement_is_carried_to_the_edge_configuration() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let claims = gaugedesk_app::managed_entitlement::build_claims(
-        "tenant:synthetic",
-        "canary",
-        &publisher,
-        now,
-    );
+    let funding_ref = "gaugedesk:managed-plan:v2:74656e616e743a73796e746865746963:63616e617279:746573742d697373756572:test:7375622d63616e617279";
+    let claims = gaugedesk_app::managed_entitlement::build_claims(funding_ref, &publisher, now);
     let hub_key = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
     let entitlement: gaugedesk_app::managed_entitlement::Entitlement =
         serde_json::from_str(&gaugedesk_app::managed_entitlement::sign(&hub_key, &claims).unwrap())
@@ -482,8 +478,7 @@ fn a_hub_signed_managed_entitlement_is_carried_to_the_edge_configuration() {
     let (edge, state) = publisher_edge();
     let mut request = publish_request("inst-seeded");
     request.edge_origin = edge;
-    request.funding_ref =
-        gaugedesk_app::managed_inference::funding_ref_for(&claims.scope, &claims.plan);
+    request.funding_ref = claims.funding_ref.clone();
     request.credential_ref.clear();
     request.managed_tenant_id = Some("tenant:synthetic".to_owned());
     request.funding_entitlement = Some(entitlement.clone());
@@ -526,12 +521,8 @@ fn an_unchanged_managed_release_update_reuses_the_admitted_funding_snapshot() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let claims = gaugedesk_app::managed_entitlement::build_claims(
-        "tenant:synthetic",
-        "canary",
-        &publisher,
-        now,
-    );
+    let funding_ref = "gaugedesk:managed-plan:v2:74656e616e743a73796e746865746963:63616e617279:746573742d697373756572:test:7375622d63616e617279";
+    let claims = gaugedesk_app::managed_entitlement::build_claims(funding_ref, &publisher, now);
     let hub_key = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
     let entitlement: gaugedesk_app::managed_entitlement::Entitlement =
         serde_json::from_str(&gaugedesk_app::managed_entitlement::sign(&hub_key, &claims).unwrap())
@@ -539,8 +530,7 @@ fn an_unchanged_managed_release_update_reuses_the_admitted_funding_snapshot() {
     let (edge, state) = publisher_edge();
     let mut initial = publish_request("inst-seeded");
     initial.edge_origin = edge.clone();
-    initial.funding_ref =
-        gaugedesk_app::managed_inference::funding_ref_for(&claims.scope, &claims.plan);
+    initial.funding_ref = claims.funding_ref.clone();
     initial.credential_ref.clear();
     initial.managed_tenant_id = Some("tenant:synthetic".to_owned());
     initial.funding_entitlement = Some(entitlement);
@@ -551,8 +541,7 @@ fn an_unchanged_managed_release_update_reuses_the_admitted_funding_snapshot() {
 
     let mut update = publish_request("inst-seeded");
     update.edge_origin = edge;
-    update.funding_ref =
-        gaugedesk_app::managed_inference::funding_ref_for(&claims.scope, &claims.plan);
+    update.funding_ref = claims.funding_ref.clone();
     update.credential_ref.clear();
     let outcome = workbench
         .lock_unpoisoned()

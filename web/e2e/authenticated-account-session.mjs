@@ -1,11 +1,16 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { chromium } from "playwright";
+import {
+    attachVirtualAuthenticator,
+    beginEmailProof,
+    completePasskeyAccount,
+} from "./passkey-account-door.mjs";
 import { build } from "vite";
 import {
     assertStateTreeExcludes,
@@ -210,6 +215,8 @@ async function issueMobileHandoff(browser, verifier) {
 }
 
 const stateRoot = await mkdtemp(resolve(tmpdir(), "gw-auth-session-wiring-"));
+const emailOutbox = resolve(stateRoot, "auth-email-outbox.json");
+const accountEmail = "account-session-wiring@gaugewright.invalid";
 const staticPort = await freePort();
 const staticOrigin = `http://localhost:${staticPort}`;
 const clientBuild = await build({
@@ -287,6 +294,14 @@ const enterprise = spawn(serverBinary, [], {
         GAUGEDESK_OIDC_POST_LOGIN_URL: `${staticOrigin}/`,
         GAUGEDESK_SESSION_COOKIE_INSECURE: "1",
         GAUGEDESK_ALLOWED_ORIGINS: staticOrigin,
+        // The first person on a fresh deployment arrives by passkey, not by
+        // consumer sign-in (ADR 0146), so this composition needs its WebAuthn
+        // relying party and a readable stand-in for the mail provider. The code
+        // lands in the isolated state directory rather than on a route, so a
+        // running server never discloses a one-time proof.
+        GAUGEDESK_ACCOUNT_RP_ID: "localhost",
+        GAUGEDESK_ACCOUNT_ORIGIN: staticOrigin,
+        GAUGEDESK_TEST_AUTH_EMAIL_OUTBOX: emailOutbox,
     },
     stdio: ["ignore", "pipe", "pipe"],
 });
@@ -379,6 +394,60 @@ try {
     const context = await browser.newContext();
     const page = await context.newPage();
 
+    // Consumer sign-in resolves an existing subject link and cannot mint an
+    // account (ADR 0146), so the person this test signs in as must exist and
+    // must have linked before the OIDC door will open at all.
+    //
+    // Both happen in their own browser context, which is then discarded. That
+    // is not tidiness: linking leaves a session at the provider, so a sign-in
+    // from the same context would be waved straight through without ever
+    // rendering the form, and the sign-in below would assert nothing about
+    // authenticating. The main context has never met the provider, so it
+    // signs in the way a person on a new machine does.
+    // oidc-production-consumer-account-and-link
+    progress = "production passkey account and consumer link";
+    const enrolment = await browser.newContext();
+    try {
+        const enrolmentPage = await enrolment.newPage();
+        await enrolmentPage.goto(`${staticOrigin}/`, { waitUntil: "domcontentloaded" });
+        const detachAuthenticator = await attachVirtualAuthenticator(enrolment, enrolmentPage);
+        const challengeId = await beginEmailProof(enrolmentPage, apiOrigin, accountEmail);
+        // Read the one-time code the way a person reads their mail: the server
+        // deliberately exposes no route that would disclose it.
+        const posted = JSON.parse(await readFile(emailOutbox, "utf8"));
+        if (posted?.purpose !== "verification" || posted?.email !== accountEmail) {
+            throw new Error(`unexpected verification mail: ${JSON.stringify(posted)}`);
+        }
+        await completePasskeyAccount(enrolmentPage, apiOrigin, {
+            challengeId,
+            code: posted.code,
+            displayName: "Account session wiring",
+        });
+        const authorizationUrl = await enrolmentPage.evaluate(async (api) => {
+            const response = await fetch(`${api}/auth/account/consumer-oidc/link/start`, {
+                method: "POST",
+                credentials: "include",
+                headers: { "content-type": "application/json" },
+                body: "{}",
+            });
+            if (!response.ok) throw new Error(`link start returned ${response.status}`);
+            return (await response.json())?.authorization_url ?? null;
+        }, apiOrigin);
+        if (typeof authorizationUrl !== "string" || !authorizationUrl) {
+            throw new Error(`consumer link did not start: ${JSON.stringify(authorizationUrl)}`);
+        }
+        await enrolmentPage.goto(authorizationUrl, { waitUntil: "domcontentloaded" });
+        await enrolmentPage.locator("#username").fill(username);
+        await enrolmentPage.locator("#password").fill(password);
+        await Promise.all([
+            enrolmentPage.waitForURL((url) => url.origin !== new URL(authorizationUrl).origin),
+            enrolmentPage.locator("#kc-login").click(),
+        ]);
+        await detachAuthenticator();
+    } finally {
+        await enrolment.close();
+    }
+
     // production-browser-client-session-chain
     // oidc-production-browser-login-callback
     progress = "production browser login and callback";
@@ -396,7 +465,12 @@ try {
         staticOrigin,
         "readAccountSession",
     );
-    if (session?.method !== "oidc" || session?.label !== "Single sign-on (OIDC)") {
+    // An authenticated session reports the method it was minted with, and this
+    // one was minted through the linked consumer provider, so it names that
+    // provider rather than the generic SSO label a bare OIDC issuer used to
+    // produce. Keycloak stands in for Google on the consumer lane here; the
+    // corporate lanes keep their own labels and have their own coverage.
+    if (session?.method !== "google" || session?.label !== "Google") {
         throw new Error(`production session client returned ${JSON.stringify(session)}`);
     }
     // production-authenticated-account-bootstrap
@@ -515,7 +589,7 @@ try {
         staticOrigin,
         "readAccountSession",
     );
-    if (afterRefresh?.method !== "oidc") {
+    if (afterRefresh?.method !== "google") {
         throw new Error("refreshed cookie no longer authenticated the account session");
     }
 
@@ -648,7 +722,13 @@ try {
     }
     for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
         const denied = await fetchInPage(page, "/auth/session", { method });
-        const expected = method === "PATCH" ? 0 : 400;
+        // 405, not the idempotency guard's 400: authentication ceremonies are
+        // exempt from that guard, because an external IdP and a plain browser
+        // form cannot carry an Idempotency-Key. The route answers for itself,
+        // and a read-only route answers an unsupported method truthfully.
+        // PATCH is 0 because it never leaves the browser: it is absent from
+        // the CORS allowlist, so the preflight refuses it.
+        const expected = method === "PATCH" ? 0 : 405;
         if (denied.status !== expected) {
             throw new Error(`${method} /auth/session returned ${denied.status}`);
         }

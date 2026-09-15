@@ -86,6 +86,9 @@ run_contracts() {
     echo "== product contracts =="
     node scripts/check-product-contracts.mjs --enforce-local-evidence
 
+    echo "== GaugeApp page/action contract =="
+    node scripts/check-gaugeapps-contract.mjs
+
     echo "== action provenance inventory =="
     node scripts/check-action-provenance.mjs
     node --test scripts/check-action-provenance.test.mjs
@@ -94,7 +97,7 @@ run_contracts() {
     node scripts/check-whipplescript-workstream-contract.mjs
     python3 scripts/check-whipplescript-host-action.py
 
-    echo "== TokenWright Environment bundle =="
+    echo "== TokenWright native-control metadata =="
     node scripts/check-tokenwright-environment.mjs
     node scripts/check-tokenwright-carried-surface.mjs
 
@@ -148,12 +151,16 @@ run_contracts() {
         scripts/production-wiring-canary.test.mjs \
         scripts/run-production-wiring-canaries.test.mjs \
         scripts/wiring-canary/runners.test.mjs \
+        scripts/wiring-canary/administration-agent-erasure.test.mjs \
+        scripts/wiring-canary/account-boxes.test.mjs \
         scripts/wiring-canary/totp.test.mjs \
         scripts/wiring-canary/capture-provider-state.test.mjs \
         scripts/wiring-canary/diagnostic.test.mjs \
         scripts/wiring-canary/hosted-account-session.test.mjs \
+        scripts/wiring-canary/managed-entitlement-mint.test.mjs \
         scripts/wiring-canary/poll.test.mjs \
         web/e2e/production-account-session-canary.test.mjs \
+        web/e2e/production-passkey-account-canary.test.mjs \
         web/e2e/production-native-session-canary.test.mjs
 
     echo "== client calls =="
@@ -275,8 +282,14 @@ run_rust() {
     cargo test --workspace
 
     # The open build must stay buildable without the enterprise features.
+    # Keep this feature graph out of the all-feature test graph's fingerprints.
+    # Cargo can otherwise remove a package fingerprint while the next graph is
+    # starting its build script, leaving an `invoked.timestamp` write aimed at
+    # a directory that no longer exists. The output is still owned by this
+    # worktree; only the incompatible graph gets its own subdirectory.
     echo "== no-default-features =="
-    cargo check -p gaugedesk-app --no-default-features --all-targets
+    CARGO_TARGET_DIR="$PWD/target/no-default-features" \
+        cargo check -p gaugedesk-app --no-default-features --all-targets
 }
 
 run_web() {
@@ -322,6 +335,7 @@ run_web() {
 
     [ -d ee/web/node_modules ] || npm --prefix ee/web ci
     echo "== enterprise web =="
+    npm --prefix ee/web test
     npm --prefix ee/web run typecheck
     npm --prefix ee/web run build
 

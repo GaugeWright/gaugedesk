@@ -45,6 +45,7 @@ export interface AccountMenuItem {
     /** Renders a disclosure arrow — the row opens a further surface, not an action. */
     readonly submenu?: boolean;
     readonly danger?: boolean;
+    readonly disabled?: boolean;
     readonly run: () => void;
 }
 
@@ -57,6 +58,8 @@ export interface AccountMenuProps {
     /** The Home this client reaches. The only identity `desk` has to show. */
     readonly reach?: string;
     readonly items: readonly AccountMenuItem[];
+    /** A concise failure from an action that must remain in this menu. */
+    readonly status?: string;
     readonly open: boolean;
     readonly onToggle: () => void;
 }
@@ -148,6 +151,7 @@ export function AccountMenu(props: AccountMenuProps): JSX.Element {
                                     classList={{ danger: item.danger }}
                                     role="menuitem"
                                     data-account-menu-item={item.id}
+                                    disabled={item.disabled}
                                     onClick={() => item.run()}
                                 >
                                     <span class="account-menu-label">{item.label}</span>
@@ -161,6 +165,13 @@ export function AccountMenu(props: AccountMenuProps): JSX.Element {
                             </Show>
                         )}
                     </For>
+                    <Show when={props.status}>
+                        {(status) => (
+                            <div class="account-menu-status" role="alert">
+                                {status()}
+                            </div>
+                        )}
+                    </Show>
                 </div>
             </Show>
         </div>

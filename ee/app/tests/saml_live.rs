@@ -45,6 +45,7 @@ fn provider(cert: &str, audience: &str, roles_attr: Option<String>) -> SamlSidec
         audience,
     )
     .with_mapping(SamlClaimMapping {
+        email_attribute: std::env::var("SAML_EMAIL_ATTR").ok(),
         roles_attribute: roles_attr,
         region_attribute: std::env::var("SAML_REGION_ATTR").ok(),
         tenant_attribute: std::env::var("SAML_TENANT_ATTR").ok(),

@@ -30,15 +30,14 @@ import {
     claimBox,
     forgetBox,
     listBoxes,
-    openManagementEnvironment,
-    readManagementDocument,
-    type ManagementEnvironmentReceipt,
-    type ManagementEnvironmentSession,
+    openTokenWrightEnvironment,
+    readTokenWrightDocument,
+    type TokenWrightReceipt,
+    type TokenWrightSession,
     type RouteJson,
     type StoredBox,
 } from "@gaugewright/control-plane-client";
 import { setTokenWrightDesired, tokenwrightCommandsFrom, type TokenWrightCommandBinding } from "./tokenwright-box";
-import type { EnvironmentViewCommand } from "./EnvironmentDocumentView";
 import {
     ago,
     engineChangePending,
@@ -71,10 +70,15 @@ type Tab = "inference" | "posture" | "access";
 
 interface Opened {
     readonly route: RouteJson;
-    readonly session: ManagementEnvironmentSession;
+    readonly session: TokenWrightSession;
     readonly inference: { content: InferenceDocument; revision: string };
     readonly posture: { content: PostureDocument; revision: string };
     readonly access: { content: AccessDocument; revision: string };
+}
+
+interface TokenWrightViewCommand {
+    readonly label?: string;
+    readonly run: () => void | Promise<void>;
 }
 
 interface Toast {
@@ -85,9 +89,9 @@ interface Toast {
 
 async function openBox(home: RouteJson, box: StoredBox): Promise<Opened> {
     const route = boxRouteJson(home, box.fingerprint);
-    const session = await openManagementEnvironment(route, "tokenwright");
+    const session = await openTokenWrightEnvironment(route);
     const read = async <T,>(id: string) => {
-        const document = await readManagementDocument(route, session, id);
+        const document = await readTokenWrightDocument(route, session, id);
         return { content: document.content as T, revision: document.revision };
     };
     // Sequential on purpose. Each request the Home carries is its own relay
@@ -216,7 +220,7 @@ export function TokenWrightBoxPanel(props: TokenWrightBoxPanelProps): JSX.Elemen
                 "tokenwright.posture": held.posture.revision,
                 "tokenwright.access": held.access.revision,
             })[id],
-            onReceipt: (receipt: ManagementEnvironmentReceipt) => {
+            onReceipt: (receipt: TokenWrightReceipt) => {
                 const tone = receipt.status === "applied" ? "ok" : receipt.status === "conflict" ? "warn" : "bad";
                 const label = LABEL[receipt.command_id ?? ""] ?? receipt.command_id ?? "command";
                 toast(tone, `${label} — ${receipt.status}`);
@@ -224,7 +228,7 @@ export function TokenWrightBoxPanel(props: TokenWrightBoxPanelProps): JSX.Elemen
         };
     };
 
-    const commands = createMemo<Readonly<Record<string, EnvironmentViewCommand>>>(() => {
+    const commands = createMemo<Readonly<Record<string, TokenWrightViewCommand>>>(() => {
         const b = binding();
         return b ? tokenwrightCommandsFrom(b) : {};
     });

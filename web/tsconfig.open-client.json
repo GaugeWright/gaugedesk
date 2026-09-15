@@ -12,9 +12,10 @@
     "packages/control-plane-client/src/control-plane-federation.ts",
     "packages/control-plane-client/src/control-plane-transport.ts",
     "packages/control-plane-client/src/control-plane-workbench.ts",
-    "packages/control-plane-client/src/management-environment.ts",
+    "packages/control-plane-client/src/gaugeapp.ts",
     "packages/control-plane-client/src/project-home.ts",
     "packages/control-plane-client/src/projection-carriage.ts",
-    "packages/control-plane-client/src/remote-control-plane.ts"
+    "packages/control-plane-client/src/remote-control-plane.ts",
+    "packages/control-plane-client/src/tokenwright-environment.ts"
   ]
 }

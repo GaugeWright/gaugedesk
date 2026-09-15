@@ -110,7 +110,7 @@ export interface FacetBrowserApi {
     /** Mobile's ADR 0037 reference resolver. Optional because the desktop shell
      * keeps its existing full-refresh policy; `deltaSync` requires both methods. */
     getWorkspaceDeltaCarriage?(change: WorkspaceChange): Promise<ProjectionCarriage<WorkspaceDelta>>;
-    subscribeWorkspace?(onChange: (change: WorkspaceChange) => void): () => void;
+    subscribeWorkspace?(onChange: (change: WorkspaceChange) => void, onOpen?: () => void): () => void;
     search(query: string): Promise<SearchHit[]>;
     getPlacementConfig(placementId: PlacementId): Promise<{ config: string; notes: string }>;
     setPlacementConfig(placementId: PlacementId, config: string, notes: string): Promise<void>;
@@ -237,6 +237,7 @@ export function FacetBrowser(props: {
         if (!props.api.subscribeWorkspace || !props.api.getWorkspaceDeltaCarriage) return;
         let active = true;
         let queue = Promise.resolve();
+        let opened = false;
         const stop = props.api.subscribeWorkspace((change) => {
             queue = queue
                 .then(async () => {
@@ -256,6 +257,16 @@ export function FacetBrowser(props: {
                     await refetch();
                     props.onWorkspaceChange?.(change);
                 });
+        }, () => {
+            if (!opened) {
+                opened = true;
+                return;
+            }
+            // Workspace events are references, not a replay log. A full
+            // projection read repairs anything missed while disconnected.
+            queue = queue.then(async () => {
+                if (active) await refetch();
+            });
         });
         onCleanup(() => {
             active = false;
@@ -976,10 +987,12 @@ export function FacetBrowser(props: {
                 { label: "attach Git repository…", hint: "Use its native Git history and explicit apply lifecycle", run: () => props.onAttachTarget?.(p.id, p.name, "external-vcs" as const) },
                 { label: "attach folder…", hint: "Fingerprint the folder and compare before every write", run: () => props.onAttachTarget?.(p.id, p.name, "external-folder" as const) },
             ] : []),
-            { label: "project home…", hint: "Recent runs, outputs under review, and an audit rollup for this project", run: () => props.onOpenProjectHome(p.id, p.name) },
+            { label: "project settings…", hint: "Manage work, Agents, model access, and—outside Personal—sharing", run: () => props.onOpenProjectHome(p.id, p.name) },
+            // Tasks is new work, not one of the doors project settings absorbed,
+            // so it stays its own entry. Model access and sharing are deliberately
+            // absent: they moved inside project settings, and a second door to a
+            // surface that has moved is worse than no door.
             ...(props.onOpenProjectTasks ? [{ label: "tasks…", hint: "Open the project’s task backlog, including unassigned work", run: () => props.onOpenProjectTasks?.(p.id, p.name) }] : []),
-            { label: "model access…", hint: "Pin a per-project LLM provider key (overrides the account default)", run: () => props.onOpenModelAccess(p.id, p.name) },
-            { label: "share & hand off…", run: () => props.onOpenEngagement(p.id, p.name) },
             ...(p.isPersonal ? [] : [
                 { label: "rename", run: () => startEdit({ kind: "rename-project", id: p.id }, p.name) },
                 { label: "delete", danger: true, confirmHint: projectBlastRadius(p), run: () => void withRefresh(() => props.api.deleteProject(p.id), "project deleted") },

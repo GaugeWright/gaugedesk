@@ -102,9 +102,9 @@ export async function forgetBox(json: RouteJson, fingerprint: string): Promise<v
 /**
  * A `RouteJson` that reaches one box **through the Home**.
  *
- * The existing management functions take a transport and do not care what it
- * is, so `openManagementEnvironment(boxRouteJson(json, fingerprint),
- * "tokenwright")` works unchanged. That is the whole point of the shape: what
+ * The TokenWright functions take a transport and do not care what it is, so
+ * `openTokenWrightEnvironment(boxRouteJson(json, fingerprint))` works
+ * unchanged. That is the whole point of the shape: what
  * changed is which side of the wire holds the credential, not the surface.
  *
  * It replaces a tunnel the page opened for itself. A page cannot dial a box any

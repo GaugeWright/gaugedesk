@@ -5,7 +5,7 @@
  * IdP, enter the IdP's back) → **Test** (a real discovery round-trip, `ONB-3`) →
  * **Provision** (issue a SCIM token; note that JIT auto-provisions verified-domain
  * users, `ONB-2`) → **Enforce**. A thin orchestration over the existing control-plane
- * methods — the flat `AdminEnvironment` sections remain for power users.
+ * methods. The typed Enterprise Identity page decides when this ceremony opens.
  */
 
 import { createResource, createSignal, For, type JSX, Show } from "solid-js";

@@ -365,6 +365,15 @@ impl Workbench {
             .unwrap_or(false)
     }
 
+    /// Whether a configured content vault has permanently fenced this scope.
+    /// Used by crash-resumable erasure coordinators after an effect may have
+    /// won but before its separate phase receipt was admitted.
+    pub fn content_scope_erased(&self, scope: &str) -> bool {
+        self.content_vault
+            .as_ref()
+            .is_some_and(|vault| vault.is_erased(scope))
+    }
+
     /// Whether content encryption is configured (a vault is present). Lets an
     /// erasure caller tell a [`crypto_erase_content`](Self::crypto_erase_content)
     /// that returned `false` because encryption is off (expected) from one that

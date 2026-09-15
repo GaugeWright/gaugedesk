@@ -4,10 +4,10 @@
   "version": "0.4.3",
   "identifier": "com.gaugewright.gaugedesk",
   "build": {
-    "frontendDist": "../web/dist-app-mobile-web",
-    "devUrl": "http://localhost:5174",
-    "beforeDevCommand": "npm --prefix ../web run dev --workspace=@gaugewright/mobile-web",
-    "beforeBuildCommand": "npm --prefix ../web run build --workspace=@gaugewright/mobile-web"
+    "frontendDist": "../ee/web/dist-enterprise-workbench",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm --prefix ../ee/web run dev:mobile --workspace=@gaugewright/enterprise-workbench",
+    "beforeBuildCommand": "npm --prefix ../ee/web run build:mobile --workspace=@gaugewright/enterprise-workbench"
   },
   "app": {
     "windows": [

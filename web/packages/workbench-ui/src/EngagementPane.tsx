@@ -20,7 +20,6 @@ import {
     type ProjectId,
     type Workspace,
     type AccountTenant,
-    type CreatedHomeInvitation,
     type PlacementDistributionStatus,
     type PlacementId,
 } from "@gaugewright/control-plane-client";
@@ -136,11 +135,6 @@ export interface EngagementPaneApi {
     allowRuns(project: ProjectId, operator: string): Promise<void>;
     denyRun(correlation: string): Promise<void>;
     handoffConnectData(project: ProjectId, handle: string, label?: string): Promise<void>;
-    createHomeInvitation(
-        authority: string,
-        project: ProjectId,
-        role?: "member" | "viewer",
-    ): Promise<CreatedHomeInvitation>;
 }
 
 export function EngagementPane(props: {
@@ -148,6 +142,7 @@ export function EngagementPane(props: {
     project: ProjectId;
     projectName: string;
     onClose: () => void;
+    onOpenPeopleAndSharing?: () => void;
 }): JSX.Element {
     const [status, setStatus] = createSignal("");
     const [peer, setPeer] = createSignal("");
@@ -159,8 +154,6 @@ export function EngagementPane(props: {
     // picker there — an inline field stands in for the dialog.
     const [folder, setFolder] = createSignal("");
     const [showFolderField, setShowFolderField] = createSignal(false);
-    const [personAuthority, setPersonAuthority] = createSignal("");
-    const [personInvite, setPersonInvite] = createSignal<CreatedHomeInvitation | null>(null);
 
     const [handoff, { refetch: refetchHandoff }] = createResource(
         () => props.project,
@@ -398,30 +391,6 @@ export function EngagementPane(props: {
             } catch {
                 /* selectable regardless */
             }
-        }
-    };
-    const invitePerson = async () => {
-        const authority = personAuthority().trim();
-        if (!authority) {
-            setStatus("enter the GaugeWright account authority to invite");
-            return;
-        }
-        try {
-            const created = await props.api.createHomeInvitation(authority, props.project);
-            setPersonInvite(created);
-            setStatus("project invitation ready — share this link with that account only");
-        } catch (e) {
-            setStatus(describeFailure("invite the person", e));
-        }
-    };
-    const copyPersonInvite = async () => {
-        const url = personInvite()?.url;
-        if (!url) return;
-        try {
-            await navigator.clipboard?.writeText(url);
-            setStatus("project invitation link copied");
-        } catch {
-            setStatus("select and copy the project invitation link");
         }
     };
     const cancel = async () => {
@@ -827,48 +796,13 @@ export function EngagementPane(props: {
                     </Show>
                 </Show>
 
-                {/* Ordinary free-account participation is separate from device pairing
-                    and Home relocation. It grants this project on the current Home. */}
-                <section class="engagement-person-invite" data-person-invite>
-                    <p class="status" style={{ margin: "12px 0 4px" }}>
-                        Invite a person to this project:
-                    </p>
-                    <Show
-                        when={personInvite()}
-                        fallback={<div class="pair-device-actions">
-                            <input
-                                class="fed-paste"
-                                data-person-authority
-                                value={personAuthority()}
-                                placeholder="GaugeWright account authority"
-                                onInput={(event) => setPersonAuthority(event.currentTarget.value)}
-                            />
-                            <button
-                                type="button"
-                                class="tree-action"
-                                data-person-invite-create
-                                onClick={() => void invitePerson()}
-                            >
-                                Create project invitation
-                            </button>
-                        </div>}
-                    >
-                        {(created) => <div class="engagement-invite">
-                            <p class="status">
-                                This link works only for the invited account and grants only this project.
-                            </p>
-                            <code class="pair-ticket" data-person-invite-link>{created().url}</code>
-                            <button
-                                type="button"
-                                class="tree-action"
-                                data-person-invite-copy
-                                onClick={() => void copyPersonInvite()}
-                            >
-                                copy link
-                            </button>
-                        </div>}
-                    </Show>
-                </section>
+                <Show when={props.onOpenPeopleAndSharing}>
+                    <div class="pair-device-actions">
+                        <button type="button" class="tree-action" onClick={props.onOpenPeopleAndSharing}>
+                            Manage people &amp; sharing
+                        </button>
+                    </div>
+                </Show>
 
                 {/* Participants & ownership (revoke = licensing, not secrecy). */}
                 <Show when={(participants() ?? []).length > 0}>
@@ -968,11 +902,11 @@ export function EngagementPane(props: {
                         <select
                             class="fed-paste"
                             data-engagement-run-target-chat
-                            aria-label="Hub workstream chat"
+                            aria-label="Workstream chat"
                             value={runTargetChat()}
                             onChange={(e) => setRunTargetChat(e.currentTarget.value)}
                         >
-                            <option value="">Choose a hub workstream chat</option>
+                            <option value="">Choose a workstream chat</option>
                             <For each={hubChats()}>
                                 {(chat) => <option value={chat.id}>{chat.title}</option>}
                             </For>

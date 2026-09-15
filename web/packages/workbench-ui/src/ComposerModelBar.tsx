@@ -24,132 +24,168 @@ import { modelKey, type ModelOption } from "./model-picker";
  *  order today, but the menu's ordering is a claim about the scale, so it is
  *  asserted here rather than inherited from array order. */
 const EFFORT_RANK: Record<string, number> = {
-    off: 0,
-    minimal: 1,
-    low: 2,
-    medium: 3,
-    high: 4,
-    xhigh: 5,
+  off: 0,
+  minimal: 1,
+  low: 2,
+  medium: 3,
+  high: 4,
+  xhigh: 5,
 };
 
 export interface ComposerModelBarProps {
-    /** Catalog + linked-account models, already filtered to what's reachable. */
-    readonly options: readonly ModelOption[];
-    /** The selected `modelKey`, or `""` for the archetype's default. */
-    readonly value: string;
-    readonly onPick: (key: string) => void;
-    /** Reasoning levels the pinned model supports. Absent or all-`off` hides the control. */
-    readonly effortLevels?: readonly string[];
-    /** The pinned level, or `""` for the model's own default. */
-    readonly effort?: string;
-    readonly onPickEffort?: (level: string) => void;
-    /** Stacked rows instead of an inline pair — how the narrow rail's expander
-     *  menu presents the same two controls. */
-    readonly stacked?: boolean;
-    /** Where a model comes from when there is none to pick: opens Settings at
-     *  Model access. Offered only when `options` is empty — nothing linked, or
-     *  an endpoint with nothing declared — because then the menu would
-     *  otherwise be a list with no rows. */
-    readonly onAddModel?: () => void;
+  /** Catalog + linked-account models, already filtered to what's reachable. */
+  readonly options: readonly ModelOption[];
+  /** The selected `modelKey`, or `""` for the archetype's default. */
+  readonly value: string;
+  readonly onPick: (key: string) => void;
+  /** Reasoning levels the pinned model supports. Absent or all-`off` hides the control. */
+  readonly effortLevels?: readonly string[];
+  /** The pinned level, or `""` for the model's own default. */
+  readonly effort?: string;
+  readonly onPickEffort?: (level: string) => void;
+  /** Stacked rows instead of an inline pair — how the narrow rail's expander
+   *  menu presents the same two controls. */
+  readonly stacked?: boolean;
+  /** Where a model comes from when there is none to pick: opens Settings at
+   *  Model access. Offered only when `options` is empty — nothing linked, or
+   *  an endpoint with nothing declared — because then the menu would
+   *  otherwise be a list with no rows. */
+  readonly onAddModel?: () => void;
+  /** Set when an organization connection funds this project's turns.
+   *
+   *  The engine binds such a turn to the admitted selection on every axis —
+   *  provider, credential and model all come from it, and whatever the
+   *  composer holds is discarded. A picker here would therefore report a
+   *  decision the next turn does not honour, so the control reports the
+   *  served model instead of offering one. The model is changed where it is
+   *  actually decided: Settings → Model access. */
+  readonly served?: { readonly label: string; readonly connection: string };
 }
 
 export function ComposerModelBar(props: ComposerModelBarProps): JSX.Element {
-    const effortLevels = createMemo(() =>
-        [...(props.effortLevels ?? [])]
-            .filter((level) => level !== "off")
-            .sort((a, b) => (EFFORT_RANK[a] ?? 99) - (EFFORT_RANK[b] ?? 99)),
+  const effortLevels = createMemo(() =>
+    [...(props.effortLevels ?? [])]
+      .filter((level) => level !== "off")
+      .sort((a, b) => (EFFORT_RANK[a] ?? 99) - (EFFORT_RANK[b] ?? 99)),
+  );
+  const selected = () =>
+    props.options.find(
+      (option) => (option.id ? modelKey(option) : "") === props.value,
     );
-    const selected = () =>
-        props.options.find((option) => (option.id ? modelKey(option) : "") === props.value);
-    return (
-        <div class="composer-models" classList={{ stacked: props.stacked }}>
-            {/* "Select model" rather than "Default model" when nothing is
+  return (
+    <div class="composer-models" classList={{ stacked: props.stacked }}>
+      <Show
+        when={props.served}
+        fallback={
+          /* "Select model" rather than "Default model" when nothing is
                 selected: the options lead with the resolved default when one
                 exists, so an unmatched empty value means there is no default
-                to fall back on and the next turn needs a choice. */}
-            <ComposerMenuButton
-                label={selected()?.label ?? "Select model"}
-                title="Model for this chat — overrides the Agent's default for this conversation only"
-                testAttr="model"
-                stacked={props.stacked}
-                rowLabel="Model"
-            >
-                {(close) => (
-                    <>
-                        <For each={props.options}>
-                            {(option) => {
-                                const key = option.id ? modelKey(option) : "";
-                                return (
-                                    <button
-                                        class="composer-menu-item"
-                                        classList={{ selected: key === props.value }}
-                                        type="button"
-                                        role="menuitemradio"
-                                        aria-checked={key === props.value}
-                                        data-model-option={key}
-                                        onClick={() => {
-                                            props.onPick(key);
-                                            close();
-                                        }}
-                                    >
-                                        <span>{option.label}</span>
-                                        <Show when={option.provider}>
-                                            <small>{option.provider}</small>
-                                        </Show>
-                                    </button>
-                                );
-                            }}
-                        </For>
-                        <Show when={props.options.length === 0 && props.onAddModel}>
-                            <button
-                                class="composer-menu-item foot"
-                                type="button"
-                                role="menuitem"
-                                data-add-model
-                                onClick={() => {
-                                    props.onAddModel!();
-                                    close();
-                                }}
-                            >
-                                <span>Add a model…</span>
-                            </button>
+                to fall back on and the next turn needs a choice. */
+          <ComposerMenuButton
+            label={selected()?.label ?? "Select model"}
+            title="Model for this chat — overrides the Agent's default for this conversation only"
+            testAttr="model"
+            stacked={props.stacked}
+            rowLabel="Model"
+          >
+            {(close) => (
+              <>
+                <For each={props.options}>
+                  {(option) => {
+                    const key = option.id ? modelKey(option) : "";
+                    return (
+                      <button
+                        class="composer-menu-item"
+                        classList={{ selected: key === props.value }}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={key === props.value}
+                        data-model-option={key}
+                        onClick={() => {
+                          props.onPick(key);
+                          close();
+                        }}
+                      >
+                        <span>{option.label}</span>
+                        <Show when={option.provider}>
+                          <small>{option.provider}</small>
                         </Show>
-                    </>
-                )}
-            </ComposerMenuButton>
-
-            <Show when={effortLevels().length > 0 && props.onPickEffort}>
-                <ComposerMenuButton
-                    label={props.effort || "auto"}
-                    title="Reasoning effort for this chat — higher is more deliberate (slower, costlier); auto uses the model's own setting"
-                    testAttr="effort"
-                    stacked={props.stacked}
-                    rowLabel="Effort"
-                >
-                    {(close) => (
-                        // `auto` leads because it is the unpinned state: getting back
-                        // to the model's own setting stays inside the same control.
-                        <For each={["", ...effortLevels()]}>
-                            {(level) => (
-                                <button
-                                    class="composer-menu-item"
-                                    classList={{ selected: level === (props.effort ?? "") }}
-                                    type="button"
-                                    role="menuitemradio"
-                                    aria-checked={level === (props.effort ?? "")}
-                                    data-effort-level={level || "auto"}
-                                    onClick={() => {
-                                        props.onPickEffort!(level);
-                                        close();
-                                    }}
-                                >
-                                    <span>{level || "auto"}</span>
-                                </button>
-                            )}
-                        </For>
-                    )}
-                </ComposerMenuButton>
+                      </button>
+                    );
+                  }}
+                </For>
+                <Show when={props.options.length === 0 && props.onAddModel}>
+                  <button
+                    class="composer-menu-item foot"
+                    type="button"
+                    role="menuitem"
+                    data-add-model
+                    onClick={() => {
+                      props.onAddModel!();
+                      close();
+                    }}
+                  >
+                    <span>Add a model…</span>
+                  </button>
+                </Show>
+              </>
+            )}
+          </ComposerMenuButton>
+        }
+      >
+        {(served) => (
+          /* Deliberately not a button and not focusable: there is
+                       nothing here to operate. It keeps the control's register
+                       and its place in the row so the composer does not appear
+                       to lose a setting, while saying the value is decided
+                       elsewhere. */
+          <span class="composer-menu-anchor" classList={{ row: props.stacked }}>
+            <Show when={props.stacked}>
+              <span class="composer-menu-row-label">Model</span>
             </Show>
-        </div>
-    );
+            <span
+              class="composer-menu-btn served"
+              data-model-served={served().connection}
+              title="Served by this project's organization model connection — change it in Settings → Model access"
+            >
+              <span>{served().label}</span>
+            </span>
+          </span>
+        )}
+      </Show>
+
+      <Show when={effortLevels().length > 0 && props.onPickEffort}>
+        <ComposerMenuButton
+          label={props.effort || "auto"}
+          title="Reasoning effort for this chat — higher is more deliberate (slower, costlier); auto uses the model's own setting"
+          testAttr="effort"
+          stacked={props.stacked}
+          rowLabel="Effort"
+        >
+          {(close) => (
+            // `auto` leads because it is the unpinned state: getting back
+            // to the model's own setting stays inside the same control.
+            <For each={["", ...effortLevels()]}>
+              {(level) => (
+                <button
+                  class="composer-menu-item"
+                  classList={{ selected: level === (props.effort ?? "") }}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={level === (props.effort ?? "")}
+                  data-effort-level={level || "auto"}
+                  onClick={() => {
+                    props.onPickEffort!(level);
+                    close();
+                  }}
+                >
+                  <span>{level || "auto"}</span>
+                </button>
+              )}
+            </For>
+          )}
+        </ComposerMenuButton>
+      </Show>
+    </div>
+  );
 }

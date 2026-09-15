@@ -16,9 +16,12 @@ const MAX_ACTIVE_SESSIONS: usize = 16_384;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AccountSession {
     account_id: String,
-    /// The sign-in method that minted this session — `"oidc"` or `"passkey"`. The
-    /// session surface reports it (`get_session`); the durable index carries the
-    /// same value (`ADR 0147` §1).
+    /// The sign-in method that minted this session. Consumer sessions use
+    /// `"oidc"` or `"passkey"`; organization SSO sessions bind the exact
+    /// connection as `"enterprise-oidc:<connection>"` or
+    /// `"enterprise-saml:<connection>"`. The session surface reports the safe
+    /// family label (`get_session`); the durable index carries the exact value
+    /// (`ADR 0147` §1).
     method: String,
     expires_at: u64,
 }
@@ -125,6 +128,28 @@ impl AccountSessionStore {
         self.lock().remove(&token_digest(token)).is_some()
     }
 
+    /// Evict a session by its durable, already-digested id. Administrative and
+    /// account-management surfaces never possess another session's raw bearer;
+    /// revocation therefore names the same opaque id carried by the durable index.
+    pub fn revoke_id(&self, session_id: &str) -> bool {
+        self.lock().remove(session_id).is_some()
+    }
+
+    /// Evict every hot bearer for one account and return their opaque session
+    /// ids. Account erasure uses this after its global fence wins; the returned
+    /// ids are safe coordination values and never reveal the bearer tokens.
+    pub fn revoke_account(&self, account_id: &str) -> Vec<String> {
+        let mut sessions = self.lock();
+        let ids = sessions
+            .iter()
+            .filter_map(|(id, session)| (session.account_id == account_id).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        for id in &ids {
+            sessions.remove(id);
+        }
+        ids
+    }
+
     #[cfg(test)]
     fn contains_raw_token(&self, token: &str) -> bool {
         self.lock().keys().any(|key| key.contains(token))
@@ -209,5 +234,22 @@ mod tests {
         let revoked = sessions.issue("account-root", 80, 60).unwrap();
         assert!(sessions.revoke(&revoked));
         assert_eq!(sessions.resolve(&revoked, 81), None);
+    }
+
+    #[test]
+    fn account_eviction_removes_only_that_accounts_opaque_bearers() {
+        let sessions = AccountSessionStore::new();
+        let alice_one = sessions.issue("alice", 10, 60).unwrap();
+        let alice_two = sessions.issue("alice", 10, 60).unwrap();
+        let bob = sessions.issue("bob", 10, 60).unwrap();
+
+        let mut removed = sessions.revoke_account("alice");
+        removed.sort();
+        let mut expected = vec![session_id(&alice_one), session_id(&alice_two)];
+        expected.sort();
+        assert_eq!(removed, expected);
+        assert_eq!(sessions.resolve(&alice_one, 11), None);
+        assert_eq!(sessions.resolve(&alice_two, 11), None);
+        assert_eq!(sessions.resolve(&bob, 11).as_deref(), Some("bob"));
     }
 }

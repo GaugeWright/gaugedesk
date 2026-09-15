@@ -32,6 +32,21 @@ use gaugedesk_core::ids::HomeId;
 /// The reserved store scope holding the person's account state.
 pub const ACCOUNT_SCOPE: &str = "account";
 
+/// The latest-wins record kind and singleton id for the person's non-secret
+/// account profile. Authentication methods remain independently governed by
+/// `account_auth`; this record is presentation metadata only.
+pub const ACCOUNT_PROFILE_KIND: &str = "profile";
+pub const ACCOUNT_PROFILE_ID: &str = "profile";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AccountProfileRecord {
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    #[serde(default)]
+    pub display_name: String,
+}
+
 /// A device's standing in the registry.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
@@ -39,6 +54,19 @@ pub enum DeviceStatus {
     #[default]
     Active,
     Revoked,
+}
+
+/// The form factor the person chose while linking a trusted device. Older
+/// enrollment paths did not collect it, so `Unknown` is durable truth rather
+/// than a guess made from a label or public-key shape.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceKind {
+    Computer,
+    Phone,
+    Tablet,
+    #[default]
+    Unknown,
 }
 
 /// One enrolled device (the "trusted devices" surface). Durable, auditable
@@ -50,6 +78,8 @@ pub struct DeviceRecord {
     pub op: RecordOp,
     #[serde(default)]
     pub label: String,
+    #[serde(default)]
+    pub kind: DeviceKind,
     /// Hex of the device subkey's public key (FED-5a).
     #[serde(default)]
     pub subkey_pubkey: String,
@@ -83,19 +113,11 @@ pub const SESSION_ABSOLUTE_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// admitted refresh touches `last_seen_ms`.
 pub const SESSION_IDLE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
-/// The fixed binding id for the **browser** refresh grant. The consumer-OIDC
-/// browser path has no per-session id in this model — a per-session opaque token
-/// is the separate cookie-model change — so one stable per-person key names the
-/// browser's durable grant (ADR 0147 §2).
+/// Legacy binding id for browser refresh grants created before opaque browser
+/// sessions became per-session. New browser and native grants are keyed by their
+/// opaque session digest; the constant remains only for reading historical facts
+/// and exercising their bounds.
 pub const WEB_REFRESH_BINDING: &str = "web";
-
-/// The fixed binding id for the **native** refresh grant. A native client presents
-/// only its bearer on refresh (no per-session id, no device header), so one stable
-/// per-person key names its durable grant; the enrolled device it is bound to is
-/// carried in [`RefreshRecord::device_id`] and read from there on every refresh, so
-/// admission never depends on a request header (ADR 0147 §2; per-device native
-/// sessions arrive with the cookie-model change's per-session tokens).
-pub const NATIVE_REFRESH_BINDING: &str = "native";
 
 /// A wall-clock millisecond reading for a session's issued-at / last-seen. Carried
 /// into the reducer by the admission shell (`observeExpiry`), never read inside a
@@ -107,10 +129,9 @@ pub fn session_now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-/// What a refresh grant is bound to (ADR 0147 §2). The browser grant is bound to
-/// the stable per-person [`WEB_REFRESH_BINDING`] key; a native grant is bound to
-/// the enrolled device whose id is the record's own `id`, so enforcement reads the
-/// **stored** binding rather than a request-supplied header.
+/// What a refresh grant is bound to (ADR 0147 §2). Current grants are keyed by
+/// opaque session id; a native grant additionally carries its enrolled device in
+/// the stored record, so enforcement never depends on a request-supplied header.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RefreshBinding {
@@ -121,15 +142,16 @@ pub enum RefreshBinding {
 
 /// One durable, bound, timestamped refresh grant (ADR 0147). Mirrors
 /// [`DeviceRecord`]'s op/tombstone shape: a grant is folded latest-wins by `id`
-/// (the binding discriminator — [`WEB_REFRESH_BINDING`] for the browser, the
-/// enrolled `DeviceId` for a native client), and revocation flips it to a
+/// (the binding discriminator — [`WEB_REFRESH_BINDING`] for the legacy browser
+/// grant, the opaque session id for current browser and native clients), and
+/// revocation flips it to a
 /// tombstone (`INV-18`) rather than erasing history. The refresh token itself is
 /// held only as `SEC-4` `sealed` ciphertext (`INV-10`); the binding, issued-at,
 /// and last-seen are the admitted session facts.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RefreshRecord {
-    /// The binding discriminator: [`WEB_REFRESH_BINDING`] for the browser grant or
-    /// [`NATIVE_REFRESH_BINDING`] for the native grant.
+    /// The binding discriminator: [`WEB_REFRESH_BINDING`] for a legacy browser
+    /// grant or the opaque account-session id for current sessions.
     pub id: String,
     #[serde(default)]
     pub op: RecordOp,
@@ -411,10 +433,11 @@ impl From<HomeRouteRecord> for crate::home::OpaqueHomeRoute {
 /// The folded account projection (derived, rebuildable — `INV-5`).
 #[derive(Default, Clone, Debug)]
 pub struct Account {
+    pub profile: Option<AccountProfileRecord>,
     pub devices: BTreeMap<String, DeviceRecord>,
-    /// Durable refresh grants, folded latest-wins by binding id (ADR 0147). One
-    /// browser grant keyed by [`WEB_REFRESH_BINDING`] plus a grant per enrolled
-    /// native device; a tombstoned grant folds out exactly as a revoked device does.
+    /// Durable refresh grants, folded latest-wins by opaque session id (ADR
+    /// 0147). Native grants additionally name their enrolled device; a
+    /// tombstoned grant folds out exactly as a revoked device does.
     pub refresh_sessions: BTreeMap<String, RefreshRecord>,
     pub settings: BTreeMap<String, SettingRecord>,
     pub credentials: BTreeMap<String, CredentialRecord>,
@@ -470,6 +493,12 @@ impl Account {
     /// for a hosted person. Scope-isolated (`INV-1`).
     pub fn rebuild_in(store: &Store, scope: &str) -> Result<Account, AdmitError> {
         let mut acct = Account::default();
+        let mut profiles = BTreeMap::new();
+        for row in store.records(scope, ACCOUNT_PROFILE_KIND)? {
+            let record: AccountProfileRecord = serde_json::from_str(&row)?;
+            fold(&mut profiles, record.id.clone(), record.op, record);
+        }
+        acct.profile = profiles.remove(ACCOUNT_PROFILE_ID);
         for row in store.records(scope, "device")? {
             let r: DeviceRecord = serde_json::from_str(&row)?;
             fold(&mut acct.devices, r.id.clone(), r.op, r);
@@ -1329,6 +1358,21 @@ impl Workbench {
         let Some(existing) = account.devices.get(device_id) else {
             return Ok(None);
         };
+        let mut bound_session_ids: std::collections::BTreeSet<String> = account
+            .refresh_sessions
+            .values()
+            .filter(|refresh| refresh.device_id == device_id)
+            .map(|refresh| refresh.id.clone())
+            .collect();
+        let auth = crate::account_auth::AccountAuth::rebuild(self.store_ref())?;
+        bound_session_ids.extend(
+            auth.sessions
+                .values()
+                .filter(|session| {
+                    account_scope(&session.account_id) == scope && session.device_id == device_id
+                })
+                .map(|session| session.id.clone()),
+        );
         let mut record = existing.clone();
         record.op = RecordOp::Upsert;
         record.status = DeviceStatus::Revoked;
@@ -1338,6 +1382,13 @@ impl Workbench {
         // every refresh grant whose stored `device_id` names this device. Idempotent
         // when the device holds no grant.
         self.revoke_account_refresh_for_device_in(scope, &id)?;
+        // The refresh id is the opaque session digest. Tombstone the durable
+        // session index and evict its hot entry as part of the same lifecycle;
+        // otherwise a revoked device's bearer would authenticate again after a
+        // process restart even though it could no longer refresh.
+        for session_id in bound_session_ids {
+            self.revoke_account_session_id(&session_id);
+        }
         Ok(Some(record))
     }
 
@@ -1768,6 +1819,10 @@ impl Workbench {
         )?;
         if outcome.is_ok() {
             let scope = crate::org::tenant_scope(tenant_id);
+            // Management transcripts are intentionally keyed per stable
+            // person/App/tenant thread rather than under the tenant DEK. Find
+            // and destroy those child keys before the parent scope disappears.
+            crate::gaugeapp_agent::crypto_erase_gaugeapp_agent_threads_for_tenant(self, tenant_id)?;
             if !self.crypto_erase_content(&scope) && self.content_encryption_enabled() {
                 tracing::warn!(
                     tenant = %tenant_id,
@@ -1778,6 +1833,68 @@ impl Workbench {
             }
         }
         Ok(outcome)
+    }
+
+    /// Organizations that currently prevent this person from erasing their
+    /// account. This is the authoritative preflight used by both the Account
+    /// Settings projection and the reviewed erasure command; callers must not
+    /// reproduce its ownership/facility rules in a UI or service shell.
+    pub fn account_erase_blockers_in(
+        &self,
+        actor: &str,
+        account_scope: &str,
+    ) -> Result<Vec<String>, AdmitError> {
+        Ok(self.account_erase_plan_in(actor, account_scope)?.blocking)
+    }
+
+    fn account_erase_plan_in(
+        &self,
+        actor: &str,
+        account_scope: &str,
+    ) -> Result<AccountErasePlan, AdmitError> {
+        use crate::org::{MembershipStatus, Org};
+        use crate::tenancy::Tenancy;
+
+        let tenancy = Tenancy::rebuild_in(self.store_ref(), account_scope)?;
+        let mut plan = AccountErasePlan::default();
+        for tenant in tenancy.list().cloned().collect::<Vec<_>>() {
+            if tenant.personal {
+                plan.personal.push(tenant);
+                continue;
+            }
+            let scope = crate::org::tenant_scope(&tenant.id);
+            // The singleton local directory is not a hosted organization.
+            if scope == crate::org::ORG_SCOPE {
+                continue;
+            }
+            let org = Org::rebuild_in(self.store_ref(), &scope)?;
+            let Some(member) = org.member_by_authority(actor).cloned() else {
+                // A stale switcher entry for a tenant this person no longer has a
+                // membership in — nothing there to revoke.
+                continue;
+            };
+            let is_active_owner =
+                member.status == MembershipStatus::Active && member.role == "owner";
+            let others = org
+                .members
+                .values()
+                .filter(|member| {
+                    member.status == MembershipStatus::Active && member.authority != actor
+                })
+                .count();
+            let sole_active_owner = is_active_owner && others == 0;
+            let active_facilities =
+                crate::facility::Facilities::rebuild_in(self.store_ref(), &scope)?
+                    .active()
+                    .count();
+            if sole_active_owner || active_facilities > 0 {
+                plan.blocking.push(tenant.id);
+            } else if member.status == MembershipStatus::Active && member.role != "owner" {
+                plan.deprovision.push(tenant.id);
+            }
+        }
+        plan.blocking.sort();
+        Ok(plan)
     }
 
     /// **Erase this person's own account** (SOC 2 finding 4.4a / DR-0086): the
@@ -1820,61 +1937,21 @@ impl Workbench {
         account_scope: &str,
     ) -> Result<Result<(), AccountEraseRefusal>, AdmitError> {
         use crate::org::{MembershipStatus, Org, OrgRecord, ORG_ID};
-        use crate::tenancy::Tenancy;
-
-        let tenancy = Tenancy::rebuild_in(self.store_ref(), account_scope)?;
-
-        // Partition the person's tenants. `personal` is their own tenant-of-one;
-        // every other entry is an organization they belong to.
-        let mut personal: Vec<crate::tenancy::TenantRef> = Vec::new();
-        let mut blocking: Vec<String> = Vec::new();
-        let mut deprovision: Vec<String> = Vec::new();
-        for tenant in tenancy.list().cloned().collect::<Vec<_>>() {
-            if tenant.personal {
-                personal.push(tenant);
-                continue;
-            }
-            let scope = crate::org::tenant_scope(&tenant.id);
-            // The singleton local directory is not a hosted organization.
-            if scope == crate::org::ORG_SCOPE {
-                continue;
-            }
-            let org = Org::rebuild_in(self.store_ref(), &scope)?;
-            let Some(member) = org.member_by_authority(actor).cloned() else {
-                // A stale switcher entry for a tenant this person no longer has a
-                // membership in — nothing there to revoke.
-                continue;
-            };
-            // Reuse delete_organization_in's ownership test: a sole active owner is
-            // an active owner with no other active member.
-            let is_active_owner =
-                member.status == MembershipStatus::Active && member.role == "owner";
-            let others = org
-                .members
-                .values()
-                .filter(|m| m.status == MembershipStatus::Active && m.authority != actor)
-                .count();
-            let sole_active_owner = is_active_owner && others == 0;
-            let active_facilities =
-                crate::facility::Facilities::rebuild_in(self.store_ref(), &scope)?
-                    .active()
-                    .count();
-            if sole_active_owner || active_facilities > 0 {
-                blocking.push(tenant.id.clone());
-            } else if member.status == MembershipStatus::Active && member.role != "owner" {
-                deprovision.push(tenant.id.clone());
-            }
+        // The account-scope key is destroyed last. Seeing its permanent fence
+        // therefore proves every earlier local phase won, even if the process
+        // crashed before the outer coordinator recorded its receipt.
+        if self.content_scope_erased(account_scope) {
+            return Ok(Ok(()));
         }
-
-        if !blocking.is_empty() {
-            blocking.sort();
-            return Ok(Err(AccountEraseRefusal::OwnsOrganizations(blocking)));
+        let plan = self.account_erase_plan_in(actor, account_scope)?;
+        if !plan.blocking.is_empty() {
+            return Ok(Err(AccountEraseRefusal::OwnsOrganizations(plan.blocking)));
         }
 
         // Not refused: deprovision the person's non-owner memberships (future-only,
         // INV-18) under each organization's *own* scope — never erased here, it
         // belongs to the tenant and its other members.
-        for tenant_id in &deprovision {
+        for tenant_id in &plan.deprovision {
             let scope = crate::org::tenant_scope(tenant_id);
             if let Some(member) = Org::rebuild_in(self.store_ref(), &scope)?
                 .member_by_authority(actor)
@@ -1893,8 +1970,14 @@ impl Workbench {
         // Crypto-erase the personal tenant-of-one: tombstone its org + owner
         // membership as delete_organization_in does, then destroy its content key so
         // the retained ciphertext is unrecoverable.
-        for tenant in &personal {
+        for tenant in &plan.personal {
             let scope = crate::org::tenant_scope(&tenant.id);
+            // A crash may occur after one Personal scope is erased but before
+            // the next. Its fence is the receipt: no rebuild of erased content
+            // is possible or necessary, and the remaining plan can continue.
+            if self.content_scope_erased(&scope) {
+                continue;
+            }
             let directory = OrgRecord {
                 id: ORG_ID.into(),
                 op: RecordOp::Tombstone,
@@ -1929,6 +2012,12 @@ impl Workbench {
             }
         }
 
+        // Account Settings, Administration, and Commercial Operations chats are
+        // per-person even when their data authority is a tenant. No other member
+        // can read this actor's thread, so account erasure destroys every child
+        // transcript key before the account key itself.
+        crate::gaugeapp_agent::crypto_erase_gaugeapp_agent_threads_for_actor(self, actor)?;
+
         // Finally, crypto-erase the account scope itself. Everything written
         // under it becomes permanently unrecoverable — devices, settings,
         // credentials, paired boxes, homes, home-routes, and the tenant_ref
@@ -1948,6 +2037,13 @@ impl Workbench {
 
         Ok(Ok(()))
     }
+}
+
+#[derive(Default)]
+struct AccountErasePlan {
+    personal: Vec<crate::tenancy::TenantRef>,
+    blocking: Vec<String>,
+    deprovision: Vec<String>,
 }
 
 /// Why an [`Workbench::erase_account_in`] was refused. Mirrors
@@ -2016,6 +2112,8 @@ pub(crate) fn resolved_credential_capability(
 /// device registry + settings + the (already-sealed) credentials — never your work.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct AccountBlob {
+    #[serde(default)]
+    pub profile: Option<AccountProfileRecord>,
     pub settings: BTreeMap<String, String>,
     pub devices: Vec<DeviceRecord>,
     pub credentials: Vec<CredentialRecord>,
@@ -2026,6 +2124,7 @@ pub struct AccountBlob {
 /// Project the folded account to the syncable blob shape.
 pub fn account_blob(acct: &Account) -> AccountBlob {
     AccountBlob {
+        profile: acct.profile.clone(),
         settings: acct
             .settings
             .values()
@@ -2348,6 +2447,7 @@ mod tests {
             id: "phone".into(),
             op: RecordOp::Upsert,
             label: "My phone".into(),
+            kind: DeviceKind::Phone,
             subkey_pubkey: "abcd".into(),
             status: DeviceStatus::Active,
             enrolled_at: 1_700_000_000,
@@ -2383,6 +2483,7 @@ mod tests {
             id: "old".into(),
             op: RecordOp::Upsert,
             label: "Old laptop".into(),
+            kind: DeviceKind::Computer,
             subkey_pubkey: "ff".into(),
             status: DeviceStatus::Active,
             enrolled_at: 1_700_000_000,
@@ -2418,6 +2519,7 @@ mod tests {
             id: "laptop".into(),
             op: RecordOp::Upsert,
             label: "Old label".into(),
+            kind: DeviceKind::Computer,
             subkey_pubkey: "ff".into(),
             status: DeviceStatus::Active,
             enrolled_at: 1_700_000_000,
@@ -2440,6 +2542,7 @@ mod tests {
             id: "legacy".into(),
             op: RecordOp::Upsert,
             label: "Before dates".into(),
+            kind: DeviceKind::Unknown,
             subkey_pubkey: "old".into(),
             status: DeviceStatus::Active,
             enrolled_at: 0,
@@ -2486,6 +2589,7 @@ mod tests {
                 id: "phone".into(),
                 op: RecordOp::Upsert,
                 label: "Phone".into(),
+                kind: DeviceKind::Phone,
                 subkey_pubkey: "dev-pub-1".into(),
                 status: DeviceStatus::Active,
                 enrolled_at: 1_700_000_000,

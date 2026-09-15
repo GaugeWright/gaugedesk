@@ -241,9 +241,9 @@ export function DevicesModal(props: {
                 controllerEndpoint(),
             );
             setControllerInvitation(invitation);
-            setStatus("Machine invitation ready — scan it with GaugeDesk Mobile");
+            setStatus("Trusted-device invitation ready — scan it with GaugeDesk Mobile");
         } catch (error) {
-            setStatus(`Machine invitation failed: ${error}`);
+            setStatus(`Trusted-device invitation failed: ${error}`);
         }
     };
 
@@ -524,9 +524,9 @@ export function DevicesModal(props: {
 
                 {/* Secure enrollment handshake (ACCT-1): the holder shows a ticket + compares
                     the SAS before authorizing; the account key is transferred sealed. */}
-                <h4 style={{ "margin-top": "16px" }}>Control this Machine from mobile</h4>
+                <h4 style={{ "margin-top": "16px" }}>Control this Project Host from a trusted device</h4>
                 <p class="status" style={{ margin: "0 0 8px" }}>
-                    Create a one-use invitation for this Machine. The phone proves its
+                    Create a one-use invitation for this Project Host. The phone proves its
                     hardware-backed key, then waits here for your approval.
                 </p>
                 <div class="pair-device-actions">
@@ -536,8 +536,8 @@ export function DevicesModal(props: {
                         autocomplete="url"
                         value={controllerEndpoint()}
                         onInput={(event) => setControllerEndpoint(event.currentTarget.value)}
-                        placeholder="https://machine.example.com"
-                        aria-label="Reachable Machine HTTPS endpoint"
+                        placeholder="https://project-host.example.com"
+                        aria-label="Reachable Project Host HTTPS endpoint"
                         data-controller-endpoint
                     />
                     <button

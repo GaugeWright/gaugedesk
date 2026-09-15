@@ -2,6 +2,7 @@ import {
     browserRouteEventStream,
     browserRouteJson,
     browserRouteRequest,
+    reconnectingRouteEventStream,
     type BrowserRouteJsonOptions,
     type RouteEventStream,
     type RouteRequest,
@@ -123,7 +124,19 @@ export class RemoteControlPlane implements ControlPlane {
         };
         this.route = options.route ?? browserRouteJson(this.base, auth);
         this.request = browserRouteRequest(this.base, auth);
-        this.events = browserRouteEventStream(this.base, auth);
+        const eventSource = browserRouteEventStream(this.base, auth);
+        this.events = reconnectingRouteEventStream(() => eventSource, {
+            beforeReconnect: async (reason) => {
+                if (
+                    !this.homeAdmissionProvider
+                    && reason?.status === 401
+                    && reason.detail === "target Home admission required"
+                ) {
+                    this.homeAdmission = null;
+                    await this.admitHome();
+                }
+            },
+        });
     }
 
     setBearer(token: string | null): void {

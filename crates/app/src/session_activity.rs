@@ -6,9 +6,11 @@
 //! genuine re-authentication (a new token → a fresh session key).
 //!
 //! Pure over an **injected** monotonic `now_ms` so the timeout logic is exhaustively
-//! unit-tested; the live impl reads an internal [`Instant`] epoch. Additive to the auth
-//! middleware — a future unified session registry (`ITGOV-2`) can subsume it. No-op when the
-//! policy leaves both bounds unset (`0`), so the single-user / no-policy path is untouched.
+//! unit-tested; the live impl reads an internal [`Instant`] epoch. The registry is scoped to
+//! the exact organization and exposes a stable digest-derived id, never the bearer or its
+//! direct hash. Durable revocation lives in the organization fold; this live ledger supplies
+//! freshness and reported-client evidence. No-op when the policy leaves both bounds unset
+//! (`0`), so the single-user / no-policy path is untouched.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -39,9 +41,15 @@ impl SessionExpiry {
 /// how long since first-seen / last-seen. The bearer is never included — only the authority.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SessionInfo {
+    /// Stable, non-secret id of this bearer in this exact organization scope.
+    pub id: String,
+    pub scope: String,
     pub authority: String,
     pub age_ms: u64,
     pub idle_ms: u64,
+    /// Wall-clock evidence for display. Policy enforcement uses the monotonic clocks above.
+    pub first_seen_unix_ms: u64,
+    pub last_seen_unix_ms: u64,
     /// Compatibility evidence reported by the client; never device attestation.
     pub client: ClientBuild,
     pub software_status: ClientAdmissionStatus,
@@ -50,9 +58,13 @@ pub struct SessionInfo {
 
 #[derive(Clone)]
 struct SessionEntry {
+    id: String,
+    scope: String,
     authority: String,
     first_seen_ms: u64,
     last_seen_ms: u64,
+    first_seen_unix_ms: u64,
+    last_seen_unix_ms: u64,
     client: ClientBuild,
     admission: ClientAdmission,
 }
@@ -124,11 +136,48 @@ impl SessionActivity {
         client: ClientBuild,
         admission: ClientAdmission,
     ) -> Result<(), SessionExpiry> {
+        self.check_and_touch_client_in(
+            key,
+            crate::org::ORG_SCOPE,
+            authority,
+            now_ms,
+            0,
+            lifetime_ms,
+            idle_ms,
+            client,
+            admission,
+        )
+    }
+
+    /// The scoped organization-session form used by live request admission. `key` is already
+    /// a one-way bearer digest; the public id is domain-separated from it and from every
+    /// other tenant, so a projected id cannot be replayed as a credential or correlated
+    /// across organizations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_and_touch_client_in(
+        &self,
+        key: &str,
+        scope: &str,
+        authority: &str,
+        now_ms: u64,
+        now_unix_ms: u64,
+        lifetime_ms: u64,
+        idle_ms: u64,
+        client: ClientBuild,
+        admission: ClientAdmission,
+    ) -> Result<(), SessionExpiry> {
         let mut m = self.inner.lock().expect("session-activity mutex");
-        let (first, last) = m
-            .get(key)
-            .map(|entry| (entry.first_seen_ms, entry.last_seen_ms))
-            .unwrap_or((now_ms, now_ms));
+        let map_key = format!("{scope}\0{key}");
+        let (first, last, first_unix) = m
+            .get(&map_key)
+            .map(|entry| {
+                (
+                    entry.first_seen_ms,
+                    entry.last_seen_ms,
+                    entry.first_seen_unix_ms,
+                )
+            })
+            .unwrap_or((now_ms, now_ms, now_unix_ms));
         if lifetime_ms > 0 && now_ms.saturating_sub(first) > lifetime_ms {
             return Err(SessionExpiry::Lifetime);
         }
@@ -136,11 +185,15 @@ impl SessionActivity {
             return Err(SessionExpiry::Idle);
         }
         m.insert(
-            key.to_string(),
+            map_key,
             SessionEntry {
+                id: organization_session_id(scope, key),
+                scope: scope.to_string(),
                 authority: authority.to_string(),
                 first_seen_ms: first,
                 last_seen_ms: now_ms,
+                first_seen_unix_ms: first_unix,
+                last_seen_unix_ms: now_unix_ms,
                 client,
                 admission,
             },
@@ -151,13 +204,31 @@ impl SessionActivity {
     /// The live session roster at `now_ms` (`ITGOV-2`): one entry per tracked session, most
     /// recently active first, with the authority (never the bearer) and its age/idle.
     pub fn roster(&self, now_ms: u64) -> Vec<SessionInfo> {
+        self.roster_matching(now_ms, |_| true)
+    }
+
+    /// The live roster for one exact organization scope.
+    pub fn roster_in(&self, scope: &str, now_ms: u64) -> Vec<SessionInfo> {
+        self.roster_matching(now_ms, |entry| entry.scope == scope)
+    }
+
+    fn roster_matching(
+        &self,
+        now_ms: u64,
+        include: impl Fn(&SessionEntry) -> bool,
+    ) -> Vec<SessionInfo> {
         let m = self.inner.lock().expect("session-activity mutex");
         let mut out: Vec<SessionInfo> = m
             .values()
+            .filter(|entry| include(entry))
             .map(|entry| SessionInfo {
+                id: entry.id.clone(),
+                scope: entry.scope.clone(),
                 authority: entry.authority.clone(),
                 age_ms: now_ms.saturating_sub(entry.first_seen_ms),
                 idle_ms: now_ms.saturating_sub(entry.last_seen_ms),
+                first_seen_unix_ms: entry.first_seen_unix_ms,
+                last_seen_unix_ms: entry.last_seen_unix_ms,
                 client: entry.client.clone(),
                 software_status: entry.admission.status,
                 software_reason: entry.admission.reason.clone(),
@@ -166,6 +237,18 @@ impl SessionActivity {
         out.sort_by_key(|s| s.idle_ms);
         out
     }
+}
+
+/// Public organization-session identity derived from an already one-way bearer key. The
+/// full digest is intentionally retained: truncation would create a revocation collision
+/// that could deny an unrelated session.
+pub fn organization_session_id(scope: &str, bearer_key: &str) -> String {
+    format!(
+        "organization-session:{}",
+        crate::org::sha256_hex(&format!(
+            "gaugedesk:organization-session:v1\0{scope}\0{bearer_key}"
+        ))
+    )
 }
 
 #[cfg(test)]
@@ -250,5 +333,48 @@ mod tests {
         assert_eq!(r[1].authority, "alice");
         assert_eq!(r[1].idle_ms, 6000);
         assert_eq!(r[1].age_ms, 6000);
+    }
+
+    #[test]
+    fn one_bearer_has_distinct_non_secret_ids_and_rosters_per_organization() {
+        let a = SessionActivity::new();
+        let admission = ClientAdmission {
+            status: ClientAdmissionStatus::Current,
+            reason: "reported build conforms".into(),
+        };
+        a.check_and_touch_client_in(
+            "bearer-hash",
+            "org::alpha",
+            "alice",
+            10,
+            1_000,
+            0,
+            0,
+            ClientBuild::default(),
+            admission.clone(),
+        )
+        .unwrap();
+        a.check_and_touch_client_in(
+            "bearer-hash",
+            "org::beta",
+            "alice",
+            20,
+            2_000,
+            0,
+            0,
+            ClientBuild::default(),
+            admission,
+        )
+        .unwrap();
+
+        let alpha = a.roster_in("org::alpha", 30);
+        let beta = a.roster_in("org::beta", 30);
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(beta.len(), 1);
+        assert_ne!(alpha[0].id, beta[0].id);
+        assert!(!alpha[0].id.contains("bearer-hash"));
+        assert_eq!(alpha[0].scope, "org::alpha");
+        assert_eq!(alpha[0].first_seen_unix_ms, 1_000);
+        assert_eq!(beta[0].last_seen_unix_ms, 2_000);
     }
 }

@@ -17,6 +17,7 @@
   },
   "exports": {
     ".": "./src/index.ts",
+    "./attention": "./src/attention.ts",
     "./AccessRequestPanel": "./src/AccessRequestPanel.tsx",
     "./AccountPanel": "./src/AccountPanel.tsx",
     "./AgentSettings": "./src/AgentSettings.tsx",
@@ -29,8 +30,6 @@
     "./ConnectionBanner": "./src/ConnectionBanner.tsx",
     "./ContentViewer": "./src/ContentViewer.tsx",
     "./Deliverables": "./src/Deliverables.tsx",
-    "./EnvironmentDocumentView": "./src/EnvironmentDocumentView.tsx",
-    "./environment-view": "./src/environment-view.ts",
     "./ContextMenu": "./src/ContextMenu.tsx",
     "./ContextPanel": "./src/ContextPanel.tsx",
     "./DevicesModal": "./src/DevicesModal.tsx",

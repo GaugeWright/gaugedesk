@@ -1565,10 +1565,11 @@ pub(crate) async fn post_task(
         (context.worktree, context.sender, context.mode)
     };
 
+    let account_bearer = crate::net_http::bearer(&headers).map(str::to_owned);
     let (account_scope, tenant_scope) = {
         let g = wb.lock_unpoisoned();
         (
-            g.account_scope_for(crate::net_http::bearer(&headers)),
+            g.account_scope_for(account_bearer.as_deref()),
             crate::workbench_auth::req_scope(&headers),
         )
     };
@@ -1591,6 +1592,7 @@ pub(crate) async fn post_task(
                 contribution_by: None,
                 account_scope: &account_scope,
                 tenant_scope: &tenant_scope,
+                account_bearer: account_bearer.as_deref(),
                 runtime_command_id: None,
                 harness_factory: None,
             },
@@ -1711,6 +1713,11 @@ pub(crate) struct TestResetQuery {
     /// production journey. The test-only route remains guard- and build-gated.
     #[serde(default)]
     attested_placement_policy: bool,
+    /// Seed one recoverable person account. The plaintext fixture code exists
+    /// only in the browser test; the store receives its verifier and encrypted
+    /// custody envelope through the production account-auth decisions.
+    #[serde(default)]
+    account_recovery: bool,
 }
 
 /// Debug builds only (DR-0054 Phase A): a route that deletes the entire state
@@ -1823,6 +1830,97 @@ pub(crate) async fn post_test_reset(
                     "placement_policy",
                     &serde_json::to_string(&record).expect("test placement policy serializes"),
                 );
+            }
+            if query.account_recovery {
+                use crate::account_auth::{
+                    append_facts, create_custodied_account_root, decide_replace_recovery_codes,
+                    decide_verify_email, AccountAuth, RecoveryCodeRecord, VerifiedEmailRecord,
+                };
+
+                let now = crate::account_session::unix_now();
+                let (account_id, root) = match create_custodied_account_root(&fresh, now) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("test recovery custody: {error:?}"),
+                        )
+                            .into_response()
+                    }
+                };
+                let state = match AccountAuth::rebuild(fresh.store_ref()) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("test recovery projection: {error:?}"),
+                        )
+                            .into_response()
+                    }
+                };
+                let email = match VerifiedEmailRecord::new(
+                    &account_id,
+                    "recovery-fixture@gaugewright.test",
+                    now,
+                ) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("test recovery email: {error:?}"),
+                        )
+                            .into_response()
+                    }
+                };
+                let code = match RecoveryCodeRecord::prepare(
+                    &account_id,
+                    "browser-recovery-fixture",
+                    "browser-recovery-salt",
+                    "GW-E2E-RECOVERY",
+                ) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("test recovery code: {error:?}"),
+                        )
+                            .into_response()
+                    }
+                };
+                let mut facts = vec![root];
+                match decide_verify_email(&state, email) {
+                    Ok(records) => facts.extend(records),
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("test recovery email decision: {error:?}"),
+                        )
+                            .into_response()
+                    }
+                }
+                match decide_replace_recovery_codes(
+                    &state,
+                    &account_id,
+                    "browser-recovery-fixture",
+                    now,
+                    vec![code],
+                ) {
+                    Ok(records) => facts.extend(records),
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("test recovery code decision: {error:?}"),
+                        )
+                            .into_response()
+                    }
+                }
+                if let Err(error) = append_facts(fresh.store_mut(), &facts) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("test recovery seed: {error:?}"),
+                    )
+                        .into_response();
+                }
             }
             if query.assignable_task {
                 let tracker = match fresh.account_tracker() {

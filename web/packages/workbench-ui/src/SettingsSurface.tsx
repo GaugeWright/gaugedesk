@@ -505,7 +505,7 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
                                     {(open) => (
                                         <p class="settings-section-foot">
                                             <button type="button" class="link-button" data-open-hub onClick={() => open()()}>
-                                                manage in the Hub ↗
+                                                manage account in GaugeDesk ↗
                                             </button>
                                         </p>
                                     )}

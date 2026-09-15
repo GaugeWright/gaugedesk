@@ -40,6 +40,14 @@ export interface AccountSignInMethod {
     readonly label: string;
 }
 
+/** A safe, active organization identity offered for project sharing. The
+ * account plane supplies the label; the opaque authority goes unchanged to
+ * the Project Home that owns the invitation. */
+export interface ProjectShareCandidate {
+    readonly authority: string;
+    readonly label: string;
+}
+
 /** Parse one facility record (total: degrades field-by-field, never throws). */
 export function parseFacility(v: unknown): AccountFacility {
     const o = (v ?? {}) as Record<string, unknown>;
@@ -81,6 +89,31 @@ export function parseAccountSignInMethod(v: unknown): AccountSignInMethod {
         method: typeof o.method === "string" ? o.method : "",
         label: typeof o.label === "string" ? o.label : "",
     };
+}
+
+export function parseProjectShareCandidate(v: unknown): ProjectShareCandidate {
+    const o = (v ?? {}) as Record<string, unknown>;
+    return {
+        authority: typeof o.authority === "string" ? o.authority : "",
+        label: typeof o.label === "string" ? o.label : "",
+    };
+}
+
+/** Active members of the selected organization, excluding the current actor.
+ * This is a picker projection, not an administration directory. */
+export async function tenantProjectShareCandidates(
+    json: RouteJson,
+    tenant: string,
+): Promise<ProjectShareCandidate[]> {
+    const o = (await json(
+        "GET",
+        `/account/tenants/${encodeURIComponent(tenant)}/project-share-candidates`,
+    )) as { candidates?: unknown[] };
+    return Array.isArray(o?.candidates)
+        ? o.candidates
+            .map(parseProjectShareCandidate)
+            .filter((candidate) => candidate.authority && candidate.label)
+        : [];
 }
 
 /** The person's account-level facilities (`GET /account/facilities`). */
@@ -221,19 +254,6 @@ export async function deleteOrganization(
     await json("DELETE", `/account/tenants/${encodeURIComponent(tenantId)}`);
 }
 
-/** Erase the signed-in person's own account (`DELETE /account/erase`, SOC 2
- * finding 4.4a / DR-0086).
- *
- * Irreversible: the Hub crypto-erases the account scope and the person's personal
- * tenant, so `confirm` must be sent explicitly (`422` without it). Refused with
- * `409` while the person still solely owns an organization (or one still has an
- * active billable facility) — those are removed through {@link deleteOrganization}
- * first. Erasing a remote Home's workbench content (4.4b) is not part of this and
- * is blocked on DR-0061. */
-export async function eraseAccount(json: RouteJson): Promise<void> {
-    await json("DELETE", "/account/erase", { confirm: true });
-}
-
 /** Create an organization tenant with the caller as its only active owner. */
 export async function createOrganization(
     json: RouteJson,
@@ -245,7 +265,7 @@ export async function createOrganization(
     return parseTenant(o?.tenant);
 }
 
-/** A Hub-signed managed-inference entitlement (SOC 2 finding F-5.3 / DR-0089).
+/** An account-service-signed managed-inference entitlement (SOC 2 finding F-5.3 / DR-0089).
  *
  * The claims and the compact `r ‖ s` P-256 signature the public edge verifies
  * before serving a managed-funded deployment. The shape is opaque to the browser
@@ -255,7 +275,7 @@ export interface ManagedInferenceEntitlement {
     readonly sig: string;
 }
 
-/** Mint a Hub-signed managed-inference entitlement for `tenantId`, bound to the
+/** Mint an account-service-signed managed-inference entitlement for `tenantId`, bound to the
  * publisher public key the caller will deploy with
  * (`POST /account/tenants/{tenant}/managed-inference/entitlement`, F-5.3 /
  * DR-0089).

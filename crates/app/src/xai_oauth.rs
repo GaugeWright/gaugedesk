@@ -343,6 +343,39 @@ fn status(wb: &SharedWorkbench, headers: &HeaderMap, class: ModelExecutionClass)
     }))
 }
 
+pub fn home_status_for_scope(wb: &crate::Workbench, scope: &str) -> Value {
+    let credential = credentials_in_scope(wb.store_ref(), scope)
+        .remove(PROVIDER)
+        .filter(|record| {
+            record.authentication == CredentialAuthentication::OAuth
+                && record.admits(ModelExecutionClass::PrivateHome)
+        })
+        .and_then(|record| wb.unseal_account_secret(&record.sealed_token))
+        .and_then(|encoded| serde_json::from_str::<XaiOAuthCredential>(&encoded).ok());
+    json!({
+        "provider": PROVIDER,
+        "linked": credential.is_some(),
+        "expires": credential.as_ref().map(|credential| credential.expires),
+        "expired": credential.as_ref().is_some_and(|credential| credential.expires <= now_ms()),
+        "login": login_for_scope(scope).map(|login| login.projection()),
+    })
+}
+
+pub async fn start_home_login_for_scope(
+    wb: SharedWorkbench,
+    scope: String,
+) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || start_login(wb, scope, ModelExecutionClass::PrivateHome))
+        .await
+        .map_err(|_| "xAI login task panicked".to_owned())?
+}
+
+pub fn cancel_home_login_for_scope(scope: &str) {
+    if let Some(login) = login_for_scope(scope).filter(DeviceLogin::active) {
+        login.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
 pub async fn get_status(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
@@ -385,7 +418,13 @@ pub async fn post_home_start(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    start(wb, headers, ModelExecutionClass::PrivateHome).await
+    let scope = wb
+        .lock_unpoisoned()
+        .account_scope_for(net_http::bearer(&headers));
+    match start_home_login_for_scope(wb, scope).await {
+        Ok(login) => Json(json!({ "mode": "device", "login": login })).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response(),
+    }
 }
 
 pub async fn post_cancel(
@@ -395,9 +434,7 @@ pub async fn post_cancel(
     let scope = wb
         .lock_unpoisoned()
         .account_scope_for(net_http::bearer(&headers));
-    if let Some(login) = login_for_scope(&scope).filter(DeviceLogin::active) {
-        login.cancelled.store(true, Ordering::Relaxed);
-    }
+    cancel_home_login_for_scope(&scope);
     StatusCode::NO_CONTENT
 }
 

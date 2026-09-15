@@ -50,11 +50,17 @@ pub use scope_key::{PreparedScopeKey, PreparedScopeTransfer, ScopeKeyCapsule};
 pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     // The durable conversation transcript (the client's own words).
     "transcript",
+    // GaugeApp management conversations and their generation pointer. The
+    // transcript has an independent per-thread key; the pointer lives under
+    // its owning account/tenant key so parent erasure reaches both layers.
+    "gaugeapp_agent_message",
+    "gaugeapp_agent_thread_state",
     // Org-scope personal-data records (SOC 2 finding 2.6 / DR-0086).
     "membership",
     "org",
     "billing",
     "sso",
+    "sso_credential",
     "scim_token",
     "member_grant",
     "group_mapping",
@@ -69,6 +75,18 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     "home",
     "home_route",
     "credential",
+    // Account-auth payloads after the ADR 0170 custody migration. These are
+    // written only in the exact person's account-auth scope; the legacy global
+    // rows remain readable during migration but are never mistaken for newly
+    // encrypted material.
+    "account_auth_email",
+    "account_auth_webauthn",
+    "account_auth_subject",
+    "account_auth_recovery_batch",
+    "account_auth_recovery_code",
+    "account_auth_recovery_attempt",
+    "account_auth_root_custody",
+    "account_auth_session",
 ];
 
 pub(crate) fn configured_content_vault(
@@ -214,13 +232,25 @@ pub struct ContentVault {
     wrap: Box<dyn KeyWrap>,
     /// The record kinds treated as content (everything else passes through plaintext).
     kinds: BTreeSet<String>,
-    /// In-memory DEK cache (scope → 32-byte key), so the KEK is touched once per scope.
-    cache: Mutex<HashMap<String, [u8; 32]>>,
+    /// Synchronized live-key cache and permanent write fences. Keeping both under one
+    /// lock makes crypto-erasure linearizable with a concurrent writer: either the
+    /// writer finishes first and erasure destroys its key, or it observes the fence
+    /// and cannot mint a replacement key.
+    key_state: Mutex<VaultKeyState>,
     /// Append-only record of crypto-erased key-ids (SOC 2 finding 4.7 / DR-0086), so an
     /// erasure survives a backup restore that resurrects the wrapped-DEK file. `None`
     /// means the vault keeps no durable erasure record (erasure is then only as durable
     /// as file deletion — undone by a restore); production always injects a backend.
     ledger: Option<Box<dyn ErasureLedger>>,
+}
+
+#[derive(Default)]
+struct VaultKeyState {
+    /// Scope → 32-byte DEK, so the KEK is touched once per live scope.
+    cache: HashMap<String, [u8; 32]>,
+    /// Hashed key identifiers declared erased in this process or by the durable
+    /// ledger. Raw scope names never enter the erasure ledger.
+    erased_key_ids: BTreeSet<String>,
 }
 
 impl ContentVault {
@@ -234,7 +264,7 @@ impl ContentVault {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            cache: Mutex::new(HashMap::new()),
+            key_state: Mutex::new(VaultKeyState::default()),
             ledger: None,
         }
     }
@@ -321,6 +351,18 @@ impl ContentVault {
         existed
     }
 
+    /// Whether this process has installed the permanent write fence for a
+    /// scope. The answer comes from the same synchronized state as reads,
+    /// writes, and erasure, so a resumable lifecycle can distinguish an effect
+    /// that already completed from a missing key that was never created.
+    pub fn is_erased(&self, scope: &str) -> bool {
+        self.key_state
+            .lock()
+            .unwrap()
+            .erased_key_ids
+            .contains(&crate::org::sha256_hex(scope))
+    }
+
     /// **Re-erase-on-open sweep** (SOC 2 finding 4.7 / DR-0086): re-apply every recorded
     /// crypto-erasure whose wrapped-DEK file is present again — e.g. because a backup
     /// restore resurrected it. Reads the append-only ledger, and for each recorded
@@ -348,6 +390,16 @@ impl ContentVault {
             }
         };
         let recorded: BTreeSet<String> = recorded.into_iter().collect();
+        // Install permanent write fences before deleting restored files. A caller can
+        // never recreate a key between the sweep and a later write, and any cached key
+        // the ledger says is erased is discarded at the same synchronization point.
+        if !recorded.is_empty() {
+            let mut state = self.key_state.lock().unwrap();
+            state.erased_key_ids.extend(recorded.iter().cloned());
+            state
+                .cache
+                .retain(|scope, _| !recorded.contains(&crate::org::sha256_hex(scope)));
+        }
         let mut count = 0;
         for key_id in &recorded {
             match self.erase_local_scope(key_id) {
@@ -380,6 +432,47 @@ impl Workbench {
             .as_ref()?
             .open_private(&crate::account::account_scope(account_id), sealed)
     }
+
+    /// Seal an organization-owned credential with an exact non-secret binding.
+    /// The binding is checked again on open so ciphertext cannot be reassigned
+    /// to another connection or revision inside the same organization scope.
+    pub fn seal_organization_secret(
+        &self,
+        organization_scope: &str,
+        binding: &str,
+        secret: &str,
+    ) -> Option<String> {
+        let payload = serde_json::to_string(&OrganizationSecretEnvelope {
+            binding: binding.to_owned(),
+            secret: secret.to_owned(),
+        })
+        .ok()?;
+        self.content_vault
+            .as_ref()?
+            .seal_private(organization_scope, &payload)
+    }
+
+    /// Open an organization-owned credential only when its exact binding
+    /// matches the current connection material.
+    pub fn unseal_organization_secret(
+        &self,
+        organization_scope: &str,
+        binding: &str,
+        sealed: &str,
+    ) -> Option<String> {
+        let payload = self
+            .content_vault
+            .as_ref()?
+            .open_private(organization_scope, sealed)?;
+        let envelope: OrganizationSecretEnvelope = serde_json::from_str(&payload).ok()?;
+        (envelope.binding == binding).then_some(envelope.secret)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OrganizationSecretEnvelope {
+    binding: String,
+    secret: String,
 }
 
 impl ContentCodec for ContentVault {
@@ -778,6 +871,7 @@ mod tests {
             "org",
             "billing",
             "sso",
+            "sso_credential",
             "scim_token",
             "member_grant",
             "group_mapping",
@@ -791,6 +885,14 @@ mod tests {
             "home",
             "home_route",
             "credential",
+            "account_auth_email",
+            "account_auth_webauthn",
+            "account_auth_subject",
+            "account_auth_recovery_batch",
+            "account_auth_recovery_code",
+            "account_auth_recovery_attempt",
+            "account_auth_root_custody",
+            "account_auth_session",
         ] {
             assert!(v.is_content(kind), "{kind} must be sealed at rest");
         }
@@ -798,6 +900,28 @@ mod tests {
         for kind in ["audit", "chat", "project", "target", "engagement"] {
             assert!(!v.is_content(kind), "{kind} must remain cleartext");
         }
+    }
+
+    #[test]
+    fn organization_secrets_are_bound_and_never_open_cross_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Arc::new(vault(dir.path()));
+        let wb = Workbench::new(Store::open_in_memory().unwrap()).with_content_vault(v);
+        let sealed = wb
+            .seal_organization_secret("org::acme", "sso:organization:oidc:rev-1", "client-secret")
+            .unwrap();
+        assert!(!sealed.contains("client-secret"));
+        assert_eq!(
+            wb.unseal_organization_secret("org::acme", "sso:organization:oidc:rev-1", &sealed,)
+                .as_deref(),
+            Some("client-secret")
+        );
+        assert!(wb
+            .unseal_organization_secret("org::acme", "sso:organization:oidc:rev-2", &sealed,)
+            .is_none());
+        assert!(wb
+            .unseal_organization_secret("org::other", "sso:organization:oidc:rev-1", &sealed,)
+            .is_none());
     }
 
     #[test]
@@ -866,6 +990,14 @@ mod tests {
         assert_eq!(
             v.decode("eng-b", "transcript", &b).as_deref(),
             Some("bob data")
+        );
+        assert!(
+            v.encode("eng-a", "transcript", "late data").is_err(),
+            "erasure is also a permanent write fence"
+        );
+        assert!(
+            !v.key_path("eng-a").exists(),
+            "a late write cannot recreate the destroyed key"
         );
         // Idempotent.
         assert!(!v.crypto_erase("eng-a"));
@@ -943,6 +1075,16 @@ mod tests {
             restored.decode("eng-1", "transcript", &ct),
             None,
             "content is unrecoverable after the sweep"
+        );
+        assert!(
+            restored
+                .encode("eng-1", "transcript", "late restored write")
+                .is_err(),
+            "a replayed ledger erasure installs the same permanent write fence"
+        );
+        assert!(
+            !restored.key_path("eng-1").exists(),
+            "the restored key cannot be minted again after the sweep"
         );
     }
 

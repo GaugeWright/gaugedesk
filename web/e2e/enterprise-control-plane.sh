@@ -25,6 +25,18 @@ ln -sfn "$REPO/plugin" "$STATE/plugin"
 export GAUGEDESK_TEST_RESET=1
 export GAUGEDESK_TEST_IDENTITY_TOKEN="${GAUGEDESK_TEST_IDENTITY_TOKEN:-gw-e2e-owner-token}"
 export GAUGEDESK_TEST_MEMBER_TOKEN="${GAUGEDESK_TEST_MEMBER_TOKEN:-gw-e2e-member-token}"
+if [[ "${GW_E2E_ACCOUNT_ENTRY:-}" == "1" ]]; then
+    export GAUGEDESK_WEB_ACCOUNT=1
+    # WebAuthn requires a domain RP id. `localhost` remains a browser-sanctioned
+    # secure loopback context; an IP literal is not a valid WebAuthn domain.
+    export GAUGEDESK_ACCOUNT_RP_ID="${GAUGEDESK_ACCOUNT_RP_ID:-localhost}"
+    # WebAuthn verifies the browser page origin, not the cross-origin account
+    # API. The Playwright composition supplies its independently allocated Desk
+    # origin; this fallback is only for direct launcher use.
+    export GAUGEDESK_ACCOUNT_ORIGIN="${GAUGEDESK_ACCOUNT_ORIGIN:-http://localhost:${PORT}}"
+    export GAUGEDESK_SESSION_COOKIE_INSECURE=1
+    export GAUGEDESK_TEST_AUTH_EMAIL_OUTBOX="$STATE/test-auth-email.json"
+fi
 export GAUGEDESK_ADDR="127.0.0.1:${PORT}"
 export GAUGEDESK_ROOT="$STATE"
 exec "$BIN"

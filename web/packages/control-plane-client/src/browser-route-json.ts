@@ -20,19 +20,142 @@ export interface BrowserRouteJsonOptions {
 
 export type RouteRequest = (path: string, init?: RequestInit) => Promise<Response>;
 
-/** Preserve HTTP refusal identity without making consumers parse error prose. */
-export class RouteResponseError extends Error {
-    constructor(public readonly status: number, message: string) {
-        super(message);
-        this.name = "RouteResponseError";
-    }
+export interface RouteEventClose {
+    readonly status?: number;
+    readonly detail?: string;
 }
 
 export type RouteEventStream = (
     path: string,
     onMessage: (data: string) => void,
     onOpen?: () => void,
+    onClose?: (reason?: RouteEventClose) => void,
 ) => () => void;
+
+export interface ReconnectingEventStream {
+    /** Permanently dispose this subscription and cancel any pending retry. */
+    close(): void;
+    /** Immediately resolve the route again, used when a project changes Home. */
+    reconnect(): void;
+}
+
+export interface ReconnectingEventStreamOptions {
+    readonly delaysMs?: readonly number[];
+    readonly beforeReconnect?: (reason?: RouteEventClose) => void | Promise<void>;
+}
+
+/** Keep one reference-only SSE subscription alive without pretending it can
+ * replay. `onOpen` runs after every successful connection so the owner can
+ * reconcile its authoritative projection. Resolving the source anew on every
+ * attempt is important for project-routed Homes: a retry may need a fresh
+ * admission or a different endpoint. */
+export function openReconnectingEventStream(
+    resolve: () => RouteEventStream | undefined | Promise<RouteEventStream | undefined>,
+    path: string,
+    onMessage: (data: string) => void,
+    onOpen?: () => void,
+    onClose?: (reason?: RouteEventClose) => void,
+    options: ReconnectingEventStreamOptions = {},
+): ReconnectingEventStream {
+    const delays = options.delaysMs?.length ? options.delaysMs : [250, 500, 1_000, 2_000, 5_000];
+    let disposed = false;
+    let attempt = 0;
+    let failures = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let stopCurrent = () => {};
+
+    const clearTimer = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        timer = undefined;
+    };
+    const connect = async () => {
+        if (disposed) return;
+        clearTimer();
+        const ownAttempt = ++attempt;
+        try {
+            const source = await resolve();
+            if (disposed || ownAttempt !== attempt) return;
+            if (!source) throw new Error("event stream unavailable");
+            let opened = false;
+            const stop = source(
+                path,
+                onMessage,
+                () => {
+                    if (disposed || ownAttempt !== attempt) return;
+                    opened = true;
+                    failures = 0;
+                    onOpen?.();
+                },
+                (reason) => {
+                    if (disposed || ownAttempt !== attempt) return;
+                    const recoveryAttempt = ++attempt;
+                    stopCurrent = () => {};
+                    onClose?.(reason);
+                    void (async () => {
+                        try {
+                            await options.beforeReconnect?.(reason);
+                        } catch {
+                            // Route repair is best-effort. The bounded retry loop
+                            // remains the honest availability mechanism.
+                        }
+                        if (disposed || attempt !== recoveryAttempt) return;
+                        const index = Math.min(failures, delays.length - 1);
+                        failures = opened ? 0 : failures + 1;
+                        timer = setTimeout(() => void connect(), delays[index]);
+                    })();
+                },
+            );
+            if (disposed || ownAttempt !== attempt) stop();
+            else stopCurrent = stop;
+        } catch {
+            if (disposed || ownAttempt !== attempt) return;
+            attempt += 1;
+            const index = Math.min(failures, delays.length - 1);
+            failures += 1;
+            timer = setTimeout(() => void connect(), delays[index]);
+        }
+    };
+
+    void connect();
+    return {
+        close() {
+            if (disposed) return;
+            disposed = true;
+            attempt += 1;
+            clearTimer();
+            stopCurrent();
+            stopCurrent = () => {};
+        },
+        reconnect() {
+            if (disposed) return;
+            attempt += 1;
+            clearTimer();
+            stopCurrent();
+            stopCurrent = () => {};
+            failures = 0;
+            void connect();
+        },
+    };
+}
+
+/** RouteEventStream-shaped convenience for transports without an external
+ * route-change signal. */
+export function reconnectingRouteEventStream(
+    resolve: () => RouteEventStream | undefined | Promise<RouteEventStream | undefined>,
+    options: ReconnectingEventStreamOptions = {},
+): RouteEventStream {
+    return (path, onMessage, onOpen, onClose) => {
+        const subscription = openReconnectingEventStream(
+            resolve,
+            path,
+            onMessage,
+            onOpen,
+            onClose,
+            options,
+        );
+        return () => subscription.close();
+    };
+}
 
 /** One browser request edge for JSON, files/config, and authenticated SSE. */
 export function browserRouteRequest(
@@ -90,15 +213,40 @@ export function browserRouteEventStream(
     options: BrowserRouteJsonOptions = {},
 ): RouteEventStream {
     const request = browserRouteRequest(base, options);
-    return (path, onMessage, onOpen) => {
+    return (path, onMessage, onOpen, onClose) => {
         const controller = new AbortController();
         void (async () => {
+            let closeReason: RouteEventClose | undefined;
             try {
                 const response = await request(path, {
                     headers: { accept: "text/event-stream" },
                     signal: controller.signal,
                 });
-                if (!response.ok || !response.body) return;
+                if (!response.ok) {
+                    closeReason = { status: response.status };
+                    const contentType = response.headers.get("content-type") ?? "";
+                    const length = Number(response.headers.get("content-length"));
+                    if (
+                        contentType.startsWith("application/json")
+                        && Number.isSafeInteger(length)
+                        && length > 0
+                        && length <= 256
+                    ) {
+                        try {
+                            const body = await response.json() as { error?: unknown };
+                            if (typeof body.error === "string") {
+                                closeReason = { status: response.status, detail: body.error };
+                            }
+                        } catch {
+                            /* keep the status-only close reason */
+                        }
+                    }
+                    return;
+                }
+                if (!response.body) {
+                    closeReason = { status: response.status, detail: "event stream body unavailable" };
+                    return;
+                }
                 onOpen?.();
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
@@ -126,6 +274,8 @@ export function browserRouteEventStream(
                     // credentials or network details through an unhandled rejection.
                     void error;
                 }
+            } finally {
+                if (!controller.signal.aborted) onClose?.(closeReason);
             }
         })();
         return () => controller.abort();
@@ -136,25 +286,41 @@ export function browserRouteEventStream(
  *  Control-plane failures return `{ "error": "…" }` (e.g. a 502 whose body explains a
  *  unavailable runtime); without this the UI only ever saw the bare status code. Falls
  *  back to the raw body, then to just the status when the body is empty/unreadable. */
+export class RouteHttpError extends Error {
+    readonly status: number;
+    readonly method: string;
+    readonly path: string;
+
+    constructor(method: string, path: string, status: number, message: string) {
+        super(message);
+        this.name = "RouteHttpError";
+        this.status = status;
+        this.method = method;
+        this.path = path;
+    }
+}
+
 async function routeError(
     method: string,
     path: string,
     res: Response,
-): Promise<string> {
+): Promise<RouteHttpError> {
     const prefix = `${method} ${path}: ${res.status}`;
     let detail = "";
     try {
         detail = await res.text();
     } catch {
-        return prefix;
+        return new RouteHttpError(method, path, res.status, prefix);
     }
     try {
         const parsed = JSON.parse(detail) as { error?: unknown };
-        if (typeof parsed.error === "string" && parsed.error) return `${prefix} ${parsed.error}`;
+        if (typeof parsed.error === "string" && parsed.error) {
+            return new RouteHttpError(method, path, res.status, `${prefix} ${parsed.error}`);
+        }
     } catch {
         /* not JSON — fall through to the raw text */
     }
-    return detail ? `${prefix} ${detail}` : prefix;
+    return new RouteHttpError(method, path, res.status, detail ? `${prefix} ${detail}` : prefix);
 }
 
 export function browserRouteJson(
@@ -184,7 +350,7 @@ export function browserRouteJson(
             throw new Rejected(r.rejected ?? r.error ?? r.message ?? "unknown", r.command_status);
         }
         if (res.status === TURN_STOPPED_STATUS) throw new TurnStopped();
-        if (!res.ok) throw new RouteResponseError(res.status, await routeError(method, path, res));
+        if (!res.ok) throw await routeError(method, path, res);
         return res.status === 204 ? null : res.json();
     };
 }

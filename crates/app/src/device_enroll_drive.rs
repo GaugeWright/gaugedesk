@@ -41,7 +41,7 @@ use gaugedesk_core::ids::PublicKey;
 use gaugedesk_core::signature::SigningKey;
 use gaugedesk_relay_transport::{connect_one_shot, OneShotLeg};
 
-use crate::account::{self, DeviceRecord, DeviceStatus, RecordOp};
+use crate::account::{self, DeviceKind, DeviceRecord, DeviceStatus, RecordOp};
 use crate::at_rest::Encryptor;
 use crate::device_enroll::{EnrollAuthorize, EnrollRequest, Holder, NewDevice};
 use crate::key_store::{FileKeyStore, KeyStore};
@@ -480,6 +480,7 @@ async fn host_handshake(
         id: device_id(&req.subkey),
         op: RecordOp::Upsert,
         label: "New device".to_string(),
+        kind: DeviceKind::Unknown,
         subkey_pubkey: req.subkey,
         status: DeviceStatus::Active,
         enrolled_at: crate::account::device_enrolled_at_now(),
@@ -553,6 +554,7 @@ async fn join_handshake(
             id: device_id(&own_subkey),
             op: RecordOp::Upsert,
             label: "This device".to_string(),
+            kind: DeviceKind::Unknown,
             subkey_pubkey: own_subkey,
             status: DeviceStatus::Active,
             enrolled_at: crate::account::device_enrolled_at_now(),

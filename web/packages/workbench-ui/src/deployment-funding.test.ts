@@ -16,7 +16,7 @@ import {
     type FundingDraft,
 } from "./deployment-funding";
 
-const PLAN = `${MANAGED_PLAN_PREFIX}74656e616e74:73747269706500`;
+const PLAN = `${MANAGED_PLAN_PREFIX}74656e616e74:73747269706500:697373756572:test:737562`;
 const KEY = "credential:public:abc123:openai:def456";
 
 const draft = (over: Partial<FundingDraft> = {}): FundingDraft => ({

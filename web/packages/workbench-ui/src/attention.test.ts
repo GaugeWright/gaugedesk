@@ -10,7 +10,6 @@ describe("attention rules (ATTN-2)", () => {
         const levels = parseAttentionRules(null);
         expect(levels.question).toBe("queue");
         expect(levels.conflict).toBe("queue");
-        expect(levels.changes).toBe("queue");
         expect(levels["turn-settled"]).toBe("mute");
     });
 
@@ -20,21 +19,21 @@ describe("attention rules (ATTN-2)", () => {
                 version: 1,
                 rules: [
                     { signal: "turn-settled", attention: "queue" },
-                    { signal: "changes", attention: "badge" },
-                    { signal: "changes", attention: "mute" }, // later dup loses
+                    { signal: "conflict", attention: "badge" },
+                    { signal: "conflict", attention: "mute" }, // later dup loses
                     { signal: "unknown", attention: "queue" }, // ignored
                     { signal: "question", attention: "loud" }, // ignored
                 ],
             }),
         );
         expect(levels["turn-settled"]).toBe("queue");
-        expect(levels.changes).toBe("badge");
+        expect(levels.conflict).toBe("badge");
         expect(levels.question).toBe("queue"); // default held
     });
 
     it("is total over malformed documents", () => {
         for (const raw of ["not json", "{}", '{"rules":"nope"}']) {
-            expect(parseAttentionRules(raw).changes).toBe("queue");
+            expect(parseAttentionRules(raw).conflict).toBe("queue");
         }
     });
 

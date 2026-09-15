@@ -13,6 +13,7 @@ export type SettingsRoom = "account" | "models" | "devices" | "behaviour";
 
 /** Open the bottom-left account menu. */
 export async function openAccountMenu(page: Page): Promise<void> {
+    if (await page.locator("[data-account-menu]").isVisible()) return;
     await page.locator("[data-account-menu-trigger]").click();
     await expect(page.locator("[data-account-menu]")).toBeVisible();
 }

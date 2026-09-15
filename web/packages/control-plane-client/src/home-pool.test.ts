@@ -134,6 +134,26 @@ describe("closing a connection releases the transport that held it", () => {
         return { instance, built, calls, closed };
     }
 
+    function poolOverTwoHomes() {
+        const admitted: string[] = [];
+        const instance = new HomePool<{ endpoint: string }>(
+            parseOpaqueHomeRoutes({ routes: [
+                { project: "proj-a", home_id: "home:a", endpoint: "https://a.example" },
+                { project: "proj-b", home_id: "home:b", endpoint: "https://b.example" },
+            ] }),
+            () => "token",
+            {
+                client: (context) => ({ endpoint: context.endpoint }),
+                routeJson: ((endpoint: string) => (async (method: string) => {
+                    const home = endpoint.includes("a.example") ? "home:a" : "home:b";
+                    if (method === "POST") admitted.push(home);
+                    return method === "POST" ? { home, admission: `token:${home}` } : {};
+                })) as never,
+            },
+        );
+        return { instance, admitted };
+    }
+
     it("revokes over the connection that holds the admission", async () => {
         // Asking `routeJson` again would build a second transport to give back a
         // credential the first one is holding. For a relay-only Home that is a
@@ -145,6 +165,18 @@ describe("closing a connection releases the transport that held it", () => {
         expect(calls).toEqual(["home:a#0 POST", "home:a#0 DELETE"]);
         expect(closed).toEqual(["home:a"]);
         expect(instance.snapshot()).toHaveLength(0);
+    });
+
+    it("invalidates only the Home serving the refused project", async () => {
+        const { instance, admitted } = poolOverTwoHomes();
+        await instance.connectProject("proj-a" as ProjectId);
+        await instance.connectProject("proj-b" as ProjectId);
+
+        await expect(instance.invalidateProject("proj-a" as ProjectId)).resolves.toBe(true);
+        expect(instance.snapshot().map(({ homeId }) => homeId)).toEqual(["home:b"]);
+        await instance.connectProject("proj-a" as ProjectId);
+        expect(admitted).toEqual(["home:a", "home:b", "home:a"]);
+        await expect(instance.invalidateProject("missing" as ProjectId)).resolves.toBe(false);
     });
 });
 

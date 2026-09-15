@@ -56,11 +56,10 @@ export interface Member {
     readonly status: string;
     readonly managed_by_scim: boolean;
 }
-/** Which id-token claims carry the ABAC attributes the verifier maps (B12 / `ID-3`).
- *  All optional — unset falls back to the `GAUGEDESK_OIDC_*_CLAIM` env knob, else
- *  unmapped (subject defaults to `sub`). */
+/** Which verified OIDC claims or signed SAML attributes carry identity and ABAC values. */
 export interface SsoClaimMapping {
     readonly subject_claim?: string | null;
+    readonly email_claim?: string | null;
     readonly roles_claim?: string | null;
     readonly region_claim?: string | null;
     readonly tenant_claim?: string | null;
@@ -114,9 +113,8 @@ export interface SoftwarePolicy {
     readonly allowed_channels: ReadonlyArray<"stable" | "beta" | "dev">;
     readonly grace_until_unix_ms?: number | null;
 }
-/** Billing/seat state (B16). `billing.update` replaces the whole record, so every
- *  field is required on the wire — an omitted `managed_inference` would drop the
- *  org-funded subscription rather than preserve it. `null` is how it is cleared. */
+/** Server-authoritative billing and seat state (B16). Plan changes flow through
+ *  the admitted subscription authority; this projection is never a client-editable record. */
 export interface Billing {
     readonly plan: string;
     readonly seats: number;
@@ -133,6 +131,8 @@ export interface ManagedUsageSummary {
     readonly total_tokens: number;
     readonly included_tokens: number;
     readonly overage_tokens: number;
+    readonly unattributed_runs: number;
+    readonly unattributed_tokens: number;
 }
 /** One audit-timeline entry (B14). */
 export interface AdminAuditEntry {

@@ -5,7 +5,8 @@ use axum::{
 
 use crate::{
     engagement_routes as er, federation, library_routes as lr, lifecycle_routes as life, net_http,
-    project_credential_routes, resource_store as rs, workstream_routes as wr, SharedWorkbench,
+    project_credential_routes, project_model_selection, resource_store as rs,
+    workstream_routes as wr, SharedWorkbench,
 };
 
 /// Open-source local workbench route surface: health, workspace/library,
@@ -253,6 +254,12 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route(
             "/projects/{id}/credentials/{provider}",
             delete(project_credential_routes::delete_project_credential),
+        )
+        .route(
+            "/projects/{id}/organization-model-selection",
+            get(project_model_selection::get_selection)
+                .put(project_model_selection::put_selection)
+                .delete(project_model_selection::delete_selection),
         )
         .route("/projects/{pid}/placements", post(lr::bind_agent))
         .route("/projects/{pid}/placements/{iid}", delete(lr::unbind_agent))

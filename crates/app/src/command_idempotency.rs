@@ -151,15 +151,23 @@ fn streamed_upload_path(method: &Method, path: &str) -> bool {
         ["", "chats", chat, "context", "stream"] if !chat.is_empty())
 }
 
-fn environment_command_path(path: &str) -> bool {
+fn gaugeapp_command_path(path: &str) -> bool {
     let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
-    matches!(parts.as_slice(), ["environments", _, "sessions"])
-        || matches!(parts.as_slice(), ["environments", _, "commands"])
-        || matches!(parts.as_slice(), ["environments", _, "changes"])
-        || matches!(
-            parts.as_slice(),
-            ["environments", _, "changes", _, "review"]
-        )
+    matches!(parts.as_slice(), ["gaugeapps", _, "sessions"])
+        || matches!(parts.as_slice(), ["gaugeapps", _, "commands"])
+        || matches!(parts.as_slice(), ["gaugeapps", _, "proposals"])
+        || matches!(parts.as_slice(), ["gaugeapps", _, "proposals", _, "review"])
+}
+
+/// Authentication ceremonies own replay protection at their protocol boundary:
+/// OIDC state, SAML RelayState + InResponseTo, WebAuthn challenges, one-time
+/// native handoff codes, and session revocation. Some of their POSTs are made
+/// by an external IdP or a plain browser form, neither of which can supply our
+/// application-specific `Idempotency-Key` header. Wrapping them in the generic
+/// command receipt guard makes the protocol unreachable before its own verifier
+/// can run.
+fn authentication_ceremony_path(path: &str) -> bool {
+    path == "/auth" || path.starts_with("/auth/")
 }
 
 fn status_response(status: StatusCode, command_id: &str, command_status: &str) -> Response {
@@ -182,7 +190,8 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
     let method = request.method().clone();
     if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS)
         || reducer_command_path(request.uri().path())
-        || environment_command_path(request.uri().path())
+        || gaugeapp_command_path(request.uri().path())
+        || authentication_ceremony_path(request.uri().path())
         // This handler binds the header key to an authenticated native action
         // and recovers its actual receipt. The generic uncertain-command cache
         // must not prevent delivery of that original result.
@@ -332,21 +341,30 @@ mod tests {
     }
 
     #[test]
-    fn environment_sessions_and_atomic_changes_bypass_the_outer_guard() {
-        assert!(environment_command_path(
-            "/environments/administration/sessions"
+    fn gaugeapp_sessions_and_atomic_changes_bypass_the_outer_guard() {
+        assert!(gaugeapp_command_path("/gaugeapps/administration/sessions"));
+        assert!(gaugeapp_command_path("/gaugeapps/administration/commands"));
+        assert!(gaugeapp_command_path("/gaugeapps/administration/proposals"));
+        assert!(gaugeapp_command_path(
+            "/gaugeapps/administration/proposals/change-1/review"
         ));
-        assert!(environment_command_path(
-            "/environments/administration/commands"
+        assert!(!gaugeapp_command_path(
+            "/gaugeapps/administration/pages/people"
         ));
-        assert!(environment_command_path(
-            "/environments/administration/changes"
-        ));
-        assert!(environment_command_path(
-            "/environments/administration/changes/change-1/review"
-        ));
-        assert!(!environment_command_path(
-            "/environments/administration/documents/access"
-        ));
+    }
+
+    #[test]
+    fn provider_and_browser_authentication_posts_reach_their_own_replay_guards() {
+        for path in [
+            "/auth/work-email",
+            "/auth/saml/acs",
+            "/auth/account/authenticate/finish",
+            "/auth/mobile/exchange",
+            "/auth/logout",
+        ] {
+            assert!(authentication_ceremony_path(path), "{path}");
+        }
+        assert!(!authentication_ceremony_path("/account/tenants"));
+        assert!(!authentication_ceremony_path("/authorization/policy"));
     }
 }

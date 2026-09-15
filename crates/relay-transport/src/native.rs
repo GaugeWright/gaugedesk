@@ -1111,7 +1111,12 @@ mod tests {
             .unwrap();
         let expected = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
         let mut response = vec![0; expected.len()];
-        timeout(Duration::from_secs(2), client.read_exact(&mut response))
+        // The production-composition check crosses a live Wrangler Worker and
+        // Durable Object. A loaded gate host can spend more than two seconds
+        // scheduling that path even though every protocol deadline still
+        // holds, so keep this test bounded without mistaking scheduler delay
+        // for a tunnel failure.
+        timeout(Duration::from_secs(10), client.read_exact(&mut response))
             .await
             .unwrap()
             .unwrap();

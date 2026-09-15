@@ -49,6 +49,9 @@ export interface CarouselProps {
     readonly panes: Record<PaneKind, JSX.Element>;
     /** Optional environment-specific subset, preserving broad-to-deep order. */
     readonly paneOrder?: readonly PaneKind[];
+    /** Optional environment vocabulary for pane slots. Management environments
+     * replace the project-oriented Files projection with their page Menu. */
+    readonly paneLabels?: Partial<Record<PaneKind, string>>;
     /** Optional: start a new chat. When supplied, the **Chat** toggle is always
      *  actionable — if a chat is open it navigates there as usual, but with none
      *  open yet it starts one (same as the nav's "+ new chat") instead of sitting
@@ -62,7 +65,7 @@ export function Carousel(props: CarouselProps): JSX.Element {
 
     const segments = createMemo(() => {
         const admitted = new Set(props.paneOrder ?? ["nav", "chat", "files", "content"]);
-        return toggleSegments(props.state).filter((segment) => admitted.has(segment.pane));
+        return toggleSegments(props.state, props.paneLabels).filter((segment) => admitted.has(segment.pane));
     });
     const peek = createMemo(() => {
         const visible = segments();
@@ -107,12 +110,14 @@ export function Carousel(props: CarouselProps): JSX.Element {
                 <EdgeGutter
                     edge="left"
                     peek={peek().broader}
+                    label={peek().broader ? props.paneLabels?.[peek().broader!] : undefined}
                     onPull={() => peek().broader && apply(tapGesture(peek().broader!))}
                 />
                 <div class="carousel-pane">{props.panes[props.state.current]}</div>
                 <EdgeGutter
                     edge="right"
                     peek={peek().deeper}
+                    label={peek().deeper ? props.paneLabels?.[peek().deeper!] : undefined}
                     onPull={() => peek().deeper && apply(tapGesture(peek().deeper!))}
                 />
             </div>
@@ -128,6 +133,7 @@ export function Carousel(props: CarouselProps): JSX.Element {
 function EdgeGutter(props: {
     readonly edge: GutterEdge;
     readonly peek: PaneKind | null;
+    readonly label?: string;
     readonly onPull: () => void;
 }): JSX.Element {
     const chevron = props.edge === "left" ? "‹" : "›";
@@ -137,7 +143,7 @@ function EdgeGutter(props: {
     // neighbour is reachable (the gutter is inert/hidden then anyway).
     const label = () =>
         props.peek !== null
-            ? `Go to ${PANE_LABEL[props.peek]}`
+            ? `Go to ${props.label ?? PANE_LABEL[props.peek]}`
             : props.edge === "left"
               ? "back"
               : "deeper";

@@ -10,10 +10,11 @@
     "packages/*"
   ],
   "scripts": {
+    "test": "node --experimental-strip-types --test apps/enterprise-workbench/src/*.test.mjs",
     "dev": "vite --config apps/enterprise-workbench/vite.config.ts",
     "build": "vite build --config apps/enterprise-workbench/vite.config.ts",
     "postbuild": "node ../../scripts/build-release-identity.mjs",
-    "typecheck": "npm run typecheck:enterprise-client && npm run typecheck:enterprise-ui",
+    "typecheck": "npm run typecheck:enterprise-client && npm run typecheck:enterprise-ui && tsc --noEmit -p tsconfig.component-tests.json",
     "typecheck:enterprise-client": "tsc --noEmit -p tsconfig.enterprise-client.json",
     "typecheck:enterprise-ui": "tsc --noEmit -p tsconfig.enterprise-ui.json"
   },
@@ -22,6 +23,7 @@
     "@gaugewright/mobile-web": "file:../../web/apps/mobile-web",
     "@gaugewright/workbench-web": "file:../../web/apps/workbench-web",
     "@gaugewright/workbench-ui": "file:../../web/packages/workbench-ui",
+    "@stripe/connect-js": "^3.4.6",
     "solid-js": "^1.9.0"
   },
   "devDependencies": {

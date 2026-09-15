@@ -594,7 +594,9 @@ pub fn directory_url_from_env() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::{open_account_blob, DeviceRecord, DeviceStatus, RecordOp, SettingRecord};
+    use crate::account::{
+        open_account_blob, DeviceKind, DeviceRecord, DeviceStatus, RecordOp, SettingRecord,
+    };
 
     fn seeded_account() -> Account {
         let mut a = Account::default();
@@ -604,6 +606,7 @@ mod tests {
                 id: "phone".into(),
                 op: RecordOp::Upsert,
                 label: "My phone".into(),
+                kind: DeviceKind::Phone,
                 subkey_pubkey: "dev-pub-1".into(),
                 status: DeviceStatus::Active,
                 enrolled_at: 1_700_000_000,

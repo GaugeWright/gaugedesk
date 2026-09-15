@@ -18,14 +18,14 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
     browserRouteJson,
-    openManagementEnvironment,
-    proposeManagementDocumentChange,
-    readManagementDocument,
-    submitManagementCommand,
-    type ManagementEnvironmentSession,
+    openTokenWrightEnvironment,
+    proposeTokenWrightDocumentChange,
+    readTokenWrightDocument,
+    submitTokenWrightCommand,
+    type TokenWrightSession,
     type RouteJson,
 } from "@gaugewright/control-plane-client";
-import { TOKENWRIGHT_MANIFEST, TOKENWRIGHT_SCHEMAS } from "./tokenwright-environment";
+import { TOKENWRIGHT_DOCUMENTS, TOKENWRIGHT_SCHEMAS } from "./tokenwright-environment";
 import { tokenwrightCommandsFrom } from "./tokenwright-box";
 
 const ROOT = process.env.TOKENWRIGHT_ROOT ?? "/home/jack/code/TokenWright";
@@ -35,7 +35,7 @@ let box: ChildProcess | undefined;
 let state = "";
 let key = "";
 let base = "";
-let session: ManagementEnvironmentSession;
+let session: TokenWrightSession;
 let invitePrinted = "";
 /** The real browser transport, pointed at the box once its port is known. */
 let json: RouteJson;
@@ -144,7 +144,7 @@ describe.skipIf(!available)("the client against a real TokenWright box", () => {
         key = claim.key.secret;
         expect(claim.paired.fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/u);
 
-        session = await openManagementEnvironment(json, "tokenwright");
+        session = await openTokenWrightEnvironment(json);
     }, 60_000);
 
     afterAll(async () => {
@@ -158,29 +158,24 @@ describe.skipIf(!available)("the client against a real TokenWright box", () => {
         expect(session.capabilities).toContain("AdministerBox");
     });
 
-    it("grants exactly the documents this repository carries a View for", () => {
-        // The two repositories agreeing on the document set is the thing that
-        // silently rots. A box adding a document nobody carries a View for
-        // renders as generic JSON; one removing a document leaves a dead entry.
+    it("grants exactly the documents with purpose-built controls", () => {
         const granted = session.documents.map((document) => document.id).sort();
-        const carried = TOKENWRIGHT_MANIFEST.documents.map((document) => document.id).sort();
+        const carried = TOKENWRIGHT_DOCUMENTS.map((document) => document.id).sort();
         expect(granted).toEqual(carried);
     });
 
-    it("serves documents the carried schemas admit", async () => {
-        for (const binding of TOKENWRIGHT_MANIFEST.documents) {
-            const document = await readManagementDocument(json, session, binding.id);
+    it("serves documents the native controls' schemas admit", async () => {
+        for (const binding of TOKENWRIGHT_DOCUMENTS) {
+            const document = await readTokenWrightDocument(json, session, binding.id);
             expect(document.schema, binding.id).toBe(binding.schema);
             const validate = TOKENWRIGHT_SCHEMAS[binding.schema]!;
-            // If this fails, the panel would fall back to generic JSON in front
-            // of an operator, and the reason would not be visible anywhere.
             expect(validate(document.content), `${binding.id} against ${binding.schema}`).toBe(true);
         }
     });
 
     it("runs a granted command end to end", async () => {
-        const inference = await readManagementDocument(json, session, "tokenwright.inference");
-        const receipt = await submitManagementCommand(json, {
+        const inference = await readTokenWrightDocument(json, session, "tokenwright.inference");
+        const receipt = await submitTokenWrightCommand(json, {
             session_id: session.id, environment: "tokenwright", scope: session.scope,
             document_id: "tokenwright.inference",
             command_id: "tokenwright.posture.rescan",
@@ -192,7 +187,7 @@ describe.skipIf(!available)("the client against a real TokenWright box", () => {
     });
 
     it("refuses a command against a stale revision, as a conflict receipt", async () => {
-        const receipt = await submitManagementCommand(json, {
+        const receipt = await submitTokenWrightCommand(json, {
             session_id: session.id, environment: "tokenwright", scope: session.scope,
             document_id: "tokenwright.inference",
             command_id: "tokenwright.engine.restart",
@@ -202,22 +197,15 @@ describe.skipIf(!available)("the client against a real TokenWright box", () => {
     });
 
     it("declares a key by literal edit and reads the reveal back", async () => {
-        const access = await readManagementDocument(json, session, "tokenwright.access");
-        // Only the editable block. Spreading the read document back in here is
-        // what made this test flaky: `tokenwright.access` projects live relay
-        // and direct status, and every key's `last_used_at`, which the box
-        // stamps at whole-second granularity. Cross a second boundary between
-        // this read and the write below — which authenticating the write can
-        // itself cause — and the echoed projection no longer matches what the
-        // box holds, so a correct edit takes a 422 `projected_field`. It
-        // passed or failed on where the wall clock happened to be.
-        await proposeManagementDocumentChange(json, {
+        const access = await readTokenWrightDocument(json, session, "tokenwright.access");
+        // Submit only the editable block. Live last-used/relay projections may
+        // change while the write authenticates; echoing them is not an edit.
+        await proposeTokenWrightDocumentChange(json, {
             session, documentId: "tokenwright.access", baseRevision: access.revision,
             content: { desired: { keys: ["paired-home", "workstation-editor"] } },
-            client: "edit",
         }, "integration-3");
 
-        const after = await readManagementDocument(json, session, "tokenwright.access");
+        const after = await readTokenWrightDocument(json, session, "tokenwright.access");
         const value = after.content as {
             keys: readonly { name: string; prefix: string; state: string }[];
             reveal: { key_id: string; secret: string } | null;
@@ -231,7 +219,7 @@ describe.skipIf(!available)("the client against a real TokenWright box", () => {
     });
 
     it("binds the box's own grant into runnable controls", async () => {
-        const inference = await readManagementDocument(json, session, "tokenwright.inference");
+        const inference = await readTokenWrightDocument(json, session, "tokenwright.inference");
         const commands = tokenwrightCommandsFrom({
             json, session, revisionOf: () => inference.revision,
         });

@@ -49,7 +49,7 @@ url = "2"
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
 # ECDH for the ACCT-1 device-enrollment seal-to-subkey (ECIES: ECDH(subkey) -> HKDF-SHA256
 # -> AES-256-GCM). The subkey is a P-256 keypair; core uses p256/ecdsa, the app adds ecdh.
-# `ecdsa` is added here too for the Hub-signed managed-inference entitlement
+# `ecdsa` is added here too for the account-service-signed managed-inference entitlement
 # (SOC 2 finding F-5.3 / DR-0089) so the mint path does not rely on another
 # crate's feature to unify it in.
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }

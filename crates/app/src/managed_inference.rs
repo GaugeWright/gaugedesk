@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use gaugedesk_core::{Lifecycle, Rejection};
 use gaugedesk_harness::ModelUsage;
 use gaugedesk_store::{AdmitError, Store};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,7 @@ pub fn funding_ref_for(scope: &str, plan: &str) -> String {
 
 pub fn is_managed_funding_ref(reference: &str) -> bool {
     reference.starts_with(MANAGED_FUNDING_PREFIX)
+        || reference.starts_with(crate::managed_funding::FUNDING_REFERENCE_PREFIX)
 }
 
 /// The funding-reference prefix, as the **edge** must also spell it.
@@ -155,13 +157,251 @@ pub struct ManagedUsageRecord {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Exact verified funding source charged for this observation. Legacy
+    /// observations omit it and therefore cannot consume a current allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_ref: Option<String>,
+    /// Server observation time in Unix seconds. This binds usage to one
+    /// processor-established subscription period without rewriting history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ManagedReservationRecord {
     pub id: String,
     pub engagement_id: String,
     pub funding_ref: String,
+    /// Conservative input + output token bound admitted before provider
+    /// dispatch. Legacy/private reservations did not carry a token budget and
+    /// therefore contribute zero to the verified-plan allowance fold.
+    #[serde(default)]
+    pub maximum_tokens: u64,
+    /// Server-stamped admission time and processor period. The funding
+    /// reference identifies a subscription source, not one renewal period, so
+    /// all three values are required before a reservation can consume the
+    /// current allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ManagedAllowanceReserve {
+    pub reservation: ManagedReservationRecord,
+    pub observed_tokens: u64,
+    pub included_tokens: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ManagedAllowanceSettle {
+    pub reservation_id: String,
+    pub usage_ref: String,
+    pub actual_tokens: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ManagedAllowanceRelease {
+    pub reservation_id: String,
+    pub release_ref: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum ManagedAllowanceCommand {
+    Reserve(ManagedAllowanceReserve),
+    Settle(ManagedAllowanceSettle),
+    Release(ManagedAllowanceRelease),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ManagedAllowanceEvent {
+    ObservedFloor {
+        period: String,
+        tokens: u64,
+    },
+    Reserved(ManagedReservationRecord),
+    Settled {
+        reservation_id: String,
+        usage_ref: String,
+        actual_tokens: u64,
+    },
+    Released {
+        reservation_id: String,
+        release_ref: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ManagedAllowanceStatus {
+    #[default]
+    Open,
+    Settled,
+    Released,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedAllowanceReservation {
+    pub record: ManagedReservationRecord,
+    pub status: ManagedAllowanceStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedAllowanceState {
+    pub accounted_tokens: BTreeMap<String, u64>,
+    pub reservations: BTreeMap<String, ManagedAllowanceReservation>,
+}
+
+pub struct ManagedAllowanceLedger;
+
+fn allowance_period(record: &ManagedReservationRecord) -> Option<String> {
+    Some(format!(
+        "{}:{}:{}",
+        record.funding_ref, record.valid_from?, record.valid_until?
+    ))
+}
+
+impl Lifecycle for ManagedAllowanceLedger {
+    type State = ManagedAllowanceState;
+    type Command = ManagedAllowanceCommand;
+    type Event = ManagedAllowanceEvent;
+
+    const KIND: &'static str = "managed_inference_allowance";
+
+    fn decide(state: &Self::State, command: Self::Command) -> Result<Vec<Self::Event>, Rejection> {
+        match command {
+            ManagedAllowanceCommand::Reserve(command) => {
+                let reservation = command.reservation;
+                let Some(period) = allowance_period(&reservation) else {
+                    return Err(Rejection {
+                        reason: "managed allowance reservation lacks an exact period",
+                    });
+                };
+                if reservation.id.trim().is_empty()
+                    || reservation.engagement_id.trim().is_empty()
+                    || reservation.maximum_tokens == 0
+                    || reservation.admitted_at.is_none()
+                    || state.reservations.contains_key(&reservation.id)
+                {
+                    return Err(Rejection {
+                        reason: "managed allowance reservation is invalid or already exists",
+                    });
+                }
+                let observed = state
+                    .accounted_tokens
+                    .get(&period)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(command.observed_tokens);
+                let open = state
+                    .reservations
+                    .values()
+                    .filter(|held| {
+                        held.status == ManagedAllowanceStatus::Open
+                            && allowance_period(&held.record).as_deref() == Some(&period)
+                    })
+                    .fold(0_u64, |total, held| {
+                        total.saturating_add(held.record.maximum_tokens)
+                    });
+                if observed
+                    .saturating_add(open)
+                    .saturating_add(reservation.maximum_tokens)
+                    > command.included_tokens
+                {
+                    return Err(Rejection {
+                        reason: "managed inference allowance exhausted",
+                    });
+                }
+                let mut events = Vec::with_capacity(2);
+                if observed > state.accounted_tokens.get(&period).copied().unwrap_or(0) {
+                    events.push(ManagedAllowanceEvent::ObservedFloor {
+                        period,
+                        tokens: observed,
+                    });
+                }
+                events.push(ManagedAllowanceEvent::Reserved(reservation));
+                Ok(events)
+            }
+            ManagedAllowanceCommand::Settle(command) => {
+                let Some(held) = state.reservations.get(&command.reservation_id) else {
+                    return Err(Rejection {
+                        reason: "managed allowance reservation does not exist",
+                    });
+                };
+                if held.status != ManagedAllowanceStatus::Open
+                    || command.usage_ref.trim().is_empty()
+                {
+                    return Err(Rejection {
+                        reason: "managed allowance reservation is not settleable",
+                    });
+                }
+                Ok(vec![ManagedAllowanceEvent::Settled {
+                    reservation_id: command.reservation_id,
+                    usage_ref: command.usage_ref,
+                    actual_tokens: command.actual_tokens,
+                }])
+            }
+            ManagedAllowanceCommand::Release(command) => {
+                let Some(held) = state.reservations.get(&command.reservation_id) else {
+                    return Err(Rejection {
+                        reason: "managed allowance reservation does not exist",
+                    });
+                };
+                if held.status != ManagedAllowanceStatus::Open
+                    || command.release_ref.trim().is_empty()
+                {
+                    return Err(Rejection {
+                        reason: "managed allowance reservation is not releasable",
+                    });
+                }
+                Ok(vec![ManagedAllowanceEvent::Released {
+                    reservation_id: command.reservation_id,
+                    release_ref: command.release_ref,
+                }])
+            }
+        }
+    }
+
+    fn evolve(state: &Self::State, event: Self::Event) -> Self::State {
+        let mut next = state.clone();
+        match event {
+            ManagedAllowanceEvent::ObservedFloor { period, tokens } => {
+                next.accounted_tokens.insert(period, tokens);
+            }
+            ManagedAllowanceEvent::Reserved(record) => {
+                next.reservations.insert(
+                    record.id.clone(),
+                    ManagedAllowanceReservation {
+                        record,
+                        status: ManagedAllowanceStatus::Open,
+                    },
+                );
+            }
+            ManagedAllowanceEvent::Settled {
+                reservation_id,
+                actual_tokens,
+                ..
+            } => {
+                if let Some(held) = next.reservations.get_mut(&reservation_id) {
+                    held.status = ManagedAllowanceStatus::Settled;
+                    if let Some(period) = allowance_period(&held.record) {
+                        let accounted = next.accounted_tokens.entry(period).or_default();
+                        *accounted = accounted.saturating_add(actual_tokens);
+                    }
+                }
+            }
+            ManagedAllowanceEvent::Released { reservation_id, .. } => {
+                if let Some(held) = next.reservations.get_mut(&reservation_id) {
+                    held.status = ManagedAllowanceStatus::Released;
+                }
+            }
+        }
+        next
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -185,6 +425,7 @@ pub struct ManagedReservationSummary {
     pub settled: u64,
     pub released: u64,
     pub outstanding: u64,
+    pub outstanding_tokens: u64,
 }
 
 impl ManagedUsageRecord {
@@ -197,6 +438,21 @@ impl ManagedUsageRecord {
             model: usage.model.clone(),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            funding_ref: None,
+            observed_at: None,
+        }
+    }
+
+    pub fn from_funded_runtime(
+        engagement_id: &str,
+        usage: &ModelUsage,
+        funding_ref: &str,
+        observed_at: u64,
+    ) -> Self {
+        Self {
+            funding_ref: Some(funding_ref.to_owned()),
+            observed_at: Some(observed_at),
+            ..Self::from_runtime(engagement_id, usage)
         }
     }
 }
@@ -209,6 +465,13 @@ pub struct ManagedUsageSummary {
     pub total_tokens: u64,
     pub included_tokens: u64,
     pub overage_tokens: u64,
+    /// Legacy observations lacking an exact funding reference or server time.
+    /// They remain historical evidence but are never silently charged against
+    /// a current-period allowance.
+    #[serde(default)]
+    pub unattributed_runs: u64,
+    #[serde(default)]
+    pub unattributed_tokens: u64,
 }
 
 pub fn fold_plan(store: &Store, scope: &str) -> Result<Option<ManagedInferencePlan>, AdmitError> {
@@ -272,6 +535,64 @@ pub fn fold_usage(
     Ok(summary)
 }
 
+/// Fold only observations charged to one exact verified funding reference in
+/// its current processor-established period. Usage from another source or
+/// period remains history; legacy observations are reported as unattributed so
+/// the caller cannot present a falsely complete current-period total.
+pub fn fold_usage_for_funding_period(
+    store: &Store,
+    scope: &str,
+    funding_ref: &str,
+    valid_from: u64,
+    valid_until: u64,
+    included_tokens: u64,
+) -> Result<ManagedUsageSummary, AdmitError> {
+    let mut observations = BTreeMap::new();
+    for row in store.records(scope, MANAGED_USAGE_KIND)? {
+        let record: ManagedUsageRecord = serde_json::from_str(&row)?;
+        observations.insert(record.id.clone(), record);
+    }
+    let mut current = Vec::new();
+    let mut unattributed_runs = 0_u64;
+    let mut unattributed_tokens = 0_u64;
+    for observation in observations.values() {
+        match (&observation.funding_ref, observation.observed_at) {
+            (Some(reference), Some(observed_at))
+                if reference == funding_ref
+                    && observed_at >= valid_from
+                    && observed_at < valid_until =>
+            {
+                current.push(observation)
+            }
+            (Some(_), Some(_)) => {}
+            _ => {
+                unattributed_runs = unattributed_runs.saturating_add(1);
+                unattributed_tokens = unattributed_tokens
+                    .saturating_add(observation.input_tokens)
+                    .saturating_add(observation.output_tokens);
+            }
+        }
+    }
+    let mut summary = ManagedUsageSummary {
+        runs: current.len() as u64,
+        included_tokens,
+        unattributed_runs,
+        unattributed_tokens,
+        ..ManagedUsageSummary::default()
+    };
+    for observation in current {
+        summary.input_tokens = summary
+            .input_tokens
+            .saturating_add(observation.input_tokens);
+        summary.output_tokens = summary
+            .output_tokens
+            .saturating_add(observation.output_tokens);
+    }
+    summary.total_tokens = summary.input_tokens.saturating_add(summary.output_tokens);
+    summary.overage_tokens = summary.total_tokens.saturating_sub(included_tokens);
+    Ok(summary)
+}
+
 pub fn append_usage(
     store: &mut Store,
     engagement_scope: &str,
@@ -279,6 +600,28 @@ pub fn append_usage(
     usage: &ModelUsage,
 ) -> Result<(), AdmitError> {
     let record = ManagedUsageRecord::from_runtime(engagement_scope, usage);
+    let payload = serde_json::to_string(&record)?;
+    if billing_scope == engagement_scope {
+        store.append_record(engagement_scope, MANAGED_USAGE_KIND, &payload)?;
+    } else {
+        store.append_records_atomically(&[
+            (engagement_scope, MANAGED_USAGE_KIND, &payload),
+            (billing_scope, MANAGED_USAGE_KIND, &payload),
+        ])?;
+    }
+    Ok(())
+}
+
+pub fn append_funded_usage(
+    store: &mut Store,
+    engagement_scope: &str,
+    billing_scope: &str,
+    usage: &ModelUsage,
+    funding_ref: &str,
+    observed_at: u64,
+) -> Result<(), AdmitError> {
+    let record =
+        ManagedUsageRecord::from_funded_runtime(engagement_scope, usage, funding_ref, observed_at);
     let payload = serde_json::to_string(&record)?;
     if billing_scope == engagement_scope {
         store.append_record(engagement_scope, MANAGED_USAGE_KIND, &payload)?;
@@ -304,6 +647,10 @@ pub fn reserve_turn(
         id: reservation_id.to_owned(),
         engagement_id: engagement_scope.to_owned(),
         funding_ref: funding_ref.to_owned(),
+        maximum_tokens: 0,
+        admitted_at: None,
+        valid_from: None,
+        valid_until: None,
     };
     let payload = serde_json::to_string(&record)?;
     store.append_record_with_key(
@@ -321,6 +668,32 @@ pub fn reserve_turn(
         )?;
     }
     Ok(())
+}
+
+/// Persist one server-bounded public reservation under the billing authority.
+/// The caller must hold the store's ordering lock while first folding usage
+/// and open reservations and then appending this fact. Exact replay is inert;
+/// changed facts under the same id are a conflict rather than a replacement.
+pub fn reserve_bounded_turn(
+    store: &mut Store,
+    billing_scope: &str,
+    record: ManagedReservationRecord,
+) -> Result<bool, AdmitError> {
+    for row in store.records(billing_scope, MANAGED_RESERVATION_KIND)? {
+        let existing: ManagedReservationRecord = serde_json::from_str(&row)?;
+        if existing.id == record.id {
+            return Ok(existing == record);
+        }
+    }
+    let payload = serde_json::to_string(&record)?;
+    store
+        .append_record_with_key(
+            billing_scope,
+            &format!("managed-reserve:{}", record.id),
+            MANAGED_RESERVATION_KIND,
+            &payload,
+        )
+        .map(|(_, inserted)| inserted)
 }
 
 pub fn settle_reservation(
@@ -378,10 +751,55 @@ pub fn fold_reservations(
         match terminal.get(reservation_id) {
             Some(ManagedSettlementRecord::Settled { .. }) => summary.settled += 1,
             Some(ManagedSettlementRecord::Released { .. }) => summary.released += 1,
-            None => summary.outstanding += 1,
+            None => {
+                summary.outstanding += 1;
+                summary.outstanding_tokens = summary
+                    .outstanding_tokens
+                    .saturating_add(reservations[reservation_id].maximum_tokens);
+            }
         }
     }
     Ok(summary)
+}
+
+/// Tokens held by non-terminal reservations for one exact verified funding
+/// source and processor-established period. Legacy reservations lack the
+/// period stamp and cannot silently consume a current allowance.
+pub fn fold_reserved_tokens_for_funding_period(
+    store: &Store,
+    scope: &str,
+    funding_ref: &str,
+    valid_from: u64,
+    valid_until: u64,
+) -> Result<u64, AdmitError> {
+    let mut reservations = BTreeMap::new();
+    for row in store.records(scope, MANAGED_RESERVATION_KIND)? {
+        let record: ManagedReservationRecord = serde_json::from_str(&row)?;
+        reservations.insert(record.id.clone(), record);
+    }
+    let mut terminal = BTreeMap::new();
+    for row in store.records(scope, MANAGED_SETTLEMENT_KIND)? {
+        let record: ManagedSettlementRecord = serde_json::from_str(&row)?;
+        let reservation_id = match &record {
+            ManagedSettlementRecord::Settled { reservation_id, .. }
+            | ManagedSettlementRecord::Released { reservation_id, .. } => reservation_id,
+        };
+        terminal.insert(reservation_id.clone(), record);
+    }
+    Ok(reservations
+        .values()
+        .filter(|reservation| {
+            !terminal.contains_key(&reservation.id)
+                && reservation.funding_ref == funding_ref
+                && reservation
+                    .admitted_at
+                    .is_some_and(|at| at >= valid_from && at < valid_until)
+                && reservation.valid_from == Some(valid_from)
+                && reservation.valid_until == Some(valid_until)
+        })
+        .fold(0_u64, |total, reservation| {
+            total.saturating_add(reservation.maximum_tokens)
+        }))
 }
 
 #[cfg(test)]
@@ -409,6 +827,69 @@ mod tests {
                 total_tokens: 12,
                 included_tokens: 10,
                 overage_tokens: 2,
+                unattributed_runs: 0,
+                unattributed_tokens: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn current_period_fold_is_exact_and_keeps_legacy_usage_visible_as_unknown() {
+        let mut store = Store::open_in_memory().unwrap();
+        let usage = |reference: &str, input_tokens, output_tokens| ModelUsage {
+            usage_ref: reference.into(),
+            provider: "managed".into(),
+            model: "model-a".into(),
+            input_tokens,
+            output_tokens,
+        };
+        append_funded_usage(
+            &mut store,
+            "chat-current",
+            "account",
+            &usage("usage-current", 7, 5),
+            "funding-current",
+            150,
+        )
+        .unwrap();
+        append_funded_usage(
+            &mut store,
+            "chat-old-period",
+            "account",
+            &usage("usage-old-period", 100, 100),
+            "funding-current",
+            99,
+        )
+        .unwrap();
+        append_funded_usage(
+            &mut store,
+            "chat-old-source",
+            "account",
+            &usage("usage-old-source", 200, 200),
+            "funding-replaced",
+            150,
+        )
+        .unwrap();
+        append_usage(
+            &mut store,
+            "chat-legacy",
+            "account",
+            &usage("usage-legacy", 3, 2),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fold_usage_for_funding_period(&store, "account", "funding-current", 100, 200, 10,)
+                .unwrap(),
+            ManagedUsageSummary {
+                runs: 1,
+                input_tokens: 7,
+                output_tokens: 5,
+                total_tokens: 12,
+                included_tokens: 10,
+                overage_tokens: 2,
+                unattributed_runs: 1,
+                unattributed_tokens: 5,
             }
         );
     }
@@ -458,9 +939,231 @@ mod tests {
             settled: 0,
             released: 1,
             outstanding: 0,
+            outstanding_tokens: 0,
         };
         assert_eq!(fold_reservations(&store, "account").unwrap(), expected);
         assert_eq!(fold_reservations(&store, "chat-1").unwrap(), expected);
+    }
+
+    #[test]
+    fn bounded_reservations_hold_only_their_exact_current_period_allowance() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(reserve_bounded_turn(
+            &mut store,
+            "tenant::acme",
+            ManagedReservationRecord {
+                id: "reservation-1".into(),
+                engagement_id: "public-deployment::dep-1".into(),
+                funding_ref: "funding-current".into(),
+                maximum_tokens: 400,
+                admitted_at: Some(150),
+                valid_from: Some(100),
+                valid_until: Some(200),
+            },
+        )
+        .unwrap());
+        assert!(reserve_bounded_turn(
+            &mut store,
+            "tenant::acme",
+            ManagedReservationRecord {
+                id: "reservation-1".into(),
+                engagement_id: "public-deployment::dep-1".into(),
+                funding_ref: "funding-current".into(),
+                maximum_tokens: 400,
+                admitted_at: Some(150),
+                valid_from: Some(100),
+                valid_until: Some(200),
+            },
+        )
+        .unwrap());
+        assert!(!reserve_bounded_turn(
+            &mut store,
+            "tenant::acme",
+            ManagedReservationRecord {
+                id: "reservation-1".into(),
+                engagement_id: "public-deployment::dep-1".into(),
+                funding_ref: "funding-current".into(),
+                maximum_tokens: 401,
+                admitted_at: Some(150),
+                valid_from: Some(100),
+                valid_until: Some(200),
+            },
+        )
+        .unwrap());
+        reserve_bounded_turn(
+            &mut store,
+            "tenant::acme",
+            ManagedReservationRecord {
+                id: "reservation-old".into(),
+                engagement_id: "public-deployment::dep-1".into(),
+                funding_ref: "funding-old".into(),
+                maximum_tokens: 900,
+                admitted_at: Some(50),
+                valid_from: Some(1),
+                valid_until: Some(100),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fold_reserved_tokens_for_funding_period(
+                &store,
+                "tenant::acme",
+                "funding-current",
+                100,
+                200,
+            )
+            .unwrap(),
+            400
+        );
+        settle_reservation(
+            &mut store,
+            "tenant::acme",
+            "tenant::acme",
+            "reservation-1",
+            Some("usage-1"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            fold_reserved_tokens_for_funding_period(
+                &store,
+                "tenant::acme",
+                "funding-current",
+                100,
+                200,
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn allowance_lifecycle_counts_observed_usage_open_holds_and_settlement_once() {
+        let mut store = Store::open_in_memory().unwrap();
+        let reservation = |id: &str, maximum_tokens| ManagedReservationRecord {
+            id: id.into(),
+            engagement_id: "public-deployment::dep-1".into(),
+            funding_ref: "funding-current".into(),
+            maximum_tokens,
+            admitted_at: Some(150),
+            valid_from: Some(100),
+            valid_until: Some(200),
+        };
+        let reserve = |id: &str, maximum_tokens| {
+            ManagedAllowanceCommand::Reserve(ManagedAllowanceReserve {
+                reservation: reservation(id, maximum_tokens),
+                observed_tokens: 100,
+                included_tokens: 1_000,
+            })
+        };
+        store
+            .admit_materialized::<ManagedAllowanceLedger>(
+                "account",
+                "reserve-1",
+                reserve("r1", 600),
+            )
+            .unwrap();
+        let exhausted = store
+            .admit_materialized::<ManagedAllowanceLedger>(
+                "account",
+                "reserve-2",
+                reserve("r2", 301),
+            )
+            .unwrap_err();
+        assert!(format!("{exhausted:?}").contains("allowance exhausted"));
+        store
+            .admit_materialized::<ManagedAllowanceLedger>(
+                "account",
+                "settle-1",
+                ManagedAllowanceCommand::Settle(ManagedAllowanceSettle {
+                    reservation_id: "r1".into(),
+                    usage_ref: "usage-1".into(),
+                    actual_tokens: 250,
+                }),
+            )
+            .unwrap();
+        store
+            .admit_materialized::<ManagedAllowanceLedger>(
+                "account",
+                "reserve-2b",
+                reserve("r2", 650),
+            )
+            .unwrap();
+        store
+            .admit_materialized::<ManagedAllowanceLedger>(
+                "account",
+                "release-2",
+                ManagedAllowanceCommand::Release(ManagedAllowanceRelease {
+                    reservation_id: "r2".into(),
+                    release_ref: "runtime-known-unused:r2".into(),
+                }),
+            )
+            .unwrap();
+        store
+            .admit_materialized::<ManagedAllowanceLedger>(
+                "account",
+                "reserve-3",
+                reserve("r3", 650),
+            )
+            .unwrap();
+        let state = store.fold::<ManagedAllowanceLedger>("account").unwrap();
+        assert_eq!(
+            state.accounted_tokens.values().copied().collect::<Vec<_>>(),
+            vec![350]
+        );
+        assert_eq!(state.reservations.len(), 3);
+        assert_eq!(
+            state.reservations["r2"].status,
+            ManagedAllowanceStatus::Released
+        );
+    }
+
+    #[test]
+    fn allowance_reservations_serialize_across_store_connections() {
+        let store = Store::open_in_memory().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["r1", "r2"]
+            .into_iter()
+            .map(|id| {
+                let mut sibling = store.sibling().unwrap();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    sibling.admit_materialized::<ManagedAllowanceLedger>(
+                        "account",
+                        &format!("reserve-{id}"),
+                        ManagedAllowanceCommand::Reserve(ManagedAllowanceReserve {
+                            reservation: ManagedReservationRecord {
+                                id: id.into(),
+                                engagement_id: "public-deployment::dep-1".into(),
+                                funding_ref: "funding-current".into(),
+                                maximum_tokens: 600,
+                                admitted_at: Some(150),
+                                valid_from: Some(100),
+                                valid_until: Some(200),
+                            },
+                            observed_tokens: 0,
+                            included_tokens: 1_000,
+                        }),
+                    )
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| format!("{outcome:?}").contains("allowance exhausted"))
+                .count(),
+            1
+        );
+        let state = store.fold::<ManagedAllowanceLedger>("account").unwrap();
+        assert_eq!(state.reservations.len(), 1);
     }
 
     #[test]

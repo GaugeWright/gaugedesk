@@ -38,6 +38,7 @@ fn provider(idp_cert: &str, audience: &str) -> SamlSidecarIdentityProvider {
         audience,
     )
     .with_mapping(SamlClaimMapping {
+        email_attribute: None,
         roles_attribute: Some("roles".into()),
         region_attribute: Some("region".into()),
         tenant_attribute: None,

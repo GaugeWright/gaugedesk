@@ -37,6 +37,7 @@ describe("mobile runtime enrollment", () => {
     });
 
     it("redeems a handoff only with this device's verifier and consumes it", async () => {
+        const accountSession = "s".repeat(43);
         const values = new Map([[MOBILE_AUTH_VERIFIER_KEY, "verifier"]]);
         const storage = {
             getItem: (key: string) => values.get(key) ?? null,
@@ -47,7 +48,7 @@ describe("mobile runtime enrollment", () => {
                 code: "a".repeat(43),
                 verifier: "verifier",
             });
-            return new Response(JSON.stringify({ id_token: "header.payload.signature" }), {
+            return new Response(JSON.stringify({ account_session: accountSession }), {
                 status: 200,
                 headers: { "content-type": "application/json" },
             });
@@ -58,7 +59,7 @@ describe("mobile runtime enrollment", () => {
                 "a".repeat(43),
                 storage,
             ),
-        ).resolves.toBe("header.payload.signature");
+        ).resolves.toBe(accountSession);
         expect(values.has(MOBILE_AUTH_VERIFIER_KEY)).toBe(false);
     });
 
@@ -111,10 +112,10 @@ describe("mobile runtime enrollment", () => {
         expect(values.get(MOBILE_MACHINE_ENDPOINT_KEY)).toBe("https://machine.example");
         expect(savedMachineEndpoint(storage)).toBe("https://machine.example");
         expect(() => normalizeMachineEndpoint("http://machine.example")).toThrow(
-            "HTTPS Machine endpoint",
+            "HTTPS Project Host endpoint",
         );
         expect(() => normalizeMachineEndpoint("http://127.0.0.1:7878")).toThrow(
-            "HTTPS Machine endpoint",
+            "HTTPS Project Host endpoint",
         );
         clearMachineEndpoint({ removeItem: (key) => values.delete(key) });
         expect(savedMachineEndpoint(storage)).toBeNull();

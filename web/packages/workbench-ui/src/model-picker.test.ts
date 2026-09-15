@@ -16,6 +16,7 @@ import {
     providerTakesEndpoint,
     serializeEnabledModels,
     serializeEndpointModels,
+    servedModelLabel,
     thinkingLevelsFor,
     withDeclaredModels,
 } from "./model-picker";
@@ -307,5 +308,29 @@ describe("modelAcceptsImages (UX-14 vision pre-check)", () => {
 
     it("is permissive for a model absent from the catalog", () => {
         expect(modelAcceptsImages({ id: "made-up", provider: "nobody" }, VISION)).toBe(true);
+    });
+});
+
+describe("a model served by an organization connection", () => {
+    it("reports the catalog's name when the approved model is one we ship", () => {
+        expect(servedModelLabel("claude-opus-4-6", "anthropic", CAT)).toBe("Claude Opus 4.6");
+    });
+
+    it("reports an unknown approved id verbatim rather than guessing", () => {
+        // An organization approves ids on its own connection, so a model the
+        // shipped catalog has never heard of is ordinary, not an error. Showing
+        // the id is honest; inventing a friendlier name would not be.
+        expect(servedModelLabel("internal-tuned-v4", "openai", CAT)).toBe("internal-tuned-v4");
+    });
+
+    it("does not borrow a name from the same id under a different provider", () => {
+        // gpt-4o exists in the fixture under `openai` only. An anthropic
+        // connection serving that id must not inherit OpenAI's display name.
+        expect(servedModelLabel("gpt-4o", "anthropic", CAT)).toBe("gpt-4o");
+        expect(servedModelLabel("gpt-4o", "openai", CAT)).toBe("GPT-4o");
+    });
+
+    it("survives an empty catalog", () => {
+        expect(servedModelLabel("gpt-4o", "openai", [])).toBe("gpt-4o");
     });
 });

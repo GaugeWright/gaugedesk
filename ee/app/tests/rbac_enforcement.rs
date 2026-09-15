@@ -327,7 +327,7 @@ async fn admin(
 
 async fn admin_document(app: &Router, token: &str, document_id: &str) -> (StatusCode, Value) {
     let (status, response) = administration_document(app, None, Some(token), document_id).await;
-    (status, response["document"]["content"].clone())
+    (status, response["page"]["model"].clone())
 }
 
 async fn admin_document_for_client(
@@ -339,7 +339,7 @@ async fn admin_document_for_client(
     let (status, opened) = send_client(
         app,
         "POST",
-        "/environments/administration/sessions",
+        "/gaugeapps/administration/sessions",
         Some("{}"),
         Some(token),
         Some(client),
@@ -350,21 +350,22 @@ async fn admin_document_for_client(
     }
     let session = &opened["session"];
     let uri = format!(
-        "/environments/administration/documents/{document_id}?session={}&scope={}",
+        "/gaugeapps/administration/pages/{document_id}?session={}&generation={}&scope={}",
         session["id"].as_str().unwrap(),
+        session["generation"].as_str().unwrap(),
         session["scope"]["id"].as_str().unwrap(),
     );
     let (status, response) = send_client(app, "GET", &uri, None, Some(token), Some(client)).await;
-    (status, response["document"]["content"].clone())
+    (status, response["page"]["model"].clone())
 }
 
 async fn update_security(app: &Router, token: &str, patch: Value) -> (StatusCode, Value) {
     let (status, document) =
-        administration_document(app, None, Some(token), "administration.policy").await;
+        administration_document(app, None, Some(token), "organization-policy").await;
     if status != StatusCode::OK {
         return (status, document);
     }
-    let mut content = document["document"]["content"].clone();
+    let mut content = document["page"]["model"].clone();
     if !content["security"].is_object() {
         content["security"] = serde_json::json!({});
     }
@@ -374,8 +375,8 @@ async fn update_security(app: &Router, token: &str, patch: Value) -> (StatusCode
     admin(
         app,
         Some(token),
-        "administration.policy",
-        "policy.update",
+        "organization-policy",
+        "organization-policy.set",
         content,
     )
     .await
@@ -403,9 +404,9 @@ async fn enterprise_mode_gates_admin_routes_by_role() {
     let (s, _) = admin(
         &app,
         Some("owner-token"),
-        "administration.access",
-        "member.invite",
-        serde_json::json!({"authority":"new-member","role":"member"}),
+        "people",
+        "people.invitation.create",
+        serde_json::json!({"emails":["new-member@example.test"],"role":"member"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "owner manages members");
@@ -414,9 +415,9 @@ async fn enterprise_mode_gates_admin_routes_by_role() {
     let (s, _) = admin(
         &app,
         Some("member-token"),
-        "administration.access",
-        "member.invite",
-        serde_json::json!({"authority":"q","role":"member"}),
+        "people",
+        "people.invitation.create",
+        serde_json::json!({"emails":["q@example.test"],"role":"member"}),
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "member cannot manage members");
@@ -425,9 +426,9 @@ async fn enterprise_mode_gates_admin_routes_by_role() {
     let (s, _) = admin(
         &app,
         None,
-        "administration.access",
-        "member.invite",
-        serde_json::json!({"authority":"q","role":"member"}),
+        "people",
+        "people.invitation.create",
+        serde_json::json!({"emails":["q@example.test"],"role":"member"}),
     )
     .await;
     assert_eq!(
@@ -440,19 +441,18 @@ async fn enterprise_mode_gates_admin_routes_by_role() {
     let (s, _) = admin(
         &app,
         Some("bogus-token"),
-        "administration.access",
-        "member.invite",
-        serde_json::json!({"authority":"q","role":"member"}),
+        "people",
+        "people.invitation.create",
+        serde_json::json!({"emails":["q@example.test"],"role":"member"}),
     )
     .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "garbage token is unauthorized");
 
     // Reads need Environment admission: a member sees no Administration document
     // (403), while the owner reads the canonical access projection (200).
-    let (s, _) =
-        administration_document(&app, None, Some("member-token"), "administration.access").await;
+    let (s, _) = administration_document(&app, None, Some("member-token"), "people").await;
     assert_eq!(s, StatusCode::FORBIDDEN, "member has no console");
-    let (s, body) = admin_document(&app, "owner-token", "administration.access").await;
+    let (s, body) = admin_document(&app, "owner-token", "people").await;
     assert_eq!(s, StatusCode::OK);
     assert!(body["members"].as_array().unwrap().len() >= 2);
 }
@@ -621,9 +621,9 @@ async fn privileged_role_grants_are_owner_only_and_scim_refuses_them() {
     let (s, body) = admin(
         &app,
         Some("admin-a-token"),
-        "administration.access",
-        "member.invite",
-        serde_json::json!({"authority": "new-admin", "role": "admin"}),
+        "people",
+        "people.invitation.create",
+        serde_json::json!({"emails": ["new-admin@example.test"], "role": "admin"}),
     )
     .await;
     assert_eq!(
@@ -637,8 +637,8 @@ async fn privileged_role_grants_are_owner_only_and_scim_refuses_them() {
     let (s, body) = admin(
         &app,
         Some("admin-a-token"),
-        "administration.access",
-        "member.role.set",
+        "people",
+        "people.role.change",
         serde_json::json!({"id": "alice", "role": "owner"}),
     )
     .await;
@@ -652,8 +652,8 @@ async fn privileged_role_grants_are_owner_only_and_scim_refuses_them() {
     let (s, body) = admin(
         &app,
         Some("owner-token"),
-        "administration.access",
-        "member.role.set",
+        "people",
+        "people.role.change",
         serde_json::json!({"id": "member-auth", "role": "admin"}),
     )
     .await;
@@ -663,8 +663,8 @@ async fn privileged_role_grants_are_owner_only_and_scim_refuses_them() {
     let (s, body) = admin(
         &app,
         Some("owner-token"),
-        "administration.identity",
-        "group-mapping.set",
+        "enterprise-identity",
+        "enterprise-identity.group-mapping.add",
         serde_json::json!({"group": "eng-leads", "role": "admin"}),
     )
     .await;
@@ -678,8 +678,8 @@ async fn privileged_role_grants_are_owner_only_and_scim_refuses_them() {
     let (s, body) = admin(
         &app,
         Some("owner-token"),
-        "administration.identity",
-        "group-mapping.set",
+        "enterprise-identity",
+        "enterprise-identity.group-mapping.add",
         serde_json::json!({"group": "eng", "role": "member"}),
     )
     .await;
@@ -695,8 +695,8 @@ async fn team_scoped_admin_cannot_administer_another_team() {
     let (s, _) = admin(
         &app,
         Some("admin-a-token"),
-        "administration.access",
-        "member.role.set",
+        "people",
+        "people.role.change",
         serde_json::json!({"id":"alice","role":"viewer"}),
     )
     .await;
@@ -706,8 +706,8 @@ async fn team_scoped_admin_cannot_administer_another_team() {
     let (s, _) = admin(
         &app,
         Some("admin-a-token"),
-        "administration.access",
-        "member.role.set",
+        "people",
+        "people.role.change",
         serde_json::json!({"id":"bob","role":"viewer"}),
     )
     .await;
@@ -717,8 +717,8 @@ async fn team_scoped_admin_cannot_administer_another_team() {
     let (s, _) = admin(
         &app,
         Some("owner-token"),
-        "administration.access",
-        "member.role.set",
+        "people",
+        "people.role.change",
         serde_json::json!({"id":"bob","role":"viewer"}),
     )
     .await;
@@ -823,8 +823,7 @@ async fn enterprise_mode_gates_data_routes_for_active_members() {
     assert_eq!(s, StatusCode::OK, "health stays exempt");
 
     // Administration admission is unchanged: a member still has no console access.
-    let (s, _) =
-        administration_document(&app, None, Some("member-token"), "administration.access").await;
+    let (s, _) = administration_document(&app, None, Some("member-token"), "people").await;
     assert_eq!(
         s,
         StatusCode::FORBIDDEN,
@@ -842,15 +841,15 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
     let (s, _) = admin(
         &app,
         Some("owner-token"),
-        "administration.access",
-        "grant.add",
+        "people",
+        "project-access.grant",
         serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "owner grants a member a project");
 
     // The grant shows up in the canonical access document.
-    let (s, grants) = admin_document(&app, "owner-token", "administration.access").await;
+    let (s, grants) = admin_document(&app, "owner-token", "people").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(grants["grants"].as_array().unwrap().len(), 1);
 
@@ -930,8 +929,8 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
     let (s, _) = admin(
         &app,
         Some("owner-token"),
-        "administration.access",
-        "grant.revoke",
+        "people",
+        "project-access.revoke",
         serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
     )
     .await;
@@ -956,8 +955,8 @@ async fn secaud4_audits_sensitive_reads_when_enabled() {
     let (s, _) = admin(
         &app,
         Some("owner-token"),
-        "administration.access",
-        "grant.add",
+        "people",
+        "project-access.grant",
         serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
     )
     .await;
@@ -1009,8 +1008,8 @@ async fn secaud4_reads_are_not_audited_by_default() {
     let (s, _) = admin(
         &app,
         Some("owner-token"),
-        "administration.access",
-        "grant.add",
+        "people",
+        "project-access.grant",
         serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
     )
     .await;
@@ -1109,8 +1108,8 @@ async fn entsec2_scopes_the_workspace_nav_content() {
     let (s, _) = admin(
         &app,
         Some("owner-token"),
-        "administration.access",
-        "grant.add",
+        "people",
+        "project-access.grant",
         serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
     )
     .await;
@@ -1232,31 +1231,34 @@ async fn entsec5_path_context_ingest_disabled_in_enterprise() {
     );
 }
 
-/// ITGOV-2: the Administration clients document lists members active on the data
-/// routes, is Environment-admission gated, and never exposes a bearer.
+/// ITGOV-2: the Administration Sessions page lists exact-tenant clients admitted
+/// through Administration or data routes, is GaugeApp-admission gated, and never
+/// exposes a bearer.
 #[tokio::test]
 async fn itgov2_session_roster_lists_active_members() {
     let (_dir, app) = workbench_with_idp();
     // The member is not on the roster yet (no data-route activity from them).
-    let (s, roster) = admin_document(&app, "owner-token", "administration.clients").await;
+    let (s, roster) = admin_document(&app, "owner-token", "sessions").await;
     assert_eq!(s, StatusCode::OK);
     assert!(
         !roster["sessions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|r| r["authority"] == "member-auth"),
+            .any(|r| r["person"]["authority"] == "member-auth"),
         "member absent before their first request: {roster}"
     );
 
     // The member makes an authenticated data request → they appear in the roster.
     let (s, _) = send(&app, "GET", "/workspace", None, Some("member-token")).await;
     assert_eq!(s, StatusCode::OK);
-    let (s, roster) = admin_document(&app, "owner-token", "administration.clients").await;
+    let (s, roster) = admin_document(&app, "owner-token", "sessions").await;
     assert_eq!(s, StatusCode::OK, "{roster}");
     let sessions = roster["sessions"].as_array().unwrap();
     assert!(
-        sessions.iter().any(|r| r["authority"] == "member-auth"),
+        sessions
+            .iter()
+            .any(|r| r["person"]["authority"] == "member-auth"),
         "the active member is on the roster: {roster}"
     );
     // The roster never carries a bearer/token field.
@@ -1268,8 +1270,7 @@ async fn itgov2_session_roster_lists_active_members() {
     );
 
     // A plain member has no console access → the roster read is forbidden.
-    let (s, _) =
-        administration_document(&app, None, Some("member-token"), "administration.clients").await;
+    let (s, _) = administration_document(&app, None, Some("member-token"), "sessions").await;
     assert_eq!(
         s,
         StatusCode::FORBIDDEN,
@@ -1296,8 +1297,8 @@ async fn itgov4_home_enforces_software_policy_and_preserves_recovery() {
     let (s, body) = admin(
         &app,
         Some("owner-token"),
-        "administration.software-policy",
-        "software-policy.update",
+        "software-policy",
+        "software-policy.set",
         grace_policy,
     )
     .await;
@@ -1305,14 +1306,13 @@ async fn itgov4_home_enforces_software_policy_and_preserves_recovery() {
 
     let (s, _) = send_client(&app, "GET", "/workspace", None, Some("member-token"), old).await;
     assert_eq!(s, StatusCode::OK, "grace warns instead of refusing");
-    let (s, roster) =
-        admin_document_for_client(&app, "owner-token", "administration.clients", current).await;
+    let (s, roster) = admin_document_for_client(&app, "owner-token", "sessions", current).await;
     assert_eq!(s, StatusCode::OK, "{roster}");
     let member = roster["sessions"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|row| row["authority"] == "member-auth")
+        .find(|row| row["person"]["authority"] == "member-auth")
         .unwrap();
     assert_eq!(member["software_status"], "warning", "{roster}");
     assert_eq!(member["client"]["version"], "1.9.0", "{roster}");
@@ -1327,8 +1327,8 @@ async fn itgov4_home_enforces_software_policy_and_preserves_recovery() {
     let (s, _) = admin(
         &app,
         Some("owner-token"),
-        "administration.software-policy",
-        "software-policy.update",
+        "software-policy",
+        "software-policy.set",
         enforced_policy,
     )
     .await;
@@ -1369,14 +1369,13 @@ async fn itgov4_home_enforces_software_policy_and_preserves_recovery() {
     );
     assert_eq!(policy["software_policy"]["minimum_version"], "2.0.0");
 
-    let (s, roster) =
-        admin_document_for_client(&app, "owner-token", "administration.clients", current).await;
+    let (s, roster) = admin_document_for_client(&app, "owner-token", "sessions", current).await;
     assert_eq!(s, StatusCode::OK, "{roster}");
     let member = roster["sessions"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|row| row["authority"] == "member-auth")
+        .find(|row| row["person"]["authority"] == "member-auth")
         .unwrap();
     assert_eq!(member["software_status"], "blocked", "{roster}");
     assert!(member["software_reason"]

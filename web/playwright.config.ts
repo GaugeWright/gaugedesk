@@ -130,9 +130,15 @@ export default defineConfig({
             env: {
                 ENTERPRISE_PORT: String(ports.enterprise),
                 GAUGEDESK_E2E_STATE: enterpriseState,
+                GAUGEDESK_ACCOUNT_RP_ID: "localhost",
+                GAUGEDESK_ACCOUNT_ORIGIN: new URL(enterpriseAppURL).origin.replace(
+                    "127.0.0.1",
+                    "localhost",
+                ),
                 GAUGEDESK_ALLOWED_ORIGINS: [
                     previewURL,
                     new URL(enterpriseAppURL).origin,
+                    new URL(enterpriseAppURL).origin.replace("127.0.0.1", "localhost"),
                 ].join(","),
             },
         },

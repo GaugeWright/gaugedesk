@@ -112,6 +112,127 @@ pub fn workspace_value(wb: &Workbench) -> serde_json::Value {
     wb.workspace_value()
 }
 
+/// The organization-wide Projects GaugeApp is a control index, not another
+/// workspace projection.  Keep its wire model deliberately narrower than
+/// [`workspace_value`]: project contents, chat names, target paths, Agent
+/// configuration, and deployment payloads remain inside the serving Home.
+///
+/// `org` comes from the directory authority while `wb` is the exact Home that
+/// owns the projects.  Hosted compositions can therefore join the two narrow
+/// authorities without teaching the blind Hub to hold project content.
+pub fn administration_projects_value(
+    wb: &Workbench,
+    org: &crate::org::Org,
+    home_label: &str,
+    home_state: &str,
+    can_create: bool,
+) -> serde_json::Value {
+    let workspace = workspace_value(wb);
+    let active_authorities = org
+        .members
+        .values()
+        .filter(|member| member.status == crate::org::MembershipStatus::Active)
+        .map(|member| member.authority.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let projects = workspace
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|project| {
+            let id = project.get("id")?.as_str()?;
+            let name = project.get("name")?.as_str()?;
+            let home_id = project.get("home_id")?.as_str()?;
+            let placements = project
+                .get("placements")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            // The built-in general placement is implementation machinery, not
+            // an Agent an administrator deliberately placed on the project.
+            let visible_placements = placements
+                .iter()
+                .filter(|placement| {
+                    !placement
+                        .get("is_default")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
+            let pending_placements = visible_placements
+                .iter()
+                .filter(|placement| {
+                    placement
+                        .get("pending")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .count();
+            let work_targets = project
+                .get("targets")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            let access_grants = org
+                .grants
+                .values()
+                .filter(|grant| {
+                    grant.project_id == id
+                        && active_authorities.contains(grant.authority.as_str())
+                })
+                .count();
+            Some(json!({
+                "id": id,
+                "name": name,
+                "authority": project.get("authority").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                "is_personal": project.get("is_personal").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                "home": {
+                    "id": home_id,
+                    "label": home_label,
+                    "state": home_state,
+                },
+                "access_grants": access_grants,
+                "agent_placements": visible_placements.len(),
+                "pending_placements": pending_placements,
+                "work_targets": work_targets,
+                "network_isolated": project.get("network_isolated").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                "freshness": "home-live",
+            }))
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "state": "live",
+        "reason": serde_json::Value::Null,
+        "can_create": can_create,
+        "home": {
+            "id": wb.home_id().as_str(),
+            "label": home_label,
+            "state": home_state,
+        },
+        "projects": projects,
+    })
+}
+
+/// The People page needs labels for its project-access picker, not a second
+/// copy of workspace contents.  Return only the reference needed to address an
+/// exact Home on the subsequent access command.
+pub fn administration_project_references_value(wb: &Workbench) -> serde_json::Value {
+    let values = workspace_value(wb)
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|project| {
+            Some(json!({
+                "id": project.get("id")?.as_str()?,
+                "name": project.get("name")?.as_str()?,
+                "is_personal": project.get("is_personal").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                "home_id": project.get("home_id")?.as_str()?,
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(values)
+}
+
 /// Resolve one workspace-change reference into the smallest self-contained slice
 /// of the workspace projection that can repair a client tree. The event stream
 /// carries only `(record, id, op)` (INV-10); this resolver returns current
@@ -740,74 +861,156 @@ pub async fn create_project(
             .into_response();
     }
     let id = gen_id("proj");
-    write_project(
-        &mut wb,
-        ProjectRecord {
-            schema: crate::library::LIBRARY_RECORD_SCHEMA,
-            extra: Default::default(),
-            id: id.clone(),
-            op: RecordOp::Upsert,
-            name: body.name.clone(),
-            is_default: false,
-            home_id: home_id.clone(),
-            network_isolated: false,
-            run_purpose: None,
-            deployment_mode: None,
-        },
-    );
-    wb.write_project_collaboration_workspace_record(ProjectCollaborationWorkspaceRecord {
-        project_id: id.clone(),
-        workspace_id: format!("project-workspace-{id}"),
-        home_id: home_id.clone(),
-        substrate: "whipplescript".to_owned(),
-        host_contract_revision: crate::workstream_host_contract::REVISION.to_owned(),
-        host_contract_digest: crate::workstream_host_contract::DIGEST.to_owned(),
-        op: RecordOp::Upsert,
-        schema: LIBRARY_RECORD_SCHEMA,
-        extra: Default::default(),
-    });
-    if let Err(error) = wb.ensure_project_collaboration_workspace(&id) {
-        wb.delete_project_cascade(&id);
-        return (
+    match create_named_project(&mut wb, &id, &body.name) {
+        Ok(project) => (StatusCode::CREATED, Json(project)).into_response(),
+        Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": error })),
         )
-            .into_response();
+            .into_response(),
     }
-    let target_id = match wb.create_managed_project_target(&id, format!("{} files", body.name)) {
-        Ok(target_id) => target_id,
+}
+
+/// Create or resume one exact project identity on this Home.
+///
+/// The ordinary route supplies a random id. Reviewed GaugeApp creation instead
+/// derives `id` from the durable operation id, so a crash after Home work but
+/// before the Hub receipt can safely resume the same project rather than create
+/// a second one. Every child identity is deterministic and each filesystem step
+/// is an ensure, making this the shared Home-owned lifecycle rather than a
+/// second Administration implementation.
+pub fn create_named_project(
+    wb: &mut Workbench,
+    id: &str,
+    requested_name: &str,
+) -> Result<serde_json::Value, String> {
+    let name = requested_name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err("project name must be between 1 and 120 characters".to_owned());
+    }
+    let home_id = wb.home_id().clone();
+    let existing = workspace_value(wb)
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|projects| {
+            projects
+                .iter()
+                .find(|project| project.get("id").and_then(serde_json::Value::as_str) == Some(id))
+                .cloned()
+        });
+    let created = existing.is_none();
+    if let Some(existing) = &existing {
+        if existing.get("name").and_then(serde_json::Value::as_str) != Some(name)
+            || existing.get("home_id").and_then(serde_json::Value::as_str) != Some(home_id.as_str())
+        {
+            return Err(
+                "project operation identity is already bound to another project".to_owned(),
+            );
+        }
+    } else {
+        write_project(
+            wb,
+            ProjectRecord {
+                schema: crate::library::LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+                id: id.to_owned(),
+                op: RecordOp::Upsert,
+                name: name.to_owned(),
+                is_default: false,
+                home_id: home_id.clone(),
+                network_isolated: false,
+                run_purpose: None,
+                deployment_mode: None,
+            },
+        );
+    }
+
+    // A retry repairs a crash between the project row and this declaration,
+    // while an exact completed retry remains entirely inert.
+    if !wb.has_project_collaboration_workspace(id) {
+        wb.write_project_collaboration_workspace_record(ProjectCollaborationWorkspaceRecord {
+            project_id: id.to_owned(),
+            workspace_id: format!("project-workspace-{id}"),
+            home_id: home_id.clone(),
+            substrate: "whipplescript".to_owned(),
+            host_contract_revision: crate::workstream_host_contract::REVISION.to_owned(),
+            host_contract_digest: crate::workstream_host_contract::DIGEST.to_owned(),
+            op: RecordOp::Upsert,
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+        });
+    }
+    let finish = (|| {
+        wb.ensure_project_collaboration_workspace(id)?;
+        let target_id = wb.create_managed_project_target(id, format!("{name} files"))?;
+        let placement_id = general_placement_id(id);
+        let placement_exists = workspace_value(wb)
+            .get("projects")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|projects| {
+                projects.iter().find(|project| {
+                    project.get("id").and_then(serde_json::Value::as_str) == Some(id)
+                })
+            })
+            .and_then(|project| project.get("placements"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|placements| {
+                placements.iter().any(|placement| {
+                    placement
+                        .get("placement_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(placement_id.as_str())
+                })
+            });
+        let placement = if placement_exists {
+            Some(placement_id)
+        } else {
+            // Bare/federation test Homes can intentionally omit the built-in
+            // Agent. Preserve the established project lifecycle: creation is
+            // still valid and a configured Home receives the placement.
+            place_archetype_with_id(wb, id, DEFAULT_AGENT, &placement_id).ok()
+        };
+        Ok::<_, String>((target_id, placement))
+    })();
+    let (target_id, placement) = match finish {
+        Ok(result) => result,
         Err(error) => {
-            wb.delete_project_cascade(&id);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": error })),
-            )
-                .into_response();
+            if created {
+                wb.delete_project_cascade(id);
+            }
+            return Err(error);
         }
     };
-    // Every project gets a built-in general placement at creation — the default
-    // archetype installed on it under a deterministic id, mirroring the Personal
-    // project. A project is therefore a real placement home the moment it exists: it
-    // hosts plain work chats and workstreams with no manual "place an archetype" step,
-    // and the nav shows those chats directly under the project (the general placement is
-    // implementation detail, never a node). Deliberately placing other archetypes adds
-    // visible placements alongside it.
-    let placement =
-        place_archetype_with_id(&mut wb, &id, DEFAULT_AGENT, &general_placement_id(&id)).ok();
-    // Advance the onboarding checklist (ADR 0075 Phase 2): the user created their
-    // first real project. Best-effort; the project already exists.
-    wb.advance_onboarding("project", &json!({ "project": id }).to_string());
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "id": id,
-            "name": body.name,
-            "home_id": home_id.as_str(),
-            "placement": placement,
-            "target_id": target_id,
-        })),
-    )
-        .into_response()
+    if created {
+        // Advance the onboarding checklist once; an operation replay is inert.
+        wb.advance_onboarding("project", &json!({ "project": id }).to_string());
+    }
+    Ok(json!({
+        "id": id,
+        "name": name,
+        "home_id": home_id.as_str(),
+        "placement": placement,
+        "target_id": target_id,
+    }))
+}
+
+/// Whether one exact idempotent project-create operation already reached this
+/// Home. This is deliberately narrower than a general project lookup: it is
+/// used only to recover the receipt after the Home effect committed first.
+pub fn named_project_matches(wb: &Workbench, id: &str, requested_name: &str) -> bool {
+    let name = requested_name.trim();
+    !name.is_empty()
+        && workspace_value(wb)
+            .get("projects")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|project| {
+                project.get("id").and_then(serde_json::Value::as_str) == Some(id)
+                    && project.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                    && project.get("home_id").and_then(serde_json::Value::as_str)
+                        == Some(wb.home_id().as_str())
+            })
 }
 
 #[derive(Deserialize)]

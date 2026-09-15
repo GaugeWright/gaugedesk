@@ -5,7 +5,7 @@
 import { SignedXml } from "xml-crypto";
 
 /** A signed, base64-encoded SAML Response with the given subject + attributes. */
-export function makeSignedResponse({ subject, audience, attributes, certPem, keyPem }) {
+export function makeSignedResponse({ subject, audience, attributes, certPem, keyPem, requestId, recipient = "http://localhost/saml/acs", issuer = "https://idp.example.com/metadata" }) {
     const assertionId = "_assertion-fixture-1";
     // Fixed, long-lived window so a *committed* fixture never expires (test fixtures
     // assert signature/audience, not clock — verify.test.mjs always sits inside it).
@@ -26,10 +26,10 @@ export function makeSignedResponse({ subject, audience, attributes, certPem, key
     const assertion =
         `<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ` +
         `Version="2.0" ID="${assertionId}" IssueInstant="${past}">` +
-        `<saml:Issuer>https://idp.example.com/metadata</saml:Issuer>` +
+        `<saml:Issuer>${issuer}</saml:Issuer>` +
         `<saml:Subject><saml:NameID>${subject}</saml:NameID>` +
         `<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">` +
-        `<saml:SubjectConfirmationData NotOnOrAfter="${future}" Recipient="http://localhost/saml/acs"/>` +
+        `<saml:SubjectConfirmationData NotOnOrAfter="${future}" Recipient="${recipient}"${requestId ? ` InResponseTo="${requestId}"` : ""}/>` +
         `</saml:SubjectConfirmation></saml:Subject>` +
         `<saml:Conditions NotBefore="${past}" NotOnOrAfter="${future}">` +
         `<saml:AudienceRestriction><saml:Audience>${audience}</saml:Audience></saml:AudienceRestriction>` +
@@ -60,8 +60,8 @@ export function makeSignedResponse({ subject, audience, attributes, certPem, key
     const response =
         `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ` +
         `xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" Version="2.0" ` +
-        `ID="_response-fixture-1" IssueInstant="${past}">` +
-        `<saml:Issuer>https://idp.example.com/metadata</saml:Issuer>` +
+        `ID="_response-fixture-1" IssueInstant="${past}"${requestId ? ` InResponseTo="${requestId}"` : ""}>` +
+        `<saml:Issuer>${issuer}</saml:Issuer>` +
         `<samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>` +
         signedAssertion +
         `</samlp:Response>`;

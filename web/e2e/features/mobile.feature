@@ -25,6 +25,16 @@ Feature: Mobile projection client — pair, navigate, send (offline + online)
     When I open the browse pane
     Then the paired environment is shown
 
+  Scenario: Personal project settings are usable on a phone
+    Given I have paired with the ticket "gaugewright-pair://demo-env/device:web-harness"
+    When I open Personal project settings on the device
+    Then the device shows the Personal project settings
+    And Personal project settings do not offer sharing
+    When I switch the device project settings to "Model access"
+    Then the device shows project "Model access"
+    When I leave device project settings
+    Then the device shows the Projects browser
+
   Scenario: a chat started on the device shows up on the desktop
     # The device and desktop are two clients of one control plane: a chat started on
     # the device must be the same kind the desktop's quick-start makes (a WORK chat,

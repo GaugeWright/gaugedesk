@@ -64,7 +64,10 @@ import {
     browserRouteRequest,
     controlPlaneBase,
     isSecureControlPlaneEndpoint,
+    openReconnectingEventStream,
+    reconnectingRouteEventStream,
     RemoteControlPlane,
+    RouteHttpError,
     type RouteEventStream,
     type RouteJson,
     type RouteRequest,
@@ -107,6 +110,32 @@ function isUnprovisionedHomeError(error: unknown): boolean {
     return /POST \/home\/admissions: 403 Home has no active owner/.test(message);
 }
 
+/** A Home restart invalidates its memory-only admissions. This exact refusal is
+ * emitted by the admission middleware before a work route can run, so it is
+ * safe to obtain a fresh admission and retry the same operation once. Other
+ * 401s are account-authentication failures and must not be hidden by reconnects. */
+function isExpiredHomeAdmission(error: unknown): boolean {
+    return error instanceof RouteHttpError
+        && error.status === 401
+        && /target Home admission required/.test(error.message);
+}
+
+async function isExpiredHomeAdmissionResponse(response: Response): Promise<boolean> {
+    if (response.status !== 401 || !response.headers.get("content-type")?.startsWith("application/json")) {
+        return false;
+    }
+    const length = Number(response.headers.get("content-length"));
+    // A missing, invalid, or oversized body is not the admission middleware's
+    // small closed response and must not be read or reinterpreted here.
+    if (!Number.isSafeInteger(length) || length < 1 || length > 256) return false;
+    try {
+        const body = await response.clone().json() as { error?: unknown };
+        return body.error === "target Home admission required";
+    } catch {
+        return false;
+    }
+}
+
 /** App-owned control-plane edge for the open workbench shell. */
 export class WorkbenchControlPlane implements ControlPlane {
     private bearer: string | null = null;
@@ -123,6 +152,7 @@ export class WorkbenchControlPlane implements ControlPlane {
      * and a Home that fails degrades only the projects routed to it. */
     private pool: HomePool<workbenchClient.WorkbenchTransport> | null = null;
     private currentProject: ProjectId | null = null;
+    private readonly restartWorkStreams = new Set<() => void>();
 
     constructor(
         private readonly base = controlPlaneBase(),
@@ -138,29 +168,46 @@ export class WorkbenchControlPlane implements ControlPlane {
         };
         this.route = browserRouteJson(this.base, auth);
         this.request = browserRouteRequest(this.base, auth);
-        this.events = browserRouteEventStream(this.base, auth);
+        const eventSource = browserRouteEventStream(this.base, auth);
+        this.events = reconnectingRouteEventStream(() => eventSource, {
+            beforeReconnect: async (reason) => {
+                if (
+                    !this.splitHomes
+                    && reason?.status === 401
+                    && reason.detail === "target Home admission required"
+                ) {
+                    this.homeAdmission = null;
+                    await this.admitHome();
+                }
+            },
+        });
         this.workTransport = this.splitHomes
             ? {
                   base: "",
-                  json: async (...args) => (await this.requireHomeTransport()).json(...args),
-                  request: async (...args) => {
-                      const request = (await this.requireHomeTransport()).request;
-                      if (!request) throw new Error("Home raw transport unavailable");
-                      return request(...args);
-                  },
-                  events: (path, onMessage, onOpen) => {
-                      let closed = false;
-                      let stop = () => {};
-                      void this.requireHomeTransport()
-                          .then((transport) => {
-                              if (!closed && transport.events) {
-                                  stop = transport.events(path, onMessage, onOpen);
-                              }
-                          })
-                          .catch(() => {});
+                  json: (...args) => this.withHomeAdmissionRetry((transport) => transport.json(...args)),
+                  request: (...args) => this.withHomeRequestAdmissionRetry(...args),
+                  events: (path, onMessage, onOpen, onClose) => {
+                      const subscription = openReconnectingEventStream(
+                          async () => (await this.requireHomeTransport()).events,
+                          path,
+                          onMessage,
+                          onOpen,
+                          onClose,
+                          {
+                              beforeReconnect: async (reason) => {
+                                  if (
+                                      reason?.status === 401
+                                      && reason.detail === "target Home admission required"
+                                  ) {
+                                      await this.invalidateHomeTransport(this.currentProject);
+                                  }
+                              },
+                          },
+                      );
+                      this.restartWorkStreams.add(subscription.reconnect);
                       return () => {
-                          closed = true;
-                          stop();
+                          this.restartWorkStreams.delete(subscription.reconnect);
+                          subscription.close();
                       };
                   },
               }
@@ -170,6 +217,44 @@ export class WorkbenchControlPlane implements ControlPlane {
                   request: this.request,
                   events: this.events,
               };
+    }
+
+    /** Retry only the pre-effect expired-admission refusal, once, and only while
+     * the same project remains selected. The pool has already marked a routed
+     * connection non-live through its authorization callback; clearing this
+     * cached transport makes the next resolution disconnect it and re-admit.
+     * A selected endpoint outside the pool is likewise re-admitted. */
+    private async withHomeAdmissionRetry<T>(
+        operation: (transport: workbenchClient.WorkbenchTransport) => Promise<T>,
+    ): Promise<T> {
+        const project = this.currentProject;
+        try {
+            return await operation(await this.requireHomeTransport());
+        } catch (error) {
+            if (!isExpiredHomeAdmission(error) || this.currentProject !== project) throw error;
+            await this.invalidateHomeTransport(project);
+            return operation(await this.requireHomeTransport());
+        }
+    }
+
+    private async withHomeRequestAdmissionRetry(...args: Parameters<RouteRequest>): Promise<Response> {
+        const project = this.currentProject;
+        const request = async () => {
+            const transport = await this.requireHomeTransport();
+            if (!transport.request) throw new Error("Home raw transport unavailable");
+            return transport.request(...args);
+        };
+        const response = await request();
+        if (this.currentProject !== project || !(await isExpiredHomeAdmissionResponse(response))) {
+            return response;
+        }
+        await this.invalidateHomeTransport(project);
+        return request();
+    }
+
+    private async invalidateHomeTransport(project: ProjectId | null): Promise<void> {
+        if (project) await this.pool?.invalidateProject(project);
+        this.homeTransport = null;
     }
 
     setBearer(token: string | null): void {
@@ -336,6 +421,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         // Only the per-project path is invalidated; other Homes in the pool keep
         // their connections, which is the point of holding several.
         this.homeTransport = null;
+        for (const reconnect of this.restartWorkStreams) reconnect();
     }
 
     /** Resolve the transport for the work in hand.
@@ -370,7 +456,19 @@ export class WorkbenchControlPlane implements ControlPlane {
         project: ProjectId,
     ): Promise<workbenchClient.WorkbenchTransport> {
         const pool = await this.homePool();
-        const route = pool.routeFor(project);
+        let route: OpaqueHomeRoute;
+        try {
+            route = pool.routeFor(project);
+        } catch (error) {
+            // A project may have been created after this browser built its Home
+            // pool. Re-read the account projection once before treating it as a
+            // legacy unrouted project; otherwise a newly created project opens
+            // against the previously selected Home and can display another
+            // project's workspace.
+            if (!String(error).includes("no granted Home route")) throw error;
+            pool.replaceRoutes(await this.homeRoutes());
+            route = pool.routeFor(project);
+        }
         // A relay-only route is not dialable without a tunnel module. That is
         // an absence of a usable route, not a broken connection, so it reads as
         // one and the account's selected Home serves instead.
@@ -1255,8 +1353,8 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.subscribe(this.workbenchTransport(), id, onEvent, onOpen);
     }
 
-    subscribeWorkspace(onChange: (change: WorkspaceChange) => void): () => void {
-        return workbenchClient.subscribeWorkspace(this.workbenchTransport(), onChange);
+    subscribeWorkspace(onChange: (change: WorkspaceChange) => void, onOpen?: () => void): () => void {
+        return workbenchClient.subscribeWorkspace(this.workbenchTransport(), onChange, onOpen);
     }
 
     getResourceReview(id: EngagementId, resource: string): Promise<ReviewState> {
@@ -1752,6 +1850,44 @@ export class WorkbenchControlPlane implements ControlPlane {
     projectCredentials(project: string): Promise<accountClient.LinkedProvider[]> {
         return this.runtimeAccountJson().then((json) =>
             accountClient.projectCredentials(json, project),
+        );
+    }
+
+    projectOrganizationModelOptions(
+        project: string,
+    ): Promise<accountClient.ProjectOrganizationModelOptions> {
+        // Organization connection discovery belongs to the account/organization
+        // plane. The returned project/Home identity is checked again by the
+        // strict reader; no credential or project payload crosses this route.
+        return accountClient.projectOrganizationModelOptions(this.routeJson(), project);
+    }
+
+    projectOrganizationModelSelection(
+        project: string,
+    ): Promise<accountClient.ProjectOrganizationModelSelection | null> {
+        return this.runtimeAccountJson().then((json) =>
+            accountClient.projectOrganizationModelSelection(json, project),
+        );
+    }
+
+    selectProjectOrganizationModel(
+        project: string,
+        input: {
+            readonly binding: accountClient.OrganizationModelAuthorityBinding;
+            readonly connection: string;
+            readonly model: string;
+            readonly privateBroker: string;
+            readonly admitPrivatePlaintext: true;
+        },
+    ): Promise<accountClient.ProjectOrganizationModelSelection> {
+        return this.runtimeAccountJson().then((json) =>
+            accountClient.selectProjectOrganizationModel(json, project, input),
+        );
+    }
+
+    clearProjectOrganizationModelSelection(project: string): Promise<void> {
+        return this.runtimeAccountJson().then((json) =>
+            accountClient.clearProjectOrganizationModelSelection(json, project),
         );
     }
 

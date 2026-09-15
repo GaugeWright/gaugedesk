@@ -27,7 +27,13 @@ const CP_KEY = "gw.cp";
 /** The solo default: the co-resident headless control plane (DEPLOY-5). `:7878` in dev/desktop;
  *  the e2e harness overrides it per run via `VITE_CP_BASE` for concurrency-safety (e2e/run.mjs). */
 export const SOLO_CONTROL_PLANE =
-    (import.meta.env?.VITE_CP_BASE as string | undefined) ?? "http://127.0.0.1:7878";
+    (import.meta.env?.VITE_CP_BASE as string | undefined)
+    ?? (import.meta.env?.MODE === "mobile"
+        ? import.meta.env?.VITE_ACCOUNT_BASE as string | undefined
+        : undefined)
+    ?? (import.meta.env?.MODE === "mobile"
+        ? "https://auth.gaugewright.com"
+        : "http://127.0.0.1:7878");
 
 /** Whether a control-plane endpoint may be connected (ENTSEC-3): **https**, or a **loopback**
  *  host on any scheme (the co-resident solo default / a dev second backend). A non-loopback

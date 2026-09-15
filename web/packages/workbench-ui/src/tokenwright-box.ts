@@ -1,20 +1,17 @@
-/** Binding a TokenWright session to the controls a View can run.
+/** Binding a TokenWright session to purpose-built controls.
  *
- * The bundle describes presentation; this is where authority enters, and it
- * enters from exactly one place — the session grant. A command the grant does
- * not carry never becomes runnable, and the renderer draws it as an inert
- * "Unavailable in this session" control rather than a button that fails when
- * pressed.
+ * Pinned declarations provide labels; authority enters from exactly one place
+ * — the current session grant. A command the grant does not carry never becomes
+ * runnable.
  */
 
 import {
-    proposeManagementDocumentChange,
-    submitManagementCommand,
-    type ManagementEnvironmentReceipt,
-    type ManagementEnvironmentSession,
+    proposeTokenWrightDocumentChange,
+    submitTokenWrightCommand,
+    type TokenWrightReceipt,
+    type TokenWrightSession,
     type RouteJson,
 } from "@gaugewright/control-plane-client";
-import type { EnvironmentViewCommand, EnvironmentViewRegistry } from "./EnvironmentDocumentView";
 import { TOKENWRIGHT_COMMANDS } from "./tokenwright-environment";
 
 /** Labels for the commands the box advertises, so a granted control reads as
@@ -23,12 +20,17 @@ const LABELS = new Map(TOKENWRIGHT_COMMANDS.map((command) => [command.id, comman
 
 export interface TokenWrightCommandBinding {
     readonly json: RouteJson;
-    readonly session: ManagementEnvironmentSession;
+    readonly session: TokenWrightSession;
     /** Read at press time, never captured. */
     readonly revisionOf: (documentId: string) => string | undefined;
-    readonly onReceipt?: (receipt: ManagementEnvironmentReceipt) => void;
+    readonly onReceipt?: (receipt: TokenWrightReceipt) => void;
     /** Injectable so a test does not depend on `crypto.randomUUID`. */
     readonly newIdempotencyKey?: () => string;
+}
+
+export interface TokenWrightCommandAction {
+    readonly label?: string;
+    readonly run: () => Promise<void>;
 }
 
 function defaultKey(): string {
@@ -43,8 +45,8 @@ function defaultKey(): string {
  */
 export function tokenwrightCommandsFrom(
     binding: TokenWrightCommandBinding,
-): Readonly<Record<string, EnvironmentViewCommand>> {
-    const commands: Record<string, EnvironmentViewCommand> = {};
+): Readonly<Record<string, TokenWrightCommandAction>> {
+    const commands: Record<string, TokenWrightCommandAction> = {};
     const newKey = binding.newIdempotencyKey ?? defaultKey;
 
     for (const grant of binding.session.documents) {
@@ -60,7 +62,7 @@ export function tokenwrightCommandsFrom(
                     if (baseRevision === undefined) {
                         throw new Error(`No revision for ${grant.id}; re-read the document first.`);
                     }
-                    const receipt = await submitManagementCommand(
+                    const receipt = await submitTokenWrightCommand(
                         binding.json,
                         {
                             session_id: binding.session.id,
@@ -96,57 +98,32 @@ export function tokenwrightCommandsFrom(
 
 /** Select a model, which is a literal edit rather than a command.
  *
- * TokenWright's commands take no parameters and the View vocabulary cannot bind
- * one, so the only way to say *which* model is to edit the document's `desired`
- * block. The guard in `proposeManagementDocumentChange` refuses this when the
+ * TokenWright's commands take no parameters, so selecting *which* model edits
+ * the document's `desired` block. The TokenWright client refuses this when the
  * grant does not mark the document editable.
  */
 export async function setTokenWrightDesired(
     json: RouteJson,
     input: {
-        readonly session: ManagementEnvironmentSession;
+        readonly session: TokenWrightSession;
         readonly documentId: string;
         readonly baseRevision: string;
         readonly desired: Record<string, unknown>;
     },
     idempotencyKey?: string,
-): Promise<ManagementEnvironmentReceipt> {
-    // ONLY the editable block goes back. This used to send the whole document
-    // with `desired` swapped, on the belief that "the box refuses a body that
-    // alters any projected field, so a trimmed document would be rejected".
-    // That belief was wrong, and it was the source of an intermittent 422.
-    //
-    // The box compares the projected fields THE CLIENT SENT against current —
-    // it iterates the request body, not the stored document — so a body
-    // carrying only `desired` is accepted and never enters the comparison.
-    // Echoing them back opts into a race instead: `tokenwright.access`
-    // projects live relay and direct status, and every key's `last_used_at`,
-    // which the box stamps at whole-second granularity. Read the document,
-    // cross a second boundary while a key is in use, send the projection back,
-    // and it no longer matches what the box now holds — 422 `projected_field`
-    // on an edit that was never stale in any sense the operator would
-    // recognise. Staleness is `base_revision`'s job and it is already checked.
-    //
-    // TokenWright pins the trimmed body in `tests/test_documents.py`
-    // (`test_a_body_carrying_only_the_editable_block_is_accepted`), so this
-    // cannot start failing silently if that contract is ever tightened.
-    return proposeManagementDocumentChange(
+): Promise<TokenWrightReceipt> {
+    // Only the editable block. Echoing live projections creates a race when
+    // authentication updates last_used_at between the read and the write.
+    // baseRevision guards the editable basis; omitted projections stay owned
+    // by the box (upstream d103aa38 / #556).
+    return proposeTokenWrightDocumentChange(
         json,
         {
             session: input.session,
             documentId: input.documentId,
             baseRevision: input.baseRevision,
             content: { desired: input.desired },
-            client: "edit",
         },
         idempotencyKey ?? defaultKey(),
     );
-}
-
-/** The registry a TokenWright panel hands the shared renderer. */
-export function tokenwrightRegistryFor(
-    binding: TokenWrightCommandBinding,
-    base: Omit<EnvironmentViewRegistry, "commands">,
-): EnvironmentViewRegistry {
-    return { ...base, commands: tokenwrightCommandsFrom(binding) };
 }

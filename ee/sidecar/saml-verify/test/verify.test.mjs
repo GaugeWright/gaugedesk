@@ -12,6 +12,9 @@ import { makeSignedResponse } from "./make-fixture.mjs";
 
 const VERIFY = fileURLToPath(new URL("../verify.mjs", import.meta.url));
 const AUDIENCE = "gaugewright-sp";
+const CALLBACK = "https://desk.example.test/auth/saml/acs";
+const REQUEST_ID = "_browser-request-1";
+const IDP_ISSUER = "https://idp.example.com/metadata";
 
 function pem(attrs) {
     const r = selfsigned.generate(attrs || [{ name: "commonName", value: "idp.example.com" }], {
@@ -57,6 +60,23 @@ test("accepts a valid signed assertion and maps subject + attributes", async () 
     // The replay-defense fields the Rust side needs for single-use enforcement.
     assert.equal(verdict.assertion_id, "_assertion-fixture-1", "assertion id is emitted");
     assert.equal(typeof verdict.not_on_or_after, "number", "expiry is emitted as epoch ms");
+});
+
+test("binds a browser response to the exact request, ACS, and IdP issuer", async () => {
+    const { cert, key } = pem();
+    const response = (overrides = {}) => makeSignedResponse({
+        subject: "alice@acme.com", audience: AUDIENCE, attributes: {}, certPem: cert, keyPem: key,
+        requestId: REQUEST_ID, recipient: CALLBACK, issuer: IDP_ISSUER, ...overrides,
+    });
+    const request = (saml_response, overrides = {}) => ({
+        saml_response, idp_cert: cert, audience: AUDIENCE,
+        request_id: REQUEST_ID, callback_url: CALLBACK, idp_issuer: IDP_ISSUER, ...overrides,
+    });
+
+    assert.equal((await runVerify(request(response()))).ok, true);
+    assert.equal((await runVerify(request(response({ requestId: "_wrong-request" })))).ok, false);
+    assert.equal((await runVerify(request(response({ recipient: "https://evil.example.test/acs" })))).ok, false);
+    assert.equal((await runVerify(request(response({ issuer: "https://other-idp.example.test" })))).ok, false);
 });
 
 test("rejects a tampered assertion (signature no longer matches)", async () => {

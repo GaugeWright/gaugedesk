@@ -43,11 +43,14 @@ export const PANE_LABEL: Record<PaneKind, string> = {
 
 /** The pane toggle for a state: every pane in canonical order, each tagged
  *  current/reachable so the island can box the active one and grey the rest. */
-export function toggleSegments(state: CarouselState): ToggleSegment[] {
+export function toggleSegments(
+    state: CarouselState,
+    labels: Partial<Record<PaneKind, string>> = {},
+): ToggleSegment[] {
     const visibility = paneVisibility(state.selection);
     return PANE_ORDER.map((pane) => ({
         pane,
-        label: PANE_LABEL[pane],
+        label: labels[pane] ?? PANE_LABEL[pane],
         current: pane === state.current,
         reachable: visibility[pane],
     }));

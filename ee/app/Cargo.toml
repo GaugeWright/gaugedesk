@@ -22,12 +22,14 @@ gaugedesk-store = { path = "../../crates/store" }
 gaugedesk-app = { path = "../../crates/app", default-features = false }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.2"
 sha2 = "0.11"
 hex = "0.4"
+quick-xml = "0.41"
 # OIDC SSO adapter (M3 ID-3): id-token (JWT) verification behind the
 # `IdentityProvider` seam. `ring` is the crypto backend (already in the tree via
 # tokio-rustls), keeping the build OpenSSL- and cmake-free to match the app's
@@ -40,6 +42,9 @@ hex = "0.4"
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
 # base64 for the enterprise OIDC auth-code state/claims decoding (ID-3).
 base64 = "0.23"
+flate2 = "1"
+urlencoding = "2"
+time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
 gaugedesk-workspace = { path = "../../crates/workspace" }

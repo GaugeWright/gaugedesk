@@ -1,5 +1,5 @@
 import { createMemo, createResource, createSignal, For, onCleanup, onMount, Show, type JSX, type Signal } from "solid-js";
-import { RouteResponseError } from "@gaugewright/control-plane-client";
+import { RouteHttpError } from "@gaugewright/control-plane-client";
 import type {
     ProjectId, ProjectTrackerBacklog, ReadableProjectTracker,
     TrackerCompletionIntent, TrackerCompletionResult,
@@ -63,7 +63,7 @@ export function ProjectTrackerPanel(props: {
                 const backlog = selected ? await props.api.readProjectTrackerBacklog(project, selected) : null;
                 return { value: { trackers, backlog } };
             } catch (reason) {
-                if (reason instanceof RouteResponseError) {
+                if (reason instanceof RouteHttpError) {
                     if (reason.status === 401) return { error: "Sign in to read project tasks." };
                     if (reason.status === 403) return { error: "You don’t currently have access to this tracker." };
                     if (reason.status === 503) return { error: "This tracker is unavailable. Refresh to try again." };

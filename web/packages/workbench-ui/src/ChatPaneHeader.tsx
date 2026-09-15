@@ -46,7 +46,7 @@ export interface ChatPaneHeaderProps {
      * disappears rather than spending header width on a constant.
      */
     readonly context?: string;
-    /** `work` / `edit`, kept on the context slot for the browser lane. */
+    /** `work` / `edit` / `management`, kept on the context slot for the browser lane. */
     readonly contextKind?: string;
     /** The line this chat's work lands on — its workstream, or the default mainline. */
     readonly workstream?: string;

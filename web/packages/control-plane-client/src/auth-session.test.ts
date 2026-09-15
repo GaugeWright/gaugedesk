@@ -1,17 +1,42 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     bearer,
+    beginLogin,
+    consumeCallbackToken,
     decodeSubject,
     endSession,
     exchangeMobileAccountHandoff,
+    finishAccountRecovery,
     parseCallbackFragment,
     refreshHostedAccountSession,
     refreshMobileAccountToken,
     setBearer,
+    signInWithPasskey,
     signedIn,
+    startAccountRecovery,
+    startPasskeyAccountCreation,
+    finishPasskeyAccountCreation,
+    workEmailLoginTarget,
 } from "./auth-session";
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("account login navigation", () => {
+    it("normalizes the control-plane base for personal sign-in", () => {
+        const location = { href: "https://desk.example/" };
+        vi.stubGlobal("window", { location });
+
+        beginLogin("https://auth.example///");
+
+        expect(location.href).toBe("https://auth.example/auth/login");
+    });
+
+    it("keeps work-email discovery input out of the target URL", () => {
+        expect(workEmailLoginTarget("https://auth.example///")).toBe(
+            "https://auth.example/auth/work-email",
+        );
+    });
+});
 
 /** Build an unsigned JWT-shaped string with the given payload (base64url, no padding) —
  *  enough to exercise the display-only `sub` decode (the client never verifies). */
@@ -32,6 +57,27 @@ describe("parseCallbackFragment", () => {
         expect(parseCallbackFragment("#")).toBeNull();
         expect(parseCallbackFragment("#error=access_denied")).toBeNull();
         expect(parseCallbackFragment("#id_token=")).toBeNull();
+    });
+
+    it("removes only OIDC fields and leaves another fragment capability for its owner", () => {
+        const replaceState = vi.fn();
+        vi.stubGlobal("window", {
+            location: {
+                hash: "#proposal_proof=one-time-proof&id_token=abc.def.ghi&token_type=Bearer",
+                pathname: "/",
+                search: "?proposal=engagement-1",
+            },
+        });
+        vi.stubGlobal("history", { replaceState });
+
+        expect(consumeCallbackToken()).toBe(true);
+        expect(bearer()).toBe("abc.def.ghi");
+        expect(replaceState).toHaveBeenCalledWith(
+            null,
+            "",
+            "/?proposal=engagement-1#proposal_proof=one-time-proof",
+        );
+        setBearer(null);
     });
 });
 
@@ -110,10 +156,251 @@ describe("endSession", () => {
     });
 });
 
+describe("provider-neutral account recovery", () => {
+    it("starts and finishes the single-use server ceremony without retaining a bearer", async () => {
+        setBearer(null);
+        const fetch = vi.fn()
+            .mockResolvedValueOnce(new Response(JSON.stringify({ challenge_id: "challenge-1", expires_in: 600 }), {
+                status: 202,
+                headers: { "content-type": "application/json" },
+            }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ account_id: "person-one" }), {
+                status: 200,
+                headers: { "content-type": "application/json", "set-cookie": "ignored-by-js" },
+            }));
+        vi.stubGlobal("fetch", fetch);
+
+        await expect(startAccountRecovery("https://auth.example/", "person@example.test"))
+            .resolves.toEqual({ challengeId: "challenge-1", expiresIn: 600 });
+        await expect(finishAccountRecovery(
+            "https://auth.example/", "challenge-1", "123456", "GW-RECOVERY-CODE",
+        )).resolves.toBe("person-one");
+
+        expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+            "https://auth.example/auth/account/recovery/start",
+            "https://auth.example/auth/account/recovery/finish",
+        ]);
+        expect(fetch.mock.calls.every(([, init]) => init?.credentials === "include")).toBe(true);
+        expect(JSON.parse(String(fetch.mock.calls[1]?.[1]?.body))).toEqual({
+            challenge_id: "challenge-1",
+            email_code: "123456",
+            recovery_code: "GW-RECOVERY-CODE",
+        });
+        expect(bearer()).toBeNull();
+    });
+
+    it("fails closed on malformed success and gives rate-limit guidance", async () => {
+        vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ challenge_id: "missing-expiry" }), {
+            status: 202,
+            headers: { "content-type": "application/json" },
+        })));
+        await expect(startAccountRecovery("https://auth.example", "person@example.test"))
+            .rejects.toThrow("response is malformed");
+
+        vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 429 })));
+        await expect(finishAccountRecovery("https://auth.example", "c", "e", "r"))
+            .rejects.toThrow("temporarily limited");
+    });
+});
+
+const bytes = (...value: number[]): ArrayBuffer => new Uint8Array(value).buffer;
+const byteValues = (value: BufferSource | undefined): number[] => {
+    if (!value) return [];
+    return Array.from(value instanceof ArrayBuffer
+        ? new Uint8Array(value)
+        : new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+};
+
+const registrationCredential = {
+    id: "registration-credential",
+    rawId: bytes(250, 251),
+    type: "public-key",
+    authenticatorAttachment: "platform",
+    response: {
+        attestationObject: bytes(1, 2),
+        clientDataJSON: bytes(3, 4),
+        getTransports: () => ["internal"],
+    },
+    getClientExtensionResults: () => ({ credProps: { rk: true } }),
+} as unknown as PublicKeyCredential;
+
+const authenticationCredential = {
+    id: "authentication-credential",
+    rawId: bytes(252, 253),
+    type: "public-key",
+    authenticatorAttachment: "platform",
+    response: {
+        authenticatorData: bytes(5, 6),
+        clientDataJSON: bytes(7, 8),
+        signature: bytes(9, 10),
+        userHandle: bytes(11, 12),
+    },
+    getClientExtensionResults: () => ({ appid: false }),
+} as unknown as PublicKeyCredential;
+
+describe("provider-neutral passkey account entry", () => {
+    it("verifies email and registers the first passkey through four server-owned steps", async () => {
+        setBearer(null);
+        const fetch = vi.fn()
+            .mockResolvedValueOnce(new Response(JSON.stringify({ challenge_id: "email-1", expires_in: 600 }), {
+                status: 202,
+                headers: { "content-type": "application/json" },
+            }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ email_verification: "verified-email-1" }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                ceremony_id: "registration-1",
+                public_key: {
+                    challenge: "AQI",
+                    rp: { name: "GaugeWright", id: "auth.example" },
+                    user: { id: "AwQ", name: "person@example.test", displayName: "Person One" },
+                    pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+                    excludeCredentials: [{ type: "public-key", id: "BQY" }],
+                },
+            }), { status: 200, headers: { "content-type": "application/json" } }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ account_id: "person-one" }), {
+                status: 200,
+                headers: { "content-type": "application/json", "set-cookie": "opaque-session" },
+            }));
+        vi.stubGlobal("fetch", fetch);
+        const create = vi.fn(async (_options: CredentialCreationOptions): Promise<Credential | null> =>
+            registrationCredential);
+
+        await expect(startPasskeyAccountCreation(
+            "https://auth.example/",
+            "person@example.test",
+        )).resolves.toEqual({ challengeId: "email-1", expiresIn: 600 });
+        await expect(finishPasskeyAccountCreation(
+            "https://auth.example/",
+            "email-1",
+            "123456",
+            "Person One",
+            { create, get: vi.fn() },
+        )).resolves.toBe("person-one");
+
+        expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+            "https://auth.example/auth/account/email/start",
+            "https://auth.example/auth/account/email/complete",
+            "https://auth.example/auth/account/passkey/register/start",
+            "https://auth.example/auth/account/passkey/register/finish",
+        ]);
+        expect(fetch.mock.calls.every(([, init]) => init?.credentials === "include")).toBe(true);
+        expect(fetch.mock.calls.every(([, init]) =>
+            Boolean(new Headers(init?.headers).get("idempotency-key")))).toBe(true);
+        expect(fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+            { email: "person@example.test" },
+            { challenge_id: "email-1", code: "123456" },
+            { email_verification: "verified-email-1", display_name: "Person One" },
+            {
+                ceremony_id: "registration-1",
+                label: "Passkey",
+                credential: {
+                    id: "-vs",
+                    transports: ["internal"],
+                    attestationObject: "AQI",
+                    clientDataJSON: "AwQ",
+                },
+            },
+        ]);
+        const creation = create.mock.calls[0]?.[0] as CredentialCreationOptions;
+        expect(byteValues(creation.publicKey?.challenge)).toEqual([1, 2]);
+        expect(byteValues(creation.publicKey?.user.id)).toEqual([3, 4]);
+        expect(byteValues(creation.publicKey?.excludeCredentials?.[0]?.id)).toEqual([5, 6]);
+        expect(bearer()).toBeNull();
+    });
+
+    it("signs in with a passkey through a fresh server ceremony", async () => {
+        setBearer(null);
+        const fetch = vi.fn()
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                ceremony_id: "authentication-1",
+                public_key: {
+                    challenge: "DQ4",
+                    rpId: "auth.example",
+                    allowCredentials: [{ type: "public-key", id: "DxA" }],
+                    userVerification: "required",
+                },
+            }), { status: 200, headers: { "content-type": "application/json" } }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ account_id: "person-one" }), {
+                status: 200,
+                headers: { "content-type": "application/json", "set-cookie": "opaque-session" },
+            }));
+        vi.stubGlobal("fetch", fetch);
+        const get = vi.fn(async (_options: CredentialRequestOptions): Promise<Credential | null> =>
+            authenticationCredential);
+
+        await expect(signInWithPasskey(
+            "https://auth.example/",
+            "person@example.test",
+            { create: vi.fn(), get },
+        )).resolves.toBe("person-one");
+
+        expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+            "https://auth.example/auth/account/passkey/login/start",
+            "https://auth.example/auth/account/passkey/login/finish",
+        ]);
+        expect(fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+            { email: "person@example.test" },
+            {
+                ceremony_id: "authentication-1",
+                credential: {
+                    id: "_P0",
+                    authenticatorData: "BQY",
+                    clientDataJSON: "Bwg",
+                    signature: "CQo",
+                    userHandle: "Cww",
+                },
+            },
+        ]);
+        const request = get.mock.calls[0]?.[0] as CredentialRequestOptions;
+        expect(byteValues(request.publicKey?.challenge)).toEqual([13, 14]);
+        expect(byteValues(request.publicKey?.allowCredentials?.[0]?.id)).toEqual([15, 16]);
+        expect(bearer()).toBeNull();
+    });
+
+    it("fails closed before browser ceremony on malformed authority responses", async () => {
+        vi.stubGlobal("fetch", vi.fn(async () => new Response("not json", {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        })));
+        await expect(startPasskeyAccountCreation("https://auth.example", "person@example.test"))
+            .rejects.toThrow("response is malformed");
+
+        vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+            ceremony_id: "authentication-1",
+            public_key: { challenge: "%%%" },
+        }), { status: 200, headers: { "content-type": "application/json" } })));
+        const get = vi.fn();
+        await expect(signInWithPasskey(
+            "https://auth.example",
+            "person@example.test",
+            { create: vi.fn(), get },
+        )).rejects.toThrow("WebAuthn response is malformed");
+        expect(get).not.toHaveBeenCalled();
+    });
+
+    it("does not finish a ceremony the browser cancelled", async () => {
+        const fetch = vi.fn(async () => new Response(JSON.stringify({
+            ceremony_id: "authentication-1",
+            public_key: { challenge: "AQI", allowCredentials: [] },
+        }), { status: 200, headers: { "content-type": "application/json" } }));
+        vi.stubGlobal("fetch", fetch);
+
+        await expect(signInWithPasskey(
+            "https://auth.example",
+            "person@example.test",
+            { create: vi.fn(), get: vi.fn(async () => null) },
+        )).rejects.toThrow("Passkey sign-in was cancelled");
+        expect(fetch).toHaveBeenCalledOnce();
+    });
+});
+
 describe("native account session transport", () => {
     it("exchanges the device-bound handoff through the shared request owner", async () => {
         const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
-            new Response(JSON.stringify({ id_token: "header.payload.signature" }), {
+            new Response(JSON.stringify({ account_session: "opaque-account-session" }), {
                 status: 200,
                 headers: { "content-type": "application/json" },
             }));
@@ -123,7 +410,7 @@ describe("native account session transport", () => {
             "https://auth.example/",
             "handoff-code",
             "device-verifier",
-        )).resolves.toBe("header.payload.signature");
+        )).resolves.toBe("opaque-account-session");
 
         expect(fetch.mock.calls[0]?.[0]).toBe("https://auth.example/auth/mobile/exchange");
         const init = fetch.mock.calls[0]?.[1];
@@ -135,9 +422,9 @@ describe("native account session transport", () => {
         expect(init?.credentials).toBe("include");
     });
 
-    it("refreshes with the exact current bearer and rejects malformed success", async () => {
+    it("renews with the exact stable bearer and rejects malformed success", async () => {
         const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
-            new Response(JSON.stringify({ id_token: "replacement" }), {
+            new Response(JSON.stringify({ refreshed: true }), {
                 status: 200,
                 headers: { "content-type": "application/json" },
             }));
@@ -146,14 +433,14 @@ describe("native account session transport", () => {
         await expect(refreshMobileAccountToken(
             "https://auth.example",
             "current-token",
-        )).resolves.toBe("replacement");
+        )).resolves.toBe("current-token");
 
         const init = fetch.mock.calls[0]?.[1];
         expect(new Headers(init?.headers).get("authorization")).toBe("Bearer current-token");
         expect(new Headers(init?.headers).get("idempotency-key")).toBeTruthy();
 
         vi.stubGlobal("fetch", vi.fn(async () =>
-            new Response(JSON.stringify({ refreshed: true }), {
+            new Response(JSON.stringify({ person: "account-root" }), {
                 status: 200,
                 headers: { "content-type": "application/json" },
             })));

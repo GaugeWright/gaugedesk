@@ -5,12 +5,15 @@
 
 import { expect } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
-import { closeSettings, openSettings } from "./settings-nav";
+import { closeSettings, openAccountMenu, openSettings } from "./settings-nav";
 
 const { When, Then } = createBdd();
 
 When("I open my account", async ({ page }) => {
-    await openSettings(page, "account");
+    // Account Settings is now a first-party GaugeApp reached from the existing
+    // identity menu. A signed-out desktop has no admitted Account pages yet;
+    // the menu itself is the entry surface until native handoff completes.
+    await openAccountMenu(page);
 });
 
 When("I open my model access", async ({ page }) => {

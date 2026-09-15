@@ -1,0 +1,861 @@
+.gaugeapp-nav,
+.gaugeapp-menu,
+.gaugeapp-content {
+    font-family: var(--font-chrome);
+}
+
+.gaugeapp-nav { padding: 10px; }
+.gaugeapp-nav > div { display: grid; gap: 2px; margin: 16px 4px; }
+.gaugeapp-nav span,
+.gaugeapp-eyebrow,
+.gaugeapp-fact > span,
+.gaugeapp-freshness {
+    color: var(--muted);
+    font-size: var(--fs-label);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+}
+.gaugeapp-back { width: auto; padding: 4px 7px; background: transparent; border-color: transparent; }
+
+.gaugeapp-content { height: 100%; overflow: auto; container-type: inline-size; }
+.gaugeapp-content select,
+.gaugeapp-content textarea { box-sizing: border-box; border: 1px solid var(--edge);
+    background: var(--bg); color: var(--ink); font: inherit; }
+.gaugeapp-content select:focus-visible,
+.gaugeapp-content textarea:focus-visible { outline: 1px solid var(--warn); outline-offset: 1px; }
+.gaugeapp-content button:disabled,
+.gaugeapp-menu button:disabled { opacity: .46; cursor: default; }
+.gaugeapp-page,
+.gaugeapp-proposals { width: min(760px, calc(100% - 36px)); margin: 22px auto; }
+.gaugeapp-page { padding: 3px; border: 1px solid var(--edge);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--edge) 54%, transparent); container-type: inline-size; }
+.gaugeapp-page-head { display: flex; align-items: end; justify-content: space-between; gap: 20px;
+    margin: 0; padding: 12px 14px; background: color-mix(in srgb, var(--navy) 70%, var(--panel));
+    border: 0; border-bottom: 1px solid var(--edge); }
+.gaugeapp-page-head h1 { margin: 3px 0 0; font: 400 var(--fs-title)/1.2 var(--font-chrome); }
+.gaugeapp-panel { position: relative; display: grid; gap: 0; padding: 12px 14px;
+    border: 0; }
+.gaugeapp-panel > * { min-width: 0; }
+.gaugeapp-page > .gaugeapp-panel + .gaugeapp-panel { margin-top: 6px; }
+.gaugeapp-panel h2 { margin: 8px 0 5px; font: 400 var(--fs-ui)/1.2 var(--font-chrome); }
+.gaugeapp-facts-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.gaugeapp-fact { display: grid; gap: 2px; min-width: 0; padding: 10px 12px; }
+.gaugeapp-fact strong { font-weight: 500; overflow-wrap: anywhere; }
+.gaugeapp-fact small,
+.gaugeapp-row span,
+.gaugeapp-proposal span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-backup-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    margin: 2px 8px 4px; background: color-mix(in srgb, var(--panel) 62%, transparent);
+    border-block: 1px solid color-mix(in srgb, var(--edge) 72%, transparent); }
+.gaugeapp-backup-summary .gaugeapp-fact { padding: 8px 9px; }
+.gaugeapp-backup-schedule { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+    gap: 10px; align-items: end; padding: 4px 8px 7px; }
+.gaugeapp-backup-schedule > label { display: grid; gap: 4px; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-number-unit { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center;
+    min-width: 0; border: 1px solid var(--edge); background: var(--bg); }
+.gaugeapp-number-unit input { min-width: 0; height: 28px; padding: 3px 7px; color: var(--ink);
+    background: transparent; border: 0; font: inherit; }
+.gaugeapp-number-unit > span { padding-right: 7px; }
+.gaugeapp-backup-schedule > button,
+.gaugeapp-backup-row button,
+.gaugeapp-backup-pending button { width: auto; min-width: 64px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-backup-list { display: grid; margin: 0 8px; }
+.gaugeapp-backup-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px;
+    align-items: center; min-height: 38px; padding: 5px 1px; }
+.gaugeapp-backup-row + .gaugeapp-backup-row { border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-backup-row > div { display: grid; gap: 2px; min-width: 0; }
+.gaugeapp-backup-row strong { font-weight: 500; }
+.gaugeapp-backup-row span,
+.gaugeapp-backup-note,
+.gaugeapp-backup-pending small { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-backup-note { margin: 2px 8px 6px; }
+.gaugeapp-backup-pending { display: grid; margin: 0 8px 5px; padding: 2px 8px;
+    background: color-mix(in srgb, var(--warn) 7%, transparent); border-left: 1px solid var(--warn); }
+.gaugeapp-backup-pending > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px;
+    align-items: center; min-height: 42px; }
+.gaugeapp-backup-pending > div + div { border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-backup-pending span { display: grid; gap: 2px; }
+.gaugeapp-rows { display: grid; }
+.gaugeapp-projects { gap: 8px; }
+.gaugeapp-projects .gaugeapp-section-head { margin: 0; }
+.gaugeapp-projects .gaugeapp-section-head h2 { display: flex; align-items: baseline; gap: 7px; }
+.gaugeapp-projects .gaugeapp-section-head h2 small { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-projects .gaugeapp-section-head button,
+.gaugeapp-project-row > button:last-child,
+.gaugeapp-project-detail button { width: auto; min-width: 58px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-project-create { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px;
+    align-items: end; padding: 9px 10px; background: color-mix(in srgb, var(--panel) 76%, transparent);
+    border: 1px solid var(--edge); }
+.gaugeapp-project-create label { display: grid; gap: 4px; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-project-create input { min-width: 0; height: 30px; padding: 4px 7px; }
+.gaugeapp-project-list { display: grid; border: 1px solid var(--edge); }
+.gaugeapp-project-row { display: grid; grid-template-columns: minmax(150px, 1fr) repeat(3, 62px) auto;
+    gap: 10px; align-items: center; min-height: 43px; padding: 5px 8px; }
+.gaugeapp-project-row + .gaugeapp-project-row { border-top: 1px solid color-mix(in srgb, var(--edge) 68%, transparent); }
+.gaugeapp-project-row.selected { background: color-mix(in srgb, var(--navy) 45%, var(--panel)); }
+.gaugeapp-project-name { display: grid; gap: 1px; min-width: 0; padding: 0; background: none; border: 0; text-align: left; }
+.gaugeapp-project-name strong { overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.gaugeapp-project-name span { overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-project-row > span { display: grid; gap: 1px; text-align: right; }
+.gaugeapp-project-row > span b { font-weight: 500; }
+.gaugeapp-project-row > span small { color: var(--muted); font-size: var(--fs-label); text-transform: uppercase; letter-spacing: .04em; }
+.gaugeapp-project-detail { display: grid; background: color-mix(in srgb, var(--panel) 70%, transparent);
+    border: 1px solid var(--edge); }
+.gaugeapp-project-detail > header { display: flex; justify-content: space-between; align-items: start; gap: 14px;
+    padding: 8px 10px; background: color-mix(in srgb, var(--navy) 66%, var(--panel)); border-bottom: 1px solid var(--edge); }
+.gaugeapp-project-detail h3 { margin: 2px 0 0; font-weight: 500; }
+.gaugeapp-project-detail-foot { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    min-height: 38px; padding: 5px 10px; border-top: 1px solid color-mix(in srgb, var(--edge) 68%, transparent); }
+.gaugeapp-project-detail-foot span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-project-detail-foot .primary { color: var(--warn); border-color: var(--warn); }
+@container (max-width: 560px) {
+    .gaugeapp-project-row { grid-template-columns: minmax(0, 1fr) repeat(3, 48px) auto; gap: 6px; }
+}
+@container (max-width: 430px) {
+    .gaugeapp-project-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .gaugeapp-project-row > span { display: none; }
+    .gaugeapp-project-create { grid-template-columns: minmax(0, 1fr); }
+}
+.gaugeapp-host-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.gaugeapp-host-section-head h2 { margin: 2px 0; }
+.gaugeapp-host-row { display: grid; grid-template-columns: minmax(0, 1fr) 105px auto; align-items: center; gap: 12px; padding: 8px 0; }
+.gaugeapp-host-row + .gaugeapp-host-row { border-top: 1px solid var(--edge); }
+.gaugeapp-host-row button { padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-host-row .gaugeapp-host-name { display: grid; gap: 3px; min-width: 0; padding: 0; background: transparent; border: 0; text-align: left; }
+.gaugeapp-host-name strong { color: var(--ink); font-weight: 500; }
+.gaugeapp-host-name span, .gaugeapp-host-standing, .gaugeapp-host-note { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-host-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.gaugeapp-host-actions button, .gaugeapp-host-section-head button { width: auto; padding: 4px 9px; border-radius: 2px; }
+.gaugeapp-host-actions .primary, .gaugeapp-host-section-head .primary { border-color: var(--warn); color: var(--warn); }
+.gaugeapp-host-facts { display: grid; gap: 8px; margin: 10px 0; font-size: var(--fs-small); }
+.gaugeapp-host-facts > div { display: grid; grid-template-columns: minmax(100px, .38fr) minmax(0, 1fr); gap: 14px; }
+.gaugeapp-host-facts dt { color: var(--muted); }
+.gaugeapp-host-facts dd { margin: 0; overflow-wrap: anywhere; }
+.gaugeapp-host-note { margin: 7px 0; line-height: 1.5; }
+.gaugeapp-host-diagnostics { margin-top: 8px; font-size: var(--fs-small); }
+.gaugeapp-host-diagnostics summary { cursor: pointer; color: var(--muted); }
+.gaugeapp-host-editor { gap: 10px; background: color-mix(in srgb, var(--panel) 75%, var(--bg)); border-top: 1px solid var(--edge); }
+.gaugeapp-host-editor > label { display: grid; gap: 5px; font-size: var(--fs-small); }
+.gaugeapp-host-editor input:not([type="checkbox"]) { width: 100%; box-sizing: border-box; padding: 6px 8px; }
+.gaugeapp-host-editor > .gaugeapp-host-toggle { display: flex; align-items: center; gap: 8px; }
+.gaugeapp-host-error { margin: 8px 14px; color: var(--danger, #e88); }
+.gaugeapp-host-projects { margin: 6px 0; padding-left: 16px; }
+.gaugeapp-org-providers { min-width: 0; }
+.gaugeapp-org-providers button { width: auto; padding: 4px 9px; border-radius: 1px; font: inherit; font-size: var(--fs-small); }
+.gaugeapp-org-provider-row { display: grid; grid-template-columns: minmax(0, 1fr) 85px 80px; gap: 12px; align-items: center; padding: 7px 0; }
+.gaugeapp-org-provider-row .gaugeapp-org-provider-name { display: flex; align-items: baseline; gap: 10px; padding: 0; min-width: 0; background: none; border: 0; text-align: left; }
+.gaugeapp-org-provider-name strong, .gaugeapp-org-provider-grant strong { font-weight: 500; overflow-wrap: anywhere; }
+.gaugeapp-org-provider-name small, .gaugeapp-org-provider-status, .gaugeapp-org-provider-grant-title > span, .gaugeapp-org-provider-limit small { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-org-provider-default { display: grid; grid-template-columns: 145px minmax(0, 1fr); gap: 12px; align-items: center; margin: 12px 0 0; font-size: var(--fs-small); }
+.gaugeapp-org-providers select, .gaugeapp-org-provider-editor input:not([type="checkbox"]) { min-width: 0; width: 100%; box-sizing: border-box; padding: 5px 7px; font: inherit; font-size: var(--fs-small); }
+.gaugeapp-org-provider-detail { border-block: 1px solid var(--edge); background: color-mix(in srgb, var(--panel) 75%, var(--bg)); }
+.gaugeapp-org-provider-candidate { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.gaugeapp-org-provider-candidate > div:first-child { display: grid; gap: 4px; font-size: var(--fs-small); }
+.gaugeapp-org-provider-candidate span { color: var(--muted); }
+.gaugeapp-org-provider-grant { display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, .65fr) 80px; gap: 6px 12px; align-items: start; padding: 9px 0; }
+.gaugeapp-org-provider-grant + .gaugeapp-org-provider-grant { border-top: 1px solid var(--edge); }
+.gaugeapp-org-provider-grant-title, .gaugeapp-org-provider-limit { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; font-size: var(--fs-small); }
+.gaugeapp-org-provider-usage { grid-column: 1 / -1; font-size: var(--fs-small); }
+.gaugeapp-org-provider-usage summary { color: var(--muted); cursor: pointer; }
+.gaugeapp-org-provider-editor { gap: 12px; border-top: 1px solid var(--edge); background: color-mix(in srgb, var(--panel) 75%, var(--bg)); }
+.gaugeapp-org-provider-editor > label { display: grid; grid-template-columns: 145px minmax(0, 1fr); gap: 12px; align-items: center; font-size: var(--fs-small); }
+.gaugeapp-org-provider-models { padding: 0; border: 0; margin: 0; min-width: 0; }
+.gaugeapp-org-provider-models legend { color: var(--muted); font-size: var(--fs-small); margin-bottom: 5px; }
+.gaugeapp-org-provider-models label { display: flex; align-items: center; gap: 8px; padding: 3px 0; min-width: 0; font-size: var(--fs-small); }
+.gaugeapp-org-provider-models input { margin: 0; flex: 0 0 auto; }
+.gaugeapp-org-provider-models span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.gaugeapp-org-providers > [role="status"] { padding: 0 14px; }
+@container (max-width: 460px) {
+    .gaugeapp-org-provider-row { grid-template-columns: minmax(0, 1fr) 60px 80px; gap: 8px; }
+    .gaugeapp-org-provider-row .gaugeapp-org-provider-name { display: grid; gap: 3px; }
+    .gaugeapp-org-provider-default, .gaugeapp-org-provider-editor > label { grid-template-columns: minmax(0, 1fr); gap: 5px; }
+    .gaugeapp-org-provider-grant { grid-template-columns: minmax(0, 1fr) 80px; }
+    .gaugeapp-org-provider-grant > button { grid-column: 2; grid-row: 1 / span 2; }
+    .gaugeapp-org-provider-limit { grid-column: 1; }
+    .gaugeapp-org-provider-candidate { display: grid; gap: 4px; }
+}
+@container (max-width: 420px) {
+    .gaugeapp-host-row { grid-template-columns: minmax(0, 1fr) auto; gap: 6px 10px; }
+    .gaugeapp-host-standing { grid-column: 1; grid-row: 2; }
+    .gaugeapp-host-row > button:last-child { grid-column: 2; grid-row: 1 / span 2; }
+    .gaugeapp-host-detail > .gaugeapp-host-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .gaugeapp-host-detail > .gaugeapp-host-actions button { width: 100%; }
+}
+.gaugeapp-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr);
+    gap: 14px; align-items: baseline; padding: 8px 10px; border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-row:first-child { border-top: 0; }
+.gaugeapp-empty,
+.gaugeapp-loading { color: var(--muted); padding: 14px; }
+.gaugeapp-chat-actions button { width: auto; min-width: 44px; padding: 3px 7px;
+    color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 2px; }
+.gaugeapp-chat-actions button:not(:disabled):hover { color: var(--ink); border-color: var(--edge); }
+.gaugeapp-chat-clear { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 6px 10px; color: var(--muted); background: color-mix(in srgb, var(--danger, #e88) 7%, var(--panel));
+    border-bottom: 1px solid color-mix(in srgb, var(--danger, #e88) 42%, var(--edge)); font-size: var(--fs-small); }
+.gaugeapp-chat-clear > div { display: flex; gap: 5px; flex: 0 0 auto; }
+.gaugeapp-chat-clear button { width: auto; padding: 3px 7px; border-radius: 2px; }
+.gaugeapp-chat-clear button.danger { color: var(--danger, #e88); border-color: color-mix(in srgb, var(--danger, #e88) 55%, var(--edge)); }
+.gaugeapp-chat-error { margin: 0; padding: 6px 10px; color: var(--danger, #e88); border-bottom: 1px solid var(--edge); font-size: var(--fs-small); }
+.gaugeapp-status { position: sticky; z-index: 2; top: 0; width: min(732px, calc(100% - 64px));
+    margin: 0 auto; padding: 6px 14px; background: var(--panel); border: 1px solid var(--edge); }
+.gaugeapp-update-delayed { box-sizing: border-box; width: min(732px, calc(100% - 64px));
+    margin: 12px auto -10px; padding: 6px 10px; background: color-mix(in srgb, var(--panel) 78%, transparent);
+    border-block: 1px solid var(--edge); border-left: 2px solid var(--warn); font-size: var(--fs-small); }
+.gaugeapp-update-delayed button { width: auto; min-width: 60px; margin-left: 6px; padding: 3px 7px; border-radius: 2px; }
+
+.gaugeapp-proposals { box-sizing: border-box; border: 1px solid var(--warn); padding: 12px 14px; }
+.gaugeapp-proposals h2 { margin: 0 0 8px; font: 400 var(--fs-ui)/1.2 var(--font-chrome); }
+.gaugeapp-proposal { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; padding: 10px 0; }
+.gaugeapp-proposal + .gaugeapp-proposal { border-top: 1px solid var(--edge); }
+.gaugeapp-proposal > header { display: grid; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+.gaugeapp-proposal > .gaugeapp-actions { grid-column: 2; grid-row: 1; align-self: start; }
+.gaugeapp-proposal > p { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-review-fields { grid-column: 1 / -1; display: grid; gap: 5px; margin: 0; }
+.gaugeapp-review-fields > div { display: grid; grid-template-columns: minmax(90px, .32fr) minmax(0, 1fr); gap: 12px; }
+.gaugeapp-review-fields dt { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-review-fields dd { margin: 0; overflow-wrap: anywhere; }
+.gaugeapp-review-fields pre { margin: 6px 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--fs-small); }
+.gaugeapp-review-fields summary { cursor: pointer; color: var(--warn); }
+.gaugeapp-actions { display: flex; gap: 6px; }
+.gaugeapp-actions button { width: auto; min-width: 78px; padding: 5px 9px; border-radius: 3px; }
+.gaugeapp-actions .primary { border-color: var(--warn); color: var(--warn); }
+.gaugeapp-one-time .gaugeapp-actions a { display: inline-flex; align-items: center; min-height: 28px; padding: 4px 9px;
+    color: var(--warn); border: 1px solid var(--edge); border-radius: 2px; text-decoration: none; }
+
+.gaugeapp-menu { display: grid; align-content: start; gap: 2px; padding: 8px; }
+.gaugeapp-menu h2 { margin: 2px 4px 7px; font: 400 var(--fs-ui)/1.2 var(--font-chrome); }
+.gaugeapp-menu button { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    width: 100%; padding: 6px 8px; background: transparent; border: 1px solid transparent;
+    border-radius: 3px; text-align: left; }
+.gaugeapp-menu button:hover { background: var(--edge); }
+.gaugeapp-menu button.active { background: color-mix(in srgb, var(--edge) 56%, transparent); border-color: var(--edge); color: var(--warn); }
+.gaugeapp-menu small { color: var(--muted); }
+
+.gaugeapp-section-stack { gap: 8px; margin-top: 10px; }
+.gaugeapp-section-head { position: relative; z-index: 1; display: flex; align-items: center;
+    justify-content: space-between; gap: 16px; padding: 4px 8px; }
+.gaugeapp-section-head > div { min-width: 0; }
+.gaugeapp-section-head > button { flex: 0 0 auto; white-space: nowrap; }
+.gaugeapp-section-head h2 { margin: 0; }
+.gaugeapp-section-head p { margin: 2px 0 0; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-section-head button,
+.gaugeapp-inline-form button,
+.gaugeapp-device-edit button,
+.gaugeapp-one-time button { width: auto; min-width: 76px; padding: 5px 9px; border-radius: 2px; }
+.gaugeapp-one-time > button { justify-self: end; }
+.gaugeapp-inline-form { position: relative; z-index: 1; display: grid;
+    grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; padding: 4px 8px 8px; }
+.gaugeapp-inline-form-wide { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+.gaugeapp-inline-form label { display: grid; gap: 4px; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-inline-form input,
+.gaugeapp-device-edit input,
+.gaugeapp-setting-row input { min-width: 0; height: 30px; padding: 4px 7px; border-radius: 2px; }
+.gaugeapp-row-action { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.gaugeapp-row-action > div:first-child { display: grid; gap: 2px; }
+.gaugeapp-row-action button { width: auto; min-width: 68px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-row-note { max-width: 230px; color: var(--muted); font-size: var(--fs-small); line-height: 1.35; text-align: right; }
+.gaugeapp-inline-notice { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    margin: 0 8px; padding: 7px 9px; border-left: 2px solid var(--warn);
+    background: color-mix(in srgb, var(--warn) 5%, transparent); color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-inline-notice .gaugeapp-actions { flex: 0 0 auto; }
+.gaugeapp-inline-notice button { width: auto; min-width: 68px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-danger { color: var(--danger, #e88); }
+.gaugeapp-danger-zone { margin: 10px 8px 8px !important; padding: 10px 8px;
+    background: color-mix(in srgb, var(--danger, #e88) 5%, var(--panel));
+    border: 1px solid color-mix(in srgb, var(--danger, #e88) 48%, var(--edge)); }
+.gaugeapp-danger-zone button.danger { color: var(--danger, #e88);
+    border-color: color-mix(in srgb, var(--danger, #e88) 62%, var(--edge)); }
+.gaugeapp-danger-zone button.danger:not(:disabled):hover {
+    background: color-mix(in srgb, var(--danger, #e88) 10%, transparent); }
+.gaugeapp-people-invite { display: grid; grid-template-columns: minmax(240px, 1fr) 104px auto;
+    gap: 7px; align-items: end; margin: 0 8px 5px; padding: 9px 10px; background: color-mix(in srgb, var(--panel) 72%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-people-invite label { display: grid; gap: 3px; min-width: 0; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-people-invite input,
+.gaugeapp-people-invite select,
+.gaugeapp-people-invite textarea { width: 100%; min-width: 0; padding: 4px 7px; border-radius: 2px; }
+.gaugeapp-people-invite input,
+.gaugeapp-people-invite select { height: 30px; }
+.gaugeapp-people-invite textarea { min-height: 58px; resize: vertical; }
+.gaugeapp-people-invite button { width: auto; min-width: 84px; padding: 5px 9px; border-radius: 2px; justify-self: start; }
+.gaugeapp-people-invite small { grid-column: 1 / -1; color: var(--muted); }
+.gaugeapp-subsection-label { margin: 5px 9px 0; padding-top: 7px; color: var(--muted); border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent);
+    font-size: var(--fs-label); letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-people-list { display: grid; }
+.gaugeapp-person-row { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(170px, .8fr) auto; gap: 8px; align-items: center; min-height: 42px; padding: 5px 9px;
+    border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-person-row:first-child { border-top: 0; }
+.gaugeapp-person-identity { display: grid; gap: 1px; width: auto; min-width: 0; padding: 0; background: transparent; border: 0; border-radius: 0; text-align: left; }
+.gaugeapp-person-identity strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-person-identity span,
+.gaugeapp-person-role { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-person-role-edit { display: grid; grid-template-columns: minmax(92px, 1fr) auto; gap: 5px; }
+.gaugeapp-person-role-edit select { min-width: 0; height: 29px; padding: 3px 6px; border-radius: 2px; text-transform: capitalize; }
+.gaugeapp-person-role-edit button,
+.gaugeapp-row-actions button,
+.gaugeapp-member-detail > header button { width: auto; min-width: 54px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-row-actions { display: flex; justify-content: end; gap: 4px; }
+.gaugeapp-session-list { display: grid; }
+.gaugeapp-session-row { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(120px, .38fr) auto;
+    gap: 10px; align-items: center; min-height: 44px; padding: 6px 9px;
+    border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-session-row:first-child { border-top: 0; }
+.gaugeapp-session-identity { display: grid; gap: 2px; min-width: 0; width: auto; padding: 0;
+    background: transparent; border: 0; border-radius: 0; text-align: left; }
+.gaugeapp-session-identity strong,
+.gaugeapp-session-identity span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-session-row > button:last-child { width: auto; min-width: 54px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-session-identity span,
+.gaugeapp-session-posture span,
+.gaugeapp-session-detail-action p { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-session-posture { display: grid; gap: 2px; }
+.gaugeapp-session-posture strong { font-size: var(--fs-small); font-weight: 600; }
+.gaugeapp-session-detail-action { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px;
+    align-items: center; margin: 0 9px 9px; padding: 9px 10px; border-top: 1px solid var(--edge); }
+.gaugeapp-session-detail-action p { margin: 0; }
+.gaugeapp-session-detail-action button { width: auto; min-width: 94px; padding: 5px 9px; border-radius: 2px; }
+.gaugeapp-session-inline-detail { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end;
+    margin: 0 9px 4px; padding: 8px 0 4px; border-top: 1px solid var(--edge); }
+.gaugeapp-session-inline-detail > button { width: auto; min-width: 100px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-identity-summary { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(110px, .55fr) minmax(0, 1fr); }
+.gaugeapp-admission-control { display: grid; grid-template-columns: minmax(180px, .65fr) minmax(0, 1fr) auto;
+    gap: 10px; align-items: end; margin: 0 8px 4px; padding: 8px 9px;
+    background: color-mix(in srgb, var(--panel) 72%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-admission-control label { display: grid; gap: 3px; }
+.gaugeapp-admission-control label > span { color: var(--muted); font-size: var(--fs-label); letter-spacing: .04em; text-transform: uppercase; }
+.gaugeapp-admission-control select { width: 100%; min-width: 0; height: 30px; border-radius: 2px; }
+.gaugeapp-admission-control p { margin: 0 0 5px; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-admission-control > button { min-width: 54px; }
+.gaugeapp-readiness-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px 14px;
+    margin: 0 9px 5px; padding: 7px 0 2px; border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-readiness-list > div { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 5px;
+    align-items: baseline; min-height: 23px; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-readiness-list > div[data-ready="true"] { color: var(--ink); }
+.gaugeapp-readiness-list > div > span:first-child { color: var(--warn); }
+.gaugeapp-domain-list { display: grid; }
+.gaugeapp-domain-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; min-height: 40px; padding: 5px 9px;
+    border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-domain-row:first-child { border-top: 0; }
+.gaugeapp-domain-row > div:first-child { display: flex; align-items: baseline; gap: 9px; min-width: 0; }
+.gaugeapp-domain-row > div:first-child strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-domain-row > div:first-child span { color: var(--ok, #8ca); font-size: var(--fs-label); letter-spacing: .04em; text-transform: uppercase; }
+.gaugeapp-domain-challenge { display: grid; gap: 9px; margin: 0 8px 6px; padding: 10px;
+    background: color-mix(in srgb, var(--panel) 74%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-domain-challenge > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.gaugeapp-domain-challenge > header > div { display: grid; gap: 2px; }
+.gaugeapp-domain-challenge > header button { width: auto; min-width: 54px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-domain-challenge p { margin: 0; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-domain-challenge dl { display: grid; gap: 5px; margin: 0; }
+.gaugeapp-domain-challenge dl > div { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 8px; align-items: baseline; }
+.gaugeapp-domain-challenge dt { color: var(--muted); font-size: var(--fs-label); letter-spacing: .04em; text-transform: uppercase; }
+.gaugeapp-domain-challenge dd { min-width: 0; margin: 0; }
+.gaugeapp-domain-challenge code { display: block; overflow: auto; padding: 5px 7px; background: color-mix(in srgb, var(--navy) 62%, var(--panel)); border: 1px solid color-mix(in srgb, var(--edge) 70%, transparent); font-size: var(--fs-small); }
+.gaugeapp-domain-challenge > .gaugeapp-actions { justify-content: end; }
+.gaugeapp-plan-head { align-items: end; padding-top: 7px; padding-bottom: 7px; }
+.gaugeapp-plan-head > div:first-child { display: grid; gap: 2px; }
+.gaugeapp-plan-head > .gaugeapp-actions { flex: 0 0 auto; }
+.gaugeapp-plan-offer { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, .9fr); gap: 18px; align-items: center;
+    margin: 0 8px 5px; padding: 10px; background: color-mix(in srgb, var(--panel) 72%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-plan-offer > div:first-child { display: grid; gap: 2px; }
+.gaugeapp-plan-offer span,
+.gaugeapp-plan-offer dt { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-plan-offer dl { display: grid; gap: 4px; margin: 0; }
+.gaugeapp-plan-offer dl > div { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(0, 1.2fr); gap: 8px; }
+.gaugeapp-plan-offer dd { margin: 0; }
+.gaugeapp-plan-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.gaugeapp-plan-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px;
+    margin: 0 8px 6px; padding: 8px 10px; background: color-mix(in srgb, var(--panel) 72%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-plan-control > div:first-child { display: grid; gap: 2px; }
+.gaugeapp-plan-control span,
+.gaugeapp-plan-control p { margin: 0; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-plan-control > button { min-width: 112px; }
+.gaugeapp-plan-control form { display: flex; align-items: end; gap: 7px; }
+.gaugeapp-plan-control form label { width: 88px; }
+.gaugeapp-plan-control form input { min-width: 0; }
+.gaugeapp-plan-confirm { display: grid; justify-items: end; gap: 6px; max-width: 330px; text-align: right; }
+.gaugeapp-plan-control-danger { border-left-color: color-mix(in srgb, var(--danger, #d87979) 68%, var(--edge)); }
+.gaugeapp-tenant-service-list { display: grid; margin: 0 8px 4px; border: 1px solid var(--edge); }
+.gaugeapp-tenant-service-row { display: grid; grid-template-columns: minmax(0, 1fr) 128px auto; gap: 12px;
+    align-items: center; min-height: 48px; padding: 7px 9px; }
+.gaugeapp-tenant-service-row + .gaugeapp-tenant-service-row { border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-tenant-service-row > div:first-child { display: grid; gap: 2px; min-width: 0; }
+.gaugeapp-tenant-service-row > div:first-child span,
+.gaugeapp-service-status { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-service-status { text-align: right; white-space: nowrap; }
+.gaugeapp-service-status-active { color: var(--ok, #8ca); }
+.gaugeapp-service-status-removal-scheduled { color: var(--warn); }
+.gaugeapp-tenant-service-row > .gaugeapp-actions { justify-content: end; }
+.gaugeapp-tenant-service-row > .gaugeapp-actions button { min-width: 52px; }
+.gaugeapp-billing-documents { gap: 6px; }
+.gaugeapp-billing-estimate { display: grid; gap: 7px; margin: 0 8px 3px; padding: 9px 10px;
+    background: color-mix(in srgb, var(--panel) 75%, transparent); border-left: 2px solid var(--warn); }
+.gaugeapp-billing-estimate-head { display: flex; align-items: end; justify-content: space-between; gap: 14px; }
+.gaugeapp-billing-estimate-head > div { display: grid; gap: 2px; }
+.gaugeapp-billing-estimate-head > div > strong { font-size: var(--fs-ui); font-weight: 500; }
+.gaugeapp-billing-estimate-head > span,
+.gaugeapp-billing-line > span,
+.gaugeapp-billing-invoice span,
+.gaugeapp-billing-documents .gaugeapp-quiet { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-billing-lines { display: grid; }
+.gaugeapp-billing-line { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px;
+    align-items: baseline; min-height: 27px; padding: 4px 0; }
+.gaugeapp-billing-line + .gaugeapp-billing-line { border-top: 1px solid color-mix(in srgb, var(--edge) 58%, transparent); }
+.gaugeapp-billing-line > strong { font-weight: 500; }
+.gaugeapp-billing-documents .gaugeapp-quiet { margin: 0; }
+.gaugeapp-billing-history { display: grid; margin: 0 8px 3px; }
+.gaugeapp-billing-history .gaugeapp-editor-section-head { padding: 4px 1px 5px; }
+.gaugeapp-billing-invoice { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px;
+    align-items: center; min-height: 38px; padding: 5px 1px; }
+.gaugeapp-billing-invoice + .gaugeapp-billing-invoice { border-top: 1px solid color-mix(in srgb, var(--edge) 62%, transparent); }
+.gaugeapp-billing-invoice > div:first-child { display: flex; align-items: baseline; gap: 9px; min-width: 0; }
+.gaugeapp-billing-invoice > div:first-child strong { font-weight: 500; }
+.gaugeapp-document-actions { display: flex; gap: 5px; }
+.gaugeapp-document-actions a { display: inline-flex; align-items: center; justify-content: center;
+    min-width: 48px; min-height: 26px; padding: 3px 7px; color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 2px; text-decoration: none; }
+.gaugeapp-document-actions a:hover { color: var(--warn); border-color: var(--warn); }
+.gaugeapp-member-detail { margin: 6px 8px 8px !important; padding: 0; background: color-mix(in srgb, var(--panel) 70%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-member-detail > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px;
+    background: color-mix(in srgb, var(--navy) 54%, var(--panel)); border-bottom: 1px solid var(--edge); }
+.gaugeapp-member-detail > header h2 { margin: 2px 0 0; }
+.gaugeapp-member-projects { padding: 0 8px 8px; }
+.gaugeapp-summary-row,
+.gaugeapp-setting-row,
+.gaugeapp-device-edit { position: relative; z-index: 1; display: grid; align-items: center;
+    gap: 10px; padding: 7px 9px; border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-summary-row { grid-template-columns: minmax(0, 1fr) auto; }
+.gaugeapp-summary-row > div,
+.gaugeapp-setting-row > div { display: grid; gap: 2px; }
+.gaugeapp-summary-row span,
+.gaugeapp-setting-row span,
+.gaugeapp-device-edit > span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-setting-row { grid-template-columns: minmax(150px, .65fr) minmax(180px, 1fr); }
+.gaugeapp-attention-row { grid-template-columns: minmax(0, 1fr) 150px; }
+.gaugeapp-attention-row select { width: 100%; min-width: 0; height: 30px; padding: 4px 7px; border-radius: 2px; }
+.gaugeapp-setting-chips { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 5px; margin: 0; padding: 0 8px; list-style: none; }
+.gaugeapp-setting-chips > li:not(.gaugeapp-empty) { display: inline-flex; align-items: center; min-height: 28px; border: 1px solid var(--edge); background: color-mix(in srgb, var(--panel) 72%, transparent); }
+.gaugeapp-setting-chips code { padding: 4px 8px; color: var(--ink); font: 400 var(--fs-small)/1.2 var(--font-chrome); }
+.gaugeapp-setting-chips button { align-self: stretch; width: auto; min-width: 0; padding: 3px 7px; border: 0; border-left: 1px solid var(--edge); border-radius: 0; color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-setting-chips button:hover { color: var(--warn); }
+.gaugeapp-setting-note { position: relative; z-index: 1; margin: -2px 8px 7px; color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-device-edit { grid-template-columns: minmax(180px, 1fr) minmax(154px, .55fr) auto; }
+.gaugeapp-device-edit > div:first-child { display: grid; gap: 2px; }
+.gaugeapp-device-edit > div:first-child small,
+.gaugeapp-device-link small,
+.gaugeapp-device-join-status small { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-device-access { display: grid; gap: 2px; min-width: 0; }
+.gaugeapp-device-access strong { font-size: var(--fs-small); font-weight: 600; text-transform: capitalize; }
+.gaugeapp-device-access small { overflow: hidden; color: var(--muted); font-size: var(--fs-label); text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-device-link { display: grid; gap: 8px; margin: 0 8px 4px; padding: 10px;
+    background: color-mix(in srgb, var(--panel) 74%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-device-link > p { margin: 0; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-device-link-code { display: grid; grid-template-columns: 116px minmax(0, 1fr); gap: 14px; align-items: center; }
+.gaugeapp-device-qr { display: grid; place-items: center; width: 116px; height: 116px; padding: 6px; background: #fff; }
+.gaugeapp-device-qr svg { width: 100%; height: 100%; }
+.gaugeapp-device-link-code > div:last-child,
+.gaugeapp-device-compare > div,
+.gaugeapp-device-join-status { display: grid; gap: 3px; }
+.gaugeapp-device-link-code strong,
+.gaugeapp-device-compare > div:last-child strong,
+.gaugeapp-device-join-status strong { color: var(--warn); font-size: 18px; letter-spacing: .08em; }
+.gaugeapp-device-compare { display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, auto); gap: 12px; align-items: center; }
+.gaugeapp-device-compare > div:last-child { padding-left: 12px; border-left: 1px solid var(--edge); }
+.gaugeapp-success { margin: 0; padding: 9px 10px; color: var(--ok, #8ca); }
+.gaugeapp-device-join { display: grid; grid-template-columns: minmax(130px, .7fr) minmax(180px, 1fr) 118px auto;
+    gap: 8px; align-items: end; padding: 2px 8px 6px; }
+.gaugeapp-device-join label { display: grid; gap: 3px; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-device-join input,
+.gaugeapp-device-join select { width: 100%; min-width: 0; height: 30px; padding: 4px 7px; border-radius: 2px; }
+.gaugeapp-device-join button { width: auto; min-width: 76px; padding: 5px 9px; border-radius: 2px; }
+.gaugeapp-device-join-status { margin: 0 8px; padding: 8px 10px; border-left: 2px solid var(--warn); }
+.gaugeapp-provider-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 10px; margin: 0 8px 4px; padding: 10px;
+    background: color-mix(in srgb, var(--panel) 76%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-provider-form label { display: grid; gap: 3px; min-width: 0; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-provider-form label.wide { grid-column: 1 / -1; }
+.gaugeapp-provider-form input,
+.gaugeapp-provider-form textarea,
+.gaugeapp-provider-form select,
+.gaugeapp-inline-form select { width: 100%; min-width: 0; height: 30px; padding: 4px 7px; border-radius: 2px; }
+.gaugeapp-provider-form textarea { height: auto; min-height: 112px; resize: vertical; }
+.gaugeapp-identity-values { display: grid; gap: 4px; }
+.gaugeapp-identity-values > div { display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; gap: 7px; align-items: center; }
+.gaugeapp-identity-values span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-identity-values code { min-width: 0; overflow: hidden; color: var(--ink); font-size: var(--fs-small); text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-identity-values button { width: auto; min-width: 48px; padding: 3px 7px; border-radius: 2px; }
+.gaugeapp-form-actions { display: flex; grid-column: 1 / -1; justify-content: end; gap: 5px; }
+.gaugeapp-form-actions button,
+.gaugeapp-provider-row button,
+.gaugeapp-provider-account-row button { width: auto; min-width: 58px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-provider-list { display: grid; }
+.gaugeapp-provider-row,
+.gaugeapp-provider-account-row { display: grid; grid-template-columns: minmax(0, 1fr) 104px auto; gap: 10px; align-items: center; min-height: 42px; padding: 6px 9px;
+    border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-provider-row:first-child,
+.gaugeapp-provider-account-row:first-of-type { border-top: 0; }
+.gaugeapp-provider-row > div:first-child,
+.gaugeapp-provider-account-row > div:first-child { display: grid; gap: 1px; min-width: 0; }
+.gaugeapp-provider-row > div:first-child span,
+.gaugeapp-provider-account-row > div:first-child span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-provider-row > input { min-width: 0; height: 29px; padding: 4px 7px; border-radius: 2px; }
+.gaugeapp-provider-account-row { grid-template-columns: minmax(0, 1fr) minmax(88px, auto) auto; }
+.gaugeapp-provider-account-row code { color: var(--warn); font-size: var(--fs-small); letter-spacing: .05em; }
+.gaugeapp-provider-account-row a { display: inline-flex; align-items: center; min-height: 27px; padding: 4px 8px; color: var(--warn); border: 1px solid var(--edge); border-radius: 2px; text-decoration: none; }
+.gaugeapp-connection-state { color: var(--muted); font-size: var(--fs-label); letter-spacing: .04em; text-transform: uppercase; }
+.gaugeapp-connection-state.reachable { color: var(--ok, #8ca); }
+.gaugeapp-connection-state.unreachable { color: var(--danger, #e88); }
+.gaugeapp-catalog { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.gaugeapp-catalog-card { display: grid; gap: 7px; padding: 10px 11px; background: color-mix(in srgb, var(--panel) 72%, transparent);
+    border-left: 1px solid var(--warn); outline: 1px solid color-mix(in srgb, var(--edge) 76%, transparent); }
+.gaugeapp-catalog-card header { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.gaugeapp-catalog-card header > div:first-child { display: flex; align-items: baseline; gap: 9px; min-width: 0; }
+.gaugeapp-catalog-card header span { color: var(--warn); font-size: var(--fs-label); letter-spacing: .05em; text-transform: uppercase; }
+.gaugeapp-catalog-card p { margin: 0; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-card-facts { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-card-actions { display: flex; flex: none; gap: 4px; }
+.gaugeapp-card-actions button,
+.gaugeapp-editor button,
+.gaugeapp-product-detail button { width: auto; min-width: 58px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-unavailable { margin: 0 8px; padding: 8px 10px; color: var(--muted); background: color-mix(in srgb, var(--danger, #e88) 7%, transparent); border-left: 1px solid var(--danger, #e88); }
+
+.gaugeapp-policy-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.gaugeapp-policy-group { display: grid; align-content: start; gap: 8px; padding: 10px 11px;
+    background: color-mix(in srgb, var(--panel) 72%, transparent); border: 1px solid color-mix(in srgb, var(--edge) 76%, transparent); }
+.gaugeapp-policy-group h2,
+.gaugeapp-policy-group p { margin: 0; }
+.gaugeapp-policy-group p { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-policy-group fieldset { display: flex; flex-wrap: wrap; gap: 5px 12px; margin: 0; padding: 0; border: 0; }
+.gaugeapp-policy-group legend { width: 100%; margin-bottom: 4px; color: var(--muted); font-size: var(--fs-label); letter-spacing: .04em; text-transform: uppercase; }
+.gaugeapp-policy-group fieldset label,
+.gaugeapp-check { display: inline-flex; align-items: center; gap: 6px; min-height: 24px; font-size: var(--fs-small); text-transform: capitalize; }
+.gaugeapp-policy-group input[type="checkbox"] { width: 14px; height: 14px; margin: 0; accent-color: var(--warn); }
+.gaugeapp-policy-numbers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.gaugeapp-policy-numbers label { display: grid; gap: 3px; min-width: 0; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-policy-numbers input { width: 100%; min-width: 0; height: 30px; padding: 4px 7px; border-radius: 2px; }
+.gaugeapp-change-summary { grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: end;
+    margin: 6px 8px 8px !important; padding: 10px 11px; background: color-mix(in srgb, var(--navy) 44%, var(--panel));
+    border-left: 1px solid var(--warn); outline: 1px solid color-mix(in srgb, var(--edge) 68%, transparent); }
+.gaugeapp-change-summary h2,
+.gaugeapp-change-summary p,
+.gaugeapp-change-summary ul { margin: 0; }
+.gaugeapp-change-summary p,
+.gaugeapp-change-summary li { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-change-summary ul { display: grid; gap: 2px; margin-top: 5px; padding-left: 17px; }
+
+.gaugeapp-editor { display: grid; margin: 0 8px 8px; background: color-mix(in srgb, var(--panel) 78%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-editor > * { min-width: 0; }
+.gaugeapp-editor-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 8px 10px; background: color-mix(in srgb, var(--navy) 66%, var(--panel)); border-bottom: 1px solid var(--edge); }
+.gaugeapp-editor-head > div { display: grid; gap: 1px; }
+.gaugeapp-editor-head span,
+.gaugeapp-editor label > span,
+.gaugeapp-editor-section-head span { color: var(--muted); font-size: var(--fs-label); letter-spacing: .04em; text-transform: uppercase; }
+.gaugeapp-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 10px; padding: 10px; }
+.gaugeapp-editor label { display: grid; gap: 3px; min-width: 0; }
+.gaugeapp-editor input,
+.gaugeapp-editor select,
+.gaugeapp-editor textarea { width: 100%; min-width: 0; padding: 4px 7px; border-radius: 2px; }
+.gaugeapp-editor input,
+.gaugeapp-editor select { height: 30px; }
+.gaugeapp-editor textarea { resize: vertical; }
+.gaugeapp-field-wide { grid-column: 1 / -1; }
+.gaugeapp-input-suffix { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.gaugeapp-input-suffix span { padding: 0 7px; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-editor-section { padding: 0 10px 10px; }
+.gaugeapp-editor-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 34px; border-top: 1px solid color-mix(in srgb, var(--edge) 72%, transparent); }
+.gaugeapp-editor-section-head > div { display: flex; align-items: baseline; gap: 8px; }
+.gaugeapp-editor-rows { display: grid; gap: 6px; }
+.gaugeapp-price-inheritance { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 7px 9px; background: color-mix(in srgb, var(--navy) 36%, transparent); }
+.gaugeapp-price-inheritance span { color: var(--muted); font-size: var(--fs-label); letter-spacing: .04em; text-transform: uppercase; }
+.gaugeapp-editor-inline-actions { display: flex; justify-content: end; padding-top: 6px; }
+.gaugeapp-price-row { display: flex; flex-wrap: wrap; align-items: end; gap: 6px; padding: 7px; background: color-mix(in srgb, var(--navy) 36%, transparent); }
+.gaugeapp-price-row label { flex: 1 1 88px; }
+.gaugeapp-price-row label:first-child { flex-basis: 150px; }
+.gaugeapp-service-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(90px, .55fr) minmax(160px, 1.4fr) auto; align-items: end; gap: 6px; padding: 7px; background: color-mix(in srgb, var(--navy) 36%, transparent); }
+.gaugeapp-recipient-row { display: grid; grid-template-columns: minmax(96px, .8fr) minmax(80px, 1fr) minmax(120px, 1.2fr) minmax(76px, .8fr) auto; align-items: end; gap: 6px; padding: 7px; background: color-mix(in srgb, var(--navy) 36%, transparent); }
+.gaugeapp-icon-action { align-self: end; }
+.gaugeapp-editor-actions { display: flex; justify-content: end; gap: 6px; padding: 8px 10px; background: color-mix(in srgb, var(--navy) 30%, transparent); border-top: 1px solid var(--edge); }
+.gaugeapp-editor-actions .primary { color: var(--warn); border-color: var(--warn); }
+
+.gaugeapp-product-detail { display: grid; gap: 8px; margin: 0 8px 8px; padding: 10px 11px; background: color-mix(in srgb, var(--panel) 70%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-product-detail > header { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.gaugeapp-product-detail > header > div { display: grid; gap: 2px; }
+.gaugeapp-product-detail h3,
+.gaugeapp-product-detail p { margin: 0; }
+.gaugeapp-product-detail > header span { color: var(--warn); font-size: var(--fs-label); letter-spacing: .05em; text-transform: uppercase; }
+.gaugeapp-product-detail > header p { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-detail-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.gaugeapp-detail-list { display: flex; flex-wrap: wrap; gap: 5px 14px; padding: 7px 10px; border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-detail-list span { color: var(--muted); font-size: var(--fs-small); }
+
+.gaugeapp-client-list { display: grid; }
+.gaugeapp-client-card { display: grid; grid-template-columns: minmax(130px, 1fr) minmax(130px, 1fr) auto; gap: 10px; align-items: center; padding: 8px 9px; border-top: 1px solid color-mix(in srgb, var(--edge) 68%, transparent); }
+.gaugeapp-client-card:first-child { border-top: 0; }
+.gaugeapp-client-card > div:first-child { display: grid; gap: 1px; }
+.gaugeapp-client-card span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-client-detail { display: grid; gap: 8px; margin: 0 8px 8px; padding: 10px 11px; background: color-mix(in srgb, var(--panel) 70%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-client-detail > header { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.gaugeapp-client-detail > header > div { display: grid; gap: 2px; }
+.gaugeapp-client-detail h3 { margin: 0; }
+.gaugeapp-client-detail > header span { color: var(--warn); font-size: var(--fs-label); letter-spacing: .05em; text-transform: uppercase; }
+.gaugeapp-client-detail button { width: auto; min-width: 58px; padding: 4px 8px; border-radius: 2px; }
+
+.gaugeapp-engagement-group { display: grid; gap: 4px; }
+.gaugeapp-engagement-group h3 { margin: 4px 8px 0; color: var(--muted); font: 400 var(--fs-label)/1.2 var(--font-chrome); letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-engagement-list { display: grid; }
+.gaugeapp-engagement-card { display: grid; grid-template-columns: minmax(130px, 1.2fr) 88px minmax(120px, 1fr) auto; gap: 10px; align-items: center; padding: 8px 9px; border-top: 1px solid color-mix(in srgb, var(--edge) 68%, transparent); }
+.gaugeapp-engagement-card:first-child { border-top: 0; }
+.gaugeapp-engagement-card > div { display: grid; gap: 1px; }
+.gaugeapp-engagement-card span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-engagement-card button,
+.gaugeapp-engagement-detail button { width: auto; min-width: 58px; padding: 4px 8px; border-radius: 2px; }
+.gaugeapp-stage { color: var(--warn) !important; letter-spacing: .05em; text-transform: uppercase; }
+.gaugeapp-engagement-detail { display: grid; gap: 8px; margin: 0 8px 8px; padding: 10px 11px; background: color-mix(in srgb, var(--panel) 70%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-engagement-detail > header { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.gaugeapp-engagement-detail > header > div { display: grid; gap: 2px; }
+.gaugeapp-engagement-detail h3,
+.gaugeapp-engagement-detail p { margin: 0; }
+.gaugeapp-engagement-detail > header span { color: var(--warn); font-size: var(--fs-label); letter-spacing: .05em; text-transform: uppercase; }
+.gaugeapp-engagement-detail > header p,
+.gaugeapp-operation-row span,
+.gaugeapp-callout span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-detail-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.gaugeapp-detail-actions-end { justify-content: end; }
+.gaugeapp-callout { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 9px; background: color-mix(in srgb, var(--warn) 6%, transparent); border-left: 1px solid var(--warn); }
+.gaugeapp-callout > div:first-child { display: grid; gap: 2px; }
+.gaugeapp-identity-validation[data-status="ready"] { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.gaugeapp-form-note { margin: -2px 0 0; color: var(--muted); font-size: var(--fs-small); line-height: 1.4; }
+.gaugeapp-engagement-operations { display: grid; }
+.gaugeapp-operation-row { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) auto; gap: 8px; align-items: center; padding: 8px 9px; border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-operation-row > div:first-child { display: grid; gap: 2px; }
+.gaugeapp-operation-row input { min-width: 0; height: 30px; padding: 4px 7px; border-radius: 2px; }
+.gaugeapp-payment-readiness,
+.gaugeapp-payment-totals { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 0 8px; }
+.gaugeapp-payments > .gaugeapp-section-head > button { flex: 0 0 auto; white-space: nowrap; }
+.gaugeapp-stripe-tools { display: flex; flex-wrap: wrap; gap: 5px; padding: 8px; background: color-mix(in srgb, var(--navy) 38%, transparent); border-block: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-stripe-tools button,
+.gaugeapp-payment-actions button,
+.gaugeapp-action-result button,
+.gaugeapp-action-result a,
+.gaugeapp-payment-detail button,
+.gaugeapp-payment-ledger a { width: auto; min-width: 64px; padding: 4px 8px; border: 1px solid var(--edge); border-radius: 2px; background: color-mix(in srgb, var(--edge) 84%, var(--bg)); color: inherit; font: inherit; text-align: center; text-decoration: none; }
+.gaugeapp-stripe-tools button[aria-pressed="true"] { color: var(--warn); border-color: var(--warn); }
+.gaugeapp-stripe-component { min-height: 120px; padding: 10px; background: color-mix(in srgb, var(--panel) 70%, transparent); }
+.gaugeapp-payment-note { margin: 0; padding: 0 10px 8px; color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-payment-actions { display: grid; grid-template-columns: minmax(130px, .85fr) repeat(3, minmax(110px, 1fr)) auto; gap: 7px; align-items: end; margin: 0 8px 8px; padding: 9px; background: color-mix(in srgb, var(--navy) 36%, transparent); border: 1px solid color-mix(in srgb, var(--edge) 70%, transparent); }
+.gaugeapp-payment-actions > div:first-child,
+.gaugeapp-payment-actions label,
+.gaugeapp-payment-detail header > div { display: grid; gap: 3px; min-width: 0; }
+.gaugeapp-payment-actions span,
+.gaugeapp-payment-detail span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-payment-actions select,
+.gaugeapp-payment-actions input,
+.gaugeapp-refund-row input { min-width: 0; height: 30px; padding: 4px 7px; border-radius: 2px; }
+.gaugeapp-action-result { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; margin: 0 8px 8px; padding: 8px 9px; border-left: 1px solid var(--warn); background: color-mix(in srgb, var(--warn) 6%, transparent); }
+.gaugeapp-action-result > div { display: grid; gap: 2px; }
+.gaugeapp-action-result span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-payment-ledger { display: grid; padding: 0 8px; }
+.gaugeapp-row.gaugeapp-invoice-row { grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px 12px; }
+.gaugeapp-invoice-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 10px; min-width: 0; }
+.gaugeapp-invoice-heading strong { overflow-wrap: anywhere; }
+.gaugeapp-invoice-row > a { grid-column: 2; grid-row: 1; justify-self: end; min-width: 54px; width: auto; padding: 4px 8px; }
+.gaugeapp-invoice-amounts { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)); gap: 6px 12px; }
+.gaugeapp-invoice-amounts .gaugeapp-fact { padding: 0; }
+.gaugeapp-payment-ledger .gaugeapp-empty { margin: 0; padding: 4px 0 12px; font-size: var(--fs-small); }
+.gaugeapp-payment-detail { display: grid; gap: 8px; margin: 0 8px 8px; padding: 9px; background: color-mix(in srgb, var(--panel) 70%, transparent); border: 1px solid var(--edge); }
+.gaugeapp-payment-detail header { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.gaugeapp-refund-row { display: grid; grid-template-columns: minmax(110px, .6fr) minmax(160px, 1fr) auto; gap: 7px; align-items: end; padding-top: 8px; border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.gaugeapp-refund-row label { display: grid; gap: 3px; }
+.gaugeapp-one-time { position: sticky; z-index: 4; top: 8px; display: grid; grid-template-columns: minmax(160px, .7fr) minmax(240px, 1fr) auto;
+    gap: 14px; align-items: center; width: min(732px, calc(100% - 64px)); margin: 8px auto; padding: 10px 12px;
+    background: var(--panel); border: 1px solid var(--warn); }
+.gaugeapp-one-time > div { display: grid; gap: 2px; }
+.gaugeapp-one-time span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-one-time code { max-height: 132px; overflow: auto; white-space: pre; font-size: var(--fs-small); }
+.gaugeapp-delivery-links { grid-template-columns: minmax(150px, .7fr) minmax(260px, 1.3fr) auto; }
+.gaugeapp-commercial-evidence { grid-template-columns: minmax(150px, .65fr) minmax(260px, 1.35fr) auto; }
+.gaugeapp-evidence-facts,
+.gaugeapp-evidence-list { display: flex !important; flex-wrap: wrap; align-items: center; gap: 5px 14px !important; }
+.gaugeapp-evidence-facts > span,
+.gaugeapp-evidence-list > span { color: var(--ink); }
+.gaugeapp-delivery-link-list { display: grid; gap: 4px; }
+.gaugeapp-delivery-link-list > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.gaugeapp-delivery-link-list a { min-width: 58px; padding: 4px 8px; border: 1px solid var(--edge); border-radius: 2px; color: inherit; text-align: center; text-decoration: none; }
+.gaugeapp-invitation-response { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 12px; border-color: var(--warn); }
+.gaugeapp-invitation-response > div { display: grid; gap: 3px; }
+.gaugeapp-invitation-response > p { grid-column: 1 / -1; margin: 0; color: var(--danger, #e88); }
+
+.proposal-chat { display: grid; align-content: start; height: 100%; padding: 14px; color: var(--ink); font-family: var(--font-chrome); }
+.proposal-chat header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 9px; border-bottom: 1px solid var(--edge); }
+.proposal-chat header span { color: var(--warn); font-size: var(--fs-label); letter-spacing: .06em; text-transform: uppercase; }
+.proposal-chat button { width: auto; min-width: 58px; padding: 4px 8px; border-radius: 2px; }
+.proposal-chat > div { display: grid; gap: 6px; padding-top: 14px; }
+.proposal-chat p { margin: 0; color: var(--muted); font-size: var(--fs-small); }
+.proposal-page { container-type: inline-size; }
+.proposal-sheet { display: grid; gap: 10px; padding: 12px; }
+.proposal-sheet > header { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: end; padding: 2px 2px 10px; border-bottom: 1px solid var(--edge); }
+.proposal-sheet > header > div { display: grid; gap: 2px; }
+.proposal-sheet > header span { color: var(--warn); font-size: var(--fs-label); letter-spacing: .05em; text-transform: uppercase; }
+.proposal-sheet h2,
+.proposal-sheet p { margin: 0; }
+.proposal-sheet > header p { color: var(--muted); font-size: var(--fs-small); }
+.proposal-sheet > header > strong { color: var(--warn); font-weight: 400; text-align: right; }
+.proposal-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.proposal-facts > div { display: grid; gap: 2px; padding: 8px 9px; border-left: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.proposal-facts > div:nth-child(3n + 1) { border-left: 0; }
+.proposal-facts span,
+.proposal-services small,
+.proposal-decision span { color: var(--muted); font-size: var(--fs-small); }
+.proposal-services,
+.proposal-note { display: grid; gap: 4px; padding: 9px; border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.proposal-services > div { display: grid; grid-template-columns: minmax(120px, .7fr) minmax(0, 1fr); gap: 10px; }
+.proposal-note p { color: var(--muted); font-size: var(--fs-small); }
+.proposal-sheet > footer { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 10px 2px 2px; border-top: 1px solid var(--edge); }
+.proposal-sheet > footer > button { width: auto; min-width: 128px; padding: 6px 10px; border-radius: 2px; border-color: var(--warn); color: var(--warn); }
+.proposal-decision { display: grid; gap: 2px; margin-right: auto; }
+.proposal-decision.accepted strong { color: var(--warn); }
+.proposal-state { padding: 18px; }
+.proposal-state p { margin-bottom: 0; color: var(--muted); }
+.proposal-menu > div { display: grid; gap: 2px; padding: 7px 8px; border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+.proposal-menu > div span { color: var(--muted); font-size: var(--fs-label); letter-spacing: .04em; text-transform: uppercase; }
+
+.organization-anchor { position: relative; width: 100%; font-family: var(--font-chrome); }
+.organization-trigger { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 8px; align-items: center;
+    width: 100%; padding: 6px 7px; background: transparent; border: 1px solid transparent; border-radius: 3px; text-align: left; }
+.organization-trigger:hover,
+.organization-trigger[aria-expanded="true"] { background: color-mix(in srgb, var(--edge) 54%, transparent); border-color: var(--edge); }
+.organization-trigger > span:nth-child(2) { display: grid; min-width: 0; }
+.organization-trigger small,
+.organization-menu-choices small { color: var(--muted); font-size: var(--fs-label); font-weight: 400; letter-spacing: .04em; text-transform: uppercase; }
+.organization-trigger strong { overflow: hidden; font-size: var(--fs-small); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.organization-mark { display: grid; place-items: center; width: 22px; height: 22px; color: var(--warn); border: 1px solid var(--edge); }
+.organization-popover { position: fixed; z-index: 80; font-family: var(--font-chrome); width: min(292px, calc(100vw - 24px));
+    overflow: auto; padding: 6px; background: var(--panel); border: 1px solid var(--edge); box-shadow: 0 12px 36px rgba(0, 0, 0, .35); }
+.organization-popover button { width: 100%; background: transparent; border: 1px solid transparent; border-radius: 2px; text-align: left; }
+.organization-popover button:hover,
+.organization-popover button.active { background: color-mix(in srgb, var(--edge) 58%, transparent); border-color: var(--edge); }
+.organization-create-trigger { margin-top: 4px; border-top-color: var(--edge) !important; color: var(--accent) !important; }
+.organization-create { display: grid; gap: 6px; margin-top: 5px; padding: 9px; border: 1px solid var(--edge); background: color-mix(in srgb, var(--panel) 72%, var(--bg)); }
+.organization-create label { color: var(--muted); font-size: var(--fs-label); letter-spacing: .06em; text-transform: uppercase; }
+.organization-create input { box-sizing: border-box; width: 100%; min-width: 0; }
+.organization-create p { margin: 0; color: var(--danger, #e88); font-size: var(--fs-small); }
+.organization-create > div { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.organization-create > div button { text-align: center; border-color: var(--edge); }
+.organization-work { padding: 6px 8px; }
+.organization-menu-choices { display: grid; gap: 2px; padding: 5px 0; border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge); }
+.organization-menu-choices button { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 8px; align-items: center; padding: 5px 7px; }
+.organization-menu-choices button > span:last-child { display: grid; }
+.organization-menu-branch { display: grid; gap: 1px; padding-top: 6px; }
+.organization-menu-branch > span { padding: 3px 8px; color: var(--warn); font-size: var(--fs-label); letter-spacing: .06em; text-transform: uppercase; }
+.organization-menu-branch button { padding: 5px 8px 5px 18px; }
+
+/* Management pages share the screen with three resizable panes. Their
+   available width, not the browser viewport, governs the compact layout. */
+@container (max-width: 720px) {
+    .gaugeapp-facts-grid { grid-template-columns: 1fr; }
+    .gaugeapp-backup-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .gaugeapp-backup-schedule { grid-template-columns: minmax(0, 1fr); }
+    .gaugeapp-backup-schedule > button { justify-self: end; }
+    .gaugeapp-row { grid-template-columns: 1fr; gap: 2px; }
+    .gaugeapp-inline-form,
+    .gaugeapp-inline-form-wide,
+    .gaugeapp-identity-summary,
+    .gaugeapp-setting-row,
+    .gaugeapp-device-edit,
+    .gaugeapp-provider-form,
+    .gaugeapp-provider-row,
+    .gaugeapp-provider-account-row,
+    .gaugeapp-device-link-code,
+    .gaugeapp-device-compare,
+    .gaugeapp-device-join,
+    .gaugeapp-people-invite,
+    .gaugeapp-person-row,
+    .gaugeapp-session-row,
+    .gaugeapp-session-detail-action,
+    .gaugeapp-session-inline-detail,
+    .gaugeapp-admission-control,
+    .gaugeapp-plan-offer,
+    .gaugeapp-plan-control,
+    .gaugeapp-one-time,
+    .gaugeapp-delivery-links,
+    .gaugeapp-commercial-evidence,
+    .gaugeapp-invitation-response,
+    .gaugeapp-policy-grid,
+    .gaugeapp-policy-numbers,
+    .gaugeapp-change-summary { grid-template-columns: 1fr; }
+    .gaugeapp-admission-control > button { justify-self: start; }
+    .gaugeapp-readiness-list { grid-template-columns: 1fr; }
+    .gaugeapp-plan-control form { align-items: stretch; flex-direction: column; }
+    .gaugeapp-plan-control form label { width: auto; }
+    .gaugeapp-plan-confirm { justify-items: start; max-width: none; text-align: left; }
+    .gaugeapp-provider-form label.wide,
+    .gaugeapp-form-actions { grid-column: auto; }
+    .gaugeapp-inline-form > button { justify-self: end; }
+    .gaugeapp-people-invite { grid-template-columns: minmax(0, 1fr) auto; }
+    .gaugeapp-people-invite label.wide,
+    .gaugeapp-people-invite small { grid-column: 1 / -1; }
+    .gaugeapp-person-row { grid-template-columns: minmax(0, 1fr) auto; gap: 3px 8px; }
+    .gaugeapp-person-role,
+    .gaugeapp-person-role-edit { grid-column: 1; }
+    .gaugeapp-person-row > .gaugeapp-row-actions { grid-column: 2; grid-row: 1 / span 2;
+        flex-direction: column; align-items: end; }
+    .gaugeapp-row-actions { justify-content: start; }
+    .gaugeapp-session-row { grid-template-columns: minmax(0, 1fr) auto; gap: 3px 8px; }
+    .gaugeapp-session-posture { grid-column: 1; }
+    .gaugeapp-session-row > button:last-child { grid-column: 2; grid-row: 1 / span 2; justify-self: end; }
+    .gaugeapp-session-inline-detail > button { justify-self: end; }
+    .gaugeapp-device-compare > div:last-child { padding: 7px 0 0; border-left: 0; border-top: 1px solid var(--edge); }
+    .gaugeapp-catalog { grid-template-columns: 1fr; }
+    .gaugeapp-editor-grid,
+    .gaugeapp-tenant-service-row,
+    .gaugeapp-service-row,
+    .gaugeapp-recipient-row,
+    .gaugeapp-detail-facts,
+    .gaugeapp-payment-actions,
+    .gaugeapp-refund-row { grid-template-columns: 1fr; }
+    .gaugeapp-field-wide { grid-column: auto; }
+}
+
+@container (max-width: 520px) {
+    .gaugeapp-section-head { align-items: stretch; flex-direction: column; gap: 6px; }
+    .gaugeapp-section-head > .gaugeapp-actions { align-self: start; flex-wrap: wrap; }
+    .gaugeapp-section-head > button { align-self: start; }
+    .gaugeapp-plan-head { align-items: start; flex-direction: column; gap: 7px; }
+    .gaugeapp-plan-head > .gaugeapp-row-actions,
+    .gaugeapp-plan-head > .gaugeapp-actions { align-self: stretch; flex-wrap: wrap; }
+    .gaugeapp-plan-head > .gaugeapp-row-actions button,
+    .gaugeapp-plan-head > .gaugeapp-actions button { flex: 0 0 auto; white-space: nowrap; }
+    .gaugeapp-proposal { grid-template-columns: minmax(0, 1fr); }
+    .gaugeapp-proposal > .gaugeapp-actions { grid-column: 1; grid-row: auto; justify-self: end; }
+    .gaugeapp-catalog,
+    .gaugeapp-editor-grid,
+    .gaugeapp-tenant-service-row,
+    .gaugeapp-service-row,
+    .gaugeapp-recipient-row { grid-template-columns: 1fr; }
+    .gaugeapp-field-wide { grid-column: auto; }
+    .gaugeapp-price-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .gaugeapp-price-row label,
+    .gaugeapp-price-row label:first-child { flex-basis: auto; }
+    .gaugeapp-price-row .gaugeapp-icon-action { justify-self: end; }
+    .gaugeapp-card-facts { display: grid; gap: 2px; }
+    .gaugeapp-client-card { grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; }
+    .gaugeapp-client-card > span { grid-column: 1 / -1; }
+    .gaugeapp-client-card .gaugeapp-card-actions { grid-column: 2; grid-row: 1 / span 2; }
+    .gaugeapp-engagement-card { grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; }
+    .gaugeapp-engagement-card > span:not(.gaugeapp-stage) { grid-column: 1 / -1; }
+    .gaugeapp-engagement-card button { grid-column: 2; grid-row: 1 / span 2; }
+    .gaugeapp-operation-row { grid-template-columns: 1fr; }
+    .gaugeapp-callout { align-items: start; flex-direction: column; }
+    .gaugeapp-payment-readiness,
+    .gaugeapp-payment-totals { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .gaugeapp-payment-actions,
+    .gaugeapp-refund-row,
+    .gaugeapp-action-result { grid-template-columns: 1fr; }
+    .gaugeapp-action-result a,
+    .gaugeapp-action-result button { justify-self: start; }
+    .proposal-sheet > header,
+    .proposal-facts { grid-template-columns: 1fr; }
+    .proposal-sheet > header > strong { text-align: left; }
+    .proposal-facts > div { border-left: 0; border-top: 1px solid color-mix(in srgb, var(--edge) 66%, transparent); }
+    .proposal-facts > div:first-child { border-top: 0; }
+    .proposal-services > div { grid-template-columns: 1fr; gap: 1px; }
+    .proposal-sheet > footer { align-items: stretch; flex-direction: column; }
+    .proposal-decision { margin-right: 0; }
+}

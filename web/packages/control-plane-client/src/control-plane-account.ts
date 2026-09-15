@@ -235,6 +235,8 @@ export interface ManagedUsageSummary {
     readonly total_tokens: number;
     readonly included_tokens: number;
     readonly overage_tokens: number;
+    readonly unattributed_runs: number;
+    readonly unattributed_tokens: number;
 }
 export interface ManagedInferenceBilling {
     readonly plan: ManagedInferencePlan | null;
@@ -488,7 +490,8 @@ export async function linkProjectCredential(
     });
 }
 
-/** Drop a project's pin, so the project falls back to the account default again. */
+/** Drop one project-owned credential. Organization selection and account-level
+ * resolution remain independent and are evaluated by the server at run time. */
 export async function unlinkProjectCredential(
     json: RouteJson,
     project: string,
@@ -644,9 +647,9 @@ export interface HubSessionStatus {
     available: boolean;
     linked: boolean;
     person: string | null;
-    /** The subject as a person would recognize it (the id-token's email, else
-     *  name) — what surfaces display. `person` stays the IdP's opaque `sub`.
-     *  Falls back to `person` against a control plane that predates it. */
+    /** Human-recognizable label projected by the Hub from the verified sign-in
+     *  assertion. `person` is the independent GaugeDesk account id; an external
+     *  provider subject is neither identity nor display truth. */
     label: string | null;
     expires: number | null;
     expired: boolean;

@@ -2448,48 +2448,54 @@ Then("no chat shows a working dot", async ({ page }) => {
 
 // ---- per-project model access (LLM-2) ----
 
-// Open a project's model-access panel from its right-click context menu (the id comes
-// from the node, never typed) — mirrors the "add an archetype" project-menu flow.
+// Enter ordinary Project settings from the project's context menu, then select
+// its Model access page in the right-hand settings menu. The project id comes
+// from the node, never from a typed field.
 When("I open model access for project {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Projects" }).click();
     await page
         .locator("[data-project]", { hasText: name })
         .locator(".tree-node.project")
         .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "model access" }).click();
+    await page.locator(".menu-item", { hasText: "project settings" }).click();
+    await page.getByRole("navigation", { name: `Settings for ${name}` })
+        .getByRole("button", { name: "Model access", exact: true })
+        .click();
 });
 
 Then("the model-access panel is open", async ({ page }) => {
     await expect(page.locator("[data-project-model-access]")).toBeVisible();
 });
 
-// Pin a provider: select it, paste a throwaway token, and submit. The token is sealed
-// server-side (SEC-4) and never read back — we only assert the pin appears.
-When("I pin the provider {string} for this project", async ({ page }, provider: string) => {
+// Add a provider: select it, paste a throwaway token, and submit. The token is sealed
+// server-side (SEC-4) and never read back — we only assert the key appears.
+When("I add the provider {string} to this project", async ({ page }, provider: string) => {
     const panel = page.locator("[data-project-model-access]");
     await panel.locator("select").selectOption(provider);
     await panel.locator("[data-project-credential-token]").fill("sk-e2e-throwaway");
-    await panel.locator("button", { hasText: /^pin$/ }).click();
+    await panel.getByRole("button", { name: "Add key", exact: true }).click();
 });
 
-Then("the project pins the provider {string}", async ({ page }, provider: string) => {
+Then("the project holds the provider {string}", async ({ page }, provider: string) => {
     await expect(
         page.locator("[data-project-model-access]").locator(`[data-pinned="${provider}"]`),
     ).toBeVisible();
 });
 
-When("I unpin the provider {string} for this project", async ({ page }, provider: string) => {
+When("I remove the provider {string} from this project", async ({ page }, provider: string) => {
     await page
         .locator("[data-project-model-access]")
         .locator(`[data-pinned="${provider}"]`)
-        .locator("button", { hasText: "unpin" })
+        .getByRole("button", { name: "Remove key", exact: true })
         .click();
 });
 
-Then("the project has no provider pins", async ({ page }) => {
+Then("the project has no project-owned keys", async ({ page }) => {
     await expect(
         page.locator("[data-project-model-access]").locator("[data-pinned]"),
     ).toHaveCount(0);
+    await expect(page.getByText("No project-owned key.", { exact: true })).toBeVisible();
+    await expect(page.getByText("using the account default", { exact: false })).toHaveCount(0);
 });
 
 // ---- project home rollup (UX-2) ----

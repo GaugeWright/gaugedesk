@@ -36,6 +36,7 @@ pub mod managed_machine_execution;
 pub mod merge;
 pub mod mobile_machine_session;
 pub mod mobile_wake;
+pub mod model_connection;
 pub mod package_distribution;
 pub mod pinned_tls;
 pub mod protected_profile;

@@ -113,14 +113,6 @@
     },
     {
       "declaration": {
-        "name": "native_file_action_authorization_target",
-        "owner": "ChatWorkspace",
-        "signature": "fn native_file_action_authorization_target (& self , _path : & str , _base : & str ,) -> Result < NativeFileActionTarget >"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
         "name": "native_file_action_evidence_target",
         "owner": "ChatWorkspace",
         "signature": "fn native_file_action_evidence_target (& self , _path : & str , _base : & str ,) -> Result < NativeFileActionEvidenceTarget >"
@@ -132,30 +124,6 @@
         "name": "native_file_action_target",
         "owner": "ChatWorkspace",
         "signature": "fn native_file_action_target (& self , _path : & str , _base : & str ,) -> Result < NativeFileActionTarget >"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
-        "name": "native_file_read_target",
-        "owner": "ChatWorkspace",
-        "signature": "fn native_file_read_target (& self , _path : & str) -> Result < NativeFileActionTarget >"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
-        "name": "native_resolution_recording_evidence_target",
-        "owner": "ChatWorkspace",
-        "signature": "fn native_resolution_recording_evidence_target (& self , _path : & str , _scope : whipplescript_store :: vcs :: resolution_scope :: ResolutionMemoryScope ,) -> Result < NativeResolutionRecordingEvidenceTarget >"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
-        "name": "native_resolution_recording_target",
-        "owner": "ChatWorkspace",
-        "signature": "fn native_resolution_recording_target (& self , _path : & str , _scope : whipplescript_store :: vcs :: resolution_scope :: ResolutionMemoryScope ,) -> Result < NativeResolutionRecordingTarget >"
       },
       "classification": "requires-provenance-review"
     },
@@ -204,14 +172,6 @@
         "name": "read_file_capped",
         "owner": "ChatWorkspace",
         "signature": "fn read_file_capped (& self , rel : & str , max_bytes : usize) -> Result < Option < String > >"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
-        "name": "recorded_file_cut",
-        "owner": "ChatWorkspace",
-        "signature": "fn recorded_file_cut (& self , _rel : & str , _served : & [u8]) -> Result < Option < String > >"
       },
       "classification": "requires-provenance-review"
     },
@@ -313,14 +273,6 @@
     },
     {
       "declaration": {
-        "name": "write_file_from_path",
-        "owner": "ChatWorkspace",
-        "signature": "fn write_file_from_path (& self , rel : & str , source : & std :: path :: Path) -> Result < () >"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
         "name": "archive_workstream",
         "owner": "Workspace",
         "signature": "fn archive_workstream (& self , _workstream_id : & str) -> Result < Vec < String > >"
@@ -409,14 +361,6 @@
     },
     {
       "declaration": {
-        "name": "export_protected_workflow",
-        "owner": "Workspace",
-        "signature": "fn export_protected_workflow (& self , _protection : & WorkflowProtection ,) -> Result < WorkspaceExport >"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
         "name": "fork_engagement_at",
         "owner": "Workspace",
         "signature": "fn fork_engagement_at (& self , id : & str , source_branch : & str , target : & str , cut_id : & str ,) -> Result < Box < dyn ChatWorkspace > >"
@@ -446,22 +390,6 @@
         "signature": "fn mainline (& self) -> & str"
       },
       "classification": "locator"
-    },
-    {
-      "declaration": {
-        "name": "native_workflow_storage",
-        "owner": "Workspace",
-        "signature": "fn native_workflow_storage (& self) -> Result < NativeWorkflowStorage >"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
-        "name": "open_engagement_subset",
-        "owner": "Workspace",
-        "signature": "fn open_engagement_subset (& self , _id : & str , _target : & str , _roots : & BTreeSet < String > ,) -> Result < Option < Box < dyn ChatWorkspace > > >"
-      },
-      "classification": "requires-provenance-review"
     },
     {
       "declaration": {
@@ -553,14 +481,6 @@
     },
     {
       "declaration": {
-        "name": "workflow_source",
-        "owner": "Workspace",
-        "signature": "fn workflow_source (& self , path : & str , cut : & str , byte_limit : usize) -> Result < WorkflowSource >"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
         "name": "workstream",
         "owner": "Workspace",
         "signature": "fn workstream (& self , _workstream_id : & str) -> Result < Option < WorkstreamRow > >"
@@ -593,14 +513,6 @@
     },
     {
       "declaration": {
-        "name": "accepts_export_format",
-        "owner": "WorkspaceProvider",
-        "signature": "fn accepts_export_format (& self , format : & str) -> bool"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
         "name": "export_format",
         "owner": "WorkspaceProvider",
         "signature": "fn export_format (& self) -> & 'static str"
@@ -625,14 +537,6 @@
     },
     {
       "declaration": {
-        "name": "from_protected_export_at",
-        "owner": "WorkspaceProvider",
-        "signature": "fn from_protected_export_at (& self , _dir : & Path , _export : & [u8] , _protection : & WorkflowProtection ,) -> Result < Box < dyn Workspace > >"
-      },
-      "classification": "requires-provenance-review"
-    },
-    {
-      "declaration": {
         "name": "init_at",
         "owner": "WorkspaceProvider",
         "signature": "fn init_at (& self , dir : & Path) -> Result < Box < dyn Workspace > >"
@@ -646,9 +550,113 @@
         "signature": "fn open_at (& self , dir : & Path) -> Box < dyn Workspace >"
       },
       "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "native_resolution_recording_evidence_target",
+        "owner": "ChatWorkspace",
+        "signature": "fn native_resolution_recording_evidence_target (& self , _path : & str , _scope : whipplescript_store :: vcs :: resolution_scope :: ResolutionMemoryScope ,) -> Result < NativeResolutionRecordingEvidenceTarget >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "native_resolution_recording_target",
+        "owner": "ChatWorkspace",
+        "signature": "fn native_resolution_recording_target (& self , _path : & str , _scope : whipplescript_store :: vcs :: resolution_scope :: ResolutionMemoryScope ,) -> Result < NativeResolutionRecordingTarget >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "open_engagement_subset",
+        "owner": "Workspace",
+        "signature": "fn open_engagement_subset (& self , _id : & str , _target : & str , _roots : & BTreeSet < String > ,) -> Result < Option < Box < dyn ChatWorkspace > > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "native_file_action_authorization_target",
+        "owner": "ChatWorkspace",
+        "signature": "fn native_file_action_authorization_target (& self , _path : & str , _base : & str ,) -> Result < NativeFileActionTarget >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "native_file_read_target",
+        "owner": "ChatWorkspace",
+        "signature": "fn native_file_read_target (& self , _path : & str) -> Result < NativeFileActionTarget >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "recorded_file_cut",
+        "owner": "ChatWorkspace",
+        "signature": "fn recorded_file_cut (& self , _rel : & str , _served : & [u8]) -> Result < Option < String > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "write_file_from_path",
+        "owner": "ChatWorkspace",
+        "signature": "fn write_file_from_path (& self , rel : & str , source : & std :: path :: Path) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "export_protected_workflow",
+        "owner": "Workspace",
+        "signature": "fn export_protected_workflow (& self , _protection : & WorkflowProtection ,) -> Result < WorkspaceExport >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "native_workflow_storage",
+        "owner": "Workspace",
+        "signature": "fn native_workflow_storage (& self) -> Result < NativeWorkflowStorage >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "workflow_source",
+        "owner": "Workspace",
+        "signature": "fn workflow_source (& self , path : & str , cut : & str , byte_limit : usize) -> Result < WorkflowSource >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "accepts_export_format",
+        "owner": "WorkspaceProvider",
+        "signature": "fn accepts_export_format (& self , format : & str) -> bool"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "from_protected_export_at",
+        "owner": "WorkspaceProvider",
+        "signature": "fn from_protected_export_at (& self , _dir : & Path , _export : & [u8] , _protection : & WorkflowProtection ,) -> Result < Box < dyn Workspace > >"
+      },
+      "classification": "requires-provenance-review"
     }
   ],
   "profiles": {
+    "editor-and-import": {
+      "coverage_id": "ACTION-4",
+      "reason": "Editor, import, upload, restore and read/base helpers require exact admitted intent and evidence; existing materialization and best-effort transcript publication do not establish parity.",
+      "required_evidence": [
+        "Migrate actual HTTP and non-HTTP callers to the shared governed implementation.",
+        "Preserve conflict/resolution and exact observed bases; attribute external writes only as observed."
+      ]
+    },
     "agent-turn": {
       "coverage_id": "ACTION-5",
       "reason": "Agent turn boundaries, automatic merge and autosync mutate or observe shared workspace state and need their causal command/effect/result mapping.",
@@ -665,28 +673,20 @@
         "Bind every durable authoring change and release result to its originating authenticated command."
       ]
     },
-    "custody-and-erasure": {
-      "coverage_id": "ACTION-6",
-      "reason": "Credential, content-key and quarantine cleanup sites share workspace method names but belong to dedicated custody/erasure authorities.",
+    "startup-and-migration": {
+      "coverage_id": "ACTION-8",
+      "reason": "Startup migration, reconciliation and recovery can import or change durable work without an HTTP request; bootstrap must not manufacture a work grant or retroactive actor.",
       "required_evidence": [
-        "Verify the actual receiver and admitted custody/erasure outcome rather than inferring a workspace call from its name.",
-        "Retain permitted metadata only; secret bytes never enter generic commands or runtime evidence."
+        "Declare the migration/observation boundary and preserve legacy or unknown provenance.",
+        "Map durable effects and recovery to their actual authority; classify disposable initialization separately."
       ]
     },
-    "editor-and-import": {
-      "coverage_id": "ACTION-4",
-      "reason": "Editor, import, upload, restore and read/base helpers require exact admitted intent and evidence; existing materialization and best-effort transcript publication do not establish parity.",
-      "required_evidence": [
-        "Migrate actual HTTP and non-HTTP callers to the shared governed implementation.",
-        "Preserve conflict/resolution and exact observed bases; attribute external writes only as observed."
-      ]
-    },
-    "external-workspace-adapter": {
+    "topology-and-settlement": {
       "coverage_id": "ACTION-5",
-      "reason": "External-folder and Git adapters retain external authority and may perform file or process effects; native history cannot stand in for their observation ceiling.",
+      "reason": "Workspace construction, homing, promotion and target settlement require shared command/effect/result provenance under their existing independent authorities.",
       "required_evidence": [
-        "Bind exact external bases and declared apply/publish/reconciliation capability.",
-        "Keep opaque process footprints and unknown external authorship explicit; do not retry uncertain effects blindly."
+        "Preserve reservations, CAS, exact candidate/target bases and compensation identity.",
+        "Qualify partial application, current authority and interrupted recovery without a second settlement machine."
       ]
     },
     "native-action-boundary": {
@@ -697,28 +697,6 @@
         "Connect the qualified runtime evidence and product admission to live entry points without an alternate writer."
       ]
     },
-    "native-action-observation-callback": {
-      "coverage_id": "ACTION-3",
-      "reason": "These private observation callbacks share the current reader and original-command authority fence. Execution-only reads drop the one-use writer; saved-source retention may consume it only after the existing exact attempt-bound target proof.",
-      "required_evidence": [
-        "Missing acknowledgment remains an evidence gap without redelivery or store initialization; retained acknowledgment requires the exact receipt, fact, command, runtime and independently verified runtime prefix.",
-        "Execution observations preserve original attribution and original/current restrictions, refuse revoked readers, and leave product and runtime history unchanged.",
-        "Saved-input observation and source retention retain their exact target proof and one-use publication fence; live entry-point migration remains open."
-      ]
-    },
-    "native-recording-boundary": {
-      "coverage_id": "ACTION-4",
-      "reason": "Native recording descriptors bind the actual selected store and namespace, with a separate read-only historical evidence adapter. Home admission retains exact input and a fenced independent command/outbox; delivery verifies original admission and current authority. Execution resolves the retained input under the Home fences and invokes the runtime-owned recording door after exact target, scope and IFC checks. Independent inspection authenticates the current reader, preserves all original and current metadata restrictions and validates the original Home input mapping before reading the actual historical batch through a read-only adapter. Reconciliation uses its independently admitted outbox and retained read policy, current investigator authority and an explicitly acquired actual-Home runtime epoch. The owner verifies the original execution, input mapping and actual historical target batch before publishing a disposition; the Home admits only the pinned runtime acknowledgment, with no recording retry or workflow advance. Product result admission independently checks the committed reconciliation/outbox/acknowledgment, undisputed Applied history and actual original batch, then records the owner's exact ordered outcomes under the current product fence. Reads return only the immutable admitted metadata under current access and all retained result restrictions, without opening runtime, target or input databases or promising body availability. Derived-input handling and activation remain open.",
-      "required_evidence": [
-        "Derive input and scope from current Home authority and invoke only the runtime-owned fixed recording profile after durable dispatch.",
-        "Preserve original attribution and first-wins outcomes without advancing file heads or reconstructing erased bodies.",
-        "Authorize an independent investigator before reading the original target receipt; do not treat an absent receipt as non-application.",
-        "Refuse stale or foreign-Home ownership, missing outboxes and revoked current investigators; recover a lost acknowledgment from the exact runtime receipt without retrying the target.",
-        "Keep original batch attribution and both merge orientations, including inserted=false for existing winners; a later investigator or result-admitting reader never becomes their original author.",
-        "Refuse missing admission, acknowledgment, target receipt or product commit receipt, and disputed runtime evidence; retain stricter historical metadata restrictions after target policy relaxation.",
-        "Recover product commit failures under the same result identity without runtime or target mutation; independently authorize read-only historical result retrieval after backing runtime or target removal."
-      ]
-    },
     "native-workspace-adapter": {
       "coverage_id": "ACTION-5",
       "reason": "Native workspace methods adapt the owning WhippleScript stores, including read-triggered imports, versioned changes, topology and disposable materialization.",
@@ -727,21 +705,20 @@
         "Preserve exact native cuts and retention, and identify observation-only or derived paths explicitly."
       ]
     },
-    "project-tracker-completion": {
-      "coverage_id": "ACTION-3",
-      "reason": "Human tracker completion retains exact input and permanent issue binding under current project tracker grants before a separate native closure action; it does not infer authority from assignment or claim-holder identity.",
+    "external-workspace-adapter": {
+      "coverage_id": "ACTION-5",
+      "reason": "External-folder and Git adapters retain external authority and may perform file or process effects; native history cannot stand in for their observation ceiling.",
       "required_evidence": [
-        "Fence current recipient Read and Contribute grants, pending handoff, project key and retained input through original command publication and native closure.",
-        "Preserve the original actor, permanent subject and explicit claim precondition across retry and restart; recover a committed closing receipt without re-dispatch and refuse unresolved receipt loss.",
-        "An authorized colleague closes an away assignee task under their own native attribution; assignment and the tutorial root remain distinct."
+        "Bind exact external bases and declared apply/publish/reconciliation capability.",
+        "Keep opaque process footprints and unknown external authorship explicit; do not retry uncertain effects blindly."
       ]
     },
-    "project-workflow-launch": {
-      "coverage_id": "ACTION-3",
-      "reason": "Ordinary folder workflow admission retains immutable source and typed inputs under current project, source and tracker authority; native admission is distinct from subsequent effect permission.",
+    "custody-and-erasure": {
+      "coverage_id": "ACTION-6",
+      "reason": "Credential, content-key and quarantine cleanup sites share workspace method names but belong to dedicated custody/erasure authorities.",
       "required_evidence": [
-        "Fence current source and resource grants through protected input retention and product command publication.",
-        "Recover the original command and native instance across retry, restart and relocation; changed inputs, revoked access and erased custody refuse."
+        "Verify the actual receiver and admitted custody/erasure outcome rather than inferring a workspace call from its name.",
+        "Retain permitted metadata only; secret bytes never enter generic commands or runtime evidence."
       ]
     },
     "publication-review": {
@@ -760,20 +737,43 @@
         "A handler reference is not itself proof of runtime mediation or an exemption for the handler body."
       ]
     },
-    "startup-and-migration": {
-      "coverage_id": "ACTION-8",
-      "reason": "Startup migration, reconciliation and recovery can import or change durable work without an HTTP request; bootstrap must not manufacture a work grant or retroactive actor.",
+    "native-recording-boundary": {
+      "coverage_id": "ACTION-4",
+      "reason": "Native recording descriptors bind the actual selected store and namespace, with a separate read-only historical evidence adapter. Home admission retains exact input and a fenced independent command/outbox; delivery verifies original admission and current authority. Execution resolves the retained input under the Home fences and invokes the runtime-owned recording door after exact target, scope and IFC checks. Independent inspection authenticates the current reader, preserves all original and current metadata restrictions and validates the original Home input mapping before reading the actual historical batch through a read-only adapter. Reconciliation uses its independently admitted outbox and retained read policy, current investigator authority and an explicitly acquired actual-Home runtime epoch. The owner verifies the original execution, input mapping and actual historical target batch before publishing a disposition; the Home admits only the pinned runtime acknowledgment, with no recording retry or workflow advance. Product result admission independently checks the committed reconciliation/outbox/acknowledgment, undisputed Applied history and actual original batch, then records the owner's exact ordered outcomes under the current product fence. Reads return only the immutable admitted metadata under current access and all retained result restrictions, without opening runtime, target or input databases or promising body availability. Derived-input handling and activation remain open.",
       "required_evidence": [
-        "Declare the migration/observation boundary and preserve legacy or unknown provenance.",
-        "Map durable effects and recovery to their actual authority; classify disposable initialization separately."
+        "Derive input and scope from current Home authority and invoke only the runtime-owned fixed recording profile after durable dispatch.",
+        "Preserve original attribution and first-wins outcomes without advancing file heads or reconstructing erased bodies.",
+        "Authorize an independent investigator before reading the original target receipt; do not treat an absent receipt as non-application.",
+        "Refuse stale or foreign-Home ownership, missing outboxes and revoked current investigators; recover a lost acknowledgment from the exact runtime receipt without retrying the target.",
+        "Keep original batch attribution and both merge orientations, including inserted=false for existing winners; a later investigator or result-admitting reader never becomes their original author.",
+        "Refuse missing admission, acknowledgment, target receipt or product commit receipt, and disputed runtime evidence; retain stricter historical metadata restrictions after target policy relaxation.",
+        "Recover product commit failures under the same result identity without runtime or target mutation; independently authorize read-only historical result retrieval after backing runtime or target removal."
       ]
     },
-    "topology-and-settlement": {
-      "coverage_id": "ACTION-5",
-      "reason": "Workspace construction, homing, promotion and target settlement require shared command/effect/result provenance under their existing independent authorities.",
+    "native-action-observation-callback": {
+      "coverage_id": "ACTION-3",
+      "reason": "These private observation callbacks share the current reader and original-command authority fence. Execution-only reads drop the one-use writer; saved-source retention may consume it only after the existing exact attempt-bound target proof.",
       "required_evidence": [
-        "Preserve reservations, CAS, exact candidate/target bases and compensation identity.",
-        "Qualify partial application, current authority and interrupted recovery without a second settlement machine."
+        "Missing acknowledgment remains an evidence gap without redelivery or store initialization; retained acknowledgment requires the exact receipt, fact, command, runtime and independently verified runtime prefix.",
+        "Execution observations preserve original attribution and original/current restrictions, refuse revoked readers, and leave product and runtime history unchanged.",
+        "Saved-input observation and source retention retain their exact target proof and one-use publication fence; live entry-point migration remains open."
+      ]
+    },
+    "project-tracker-completion": {
+      "coverage_id": "ACTION-3",
+      "reason": "Human tracker completion retains exact input and permanent issue binding under current project tracker grants before a separate native closure action; it does not infer authority from assignment or claim-holder identity.",
+      "required_evidence": [
+        "Fence current recipient Read and Contribute grants, pending handoff, project key and retained input through original command publication and native closure.",
+        "Preserve the original actor, permanent subject and explicit claim precondition across retry and restart; recover a committed closing receipt without re-dispatch and refuse unresolved receipt loss.",
+        "An authorized colleague closes an away assignee task under their own native attribution; assignment and the tutorial root remain distinct."
+      ]
+    },
+    "project-workflow-launch": {
+      "coverage_id": "ACTION-3",
+      "reason": "Ordinary folder workflow admission retains immutable source and typed inputs under current project, source and tracker authority; native admission is distinct from subsequent effect permission.",
+      "required_evidence": [
+        "Fence current source and resource grants through protected input retention and product command publication.",
+        "Recover the original command and native instance across retry, restart and relocation; changed inputs, revoked access and erased custody refuse."
       ]
     }
   },
@@ -827,26 +827,6 @@
         "file": "crates/app/src/at_rest.rs"
       },
       "profile": "custody-and-erasure"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for ContentVault::erase_local_scope",
-        "capability": "remove_file",
-        "count": 1,
-        "expression": "std :: fs :: remove_file (key_path (& root , key_id))",
-        "file": "crates/app/src/content_vault/scope_key.rs"
-      },
-      "profile": "custody-and-erasure"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for PreparedScopeKey::retain",
-        "capability": "publish",
-        "count": 1,
-        "expression": "publish ()",
-        "file": "crates/app/src/content_vault/scope_key.rs"
-      },
-      "profile": "native-action-boundary"
     },
     {
       "site": {
@@ -930,16 +910,6 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::engagement_recorded_file_cut",
-        "capability": "recorded_file_cut",
-        "count": 1,
-        "expression": "eng . recorded_file_cut (& path , served)",
-        "file": "crates/app/src/engagement_routes.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
         "callable": "impl inherent for Workbench::engagement_task_context",
         "capability": "boundary_cut",
         "count": 1,
@@ -984,26 +954,6 @@
         "capability": "ingest_into",
         "count": 1,
         "expression": "eng . ingest_into (& prefix , path)",
-        "file": "crates/app/src/engagement_routes.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::ingest_streamed_file_into_engagement",
-        "capability": "commit_turn",
-        "count": 1,
-        "expression": "eng . commit_turn (& format ! (\"ingest uploaded context: {base}\"))",
-        "file": "crates/app/src/engagement_routes.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::ingest_streamed_file_into_engagement",
-        "capability": "write_file_from_path",
-        "count": 1,
-        "expression": "eng . write_file_from_path (& relative , source)",
         "file": "crates/app/src/engagement_routes.rs"
       },
       "profile": "editor-and-import"
@@ -1290,26 +1240,6 @@
     },
     {
       "site": {
-        "callable": "capture_handoff_offer",
-        "capability": "publish",
-        "count": 1,
-        "expression": "publish (None)",
-        "file": "crates/app/src/federation.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "capture_handoff_offer",
-        "capability": "publish",
-        "count": 1,
-        "expression": "publish (Some ((key , capsule)))",
-        "file": "crates/app/src/federation.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
         "callable": "impl inherent for Workbench::create_default_target_engagement",
         "capability": "create_engagement",
         "count": 1,
@@ -1321,29 +1251,9 @@
     {
       "site": {
         "callable": "impl inherent for Workbench::materialize_collaboration_workspace",
-        "capability": "accepts_export_format",
-        "count": 1,
-        "expression": "provider . accepts_export_format (format)",
-        "file": "crates/app/src/federation.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::materialize_collaboration_workspace",
         "capability": "from_export_at",
         "count": 1,
         "expression": "provider . from_export_at (& dir , bundle)",
-        "file": "crates/app/src/federation.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::materialize_target",
-        "capability": "accepts_export_format",
-        "count": 1,
-        "expression": "provider . accepts_export_format (format)",
         "file": "crates/app/src/federation.rs"
       },
       "profile": "topology-and-settlement"
@@ -1367,166 +1277,6 @@
         "file": "crates/app/src/federation.rs"
       },
       "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "commit",
-        "capability": "accepts_export_format",
-        "count": 1,
-        "expression": "provider . accepts_export_format (& bundle . format)",
-        "file": "crates/app/src/federation_incoming_handoff.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "commit",
-        "capability": "from_export_at",
-        "count": 1,
-        "expression": "provider . from_export_at (& path , & bundle . bundle)",
-        "file": "crates/app/src/federation_incoming_handoff.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "commit",
-        "capability": "from_protected_export_at",
-        "count": 1,
-        "expression": "provider . from_protected_export_at (& path , & bundle . bundle , protection)",
-        "file": "crates/app/src/federation_incoming_handoff.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "commit",
-        "capability": "publish",
-        "count": 2,
-        "expression": "publish ()",
-        "file": "crates/app/src/federation_incoming_handoff.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "publish_views",
-        "capability": "reconcile_engagements",
-        "count": 1,
-        "expression": "workspace . reconcile_engagements ()",
-        "file": "crates/app/src/federation_incoming_handoff.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "prepare",
-        "capability": "native_workflow_storage",
-        "count": 1,
-        "expression": "workspace . native_workflow_storage ()",
-        "file": "crates/app/src/federation_workflow_keys.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::observe_native_file_content",
-        "capability": "native_file_read_target",
-        "count": 1,
-        "expression": "self . engagements . get (chat) . ok_or (\"chat workspace is unavailable\") ? . native_file_read_target (& authority . workspace_path)",
-        "file": "crates/app/src/file_action_content.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::bind_native_editor_target",
-        "capability": "native_file_action_authorization_target",
-        "count": 1,
-        "expression": "self . engagements . get (chat_id) . ok_or (\"editor workspace is unavailable\") ? . native_file_action_authorization_target (& path , base)",
-        "file": "crates/app/src/file_action_delivery.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::deliver_editor_file_save",
-        "capability": "publish",
-        "count": 1,
-        "expression": "inputs . publish (std :: slice :: from_ref (input) , | | { target . publish_base (| | { let verifier = NativeAdmissionVerifier { command , key : key . public_key () , } ; let proof = key . sign (& bytes) ; runtime . admit_action (command . clone () , & action , & verifier , proof . as_bytes ()) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"runtime editor admission refused: {error:?}\")) }) }) })",
-        "file": "crates/app/src/file_action_delivery.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::with_editor_saved_source",
-        "capability": "publish",
-        "count": 1,
-        "expression": "publish (writer)",
-        "file": "crates/app/src/file_action_derived_source.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::admit_editor_file_save",
-        "capability": "native_file_action_authorization_target",
-        "count": 1,
-        "expression": "self . engagements . get (request . chat_id) . ok_or (\"chat workspace is unavailable\") ? . native_file_action_authorization_target (& authority . workspace_path , request . base_cut)",
-        "file": "crates/app/src/file_action_factory.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::admit_editor_file_save",
-        "capability": "publish",
-        "count": 1,
-        "expression": "inputs . publish (std :: slice :: from_ref (& input) , | | { target . publish_base (| | { writer . admit_with_dispatch_against :: < ProductActionAdmission > (& scope , & command . request_id , command . clone () , & dispatch , & basis ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"file admission refused: {error:?}\")) }) }) })",
-        "file": "crates/app/src/file_action_factory.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::with_editor_file_save_observation",
-        "capability": "publish",
-        "count": 1,
-        "expression": "publish (EditorFileSaveObservation { evidence , saved , restrictions : observation . restrictions , observer : observation . observer , } , & original , reader . target , writer ,)",
-        "file": "crates/app/src/file_action_inspection.rs"
-      },
-      "profile": "native-action-observation-callback"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::with_editor_file_save_read",
-        "capability": "native_file_action_evidence_target",
-        "count": 1,
-        "expression": "self . engagements . get (& chat) . ok_or (\"saved-input workspace is unavailable\") ? . native_file_action_evidence_target (& path , & base)",
-        "file": "crates/app/src/file_action_inspection.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::with_editor_file_save_read",
-        "capability": "publish",
-        "count": 1,
-        "expression": "publish (EditorFileSaveExecutionObservation { command : command . clone () , runtime : None , restrictions , observer : context . actor () . as_str () . into () , } , None , writer ,)",
-        "file": "crates/app/src/file_action_inspection.rs"
-      },
-      "profile": "native-action-observation-callback"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::with_editor_file_save_read",
-        "capability": "publish",
-        "count": 1,
-        "expression": "publish (EditorFileSaveExecutionObservation { command : command . clone () , runtime : Some (evidence) , restrictions , observer : context . actor () . as_str () . into () , } , Some (SavedEvidenceReader { runtime : & runtime , target , history , }) , writer ,)",
-        "file": "crates/app/src/file_action_inspection.rs"
-      },
-      "profile": "native-action-observation-callback"
     },
     {
       "site": {
@@ -1560,13 +1310,53 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::retain_editor_file_save_source",
+        "callable": "begin_gaugeapp_agent_live_turn",
         "capability": "publish",
         "count": 1,
-        "expression": "inputs . publish (std :: slice :: from_ref (& input) , | | { self . with_editor_file_save_observation (context , command , admission , attempt , SavedObservationOptions { through : Some (current . evidence . observed_at . clone ()) , retained : None , } , | fresh , original , target , writer | { let actual = statement (& home , request_id , input . clone () , & fresh , EditorFileSaveAttempt { effect_id : & expected . effect_id , run_id : & expected . attempt . run_id , } ,) ? ; if actual != expected { return Err (refused ()) ; } target . publish_committed_scoped_result (& original . binding , & original . resolution_scope , & original . attempt , | _ , saved | { if digest (saved . receipt_json . as_bytes ()) != expected . receipt_digest || saved . reference != expected . receipt || whipplescript_store :: stable_hash_hex (& saved . accepted_content ,) != expected . content_hash { return Err (refused ()) ; } let source = match original_source (& history . store , & scope , & expected , & key . public_key () ,) ? { Some (source) => source , None => SignedSource { signature : key . sign (& expected . signing_bytes () ?) . as_bytes () . to_vec () , statement : expected . clone () , } , } ; let snapshot = source . statement . snapshot () ? ; let receipt = writer . commit (& scope , KEY , & snapshot , & [CommandRecordFact { scope_id : scope . clone () , kind : KIND . into () , payload : serde_json :: to_string (& source) ? , }] ,) . map_err (| _ | refused ()) ? ; Ok (RetainedEditorFileSaveSource { input : input . clone () , cause : ActionCause { authority : expected . issuer . clone () , record_ref : serde_json :: to_string (& (& scope , KEY)) ? , digest : digest (snapshot . as_bytes ()) , } , replayed : receipt . replayed , }) } ,) ? . ok_or_else (refused) } ,) . map_err (StoreError :: Conflict) })",
-        "file": "crates/app/src/file_action_source.rs"
+        "expression": "live . publish (GaugeAppAgentLiveEvent :: Started)",
+        "file": "crates/app/src/gaugeapp_agent.rs"
       },
-      "profile": "native-action-boundary"
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "agent_message",
+        "capability": "publish",
+        "count": 1,
+        "expression": "live_turn . publish (GaugeAppAgentLiveEvent :: Failed)",
+        "file": "ee/app/src/gaugeapp_routes.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "agent_message",
+        "capability": "publish",
+        "count": 1,
+        "expression": "live_turn . publish (GaugeAppAgentLiveEvent :: Settled)",
+        "file": "ee/app/src/gaugeapp_routes.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "agent_message",
+        "capability": "publish",
+        "count": 2,
+        "expression": "live_turn . publish (event)",
+        "file": "ee/app/src/gaugeapp_routes.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "agent_message",
+        "capability": "publish",
+        "count": 1,
+        "expression": "runtime_live_turn . publish (event)",
+        "file": "ee/app/src/gaugeapp_routes.rs"
+      },
+      "profile": "publication-review"
     },
     {
       "site": {
@@ -2090,16 +1880,6 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::library_project_relocation_content_bundles",
-        "capability": "export_protected_workflow",
-        "count": 1,
-        "expression": "workspace . export_protected_workflow (protection)",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
         "callable": "impl inherent for Workbench::pull_archetype_from_source",
         "capability": "pull_from",
         "count": 1,
@@ -2560,16 +2340,6 @@
     },
     {
       "site": {
-        "callable": "open_project_chat_engagements",
-        "capability": "open_engagement_subset",
-        "count": 1,
-        "expression": "workspace . open_engagement_subset (& chat . id , target , & roots)",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "startup-and-migration"
-    },
-    {
-      "site": {
         "callable": "open_project_collaboration_workspaces",
         "capability": "init_at",
         "count": 1,
@@ -2654,16 +2424,6 @@
         "capability": "create_engagement",
         "count": 1,
         "expression": "source . create_engagement (& source_probe_id)",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "startup-and-migration"
-    },
-    {
-      "site": {
-        "callable": "seed_empty_collaboration_workspaces",
-        "capability": "current_main_cut",
-        "count": 1,
-        "expression": "collaboration . current_main_cut ()",
         "file": "crates/app/src/library_state.rs"
       },
       "profile": "startup-and-migration"
@@ -2780,46 +2540,6 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::prepare_tracker_completion",
-        "capability": "publish",
-        "count": 1,
-        "expression": "inputs . publish (& [input] , | | { admission . commit_dispatch :: < ProductActionAdmission > (scope , & request . request_id , command . clone () , & dispatch ,) . map_err (native_error) })",
-        "file": "crates/app/src/project_tracker_completion.rs"
-      },
-      "profile": "project-tracker-completion"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::launch_project_workflow",
-        "capability": "publish",
-        "count": 1,
-        "expression": "inputs . publish (& retained , | | { admission . commit_dispatch :: < ProductActionAdmission > (& scope , & request . request_id , command . clone () , & dispatch ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (debug_error (error)) }) })",
-        "file": "crates/app/src/project_workflow_launch.rs"
-      },
-      "profile": "project-workflow-launch"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::launch_project_workflow",
-        "capability": "workflow_source",
-        "count": 1,
-        "expression": "target . workflow_source (& request . path , & request . cut , limits . source_bytes)",
-        "file": "crates/app/src/project_workflow_launch.rs"
-      },
-      "profile": "project-workflow-launch"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::workflow_storage",
-        "capability": "native_workflow_storage",
-        "count": 1,
-        "expression": "self . collaboration_workspaces . get (workspace) . ok_or (\"project collaboration workspace is not open\") ? . native_workflow_storage ()",
-        "file": "crates/app/src/project_workflow_launch.rs"
-      },
-      "profile": "project-workflow-launch"
-    },
-    {
-      "site": {
         "callable": "impl inherent for QuarantineStore::discard",
         "capability": "remove_file",
         "count": 1,
@@ -2830,126 +2550,6 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::deliver_editor_corrections",
-        "capability": "publish",
-        "count": 1,
-        "expression": "inputs . publish (std :: slice :: from_ref (& command . inputs [\"corrections\"]) , | | { let verifier = super :: super :: delivery :: NativeAdmissionVerifier { command , key : prepared . key . public_key () , } ; runtime . admit_action (command . clone () , recording . action () , & verifier , prepared . key . sign (& bytes) . as_bytes () ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"runtime correction admission refused: {error:?}\")) }) })",
-        "file": "crates/app/src/resolution_recording_delivery.rs"
-      },
-      "profile": "native-recording-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::prepare_native_corrections_access",
-        "capability": "native_resolution_recording_target",
-        "count": 1,
-        "expression": "self . engagements . get (& chat) . ok_or (\"chat workspace is unavailable\") ? . native_resolution_recording_target (& path , original_scope)",
-        "file": "crates/app/src/resolution_recording_delivery.rs"
-      },
-      "profile": "native-recording-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::admit_editor_corrections",
-        "capability": "publish",
-        "count": 1,
-        "expression": "inputs . publish (std :: slice :: from_ref (& prepared . input) , | | { self . store_mut () . admit_with_dispatch_against :: < ProductActionAdmission > (& prepared . scope , & prepared . command . request_id , prepared . command . clone () , & prepared . dispatch , & prepared . basis ,) . map_err (| e | { whipplescript_store :: StoreError :: Conflict (format ! (\"correction admission refused: {e:?}\")) }) })",
-        "file": "crates/app/src/resolution_recording_factory.rs"
-      },
-      "profile": "native-recording-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::admit_saved_source_corrections",
-        "capability": "publish",
-        "count": 1,
-        "expression": "inputs . publish (& held , | | { self . with_editor_saved_source (context , & source , | writer | { writer . admit_with_dispatch_against :: < ProductActionAdmission > (& prepared . scope , & prepared . command . request_id , prepared . command . clone () , & prepared . dispatch , & prepared . basis ,) . map_err (| e | { whipplescript_store :: StoreError :: Conflict (format ! (\"derived correction admission refused: {e:?}\")) }) }) . map_err (whipplescript_store :: StoreError :: Conflict) })",
-        "file": "crates/app/src/resolution_recording_factory.rs"
-      },
-      "profile": "native-recording-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::prepare_editor_corrections",
-        "capability": "native_resolution_recording_target",
-        "count": 1,
-        "expression": "self . engagements . get (request . chat_id) . ok_or (\"chat workspace is unavailable\") ? . native_resolution_recording_target (& authority . workspace_path , authority . resolution_scope . clone () ,)",
-        "file": "crates/app/src/resolution_recording_factory.rs"
-      },
-      "profile": "native-recording-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::inspect_editor_correction_attempt",
-        "capability": "observe",
-        "count": 1,
-        "expression": "prepared . target . observe (& binding , | workspace | { read_committed_resolution_recording (workspace , & binding) })",
-        "file": "crates/app/src/resolution_recording_inspection.rs"
-      },
-      "profile": "native-recording-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::prepare_correction_inspection_scoped",
-        "capability": "native_resolution_recording_evidence_target",
-        "count": 1,
-        "expression": "self . engagements . get (& chat) . ok_or (\"correction workspace is unavailable\") ? . native_resolution_recording_evidence_target (& path , original_scope)",
-        "file": "crates/app/src/resolution_recording_inspection.rs"
-      },
-      "profile": "native-recording-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::deliver_editor_correction_reconciliation",
-        "capability": "observe",
-        "count": 1,
-        "expression": "prepared . inspection . target . observe (& historical . binding , | workspace | { let source = ResolutionRecordingEvidenceSource { action : & action , admission , workspace , authority_ref : & original . issuer , } ; let receipt = owner . runtime . reconcile_resolution_recording (command . clone () , owner . epoch , & source , & authority , proof . as_bytes () ,) . map_err (refused) ? ; validate_receipt (& owner . runtime , command , & receipt) ? ; let ack = CorrectionReconciliationAcknowledgment { product_command_id : prepared . delivery . command_id . clone () , runtime_ref : prepared . delivery . dispatch . runtime_ref . clone () , receipt , } ; let payload = serde_json :: to_string (& ack) ? ; writer . commit (& format ! (\"correction-reconciliation-ack:{}\" , prepared . scope) , \"reconciled\" , & payload , & [CommandRecordFact { scope_id : prepared . scope . clone () , kind : ACK_KIND . into () , payload : payload . clone () , }] ,) . map_err (refused) ? ; Ok (ack) })",
-        "file": "crates/app/src/resolution_recording_reconciliation_delivery.rs"
-      },
-      "profile": "native-recording-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::admit_editor_correction_result",
-        "capability": "observe",
-        "count": 1,
-        "expression": "prepared . target . observe (& historical . binding , | workspace | { let recording = read_committed_resolution_recording (workspace , & historical . binding) ? . ok_or_else (| | refused (\"original correction receipt is unavailable\")) ? ; let result = NativeEditorCorrectionResult { protocol : RESULT_PROTOCOL . into () , issuer : original . issuer . clone () , request_id : request . request_id . into () , admission : admission . clone () , policy : retained . policy_ref () . clone () , evidence_label_ref : format ! (\"policy:{}:result\" , retained . policy_ref () . envelope_hash) , provenance : ActionProvenance { initiator : context . actor () . as_str () . into () , executor : context . actor () . as_str () . into () , delegation : vec ! [] , origin : \"editor.corrections.result\" . into () , causes : vec ! [cause (original , & admission . admitted_at) ?, cause (original , & acknowledgment . receipt . recorded_at) ?,] , } , reconciliation : reconciliation . clone () , acknowledgment : acknowledgment . clone () , observed_at : evidence . observed_at . clone () , binding : historical . binding . clone () , recording , } ; verify_result_identity (original , admission , request . request_id , & result) ? ; let payload = serde_json :: to_string (& result) ? ; let admitted = writer . commit (scope , request . request_id , & payload , & [CommandRecordFact { scope_id : scope . clone () , kind : RESULT_KIND . into () , payload : payload . clone () , }] ,) . map_err (refused) ? ; Ok (AdmittedEditorCorrectionResult { result , replayed : admitted . replayed , }) })",
-        "file": "crates/app/src/resolution_recording_result.rs"
-      },
-      "profile": "native-recording-boundary"
-    },
-    {
-      "site": {
-        "callable": "admit_streamed_upload",
-        "capability": "publish",
-        "count": 1,
-        "expression": "wb . publish (id , ServerEvent :: Admitted { kind : \"context\" . into () , text : format ! (\"uploaded {n} file(s) -> {handle}\") , } ,)",
-        "file": "crates/app/src/resource_store.rs"
-      },
-      "profile": "publication-review"
-    },
-    {
-      "site": {
-        "callable": "admit_streamed_upload",
-        "capability": "remove_file",
-        "count": 2,
-        "expression": "std :: fs :: remove_file (source)",
-        "file": "crates/app/src/resource_store.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
-        "callable": "impl Drop for StagedUpload::drop",
-        "capability": "remove_file",
-        "count": 1,
-        "expression": "std :: fs :: remove_file (path)",
-        "file": "crates/app/src/resource_store.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
         "callable": "post_context",
         "capability": "publish",
         "count": 1,
@@ -2957,16 +2557,6 @@
         "file": "crates/app/src/resource_store.rs"
       },
       "profile": "publication-review"
-    },
-    {
-      "site": {
-        "callable": "post_context_stream",
-        "capability": "remove_file",
-        "count": 2,
-        "expression": "std :: fs :: remove_file (& source)",
-        "file": "crates/app/src/resource_store.rs"
-      },
-      "profile": "editor-and-import"
     },
     {
       "site": {
@@ -3530,30 +3120,10 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Engagement::native_file_action_authorization_target",
-        "capability": "observe",
-        "count": 1,
-        "expression": "target . observe ()",
-        "file": "crates/workspace/src/action_target.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
         "callable": "impl inherent for Engagement::native_file_action_target",
         "capability": "observe",
         "count": 1,
         "expression": "target . observe ()",
-        "file": "crates/workspace/src/action_target.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Engagement::native_file_read_target",
-        "capability": "native_file_action_authorization_target",
-        "count": 1,
-        "expression": "self . native_file_action_authorization_target (path , & base)",
         "file": "crates/workspace/src/action_target.rs"
       },
       "profile": "native-action-boundary"
@@ -3654,26 +3224,6 @@
         "capability": "publish",
         "count": 1,
         "expression": "publish ()",
-        "file": "crates/workspace/src/action_target.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for NativeFileActionTarget::read_authorized_base",
-        "capability": "observe",
-        "count": 1,
-        "expression": "self . observe ()",
-        "file": "crates/workspace/src/action_target.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for NativeFileActionTarget::version_origin",
-        "capability": "observe",
-        "count": 1,
-        "expression": "self . observe ()",
         "file": "crates/workspace/src/action_target.rs"
       },
       "profile": "native-action-boundary"
@@ -3787,16 +3337,6 @@
         "file": "crates/workspace/src/external.rs"
       },
       "profile": "external-workspace-adapter"
-    },
-    {
-      "site": {
-        "callable": "resume",
-        "capability": "native_workflow_storage",
-        "count": 1,
-        "expression": "instance . native_workflow_storage ()",
-        "file": "crates/workspace/src/import_receipt.rs"
-      },
-      "profile": "native-workspace-adapter"
     },
     {
       "site": {
@@ -3920,16 +3460,6 @@
     },
     {
       "site": {
-        "callable": "impl ChatWorkspace for Engagement::native_file_action_authorization_target",
-        "capability": "native_file_action_authorization_target",
-        "count": 1,
-        "expression": "Engagement :: native_file_action_authorization_target (self , path , base)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
         "callable": "impl ChatWorkspace for Engagement::native_file_action_evidence_target",
         "capability": "native_file_action_evidence_target",
         "count": 1,
@@ -3947,36 +3477,6 @@
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
-        "callable": "impl ChatWorkspace for Engagement::native_file_read_target",
-        "capability": "native_file_read_target",
-        "count": 1,
-        "expression": "Engagement :: native_file_read_target (self , path)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-action-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl ChatWorkspace for Engagement::native_resolution_recording_evidence_target",
-        "capability": "native_resolution_recording_evidence_target",
-        "count": 1,
-        "expression": "Engagement :: native_resolution_recording_evidence_target (self , path , scope)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-recording-boundary"
-    },
-    {
-      "site": {
-        "callable": "impl ChatWorkspace for Engagement::native_resolution_recording_target",
-        "capability": "native_resolution_recording_target",
-        "count": 1,
-        "expression": "Engagement :: native_resolution_recording_target (self , path , scope)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-recording-boundary"
     },
     {
       "site": {
@@ -4004,16 +3504,6 @@
         "capability": "read_file_capped",
         "count": 1,
         "expression": "self . read_file_capped (relative , max_bytes)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
-        "callable": "impl ChatWorkspace for Engagement::recorded_file_cut",
-        "capability": "recorded_file_cut",
-        "count": 1,
-        "expression": "Engagement :: recorded_file_cut (self , relative , served)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
@@ -4120,16 +3610,6 @@
     },
     {
       "site": {
-        "callable": "impl ChatWorkspace for Engagement::write_file_from_path",
-        "capability": "write_file_from_path",
-        "count": 1,
-        "expression": "self . write_file_from_path (relative , source)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
         "callable": "impl Workspace for Instance::archive_workstream",
         "capability": "archive_workstream",
         "count": 1,
@@ -4230,16 +3710,6 @@
     },
     {
       "site": {
-        "callable": "impl Workspace for Instance::export_protected_workflow",
-        "capability": "export_protected_workflow",
-        "count": 1,
-        "expression": "Self :: export_protected_workflow (self , protection)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
         "callable": "impl Workspace for Instance::fork_engagement_at",
         "capability": "fork_engagement_at",
         "count": 1,
@@ -4264,26 +3734,6 @@
         "capability": "leave_engagement_workstream",
         "count": 1,
         "expression": "Self :: leave_engagement_workstream (self , engagement_id)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
-        "callable": "impl Workspace for Instance::native_workflow_storage",
-        "capability": "native_workflow_storage",
-        "count": 1,
-        "expression": "Self :: native_workflow_storage (self)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
-        "callable": "impl Workspace for Instance::open_engagement_subset",
-        "capability": "open_engagement_subset",
-        "count": 1,
-        "expression": "Self :: open_engagement_subset (self , id , target , roots)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
@@ -4390,16 +3840,6 @@
     },
     {
       "site": {
-        "callable": "impl Workspace for Instance::workflow_source",
-        "capability": "workflow_source",
-        "count": 1,
-        "expression": "Self :: workflow_source (self , path , cut , byte_limit)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
         "callable": "impl Workspace for Instance::workstream",
         "capability": "workstream",
         "count": 1,
@@ -4434,16 +3874,6 @@
         "capability": "from_export_at",
         "count": 1,
         "expression": "Instance :: from_export_at (dir , export)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
-        "callable": "impl WorkspaceProvider for WhippleWorkspaceProvider::from_protected_export_at",
-        "capability": "from_protected_export_at",
-        "count": 1,
-        "expression": "Instance :: from_protected_export_at (dir , export , protection ,)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
@@ -4570,16 +4000,6 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Engagement::write_file_from_path",
-        "capability": "remove_file",
-        "count": 1,
-        "expression": "std :: fs :: remove_file (source)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
         "callable": "impl inherent for Instance::create_engagement",
         "capability": "create_engagement_on",
         "count": 1,
@@ -4600,40 +4020,10 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Instance::export_inner",
-        "capability": "native_workflow_storage",
-        "count": 1,
-        "expression": "self . native_workflow_storage ()",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
         "callable": "impl inherent for Instance::fork_from_at",
         "capability": "from_export_at",
         "count": 1,
         "expression": "Self :: from_export_at (dir , & export)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Instance::from_export_inner",
-        "capability": "native_workflow_storage",
-        "count": 1,
-        "expression": "instance . native_workflow_storage ()",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Instance::from_export_inner",
-        "capability": "reconcile_engagements",
-        "count": 1,
-        "expression": "instance . reconcile_engagements ()",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
@@ -4700,26 +4090,6 @@
     },
     {
       "site": {
-        "callable": "trait ChatWorkspace::write_file_from_path",
-        "capability": "remove_file",
-        "count": 1,
-        "expression": "std :: fs :: remove_file (source)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
-        "callable": "trait ChatWorkspace::write_file_from_path",
-        "capability": "write_file_bytes",
-        "count": 1,
-        "expression": "self . write_file_bytes (rel , & body)",
-        "file": "crates/workspace/src/lib.rs"
-      },
-      "profile": "native-workspace-adapter"
-    },
-    {
-      "site": {
         "callable": "trait Workspace::create_engagement_subset",
         "capability": "create_engagement_on",
         "count": 1,
@@ -4750,6 +4120,26 @@
     },
     {
       "site": {
+        "callable": "impl ChatWorkspace for Engagement::native_resolution_recording_evidence_target",
+        "capability": "native_resolution_recording_evidence_target",
+        "count": 1,
+        "expression": "Engagement :: native_resolution_recording_evidence_target (self , path , scope)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::native_resolution_recording_target",
+        "capability": "native_resolution_recording_target",
+        "count": 1,
+        "expression": "Engagement :: native_resolution_recording_target (self , path , scope)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
         "callable": "impl inherent for NativeResolutionRecordingEvidenceTarget::observe",
         "capability": "observe",
         "count": 1,
@@ -4767,6 +4157,666 @@
         "file": "crates/workspace/src/resolution_recording_target.rs"
       },
       "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::inspect_editor_correction_attempt",
+        "capability": "observe",
+        "count": 1,
+        "expression": "prepared . target . observe (& binding , | workspace | { read_committed_resolution_recording (workspace , & binding) })",
+        "file": "crates/app/src/resolution_recording_inspection.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::prepare_correction_inspection_scoped",
+        "capability": "native_resolution_recording_evidence_target",
+        "count": 1,
+        "expression": "self . engagements . get (& chat) . ok_or (\"correction workspace is unavailable\") ? . native_resolution_recording_evidence_target (& path , original_scope)",
+        "file": "crates/app/src/resolution_recording_inspection.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::deliver_editor_correction_reconciliation",
+        "capability": "observe",
+        "count": 1,
+        "expression": "prepared . inspection . target . observe (& historical . binding , | workspace | { let source = ResolutionRecordingEvidenceSource { action : & action , admission , workspace , authority_ref : & original . issuer , } ; let receipt = owner . runtime . reconcile_resolution_recording (command . clone () , owner . epoch , & source , & authority , proof . as_bytes () ,) . map_err (refused) ? ; validate_receipt (& owner . runtime , command , & receipt) ? ; let ack = CorrectionReconciliationAcknowledgment { product_command_id : prepared . delivery . command_id . clone () , runtime_ref : prepared . delivery . dispatch . runtime_ref . clone () , receipt , } ; let payload = serde_json :: to_string (& ack) ? ; writer . commit (& format ! (\"correction-reconciliation-ack:{}\" , prepared . scope) , \"reconciled\" , & payload , & [CommandRecordFact { scope_id : prepared . scope . clone () , kind : ACK_KIND . into () , payload : payload . clone () , }] ,) . map_err (refused) ? ; Ok (ack) })",
+        "file": "crates/app/src/resolution_recording_reconciliation_delivery.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_editor_correction_result",
+        "capability": "observe",
+        "count": 1,
+        "expression": "prepared . target . observe (& historical . binding , | workspace | { let recording = read_committed_resolution_recording (workspace , & historical . binding) ? . ok_or_else (| | refused (\"original correction receipt is unavailable\")) ? ; let result = NativeEditorCorrectionResult { protocol : RESULT_PROTOCOL . into () , issuer : original . issuer . clone () , request_id : request . request_id . into () , admission : admission . clone () , policy : retained . policy_ref () . clone () , evidence_label_ref : format ! (\"policy:{}:result\" , retained . policy_ref () . envelope_hash) , provenance : ActionProvenance { initiator : context . actor () . as_str () . into () , executor : context . actor () . as_str () . into () , delegation : vec ! [] , origin : \"editor.corrections.result\" . into () , causes : vec ! [cause (original , & admission . admitted_at) ?, cause (original , & acknowledgment . receipt . recorded_at) ?,] , } , reconciliation : reconciliation . clone () , acknowledgment : acknowledgment . clone () , observed_at : evidence . observed_at . clone () , binding : historical . binding . clone () , recording , } ; verify_result_identity (original , admission , request . request_id , & result) ? ; let payload = serde_json :: to_string (& result) ? ; let admitted = writer . commit (scope , request . request_id , & payload , & [CommandRecordFact { scope_id : scope . clone () , kind : RESULT_KIND . into () , payload : payload . clone () , }] ,) . map_err (refused) ? ; Ok (AdmittedEditorCorrectionResult { result , replayed : admitted . replayed , }) })",
+        "file": "crates/app/src/resolution_recording_result.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::with_editor_saved_source",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (writer)",
+        "file": "crates/app/src/file_action_derived_source.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::retain_editor_file_save_source",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (std :: slice :: from_ref (& input) , | | { self . with_editor_file_save_observation (context , command , admission , attempt , SavedObservationOptions { through : Some (current . evidence . observed_at . clone ()) , retained : None , } , | fresh , original , target , writer | { let actual = statement (& home , request_id , input . clone () , & fresh , EditorFileSaveAttempt { effect_id : & expected . effect_id , run_id : & expected . attempt . run_id , } ,) ? ; if actual != expected { return Err (refused ()) ; } target . publish_committed_scoped_result (& original . binding , & original . resolution_scope , & original . attempt , | _ , saved | { if digest (saved . receipt_json . as_bytes ()) != expected . receipt_digest || saved . reference != expected . receipt || whipplescript_store :: stable_hash_hex (& saved . accepted_content ,) != expected . content_hash { return Err (refused ()) ; } let source = match original_source (& history . store , & scope , & expected , & key . public_key () ,) ? { Some (source) => source , None => SignedSource { signature : key . sign (& expected . signing_bytes () ?) . as_bytes () . to_vec () , statement : expected . clone () , } , } ; let snapshot = source . statement . snapshot () ? ; let receipt = writer . commit (& scope , KEY , & snapshot , & [CommandRecordFact { scope_id : scope . clone () , kind : KIND . into () , payload : serde_json :: to_string (& source) ? , }] ,) . map_err (| _ | refused ()) ? ; Ok (RetainedEditorFileSaveSource { input : input . clone () , cause : ActionCause { authority : expected . issuer . clone () , record_ref : serde_json :: to_string (& (& scope , KEY)) ? , digest : digest (snapshot . as_bytes ()) , } , replayed : receipt . replayed , }) } ,) ? . ok_or_else (refused) } ,) . map_err (StoreError :: Conflict) })",
+        "file": "crates/app/src/file_action_source.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_editor_corrections",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (std :: slice :: from_ref (& prepared . input) , | | { self . store_mut () . admit_with_dispatch_against :: < ProductActionAdmission > (& prepared . scope , & prepared . command . request_id , prepared . command . clone () , & prepared . dispatch , & prepared . basis ,) . map_err (| e | { whipplescript_store :: StoreError :: Conflict (format ! (\"correction admission refused: {e:?}\")) }) })",
+        "file": "crates/app/src/resolution_recording_factory.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_saved_source_corrections",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (& held , | | { self . with_editor_saved_source (context , & source , | writer | { writer . admit_with_dispatch_against :: < ProductActionAdmission > (& prepared . scope , & prepared . command . request_id , prepared . command . clone () , & prepared . dispatch , & prepared . basis ,) . map_err (| e | { whipplescript_store :: StoreError :: Conflict (format ! (\"derived correction admission refused: {e:?}\")) }) }) . map_err (whipplescript_store :: StoreError :: Conflict) })",
+        "file": "crates/app/src/resolution_recording_factory.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::prepare_editor_corrections",
+        "capability": "native_resolution_recording_target",
+        "count": 1,
+        "expression": "self . engagements . get (request . chat_id) . ok_or (\"chat workspace is unavailable\") ? . native_resolution_recording_target (& authority . workspace_path , authority . resolution_scope . clone () ,)",
+        "file": "crates/app/src/resolution_recording_factory.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "open_project_chat_engagements",
+        "capability": "open_engagement_subset",
+        "count": 1,
+        "expression": "workspace . open_engagement_subset (& chat . id , target , & roots)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "seed_empty_collaboration_workspaces",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "collaboration . current_main_cut ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::open_engagement_subset",
+        "capability": "open_engagement_subset",
+        "count": 1,
+        "expression": "Self :: open_engagement_subset (self , id , target , roots)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::engagement_recorded_file_cut",
+        "capability": "recorded_file_cut",
+        "count": 1,
+        "expression": "eng . recorded_file_cut (& path , served)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::observe_native_file_content",
+        "capability": "native_file_read_target",
+        "count": 1,
+        "expression": "self . engagements . get (chat) . ok_or (\"chat workspace is unavailable\") ? . native_file_read_target (& authority . workspace_path)",
+        "file": "crates/app/src/file_action_content.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::bind_native_editor_target",
+        "capability": "native_file_action_authorization_target",
+        "count": 1,
+        "expression": "self . engagements . get (chat_id) . ok_or (\"editor workspace is unavailable\") ? . native_file_action_authorization_target (& path , base)",
+        "file": "crates/app/src/file_action_delivery.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::deliver_editor_file_save",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (std :: slice :: from_ref (input) , | | { target . publish_base (| | { let verifier = NativeAdmissionVerifier { command , key : key . public_key () , } ; let proof = key . sign (& bytes) ; runtime . admit_action (command . clone () , & action , & verifier , proof . as_bytes ()) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"runtime editor admission refused: {error:?}\")) }) }) })",
+        "file": "crates/app/src/file_action_delivery.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_editor_file_save",
+        "capability": "native_file_action_authorization_target",
+        "count": 1,
+        "expression": "self . engagements . get (request . chat_id) . ok_or (\"chat workspace is unavailable\") ? . native_file_action_authorization_target (& authority . workspace_path , request . base_cut)",
+        "file": "crates/app/src/file_action_factory.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::admit_editor_file_save",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (std :: slice :: from_ref (& input) , | | { target . publish_base (| | { writer . admit_with_dispatch_against :: < ProductActionAdmission > (& scope , & command . request_id , command . clone () , & dispatch , & basis ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"file admission refused: {error:?}\")) }) }) })",
+        "file": "crates/app/src/file_action_factory.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::with_editor_file_save_observation",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (EditorFileSaveObservation { evidence , saved , restrictions : observation . restrictions , observer : observation . observer , } , & original , reader . target , writer ,)",
+        "file": "crates/app/src/file_action_inspection.rs"
+      },
+      "profile": "native-action-observation-callback"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::with_editor_file_save_read",
+        "capability": "native_file_action_evidence_target",
+        "count": 1,
+        "expression": "self . engagements . get (& chat) . ok_or (\"saved-input workspace is unavailable\") ? . native_file_action_evidence_target (& path , & base)",
+        "file": "crates/app/src/file_action_inspection.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::with_editor_file_save_read",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (EditorFileSaveExecutionObservation { command : command . clone () , runtime : None , restrictions , observer : context . actor () . as_str () . into () , } , None , writer ,)",
+        "file": "crates/app/src/file_action_inspection.rs"
+      },
+      "profile": "native-action-observation-callback"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::with_editor_file_save_read",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (EditorFileSaveExecutionObservation { command : command . clone () , runtime : Some (evidence) , restrictions , observer : context . actor () . as_str () . into () , } , Some (SavedEvidenceReader { runtime : & runtime , target , history , }) , writer ,)",
+        "file": "crates/app/src/file_action_inspection.rs"
+      },
+      "profile": "native-action-observation-callback"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::native_file_action_authorization_target",
+        "capability": "observe",
+        "count": 1,
+        "expression": "target . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::native_file_read_target",
+        "capability": "native_file_action_authorization_target",
+        "count": 1,
+        "expression": "self . native_file_action_authorization_target (path , & base)",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionTarget::read_authorized_base",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeFileActionTarget::version_origin",
+        "capability": "observe",
+        "count": 1,
+        "expression": "self . observe ()",
+        "file": "crates/workspace/src/action_target.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::native_file_action_authorization_target",
+        "capability": "native_file_action_authorization_target",
+        "count": 1,
+        "expression": "Engagement :: native_file_action_authorization_target (self , path , base)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::native_file_read_target",
+        "capability": "native_file_read_target",
+        "count": 1,
+        "expression": "Engagement :: native_file_read_target (self , path)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::recorded_file_cut",
+        "capability": "recorded_file_cut",
+        "count": 1,
+        "expression": "Engagement :: recorded_file_cut (self , relative , served)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for ContentVault::erase_local_scope",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (key_path (& root , key_id))",
+        "file": "crates/app/src/content_vault/scope_key.rs"
+      },
+      "profile": "custody-and-erasure"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for PreparedScopeKey::retain",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish ()",
+        "file": "crates/app/src/content_vault/scope_key.rs"
+      },
+      "profile": "native-action-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ingest_streamed_file_into_engagement",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "eng . commit_turn (& format ! (\"ingest uploaded context: {base}\"))",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ingest_streamed_file_into_engagement",
+        "capability": "write_file_from_path",
+        "count": 1,
+        "expression": "eng . write_file_from_path (& relative , source)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "capture_handoff_offer",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (None)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "capture_handoff_offer",
+        "capability": "publish",
+        "count": 1,
+        "expression": "publish (Some ((key , capsule)))",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::materialize_collaboration_workspace",
+        "capability": "accepts_export_format",
+        "count": 1,
+        "expression": "provider . accepts_export_format (format)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::materialize_target",
+        "capability": "accepts_export_format",
+        "count": 1,
+        "expression": "provider . accepts_export_format (format)",
+        "file": "crates/app/src/federation.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "commit",
+        "capability": "accepts_export_format",
+        "count": 1,
+        "expression": "provider . accepts_export_format (& bundle . format)",
+        "file": "crates/app/src/federation_incoming_handoff.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "commit",
+        "capability": "from_export_at",
+        "count": 1,
+        "expression": "provider . from_export_at (& path , & bundle . bundle)",
+        "file": "crates/app/src/federation_incoming_handoff.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "commit",
+        "capability": "from_protected_export_at",
+        "count": 1,
+        "expression": "provider . from_protected_export_at (& path , & bundle . bundle , protection)",
+        "file": "crates/app/src/federation_incoming_handoff.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "commit",
+        "capability": "publish",
+        "count": 2,
+        "expression": "publish ()",
+        "file": "crates/app/src/federation_incoming_handoff.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "publish_views",
+        "capability": "reconcile_engagements",
+        "count": 1,
+        "expression": "workspace . reconcile_engagements ()",
+        "file": "crates/app/src/federation_incoming_handoff.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "prepare",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "workspace . native_workflow_storage ()",
+        "file": "crates/app/src/federation_workflow_keys.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::library_project_relocation_content_bundles",
+        "capability": "export_protected_workflow",
+        "count": 1,
+        "expression": "workspace . export_protected_workflow (protection)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::prepare_tracker_completion",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (& [input] , | | { admission . commit_dispatch :: < ProductActionAdmission > (scope , & request . request_id , command . clone () , & dispatch ,) . map_err (native_error) })",
+        "file": "crates/app/src/project_tracker_completion.rs"
+      },
+      "profile": "project-tracker-completion"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::launch_project_workflow",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (& retained , | | { admission . commit_dispatch :: < ProductActionAdmission > (& scope , & request . request_id , command . clone () , & dispatch ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (debug_error (error)) }) })",
+        "file": "crates/app/src/project_workflow_launch.rs"
+      },
+      "profile": "project-workflow-launch"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::launch_project_workflow",
+        "capability": "workflow_source",
+        "count": 1,
+        "expression": "target . workflow_source (& request . path , & request . cut , limits . source_bytes)",
+        "file": "crates/app/src/project_workflow_launch.rs"
+      },
+      "profile": "project-workflow-launch"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::workflow_storage",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "self . collaboration_workspaces . get (workspace) . ok_or (\"project collaboration workspace is not open\") ? . native_workflow_storage ()",
+        "file": "crates/app/src/project_workflow_launch.rs"
+      },
+      "profile": "project-workflow-launch"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::deliver_editor_corrections",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (std :: slice :: from_ref (& command . inputs [\"corrections\"]) , | | { let verifier = super :: super :: delivery :: NativeAdmissionVerifier { command , key : prepared . key . public_key () , } ; runtime . admit_action (command . clone () , recording . action () , & verifier , prepared . key . sign (& bytes) . as_bytes () ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (format ! (\"runtime correction admission refused: {error:?}\")) }) })",
+        "file": "crates/app/src/resolution_recording_delivery.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::prepare_native_corrections_access",
+        "capability": "native_resolution_recording_target",
+        "count": 1,
+        "expression": "self . engagements . get (& chat) . ok_or (\"chat workspace is unavailable\") ? . native_resolution_recording_target (& path , original_scope)",
+        "file": "crates/app/src/resolution_recording_delivery.rs"
+      },
+      "profile": "native-recording-boundary"
+    },
+    {
+      "site": {
+        "callable": "admit_streamed_upload",
+        "capability": "publish",
+        "count": 1,
+        "expression": "wb . publish (id , ServerEvent :: Admitted { kind : \"context\" . into () , text : format ! (\"uploaded {n} file(s) -> {handle}\") , } ,)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "admit_streamed_upload",
+        "capability": "remove_file",
+        "count": 2,
+        "expression": "std :: fs :: remove_file (source)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl Drop for StagedUpload::drop",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (path)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "post_context_stream",
+        "capability": "remove_file",
+        "count": 2,
+        "expression": "std :: fs :: remove_file (& source)",
+        "file": "crates/app/src/resource_store.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "resume",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "instance . native_workflow_storage ()",
+        "file": "crates/workspace/src/import_receipt.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::write_file_from_path",
+        "capability": "write_file_from_path",
+        "count": 1,
+        "expression": "self . write_file_from_path (relative , source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::export_protected_workflow",
+        "capability": "export_protected_workflow",
+        "count": 1,
+        "expression": "Self :: export_protected_workflow (self , protection)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::native_workflow_storage",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "Self :: native_workflow_storage (self)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::workflow_source",
+        "capability": "workflow_source",
+        "count": 1,
+        "expression": "Self :: workflow_source (self , path , cut , byte_limit)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl WorkspaceProvider for WhippleWorkspaceProvider::from_protected_export_at",
+        "capability": "from_protected_export_at",
+        "count": 1,
+        "expression": "Instance :: from_protected_export_at (dir , export , protection ,)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::write_file_from_path",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::export_inner",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "self . native_workflow_storage ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::from_export_inner",
+        "capability": "native_workflow_storage",
+        "count": 1,
+        "expression": "instance . native_workflow_storage ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::from_export_inner",
+        "capability": "reconcile_engagements",
+        "count": 1,
+        "expression": "instance . reconcile_engagements ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait ChatWorkspace::write_file_from_path",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (source)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait ChatWorkspace::write_file_from_path",
+        "capability": "write_file_bytes",
+        "count": 1,
+        "expression": "self . write_file_bytes (rel , & body)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
     }
   ]
 }

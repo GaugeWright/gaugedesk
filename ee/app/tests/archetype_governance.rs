@@ -1,5 +1,5 @@
 //! Archetype publish/upgrade governance, end to end (UX-9 / ADR 0063). Drives
-//! the Administration Environment's reviewed `policy.update` command (the org's
+//! the Administration GaugeApp's reviewed `organization-policy.set` command (the org's
 //! `allow_auto_upgrade` policy) alongside the open archetype/placement routes, so
 //! it composes the ee enterprise control plane —
 //! the test moved here with the enterprise band (SPLIT-1; it lived as a
@@ -14,6 +14,9 @@ use tower::ServiceExt;
 use gaugedesk_app::org::{MembershipRecord, MembershipStatus, RecordOp, ORG_ID, ORG_SCOPE};
 use gaugedesk_app::{open_workbench, LockUnpoisoned, SharedWorkbench};
 use gaugedesk_ee::enterprise_control_plane;
+
+mod support;
+use support::{administration_command, administration_document};
 
 /// A workbench seeded like the live server (builder agent + authoring instance)
 /// so the library routes have an instance to work against.
@@ -148,60 +151,21 @@ async fn archetype_publish_makes_placements_upgradeable_then_upgrade_advances_th
 
     // Auto-upgrade: the org must allow it AND the owner must opt in. Allow it, then publish
     // with auto_upgrade → the placement advances automatically.
-    let (_, opened) = send(
-        &app,
-        "POST",
-        "/environments/administration/sessions",
-        Some("{}"),
-    )
-    .await;
-    let session = parse(&opened)["session"].clone();
-    let policy_grant = session["documents"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|document| document["id"] == "administration.policy")
-        .unwrap();
-    let document_uri = format!(
-        "/environments/administration/documents/administration.policy?session={}&scope={}",
-        session["id"].as_str().unwrap(),
-        session["scope"]["id"].as_str().unwrap(),
-    );
-    let (_, current) = send(&app, "GET", &document_uri, None).await;
-    let mut content = parse(&current)["document"]["content"].clone();
+    let (s, current) = administration_document(&app, None, None, "organization-policy").await;
+    assert_eq!(s, StatusCode::OK, "policy page: {current}");
+    let mut content = current["page"]["model"].clone();
     content["security"]["allow_auto_upgrade"] = serde_json::Value::Bool(true);
-    let proposal = serde_json::json!({
-        "session_id": session["id"],
-        "environment": "administration",
-        "scope": session["scope"],
-        "document_id": "administration.policy",
-        "base_revision": policy_grant["revision"],
-        "content": content,
-        "client": "cli",
-    });
-    let (s, proposed) = send(
+    let (s, reviewed) = administration_command(
         &app,
-        "POST",
-        "/environments/administration/changes",
-        Some(&proposal.to_string()),
+        None,
+        None,
+        "organization-policy",
+        "organization-policy.set",
+        content,
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "policy proposal: {proposed}");
-    let proposed = parse(&proposed);
-    let review_uri = format!(
-        "/environments/administration/changes/{}/review",
-        proposed["change"]["id"].as_str().unwrap(),
-    );
-    let review = serde_json::json!({
-        "session_id": session["id"],
-        "environment": "administration",
-        "scope": session["scope"],
-        "decision": "accept",
-        "client": "cli",
-    });
-    let (s, reviewed) = send(&app, "POST", &review_uri, Some(&review.to_string())).await;
     assert_eq!(s, StatusCode::OK, "policy review: {reviewed}");
-    assert_eq!(parse(&reviewed)["receipt"]["status"], "applied");
+    assert_eq!(reviewed["receipt"]["status"], "applied");
     let (s, b) = send(
         &app,
         "POST",

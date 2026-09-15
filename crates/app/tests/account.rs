@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use gaugedesk_app::account::{DeviceRecord, DeviceStatus, RecordOp};
+use gaugedesk_app::account::{DeviceKind, DeviceRecord, DeviceStatus, RecordOp};
 use gaugedesk_app::open_control_plane;
 use gaugedesk_app::Workbench;
 use gaugedesk_store::Store;
@@ -73,6 +73,7 @@ async fn device_registry_list_and_revoke_preserve_a_proof_bound_seed() {
         id: "phone".into(),
         op: RecordOp::Upsert,
         label: "My phone".into(),
+        kind: DeviceKind::Phone,
         subkey_pubkey: "ab12".into(),
         status: DeviceStatus::Active,
         enrolled_at: 1,

@@ -311,6 +311,17 @@ export class HomePool<Api> {
         this.onStateChange(connection.homeId, state);
     }
 
+    /** Forget the live admission for the Home serving `project`. This is used
+     * only after that Home has explicitly rejected the admission credential;
+     * it grants nothing and leaves every other Home in the pool untouched. */
+    async invalidateProject(project: ProjectId): Promise<boolean> {
+        const route = this.routes.get(project);
+        if (!route) return false;
+        await this.disconnect(route.homeId);
+        this.pending.delete(route.homeId);
+        return true;
+    }
+
     async evictIdle(now = this.now()): Promise<void> {
         const stale = [...this.connections.values()]
             .filter((connection) => now - connection.lastUsedAt >= this.idleMs)

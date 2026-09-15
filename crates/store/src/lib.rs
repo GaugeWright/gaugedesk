@@ -25,6 +25,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub mod command_dispatch;
 pub mod command_scope_archive;
 mod record_admission;
+#[cfg(test)]
+mod record_claim_tests;
+mod request_admission;
 
 /// A transparent at-rest transform applied to record payloads of designated
 /// **content** kinds (`SECAUD-9`/`SECAUD-6`). The store crate stays crypto-free: this
@@ -53,6 +56,14 @@ pub struct Store {
     /// Set only for an ephemeral store ([`Store::open_in_memory`]): the temporary
     /// directory removed once every connection to it has dropped.
     scratch: Option<Arc<ScratchHome>>,
+}
+
+/// An additional exact-input identity claimed atomically with record facts.
+/// A reviewed external effect uses this to bind BOTH the caller's review key
+/// and the proposal's single approval identity before contacting its authority.
+pub struct RecordCommandClaim<'a> {
+    pub key: &'a str,
+    pub snapshot: &'a str,
 }
 
 #[derive(Debug)]
@@ -118,6 +129,16 @@ pub struct CommittedRecordSnapshot {
 pub struct MaterializedAdmission<S> {
     pub state: S,
     pub replayed: bool,
+}
+
+/// Durable result of an exact request admitted through [`Store::admit_request`].
+/// This is operational recovery evidence, not lifecycle state. In particular,
+/// `Rejected` means the exact request key and intent were atomically fenced
+/// without appending an effect; an absent or mismatched record proves nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestAdmissionStatus {
+    Applied,
+    Rejected,
 }
 
 /// One immutable record fact admitted as part of a caller-keyed command.
@@ -851,6 +872,33 @@ impl Store {
         self.admit_record_facts_chained(command_scope, idempotency_key, snapshot_json, facts, None)
     }
 
+    /// Atomically admit record facts only when `expected_scope` still has the
+    /// exact committed head observed by the caller. An empty scope has head
+    /// `-1`. The comparison and every append share one immediate transaction,
+    /// so a competing writer either wins before this command or after it, never
+    /// between its basis check and effects. Exact retries remain replayable
+    /// after the first admission advances the expected scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_record_facts_at_scope_head(
+        &mut self,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        facts: &[CommandRecordFact],
+        expected_scope: &str,
+        expected_position: i64,
+    ) -> Result<MaterializedRecordAdmission, AdmitError> {
+        self.admit_record_facts_internal(
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            facts,
+            None,
+            &[],
+            Some((expected_scope, expected_position)),
+        )
+    }
+
     /// Read the original record command only when its durable receipt exists.
     /// One query supplies a consistent observation, including inside a caller's
     /// read snapshot. Mutable command status is neither repaired nor trusted.
@@ -928,20 +976,245 @@ impl Store {
         facts: &[CommandRecordFact],
         chained: Option<ChainedRecordFact<'_>>,
     ) -> Result<MaterializedRecordAdmission, AdmitError> {
+        self.admit_record_facts_with_claims(
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            facts,
+            chained,
+            &[],
+        )
+    }
+
+    /// Atomically claim the ordinary request key and additional unique command
+    /// identities. Every requested retry claim must already belong to this
+    /// request. A historical receipt cannot retroactively acquire an identity
+    /// or borrow another request's claim with an identical application payload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_record_facts_with_claims(
+        &mut self,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        facts: &[CommandRecordFact],
+        chained: Option<ChainedRecordFact<'_>>,
+        claims: &[RecordCommandClaim<'_>],
+    ) -> Result<MaterializedRecordAdmission, AdmitError> {
+        self.admit_record_facts_internal(
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            facts,
+            chained,
+            claims,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_record_facts_internal(
+        &mut self,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        facts: &[CommandRecordFact],
+        chained: Option<ChainedRecordFact<'_>>,
+        claims: &[RecordCommandClaim<'_>],
+        expected_head: Option<(&str, i64)>,
+    ) -> Result<MaterializedRecordAdmission, AdmitError> {
+        let mut claim_keys = std::collections::BTreeSet::new();
+        if claims.len() > 16
+            || claims.iter().any(|claim| {
+                claim.key.is_empty()
+                    || claim.key == idempotency_key
+                    || !claim_keys.insert(claim.key)
+            })
+        {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "invalid additional command claims",
+            }));
+        }
         let stored = record_admission::encode_facts(self.codec.as_ref(), facts)?;
+        let command_id = format!(
+            "record-command:{}:{command_scope}{idempotency_key}",
+            command_scope.len()
+        );
         let codec = self.codec.clone();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        record_admission::commit(
-            tx,
-            codec,
-            command_scope,
-            idempotency_key,
-            snapshot_json,
-            stored,
-            chained,
-        )
+        tx.execute(
+            "INSERT OR IGNORE INTO commands
+             (command_id, scope_id, idempotency_key, status, snapshot_json)
+             VALUES (?1, ?2, ?3, 'received', ?4)",
+            params![command_id, command_scope, idempotency_key, snapshot_json],
+        )?;
+        let record = tx
+            .query_row(
+                "SELECT command_id, scope_id, idempotency_key, status, snapshot_json
+                 FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
+                params![command_scope, idempotency_key],
+                command_record_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| AdmitError::Db(rusqlite::Error::QueryReturnedNoRows))?;
+        if record.snapshot_json != snapshot_json {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "idempotency key reused with different command",
+            }));
+        }
+        let replayed = tx
+            .query_row(
+                "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
+                params![command_scope, idempotency_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        for claim in claims {
+            let expected_claim = serde_json::to_string(&(
+                "record-command-claim-v1",
+                command_scope,
+                idempotency_key,
+                claim.snapshot,
+            ))?;
+            let claimed = tx.query_row(
+                "SELECT snapshot_json FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
+                params![command_scope, claim.key], |row| row.get::<_, String>(0),
+            ).optional()?;
+            match claimed {
+                Some(snapshot) if snapshot != expected_claim || !replayed => {
+                    return Err(AdmitError::Rejected(Rejection {
+                        reason: "additional command identity is already claimed",
+                    }))
+                }
+                Some(_) => {
+                    let receipted = tx.query_row("SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2", params![command_scope, claim.key], |_| Ok(())).optional()?.is_some();
+                    if !receipted {
+                        return Err(AdmitError::Rejected(Rejection {
+                            reason: "additional command claim has no receipt",
+                        }));
+                    }
+                }
+                None if replayed => {
+                    return Err(AdmitError::Rejected(Rejection {
+                        reason: "original receipt does not own additional command claim",
+                    }))
+                }
+                None => {}
+            }
+        }
+        if replayed {
+            tx.execute(
+                "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
+                 WHERE command_id = ?1",
+                params![record.command_id],
+            )?;
+            tx.commit()?;
+            return Ok(MaterializedRecordAdmission {
+                positions: Vec::new(),
+                replayed: true,
+                chained_payload: None,
+            });
+        }
+        if record.status != "received" {
+            let reason = match record.status.as_str() {
+                "processing" => "command is already processing",
+                "rejected" => "command already rejected; submit with a new key",
+                "expired" => "idempotency key expired; submit with a new key",
+                "applied" => "applied command is missing its durable receipt",
+                _ => "command could not be claimed",
+            };
+            return Err(AdmitError::Rejected(Rejection { reason }));
+        }
+        if let Some((expected_scope, expected_position)) = expected_head {
+            let actual_position: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(position), -1) FROM events WHERE scope_id = ?1",
+                params![expected_scope],
+                |row| row.get(0),
+            )?;
+            if actual_position != expected_position {
+                return Err(AdmitError::Rejected(Rejection {
+                    reason: "scope head changed before record admission",
+                }));
+            }
+        }
+        tx.execute(
+            "UPDATE commands SET status = 'processing', updated_at = CURRENT_TIMESTAMP
+             WHERE command_id = ?1 AND status = 'received'",
+            params![record.command_id],
+        )?;
+
+        let mut positions = Vec::with_capacity(stored.len());
+        for fact in stored {
+            let position: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+                params![fact.scope_id],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
+                params![fact.scope_id, position, fact.kind, fact.payload],
+            )?;
+            positions.push(position);
+        }
+        // Resolve the chain link against the head visible to *this* transaction and
+        // append it here. Reading the head outside the transaction would let two
+        // concurrent governed actions link to the same predecessor and fork the
+        // chain — the defect this method exists to make unrepresentable.
+        let mut chained_payload = None;
+        if let Some(chained) = chained {
+            let previous = tx_chain_head(&tx, codec.as_ref(), chained.scope_id, chained.kind)?;
+            let payload = (chained.link)(previous.as_deref());
+            let encoded = match &codec {
+                Some(codec) => codec
+                    .encode(chained.scope_id, chained.kind, &payload)
+                    .map_err(AdmitError::Codec)?,
+                None => payload.clone(),
+            };
+            let position: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+                params![chained.scope_id],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
+                params![chained.scope_id, position, chained.kind, encoded],
+            )?;
+            positions.push(position);
+            chained_payload = Some(payload);
+        }
+        let applied_at = positions.first().copied().unwrap_or(0);
+        tx.execute(
+            "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
+            params![command_scope, idempotency_key, applied_at],
+        )?;
+        tx.execute(
+            "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
+             WHERE command_id = ?1",
+            params![record.command_id],
+        )?;
+        for claim in claims {
+            let claim_id = format!(
+                "record-command:{}:{command_scope}{}",
+                command_scope.len(),
+                claim.key
+            );
+            let claim_snapshot = serde_json::to_string(&(
+                "record-command-claim-v1",
+                command_scope,
+                idempotency_key,
+                claim.snapshot,
+            ))?;
+            tx.execute("INSERT INTO commands (command_id, scope_id, idempotency_key, status, snapshot_json) VALUES (?1, ?2, ?3, 'applied', ?4)", params![claim_id, command_scope, claim.key, claim_snapshot])?;
+            tx.execute("INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)", params![command_scope, claim.key, applied_at])?;
+        }
+        tx.commit()?;
+        Ok(MaterializedRecordAdmission {
+            positions,
+            replayed: false,
+            chained_payload,
+        })
     }
 
     pub fn put_projection_meta(&mut self, meta: &ProjectionMeta) -> Result<(), AdmitError> {
@@ -1357,6 +1630,36 @@ impl Store {
                     }
                 }
                 None => out.push(payload),
+            }
+        }
+        Ok(out)
+    }
+
+    /// All decoded records of one `kind`, paired with the exact scope that owns
+    /// each row. This is deliberately narrower than a general event scan: it is
+    /// used by erasure cascades that must discover independently keyed child
+    /// content before destroying an account or tenant key.
+    ///
+    /// Crypto-erased rows are omitted exactly as they are from [`Self::records`].
+    /// Callers still have to authorize and filter the returned domain records;
+    /// this is an internal storage primitive, not a projection API.
+    pub fn records_across_scopes(&self, kind: &str) -> Result<Vec<(String, String)>, AdmitError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scope_id, payload FROM events WHERE kind = ?1 ORDER BY scope_id, position",
+        )?;
+        let rows = stmt.query_map(params![kind], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (scope, payload) = row?;
+            match &self.codec {
+                Some(codec) => {
+                    if let Some(plain) = codec.decode(&scope, kind, &payload) {
+                        out.push((scope, plain));
+                    }
+                }
+                None => out.push((scope, payload)),
             }
         }
         Ok(out)
@@ -2455,6 +2758,151 @@ mod tests {
                 .replayed
         );
         assert_eq!(second.records("org", "org").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scope_head_bound_record_admission_is_atomic_and_replayable() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .append_record("account-auth", "legacy", r#"{"id":"alice"}"#)
+            .unwrap();
+        let facts = vec![
+            CommandRecordFact {
+                scope_id: "account-auth".into(),
+                kind: "account-auth-custody".into(),
+                payload: r#"{"state":"copying"}"#.into(),
+            },
+            CommandRecordFact {
+                scope_id: "account-auth::alice".into(),
+                kind: "account_auth_email".into(),
+                payload: r#"{"email":"alice@example.com"}"#.into(),
+            },
+        ];
+
+        let first = store
+            .admit_record_facts_at_scope_head(
+                "account-auth",
+                "migrate-alice",
+                r#"{"account_id":"alice","source_position":0}"#,
+                &facts,
+                "account-auth",
+                0,
+            )
+            .unwrap();
+        assert_eq!(first.positions, vec![1, 0]);
+        assert!(!first.replayed);
+
+        let replay = store
+            .admit_record_facts_at_scope_head(
+                "account-auth",
+                "migrate-alice",
+                r#"{"account_id":"alice","source_position":0}"#,
+                &facts,
+                "account-auth",
+                0,
+            )
+            .unwrap();
+        assert!(
+            replay.replayed,
+            "the advanced head does not defeat an exact retry"
+        );
+        assert!(replay.positions.is_empty());
+        assert_eq!(
+            store
+                .records("account-auth", "account-auth-custody")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .records("account-auth::alice", "account_auth_email")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_scope_head_refuses_without_a_command_or_fact() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .append_record("account-auth", "legacy", r#"{"id":"alice"}"#)
+            .unwrap();
+        let fact = CommandRecordFact {
+            scope_id: "account-auth::alice".into(),
+            kind: "account_auth_email".into(),
+            payload: r#"{"email":"alice@example.com"}"#.into(),
+        };
+
+        let result = store.admit_record_facts_at_scope_head(
+            "account-auth",
+            "stale-copy",
+            r#"{"account_id":"alice","source_position":-1}"#,
+            &[fact],
+            "account-auth",
+            -1,
+        );
+        assert!(matches!(
+            result,
+            Err(AdmitError::Rejected(Rejection {
+                reason: "scope head changed before record admission"
+            }))
+        ));
+        assert!(store
+            .command_for_key("account-auth", "stale-copy")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .records("account-auth::alice", "account_auth_email")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn competing_scope_head_bound_admissions_have_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scope-head-command.sqlite");
+        let mut first = Store::open(path.to_str().unwrap()).unwrap();
+        let mut second = Store::open(path.to_str().unwrap()).unwrap();
+        let first_fact = CommandRecordFact {
+            scope_id: "account-auth".into(),
+            kind: "migration".into(),
+            payload: r#"{"account_id":"alice"}"#.into(),
+        };
+        let second_fact = CommandRecordFact {
+            scope_id: "account-auth".into(),
+            kind: "migration".into(),
+            payload: r#"{"account_id":"bob"}"#.into(),
+        };
+
+        first
+            .admit_record_facts_at_scope_head(
+                "account-auth",
+                "copy-alice",
+                r#"{"account_id":"alice"}"#,
+                &[first_fact],
+                "account-auth",
+                -1,
+            )
+            .unwrap();
+        let loser = second.admit_record_facts_at_scope_head(
+            "account-auth",
+            "copy-bob",
+            r#"{"account_id":"bob"}"#,
+            &[second_fact],
+            "account-auth",
+            -1,
+        );
+        assert!(matches!(loser, Err(AdmitError::Rejected(_))));
+        assert!(second
+            .command_for_key("account-auth", "copy-bob")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            second.records("account-auth", "migration").unwrap().len(),
+            1
+        );
     }
 
     #[test]

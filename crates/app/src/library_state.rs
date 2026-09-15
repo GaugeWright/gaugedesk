@@ -3385,6 +3385,12 @@ impl Workbench {
         self.notify_library_changed("project", &id, op);
     }
 
+    pub(crate) fn has_project_collaboration_workspace(&self, project_id: &str) -> bool {
+        self.library
+            .project_collaboration_workspaces
+            .contains_key(project_id)
+    }
+
     pub(crate) fn ensure_project_collaboration_workspace(
         &mut self,
         project_id: &str,
@@ -6652,6 +6658,7 @@ impl Workbench {
                     // project placement below projects its pinned version
                     // instead, so deployment never follows draft edits.
                     "panel_profile": agent.panel_profile,
+                    "current_version": agent.current_version,
                     "instance_id": agent.instance_id,
                     "authoring_target_id": lib.authoring_target_for(&agent.id).expect("validated archetype has an authoring target").id,
                     "is_default": agent.id == DEFAULT_AGENT,
@@ -6732,6 +6739,7 @@ impl Workbench {
                 serde_json::json!({
                     "id": project.id,
                     "name": project.name,
+                    "authority": self.authority.as_str(),
                     "is_personal": project.is_default,
                     "home_id": project.home_id.as_str(),
                     "network_isolated": project.network_isolated,

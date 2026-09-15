@@ -38,6 +38,11 @@ pub(crate) struct PolicyCompilationInput {
     pub model: String,
     pub base_url: String,
     pub credential_ref: String,
+    /// Explicit plaintext recipient for private organization-owned model
+    /// requests. `None` is the ordinary direct provider path. Supplying one
+    /// adds that authority to the input label; selecting a provider alone does
+    /// not imply this disclosure.
+    pub private_model_broker: Option<String>,
     pub wire: String,
     pub placement_kind: String,
     pub command_network: bool,
@@ -171,6 +176,9 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
     require_nonempty("model", &input.model)?;
     require_nonempty("provider base URL", &input.base_url)?;
     require_nonempty("credential reference", &input.credential_ref)?;
+    if let Some(broker) = &input.private_model_broker {
+        require_nonempty("private model broker", broker)?;
+    }
     require_nonempty("placement kind", &input.placement_kind)?;
 
     let actor_role = authority_role(&input.actor);
@@ -200,6 +208,9 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
     );
     if workspace_readers.is_empty() {
         workspace_readers.insert(actor_role.clone());
+    }
+    if let Some(broker) = &input.private_model_broker {
+        workspace_readers.insert(authority_role(broker));
     }
     let labeled = |principal| ResourcePolicy {
         reader: workspace_readers.clone(),
@@ -283,6 +294,11 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
         )]),
         ..HostGovernancePolicy::default()
     };
+    if let Some(broker) = &input.private_model_broker {
+        policy
+            .parties
+            .insert(broker.clone(), authority_role(broker));
+    }
 
     for binding in &input.target_bindings {
         let address = format!("file:target:{}", short_hash(&binding.target_id));
@@ -556,6 +572,7 @@ mod tests {
             model: "gpt-5".to_owned(),
             base_url: "https://api.openai.com".to_owned(),
             credential_ref: "credential:gaugedesk/account/alice/openai/v1".to_owned(),
+            private_model_broker: None,
             wire: "openai-responses".to_owned(),
             placement_kind: "local".to_owned(),
             command_network: false,
@@ -660,6 +677,30 @@ mod tests {
             .placements
             .get(PLACEMENT_HANDLE)
             .is_some_and(|placement| !placement.command_network));
+    }
+
+    #[test]
+    fn private_model_broker_is_an_explicit_input_reader_not_an_implied_provider_right() {
+        let direct = compile_policy(&input()).expect("direct policy");
+        assert!(!direct.parties.contains_key("authority:private-broker"));
+
+        let mut brokered = input();
+        brokered.private_model_broker = Some("authority:private-broker".to_owned());
+        let brokered = compile_policy(&brokered).expect("brokered policy");
+        let broker_role = authority_role("authority:private-broker");
+        assert_eq!(
+            brokered
+                .parties
+                .get("authority:private-broker")
+                .map(String::as_str),
+            Some(broker_role.as_str())
+        );
+        let provider = brokered
+            .bindings
+            .get(PROVIDER_BINDING_HANDLE)
+            .and_then(|address| brokered.resources.get(address))
+            .expect("provider input label");
+        assert!(provider.reader.contains(&broker_role));
     }
 
     #[test]

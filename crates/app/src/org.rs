@@ -131,6 +131,66 @@ pub struct MembershipRecord {
     pub team: Option<String>,
 }
 
+/// The durable lifecycle of an email-addressed organization invitation.
+///
+/// This is deliberately separate from [`MembershipRecord`]: an email address is
+/// not an authenticated GaugeDesk authority, and an invitation grants no
+/// standing before the recipient either presents its one-time proof while
+/// signed in or returns a provider-verified matching subject through the
+/// organization's explicit invited-only SSO admission mode.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OrganizationInvitationStatus {
+    #[default]
+    Pending,
+    Accepted,
+    Declined,
+    Cancelled,
+}
+
+/// A hash-only, email-addressed invitation into one organization.
+///
+/// The plaintext proof is response-only at creation/resend and may be delivered
+/// by an administrator or an outbound-mail adapter. The append-only directory
+/// retains only its SHA-256 digest, so page models, transcripts, receipts, and
+/// backups cannot disclose a usable invitation.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct OrganizationInvitationRecord {
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    #[serde(default)]
+    pub org_id: String,
+    pub email: String,
+    pub role: String,
+    #[serde(default)]
+    pub team: Option<String>,
+    pub proof_sha256: String,
+    #[serde(default)]
+    pub status: OrganizationInvitationStatus,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    #[serde(default)]
+    pub responded_by: Option<String>,
+    #[serde(default)]
+    pub responded_at_ms: Option<u64>,
+}
+
+/// Record kind for [`OrganizationInvitationRecord`] facts.
+pub const ORGANIZATION_INVITATION_KIND: &str = "organization_invitation";
+
+impl OrganizationInvitationRecord {
+    /// Whether this exact plaintext proof may still authorize a recipient
+    /// response. Expiry is server-observed and an already-consumed/cancelled
+    /// record always fails closed.
+    pub fn accepts_proof(&self, proof: &str, now_ms: u64) -> bool {
+        self.status == OrganizationInvitationStatus::Pending
+            && self.expires_at_ms > now_ms
+            && !proof.trim().is_empty()
+            && self.proof_sha256 == sha256_hex(proof.trim())
+    }
+}
+
 /// The SSO protocol a connection speaks (B12).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
@@ -140,17 +200,74 @@ pub enum SsoProtocol {
     Saml,
 }
 
-/// Which id-token claims carry the ABAC attributes the verifier maps (B12 / `ID-3`):
+/// The separately custodied credential for one organization SSO connection.
+///
+/// Configuration proposals never carry this record. The public connection
+/// names only its opaque `credential_revision`; the plaintext is sealed under
+/// the organization content key before this record enters the event store.
+/// This is a singleton today because an organization has one SSO connection.
+pub const SSO_CREDENTIAL_KIND: &str = "sso_credential";
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SsoCredentialRecord {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    pub connection_id: String,
+    pub protocol: SsoProtocol,
+    /// Random opaque revision. It is deliberately not a digest of the
+    /// credential, because client secrets can have low entropy.
+    pub credential_revision: String,
+    /// Ciphertext produced by the organization content vault. It is never
+    /// returned through an HTTP projection.
+    pub sealed_secret: String,
+}
+
+/// How a verified corporate subject may become an organization member
+/// (`AUTH-7`, ADR 0146 §4). This is separate from the identity-provider
+/// connection: changing who may enter must not invalidate a working protocol
+/// configuration or its browser-test evidence.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub enum SsoAdmissionMode {
+    InvitedOnly,
+    VerifiedDomainJit,
+    Scim,
+}
+
+/// Explicit organization admission policy. Absence means unconfigured, not an
+/// implicit JIT default; an administrator must choose one of the three accepted
+/// modes before SSO enforcement can be enabled.
+pub const SSO_ADMISSION_KIND: &str = "sso_admission";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SsoAdmissionRecord {
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    pub mode: SsoAdmissionMode,
+}
+
+/// Which verified OIDC claims or signed SAML attributes carry identity and ABAC
+/// values (B12 / `ID-3`):
 /// the admin-configurable home for what was previously only a `GAUGEDESK_OIDC_*_CLAIM`
 /// env knob. Every field is optional — unset means "fall back to the env knob, else do
 /// not map that attribute" (fail-closed: no attribute is safer than a wrong one). The
 /// subject defaults to `sub` (the OIDC stable identifier) when unset.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct SsoClaimMapping {
-    /// The claim naming the durable subject → authority. `None` ⇒ `sub`.
+    /// The OIDC claim naming the durable subject → authority. `None` ⇒
+    /// `sub`; SAML always uses signed NameID.
     #[serde(default)]
     pub subject_claim: Option<String>,
-    /// The claim carrying roles (a JSON array or space-delimited string). `None` ⇒ none.
+    /// The verified email claim / signed SAML attribute used for admission.
+    /// OIDC defaults to `email`; SAML defaults to an email-shaped NameID.
+    /// An organization whose SAML NameID is opaque names its email attribute
+    /// here rather than relying on an implementation-specific guess.
+    #[serde(default)]
+    pub email_claim: Option<String>,
+    /// The claim / SAML attribute carrying roles. `None` ⇒ none.
     #[serde(default)]
     pub roles_claim: Option<String>,
     /// The claim carrying the data-residency region. `None` ⇒ none.
@@ -173,6 +290,16 @@ pub struct SsoConnectionRecord {
     pub id: String,
     #[serde(default)]
     pub op: RecordOp,
+    /// Digest of the exact connection configuration. The server replaces this
+    /// on every admitted edit; browser-test evidence binds to this value rather
+    /// than to a timeless `connected` flag.
+    #[serde(default)]
+    pub revision: String,
+    /// Opaque revision of the separately sealed credential, when this OIDC
+    /// client is confidential. Its presence is safe to project only as a
+    /// boolean; the value remains server-side connection material.
+    #[serde(default)]
+    pub credential_revision: Option<String>,
     #[serde(default)]
     pub protocol: SsoProtocol,
     /// OIDC issuer URL / SAML IdP entityID.
@@ -184,6 +311,14 @@ pub struct SsoConnectionRecord {
     /// OIDC discovery URL or raw SAML metadata (the connection material).
     #[serde(default)]
     pub metadata: String,
+    /// Exact SAML service-provider entity id bound when the connection is
+    /// admitted. Empty only on legacy records created before revisioned SAML
+    /// browser ceremonies existed.
+    #[serde(default)]
+    pub saml_sp_entity_id: String,
+    /// Exact SAML assertion-consumer URL paired with `saml_sp_entity_id`.
+    #[serde(default)]
+    pub saml_acs_url: String,
     /// Require all members to authenticate via the IdP (`ID-5`). Fail-safe: it never
     /// removes the last break-glass `owner` — that guard is structural (enforced by
     /// the member routes), independent of this flag.
@@ -193,6 +328,102 @@ pub struct SsoConnectionRecord {
     /// old log records (written before this field) parseable (`INV-6`).
     #[serde(default)]
     pub claim_mapping: SsoClaimMapping,
+}
+
+impl SsoConnectionRecord {
+    /// Compute the revision over the connection material, excluding the digest
+    /// itself. This also gives pre-revision records a deterministic current
+    /// revision without requiring an in-place migration.
+    pub fn computed_revision(&self) -> String {
+        let mut canonical = self.clone();
+        canonical.revision.clear();
+        // Enforcement is organization entry policy, not IdP protocol material.
+        // Toggling it must not manufacture a new connection revision and
+        // immediately invalidate the browser test that made enforcement safe.
+        canonical.enforce_sso = false;
+        sha256_hex(
+            &serde_json::to_string(&canonical)
+                .expect("SSO connection configuration serializes for revisioning"),
+        )
+    }
+
+    /// Replace any caller-supplied or stale revision with the server-derived
+    /// digest of this exact configuration.
+    pub fn seal_revision(&mut self) {
+        self.revision = self.computed_revision();
+    }
+
+    /// The exact revision represented by this record, including old records
+    /// written before the explicit field existed.
+    pub fn current_revision(&self) -> String {
+        let computed = self.computed_revision();
+        if self.revision == computed {
+            self.revision.clone()
+        } else {
+            computed
+        }
+    }
+
+    /// Exact non-secret binding placed inside the sealed credential envelope.
+    /// `None` means this connection is public-client / metadata-only and has no
+    /// credential to resolve.
+    pub fn credential_binding(&self) -> Option<String> {
+        let revision = self.credential_revision.as_deref()?;
+        let protocol = match self.protocol {
+            SsoProtocol::Oidc => "oidc",
+            SsoProtocol::Saml => "saml",
+        };
+        Some(format!("sso:{}:{protocol}:{revision}", self.id))
+    }
+}
+
+/// Durable evidence that one real browser authentication completed against an
+/// exact enterprise-connection revision. It is not a login, membership, or
+/// timeless `connected` flag; changing the connection makes this evidence
+/// inapplicable without rewriting its history.
+pub const SSO_BROWSER_TEST_KIND: &str = "sso_browser_test";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SsoBrowserTestRecord {
+    pub id: String,
+    pub connection_id: String,
+    pub connection_revision: String,
+    pub protocol: SsoProtocol,
+    pub subject: String,
+    #[serde(default)]
+    pub mapped_roles: Vec<String>,
+    #[serde(default)]
+    pub mapped_region: Option<String>,
+    #[serde(default)]
+    pub mapped_tenant: Option<String>,
+    pub initiated_by: String,
+    pub tested_at_ms: u64,
+}
+
+/// Server-derived prerequisites for the admitted `Require SSO for members`
+/// transition (`AUTH-8`, ADR 0146 §7). These facts are projected for a useful
+/// setup UI, but only [`ready`](Self::ready) decides the mutation.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SsoEnforcementReadiness {
+    pub connection_configured: bool,
+    pub domain_verified: bool,
+    pub browser_test_current: bool,
+    pub admission_configured: bool,
+    pub owner_subject_linked: bool,
+    pub owner_recovery_ready: bool,
+    /// A second active owner is a warning, not an initial hard gate.
+    pub second_owner_present: bool,
+}
+
+impl SsoEnforcementReadiness {
+    pub fn ready(&self) -> bool {
+        self.connection_configured
+            && self.domain_verified
+            && self.browser_test_current
+            && self.admission_configured
+            && self.owner_subject_linked
+            && self.owner_recovery_ready
+    }
 }
 
 /// The org's resource-floor ABAC policy (B15, `RBAC-6`): the per-org [`Policy`] the
@@ -246,6 +477,47 @@ pub struct ScimTokenRecord {
     pub token_sha256: String,
 }
 
+/// Safe operational evidence from an authenticated SCIM request. The record
+/// deliberately retains only the operation, optional SCIM resource id, a
+/// closed outcome/reason, and server time. Arbitrary provider payloads and
+/// bearer material never enter the organization log.
+pub const SCIM_SYNC_KIND: &str = "scim_sync";
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScimSyncOperation {
+    Provision,
+    Update,
+    Deprovision,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScimSyncStatus {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScimSyncError {
+    InvalidUserName,
+    UnsupportedChange,
+    UnknownUser,
+    SeatCapacity,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ScimSyncRecord {
+    pub operation: ScimSyncOperation,
+    #[serde(default)]
+    pub subject: Option<String>,
+    pub status: ScimSyncStatus,
+    #[serde(default)]
+    pub error: Option<ScimSyncError>,
+    pub observed_at_ms: u64,
+}
+
 /// The org's security policy (B15 / `SEC-1`/`-2`/`-3`): MFA enforcement, session
 /// lifetime / idle timeout, and the default residency region. These controls
 /// *compose with* — never widen — the protection floor (`ABAC_MONOTONE`). The MFA
@@ -283,10 +555,22 @@ pub struct SecurityPolicyRecord {
     pub allow_auto_upgrade: bool,
 }
 
+/// A future-only revocation of one authenticated client's access to this exact
+/// organization. The id is the public, domain-separated organization-session id —
+/// never a bearer or a directly reusable credential. This record deliberately does
+/// not revoke the person's Trusted Device or their access to another organization.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OrganizationSessionRevocationRecord {
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+}
+
 /// The default published minimum audit-retention guarantee (`AUD-3`): one year. We keep the
 /// log forever (`INV-6`); this is the floor a buyer is guaranteed unless they configure a
 /// longer one.
 pub const DEFAULT_AUDIT_RETENTION_MIN_DAYS: u64 = 365;
+pub const BILLING_CONTACT_KIND: &str = "billing_contact";
 
 /// The org-level **archetype-approval policy** ([ADR 0063](../../../specs/decisions/0063-archetype-approval-two-acts.md)).
 /// When `require_approval` is set, adding an archetype to a project lands its [[placement]]
@@ -306,8 +590,8 @@ pub struct ArchetypeApprovalPolicyRecord {
 
 /// The org's billing/seat state (B16 / `BILL-1`). **Operational, never authority**
 /// (`BILL-3`/`INV-18`): a paid seat is not a grant and a lapsed plan rewrites no
-/// history; seat state may *gate future* seat assignment only. Nothing in the
-/// authority/role path reads this record. Singleton.
+/// history; seat state may *refuse future* activation only. It never grants a
+/// role or project authority and never revokes an existing member. Singleton.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct BillingRecord {
     #[serde(default)]
@@ -325,6 +609,22 @@ pub struct BillingRecord {
     /// historical usage or authority.
     #[serde(default)]
     pub managed_inference: Option<crate::managed_inference::ManagedInferencePlan>,
+}
+
+/// The minimum organization-owned recipient metadata GaugeWright needs for
+/// billing notices. Payment instruments, postal addresses, tax identity, and
+/// invoice documents remain with the payment processor. This is deliberately
+/// separate from [`BillingRecord`]: reconciled subscription updates replace
+/// that operational record and must never erase an independently edited
+/// contact. Singleton.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BillingContactRecord {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    pub name: String,
+    pub email: String,
 }
 
 /// A mapping from an IdP **group** to a workspace role (and optional team) (B13 /
@@ -372,8 +672,16 @@ impl MemberGrantRecord {
 /// The folded org directory projection (derived, rebuildable — `INV-5`).
 #[derive(Default, Clone, Debug)]
 pub struct Org {
+    /// Exact store scope this projection was rebuilt from. Enterprise
+    /// connection ids are scoped to an organization, so globally stored
+    /// account-subject links and account-session methods must include this
+    /// namespace rather than treating every tenant's singleton `org` id as the
+    /// same provider connection.
+    pub scope: String,
     pub org: Option<OrgRecord>,
     pub members: BTreeMap<String, MembershipRecord>,
+    /// Email-addressed invitations that have not yet become memberships.
+    pub invitations: BTreeMap<String, OrganizationInvitationRecord>,
     /// Explicit member→project scope grants (`ENTSEC-2`), folded latest-wins by id.
     pub grants: BTreeMap<String, MemberGrantRecord>,
     pub group_mappings: BTreeMap<String, GroupMappingRecord>,
@@ -381,10 +689,26 @@ pub struct Org {
     pub placement_policy: Option<PlacementPolicy>,
     pub software_policy: Option<crate::client_admission::SoftwarePolicy>,
     pub sso: Option<SsoConnectionRecord>,
+    /// Separately sealed credential material. It never participates in a
+    /// public projection; consumers must resolve it against the current SSO
+    /// connection's exact id, protocol, and credential revision.
+    pub sso_credential: Option<SsoCredentialRecord>,
+    /// Explicit admission mode for corporate subjects. `None` is intentionally
+    /// unconfigured and cannot satisfy the enforce-SSO reducer.
+    pub sso_admission: Option<SsoAdmissionRecord>,
+    /// Ordered real-browser sign-in evidence. Consumers select evidence whose
+    /// connection id, protocol, and revision still match the current record.
+    pub sso_browser_tests: Vec<SsoBrowserTestRecord>,
     pub scim_token_sha256: Option<String>,
+    /// Ordered authenticated SCIM request outcomes. Consumers project only the
+    /// last successful sync and unresolved recent failures.
+    pub scim_sync: Vec<ScimSyncRecord>,
     pub security: Option<SecurityPolicyRecord>,
     pub billing: Option<BillingRecord>,
+    pub billing_contact: Option<BillingContactRecord>,
     pub archetype_approval: Option<ArchetypeApprovalPolicyRecord>,
+    /// Organization-only session revocations keyed by stable session id.
+    pub session_revocations: BTreeMap<String, OrganizationSessionRevocationRecord>,
 }
 
 /// The store scope holding tenant `tenant`'s org records (`DEPLOY-6` tenancy-as-scope).
@@ -401,6 +725,21 @@ pub fn tenant_scope(tenant: &str) -> String {
 }
 
 impl Org {
+    /// Return only credential ciphertext belonging to the exact current
+    /// connection revision. A stale, cross-protocol, or caller-injected record
+    /// is unusable rather than a fallback credential.
+    pub fn current_sso_credential(&self) -> Option<&SsoCredentialRecord> {
+        let connection = self.sso.as_ref()?;
+        let revision = connection.credential_revision.as_deref()?;
+        self.sso_credential.as_ref().filter(|credential| {
+            credential.op == RecordOp::Upsert
+                && credential.connection_id == connection.id
+                && credential.protocol == connection.protocol
+                && credential.credential_revision == revision
+                && !credential.sealed_secret.is_empty()
+        })
+    }
+
     /// Rebuild the **default tenant**'s directory (the solo / singleton path) — folds the
     /// fixed [`ORG_SCOPE`]. Equivalent to [`rebuild_in`](Self::rebuild_in) at that scope.
     pub fn rebuild(store: &Store) -> Result<Org, AdmitError> {
@@ -411,7 +750,10 @@ impl Org {
     /// (latest-wins). For the default tenant pass [`ORG_SCOPE`]; for a named tenant pass
     /// [`tenant_scope`]`(id)`. Tenancy-as-scope (`DEPLOY-6`): the fold is scope-isolated.
     pub fn rebuild_in(store: &Store, scope: &str) -> Result<Org, AdmitError> {
-        let mut org = Org::default();
+        let mut org = Org {
+            scope: scope.to_owned(),
+            ..Org::default()
+        };
         for row in store.records(scope, "org")? {
             let r: OrgRecord = serde_json::from_str(&row)?;
             match r.op {
@@ -427,6 +769,17 @@ impl Org {
                 }
                 RecordOp::Upsert => {
                     org.members.insert(r.id.clone(), r);
+                }
+            }
+        }
+        for row in store.records(scope, ORGANIZATION_INVITATION_KIND)? {
+            let r: OrganizationInvitationRecord = serde_json::from_str(&row)?;
+            match r.op {
+                RecordOp::Tombstone => {
+                    org.invitations.remove(&r.id);
+                }
+                RecordOp::Upsert => {
+                    org.invitations.insert(r.id.clone(), r);
                 }
             }
         }
@@ -458,12 +811,34 @@ impl Org {
                 RecordOp::Upsert => org.sso = Some(r),
             }
         }
+        for row in store.records(scope, SSO_CREDENTIAL_KIND)? {
+            let r: SsoCredentialRecord = serde_json::from_str(&row)?;
+            match r.op {
+                RecordOp::Tombstone => org.sso_credential = None,
+                RecordOp::Upsert => org.sso_credential = Some(r),
+            }
+        }
+        for row in store.records(scope, SSO_ADMISSION_KIND)? {
+            let r: SsoAdmissionRecord = serde_json::from_str(&row)?;
+            match r.op {
+                RecordOp::Tombstone => org.sso_admission = None,
+                RecordOp::Upsert => org.sso_admission = Some(r),
+            }
+        }
+        for row in store.records(scope, SSO_BROWSER_TEST_KIND)? {
+            let r: SsoBrowserTestRecord = serde_json::from_str(&row)?;
+            org.sso_browser_tests.push(r);
+        }
         for row in store.records(scope, "scim_token")? {
             let r: ScimTokenRecord = serde_json::from_str(&row)?;
             match r.op {
                 RecordOp::Tombstone => org.scim_token_sha256 = None,
                 RecordOp::Upsert => org.scim_token_sha256 = Some(r.token_sha256),
             }
+        }
+        for row in store.records(scope, SCIM_SYNC_KIND)? {
+            let r: ScimSyncRecord = serde_json::from_str(&row)?;
+            org.scim_sync.push(r);
         }
         for row in store.records(scope, "security")? {
             let r: SecurityPolicyRecord = serde_json::from_str(&row)?;
@@ -479,11 +854,29 @@ impl Org {
                 RecordOp::Upsert => org.billing = Some(r),
             }
         }
+        for row in store.records(scope, BILLING_CONTACT_KIND)? {
+            let r: BillingContactRecord = serde_json::from_str(&row)?;
+            match r.op {
+                RecordOp::Tombstone => org.billing_contact = None,
+                RecordOp::Upsert => org.billing_contact = Some(r),
+            }
+        }
         for row in store.records(scope, "archetype_approval")? {
             let r: ArchetypeApprovalPolicyRecord = serde_json::from_str(&row)?;
             match r.op {
                 RecordOp::Tombstone => org.archetype_approval = None,
                 RecordOp::Upsert => org.archetype_approval = Some(r),
+            }
+        }
+        for row in store.records(scope, "organization_session_revocation")? {
+            let r: OrganizationSessionRevocationRecord = serde_json::from_str(&row)?;
+            match r.op {
+                RecordOp::Tombstone => {
+                    org.session_revocations.remove(&r.id);
+                }
+                RecordOp::Upsert => {
+                    org.session_revocations.insert(r.id.clone(), r);
+                }
             }
         }
         for row in store.records(scope, "member_grant")? {
@@ -509,6 +902,100 @@ impl Org {
             }
         }
         Ok(org)
+    }
+
+    /// Most recent successful real-browser test for the exact live connection
+    /// revision. Old evidence remains in the append-only log but cannot satisfy
+    /// a changed connection.
+    pub fn current_sso_browser_test(&self) -> Option<&SsoBrowserTestRecord> {
+        let connection = self.sso.as_ref()?;
+        let revision = connection.current_revision();
+        self.sso_browser_tests.iter().rev().find(|test| {
+            test.connection_id == connection.id
+                && test.connection_revision == revision
+                && test.protocol == connection.protocol
+        })
+    }
+
+    /// Derive the complete lockout-safety basis from current organization and
+    /// account-auth facts. No client-supplied readiness flag participates.
+    pub fn sso_enforcement_readiness(
+        &self,
+        account_auth: &crate::account_auth::AccountAuth,
+    ) -> SsoEnforcementReadiness {
+        let active_owners = self
+            .members
+            .values()
+            .filter(|member| member.status == MembershipStatus::Active && member.role == "owner")
+            .map(|member| member.authority.as_str())
+            .collect::<Vec<_>>();
+        let connection = self.sso.as_ref();
+        let owner_subject_linked = active_owners
+            .iter()
+            .any(|account_id| self.corporate_subject_linked_for(account_auth, account_id));
+        let owner_recovery_ready = active_owners.iter().any(|account_id| {
+            account_auth.active_webauthn_count(account_id) > 0
+                && account_auth.unused_recovery_code_count(account_id) > 0
+        });
+        let admission_configured =
+            self.sso_admission
+                .as_ref()
+                .is_some_and(|admission| match admission.mode {
+                    SsoAdmissionMode::InvitedOnly => true,
+                    SsoAdmissionMode::VerifiedDomainJit => self
+                        .org
+                        .as_ref()
+                        .is_some_and(|record| !record.verified_domains.is_empty()),
+                    SsoAdmissionMode::Scim => self.scim_token_sha256.is_some(),
+                });
+        SsoEnforcementReadiness {
+            connection_configured: connection.is_some(),
+            domain_verified: self
+                .org
+                .as_ref()
+                .is_some_and(|record| !record.verified_domains.is_empty()),
+            browser_test_current: self.current_sso_browser_test().is_some(),
+            admission_configured,
+            owner_subject_linked,
+            owner_recovery_ready,
+            second_owner_present: active_owners.len() > 1,
+        }
+    }
+
+    /// Whether `account_id` holds an active subject link for the exact current
+    /// corporate connection. Old-provider and revoked links never count.
+    pub fn corporate_subject_linked_for(
+        &self,
+        account_auth: &crate::account_auth::AccountAuth,
+        account_id: &str,
+    ) -> bool {
+        let Some(connection) = self.sso.as_ref() else {
+            return false;
+        };
+        let expected_kind = match connection.protocol {
+            SsoProtocol::Oidc => crate::account_auth::ExternalSubjectKind::EnterpriseOidc,
+            SsoProtocol::Saml => crate::account_auth::ExternalSubjectKind::EnterpriseSaml,
+        };
+        account_auth.external_subjects.values().any(|subject| {
+            subject.status == crate::account_auth::AuthMethodStatus::Active
+                && subject.account_id == account_id
+                && subject.connection_id == self.enterprise_connection_key(&connection.id)
+                && subject.issuer == connection.issuer
+                && subject.kind == expected_kind
+        })
+    }
+
+    /// Globally unambiguous key for an organization-scoped enterprise
+    /// connection. The connection record is singleton-within-scope and is
+    /// commonly named `org`; the account-auth ledger is global, so the scope is
+    /// part of every subject-link and session-method identity.
+    pub fn enterprise_connection_key(&self, connection_id: &str) -> String {
+        let scope = if self.scope.is_empty() {
+            ORG_SCOPE
+        } else {
+            &self.scope
+        };
+        format!("{scope}:{connection_id}")
     }
 
     /// The (role, team) a member carrying any of `groups` should take, from the
@@ -560,6 +1047,13 @@ impl Org {
             .unwrap_or((0, 0))
     }
 
+    /// Whether this exact organization session has been durably revoked. A new
+    /// authentication receives a different session id and is not caught by the old
+    /// tombstone; the same credential cannot regain access after a process restart.
+    pub fn organization_session_revoked(&self, session_id: &str) -> bool {
+        self.session_revocations.contains_key(session_id)
+    }
+
     /// The effective **minimum audit-retention guarantee** in days (`AUD-3`): the configured
     /// floor, or [`DEFAULT_AUDIT_RETENTION_MIN_DAYS`] (one year) when unset. A promise floor —
     /// the log is kept forever (`INV-6`); this is what the buyer is guaranteed at minimum.
@@ -589,6 +1083,23 @@ impl Org {
             .count()
     }
 
+    /// Whether activating `member_id` would fit the purchased capacity. An
+    /// organization without a billing record keeps the legacy unmetered
+    /// behavior. A record with zero seats deliberately freezes new activation,
+    /// while already-active members remain active (`BILL-3`).
+    pub fn seat_available_for(&self, member_id: &str) -> bool {
+        if self
+            .members
+            .get(member_id)
+            .is_some_and(|member| member.status == MembershipStatus::Active)
+        {
+            return true;
+        }
+        self.billing.as_ref().is_none_or(|billing| {
+            u64::try_from(self.seats_used()).is_ok_and(|used| used < billing.seats)
+        })
+    }
+
     /// Whether `token` is the org's current SCIM bearer (`B13`): SHA-256 of the
     /// presented token matches the stored hash. No token issued ⇒ never authenticates
     /// (fail-closed). Constant work; the hash compare is over fixed-width hex.
@@ -602,6 +1113,24 @@ impl Org {
     /// Whether SSO is enforced (`ID-5`) — `false` until a connection sets the flag.
     pub fn sso_enforced(&self) -> bool {
         self.sso.as_ref().is_some_and(|s| s.enforce_sso)
+    }
+
+    /// Whether an opaque account session was minted by this exact current
+    /// enterprise connection. Consumer OIDC and passkey sessions deliberately
+    /// do not satisfy organization SSO enforcement.
+    pub fn enterprise_session_method_matches(&self, method: &str) -> bool {
+        let Some(connection) = self.sso.as_ref() else {
+            return false;
+        };
+        let family = match connection.protocol {
+            SsoProtocol::Oidc => "enterprise-oidc",
+            SsoProtocol::Saml => "enterprise-saml",
+        };
+        method
+            == format!(
+                "{family}:{}",
+                self.enterprise_connection_key(&connection.id)
+            )
     }
 
     /// Whether `email`'s domain is one of the org's **verified domains** (B10) — the
@@ -753,6 +1282,46 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn organization_invitation_folds_hash_only_and_consumes_once() {
+        let proof = "plain-proof-never-stored";
+        let pending = OrganizationInvitationRecord {
+            id: "oinv-one".into(),
+            op: RecordOp::Upsert,
+            org_id: ORG_ID.into(),
+            email: "person@example.test".into(),
+            role: "member".into(),
+            team: None,
+            proof_sha256: sha256_hex(proof),
+            status: OrganizationInvitationStatus::Pending,
+            issued_at_ms: 10,
+            expires_at_ms: 100,
+            responded_by: None,
+            responded_at_ms: None,
+        };
+        let payload = serde_json::to_string(&pending).unwrap();
+        assert!(!payload.contains(proof));
+        let mut store = store_with(&[(ORGANIZATION_INVITATION_KIND, &payload)]);
+        let folded = Org::rebuild(&store).unwrap();
+        assert!(folded.invitations["oinv-one"].accepts_proof(proof, 99));
+        assert!(!folded.invitations["oinv-one"].accepts_proof("wrong", 99));
+        assert!(!folded.invitations["oinv-one"].accepts_proof(proof, 100));
+
+        let mut accepted = pending;
+        accepted.status = OrganizationInvitationStatus::Accepted;
+        accepted.responded_by = Some("person:recipient".into());
+        accepted.responded_at_ms = Some(50);
+        store
+            .append_record(
+                ORG_SCOPE,
+                ORGANIZATION_INVITATION_KIND,
+                &serde_json::to_string(&accepted).unwrap(),
+            )
+            .unwrap();
+        let folded = Org::rebuild(&store).unwrap();
+        assert!(!folded.invitations["oinv-one"].accepts_proof(proof, 51));
+    }
+
     /// The production case: an OIDC actor arrives with no roles, because a
     /// provider only maps them when a `roles_claim` is configured and a Google
     /// id-token carries none. The directory records the same authority an active
@@ -885,6 +1454,24 @@ mod tests {
     }
 
     #[test]
+    fn enterprise_connection_keys_include_the_organization_scope() {
+        let store = Store::open_in_memory().unwrap();
+        let default = Org::rebuild(&store).unwrap();
+        let alpha = Org::rebuild_in(&store, &tenant_scope("organization:alpha")).unwrap();
+        let beta = Org::rebuild_in(&store, &tenant_scope("organization:beta")).unwrap();
+
+        assert_eq!(default.enterprise_connection_key(ORG_ID), "org:org");
+        assert_eq!(
+            alpha.enterprise_connection_key(ORG_ID),
+            "org::organization:alpha:org"
+        );
+        assert_ne!(
+            alpha.enterprise_connection_key(ORG_ID),
+            beta.enterprise_connection_key(ORG_ID)
+        );
+    }
+
+    #[test]
     fn role_of_reads_active_member_role() {
         let store = store_with(&[(
             "membership",
@@ -1005,6 +1592,80 @@ mod tests {
     }
 
     #[test]
+    fn sso_revision_is_server_derived_and_changes_with_configuration() {
+        let mut record = SsoConnectionRecord {
+            id: ORG_ID.into(),
+            op: RecordOp::Upsert,
+            protocol: SsoProtocol::Oidc,
+            issuer: "https://idp.example.test".into(),
+            audiences: vec!["client".into()],
+            revision: "caller-value".into(),
+            ..Default::default()
+        };
+        let expected = record.computed_revision();
+        assert_eq!(record.current_revision(), expected);
+        record.seal_revision();
+        assert_eq!(record.revision, expected);
+        record.enforce_sso = true;
+        assert_eq!(
+            record.current_revision(),
+            expected,
+            "entry enforcement is not connection material"
+        );
+        record.audiences.push("second-client".into());
+        assert_ne!(record.current_revision(), expected);
+        let before_credential = record.current_revision();
+        record.credential_revision = Some("opaque-credential-revision".into());
+        assert_ne!(record.current_revision(), before_credential);
+    }
+
+    #[test]
+    fn sso_credential_folds_only_for_the_exact_current_connection() {
+        let mut connection = SsoConnectionRecord {
+            id: ORG_ID.into(),
+            op: RecordOp::Upsert,
+            protocol: SsoProtocol::Oidc,
+            issuer: "https://idp.example.test".into(),
+            audiences: vec!["gaugedesk".into()],
+            credential_revision: Some("secret-rev-1".into()),
+            ..Default::default()
+        };
+        connection.seal_revision();
+        let credential = SsoCredentialRecord {
+            id: ORG_ID.into(),
+            op: RecordOp::Upsert,
+            connection_id: ORG_ID.into(),
+            protocol: SsoProtocol::Oidc,
+            credential_revision: "secret-rev-1".into(),
+            sealed_secret: "ciphertext".into(),
+        };
+        let store = store_with(&[
+            ("sso", &serde_json::to_string(&connection).unwrap()),
+            (
+                SSO_CREDENTIAL_KIND,
+                &serde_json::to_string(&credential).unwrap(),
+            ),
+        ]);
+        let org = Org::rebuild(&store).unwrap();
+        assert_eq!(
+            org.current_sso_credential()
+                .map(|record| record.credential_revision.as_str()),
+            Some("secret-rev-1")
+        );
+
+        let mut stale = credential;
+        stale.credential_revision = "secret-rev-0".into();
+        let store = store_with(&[
+            ("sso", &serde_json::to_string(&connection).unwrap()),
+            (SSO_CREDENTIAL_KIND, &serde_json::to_string(&stale).unwrap()),
+        ]);
+        assert!(Org::rebuild(&store)
+            .unwrap()
+            .current_sso_credential()
+            .is_none());
+    }
+
+    #[test]
     fn domain_capture_matches_verified_domains() {
         let rec = OrgRecord {
             id: ORG_ID.into(),
@@ -1110,6 +1771,80 @@ mod tests {
     }
 
     #[test]
+    fn purchased_capacity_only_gates_future_activation() {
+        let billing = serde_json::to_string(&BillingRecord {
+            id: "organization-billing".into(),
+            op: RecordOp::Upsert,
+            plan: "cloud".into(),
+            seats: 2,
+            managed_inference: None,
+        })
+        .unwrap();
+        let store = store_with(&[
+            (
+                "membership",
+                &membership("one", "one", "owner", MembershipStatus::Active),
+            ),
+            (
+                "membership",
+                &membership("two", "two", "member", MembershipStatus::Active),
+            ),
+            (
+                "membership",
+                &membership(
+                    "waiting",
+                    "waiting",
+                    "member",
+                    MembershipStatus::Deprovisioned,
+                ),
+            ),
+            ("billing", &billing),
+        ]);
+        let org = Org::rebuild(&store).unwrap();
+        assert!(
+            org.seat_available_for("one"),
+            "billing never revokes standing"
+        );
+        assert!(
+            !org.seat_available_for("waiting"),
+            "a third activation is refused"
+        );
+    }
+
+    #[test]
+    fn billing_contact_is_independent_of_subscription_reconciliation() {
+        let contact = BillingContactRecord {
+            id: "tenant-billing-contact".into(),
+            op: RecordOp::Upsert,
+            name: "Ada Lovelace".into(),
+            email: "billing@example.test".into(),
+        };
+        let first_billing = BillingRecord {
+            id: "organization-billing".into(),
+            op: RecordOp::Upsert,
+            plan: "business".into(),
+            seats: 2,
+            managed_inference: None,
+        };
+        let replacement_billing = BillingRecord {
+            seats: 5,
+            ..first_billing.clone()
+        };
+        let contact_json = serde_json::to_string(&contact).unwrap();
+        let first_billing_json = serde_json::to_string(&first_billing).unwrap();
+        let replacement_billing_json = serde_json::to_string(&replacement_billing).unwrap();
+        let store = store_with(&[
+            (BILLING_CONTACT_KIND, &contact_json),
+            ("billing", &first_billing_json),
+            ("billing", &replacement_billing_json),
+        ]);
+
+        let org = Org::rebuild(&store).unwrap();
+        assert_eq!(org.billing_contact, Some(contact));
+        assert_eq!(org.billing.unwrap().seats, 5);
+    }
+
+    #[test]
     fn fixed_roles_validate() {
         assert!(is_valid_role("owner") && is_valid_role("billing"));
         // ADR 0149 §3: the read-only auditor is a fixed role.
@@ -1160,5 +1895,187 @@ mod tests {
             org.role_for_groups(&["finance".into()]),
             Some(("billing".into(), None))
         );
+    }
+
+    #[test]
+    fn browser_test_evidence_applies_only_to_the_exact_connection_revision() {
+        let mut connection = SsoConnectionRecord {
+            id: ORG_ID.into(),
+            protocol: SsoProtocol::Oidc,
+            issuer: "https://idp.example.test".into(),
+            audiences: vec!["gaugedesk".into()],
+            ..Default::default()
+        };
+        connection.seal_revision();
+        let test = SsoBrowserTestRecord {
+            id: "ssotest-1".into(),
+            connection_id: connection.id.clone(),
+            connection_revision: connection.current_revision(),
+            protocol: SsoProtocol::Oidc,
+            subject: "corporate-subject".into(),
+            mapped_roles: vec!["engineering".into()],
+            mapped_region: None,
+            mapped_tenant: None,
+            initiated_by: "owner".into(),
+            tested_at_ms: 42,
+        };
+        let connection_json = serde_json::to_string(&connection).unwrap();
+        let test_json = serde_json::to_string(&test).unwrap();
+        let store = store_with(&[
+            ("sso", &connection_json),
+            (SSO_BROWSER_TEST_KIND, &test_json),
+        ]);
+        let org = Org::rebuild(&store).unwrap();
+        assert_eq!(org.current_sso_browser_test(), Some(&test));
+
+        let mut changed = connection;
+        changed.audiences = vec!["replacement-client".into()];
+        changed.seal_revision();
+        let changed_json = serde_json::to_string(&changed).unwrap();
+        let store = store_with(&[
+            ("sso", &connection_json),
+            (SSO_BROWSER_TEST_KIND, &test_json),
+            ("sso", &changed_json),
+        ]);
+        let org = Org::rebuild(&store).unwrap();
+        assert!(org.current_sso_browser_test().is_none());
+        assert_eq!(org.sso_browser_tests, vec![test], "history remains");
+    }
+
+    #[test]
+    fn sso_admission_is_explicit_and_folds_latest_wins() {
+        let invited = SsoAdmissionRecord {
+            id: ORG_ID.into(),
+            op: RecordOp::Upsert,
+            mode: SsoAdmissionMode::InvitedOnly,
+        };
+        let scim = SsoAdmissionRecord {
+            mode: SsoAdmissionMode::Scim,
+            ..invited.clone()
+        };
+        let store = store_with(&[
+            (
+                SSO_ADMISSION_KIND,
+                &serde_json::to_string(&invited).unwrap(),
+            ),
+            (SSO_ADMISSION_KIND, &serde_json::to_string(&scim).unwrap()),
+        ]);
+        assert_eq!(Org::rebuild(&store).unwrap().sso_admission, Some(scim));
+        assert!(Org::default().sso_admission.is_none());
+    }
+
+    #[test]
+    fn sso_enforcement_requires_every_lockout_safety_fact_but_not_a_second_owner() {
+        use crate::account_auth::{
+            AuthMethodStatus, ExternalSubjectKind, ExternalSubjectRecord, RecoveryBatchRecord,
+            RecoveryBatchStatus, RecoveryCodeRecord, WebAuthnMethodRecord,
+        };
+
+        let mut connection = SsoConnectionRecord {
+            id: ORG_ID.into(),
+            protocol: SsoProtocol::Oidc,
+            issuer: "https://idp.example.test".into(),
+            audiences: vec!["gaugedesk".into()],
+            ..Default::default()
+        };
+        connection.seal_revision();
+        let mut org = Org {
+            org: Some(OrgRecord {
+                id: ORG_ID.into(),
+                op: RecordOp::Upsert,
+                display_name: "Acme".into(),
+                verified_domains: vec!["acme.example".into()],
+                default_region: None,
+                kind: Default::default(),
+            }),
+            sso: Some(connection.clone()),
+            sso_admission: Some(SsoAdmissionRecord {
+                id: ORG_ID.into(),
+                op: RecordOp::Upsert,
+                mode: SsoAdmissionMode::InvitedOnly,
+            }),
+            ..Default::default()
+        };
+        org.members.insert(
+            "owner".into(),
+            MembershipRecord {
+                id: "owner".into(),
+                op: RecordOp::Upsert,
+                org_id: ORG_ID.into(),
+                authority: "account-owner".into(),
+                email: "owner@acme.example".into(),
+                role: "owner".into(),
+                status: MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            },
+        );
+        org.sso_browser_tests.push(SsoBrowserTestRecord {
+            id: "test".into(),
+            connection_id: connection.id.clone(),
+            connection_revision: connection.current_revision(),
+            protocol: connection.protocol,
+            subject: "corporate-owner".into(),
+            mapped_roles: vec![],
+            mapped_region: None,
+            mapped_tenant: None,
+            initiated_by: "account-owner".into(),
+            tested_at_ms: 1,
+        });
+
+        let mut auth = crate::account_auth::AccountAuth::default();
+        let subject = ExternalSubjectRecord::new(
+            "account-owner",
+            &org.enterprise_connection_key(ORG_ID),
+            &connection.issuer,
+            "corporate-owner",
+            ExternalSubjectKind::EnterpriseOidc,
+            2,
+        )
+        .unwrap();
+        auth.external_subjects.insert(subject.id.clone(), subject);
+        auth.webauthn_methods.insert(
+            "credential".into(),
+            WebAuthnMethodRecord {
+                id: "credential".into(),
+                op: RecordOp::Upsert,
+                account_id: "account-owner".into(),
+                verifier_json: "public-verifier".into(),
+                label: "Security key".into(),
+                created_at: 1,
+                status: AuthMethodStatus::Active,
+            },
+        );
+        auth.recovery_batches.insert(
+            "batch".into(),
+            RecoveryBatchRecord {
+                id: "batch".into(),
+                op: RecordOp::Upsert,
+                account_id: "account-owner".into(),
+                created_at: 1,
+                status: RecoveryBatchStatus::Active,
+            },
+        );
+        auth.recovery_codes.insert(
+            "code".into(),
+            RecoveryCodeRecord {
+                id: "code".into(),
+                op: RecordOp::Upsert,
+                account_id: "account-owner".into(),
+                batch_id: "batch".into(),
+                salt: "salt".into(),
+                code_hash: "hash".into(),
+                consumed_at: None,
+            },
+        );
+
+        let readiness = org.sso_enforcement_readiness(&auth);
+        assert!(readiness.ready());
+        assert!(!readiness.second_owner_present, "second owner is a warning");
+
+        org.sso_admission.as_mut().unwrap().mode = SsoAdmissionMode::Scim;
+        let readiness = org.sso_enforcement_readiness(&auth);
+        assert!(!readiness.admission_configured);
+        assert!(!readiness.ready(), "SCIM needs an issued credential");
     }
 }
