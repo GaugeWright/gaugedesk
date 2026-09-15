@@ -488,6 +488,15 @@ mod tests {
     /// never reaches the proxy (raw IP, non-443) is dropped by nft. Gated to run
     /// only where pasta+bwrap+nft+curl exist and work, and where the host itself has
     /// egress; skips with a log otherwise.
+    ///
+    /// It deliberately still uses the real `example.com` over the real internet. A
+    /// loopback TLS endpoint would remove the network dependency, but the proxy dials
+    /// the SNI host on a hardcoded 443 (and the netns DNATs only 443), so a local
+    /// stand-in would need a privileged bind plus a trusted cert or a
+    /// verification-disabling client flag — a test-only seam through the enforcement
+    /// heart, in exchange for a weaker proof. The live dependency is kept and made
+    /// self-diagnosing instead: see `allow_path_must_succeed` below, which is how a
+    /// transient resolver failure is prevented from reading as an egress regression.
     #[cfg(target_os = "linux")]
     #[test]
     fn transparent_sni_egress_is_non_bypassable_end_to_end() {
@@ -501,6 +510,20 @@ mod tests {
         }
         fn ok(cmd: &mut Command) -> bool {
             matches!(cmd.status(), Ok(s) if s.success())
+        }
+        /// Can the **host itself** reach the allowlisted endpoint right now?
+        /// Every *positive* assertion below ("an allowlisted host stays
+        /// reachable through the sandbox") only carries information about the
+        /// sandbox while this is true at that instant.
+        fn host_egress_ok() -> bool {
+            ok(Command::new("curl").args([
+                "-sS",
+                "-o",
+                "/dev/null",
+                "--max-time",
+                "15",
+                "https://example.com",
+            ]))
         }
 
         if !["pasta", "bwrap", "nft", "curl"].iter().all(|b| on_path(b)) {
@@ -518,16 +541,68 @@ mod tests {
             return;
         }
         // No point asserting "allowed host reachable" if the host itself is offline.
-        if !ok(Command::new("curl").args([
-            "-sS",
-            "-o",
-            "/dev/null",
-            "--max-time",
-            "15",
-            "https://example.com",
-        ])) {
+        if !host_egress_ok() {
             eprintln!("skip: host has no egress to example.com (offline)");
             return;
+        }
+
+        /// Drive a *positive* (liveness) probe that must succeed, distinguishing a
+        /// broken egress path from a machine that transiently lost its own name
+        /// resolution. `probe` returns `Err(diagnostic)` when the allow-path attempt
+        /// did not succeed.
+        ///
+        /// MEASURED (2026-09-14, 20-core host under heavy build load): `example.com`
+        /// intermittently fails to resolve — `curl: (6) Could not resolve host` — for
+        /// the **host and the sandbox alike**, in roughly 1 run in 25. The preflight
+        /// above establishes host egress once, but these assertions land up to thirty
+        /// seconds later and the record's TTL is shorter than this test, so a resolver
+        /// blip inside that window used to fail the whole `rust` section with a
+        /// message that reads exactly like a genuine egress regression.
+        ///
+        /// So a failed attempt is not a verdict on its own: ask the host the same
+        /// question. If the host can reach the endpoint and the sandboxed path cannot,
+        /// that IS the regression this test exists to catch and it fails immediately,
+        /// with a better message than before. If the host cannot reach it either, the
+        /// attempt says nothing about the sandbox and is retried until the host's own
+        /// egress comes back or the budget runs out (then it skips, like the preflight).
+        ///
+        /// Retrying is sound here *because it is confined to the liveness half*: a
+        /// broken proxy, netns, or ruleset fails every attempt while `host_egress_ok()`
+        /// keeps returning true, so it still fails deterministically and on the first
+        /// attempt. The negative assertions below are deterministic and never retried.
+        fn allow_path_must_succeed(label: &str, mut probe: impl FnMut() -> Result<(), String>) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let last = match probe() {
+                    Ok(()) => return,
+                    Err(diagnostic) => diagnostic,
+                };
+                if host_egress_ok() {
+                    panic!(
+                        "{label}: the host itself reaches https://example.com right now, \
+                         so the transparent sandbox failing to is a real egress \
+                         regression — {last}"
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "skip ({label}): the host's own egress to example.com stayed down \
+                         for the whole retry budget — this run cannot judge the sandbox \
+                         (last attempt: {last})"
+                    );
+                    return;
+                }
+                // Leave a breadcrumb: a silently-recovered retry would hide the fact
+                // that this machine's name resolution is dropping out under load.
+                eprintln!(
+                    "retry ({label}): the host cannot reach example.com either right \
+                     now, so this attempt judges nothing — {last}"
+                );
+                // Poll interval while the host's own resolver is confirmed down. This
+                // is not the fix — the host-side re-check above is; this only spaces
+                // the polls so a fast-failing resolver does not burn the budget.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
         }
 
         // The one enforced allowlist entry — the proxy rules on the TLS SNI.
@@ -549,21 +624,25 @@ mod tests {
         };
         // curl flags: silent, discard body, print only the HTTP status, bounded time.
         // (a) allowlisted host over 443 → succeeds through the transparent proxy.
-        let (code_a, ok_a) = run(&[
-            "-sS",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "--max-time",
-            "12",
-            "https://example.com",
-        ]);
-        assert_eq!(
-            (code_a.as_str(), ok_a),
-            ("200", true),
-            "allowlisted https://example.com must succeed through the proxy"
-        );
+        allow_path_must_succeed("allowlisted https://example.com through the proxy", || {
+            let (code_a, ok_a) = run(&[
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                "12",
+                "https://example.com",
+            ]);
+            if (code_a.as_str(), ok_a) == ("200", true) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "curl in the sandbox gave http_code={code_a:?} success={ok_a}"
+                ))
+            }
+        });
 
         // (b) non-allowlisted host over 443 → proxy reads the SNI, opens NO
         // upstream, connection dropped.
@@ -699,30 +778,39 @@ mod tests {
         // host here, Pi's model client reaches an allowlisted model endpoint the same
         // way. This is the functional gate for FILTERED_ROUTING_VERIFIED. Gated on bun.
         if on_path("bun") {
-            let tmp = tempfile::tempdir().unwrap();
-            let policy = SandboxPolicy::new(vec![tmp.path().to_path_buf()])
-                .filter_egress(vec!["example.com".to_string()]);
-            let js = "const r = await fetch('https://example.com'); \
-                      process.stdout.write(String(r.status));";
-            let argv = filtered_wrap(
-                &policy,
-                "bun",
-                &["-e".to_string(), js.to_string()],
-                None,
-                proxy.addr(),
-            )
-            .expect("filtered_wrap builds the composition on Linux");
-            // HOME → the writable worktree so bun's cache doesn't hit the read-only host HOME.
-            let out = Command::new(&argv[0])
-                .args(&argv[1..])
-                .env("HOME", tmp.path())
-                .output()
-                .unwrap();
-            let body = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                body.contains("200"),
-                "the agent runtime (bun fetch) must reach the allowlisted host through the transparent sandbox — stdout={body:?} stderr={:?}",
-                String::from_utf8_lossy(&out.stderr)
+            allow_path_must_succeed(
+                "the agent runtime (bun fetch) through the transparent sandbox",
+                || {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let policy = SandboxPolicy::new(vec![tmp.path().to_path_buf()])
+                        .filter_egress(vec!["example.com".to_string()]);
+                    let js = "const r = await fetch('https://example.com'); \
+                              process.stdout.write(String(r.status));";
+                    let argv = filtered_wrap(
+                        &policy,
+                        "bun",
+                        &["-e".to_string(), js.to_string()],
+                        None,
+                        proxy.addr(),
+                    )
+                    .expect("filtered_wrap builds the composition on Linux");
+                    // HOME → the writable worktree so bun's cache doesn't hit the
+                    // read-only host HOME.
+                    let out = Command::new(&argv[0])
+                        .args(&argv[1..])
+                        .env("HOME", tmp.path())
+                        .output()
+                        .unwrap();
+                    let body = String::from_utf8_lossy(&out.stdout);
+                    if body.contains("200") {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "bun in the sandbox gave stdout={body:?} stderr={:?}",
+                            String::from_utf8_lossy(&out.stderr)
+                        ))
+                    }
+                },
             );
         } else {
             eprintln!("skip (g): bun not on PATH — agent-runtime functional check not run");
