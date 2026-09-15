@@ -2646,13 +2646,29 @@ fn sync_out_with_roots_observing(
         // Bottom-up best-effort prune; non-empty directories refuse.
         let _ = std::fs::remove_dir(root.join(&entry.path));
     }
-    let scratch = whipplescript_store::materialize::materialize_manifest_subset(
+    // Told what is already on disk, so it writes only what is not.
+    //
+    // `commit_turn` imports the worktree and then projects the branch back onto
+    // it, which means that at this point every observed path already holds
+    // exactly the bytes the manifest records. Projecting them anyway read and
+    // rewrote the whole tree on every turn, and held it in memory while doing
+    // so. The import persisted its own scan cache immediately before this runs,
+    // so the honest answer to "what is out there" is already on disk; the
+    // materializer re-checks every entry against the file itself and believes
+    // it only under `scan_dir`'s own trust rule, so a stale cache costs a write
+    // rather than a wrong skip. The fallback cache `load_scratch` synthesizes
+    // when none is persisted carries `size: u64::MAX`, which no real file
+    // matches — it vouches for nothing, which is the right answer for a cache
+    // that was invented rather than observed.
+    let on_disk = load_scratch(vcs, store_root, branch);
+    let scratch = whipplescript_store::materialize::materialize_manifest_onto(
         &full_manifest,
         include.as_ref(),
         vcs.content_store(),
         root,
         scan_stamp(),
         &whipplescript_store::materialize::MaterializeLimits::default(),
+        Some(&on_disk.cache),
     )?;
     persist_scratch(store_root, branch, &scratch.cache)
 }
