@@ -1779,13 +1779,29 @@ function base64(bytes: Uint8Array): string {
  * ingest is disabled there.
  */
 /**
+ * How many times an interrupted transfer is picked back up before we stop and
+ * tell the person.
+ *
+ * A recording is large enough that a transfer can lose a connection through no
+ * fault of anyone's, and starting it over is the outcome worth avoiding.
+ * Bounded because a transfer that keeps dying is not a transfer that is nearly
+ * finished — after a few attempts the honest thing is to say so rather than
+ * retry into a wall.
+ */
+const STREAM_UPLOAD_ATTEMPTS = 4;
+
+/**
  * Stream one file into the engagement (`POST /chats/:id/context/stream`).
  *
  * The JSON route base64-encodes into a buffered body, which costs about 2.3x
  * the file at peak and is capped accordingly. This one sends the bytes as the
- * body, so a recording is bounded by the server's disk rather than by the
- * request. One file per request: streaming several would mean multipart, and a
- * caller that wants several can call this several times.
+ * body, so the *request* costs constant memory however large the file is. The
+ * ceiling it is capped at belongs to admitting the file rather than to sending
+ * it (ADR 0168 §4, ADR 0172 §6). One file per request: streaming several would
+ * mean multipart, and a caller that wants several can call this several times.
+ *
+ * An interrupted transfer is resumed rather than restarted: the server keeps
+ * what arrived, and the attempts below ask how far it got and send the rest.
  */
 export async function streamContextUpload(
     transport: WorkbenchTransport,
@@ -1795,17 +1811,91 @@ export async function streamContextUpload(
 ): Promise<number> {
     const query = new URLSearchParams({ name: file.name });
     if (targetId) query.set("target_id", targetId);
-    const res = await request(transport, `/chats/${id}/context/stream?${query}`, {
-        method: "POST",
-        headers: {
-            "idempotency-key": newIdempotencyKey(),
-            "content-type": "application/octet-stream",
-        },
-        body: file.body,
-    });
-    if (!res.ok) throw new Error(`stream ${file.name}: ${res.status} ${await res.text()}`);
-    const o = (await res.json()) as { ingested: number };
-    return o.ingested;
+    // One key for every attempt at one upload. It is what names the partial on
+    // the server, so minting a fresh one per attempt would make each retry a
+    // new upload starting from nothing — and would take the replay guarantee
+    // with it.
+    const key = newIdempotencyKey();
+
+    let sent = 0;
+    let failure = "";
+    for (let attempt = 0; attempt < STREAM_UPLOAD_ATTEMPTS; attempt += 1) {
+        const at = sent > 0 ? `${query}&offset=${sent}` : `${query}`;
+        let res: Response;
+        try {
+            // Spelled out at the call rather than built above it: the client
+            // and the control plane are matched route by route by a check that
+            // reads this literal, and a variable here reads to it as a call
+            // that reaches nothing.
+            res = await request(transport, `/chats/${id}/context/stream?${at}`, {
+                method: "POST",
+                headers: {
+                    "idempotency-key": key,
+                    "content-type": "application/octet-stream",
+                },
+                body: sent > 0 ? file.body.slice(sent) : file.body,
+            });
+        } catch (error) {
+            // The transport itself gave out — the case the server keeps bytes
+            // for. Ask what arrived and carry on from there.
+            failure = `${error}`;
+            const resumed = await streamedUploadProgress(transport, id, query, key);
+            // Nothing more staged than we already knew about. Either the
+            // transfer never got anywhere, or it finished and the response was
+            // what we lost — a completed upload's staging file is moved into
+            // the worktree, so it reads as zero either way. We cannot tell
+            // those apart from here and do not guess: the failure is reported,
+            // and a file that did land shows up in the Files pane.
+            if (resumed === undefined || resumed <= sent) break;
+            sent = resumed;
+            continue;
+        }
+        if (res.ok) {
+            const o = (await res.json()) as { ingested: number };
+            return o.ingested;
+        }
+        const text = await res.text();
+        failure = `${res.status} ${text}`;
+        // A refusal is an answer, not a dropped connection: the only one worth
+        // another attempt is the server saying the offset was wrong, and it
+        // says what the right one is.
+        if (res.status !== 409) break;
+        let received: number | undefined;
+        try {
+            received = (JSON.parse(text) as { received?: number }).received;
+        } catch {
+            received = undefined;
+        }
+        if (received === undefined || received <= sent) break;
+        sent = received;
+    }
+    throw new Error(`stream ${file.name}: ${failure}`);
+}
+
+/**
+ * How much of an upload the server is holding, or `undefined` if it cannot say.
+ *
+ * Failure here is not worth surfacing on its own — it only ever means we
+ * cannot resume, and the caller reports the transfer failure that sent us
+ * here instead.
+ */
+async function streamedUploadProgress(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    query: URLSearchParams,
+    key: string,
+): Promise<number | undefined> {
+    try {
+        const res = await request(transport, `/chats/${id}/context/stream?${query}`, {
+            method: "GET",
+            headers: { "idempotency-key": key },
+        });
+        if (!res.ok) return undefined;
+        const o = (await res.json()) as { received?: number };
+        return typeof o.received === "number" ? o.received : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 export async function ingestContextUpload(

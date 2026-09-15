@@ -913,6 +913,14 @@ pub(crate) struct StreamUploadQuery {
     /// The uploaded file's name. Only its basename is used; a client does not
     /// choose a worktree path by naming its upload.
     name: String,
+    /// Where in the file this request's bytes begin.
+    ///
+    /// Absent means the beginning, and the staging file is truncated — a fresh
+    /// transfer, which is what every first attempt is. Present, it must equal
+    /// what the server already holds; a client that guesses is refused with
+    /// the real number rather than quietly writing a hole.
+    #[serde(default)]
+    offset: Option<u64>,
     #[serde(default)]
     target_id: Option<String>,
     #[serde(default)]
@@ -921,25 +929,153 @@ pub(crate) struct StreamUploadQuery {
     region: Option<String>,
 }
 
-/// A partial upload that removes itself unless the transfer completes.
+/// Where one streamed upload's bytes accumulate.
 ///
-/// The client can vanish mid-stream and the handler's future is simply dropped,
-/// so nothing after the loop would run. Without this, every abandoned upload
-/// would leave its bytes in the staging directory forever.
-struct StagedUpload(Option<std::path::PathBuf>);
+/// The same caller, the same idempotency key and the same name always name the
+/// same file, and that stability is what makes a transfer resumable: a second
+/// attempt finds the first attempt's bytes instead of starting over. It used
+/// to carry the clock, so that two uploads under one key could not write one
+/// file. That hazard is real and is now held off by `Receiving` instead, which
+/// is the honest place for it — two requests carrying one key and one name are
+/// two attempts at one upload, not two uploads, and only one of them may be
+/// writing at a time.
+fn staged_upload_path(
+    dir: &std::path::Path,
+    chat: &str,
+    caller: &str,
+    key: &str,
+    name: &str,
+) -> std::path::PathBuf {
+    let unique =
+        crate::command_idempotency::digest(format!("{chat}\n{caller}\n{key}\n{name}").as_bytes());
+    dir.join(format!("{unique}.part"))
+}
 
-impl StagedUpload {
-    fn keep(&mut self) -> std::path::PathBuf {
-        self.0.take().expect("staged upload kept twice")
+/// How long an abandoned transfer's bytes are kept for a resumption that may
+/// never come.
+///
+/// A partial upload has to outlive the failure that interrupted it — a closed
+/// laptop, a dropped connection, a browser tab that reloads — or resuming is a
+/// promise the server cannot keep. It also cannot be kept forever: nothing
+/// else deletes it, and half a gigabyte of a recording nobody finished is
+/// still half a gigabyte. A day is long enough to cover an interruption a
+/// person would actually return from and short enough that a forgotten
+/// transfer is not a permanent cost.
+const STAGED_UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Drop partial uploads nobody came back for.
+///
+/// Run at the start of a transfer rather than on a timer: the staging
+/// directory only grows when someone uploads, so the moment someone uploads is
+/// exactly when it is worth looking. Anything that cannot be read or dated is
+/// left alone — a sweep that guesses about files it cannot see is a sweep that
+/// deletes a transfer in progress.
+fn sweep_staged_uploads(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("part") {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| {
+                modified
+                    .elapsed()
+                    .is_ok_and(|elapsed| elapsed > STAGED_UPLOAD_TTL)
+            })
+            .unwrap_or(false);
+        if expired {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
-impl Drop for StagedUpload {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = std::fs::remove_file(path);
+/// The uploads currently receiving bytes.
+///
+/// One upload, one writer. Two attempts that overlap — a client that retried
+/// before its first request finished dying, or two tabs — would otherwise
+/// seek to the same offsets in one file and interleave, and the result would
+/// hash to something neither of them sent. Process-wide because the control
+/// plane is one process; a restart empties it, which is correct, since a
+/// restart also ended every transfer it was tracking.
+static RECEIVING: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The right to write to one staging file, released however the request ends —
+/// including by the client vanishing, which drops the handler's future and
+/// runs this.
+struct Receiving(std::path::PathBuf);
+
+impl Receiving {
+    fn claim(path: &std::path::Path) -> Option<Self> {
+        let mut held = RECEIVING.lock().unwrap_or_else(|error| error.into_inner());
+        if held.insert(path.to_path_buf()) {
+            Some(Self(path.to_path_buf()))
+        } else {
+            None
         }
     }
+}
+
+impl Receiving {
+    /// Whether some request is writing to this file right now. Deliberately a
+    /// read and not a claim: a progress query that took the write right would
+    /// refuse a real upload that started in the same instant, which is a worse
+    /// failure than the stale number this can return.
+    fn in_flight(path: &std::path::Path) -> bool {
+        RECEIVING
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(path)
+    }
+}
+
+impl Drop for Receiving {
+    fn drop(&mut self) {
+        RECEIVING
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// The digest of everything staged for this upload, taken a window at a time.
+///
+/// This is the value the replay guarantee is built on, so it has to cover the
+/// whole file and not merely the part of it this request carried.
+async fn staged_upload_sha256(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::Digest as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = sha2::Sha256::new();
+    let mut window = vec![0u8; 256 * 1024];
+    loop {
+        let read = file.read(&mut window).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&window[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// How many bytes of this upload the server already holds.
+///
+/// A file that is not there is not an error: it is an upload that has not
+/// started, and the answer is zero.
+fn staged_upload_length(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
 }
 
 /// `POST /chats/:id/context/stream?name=…` — ingest one file without ever
@@ -965,7 +1101,6 @@ pub(crate) async fn post_context_stream(
     body: axum::body::Body,
 ) -> impl IntoResponse {
     use futures::StreamExt as _;
-    use sha2::{Digest as _, Sha256};
     use tokio::io::AsyncWriteExt as _;
 
     let key = match crate::command_idempotency::caller_idempotency_key(&headers) {
@@ -976,22 +1111,8 @@ pub(crate) async fn post_context_stream(
         return (StatusCode::BAD_REQUEST, "name is not a file name").into_response();
     }
 
-    let (staging_dir, path) = {
-        let wb = wb.lock_unpoisoned();
-        let dir = wb.staging_uploads_dir();
-        // Unique per request: two uploads under one key must not write the same
-        // staging file, or the loser's bytes would land under the winner's name.
-        let unique = crate::command_idempotency::digest(
-            format!(
-                "{}\n{}\n{:?}",
-                key,
-                query.name,
-                std::time::SystemTime::now()
-            )
-            .as_bytes(),
-        );
-        (dir.clone(), dir.join(format!("{unique}.part")))
-    };
+    let caller = crate::command_idempotency::caller_hash(&headers);
+    let staging_dir = wb.lock_unpoisoned().staging_uploads_dir();
     if let Err(error) = std::fs::create_dir_all(&staging_dir) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -999,9 +1120,43 @@ pub(crate) async fn post_context_stream(
         )
             .into_response();
     }
+    sweep_staged_uploads(&staging_dir);
+    let path = staged_upload_path(&staging_dir, &id, &caller, &key, &query.name);
 
-    let mut staged = StagedUpload(Some(path.clone()));
-    let file = match tokio::fs::File::create(&path).await {
+    let Some(_receiving) = Receiving::claim(&path) else {
+        return (
+            StatusCode::CONFLICT,
+            "this upload is already receiving bytes",
+        )
+            .into_response();
+    };
+
+    // The claim is held, so the length cannot move under the answer.
+    let held = staged_upload_length(&path);
+    let offset = query.offset.unwrap_or(0);
+    if offset != held {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "offset-does-not-match-what-is-held",
+                "received": held,
+            })),
+        )
+            .into_response();
+    }
+
+    let file = if offset == 0 {
+        tokio::fs::File::create(&path).await
+    } else {
+        // Appending, not rewriting: the prefix is the earlier attempt's bytes
+        // and is exactly what makes this a resumption.
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&path)
+            .await
+    };
+    let file = match file {
         Ok(file) => file,
         Err(error) => {
             return (
@@ -1012,22 +1167,29 @@ pub(crate) async fn post_context_stream(
         }
     };
     let mut writer = tokio::io::BufWriter::new(file);
-    let mut hasher = Sha256::new();
-    let mut written: u64 = 0;
+    let mut written: u64 = offset;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
+                // The bytes already written stay where they are. An interrupted
+                // transfer is the case resumption exists for, and deleting the
+                // prefix here would make every interruption start over — which
+                // is what it used to do.
+                let _ = writer.flush().await;
                 return (
                     StatusCode::BAD_REQUEST,
                     format!("upload interrupted: {error}"),
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         written += chunk.len() as u64;
         if written > MAX_STREAMED_FILE_BYTES {
+            // Past the ceiling nothing is recoverable, so the partial goes.
+            let _ = writer.flush().await;
+            let _ = std::fs::remove_file(&path);
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
@@ -1037,8 +1199,8 @@ pub(crate) async fn post_context_stream(
             )
                 .into_response();
         }
-        hasher.update(&chunk);
         if let Err(error) = writer.write_all(&chunk).await {
+            let _ = writer.flush().await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("staging write: {error}"),
@@ -1054,17 +1216,27 @@ pub(crate) async fn post_context_stream(
             .into_response();
     }
     if written == 0 {
+        let _ = std::fs::remove_file(&path);
         return (StatusCode::BAD_REQUEST, "no bytes uploaded").into_response();
     }
-    let body_sha256: String = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    // Hashed from the staged file rather than from the chunks as they arrived,
+    // because a resumed transfer never sees the bytes it is resuming and a
+    // running hash would have to be carried across requests to cover them. One
+    // pass over a file the kernel just wrote is cheap; a serialized digest
+    // state that has to survive a process restart is not.
+    let body_sha256 = match staged_upload_sha256(&path).await {
+        Ok(digest) => digest,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("staging digest: {error}"),
+            )
+                .into_response()
+        }
+    };
 
     let method = axum::http::Method::POST;
     let route = format!("/chats/{id}/context/stream");
-    let caller = crate::command_idempotency::caller_hash(&headers);
     let snapshot = crate::command_idempotency::command_snapshot(
         &method,
         &route,
@@ -1079,7 +1251,6 @@ pub(crate) async fn post_context_stream(
         .map(|axum::extract::Extension(actor)| actor.0.as_str().to_owned())
         .unwrap_or_else(|| wb.lock_unpoisoned().authority().as_str().to_string());
 
-    let source = staged.keep();
     let outcome = {
         let mut guard = wb.lock_unpoisoned();
         match guard
@@ -1096,7 +1267,7 @@ pub(crate) async fn post_context_stream(
                 }
             }
             Err(error) => {
-                let _ = std::fs::remove_file(&source);
+                let _ = std::fs::remove_file(&path);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("command receipt: {error:?}"),
@@ -1107,11 +1278,11 @@ pub(crate) async fn post_context_stream(
     };
     if let Err((status, message)) = outcome {
         // A refused claim admits nothing, so the bytes go no further.
-        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&path);
         return (status, message).into_response();
     }
 
-    let response = admit_streamed_upload(&wb, &id, &query, &source, &owner);
+    let response = admit_streamed_upload(&wb, &id, &query, &path, &owner);
     let status = if response.status().is_success() {
         "applied"
     } else if response.status().is_client_error() {
@@ -1124,6 +1295,51 @@ pub(crate) async fn post_context_stream(
         .store_mut()
         .set_command_status(&command_id, status);
     response
+}
+
+/// `GET /chats/:id/context/stream?name=…` — how much of this upload the server
+/// already holds.
+///
+/// The one question a client has to be able to ask before it can resume: it
+/// knows what it sent, but not what arrived, and the difference is exactly the
+/// interruption. Identified the same way the upload itself is — the caller,
+/// the idempotency key, and the name — so the answer is about *this* transfer
+/// and not about anyone else's file of the same name.
+///
+/// Zero is a real answer, not an absence: an upload that never started and an
+/// upload whose bytes expired both have nothing staged, and in both cases the
+/// client should send from the beginning.
+pub(crate) async fn get_context_stream(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Query(query): Query<StreamUploadQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let key = match crate::command_idempotency::caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let caller = crate::command_idempotency::caller_hash(&headers);
+    let staging_dir = wb.lock_unpoisoned().staging_uploads_dir();
+    let path = staged_upload_path(&staging_dir, &id, &caller, &key, &query.name);
+    // A transfer that is mid-flight has a length that is already stale by the
+    // time it is read, and resuming from it would write a hole. Say so instead.
+    //
+    // One can still start between this answer and the client acting on it, and
+    // that is fine: the upload's own offset check is what actually refuses a
+    // stale resumption, and it answers with the real number.
+    if Receiving::in_flight(&path) {
+        return (
+            StatusCode::CONFLICT,
+            "this upload is already receiving bytes",
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "received": staged_upload_length(&path) })),
+    )
+        .into_response()
 }
 
 /// Everything after the bytes land, which is the buffered route's path exactly.

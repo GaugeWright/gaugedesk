@@ -1253,6 +1253,10 @@ When("I select the file {string} in the workspace", async ({ page }, file: strin
     await page.locator("[data-worktree] .file", { hasText: file }).click();
 });
 
+Then("the target workspace contains {string}", async ({ page }, file: string) => {
+    await expect(page.locator("[data-worktree] .file", { hasText: file })).toBeVisible();
+});
+
 Then("the target workspace does not contain {string}", async ({ page }, file: string) => {
     await expect(page.locator("[data-worktree] .file", { hasText: file })).toHaveCount(0);
 });
@@ -1371,6 +1375,42 @@ When("I reload as the desktop app and add the repository plugin folder", async (
     expect(await response.json()).toMatchObject({
         ingested: expect.any(Number),
     });
+});
+
+/**
+ * The Files pane's own ceiling decides the route: past 32 MiB the shipped
+ * client stops batching the file into a JSON body and streams it instead. So
+ * the size here is not decoration — a smaller file would take the buffered
+ * route and this scenario would prove nothing about the streaming one. The
+ * response is awaited on the stream path specifically, which is what makes
+ * that claim checkable rather than assumed.
+ *
+ * The bytes are a repeating non-UTF-8 pattern: cheap to generate, and a
+ * lossy text decode anywhere along the path would change them.
+ */
+When("I add a recording too large to buffer named {string}", async ({ page }, name: string) => {
+    const size = 33 * 1024 * 1024;
+    const buffer = Buffer.alloc(size);
+    for (let at = 0; at < size; at += 1) buffer[at] = (at % 251) ^ 0x80;
+
+    const streamed = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "POST"
+            && /^\/chats\/[^/]+\/context\/stream$/.test(url.pathname);
+    }, { timeout: 120_000 });
+    await page.locator("[data-add-file-input]").setInputFiles({
+        name,
+        mimeType: "audio/wav",
+        buffer,
+    });
+    const response = await streamed;
+    expect(response.status()).toBe(200);
+    // Only the status, deliberately. Reading the body here failed with
+    // "content was evicted from inspector cache" — the page navigates on while
+    // a 33 MiB upload settles, and a body the inspector has dropped is not
+    // evidence of anything. What the upload actually did is asserted on the
+    // next step, against the diff.
+    expect(new URL(response.url()).searchParams.get("offset")).toBeNull();
 });
 
 // ---- message attachments (composer paperclip, UX-14) ----

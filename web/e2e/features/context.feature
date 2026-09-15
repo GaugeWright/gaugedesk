@@ -17,3 +17,10 @@ Feature: Context ingestion
     When I reload as the desktop app and add the repository plugin folder
     When I open the "diff" tab
     Then the diff shows "gaugewright-plugin.ts"
+
+  # streamed-context-upload-production-client
+  @transport
+  Scenario: a recording too large to buffer streams in through the shipped client
+    Given a new engagement
+    When I add a recording too large to buffer named "take.wav"
+    Then the target workspace contains "take.wav"

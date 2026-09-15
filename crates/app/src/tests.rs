@@ -395,6 +395,45 @@ async fn send_stream(app: &Router, uri: &str, body: Vec<u8>, key: &str) -> (Stat
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// A transfer that dies partway: real chunks, then a real stream error, which
+/// is what a dropped connection looks like to the handler.
+async fn send_stream_interrupted(
+    app: &Router,
+    uri: &str,
+    delivered: Vec<u8>,
+    key: &str,
+) -> (StatusCode, String) {
+    let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![
+        Ok(axum::body::Bytes::from(delivered)),
+        Err(std::io::Error::other("the connection went away")),
+    ];
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("idempotency-key", key)
+        .header("content-type", "application/octet-stream")
+        .body(Body::from_stream(futures::stream::iter(chunks)))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Ask how much of an upload the server holds.
+async fn staged_progress(app: &Router, uri: &str, key: &str) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("idempotency-key", key)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 async fn send_as(
     app: &Router,
     method: &str,
@@ -3089,6 +3128,123 @@ async fn a_refused_stream_leaves_no_partial_behind() {
         .unwrap_or_default();
     assert!(left.is_empty(), "staging is empty, found {left:?}");
     drop(dir);
+}
+
+/// The whole point of resumption: an interrupted transfer keeps what arrived,
+/// says how much that was, and the second attempt carries only the rest —
+/// landing the same bytes the first attempt was trying to deliver.
+#[tokio::test]
+async fn an_interrupted_stream_resumes_from_what_arrived() {
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"resume-chat"}"#)).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    let recording: Vec<u8> = (0..(512 * 1024u32)).map(|i| (i % 251) as u8).collect();
+    let cut = 300 * 1024;
+    let route = "/chats/resume-chat/context/stream?name=take.wav";
+
+    let (s, body) =
+        send_stream_interrupted(&app, route, recording[..cut].to_vec(), "resume-key").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the interruption is reported");
+    assert!(body.contains("interrupted"), "and named: {body}");
+
+    let (s, body) = staged_progress(&app, route, "resume-key").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        body.contains(&format!("\"received\":{cut}")),
+        "the server says what it holds: {body}"
+    );
+
+    let (s, body) = send_stream(
+        &app,
+        &format!("{route}&offset={cut}"),
+        recording[cut..].to_vec(),
+        "resume-key",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "the remainder completes it: {body}");
+
+    let (s, served) = send_bytes(&app, "GET", "/chats/resume-chat/file?path=take.wav").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        served, recording,
+        "and the file is what the first attempt set out to send"
+    );
+}
+
+/// A client that guesses its offset is refused with the real one rather than
+/// being allowed to write a hole into someone's recording.
+#[tokio::test]
+async fn a_stream_resuming_from_the_wrong_place_is_refused() {
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"offset-chat"}"#)).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let route = "/chats/offset-chat/context/stream?name=b.bin";
+
+    let (s, _) =
+        send_stream_interrupted(&app, route, b"the first eight".to_vec(), "offset-key").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    for guess in ["0", "3", "900"] {
+        let (s, body) = send_stream(
+            &app,
+            &format!("{route}&offset={guess}"),
+            b"tail".to_vec(),
+            "offset-key",
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "offset {guess} refused: {body}");
+        assert!(
+            body.contains("\"received\":15"),
+            "and the refusal carries the real one: {body}"
+        );
+    }
+}
+
+/// Resumption made the staging path stable, so two attempts now name one file.
+/// Only one of them may be writing to it — interleaved writes at one offset
+/// would produce bytes neither caller sent.
+#[tokio::test]
+async fn one_upload_receives_from_one_request_at_a_time() {
+    let (_d, wb) = seeded_workbench();
+    let app = open_control_plane(wb);
+    let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"exclusive-chat"}"#)).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let route = "/chats/exclusive-chat/context/stream?name=c.bin";
+
+    // A body that never ends holds the first request inside the write loop.
+    let (held, holding) = tokio::sync::oneshot::channel::<()>();
+    let slow = futures::stream::once(async move {
+        let _ = holding.await;
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"eventually"))
+    });
+    let first = Request::builder()
+        .method("POST")
+        .uri(route)
+        .header("idempotency-key", "exclusive-key")
+        .header("content-type", "application/octet-stream")
+        .body(Body::from_stream(slow))
+        .unwrap();
+    let inflight = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(first).await.unwrap().status() }
+    });
+    // Let the first request reach the claim before the second asks for it.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (s, body) = send_stream(&app, route, b"mine".to_vec(), "exclusive-key").await;
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "the second writer is refused: {body}"
+    );
+    assert!(body.contains("already receiving"), "and told why: {body}");
+
+    let _ = held.send(());
+    assert_eq!(inflight.await.unwrap(), StatusCode::OK);
 }
 
 /// An upload carrying nothing is refused rather than admitted as an empty file.

@@ -336,7 +336,9 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         // very thing this route exists to stream.
         .route(
             "/chats/{id}/context/stream",
-            post(rs::post_context_stream).layer(axum::extract::DefaultBodyLimit::disable()),
+            post(rs::post_context_stream)
+                .get(rs::get_context_stream)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route("/chats/{id}/resources", get(rs::get_resources))
         .route(

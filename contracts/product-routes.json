@@ -7412,6 +7412,78 @@
       }
     },
     {
+      "id": "home.chat.context-stream",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/chats/:id/context/stream",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-placement-chat",
+      "capability": "stream-browser-owned-context",
+      "requestSchema": "http/octet-stream+query-name-offset",
+      "responseSchema": "gw://schemas/chat/context-ingested/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/e2e/features/context.feature#streamed-context-upload-production-client"
+        ],
+        "authority": [
+          "ee/app/tests/rbac_enforcement.rs#entsec5_streamed_context_upload_is_open_to_a_member_and_closed_to_a_stranger"
+        ],
+        "journey": [
+          "web/e2e/features/context.feature#streamed-context-upload-production-client"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/tests.rs#streamed_upload_lands_the_exact_bytes"
+        ]
+      }
+    },
+    {
+      "id": "home.chat.context-stream.progress",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/chats/:id/context/stream",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project-placement-chat",
+      "capability": "read-streamed-upload-progress",
+      "requestSchema": "http/query-name+idempotency-key",
+      "responseSchema": "gw://schemas/chat/context-stream-progress/v1",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/e2e/features/context.feature#streamed-context-upload-production-client"
+        ],
+        "authority": [
+          "ee/app/tests/rbac_enforcement.rs#entsec5_streamed_context_upload_is_open_to_a_member_and_closed_to_a_stranger"
+        ],
+        "journey": [
+          "web/e2e/features/context.feature#streamed-context-upload-production-client"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/tests.rs#an_interrupted_stream_resumes_from_what_arrived"
+        ]
+      }
+    },
+    {
       "id": "desktop.chat.context-path.ingest",
       "jurisdiction": "local-desktop-workbench",
       "transport": "http-json-over-loopback",
@@ -9636,13 +9708,6 @@
     {
       "method": "GET",
       "path": "/chats/{id}/context-usage",
-      "owner": "gaugedesk",
-      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
-      "expires": "2026-10-31"
-    },
-    {
-      "method": "POST",
-      "path": "/chats/{id}/context/stream",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"

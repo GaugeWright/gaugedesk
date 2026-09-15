@@ -311,7 +311,16 @@ async fn send_client(
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     (
         status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        // A plain-text refusal is not JSON, and reading it back as `Null` hid
+        // which refusal it was. An empty body stays `Null`, because that is
+        // what "no body" means and tests compare against it.
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            if bytes.is_empty() {
+                Value::Null
+            } else {
+                Value::String(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        }),
     )
 }
 
@@ -1228,6 +1237,66 @@ async fn entsec5_path_context_ingest_disabled_in_enterprise() {
         s,
         StatusCode::FORBIDDEN,
         "server-path context ingest is refused in enterprise mode"
+    );
+}
+
+/// ENTSEC-5, the other half: the path ingest is disabled in enterprise mode
+/// precisely so that a client uploads its own bytes instead, so the routes that
+/// carry those bytes have to be open to an authenticated member — and closed to
+/// everyone else. The streamed route is the one a recording takes, and it
+/// leaves the outer idempotency guard, which is exactly the kind of exemption
+/// that could take an admission check with it.
+///
+/// What is asserted is *where* each caller is stopped. The member is not
+/// stopped at admission — this harness's chat has no target set, so their
+/// upload is refused further in, by the engagement rather than by the policy,
+/// which is the distinction that matters here. The stranger never gets that
+/// far.
+#[tokio::test]
+async fn entsec5_streamed_context_upload_is_open_to_a_member_and_closed_to_a_stranger() {
+    let (_dir, app) = workbench_with_scoped_project();
+
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/chats/chat-acme/context/stream?name=take.wav",
+        Some("a recording"),
+        Some("owner-token"),
+    )
+    .await;
+    assert!(
+        s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
+        "a member reaches the route the path ingest refuses to serve them: {s} {body}"
+    );
+
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/chats/chat-acme/context/stream?name=take.wav",
+        Some("a recording"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNAUTHORIZED,
+        "and an unauthenticated caller may not"
+    );
+
+    // Progress is the same secret as the upload: it says what a person's
+    // transfer holds, so it answers to the same admission.
+    let (s, _) = send(
+        &app,
+        "GET",
+        "/chats/chat-acme/context/stream?name=take.wav",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNAUTHORIZED,
+        "nor may they ask how far it got"
     );
 }
 
