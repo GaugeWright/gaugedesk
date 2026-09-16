@@ -862,86 +862,94 @@ fn ran_and_metered(usage: serde_json::Value) -> Vec<gaugedesk_core::whip_pricing
         .expect("the gate's own store meters back")
 }
 
-/// The whole path on real data: a gate runs, the runtime meters it into its own
-/// durable log, and the desk reads that fold. Nothing here counts a token.
+/// The whole path on real data, end to end: a gate runs, the runtime meters it
+/// into its own durable log and records the model that served it, and the desk
+/// prices that fold. Nothing here counts a token.
 ///
-/// The arithmetic is the point. The provider reported 120 input tokens of which
-/// 20 were served from cache, and the runtime's buckets are **disjoint** — 100
-/// fresh and 20 cached, never 120 and 20 — so a reader that took the inclusive
-/// convention instead would bill the twenty cached tokens twice.
+/// The arithmetic is the point twice over. The provider reported 120 input
+/// tokens of which 20 were served from cache, and the runtime's buckets are
+/// **disjoint** — 100 fresh and 20 cached, never 120 and 20 — so the priced
+/// figure charges the fresh rate a hundred times and the cache rate twenty
+/// times. A reader that took the inclusive convention instead would bill those
+/// twenty cached tokens twice and be 6% high on this run alone.
+///
+/// This is also what a coerce run could not do until whipplescript-src #501.
+/// Its metadata named no model where the fold reads one, so the tokens were
+/// countable and unattributable and the figure below was unreachable.
 #[test]
-fn a_gate_that_ran_is_metered_by_the_runtime_and_read_by_the_desk() {
+fn a_gate_that_ran_is_priced_from_the_meter_the_runtime_kept() {
     let rows = ran_and_metered(serde_json::json!({
         "input_tokens": 120,
         "output_tokens": 30,
         "cached_input_tokens": 20,
     }));
-    // More than one group, because grain is in the key of every query whether
-    // or not it was asked for: the coercion's turn is one population and the
-    // gate's file reads — which could not have called a model — are another,
-    // and folding the two together is what would let an unrecorded count hide
-    // among complete zeros.
-    let usage = rows
-        .iter()
-        .map(|row| row.usage)
-        .find(|usage| usage.input_uncached.is_some_and(|tokens| tokens > 0))
-        .expect("the coercion's turn is metered");
-    assert_eq!(
-        usage.input_uncached,
-        Some(100),
-        "fresh input, cache removed"
+    assert!(
+        rows.iter()
+            .any(|row| row.model.as_deref() == Some("test-model")),
+        "the settled run names the model that served it: {rows:?}",
     );
-    assert_eq!(usage.input_cache_read, Some(20));
-    assert_eq!(usage.output, Some(30));
-    // The Responses API reports no cache-WRITE accounting, and the runtime
-    // leaves a count no provider reported unrecorded rather than inventing a
-    // zero for it.
-    assert_eq!(usage.input_cache_write, None);
+
+    let priced = rate_card(&["test-model"]).price(&rows);
+    let expected = 100 * 3_000_000u128 + 20 * 300_000 + 30 * 15_000_000;
+    assert_eq!(
+        priced.recorded_cost().micros,
+        u64::try_from(expected.div_ceil(1_000_000)).unwrap(),
+    );
+    assert_eq!(priced.recorded_cost().micros, 756);
 }
 
-/// **A coerce run cannot be priced on today's pin, and this says exactly why.**
+/// And an exact total is still out of reach, for a reason worth naming.
 ///
-/// The gate hands the kernel a `CoerceExecution` that carries the model —
-/// `gate_runner.rs` sets `model: Some(&self.coerce.model)` — and the kernel
-/// loses it twice. At run start, `coerce_run_start_metadata` files it under
-/// `__fingerprint_model`, the execution-fingerprint key, while the stats fold
-/// reads `model` (or `usage.model`). At settlement, `settle_coerce_result`
-/// overwrites the run's metadata outright with `coerce_metadata(result)` —
-/// value, error, transcript and usage, and no model under any key.
+/// The Responses API reports no cache-**write** accounting, and the runtime
+/// leaves a count no provider reported unrecorded rather than inventing a zero
+/// for it. So this run has an exact recorded cost and no exact total, and the
+/// gap says which bucket and which model — which is a repair instruction now
+/// that the model is known, rather than the dead end it used to be.
 ///
-/// `run_coerce` calls that same settle, so this is not a gap between the native
-/// and sans-IO doors: every coercion everywhere is metered without a model,
-/// `whip` and the Durable Object host included.
-///
-/// The consequence is precise: the tokens are metered and nothing can say whose
-/// rate applies to them. A rate card has no fallback rate by design, so this is
-/// where it stops, and it stops loudly rather than billing the run at a guess.
-///
-/// This test asserts the limit rather than working around it. The day the
-/// kernel records the model where the fold reads one, this is what fails.
+/// The limit is the meter being conservative in the right direction, not a
+/// defect: an exact figure needs a provider that reports cache accounting.
 #[test]
-fn a_coerce_run_is_unpriceable_until_the_kernel_records_its_model() {
+fn a_bucket_no_provider_reported_leaves_no_total_and_says_which() {
+    use gaugedesk_core::whip_pricing::{Bucket, Gap};
+    let rows = ran_and_metered(serde_json::json!({
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "cached_input_tokens": 20,
+    }));
+    let priced = rate_card(&["test-model"]).price(&rows);
+
+    assert_eq!(priced.amount(), None, "an unrecorded count is not a zero");
+    assert_eq!(
+        priced.gaps(),
+        &[Gap::Unrecorded {
+            model: Some("test-model".to_owned()),
+            bucket: Bucket::InputCacheWrite,
+        }],
+    );
+}
+
+/// A model nobody has supplied a rate for is not free, on real data either.
+///
+/// Reachable only because the run names its model: an unattributed run cannot
+/// tell you which rate is missing, which is the whole difference between a gap
+/// that is a repair instruction and one that is a shrug.
+#[test]
+fn a_gate_run_on_an_unrated_model_is_unpriced_rather_than_free() {
     use gaugedesk_core::whip_pricing::Gap;
     let rows = ran_and_metered(serde_json::json!({
         "input_tokens": 120,
         "output_tokens": 30,
         "cached_input_tokens": 20,
     }));
-    assert!(
-        rows.iter().all(|row| row.model.is_none()),
-        "the settled run names no model: {rows:?}",
-    );
+    let priced = rate_card(&[]).price(&rows);
 
-    let priced = rate_card(&["test-model"]).price(&rows);
     assert_eq!(priced.amount(), None);
+    assert_eq!(priced.recorded_cost().micros, 0, "no rate, no charge");
     assert!(
-        priced.gaps().contains(&Gap::ModelUnrecorded),
-        "tokens were spent and nothing says by whom: {:?}",
+        priced.gaps().contains(&Gap::NoRate {
+            model: "test-model".to_owned()
+        }),
+        "the gap names the rate an operator has to supply: {:?}",
         priced.gaps(),
-    );
-    assert_eq!(
-        priced.recorded_cost().micros,
-        0,
-        "no model, no rate, no charge — never a charge at a default rate",
     );
 }
