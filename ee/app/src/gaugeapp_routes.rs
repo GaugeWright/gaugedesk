@@ -617,6 +617,39 @@ struct AgentEraseBody {
 }
 
 fn agent_error(error: GaugeAppAgentError) -> Response {
+    // The reason reaches the client and, until now, nowhere else: the only
+    // server-side record of a failed turn was the hosted request fault line,
+    // which carries a status and no cause. Two production canary runs failed on
+    // `status=502` with nothing in the log saying why, and the cause was in
+    // hand the whole time.
+    //
+    // Only the variants an operator can act on are logged, and only their own
+    // messages. `Provider` carries a timeout, a size cap, or a transport error;
+    // `Credential` and `Store` describe configuration and persistence. The
+    // model's own output is deliberately excluded: `InvalidOutput` and
+    // `Rejected` carry generated content, which is the person's, not an
+    // operational detail. `Busy`, `Interrupted` and `NoModelAccess` are ordinary
+    // outcomes and stay quiet.
+    match &error {
+        GaugeAppAgentError::Provider(detail) => {
+            eprintln!("[gaugewright] management agent turn failed: provider: {detail}");
+        }
+        GaugeAppAgentError::Credential(detail) => {
+            eprintln!("[gaugewright] management agent turn failed: credential: {detail}");
+        }
+        GaugeAppAgentError::Store(detail) => {
+            eprintln!("[gaugewright] management agent turn failed: store: {detail}");
+        }
+        GaugeAppAgentError::InvalidOutput(_) => {
+            eprintln!("[gaugewright] management agent turn failed: invalid provider output");
+        }
+        GaugeAppAgentError::Rejected(_) => {
+            eprintln!("[gaugewright] management agent turn failed: proposal rejected");
+        }
+        GaugeAppAgentError::Busy
+        | GaugeAppAgentError::Interrupted
+        | GaugeAppAgentError::NoModelAccess => {}
+    }
     let status = match error {
         GaugeAppAgentError::Busy => StatusCode::CONFLICT,
         GaugeAppAgentError::Interrupted => StatusCode::from_u16(499).expect("valid status"),
@@ -4791,6 +4824,60 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request};
     use http_body_util::BodyExt;
+
+    /// A failed turn must leave a server-side record of *why*, and must not
+    /// turn the model's own output into one.
+    ///
+    /// Two production canary runs failed with `status=502` and nothing in the
+    /// log saying why. The cause was already in hand — `Provider` carries it —
+    /// and was only ever sent to the client. This pins both halves: the
+    /// operational variants map to statuses an operator can act on, and the
+    /// variants carrying generated content are logged without it.
+    #[test]
+    fn a_failed_turn_reports_an_operational_cause_and_never_the_generated_content() {
+        let generated = "the person's own words and the model's reply";
+
+        // Operational causes: the detail is the service's own and is loggable.
+        for (error, expected) in [
+            (
+                GaugeAppAgentError::Provider("provider response timed out".into()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                GaugeAppAgentError::Credential("no admitted credential".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                GaugeAppAgentError::Store("transcript append failed".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            assert_eq!(agent_error(error).status(), expected);
+        }
+
+        // Generated content: still classified, still refused, never widened
+        // into an operational status that would read as a service fault.
+        assert_eq!(
+            agent_error(GaugeAppAgentError::InvalidOutput(generated.into())).status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        );
+
+        // Ordinary outcomes are not faults at all.
+        assert_eq!(
+            agent_error(GaugeAppAgentError::Interrupted)
+                .status()
+                .as_u16(),
+            499,
+        );
+        assert_eq!(
+            agent_error(GaugeAppAgentError::Busy).status(),
+            StatusCode::CONFLICT,
+        );
+        assert_eq!(
+            agent_error(GaugeAppAgentError::NoModelAccess).status(),
+            StatusCode::CONFLICT,
+        );
+    }
     use tower::ServiceExt;
 
     use gaugedesk_app::account_auth::{

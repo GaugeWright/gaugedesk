@@ -88,6 +88,10 @@ run_contracts() {
 
     echo "== GaugeApp page/action contract =="
     node scripts/check-gaugeapps-contract.mjs
+    # The contract being well formed is not the same as the product having
+    # built it. This proves every contracted operation exists in a tracked
+    # source, or is named as a gap that has not been built yet.
+    node scripts/check-gaugeapp-operation-coverage.mjs
 
     echo "== action provenance inventory =="
     node scripts/check-action-provenance.mjs
