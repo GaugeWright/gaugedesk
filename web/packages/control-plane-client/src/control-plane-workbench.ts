@@ -591,6 +591,10 @@ export async function projectWhips(transport: WorkbenchTransport, id: string): P
 export interface ProjectWhipCosts {
     readonly project: string;
     readonly complete: boolean;
+    /** Set when a runtime store existed and would not open. A different failure
+     *  from a measure the log does not carry: there is no gap to name, because
+     *  the desk does not know what it could not see. */
+    readonly unread: string | null;
     readonly rateCard: { readonly version: string; readonly currency: string } | null;
     readonly total: {
         readonly currency: string;
@@ -605,7 +609,8 @@ export async function projectWhipCosts(
     id: string,
 ): Promise<ProjectWhipCosts> {
     const o = (await transport.json("GET", `/projects/${id}/whip-costs`)) as {
-        project?: unknown; total?: unknown; gaps?: unknown; complete?: unknown; rate_card?: unknown;
+        project?: unknown; total?: unknown; gaps?: unknown; complete?: unknown;
+        rate_card?: unknown; unread?: unknown;
     };
     const total = o.total as { amount_micros?: unknown; recorded_micros?: unknown; currency?: unknown } | undefined;
     if (typeof o.project !== "string" || !Array.isArray(o.gaps) || !total
@@ -622,6 +627,7 @@ export async function projectWhipCosts(
     return {
         project: o.project,
         complete: o.complete === true,
+        unread: typeof o.unread === "string" ? o.unread : null,
         rateCard: card && typeof card.version === "string" && typeof card.currency === "string"
             ? { version: card.version, currency: card.currency }
             : null,

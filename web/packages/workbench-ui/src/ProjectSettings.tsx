@@ -13,6 +13,7 @@ import type {
     ProjectShareCandidate,
 } from "@gaugewright/control-plane-client";
 import { ProjectModelAccessContent, type ProjectModelAccessApi } from "./ProjectModelAccessPanel";
+import { WhipCostsSection, type WhipCostsApi } from "./WhipCosts";
 import type { DeploymentSelection } from "./DeploymentPanel";
 import { availableProjectShareCandidates } from "./project-sharing";
 import "./project-settings.css";
@@ -26,7 +27,7 @@ const PAGE_LABELS: Readonly<Record<ProjectSettingsPage, string>> = {
     "model-access": "Model access",
 };
 
-export interface ProjectSettingsApi extends ProjectModelAccessApi {
+export interface ProjectSettingsApi extends ProjectModelAccessApi, WhipCostsApi {
     handoffStatus(project: ProjectId): Promise<HandoffStatus>;
     handoffParticipants(project: ProjectId): Promise<Participant[]>;
     listPeers(): Promise<FederationPeer[]>;
@@ -315,7 +316,12 @@ export function ProjectSettingsContent(props: ProjectSettingsProps): JSX.Element
             <Show when={props.page === "people"}><PeopleAndSharing {...props} /></Show>
             <Show when={props.page === "work-data"}><WorkAndData {...props} /></Show>
             <Show when={props.page === "agents"}><AgentsAndPlacements {...props} /></Show>
-            <Show when={props.page === "model-access"}><section class="project-settings-section project-settings-model"><ProjectModelAccessContent api={props.api} project={props.project.id} projectName={props.project.name} /></section></Show>
+            <Show when={props.page === "model-access"}>
+                <section class="project-settings-section project-settings-model"><ProjectModelAccessContent api={props.api} project={props.project.id} projectName={props.project.name} /></section>
+                {/* What those models have actually cost, beside the page that
+                    says which ones this project may use. */}
+                <WhipCostsSection api={props.api} project={props.project.id} />
+            </Show>
         </article>
     </main>;
 }

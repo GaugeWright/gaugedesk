@@ -1490,6 +1490,9 @@ export class WorkbenchControlPlane implements ControlPlane {
     listWhips(project: string) {
         return workbenchClient.projectWhips(this.workbenchTransport(), project);
     }
+    listWhipCosts(project: string) {
+        return workbenchClient.projectWhipCosts(this.workbenchTransport(), project);
+    }
     listQuarantine(project: string) {
         return workbenchClient.listQuarantine(this.workbenchTransport(), project);
     }
