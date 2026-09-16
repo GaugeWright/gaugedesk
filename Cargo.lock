@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-app"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-boundary"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "gaugedesk-core",
  "proptest",
@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-core"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "ciborium",
  "getrandom 0.4.3",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-directory-protocol"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "gaugedesk-core",
  "serde",
@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-ee"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1371,11 +1371,11 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-env"
-version = "0.4.10"
+version = "0.4.11"
 
 [[package]]
 name = "gaugedesk-harness"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "gaugedesk-env",
  "serde",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-pi-bridge"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "gaugedesk-core",
  "gaugedesk-env",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-relay-transport"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "base64 0.23.1",
  "futures-util",
@@ -1428,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-store"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "gaugedesk-core",
  "gaugedesk-env",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-tracker"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-whip-runtime"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "base64 0.23.1",
  "gaugedesk-core",
@@ -1471,7 +1471,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-workspace"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "hex",
  "quote",
