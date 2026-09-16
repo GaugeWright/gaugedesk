@@ -821,30 +821,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     );
     // The current pin as the `<select>` value: `provider:id`, or "" for Default.
     const modelValue = () => (paneModel().id ? modelKey(paneModel()) : "");
-    // An organization-funded project decides its model in Settings → Model
-    // access, and the engine binds the turn to that selection rather than to
-    // anything the composer holds. Read it so the composer can report the
-    // served model instead of offering a pin that would be discarded. A
-    // failure leaves this null: the ordinary picker is the honest fallback
-    // when we cannot establish that a connection funds the project.
-    const [organizationModelSelection] = createResource(
-        () => currentProject()?.id ?? null,
-        async (project) => {
-            try {
-                return await api.projectOrganizationModelSelection(project as ProjectId);
-            } catch {
-                return null;
-            }
-        },
-    );
-    const servedModel = createMemo(() => {
-        const selection = organizationModelSelection();
-        if (!selection) return undefined;
-        return {
-            label: servedModelLabel(selection.model, selection.provider, modelCatalog()),
-            connection: selection.connection,
-        };
-    });
     // The reasoning-effort options follow the pinned model; the toggle only shows when the
     // model supports thinking (more than just "off"). "" = the model's own default effort.
     const effortLevels = createMemo(() =>
@@ -1029,6 +1005,35 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // bar. Only a project-rooted work chat has one — an edit chat or the hidden
     // Personal default resolves to `null`, so the bar reads-only there.
     const currentProject = () => chatInfo()?.project ?? null;
+
+    // Declared after `currentProject` on purpose: `createResource` evaluates
+    // its source eagerly during setup, so reading `currentProject` from above
+    // its own `const` threw a temporal-dead-zone ReferenceError that killed the
+    // whole App component before it rendered — a blank window, not a degraded one.
+    // An organization-funded project decides its model in Settings → Model
+    // access, and the engine binds the turn to that selection rather than to
+    // anything the composer holds. Read it so the composer can report the
+    // served model instead of offering a pin that would be discarded. A
+    // failure leaves this null: the ordinary picker is the honest fallback
+    // when we cannot establish that a connection funds the project.
+    const [organizationModelSelection] = createResource(
+        () => currentProject()?.id ?? null,
+        async (project) => {
+            try {
+                return await api.projectOrganizationModelSelection(project as ProjectId);
+            } catch {
+                return null;
+            }
+        },
+    );
+    const servedModel = createMemo(() => {
+        const selection = organizationModelSelection();
+        if (!selection) return undefined;
+        return {
+            label: servedModelLabel(selection.model, selection.provider, modelCatalog()),
+            connection: selection.connection,
+        };
+    });
     // Tell the control plane which project is open, so work resolves to *that*
     // project's Home rather than one selected Home (DESK-3). Several Homes stay
     // connected at once; this only decides which one serves the work in hand.

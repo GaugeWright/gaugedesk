@@ -18,6 +18,8 @@
 
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
+import { LoadError } from "./LoadError";
+import { navLoadState } from "./nav-load-state";
 import {
     Rejected,
     type AgentKind,
@@ -221,12 +223,49 @@ export function FacetBrowser(props: {
     // the row under the pointer stays put.
     const [store, setStore] = createStore<{ tree: Workspace | null }>({ tree: null });
     createEffect(() => {
+        // Reading an errored resource RETHROWS the fetcher's failure. Letting that
+        // escape the effect abandons the store on `null`, so `tree()` stays
+        // undefined and the nav sits on "loading…" with nothing that can clear it
+        // — the read never runs again unless a workspace event bumps `refreshKey`,
+        // and at boot there are no events yet. Keep the last good tree instead and
+        // let the render surface the failure.
+        if (carriage.error) return;
         const v = carriage()?.value;
         if (v) setDeltaFreshness(null);
         setStore("tree", v ? reconcile(v, { key: "id" }) : null);
     });
     const tree = () => store.tree ?? undefined;
-    const fresh = () => deltaFreshness() ?? carriage()?.freshness;
+    // Same rethrow hazard: a bare `carriage()` here would throw straight through
+    // the freshness banner's render.
+    const fresh = () => deltaFreshness() ?? (carriage.error ? undefined : carriage()?.freshness);
+
+    // The co-resident control plane binds its port *after* the shell opens the
+    // webview (measured on the desktop build: ~1s warm, over 5s on a cold state
+    // root), so the nav's first read can lose that race and fail with a bare
+    // connection refusal. The event stream already treats availability as
+    // something to wait for rather than an outcome; the initial projection read
+    // is the one path that did not, which turned a few seconds of startup into a
+    // permanently empty navigator. Retry on the same bounded schedule, then leave
+    // the honest retry control for anything that outlives it.
+    const INITIAL_READ_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000];
+    let initialReadFailures = 0;
+    let initialReadTimer: ReturnType<typeof setTimeout> | undefined;
+    onCleanup(() => {
+        if (initialReadTimer !== undefined) clearTimeout(initialReadTimer);
+    });
+    createEffect(() => {
+        if (!carriage.error || store.tree) {
+            // A good read (or a tree we can still show) ends the wait and re-arms
+            // it for the next cold start.
+            if (!carriage.error) initialReadFailures = 0;
+            return;
+        }
+        if (initialReadFailures >= INITIAL_READ_DELAYS_MS.length) return;
+        const delay = INITIAL_READ_DELAYS_MS[initialReadFailures];
+        initialReadFailures += 1;
+        if (initialReadTimer !== undefined) clearTimeout(initialReadTimer);
+        initialReadTimer = setTimeout(() => void refetch(), delay);
+    });
 
     // Mobile resolves the reference-only SSE one event at a time. Serializing the
     // queue prevents a slower, older response from overwriting a newer patch; each
@@ -1728,6 +1767,10 @@ export function FacetBrowser(props: {
                 </Show>
             </div>
 
+            <Show
+                when={navLoadState({ errored: !!carriage.error, hasTree: !!tree() }) !== "error"}
+                fallback={<LoadError what="the navigator" onRetry={() => void refetch()} />}
+            >
             <Show when={tree()} fallback={<div class="status">loading…</div>}>
                 {(t) => (
                     <>
@@ -2068,6 +2111,7 @@ export function FacetBrowser(props: {
 
                     </>
                 )}
+            </Show>
             </Show>
 
             <ContextMenu menu={menu()} onClose={() => setMenu(null)} />
