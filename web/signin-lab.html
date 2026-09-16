@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GaugeDesk — sign-in lab</title>
+    <style>
+      /* Bench chrome only. Everything inside a stage is the product stylesheet;
+         nothing here may style a product class, or the prototype would flatter
+         itself and the agreed result would not survive the move into the app. */
+      body { margin: 0; background: var(--bg, #0c1a2e); color: var(--ink, #e6ebf2);
+             font-family: var(--ui), sans-serif; }
+      .lab { max-width: 1180px; margin: 0 auto; padding: 32px 24px 120px; }
+      .lab-head h1 { font-size: 20px; margin: 0 0 6px; font-weight: 650; }
+      .lab-head p, .lab-note { color: var(--muted); font-size: var(--fs-body, 13px);
+             max-width: 74ch; line-height: 1.55; margin: 0 0 18px; }
+      .lab-section { font-size: var(--fs-ui, 12px); text-transform: uppercase;
+             letter-spacing: 0.08em; color: var(--muted); margin: 44px 0 10px;
+             padding-top: 18px; border-top: 1px solid var(--edge); }
+      .lab-row { display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap; }
+      .lab-case { flex: 1 1 460px; min-width: 420px; }
+      .lab-case h2 { font-size: var(--fs-ui, 12px); text-transform: uppercase;
+             letter-spacing: 0.08em; color: var(--muted); margin: 0 0 6px; }
+      .lab-case .lab-note { font-size: var(--fs-small, 11px); margin-bottom: 10px;
+             min-height: 5.2em; }
+      .lab-note--after { margin-top: 14px; font-size: var(--fs-small, 11px); }
+      /* Both scrims are `position: fixed`. A transform on the bench's own stage
+         makes it their containing block, so each surface lands at real size
+         inside the page instead of over it — the stage is chrome acting on
+         itself, and no product rule is touched. */
+      .lab-stage { position: relative; transform: translate(0); overflow: hidden;
+             background: var(--bg); border: 1px solid var(--edge);
+             border-radius: 8px; height: 420px; }
+      .lab-stage--tall { height: 660px; }
+      .lab-actions { display: flex; align-items: center; gap: 16px; margin: 0 0 14px;
+             flex-wrap: wrap; }
+      .lab-spacer { flex: 0 0 18px; border-left: 1px solid var(--edge); height: 16px; }
+      .lab-toggle { display: inline-flex; align-items: center; gap: 6px;
+             color: var(--muted); font-size: var(--fs-ui, 12px); cursor: pointer; }
+      .lab-reset { font: inherit; color: var(--muted); background: transparent;
+             border: 1px solid var(--edge); border-radius: 3px; padding: 4px 10px;
+             cursor: pointer; }
+      .lab-reset:hover { color: var(--ink); }
+      /* The gate truth table. Bench chrome: it reports the condition, it is not
+         a surface the product renders. */
+      .lab-matrix { display: flex; flex-direction: column; border: 1px solid var(--edge);
+             border-radius: 8px; overflow: hidden; max-width: 680px; }
+      .lab-matrix-head, .lab-matrix-row { display: grid;
+             grid-template-columns: minmax(96px, .7fr) 1fr 1fr; gap: 1px; }
+      .lab-matrix-head { background: var(--edge); }
+      .lab-matrix-head span, .lab-matrix-row > span { padding: 10px 12px;
+             background: var(--panel); font-size: var(--fs-ui, 12px); }
+      .lab-matrix-head span { color: var(--muted); text-transform: uppercase;
+             letter-spacing: .06em; font-size: var(--fs-label, 10px); }
+      .lab-matrix-row { background: var(--edge); border-top: 1px solid var(--edge); }
+      .lab-matrix-row > span:first-child { color: var(--muted); }
+      .lab-cell--block { color: #e6b9b9; }
+      .lab-cell--soft { color: #e6d7b9; }
+      .lab-cell--pass { color: #b9e6c6; }
+      .lab code { font-family: var(--mono, monospace); font-size: .92em; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/apps/workbench-web/src/signin-lab.tsx"></script>
+  </body>
+</html>

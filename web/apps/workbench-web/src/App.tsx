@@ -56,7 +56,8 @@ import {
     type PlacementId,
     type WorkTargetId,
     type WorkTargetNode,
-    workEmailLoginTarget,
+    resolveSignInRoute,
+    beginWorkEmailLogin,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
@@ -64,7 +65,7 @@ import { desktopUpdateAllowed, desktopUpdateShouldRecheck, DESKTOP_UPDATE_RECHEC
 import { openExternal } from "./open-external";
 import "@gaugewright/gw-embed";
 import {
-    AccountEntry,
+    SignInCard,
     AgentSettings,
     BASIC_COMPOSER_CAPABILITIES,
     ChatPanel,
@@ -159,6 +160,11 @@ const api = new WorkbenchControlPlane(controlPlaneBase());
 // Desktop chooses the local callback flow; a hosted Home chooses the device-code
 // flow. Builds can still suppress the action if their runtime ships neither.
 const codexLoginAvailable = import.meta.env.VITE_CODEX_LOGIN !== "false";
+/// Account-settings key for "I'll do this later" on the welcome. The account KV
+/// is the right home: it is scoped to the local account while signed out and to
+/// the person once signed in, so the preference survives a restart either way
+/// and follows them to another machine.
+const FIRST_RUN_POSTPONED_SETTING = "first_run.postponed";
 const localDevLogin = import.meta.env.VITE_LOCAL_DEV_LOGIN === "true";
 // The welcome overlay's account step is offered only where the composition's
 // control plane serves the OIDC login shell (the hub-split hosted builds and the
@@ -495,6 +501,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 void api
                     .hubSessionCallback(handoffCode)
                     .then(() => refetchHubSession())
+                    .then(() => refreshAfterSignIn())
                     .catch(() => {});
                 return;
             }
@@ -524,6 +531,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             void api
                 .hubSessionCallback(webReturnCode)
                 .then(() => refetchHubSession())
+                .then(() => refreshAfterSignIn())
                 .catch(() => {});
         }
     }
@@ -765,6 +773,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [credentialRequired] = createResource(() =>
         api.onboardingStatus().then((s) => s.credentialRequired).catch(() => true),
     );
+    /// What a completed sign-in changes. Credentials are stored per account
+    /// scope (`account_routes.rs` derives the scope from the bearer), so the
+    /// startup reads taken while signed out describe a different scope than the
+    /// one now in force. Until this existed, the sign-in return refetched only
+    /// the session: the welcome stayed up demanding a model credential that the
+    /// sign-in had just restored, and nothing re-read it short of a reload.
+    const refreshAfterSignIn = () => {
+        void refetchStartupCreds();
+        void refetchStartupCodex();
+        void refetchAcctSettings();
+        refreshModelAccess();
+    };
     const [firstRunDismissed, setFirstRunDismissed] = createSignal(false);
     const hasAnyCredential = (): boolean | undefined => {
         const creds = startupCreds();
@@ -772,8 +792,35 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (creds === undefined || codex === undefined) return undefined; // still loading
         return creds.some((c) => c.linked) || Boolean(codex?.linked);
     };
+    /// A live account session. Credentials are stored per account scope, so
+    /// signing in brings back whatever this person already linked — which is why
+    /// the gate below stops at a session rather than waiting to re-read them.
+    const hasAccountSession = () =>
+        bearer() !== null
+        || (hubSession()?.linked === true && !hubSession()?.expired);
+    /// "I'll do this later" used to live in a signal, so it lasted until the
+    /// window closed and the welcome returned on every launch. It is a durable
+    /// preference and belongs in the account-settings KV, which is scoped to the
+    /// local account when signed out and follows the person once signed in.
+    const firstRunPostponed = () =>
+        firstRunDismissed() || acctSettings()?.[FIRST_RUN_POSTPONED_SETTING] === "true";
+    const postponeFirstRun = () => {
+        setFirstRunDismissed(true);
+        void api
+            .accountSetSetting(FIRST_RUN_POSTPONED_SETTING, "true")
+            .then(() => refetchAcctSettings())
+            // A preference that would not persist is not worth interrupting
+            // anyone over; the session-local signal already carries this window.
+            .catch(() => {});
+    };
+    /// Nothing blocks once either half of a working app is in place. Before, this
+    /// asked only about credentials, so a person who had just signed in — and
+    /// whose credentials had come back with them — still met the welcome.
     const showFirstRun = () =>
-        credentialRequired() === true && hasAnyCredential() === false && !firstRunDismissed();
+        credentialRequired() === true
+        && hasAnyCredential() === false
+        && !hasAccountSession()
+        && !firstRunPostponed();
     // The operator's curated "which models show" preference (managed in the Account panel,
     // persisted in the account-settings KV). `null` = never curated → default-visible subset.
     const [acctSettings, { refetch: refetchAcctSettings }] = createResource(() => selected() ?? "startup", () => api.accountSettings().catch((): Record<string, string> => ({})));
@@ -2785,29 +2832,22 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 </>
                             }
                         >
-                            <p class="homegate-kicker">GaugeDesk</p>
-                            <h1>Sign in</h1>
-                            <p class="homegate-lede">
-                                Choose your personal account or find the sign-in provided by your organization.
-                            </p>
-                            <AccountEntry
-                                personalLabel={localDevLogin ? "Enter local dev account" : "Continue with Google"}
-                                onPersonal={() => beginLogin(controlPlaneBase())}
-                                recovery={localDevLogin ? undefined : {
-                                    start: (email) => startAccountRecovery(controlPlaneBase(), email),
-                                    finish: async (challengeId, emailCode, recoveryCode) => {
-                                        await finishAccountRecovery(controlPlaneBase(), challengeId, emailCode, recoveryCode);
-                                    },
-                                    complete: () => {
-                                        // Recovery establishes the durable HttpOnly session. Rebuild
-                                        // the signed-in shell from that server authority so no
-                                        // recovery input or stale signed-out resource survives in
-                                        // client memory. Refresh first when an OIDC-backed Home grant
-                                        // exists; independent passkey/recovery sessions still re-enter
-                                        // through their opaque account cookie on reload.
-                                        void refreshHostedAccountSession(controlPlaneBase())
-                                            .finally(() => window.location.reload());
-                                    },
+                            <SignInCard
+                                title="Sign in"
+                                lede="Sign in to save model credentials, settings, and link your chats."
+                                resolve={async (email) => {
+                                    const { organization } = await resolveSignInRoute(
+                                        controlPlaneBase(),
+                                        email,
+                                    );
+                                    return organization
+                                        ? {
+                                            kind: "organization",
+                                            // Discovery will not name it; the card
+                                            // reads "your organization" without one.
+                                            go: () => beginWorkEmailLogin(controlPlaneBase(), email),
+                                        }
+                                        : { kind: "personal" };
                                 }}
                                 passkey={localDevLogin ? undefined : {
                                     signIn: async (email) => {
@@ -2815,21 +2855,48 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                     },
                                     beginCreation: (email) => startPasskeyAccountCreation(controlPlaneBase(), email),
                                     finishCreation: async (challengeId, code, name) => {
-                                        await finishPasskeyAccountCreation(
+                                        const created = await finishPasskeyAccountCreation(
                                             controlPlaneBase(),
                                             challengeId,
                                             code,
                                             name,
                                         );
+                                        return created.recoveryCodes;
                                     },
                                     complete: () => {
                                         void refreshHostedAccountSession(controlPlaneBase())
                                             .finally(() => window.location.reload());
                                     },
                                 }}
-                                workEmailAction={localDevLogin
-                                    ? undefined
-                                    : workEmailLoginTarget(controlPlaneBase())}
+                                providers={[
+                                    {
+                                        id: "google",
+                                        label: localDevLogin
+                                            ? "Enter local dev account"
+                                            : "Continue with Google",
+                                        begin: () => beginLogin(controlPlaneBase()),
+                                    },
+                                    // Placeholders until a connection exists for each.
+                                    // They are rendered rather than hidden so the row
+                                    // is the shape it will keep, and they say what they
+                                    // are rather than failing silently when pressed.
+                                    { id: "apple", label: "Continue with Apple (not yet available)", begin: () => undefined },
+                                    { id: "microsoft", label: "Continue with Microsoft (not yet available)", begin: () => undefined },
+                                ]}
+                                recovery={localDevLogin ? undefined : {
+                                    start: (email) => startAccountRecovery(controlPlaneBase(), email),
+                                    finish: async (challengeId, emailCode, recoveryCode) => {
+                                        await finishAccountRecovery(controlPlaneBase(), challengeId, emailCode, recoveryCode);
+                                    },
+                                    complete: () => {
+                                        // Recovery establishes the durable HttpOnly session.
+                                        // Rebuild the signed-in shell from that server
+                                        // authority so no recovery input or stale
+                                        // signed-out resource survives in client memory.
+                                        void refreshHostedAccountSession(controlPlaneBase())
+                                            .finally(() => window.location.reload());
+                                    },
+                                }}
                             />
                         </Show>
                         <Show when={!homeNeedsLogin()}>
@@ -2863,25 +2930,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     api={api}
                     productName="GaugeDesk"
                     codexLoginAvailable={codexLoginAvailable}
-                    account={accountLoginAvailable || hubSession()?.available ? {
-                        label: localDevLogin ? "Enter local dev account" : "Sign in with Google",
-                        // The overlay renders only after home discovery succeeded, which in
-                        // hub-split mode already required an authenticated session; the
-                        // bearer covers the local-OIDC fragment flow, and the desktop's
-                        // hub session covers the native handoff (ADR 0123).
-                        signedIn: () =>
-                            bearer() !== null ||
-                            import.meta.env.VITE_HOME_SPLIT === "true" ||
-                            (hubSession()?.linked === true && !hubSession()?.expired),
-                        subject: () => authority() ?? hubSession()?.label ?? hubSession()?.person ?? null,
-                        begin: beginAccountAdmission,
-                    } : undefined}
+                    openExternal={openExternal}
                     onConnected={() => {
                         void refetchStartupCreds();
                         void refetchStartupCodex();
                         refreshModelAccess();
                     }}
-                    onDismiss={() => setFirstRunDismissed(true)}
+                    onDismiss={postponeFirstRun}
                 />
             </Show>
             <Show when={!homeState.loading && !homeFailure() && homeState()?.kind !== "none"}>

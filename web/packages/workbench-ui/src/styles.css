@@ -2284,9 +2284,6 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .firstrun-section-label { margin: 0; font-size: var(--fs-label); font-weight: 400;
     text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 .firstrun-note { margin: 0; font-size: var(--fs-ui); line-height: 1.5; color: var(--muted); }
-.firstrun-account-state { display: flex; align-items: center; gap: 8px; margin: 0;
-    font-size: var(--fs-body); color: var(--ink); }
-.firstrun-account-check { color: var(--accent); font-weight: 400; }
 .firstrun-key { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
 .firstrun-field { display: flex; flex-direction: column; gap: 4px; }
 .firstrun-label { font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.06em;
@@ -2412,6 +2409,125 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
   .account-entry__recovery-proofs { grid-template-columns: 1fr; }
   .account-entry__privacy { grid-column: 1; margin-top: -4px; }
 }
+
+/* The sign-in card. One column, one act at a time: a person arrives with an
+   address, not with a decision about which of two sections they belong in.
+   Drawn on brand — the lockup's arrangement (mark left of the word, gold rule
+   and diamond beneath) and its figures, at chrome scale. Controls take the
+   width they need: a full-bleed button is a mobile idiom, and stretching three
+   provider marks across a 560px card makes a convenience look like the act. */
+/* A sign-in is a narrow column, not a page. The card that hosts this is sized
+   for panels of working content; left to fill it, one email field spans 520px
+   and reads as a form rather than as the single question it is.
+
+   360px is measured, not chosen: the opening line sets at 343px in the chrome
+   face at --fs-body, and breaking a one-sentence lede across two lines makes
+   the card look like it has more to say than it does. The slack absorbs the
+   fallback face, whose metrics are wider than the web font's. A longer lede
+   than this one wraps, and should. */
+.signin { display: flex; flex-direction: column; gap: 11px;
+  width: 100%; max-width: 360px; margin: 0 auto; }
+
+/* The masthead, arranged as the logo is: the mark to the left of the word, the
+   gold figure hanging beneath it — centred, because this is the one screen with
+   nothing above it to align to. The word is set in the chrome face at 400, which
+   is what brand/logos/README.md specifies for every wordmark; the prose serif is
+   for reading at length and is the wrong voice for a name. */
+/* Three tracks so the word is centred on the card and the mark sits beside it.
+   Centring the pair instead would push the word right by half the mark, which
+   is the arrangement this replaces. */
+.signin__head { display: grid; grid-template-columns: 1fr auto 1fr;
+  align-items: center; gap: 12px; }
+.signin__brand { grid-column: 1; justify-self: end; width: 40px; height: 40px; display: block; }
+.signin__headtext { grid-column: 2; display: flex; flex-direction: column;
+  align-items: stretch; gap: 5px; min-width: 0; }
+.signin__title { margin: 0; font-family: var(--ui); font-size: var(--fs-title);
+  font-weight: 400; color: var(--ink); line-height: 1.1; }
+/* The wordmark's own underline: hairlines running out to the edges and meeting
+   a small rotated square, in gold. The same figure `.whip-div` draws between
+   firings, sized to sit under a title rather than across a column. */
+.signin__orn { display: flex; align-items: center; gap: 7px; }
+.signin__orn::before, .signin__orn::after { content: ""; height: 1px; flex: 1;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--gold) 55%, transparent)); }
+.signin__orn::after { background: linear-gradient(90deg, color-mix(in srgb, var(--gold) 55%, transparent), transparent); }
+.signin__orn i { width: 5px; height: 5px; flex: none; transform: rotate(45deg);
+  border: 1px solid color-mix(in srgb, var(--gold) 60%, transparent); }
+.signin__lede { margin: 0; text-align: center; color: var(--muted);
+  font-size: var(--fs-body); line-height: 1.5; }
+
+.signin__act { display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
+.signin__field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+/* Centred with everything else rather than hidden: a placeholder-only field
+   reads as standard and costs the label, and the one visually-hidden pattern
+   in this stylesheet is a one-off on .chat-state-label, not a utility to
+   reach for a second time. */
+.signin__label { text-align: center; color: var(--muted); font-size: var(--fs-label);
+  text-transform: uppercase; letter-spacing: .065em; }
+.signin__field input { width: 100%; min-height: 32px; padding: 5px 10px;
+  border: 1px solid var(--edge); border-radius: 3px; background: var(--panel);
+  color: var(--ink); font: inherit; font-size: var(--fs-body); }
+.signin__field input:focus { outline: 1px solid var(--accent); outline-offset: 1px;
+  border-color: var(--accent); }
+/* Sized to its words, and set where the reading starts rather than across the
+   card. */
+.signin__primary { align-self: center; min-height: 30px; padding: 5px 16px;
+  border: 1px solid color-mix(in srgb, var(--accent) 68%, var(--edge)); border-radius: 3px;
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface-2));
+  color: var(--ink); font: inherit; font-size: var(--fs-ui); cursor: pointer; }
+.signin__primary:hover:not(:disabled) { border-color: var(--accent); }
+.signin__primary:disabled { opacity: .45; cursor: default; }
+
+/* The divider, in the brand's line: gold hairlines fading out from the word. */
+.signin__rule { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+  gap: 10px; margin: 1px 0; }
+.signin__rule::before, .signin__rule::after { content: ""; height: 1px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--gold) 45%, transparent)); }
+.signin__rule::after { background: linear-gradient(90deg, color-mix(in srgb, var(--gold) 45%, transparent), transparent); }
+.signin__rule span { color: var(--muted); font-size: var(--fs-small); text-transform: uppercase;
+  letter-spacing: .08em; }
+
+/* Three marks at their own size, in a row that starts where the act above it
+   does. Adding Apple and Microsoft beside Google changes the count, nothing
+   else; the accessible name lives on the button. */
+.signin__providers { display: flex; justify-content: center; gap: 8px; }
+.signin__provider { display: flex; align-items: center; justify-content: center;
+  width: 46px; height: 34px; flex: none; padding: 0; border: 1px solid var(--edge);
+  border-radius: 3px; background: var(--surface-2); color: var(--ink); cursor: pointer; }
+.signin__provider:hover:not(:disabled) { border-color: var(--accent); }
+.signin__provider:disabled { opacity: .45; cursor: default; }
+.signin__mark { width: 17px; height: 17px; display: block; }
+
+/* The resolved address carries its own way back, so the foot below keeps only
+   real alternatives instead of collecting every escape hatch. */
+.signin__resolved { display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin: 0; padding: 8px 11px; border: 1px solid var(--edge);
+  border-radius: 3px; background: var(--bg); color: var(--ink);
+  font-size: var(--fs-ui); overflow-wrap: anywhere; }
+.signin__resolved span { min-width: 0; }
+.signin__resolved strong { font-weight: inherit; color: var(--accent); }
+.signin__change { flex: 0 0 auto; padding: 0; border: 0; background: transparent;
+  color: var(--muted); font: inherit; font-size: var(--fs-small); cursor: pointer; }
+.signin__change:hover { color: var(--accent); }
+/* The codes, set to be read off a screen and typed back: monospace so the
+   groups line up and the alphabet's near-misses stay distinguishable. */
+.signin__codes { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px;
+  margin: 0; padding: 10px 12px; list-style: none; border: 1px solid var(--edge);
+  border-radius: 3px; background: var(--bg); color: var(--ink);
+  font-family: var(--mono); font-size: var(--fs-ui); }
+.signin__status { margin: 0; text-align: center; color: var(--muted);
+  font-size: var(--fs-small); line-height: 1.45; }
+.signin__quiet { align-self: center; padding: 1px 3px; border: 0; background: transparent;
+  color: var(--muted); font: inherit; font-size: var(--fs-small); cursor: pointer; }
+.signin__quiet:hover:not(:disabled) { color: var(--accent); }
+.signin__quiet:disabled { opacity: .45; cursor: default; }
+/* Underlined, because a button that reads as a sentence has nothing else to
+   say it is one. Colour alone would not: it is the only cue, and it fails for
+   anyone who cannot separate it from the muted text around it. */
+.signin__link { padding: 0; border: 0; background: transparent; color: var(--accent);
+  font: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.signin__link:hover { text-decoration-thickness: 2px; }
+.signin__foot { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.signin__foot:empty { display: none; }
 
 /* The conflict fold (SUB-6): regions to resolve after a conflicted save. */
 .conflict-fold { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow: auto; }

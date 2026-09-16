@@ -28,6 +28,12 @@ const SCAN_ROOTS = ["web/packages","web/apps","web/lab","ee/web"];
 // second request. The distinction matters twice below: where the declarations
 // are read from, and how much of TOKENS_PATH the hex scan may skip.
 const TOKENS_MODE = "file";
+// The company mark, rendered whole beside the tokens. Empty where this surface
+// draws none. Checked by digest rather than by eye: a mark that has been
+// re-exported, re-compressed, or swapped for a similar-looking file is exactly
+// the drift a second copy produces, and it is invisible in a diff.
+const MARK_PATH = "web/packages/workbench-ui/src/assets/gaugewright-mark-64.png";
+const MARK_DIGEST = "7fcd1d156b29b9ad25b14bd44d5f8c0b4d35774bffd3594b6ac9308b8caa8fa4";
 const BLOCK_BEGIN = "/* BEGIN GAUGEWRIGHT BRAND TOKENS";
 const BLOCK_END = "/* END GAUGEWRIGHT BRAND TOKENS */";
 
@@ -71,6 +77,25 @@ let canonicalValues = new Set();
 // writes; exempting the whole of it from the hex scan would excuse every rule in
 // it, which is most of what the scan exists to read.
 let tokensRegion = null;
+
+if (MARK_PATH) {
+  const markFile = path.join(root, MARK_PATH);
+  if (!fs.existsSync(markFile)) {
+    fail(
+      `${MARK_PATH} is missing. The company mark is owned by the GaugeWright `
+      + "repository; render it with `node tools/palette.mjs --write`.",
+    );
+  } else {
+    const have = crypto.createHash("sha256").update(fs.readFileSync(markFile)).digest("hex");
+    if (have !== MARK_DIGEST) {
+      fail(
+        `${MARK_PATH} is not the rendered company mark (sha256:${have.slice(0, 12)}…, `
+        + `expected sha256:${MARK_DIGEST.slice(0, 12)}…). It is owned by the GaugeWright `
+        + "repository; re-render it rather than editing it here.",
+      );
+    }
+  }
+}
 
 if (!fs.existsSync(tokensFile)) {
   fail(

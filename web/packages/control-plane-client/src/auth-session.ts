@@ -237,7 +237,7 @@ export async function finishPasskeyAccountCreation(
     code: string,
     displayName: string,
     credentials: CredentialContainer = navigator.credentials,
-): Promise<string> {
+): Promise<PasskeyAccountCreated> {
     const verified = await accountAuthJson(
         controlPlaneBase,
         "/auth/account/email/complete",
@@ -271,7 +271,27 @@ export async function finishPasskeyAccountCreation(
     if (typeof finished.account_id !== "string" || !finished.account_id) {
         throw new Error("Account authentication response is malformed.");
     }
-    return finished.account_id;
+    // The only copy. The store holds salted hashes, so nothing can reissue these
+    // — a later batch is a different batch and invalidates this one. A response
+    // without them is a server that did not mint them, which is the state this
+    // whole path existed in until recently; say so rather than show an empty list
+    // as though the account were recoverable.
+    const codes = Array.isArray(finished.recovery_codes)
+        ? finished.recovery_codes.filter((code): code is string => typeof code === "string" && !!code)
+        : [];
+    if (codes.length === 0) {
+        throw new Error(
+            "The account was created but no recovery codes were issued. "
+            + "Sign in and issue a batch before relying on this account.",
+        );
+    }
+    return { accountId: finished.account_id, recoveryCodes: codes };
+}
+
+/** A created passkey account, with the one copy of its recovery codes. */
+export interface PasskeyAccountCreated {
+    readonly accountId: string;
+    readonly recoveryCodes: readonly string[];
 }
 
 /** Authenticate an existing passkey account. Account discovery uses the
@@ -502,4 +522,60 @@ export function startSessionRefresh(base: string, intervalMs = 45 * 60 * 1000): 
     tick();
     const id = window.setInterval(tick, intervalMs);
     return () => window.clearInterval(id);
+}
+
+
+/** Where an address should sign in, as far as the account service will say.
+ *
+ * `POST /auth/work-email` (`auth_oidc.rs:294`) is the only discovery there is.
+ * A matched organization gets a redirect to its IdP; everything else gets one
+ * flat 404 covering "invalid, absent, incomplete, unsupported, and ambiguous",
+ * deliberately, so discovery cannot enumerate organizations or accounts. So
+ * this can learn *that* an address routes to an organization and nothing more —
+ * not its name, because `redirect: "manual"` yields an opaque response whose
+ * Location is not readable, and not whether a personal account exists, because
+ * the service will not say.
+ *
+ * The caller completes the organization case by submitting the same address as
+ * a real form, so the browser follows the redirect it cannot follow here. That
+ * means the authorization request is begun twice and the first is abandoned
+ * unused. It is wasteful rather than wrong — the discarded state is never seen
+ * by the IdP and the second overwrites it — but it is the seam where a small
+ * JSON discovery route would pay for itself, returning the organization's name
+ * for the confirm step and leaking no more than the redirect already does.
+ */
+export async function resolveSignInRoute(
+    controlPlaneBase: string,
+    email: string,
+): Promise<{ organization: boolean }> {
+    const response = await fetch(workEmailLoginTarget(controlPlaneBase), {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ email }),
+        redirect: "manual",
+        credentials: "include",
+    });
+    // An opaque-redirect response carries status 0; a same-origin 3xx read
+    // directly carries its own. Either means an organization matched.
+    const redirected =
+        response.type === "opaqueredirect"
+        || (response.status >= 300 && response.status < 400);
+    return { organization: redirected };
+}
+
+/** Submit the address as a real form so the browser follows the organization
+ *  redirect. A fetch cannot: the destination is cross-origin and the response is
+ *  opaque, and the IdP round trip has to happen in the address bar anyway. */
+export function beginWorkEmailLogin(controlPlaneBase: string, email: string): void {
+    const form = document.createElement("form");
+    form.method = "post";
+    form.action = workEmailLoginTarget(controlPlaneBase);
+    form.style.display = "none";
+    const field = document.createElement("input");
+    field.type = "hidden";
+    field.name = "email";
+    field.value = email;
+    form.append(field);
+    document.body.append(form);
+    form.submit();
 }

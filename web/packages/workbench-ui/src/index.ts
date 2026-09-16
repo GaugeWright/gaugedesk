@@ -17,6 +17,8 @@ export type {
 } from "./SettingsSurface";
 export { AccountMenu } from "./AccountMenu";
 export { AccountEntry } from "./AccountEntry";
+export { SignInCard } from "./SignInCard";
+export type { SignInCardProps, SignInRoute, SignInPasskeyActions, SignInRecoveryActions } from "./SignInCard";
 export type { AccountEntryProps, AccountRecoveryActions, PasskeyAccountActions } from "./AccountEntry";
 export { gaugeAppMenuIdentity } from "./gaugeapp-identity";
 export { createGaugeAppResource, refreshGaugeAppResources } from "./gaugeapp-resource";
@@ -25,7 +27,7 @@ export { createGaugeAppUpdateChannel, GAUGEAPP_UPDATE_INTERVAL_MS, GAUGEAPP_UPDA
 export type { GaugeAppUpdateScheduler } from "./gaugeapp-update-channel";
 export type { AccountMenuItem, AccountMenuProps, MenuComposition, MenuIdentity } from "./AccountMenu";
 export { FirstRunOverlay } from "./FirstRunOverlay";
-export type { FirstRunAccount, FirstRunApi } from "./FirstRunOverlay";
+export type { FirstRunApi } from "./FirstRunOverlay";
 export { AgentSettings, plainConfigError, readFormConfig, writeFormConfig } from "./AgentSettings";
 export type { AgentSettingsApi, AgentSettingsProps } from "./AgentSettings";
 export { buildOutgoing, classifyAttachment, documentFileType, extractDocumentAttachment, fileToBase64 } from "./attachments";

@@ -5,6 +5,10 @@
     "apps/workbench-web/src/main.tsx",
     "apps/workbench-web/src/App.tsx",
     "apps/workbench-web/src/workbench-control-plane.ts",
-    "apps/workbench-web/src/generated-tunnel.d.ts"
+    "apps/workbench-web/src/generated-tunnel.d.ts",
+    "apps/workbench-web/src/signin-lab.tsx",
+    "apps/workbench-web/src/settings-lab.tsx",
+    "apps/workbench-web/src/whip-lab.tsx",
+    "apps/workbench-web/src/tokenwright-lab.tsx"
   ]
 }

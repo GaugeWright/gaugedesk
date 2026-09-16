@@ -106,14 +106,14 @@ export default defineConfig({
         // fallback, so the suite's relative navigation works unchanged.
         enterpriseLane
             ? {
-                command: `npx vite preview --config apps/enterprise-workbench/vite.config.ts --port ${ports.preview} --strictPort`,
+                command: `npx vite preview --config apps/enterprise-workbench/vite.config.ts --port ${ports.preview} --strictPort --host 127.0.0.1`,
                 cwd: "../ee/web",
                 url: previewURL,
                 reuseExistingServer: false,
                 timeout: 30_000,
             }
             : {
-                command: `npm run preview -- --port ${ports.preview} --strictPort`,
+                command: `npm run preview -- --port ${ports.preview} --strictPort --host 127.0.0.1`,
                 url: previewURL,
                 reuseExistingServer: false,
                 timeout: 30_000,
@@ -145,7 +145,7 @@ export default defineConfig({
         // Static preview of the combined enterprise workbench, built by e2e/run.mjs
         // in its owning workspace. The preview serves the whole dist.
         {
-            command: `npx vite preview --config apps/enterprise-workbench/vite.config.ts --port ${ports.enterpriseApp} --strictPort`,
+            command: `npx vite preview --config apps/enterprise-workbench/vite.config.ts --port ${ports.enterpriseApp} --strictPort --host 127.0.0.1`,
             cwd: "../ee/web",
             url: enterpriseAppURL,
             reuseExistingServer: false,

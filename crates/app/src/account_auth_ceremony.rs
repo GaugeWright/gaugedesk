@@ -582,7 +582,7 @@ impl AccountAuthRuntime {
         response: &RegistrationResponse,
         label: &str,
         now: u64,
-    ) -> Result<(String, String), CeremonyError> {
+    ) -> Result<(String, String, Vec<String>), CeremonyError> {
         let pending = self
             .lock()
             .registrations
@@ -629,12 +629,19 @@ impl AccountAuthRuntime {
             )
             .map_err(|_| CeremonyError::AlreadyExists)?,
         );
+        // ADR 0146 §2 requires provider-neutral recovery: a verified email
+        // challenge plus one unused recovery code. An account created without a
+        // batch can never satisfy that, so the batch is part of creating the
+        // account rather than a later step somebody may not take.
+        let (recovery_facts, recovery_codes) =
+            mint_recovery_batch(&state, &pending.account_id, now)?;
+        facts.extend(recovery_facts);
         append_facts(wb.store_mut(), &facts).map_err(|_| CeremonyError::Unavailable)?;
         crate::auth_oidc::provision_web_account(wb, &pending.account_id, true);
         let session = wb
             .mint_account_session(&pending.account_id, "passkey", self.session_ttl_secs)
             .ok_or(CeremonyError::Unavailable)?;
-        Ok((pending.account_id, session))
+        Ok((pending.account_id, session, recovery_codes))
     }
 
     fn start_authentication(
@@ -1164,7 +1171,7 @@ async fn post_registration_finish(
         &body.label,
         unix_now(),
     );
-    session_response(result)
+    registration_response(result)
 }
 
 async fn post_authentication_start(
@@ -1385,6 +1392,23 @@ async fn post_authorization_finish(
     }
 }
 
+/// The account-creation response. Carries the one and only copy of the recovery
+/// codes: they exist in plaintext for the length of this response and nowhere
+/// else, because the store holds salted hashes. A client that drops them cannot
+/// ask again — it has to mint a new batch, which invalidates these.
+fn registration_response(result: Result<(String, String, Vec<String>), CeremonyError>) -> Response {
+    match result {
+        Ok((account_id, token, recovery_codes)) => {
+            let mut response =
+                Json(json!({"account_id": account_id, "recovery_codes": recovery_codes}))
+                    .into_response();
+            crate::auth_oidc::append_session_cookies(&mut response, &token);
+            response
+        }
+        Err(error) => error.response(),
+    }
+}
+
 fn session_response(result: Result<(String, String), CeremonyError>) -> Response {
     match result {
         Ok((account_id, token)) => {
@@ -1495,6 +1519,67 @@ fn random_token(bytes: usize) -> Result<String, CeremonyError> {
     let mut value = vec![0_u8; bytes];
     getrandom::getrandom(&mut value).map_err(|_| CeremonyError::Unavailable)?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value))
+}
+
+/// How many recovery codes a new account is issued, and how long each is.
+///
+/// Ten is enough that losing a couple to a bad transcription does not strand
+/// anyone, and few enough to be worth writing down. Twelve characters from a
+/// 32-symbol alphabet is about 60 bits, against a path that is rate limited and
+/// also demands a verified email challenge.
+const RECOVERY_CODE_COUNT: usize = 10;
+const RECOVERY_CODE_GROUPS: usize = 3;
+/// No I, O, 0 or 1: these are read off a screen and typed back, often from
+/// paper, and the pairs that collide there are the ones that strand a person on
+/// the one path they have left.
+const RECOVERY_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// One recovery code, as `XXXX-XXXX-XXXX`.
+///
+/// The alphabet is exactly 32 symbols, so every byte maps to one without
+/// rejection and without modulo bias.
+fn random_recovery_code() -> Result<String, CeremonyError> {
+    let mut bytes = vec![0_u8; RECOVERY_CODE_GROUPS * 4];
+    getrandom::getrandom(&mut bytes).map_err(|_| CeremonyError::Unavailable)?;
+    let symbols: Vec<char> = bytes
+        .iter()
+        .map(|byte| RECOVERY_ALPHABET[usize::from(*byte) % RECOVERY_ALPHABET.len()] as char)
+        .collect();
+    Ok(symbols
+        .chunks(4)
+        .map(|group| group.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("-"))
+}
+
+/// Mint a fresh batch for `account_id`, returning the facts to append and the
+/// plaintext codes to show the person once.
+///
+/// The store keeps only a salted hash per code (`RecoveryCodeRecord::prepare`),
+/// so this is the only moment the plaintext exists anywhere. Nothing reads it
+/// back, and there is no route that will print it again.
+fn mint_recovery_batch(
+    state: &AccountAuth,
+    account_id: &str,
+    now: u64,
+) -> Result<(Vec<AccountAuthFact>, Vec<String>), CeremonyError> {
+    let batch_id = random_token(16)?;
+    let mut plaintext = Vec::with_capacity(RECOVERY_CODE_COUNT);
+    let mut prepared = Vec::with_capacity(RECOVERY_CODE_COUNT);
+    for _ in 0..RECOVERY_CODE_COUNT {
+        let code = random_recovery_code()?;
+        let salt = random_token(16)?;
+        prepared.push(
+            crate::account_auth::RecoveryCodeRecord::prepare(account_id, &batch_id, &salt, &code)
+                .map_err(|_| CeremonyError::Unavailable)?,
+        );
+        plaintext.push(code);
+    }
+    let facts = crate::account_auth::decide_replace_recovery_codes(
+        state, account_id, &batch_id, now, prepared,
+    )
+    .map_err(|_| CeremonyError::Unavailable)?;
+    Ok((facts, plaintext))
 }
 
 fn random_numeric_code() -> Result<String, CeremonyError> {
@@ -1719,9 +1804,24 @@ mod tests {
         ));
         let mut wb = crate::Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
             .with_content_vault(vault);
-        let (account_id, _) = runtime
+        let (account_id, _, issued_codes) = runtime
             .finish_registration(&mut wb, &registration_id, &registration, "Laptop", 4)
             .unwrap();
+        // Creating the account issues the batch (ADR 0146 §2). This used to seed
+        // one by hand, which is exactly why nothing noticed that no production
+        // path minted one.
+        assert_eq!(issued_codes.len(), RECOVERY_CODE_COUNT);
+        assert!(issued_codes
+            .iter()
+            .all(|code| code.len() == RECOVERY_CODE_GROUPS * 5 - 1));
+        assert_eq!(
+            issued_codes
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            RECOVERY_CODE_COUNT,
+            "every issued code is distinct",
+        );
         let state = AccountAuth::rebuild(wb.store_ref()).unwrap();
         let prepared = crate::account_auth::RecoveryCodeRecord::prepare(
             &account_id,
@@ -1859,7 +1959,7 @@ mod tests {
         let mut wb = crate::Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
             .with_content_vault(vault);
 
-        let (account_id, first_session) = runtime
+        let (account_id, first_session, _) = runtime
             .finish_registration(&mut wb, &registration_id, &registration, "Laptop", 13)
             .unwrap();
         assert_eq!(

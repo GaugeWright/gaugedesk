@@ -260,7 +260,10 @@ describe("provider-neutral passkey account entry", () => {
                     excludeCredentials: [{ type: "public-key", id: "BQY" }],
                 },
             }), { status: 200, headers: { "content-type": "application/json" } }))
-            .mockResolvedValueOnce(new Response(JSON.stringify({ account_id: "person-one" }), {
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                account_id: "person-one",
+                recovery_codes: ["HKPR-7T2M-QJ4X", "B9WD-LN3F-VZ6K"],
+            }), {
                 status: 200,
                 headers: { "content-type": "application/json", "set-cookie": "opaque-session" },
             }));
@@ -278,7 +281,10 @@ describe("provider-neutral passkey account entry", () => {
             "123456",
             "Person One",
             { create, get: vi.fn() },
-        )).resolves.toBe("person-one");
+        )).resolves.toEqual({
+            accountId: "person-one",
+            recoveryCodes: ["HKPR-7T2M-QJ4X", "B9WD-LN3F-VZ6K"],
+        });
 
         expect(fetch.mock.calls.map(([url]) => url)).toEqual([
             "https://auth.example/auth/account/email/start",
@@ -309,6 +315,41 @@ describe("provider-neutral passkey account entry", () => {
         expect(byteValues(creation.publicKey?.user.id)).toEqual([3, 4]);
         expect(byteValues(creation.publicKey?.excludeCredentials?.[0]?.id)).toEqual([5, 6]);
         expect(bearer()).toBeNull();
+    });
+
+    it("refuses an account the server created without recovery codes", async () => {
+        // ADR 0146 §2 recovery needs a verified email *and* an unused recovery
+        // code, so an account issued none can never be recovered. Every passkey
+        // account was in that state until the ceremony began minting a batch;
+        // resolving here would report success for an account with one
+        // authenticator and no way back if it is lost.
+        const fetch = vi.fn()
+            .mockResolvedValueOnce(new Response(JSON.stringify({ email_verification: "verified-1" }), {
+                status: 200, headers: { "content-type": "application/json" },
+            }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                ceremony_id: "ceremony-1",
+                public_key: {
+                    challenge: "AQI",
+                    rp: { name: "GaugeWright", id: "auth.example" },
+                    user: { id: "AwQ", name: "person@example.test", displayName: "Person One" },
+                    pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+                },
+            }), { status: 200, headers: { "content-type": "application/json" } }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ account_id: "person-one" }), {
+                status: 200, headers: { "content-type": "application/json" },
+            }));
+        vi.stubGlobal("fetch", fetch);
+        const create = vi.fn(async (_options: CredentialCreationOptions): Promise<Credential | null> =>
+            registrationCredential);
+
+        await expect(finishPasskeyAccountCreation(
+            "https://auth.example/",
+            "email-1",
+            "123456",
+            "Person One",
+            { create, get: vi.fn() },
+        )).rejects.toThrow(/no recovery codes/i);
     });
 
     it("signs in with a passkey through a fresh server ceremony", async () => {

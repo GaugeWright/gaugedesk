@@ -8,6 +8,25 @@ import { enterpriseAppURL, enterpriseCP, enterpriseState } from "../ports.mjs";
 import { mutationHeaders } from "./idempotency";
 
 const { Given, When, Then, After } = createBdd();
+
+/** Carry an address through the opening step to the personal branch.
+ *
+ * The card asks for one thing and lets the account service decide where it
+ * goes: `POST /auth/work-email` redirects a connected organization and answers
+ * one flat 404 for everything else, which is what lands here. There is no
+ * "personal account" section to click any more, so the journeys that used to
+ * start at a passkey or recovery button start here instead. */
+async function identify(page: import("@playwright/test").Page, address: string) {
+    await expect(page.locator("[data-signin]")).toBeVisible();
+    await page.locator("[data-signin-email]").fill(address);
+    const routed = page.waitForResponse((response) =>
+        response.request().method() === "POST"
+        && new URL(response.url()).pathname === "/auth/work-email"
+    );
+    await page.locator("[data-signin-continue]").click();
+    await routed;
+    await expect(page.locator("[data-signin-personal]")).toBeVisible();
+}
 const email = "recovery-fixture@gaugewright.test";
 const recoveryCode = "GW-E2E-RECOVERY";
 const passkeyCP = enterpriseCP.replace("127.0.0.1", "localhost");
@@ -42,16 +61,17 @@ Given("a recoverable GaugeDesk account exists", async ({ page, request }) => {
     await page.context().clearCookies();
     await page.goto(`${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}`);
     await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
-    await page.getByRole("button", { name: "Use a recovery code" }).click();
+    await identify(page, email);
 });
 
 When("I recover it with the delivered email proof and recovery code", async ({ page }) => {
-    await page.getByLabel("Verified email").fill(email);
+    // The address is already resolved, so asking for a recovery code starts the
+    // email challenge in the same act rather than collecting the address twice.
     const started = page.waitForResponse((response) =>
         response.request().method() === "POST"
         && new URL(response.url()).pathname === "/auth/account/recovery/start"
     );
-    await page.getByRole("button", { name: "Send code" }).click();
+    await page.getByRole("button", { name: "Use a recovery code" }).click();
     const startResponse = await started;
     expect(startResponse.status()).toBe(202);
     challengeId = String((await startResponse.json()).challenge_id ?? "");
@@ -73,7 +93,7 @@ When("I recover it with the delivered email proof and recovery code", async ({ p
     );
     await page.getByRole("button", { name: "Recover account" }).click();
     expect((await finished).status()).toBe(200);
-    await expect(page.locator("[data-account-entry]")).toHaveCount(0);
+    await expect(page.locator("[data-signin]")).toHaveCount(0);
 });
 
 Then("Desk re-enters the same account through a persistent recovery session", async ({ page }) => {
@@ -84,7 +104,7 @@ Then("Desk re-enters the same account through a persistent recovery session", as
     expect(body.label).toBe("Recovery code");
 
     await page.reload();
-    await expect(page.locator("[data-account-entry]")).toHaveCount(0);
+    await expect(page.locator("[data-signin]")).toHaveCount(0);
     const refreshed = await page.request.get(`${enterpriseCP}/auth/session`);
     expect(refreshed.status()).toBe(200);
     expect(await refreshed.json()).toMatchObject({ method: "recovery", label: "Recovery code" });
@@ -137,17 +157,19 @@ Given("a new visitor has a platform passkey authenticator", async ({ page, reque
     passkeyAuthenticator = created.authenticatorId;
     await page.goto(`${passkeyApp}?cp=${encodeURIComponent(passkeyCP)}`);
     await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
-    await page.getByRole("button", { name: "Create an account" }).click();
+    // Creation is offered on the opening step rather than behind a resolved
+    // address: a person with no account has nothing for the server to route.
+    await page.locator("[data-signin-email]").fill("passkey-fixture@gaugewright.test");
+    await page.locator("[data-signin-create-open]").click();
 });
 
 When("I create an account with delivered email verification and that passkey", async ({ page }) => {
     await page.getByLabel("Your name").fill("Passkey Person");
-    await page.getByLabel("Email", { exact: true }).fill("passkey-fixture@gaugewright.test");
     const started = page.waitForResponse((response) =>
         response.request().method() === "POST"
         && new URL(response.url()).pathname === "/auth/account/email/start"
     );
-    await page.getByRole("button", { name: "Send verification code" }).click();
+    await page.getByRole("button", { name: "Email me a code" }).click();
     expect((await started).status()).toBe(202);
 
     const delivered = JSON.parse(await readFile(
@@ -165,13 +187,23 @@ When("I create an account with delivered email verification and that passkey", a
         response.request().method() === "POST"
         && new URL(response.url()).pathname === "/auth/account/passkey/register/finish"
     );
-    await page.getByRole("button", { name: "Create passkey account" }).click();
+    await page.getByRole("button", { name: "Create account" }).click();
     const response = await finished;
     expect(response.status()).toBe(200);
-    const body = await response.json() as { account_id?: string };
+    const body = await response.json() as { account_id?: string; recovery_codes?: string[] };
     passkeyAccount = body.account_id ?? "";
     expect(passkeyAccount).not.toBe("");
-    await expect(page.locator("[data-account-entry]")).toHaveCount(0);
+
+    // ADR 0146 §2: an account that cannot be recovered should not be created.
+    // The batch rides back on this one response and nowhere else, so the card
+    // shows it before it hands over — and the person acknowledges it.
+    expect(body.recovery_codes ?? []).toHaveLength(10);
+    const shown = page.locator("[data-signin-codes] .signin__codes li");
+    await expect(shown).toHaveCount(10);
+    expect(await shown.allInnerTexts()).toEqual(body.recovery_codes);
+    await page.locator("[data-signin-codes-saved]").click();
+
+    await expect(page.locator("[data-signin]")).toHaveCount(0);
 });
 
 Then("Desk enters the new account through a persistent passkey session", async ({ page }) => {
@@ -189,7 +221,7 @@ Then("Desk enters the new account through a persistent passkey session", async (
     passkeyTenantProjection = projection.body;
     expect(JSON.parse(passkeyTenantProjection)).toMatchObject({ tenants: expect.any(Array) });
     await page.reload();
-    await expect(page.locator("[data-account-entry]")).toHaveCount(0);
+    await expect(page.locator("[data-signin]")).toHaveCount(0);
 });
 
 When("I sign out and use the same passkey again", async ({ page }) => {
@@ -198,16 +230,14 @@ When("I sign out and use the same passkey again", async ({ page }) => {
     });
     expect(logout.status()).toBe(204);
     await page.reload();
-    await expect(page.locator("[data-account-entry]")).toBeVisible();
-    await page.getByRole("button", { name: "Sign in with a passkey" }).click();
-    await page.getByLabel("Account email").fill("passkey-fixture@gaugewright.test");
+    await identify(page, "passkey-fixture@gaugewright.test");
     const finished = page.waitForResponse((response) =>
         response.request().method() === "POST"
         && new URL(response.url()).pathname === "/auth/account/passkey/login/finish"
     );
-    await page.getByRole("button", { name: "Continue with passkey" }).click();
+    await page.locator("[data-signin-passkey]").click();
     expect((await finished).status()).toBe(200);
-    await expect(page.locator("[data-account-entry]")).toHaveCount(0);
+    await expect(page.locator("[data-signin]")).toHaveCount(0);
 });
 
 Then("Desk re-enters the same passkey account", async ({ page }) => {
