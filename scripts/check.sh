@@ -54,9 +54,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 section="${1:-all}"
 
-# The Debian archive tooling `scripts/test-apt-repository.sh` drives. Every
-# runner that builds a package and every machine that installs one has it, so
-# an absence here is a workstation missing `dpkg-dev`, not a platform that
+# The Debian archive tooling `scripts/test-apt-repository.sh` drives. On Linux,
+# every runner that builds a package and every machine that installs one has it,
+# so an absence there is a workstation missing `dpkg-dev`, not a platform that
 # cannot answer.
 apt_repository_prerequisites_present() {
     local tool
@@ -205,12 +205,28 @@ run_contracts() {
     # every Linux install arrives through was covered by a script no gate ran.
     # It belongs in `contracts` because it needs only Debian tooling.
     echo "== apt repository =="
-    apt_repository_prerequisites_present || {
-        echo "the APT repository test needs Debian archive tooling." >&2
-        echo "install: sudo apt-get install -y dpkg-dev gnupg apt-utils xz-utils" >&2
-        exit 1
-    }
-    bash scripts/test-apt-repository.sh
+    # The distinction the hard failure below did not draw. On Linux an absence
+    # is an incomplete workstation and is told to install the packages. On a
+    # host that is not Linux it is a platform that cannot answer: `apt-get` and
+    # `dpkg-scanpackages` are not tools a Mac is missing, they are tools that
+    # administer a system a Mac does not have, and installing them would test an
+    # archive nothing on that machine consumes. So this skips there, the way
+    # `check-windows-compile.sh` skips off Windows and for the same reason —
+    # the section stays runnable on every host the green bar runs on, and the
+    # Linux CI job is where the command is answerable. What the gate covers is
+    # unchanged: `contracts` runs on Linux in CI, where this still runs and
+    # still fails on absent tooling.
+    if [ "$(uname -s)" != "Linux" ]; then
+        echo "-- apt repository SKIPPED: host is $(uname -s), and the Debian archive tooling is Linux-only --" >&2
+        echo "   the contracts CI job runs this same section on Linux, where it does not skip" >&2
+    else
+        apt_repository_prerequisites_present || {
+            echo "the APT repository test needs Debian archive tooling." >&2
+            echo "install: sudo apt-get install -y dpkg-dev gnupg apt-utils xz-utils" >&2
+            exit 1
+        }
+        bash scripts/test-apt-repository.sh
+    fi
 
     echo "== build coverage =="
     node scripts/check-build-coverage.mjs

@@ -46,6 +46,16 @@ fi
 # with another's archiver is a harder failure to read than either being absent.
 llvm_toolchain_dir() {
   local dir
+  # Homebrew keeps its LLVM off PATH deliberately, so that a Mac's `clang` stays
+  # Apple's. That makes the Homebrew prefix the one place on a Mac where a
+  # wasm32-capable toolchain is expected to be, and it is checked first: on a
+  # Mac the versioned Debian layout below cannot match, and on Linux this cannot.
+  for dir in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+    if [ -x "$dir/clang" ] && [ -x "$dir/llvm-ar" ]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
   # `sort -V` so llvm-9 does not sort above llvm-21.
   for dir in $(ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -Vr); do
     if [ -x "$dir/clang" ] && [ -x "$dir/llvm-ar" ]; then
@@ -56,17 +66,30 @@ llvm_toolchain_dir() {
   return 1
 }
 
+# Whether a compiler can actually emit wasm32, which is not the same question as
+# whether it exists — and on macOS the two answers differ. Apple's clang is
+# always on PATH and always fails this: its LLVM carries only the Apple-platform
+# targets and rejects the triple outright. Discovery keyed on absence therefore
+# never fired on a Mac, and the build went to a compiler that cannot do the job.
+# Asking the compiler beats keeping a list of which clangs were built with which
+# targets.
+targets_wasm32() {
+  command -v "$1" >/dev/null 2>&1 \
+    && printf 'int main(void){return 0;}\n' \
+      | "$1" --target=wasm32-unknown-unknown -x c -c -o /dev/null - >/dev/null 2>&1
+}
+
 # An explicit override always wins: a caller naming a tool has a reason, and
 # discovering a different one behind their back is worse than failing. Only the
 # tools that are both unset and unresolvable are discovered, and only those are
 # reported — a message naming a toolchain the build did not actually take sends
 # the next reader to the wrong LLVM.
 discovered=()
-if { [ -z "${CC_wasm32_unknown_unknown:-}" ] && ! command -v clang >/dev/null; } \
+if { [ -z "${CC_wasm32_unknown_unknown:-}" ] && ! targets_wasm32 clang; } \
   || { [ -z "${AR_wasm32_unknown_unknown:-}" ] && ! command -v llvm-ar >/dev/null; }; then
   llvm_dir="$(llvm_toolchain_dir || true)"
   if [ -n "$llvm_dir" ]; then
-    if [ -z "${CC_wasm32_unknown_unknown:-}" ] && ! command -v clang >/dev/null; then
+    if [ -z "${CC_wasm32_unknown_unknown:-}" ] && ! targets_wasm32 clang; then
       CC_wasm32_unknown_unknown="$llvm_dir/clang"
       discovered+=(clang)
     fi
@@ -84,10 +107,21 @@ fi
 : "${AR_wasm32_unknown_unknown:=llvm-ar}"
 export CC_wasm32_unknown_unknown AR_wasm32_unknown_unknown
 
-if ! command -v "$CC_wasm32_unknown_unknown" >/dev/null; then
-  echo "error: $CC_wasm32_unknown_unknown not found — ring needs clang for wasm32 (ADR 0130 §4)" >&2
-  echo "       looked for clang on PATH and for /usr/lib/llvm-*/bin holding both clang and llvm-ar" >&2
-  echo "       install clang and llvm, or set CC_wasm32_unknown_unknown" >&2
+# Capability, not presence. A compiler that exists but has no wasm32 target
+# fails ~90 seconds later inside ring's build script, where the error is about C
+# and names neither this variable nor the compiler it chose — which is what
+# every Mac saw, because Apple's clang is present and cannot target wasm32.
+if ! targets_wasm32 "$CC_wasm32_unknown_unknown"; then
+  if command -v "$CC_wasm32_unknown_unknown" >/dev/null; then
+    echo "error: $CC_wasm32_unknown_unknown cannot target wasm32 — ring needs one that can (ADR 0130 §4)" >&2
+    echo "       Apple's clang is built without the wasm32 target; Homebrew's llvm carries it" >&2
+    echo "       install llvm (brew install llvm), or set CC_wasm32_unknown_unknown" >&2
+  else
+    echo "error: $CC_wasm32_unknown_unknown not found — ring needs clang for wasm32 (ADR 0130 §4)" >&2
+    echo "       looked for clang on PATH, for Homebrew's llvm prefix, and for" >&2
+    echo "       /usr/lib/llvm-*/bin holding both clang and llvm-ar" >&2
+    echo "       install clang and llvm, or set CC_wasm32_unknown_unknown" >&2
+  fi
   exit 1
 fi
 # The archiver is checked alongside the compiler because ring needs both, and
@@ -97,8 +131,10 @@ fi
 # before this check existed.
 if ! command -v "$AR_wasm32_unknown_unknown" >/dev/null; then
   echo "error: $AR_wasm32_unknown_unknown not found — ring needs an LLVM archiver for wasm32 (ADR 0130 §4)" >&2
-  echo "       looked for llvm-ar on PATH and for /usr/lib/llvm-*/bin holding both clang and llvm-ar" >&2
+  echo "       looked for llvm-ar on PATH, for Homebrew's llvm prefix, and for" >&2
+  echo "       /usr/lib/llvm-*/bin holding both clang and llvm-ar" >&2
   echo "       Debian and Ubuntu ship it as llvm-ar-<version>; the unversioned name comes from the llvm package" >&2
+  echo "       macOS keeps Homebrew's llvm off PATH by design; installing it is enough" >&2
   echo "       install llvm, or set AR_wasm32_unknown_unknown" >&2
   exit 1
 fi
@@ -154,12 +190,17 @@ build_module() {
   # Binaryen rewrites the module rather than compressing it: whole-program dead
   # code elimination, inlining, and dropping the name/debug sections.
   # Semantically identical, materially smaller, cheap enough for every build.
+  # `wc -c <` rather than `stat`, whose size flag is spelled `-c%s` by GNU and
+  # `-f%z` by BSD: the GNU spelling exits non-zero on macOS, and because this
+  # runs under `set -e` it takes the whole build down *after* the first module
+  # is already written — so the failure reads as a broken second module rather
+  # than as a line that only ever worked on Linux.
   local before after
-  before=$(stat -c%s "$out/${name}_bg.wasm")
+  before=$(( $(wc -c < "$out/${name}_bg.wasm") ))
   wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int \
     "$out/${name}_bg.wasm" -o "$out/${name}_bg.opt.wasm"
   mv "$out/${name}_bg.opt.wasm" "$out/${name}_bg.wasm"
-  after=$(stat -c%s "$out/${name}_bg.wasm")
+  after=$(( $(wc -c < "$out/${name}_bg.wasm") ))
   printf 'built %s (wasm %d -> %d bytes, %d%%)\n' "$out/$name.js" "$before" "$after" \
     "$(( after * 100 / before ))"
 }

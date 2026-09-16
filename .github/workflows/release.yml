@@ -58,9 +58,11 @@ jobs:
   # the Apple preflight, so the breakage stayed invisible until that was fixed.
   #
   # Built once here rather than in each matrix leg. The output is
-  # platform-independent JavaScript and wasm, and build-wasm.sh needs a GNU
-  # toolchain the macOS and Windows runners do not carry: clang, llvm-ar,
-  # binaryen 120 or newer, and `stat -c%s`.
+  # platform-independent JavaScript and wasm, and build-wasm.sh needs a
+  # toolchain the macOS and Windows runners do not carry: a clang that can
+  # target wasm32, llvm-ar, and binaryen 120 or newer. (It no longer needs GNU
+  # `stat`; that line is portable now. The runners still lack the rest, so this
+  # job stays where it is.)
   wasm:
     name: browser modules (wasm32)
     if: github.repository == 'GaugeWright/gaugedesk'

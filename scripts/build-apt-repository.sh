@@ -10,6 +10,11 @@ for tool in dpkg-deb dpkg-scanpackages gzip xz sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "$tool is required" >&2; exit 1; }
 done
 sha256_file() { sha256sum "$1" | awk '{ print $1 }'; }
+# `stat`'s size flag is spelled `-c%s` by GNU and `-f%z` by BSD, and each exits
+# non-zero on the other's. `wc -c <` is POSIX and spelled the same everywhere;
+# `$(( ))` strips the leading blanks BSD `wc` pads its count with, so this is an
+# integer rather than a string that only happens to survive `printf %d`.
+file_size() { echo "$(( $(wc -c < "$1") ))"; }
 
 mkdir -p "$REPO_ROOT/pool/main/g/gaugedesk"
 # What this package supersedes is already stated, once, in its own control file.
@@ -125,7 +130,7 @@ fi
   echo "SHA256:"
   while IFS= read -r path; do
     relative="${path#"$stable/"}"
-    printf ' %s %16d %s\n' "$(sha256_file "$path")" "$(stat -c %s "$path")" "$relative"
+    printf ' %s %16d %s\n' "$(sha256_file "$path")" "$(file_size "$path")" "$relative"
   done < <(find "$stable/main" -type f -print | sort)
 } >"$stable/Release"
 

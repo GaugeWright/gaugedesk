@@ -7,6 +7,10 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 chmod 755 "$TMP"
 sha256_file() { sha256sum "$1" | awk '{ print $1 }'; }
+# Same spelling problem as the builder this checks, and the same answer. The
+# comparison is a string one against the size the Release file records, so the
+# count has to arrive without BSD `wc`'s leading blanks.
+file_size() { echo "$(( $(wc -c < "$1") ))"; }
 
 make_deb() {
   local version="$1"
@@ -68,7 +72,7 @@ while read -r digest size relative; do
     echo "Release hash mismatch: $relative" >&2
     exit 1
   }
-  [ "$(stat -c %s "$file")" = "$size" ] || {
+  [ "$(file_size "$file")" = "$size" ] || {
     echo "Release size mismatch: $relative" >&2
     exit 1
   }
