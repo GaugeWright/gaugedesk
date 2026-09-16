@@ -601,6 +601,13 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .desktop-update { margin: 1px 4px 0; padding: 1px 4px; border: 1px solid var(--accent);
     border-radius: 4px; background: transparent; color: var(--accent); font: inherit; cursor: pointer; }
 .desktop-update:hover { background: var(--edge); }
+/* An unreachable update service reads as the muted status it is, not as the
+   accented offer beside it — it asks for nothing. The dotted underline is what
+   distinguishes it from the plain version text: it is the only part of that
+   line a click does anything to. */
+.update-retry { border: 0; background: transparent; text-align: left; cursor: pointer;
+    font-family: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }
+.update-retry:hover { color: var(--ink); }
 /* Transparent full-screen catcher: a click off a popover dismisses it. */
 .popover-catcher { position: fixed; inset: 0; z-index: 60; }
 

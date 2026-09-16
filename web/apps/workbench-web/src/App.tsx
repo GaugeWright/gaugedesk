@@ -60,7 +60,7 @@ import {
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
-import { desktopUpdateAllowed } from "./desktop-update";
+import { desktopUpdateAllowed, desktopUpdateShouldRecheck, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
 import { openExternal } from "./open-external";
 import "@gaugewright/gw-embed";
 import {
@@ -344,9 +344,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         readonly update?: import("@tauri-apps/plugin-updater").Update;
     } | null>(isTauri() ? { kind: "checking" } : null);
 
-    async function checkDesktopUpdate() {
+    /** `announce` states the check in the interface. A check a person asked for
+     * says so; the recheck timer's does not, because a footer that announces
+     * itself every few hours is reporting the timer rather than the release. */
+    async function checkDesktopUpdate(announce = true) {
         if (!isTauri()) return;
-        setDesktopUpdate({ kind: "checking" });
+        if (announce) setDesktopUpdate({ kind: "checking" });
         try {
             const [policy, updater] = await Promise.all([
                 api.softwareUpdatePolicy(),
@@ -362,8 +365,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 setDesktopUpdate({ kind: "restricted", version: update.version });
             }
         } catch {
-            // Version information remains useful even when release discovery is
-            // unavailable. Do not turn an unreachable update service into a warning.
+            // Still not a warning: an unreachable update service is not the
+            // person's problem to solve, and nothing they are doing is at risk.
+            // But it may not be *silent* either — rendering nothing here made a
+            // failed check identical to a successful one, so a client that could
+            // not reach the service looked exactly like a client that was current.
             setDesktopUpdate({ kind: "error" });
         }
     }
@@ -388,7 +394,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
     }
 
-    if (isTauri()) void checkDesktopUpdate();
+    if (isTauri()) {
+        void checkDesktopUpdate();
+        // The startup check alone answers with whatever was published before this
+        // window opened, and a desktop client stays open for days. See
+        // `DESKTOP_UPDATE_RECHECK_MS` for why discovery is a timer at all.
+        const recheck = window.setInterval(() => {
+            if (!desktopUpdateShouldRecheck(desktopUpdate()?.kind)) return;
+            void checkDesktopUpdate(false);
+        }, DESKTOP_UPDATE_RECHECK_MS);
+        onCleanup(() => window.clearInterval(recheck));
+    }
     // A pulse the in-chat "no model attached" action bumps to open the Account panel
     // (LLM-1): the transcript surfaces the refusal, this opens where you fix it.
     const [accountRequest, setAccountRequest] = createSignal(0);
@@ -1860,6 +1876,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     <span class="network-version" data-update-restricted title="The available stable release is outside this organization's allowed release channels.">
                         Update v{desktopUpdate()?.version} is managed by your organization
                     </span>
+                </Show>
+                {/* A check that could not complete states that much and no more. It
+                    carries the retry because the alternative is asking someone to
+                    restart the client to re-run a check they cannot see. */}
+                <Show when={desktopUpdate()?.kind === "error"}>
+                    <button
+                        class="network-version update-retry"
+                        data-update-error
+                        type="button"
+                        title="The update service could not be reached, so whether a newer release exists is unknown. Click to check again."
+                        onClick={() => void checkDesktopUpdate()}
+                    >
+                        Update check unavailable
+                    </button>
                 </Show>
             </div>
         </div>
