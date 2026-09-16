@@ -4460,6 +4460,42 @@
       }
     },
     {
+      "id": "home.project.whip-costs",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/projects/:id/whip-costs",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project",
+      "capability": "read-project-whip-costs",
+      "requestSchema": "http/path-project-id",
+      "responseSchema": "gw://schemas/project/whip-costs/v1",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/whip_costs.rs#a_project_that_has_run_nothing_costs_a_recorded_zero"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#project-authority-matrix"
+        ],
+        "journey": [
+          "crates/app/tests/whip_costs.rs#a_project_that_has_run_nothing_costs_a_recorded_zero"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/whip_costs.rs#a_store_that_will_not_open_withholds_the_total_rather_than_lowering_it"
+        ]
+      }
+    },
+    {
       "id": "home.project-target.attach",
       "jurisdiction": "private-home",
       "transport": "http-json",

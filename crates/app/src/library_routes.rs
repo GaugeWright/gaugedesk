@@ -843,6 +843,22 @@ pub async fn project_whips(
     }
 }
 
+/// What a project's whips have cost, priced from the runtime's own meter.
+pub async fn project_whip_costs(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    match wb.project_whip_costs_value(&id) {
+        Some(value) => (StatusCode::OK, Json(value)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such project" })),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn create_project(
     State(wb): State<SharedWorkbench>,
     Json(body): Json<CreateProject>,

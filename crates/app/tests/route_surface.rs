@@ -93,6 +93,12 @@ fn collection_and_gate_surface() -> Vec<RouteCheck> {
         },
         RouteCheck {
             method: "GET",
+            uri: format!("/projects/{PROJECT}/whip-costs"),
+            body: None,
+            because: "what a project's whips have cost, priced from the runtime's meter (COST-3)",
+        },
+        RouteCheck {
+            method: "GET",
             uri: format!("/projects/{PROJECT}/quarantine"),
             body: None,
             because: "the review surface's index (ADR 0110 §7)",

@@ -572,6 +572,64 @@ export async function projectWhips(transport: WorkbenchTransport, id: string): P
     return o as ProjectWhips;
 }
 
+/** What a project's whips have COST, priced from the runtime's own meter.
+ *
+ *  Three fields carry the rule the producer enforces, and a surface that
+ *  ignores them reintroduces the defect the whole projection is shaped around.
+ *
+ *  `total.amountMicros` is `null` whenever ANYTHING is missing — an unrecorded
+ *  token count, a model the card does not rate, or a store that would not open.
+ *  It is absent rather than smaller: a sum missing a term is not a total.
+ *
+ *  `total.recordedMicros` is what the counts the log DOES carry came to. It is
+ *  not a bound in either direction, so it is rendered beside `gaps` or not at
+ *  all — never in the place a total would go.
+ *
+ *  `gaps` are repair instructions, each naming the model and, where it applies,
+ *  the measure. "3 gaps" tells a reader nothing they can act on; "no rate for
+ *  claude-sonnet-5" is the next thing to do. */
+export interface ProjectWhipCosts {
+    readonly project: string;
+    readonly complete: boolean;
+    readonly rateCard: { readonly version: string; readonly currency: string } | null;
+    readonly total: {
+        readonly currency: string;
+        readonly amountMicros: number | null;
+        readonly recordedMicros: number;
+    };
+    readonly gaps: readonly { readonly reason: string; readonly model?: string; readonly measure?: string }[];
+}
+
+export async function projectWhipCosts(
+    transport: WorkbenchTransport,
+    id: string,
+): Promise<ProjectWhipCosts> {
+    const o = (await transport.json("GET", `/projects/${id}/whip-costs`)) as {
+        project?: unknown; total?: unknown; gaps?: unknown; complete?: unknown; rate_card?: unknown;
+    };
+    const total = o.total as { amount_micros?: unknown; recorded_micros?: unknown; currency?: unknown } | undefined;
+    if (typeof o.project !== "string" || !Array.isArray(o.gaps) || !total
+        || typeof total.recorded_micros !== "number" || typeof total.currency !== "string") {
+        throw new Error("project whip costs: response is not the declared shape");
+    }
+    // `null` is a value here, not a missing field, so it is carried through
+    // rather than defaulted. A `?? 0` on this line is the bug.
+    const amountMicros = total.amount_micros === null ? null : total.amount_micros;
+    if (amountMicros !== null && typeof amountMicros !== "number") {
+        throw new Error("project whip costs: amount_micros is neither a number nor null");
+    }
+    const card = o.rate_card as { version?: unknown; currency?: unknown } | null | undefined;
+    return {
+        project: o.project,
+        complete: o.complete === true,
+        rateCard: card && typeof card.version === "string" && typeof card.currency === "string"
+            ? { version: card.version, currency: card.currency }
+            : null,
+        total: { currency: total.currency, amountMicros, recordedMicros: total.recorded_micros },
+        gaps: o.gaps as ProjectWhipCosts["gaps"],
+    };
+}
+
 export async function placeArchetype(
     transport: WorkbenchTransport,
     pid: ProjectId,

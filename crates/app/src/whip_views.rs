@@ -49,8 +49,7 @@ impl Workbench {
         let gate_structure = std::fs::read_to_string(&gate_source)
             .ok()
             .and_then(|source| gaugedesk_whip_runtime::program_structure(&source));
-        let gate_store =
-            crate::gate_service::gate_state_dir(&root, project_id).join("runtime.sqlite");
+        let gate_store = gate_runtime_store(&root, project_id);
         let (gate_instances, gate_unread) = projected(&gate_store, Some("gate"));
         whips.push(json!({
             "path": gate_path,
@@ -63,7 +62,7 @@ impl Workbench {
 
         // Every chat's package. A chat that has never run has no store, and a
         // store's instances group by the program that ran them.
-        let runtime_root = root.join("whip-runtimes");
+        let runtime_root = chat_runtime_root(&root);
         for chat in self.library.project_chats(project_id) {
             let store = gaugedesk_whip_runtime::chat_runtime_database(&runtime_root, &chat.id);
             let mut by_program: std::collections::BTreeMap<String, Vec<Value>> = Default::default();
@@ -118,6 +117,19 @@ impl Workbench {
             "whips": whips,
         }))
     }
+}
+
+/// Where a project's gate writes its runs.
+///
+/// One spelling, shared with `whip_costs`. A second would let the desk meter a
+/// store nothing draws, or draw one nothing meters, and neither would fail.
+pub(crate) fn gate_runtime_store(root: &Path, project_id: &str) -> std::path::PathBuf {
+    crate::gate_service::gate_state_dir(root, project_id).join("runtime.sqlite")
+}
+
+/// Where a project's chats write theirs.
+pub(crate) fn chat_runtime_root(root: &Path) -> std::path::PathBuf {
+    root.join("whip-runtimes")
 }
 
 /// One store's instances, and what the read could not see (ACTION-7).

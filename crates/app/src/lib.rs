@@ -118,6 +118,7 @@ pub mod tenancy;
 pub mod throttle;
 pub mod tokenwright;
 pub mod turn_summary;
+mod whip_costs;
 mod whip_views;
 pub mod workbench_auth;
 pub mod workbench_state;
