@@ -56,12 +56,13 @@ function ProviderManager(props: Props & { model: Providers }): JSX.Element {
     let epoch = 0;
     let draftBasis = "";
     const can = (suffix: string) => props.commands.includes(`organization-provider.${suffix}`);
-    // The check is admitted by `organization-provider.verify`. Until every
-    // operated authority advertises it, a session that admits key setup at all
-    // still offers the check, because the alternative is a sealed candidate
-    // with no way forward and no explanation. Drop the second clause once
-    // gaugewright-cloud's COMMAND_IDS carries `organization-provider.verify`.
-    const canVerify = () => can("verify") || can("intake.cancel");
+    // Checking a sealed candidate is not a reviewed management command: the
+    // credential authority runs it on its own candidate-bound route, which
+    // rechecks the uploader and the exact candidate either side of the provider
+    // call. There is therefore no `organization-provider.verify` capability to
+    // gate on, and the candidate-lifecycle capability the session already
+    // carries is what says this person may drive a key through setup.
+    const canVerify = () => can("intake.cancel");
     const clearSecret = () => { if (secretInput) secretInput.value = ""; upload?.abort(); upload = undefined; };
     const close = () => { epoch++; clearSecret(); setMode(null); setBusy(false); setError(""); };
     onCleanup(() => { epoch++; clearSecret(); });

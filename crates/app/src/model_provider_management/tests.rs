@@ -1,6 +1,6 @@
 use super::*;
 use gaugedesk_core::ids::SecretHandleId;
-use gaugedesk_core::model_connection::{ConnectionStatus, Material, VersionPhase};
+use gaugedesk_core::model_connection::{ConnectionStatus, Material};
 use gaugedesk_core::Lifecycle;
 use serde_json::json;
 
@@ -75,7 +75,6 @@ fn context(request: &MetadataRequest) -> ManagementContext {
         validated_definition: None,
         validated_subject: None,
         validated_policy: None,
-        validated_verification: None,
     }
 }
 fn apply(store: &mut Store, capability: Capability, operation: Operation) -> State {
@@ -623,126 +622,6 @@ fn management_cannot_verify_its_own_candidate_and_cancellation_requires_cleanup(
         Material::ErasureRequired { handle: None }
     );
     assert!(state.connections[id].active_version().is_none());
-}
-
-/// A connection whose candidate is sealed but not yet checked — the exact state
-/// the verify request exists to move out of. `ready` runs past it.
-fn sealed_candidate(store: &mut Store) -> (State, ProviderBinding, SecretHandleId) {
-    let parsed = MetadataRequest::parse(intake_body()).unwrap();
-    let definition = parsed.requested_definition().unwrap();
-    let provider = definition.provider.clone();
-    let handle = SecretHandleId::new("test-opaque-custody-handle");
-    apply(
-        store,
-        Capability::ManageConnections,
-        Operation::BeginIntake {
-            connection: connection(),
-            definition,
-            reconnects: None,
-            version: version(),
-            expires_at: 1000,
-        },
-    );
-    let state = apply(
-        store,
-        Capability::SealCandidate,
-        Operation::RecordSealed {
-            connection: connection(),
-            version: version(),
-            handle: handle.clone(),
-        },
-    );
-    (state, provider, handle)
-}
-
-fn verify_request(revision: u64, key: &str) -> MetadataRequest {
-    request(
-        "organization-provider.verify",
-        json!({"connection": connection(), "version": version()}),
-        revision,
-        key,
-    )
-}
-
-fn verification(
-    provider: &ProviderBinding,
-    handle: &SecretHandleId,
-    passed: bool,
-) -> VerificationAdmission {
-    VerificationAdmission {
-        connection: connection(),
-        version: version(),
-        provider: provider.clone(),
-        handle: handle.clone(),
-        check: gaugedesk_core::model_connection::VerificationCheck::ModelCatalogRead,
-        passed,
-        evidence: ObservationId::new("isolated-provider-check"),
-    }
-}
-
-#[test]
-fn verification_requires_the_authority_s_own_observation_of_this_candidate() {
-    let mut store = Store::open_in_memory().unwrap();
-    let (state, provider, handle) = sealed_candidate(&mut store);
-    let req = verify_request(state.revision, "verify-unadmitted");
-    let ctx = context(&req);
-    // Naming a candidate is a request to check it, not evidence that it was
-    // checked. Without the adapter's observation there is nothing to record.
-    assert!(admit_metadata(&mut store, &ctx, &req).is_err());
-
-    let mut store = Store::open_in_memory().unwrap();
-    let (state, _, _) = sealed_candidate(&mut store);
-    let req = verify_request(state.revision, "verify-crossed");
-    let mut ctx = context(&req);
-    let mut crossed = verification(&provider, &handle, true);
-    crossed.version = CredentialVersionId::new("some-other-candidate");
-    ctx.validated_verification = Some(crossed);
-    assert!(
-        admit_metadata(&mut store, &ctx, &req).is_err(),
-        "an observation of one candidate cannot verify another"
-    );
-}
-
-#[test]
-fn an_admitted_check_records_its_outcome_and_only_a_pass_becomes_activatable() {
-    for passed in [true, false] {
-        let mut store = Store::open_in_memory().unwrap();
-        let (state, provider, handle) = sealed_candidate(&mut store);
-        let req = verify_request(state.revision, "verify");
-        let mut ctx = context(&req);
-        ctx.validated_verification = Some(verification(&provider, &handle, passed));
-        let state = admit_metadata(&mut store, &ctx, &req).unwrap().state;
-
-        let candidate = &state.connections[&connection()].versions[&version()];
-        // Either outcome names the check that was run — an unidentified
-        // observation is not proof and is not a silent failure either.
-        assert!(candidate.verification.is_some());
-        if passed {
-            assert!(matches!(candidate.phase, VersionPhase::Verified { .. }));
-        } else {
-            assert!(matches!(candidate.phase, VersionPhase::Failed { .. }));
-            assert!(
-                matches!(candidate.material, Material::ErasureRequired { .. }),
-                "a failed check ends the candidate and its material"
-            );
-        }
-
-        // Activation is a separate reviewed command, and it may only follow a
-        // pass. A failed check must not leave material an administrator can
-        // activate by retrying the next step.
-        let activate = request(
-            "organization-provider.version.activate",
-            json!({"connection": connection(), "version": version()}),
-            state.revision,
-            "activate",
-        );
-        let ctx = context(&activate);
-        assert_eq!(
-            admit_metadata(&mut store, &ctx, &activate).is_ok(),
-            passed,
-            "activation must follow the recorded outcome"
-        );
-    }
 }
 
 #[test]
