@@ -135,6 +135,24 @@ pub struct AccountAuthConfig {
     pub session_ttl_secs: u64,
 }
 
+/// Whether `host` may assert `rp_id`, per WebAuthn's registrable-suffix rule.
+///
+/// Suffix matching here is on label boundaries, never raw string ends:
+/// `evilgaugewright.com` ends with `gaugewright.com` as text while being an
+/// unrelated registration, and accepting it would let that origin mint
+/// credentials for this one.
+///
+/// A bare suffix with no dot is refused except by exact match, so no origin can
+/// claim a whole top-level domain as its RP id. Exact match is what keeps
+/// single-label development hosts such as `localhost` working.
+fn host_admits_rp_id(host: Option<&str>, rp_id: &str) -> bool {
+    let Some(host) = host else { return false };
+    if host == rp_id {
+        return true;
+    }
+    rp_id.contains('.') && host.ends_with(&format!(".{rp_id}"))
+}
+
 impl AccountAuthConfig {
     pub fn new(rp_id: &str, rp_name: &str, origin: &str) -> Result<Self, String> {
         let rp_id = rp_id.trim();
@@ -162,8 +180,18 @@ impl AccountAuthConfig {
         if parsed.scheme() != "https" && !secure_loopback {
             return Err("WebAuthn origin must be HTTPS (except loopback development)".into());
         }
-        if parsed.host_str() != Some(rp_id) {
-            return Err("WebAuthn RP id must equal the origin host".into());
+        // WebAuthn (§5.1.3) admits an RP id that is the origin's effective
+        // domain *or a registrable suffix of it*, and the suffix case is the
+        // one a multi-subdomain deployment needs: one passkey created in the
+        // Desk UI has to authenticate against the account API on a sibling
+        // host. Demanding equality quietly forces the RP id down to a single
+        // subdomain, and an RP id is baked into every credential ever
+        // registered under it — so the narrow choice cannot be taken back
+        // later without invalidating them all.
+        if !host_admits_rp_id(parsed.host_str(), rp_id) {
+            return Err(
+                "WebAuthn RP id must equal the origin host or be a registrable suffix of it".into(),
+            );
         }
         Ok(Self {
             rp_id: rp_id.to_owned(),
@@ -1760,8 +1788,44 @@ mod tests {
         );
     }
 
+    /// The deployed shape: the ceremony runs in the Desk UI while the account
+    /// API answers on a sibling host, so one passkey has to span both. Demanding
+    /// an exact host match made that unconfigurable — the hosted Hub refused to
+    /// start with `gaugewright.com` against `https://desk.gaugewright.com`, and
+    /// reported it as three missing variables that were in fact all set.
     #[test]
-    fn production_configuration_requires_https_and_exact_rp_host() {
+    fn a_registrable_suffix_rp_id_spans_sibling_hosts() {
+        assert!(AccountAuthConfig::new(
+            "gaugewright.com",
+            "GaugeDesk",
+            "https://desk.gaugewright.com"
+        )
+        .is_ok());
+        assert!(AccountAuthConfig::new(
+            "example.com",
+            "GaugeDesk",
+            "https://deep.nested.example.com"
+        )
+        .is_ok());
+
+        // Suffix matching is on label boundaries. This host merely *ends with*
+        // the RP id as text and is an unrelated registration; admitting it would
+        // let it mint credentials for the real domain.
+        assert!(
+            AccountAuthConfig::new("example.com", "GaugeDesk", "https://evilexample.com").is_err()
+        );
+        // Nothing may claim a whole top-level domain as its RP id.
+        assert!(AccountAuthConfig::new("com", "GaugeDesk", "https://example.com").is_err());
+        // The parent may not claim a child.
+        assert!(
+            AccountAuthConfig::new("desk.example.com", "GaugeDesk", "https://example.com").is_err()
+        );
+        // Exact match is still what single-label development hosts rely on.
+        assert!(AccountAuthConfig::new("localhost", "GaugeDesk", "http://localhost:3000").is_ok());
+    }
+
+    #[test]
+    fn production_configuration_requires_https_and_an_admissible_rp_host() {
         assert!(AccountAuthConfig::new("example.com", "GaugeDesk", "https://example.com").is_ok());
         assert!(
             AccountAuthConfig::new("https://example.com", "GaugeDesk", "https://example.com")
