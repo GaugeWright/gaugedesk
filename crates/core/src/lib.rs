@@ -39,6 +39,7 @@ pub mod mobile_wake;
 pub mod model_connection;
 pub mod package_distribution;
 pub mod pinned_tls;
+pub mod project_host_export;
 pub mod project_host_registration;
 pub mod protected_profile;
 pub mod rbac;
