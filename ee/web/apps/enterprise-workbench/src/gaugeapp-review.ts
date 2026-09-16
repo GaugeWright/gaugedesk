@@ -61,8 +61,9 @@ export const REVIEW_COMMANDS = {
     "organization.display-name.set": ["administration", "organization", "Change organization name"],
     "organization.ownership.transfer": ["administration", "organization", "Transfer ownership"],
     "organization.delete": ["administration", "organization", "Delete organization"],
+    "organization.domain.add": ["administration", "organization", "Add domain"],
     "organization.domain.verify": ["administration", "organization", "Verify domain"],
-    "organization.domain.remove": ["administration", "organization", "Remove verified domain"],
+    "organization.domain.remove": ["administration", "organization", "Remove domain"],
     "people.invitation.create": ["administration", "people", "Invite people"],
     "people.invitation.cancel": ["administration", "people", "Cancel invitation"],
     "people.invitation.resend": ["administration", "people", "Replace invitation link"],
@@ -579,13 +580,17 @@ export function summarizeGaugeAppChange(proposal: GaugeAppProposal, page: GaugeA
                 field("Organization", string(p.confirmation));
                 note = "Remove this organization from GaugeDesk, end access, and destroy its content key. Required billing and audit evidence may remain. Members, services, plans, active engagements, or shared model connections prevent deletion.";
                 break;
+            case "organization.domain.add":
+                field("Domain", string(p.domain));
+                note = "Record this claim and publish its DNS challenge. The domain admits no sign-in and grants nothing until a separate Verify proves the TXT record.";
+                break;
             case "organization.domain.verify":
                 field("Domain", string(p.domain));
-                note = "Domain ownership must pass verification before it can be added.";
+                note = "Check the published TXT record and, if it matches, promote this claim to a verified domain. Accepting this cannot succeed while the record is absent.";
                 break;
             case "organization.domain.remove":
-                field("Verified domain", string(p.domain));
-                note = "Remove this domain from the organization's verified domains.";
+                field("Domain", string(p.domain));
+                note = "Withdraw this domain, whether it is verified or still awaiting its DNS proof.";
                 break;
             case "people.invitation.create":
                 field("Recipients", strings(p.emails));

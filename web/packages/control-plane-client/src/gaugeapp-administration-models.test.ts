@@ -39,11 +39,29 @@ describe("Administration GaugeApp models", () => {
             ...administrationEmptyModels.organization,
             owner: { id: "member-a", authority: "authority:a", email: "a@example.test", label: "Ada" },
             ownership_candidates: [{ id: "member-b", authority: "authority:b", email: "b@example.test", label: "Babbage", role: "admin" }],
-            domains: [{ domain: "example.test", status: "verified" }],
+            domains: [{ domain: "example.test", status: "verified", challenge: null }],
         };
         expect(parseOrganizationModel(populated, "model")?.owner?.authority).toBe("authority:a");
         expect(() => parseOrganizationModel({ ...populated, owner: { ...populated.owner, email: undefined } }, "model")).toThrow(/owner.email/);
-        expect(() => parseOrganizationModel({ ...populated, domains: [{ domain: "example.test", status: "pending" }] }, "model")).toThrow(/status/);
+        expect(() => parseOrganizationModel({ ...populated, domains: [{ domain: "example.test", status: "unknown", challenge: null }] }, "model")).toThrow(/status/);
+    });
+
+    it("reads a pending domain with its exact challenge and refuses a partial one", () => {
+        const pending = (challenge: unknown) => ({
+            ...administrationEmptyModels.organization,
+            domains: [{ domain: "example.test", status: "pending", challenge }],
+        });
+        const challenge = {
+            record_name: "_gaugewright-challenge.example.test",
+            record_type: "TXT",
+            value: "gaugewright-domain-verification=abc",
+        };
+        expect(parseOrganizationModel(pending(challenge), "model")?.domains[0].challenge).toEqual(challenge);
+        // A pending row whose challenge is absent or half-built would render
+        // proof instructions the administrator cannot act on, so it is not a
+        // model this page accepts.
+        expect(() => parseOrganizationModel(pending(undefined), "model")).toThrow(/challenge/);
+        expect(() => parseOrganizationModel(pending({ ...challenge, value: undefined }), "model")).toThrow(/challenge.value/);
     });
 
     it("does not coerce organization-session identity, posture, build, or clocks", () => {

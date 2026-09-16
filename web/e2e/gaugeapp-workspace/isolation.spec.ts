@@ -61,6 +61,39 @@ test("disabled GaugeApp actions are visibly inactive", async ({ page }) => {
     expect(style.cursor).toBe("default");
 });
 
+test("a claimed domain keeps its published record and only a pending one offers verification", async ({ page }) => {
+    await page.goto("/?app=administration&all-pages=1&actionable-pages=1&domains=pending");
+    const pending = page.locator('.gaugeapp-domain-row[data-status="pending"]');
+    const verified = page.locator('.gaugeapp-domain-row[data-status="verified"]');
+    await expect(pending).toContainText("pending.example");
+    await expect(pending).toContainText("awaiting DNS proof");
+    await expect(verified).toContainText("verified.example");
+
+    // The claim is server-held, so the record to publish is on the row itself.
+    // Before this it lived in component state behind the add dialog, and a
+    // reload lost both the claim and any way to see what was outstanding.
+    await expect(pending.locator("code")).toHaveText([
+        "_gaugewright-challenge.pending.example",
+        "TXT",
+        "gaugewright-domain-verification=fixture-challenge-token",
+    ]);
+    await page.reload();
+    await expect(pending.locator("code").first()).toHaveText("_gaugewright-challenge.pending.example");
+
+    // Verification promotes a standing claim, so it is offered on the pending
+    // row and nowhere else; a verified domain has nothing left to prove.
+    await expect(pending.getByRole("button", { name: "Verify DNS", exact: true })).toBeVisible();
+    await expect(verified.getByRole("button", { name: "Verify DNS", exact: true })).toHaveCount(0);
+    await expect(verified.getByRole("button", { name: "Remove", exact: true })).toBeVisible();
+
+    await click(page, "Add domain");
+    await page.getByLabel("Domain to add").fill("  Third.Example  ");
+    await click(page, "Add domain");
+    expect(await calls(page)).toContainEqual(
+        expect.objectContaining({ command: "organization.domain.add", payload: { domain: "Third.Example" } }),
+    );
+});
+
 test("Organization Policy presents its open Project Host operator set truthfully", async ({ page }) => {
     await page.goto("/?app=administration&all-pages=1");
     await page.getByRole("button", { name: "Organization Policy", exact: true }).click();

@@ -350,6 +350,12 @@ const COMMANDS: &[CommandPolicy] = &[
         review: ReviewPolicy::Human,
     },
     CommandPolicy {
+        id: "organization.domain.add",
+        page: "organization",
+        capability: Capability::ConfigureSso,
+        review: ReviewPolicy::Human,
+    },
+    CommandPolicy {
         id: "organization.domain.verify",
         page: "organization",
         capability: Capability::ConfigureSso,
@@ -1002,10 +1008,28 @@ fn project_page(
                     "label": if member.email.trim().is_empty() { &member.authority } else { &member.email },
                     "role": member.role,
                 })).collect::<Vec<_>>(),
-                "domains": record.verified_domains.iter().map(|domain| json!({
-                    "domain": domain,
-                    "status": "verified",
-                })).collect::<Vec<_>>(),
+                "domains": record
+                    .verified_domains
+                    .iter()
+                    .map(|domain| json!({
+                        "domain": domain,
+                        "status": "verified",
+                        "challenge": Value::Null,
+                    }))
+                    .chain(record.pending_domains.iter().map(|domain| json!({
+                        "domain": domain,
+                        "status": "pending",
+                        // Derived on every read rather than stored with the
+                        // claim. The token is a pure function of the domain, so
+                        // a stored copy could only ever disagree with the proof
+                        // check, and holding one grants nothing either way.
+                        "challenge": {
+                            "record_name": format!("_gaugewright-challenge.{domain}"),
+                            "record_type": "TXT",
+                            "value": crate::org_routes::expected_txt(domain),
+                        },
+                    })))
+                    .collect::<Vec<_>>(),
             })
         }),
         "people" => {
@@ -2123,6 +2147,45 @@ fn parse<T: serde::de::DeserializeOwned>(payload: &Value) -> Result<T, Response>
     })
 }
 
+/// A claimed domain, lowercased and checked for the shape a DNS challenge can
+/// actually be published under.
+///
+/// The page sends whatever an administrator typed, so a pasted URL or an email
+/// address arrives here routinely. Minting a challenge for one produces a
+/// `_gaugewright-challenge.https://acme.com` record nobody can create, and the
+/// claim then sits pending forever while the page insists the DNS is wrong.
+fn claimed_domain(raw: &str) -> Result<String, Response> {
+    let domain = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "domain is required" })),
+        )
+            .into_response());
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    let publishable = domain.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    if !publishable {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "domain is not a publishable DNS name",
+                "domain": domain,
+            })),
+        )
+            .into_response());
+    }
+    Ok(domain)
+}
+
 /// ADR 0149 §1: granting a **privileged** role (`owner`/`admin`) — as the target of an
 /// invite or a role change — requires the owner-only `GrantPrivilegedRoles` capability,
 /// over and above the `ManageMembers` the `member.*` command already carries. The
@@ -2355,24 +2418,83 @@ fn plan_command(
                 transient_result: Some(json!({ "deleted_organization": tenant })),
             }
         }
-        "organization.domain.verify" => {
+        "organization.domain.add" => {
             let value: DomainPayload = parse(&command.payload)?;
-            let domain = value.domain.trim().to_ascii_lowercase();
-            if domain.is_empty() {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({ "error": "domain is required" })),
-                )
-                    .into_response());
-            }
+            let domain = claimed_domain(&value.domain)?;
             let mut record = org.org.clone().unwrap_or_default();
             record.id = ORG_ID.into();
             record.op = RecordOp::Upsert;
-            if !record
+            if record
                 .verified_domains
                 .iter()
                 .any(|existing| existing.eq_ignore_ascii_case(&domain))
             {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "domain is already verified",
+                        "domain": domain,
+                    })),
+                )
+                    .into_response());
+            }
+            if record
+                .pending_domains
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&domain))
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "domain is already awaiting its DNS proof",
+                        "domain": domain,
+                    })),
+                )
+                    .into_response());
+            }
+            record.pending_domains.push(domain.clone());
+            record.pending_domains.sort();
+            record.pending_domains.dedup();
+            MutationPlan {
+                facts: vec![fact(&scope, "org", &record)?],
+                notices: vec![("org", record.id.clone(), "upsert")],
+                audit_action: "organization.domain.add",
+                audit_target: domain,
+                transient_result: None,
+            }
+        }
+        "organization.domain.verify" => {
+            let value: DomainPayload = parse(&command.payload)?;
+            let domain = claimed_domain(&value.domain)?;
+            let mut record = org.org.clone().unwrap_or_default();
+            record.id = ORG_ID.into();
+            record.op = RecordOp::Upsert;
+            // Verification promotes a standing claim; it does not create one.
+            // Accepting an unclaimed domain here would let the proof step be the
+            // whole ceremony, which is how a domain nobody ever claimed becomes
+            // verified in one reviewed call.
+            let claimed = record
+                .pending_domains
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&domain));
+            let already_verified = record
+                .verified_domains
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&domain));
+            if !claimed && !already_verified {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": "domain has not been added",
+                        "domain": domain,
+                    })),
+                )
+                    .into_response());
+            }
+            record
+                .pending_domains
+                .retain(|existing| !existing.eq_ignore_ascii_case(&domain));
+            if !already_verified {
                 record.verified_domains.push(domain.clone());
                 record.verified_domains.sort();
                 record.verified_domains.dedup();
@@ -2402,14 +2524,20 @@ fn plan_command(
                 )
                     .into_response());
             };
-            let original_len = record.verified_domains.len();
+            // Remove withdraws a claim at either stage. Restricting it to
+            // verified domains would leave a mistyped pending claim with no way
+            // off the page at all, since its DNS proof can never arrive.
+            let before = record.verified_domains.len() + record.pending_domains.len();
             record
                 .verified_domains
                 .retain(|existing| !existing.eq_ignore_ascii_case(&domain));
-            if record.verified_domains.len() == original_len {
+            record
+                .pending_domains
+                .retain(|existing| !existing.eq_ignore_ascii_case(&domain));
+            if record.verified_domains.len() + record.pending_domains.len() == before {
                 return Err((
                     StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "verified domain is not present" })),
+                    Json(json!({ "error": "domain is not present" })),
                 )
                     .into_response());
             }
@@ -7073,6 +7201,7 @@ mod tests {
             op: RecordOp::Upsert,
             display_name: "Expert LLC".into(),
             verified_domains: vec!["example.test".into()],
+            pending_domains: Vec::new(),
             default_region: Some("eu".into()),
             kind: gaugedesk_app::org::OrgKind::Consultant,
         };
@@ -7407,6 +7536,7 @@ mod tests {
             op: RecordOp::Upsert,
             display_name: "Acme".into(),
             verified_domains: vec!["acme.example".into(), "keep.example".into()],
+            pending_domains: Vec::new(),
             default_region: Some("us".into()),
             kind: gaugedesk_app::org::OrgKind::Client,
         };
@@ -7470,6 +7600,250 @@ mod tests {
         assert_eq!(record.display_name, "Acme");
         assert_eq!(record.verified_domains, vec!["keep.example"]);
         assert_eq!(record.default_region.as_deref(), Some("us"));
+    }
+
+    async fn organization_page(app: &Router) -> Value {
+        let session = open(app).await;
+        let (status, response) = request(
+            app,
+            Method::GET,
+            &format!(
+                "/gaugeapps/administration/pages/organization?session={}&generation={}&scope={}",
+                session["id"].as_str().unwrap(),
+                session["generation"].as_str().unwrap(),
+                session["scope"]["id"].as_str().unwrap(),
+            ),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        response["page"].clone()
+    }
+
+    /// Propose `command_id` against the current organization basis and return
+    /// the status with the body, so a refusal can be read at the point it is
+    /// made rather than after a review that never happens.
+    async fn propose_organization(
+        app: &Router,
+        command_id: &str,
+        payload: Value,
+        key: &str,
+    ) -> (StatusCode, Value) {
+        let session = open(app).await;
+        let organization = session["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|page| page["id"] == "organization")
+            .unwrap()
+            .clone();
+        request(
+            app,
+            Method::POST,
+            "/gaugeapps/administration/commands",
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "page_id": "organization", "command_id": command_id,
+                "expected_basis": organization["resource_basis"],
+                "idempotency_key": key,
+                "payload": payload, "client": "web",
+            }),
+            Some(key),
+        )
+        .await
+    }
+
+    async fn accept_organization_proposal(app: &Router, proposal_id: &str, key: &str) -> Value {
+        let session = open(app).await;
+        let (status, applied) = request(
+            app,
+            Method::POST,
+            &format!("/gaugeapps/administration/proposals/{proposal_id}/review"),
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "decision": "accept", "client": "web",
+            }),
+            Some(key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        applied
+    }
+
+    #[tokio::test]
+    async fn adding_a_domain_records_a_pending_claim_and_publishes_its_challenge() {
+        let (_dir, shared, app) = test_app();
+        let (status, proposed) = propose_organization(
+            &app,
+            "organization.domain.add",
+            json!({ "domain": "Acme.Example." }),
+            "domain-add-1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proposed}");
+        assert!(
+            Org::rebuild(shared.lock().unwrap().store_ref())
+                .unwrap()
+                .org
+                .is_none_or(|record| record.pending_domains.is_empty()),
+            "a proposal is not authority"
+        );
+
+        accept_organization_proposal(
+            &app,
+            proposed["proposal"]["id"].as_str().unwrap(),
+            "domain-add-review-1",
+        )
+        .await;
+        let record = Org::rebuild(shared.lock().unwrap().store_ref())
+            .unwrap()
+            .org
+            .unwrap();
+        assert_eq!(record.pending_domains, vec!["acme.example"]);
+        assert!(
+            record.verified_domains.is_empty(),
+            "adding a domain must not verify it"
+        );
+
+        let domains = organization_page(&app).await["model"]["domains"].clone();
+        assert_eq!(domains.as_array().unwrap().len(), 1);
+        assert_eq!(domains[0]["domain"], "acme.example");
+        assert_eq!(domains[0]["status"], "pending");
+        assert_eq!(
+            domains[0]["challenge"]["record_name"],
+            "_gaugewright-challenge.acme.example"
+        );
+        assert_eq!(domains[0]["challenge"]["record_type"], "TXT");
+        assert_eq!(
+            domains[0]["challenge"]["value"].as_str().unwrap(),
+            crate::org_routes::expected_txt("acme.example"),
+            "the page must publish the exact value the proof check compares against"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_promotes_only_a_domain_that_was_actually_claimed() {
+        let (_dir, _shared, app) = test_app();
+        let (status, proposed) = propose_organization(
+            &app,
+            "organization.domain.add",
+            json!({ "domain": "acme.example" }),
+            "claim-1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proposed}");
+        accept_organization_proposal(
+            &app,
+            proposed["proposal"]["id"].as_str().unwrap(),
+            "claim-review-1",
+        )
+        .await;
+
+        // The claim exists, so verification may be proposed. Accepting it still
+        // requires the published TXT record, which is a separate gate.
+        let (status, ok) = propose_organization(
+            &app,
+            "organization.domain.verify",
+            json!({ "domain": "ACME.example" }),
+            "verify-1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ok}");
+
+        // Without a claim there is nothing to promote. Allowing this would make
+        // the proof step the entire ceremony for a domain nobody ever added.
+        let (status, refused) = propose_organization(
+            &app,
+            "organization.domain.verify",
+            json!({ "domain": "other.example" }),
+            "verify-2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+
+        let (status, duplicate) = propose_organization(
+            &app,
+            "organization.domain.add",
+            json!({ "domain": "acme.example" }),
+            "claim-2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{duplicate}");
+
+        for bad in [
+            "localhost",
+            "https://acme.example",
+            "admin@acme.example",
+            "acme..example",
+            "-acme.example",
+        ] {
+            let (status, refused) = propose_organization(
+                &app,
+                "organization.domain.add",
+                json!({ "domain": bad }),
+                &format!("bad-{bad}"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad} is not a publishable DNS name: {refused}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_a_pending_claim_withdraws_it_and_leaves_verified_domains() {
+        let (_dir, shared, app) = test_app();
+        let original = OrgRecord {
+            id: ORG_ID.into(),
+            op: RecordOp::Upsert,
+            display_name: "Acme".into(),
+            verified_domains: vec!["keep.example".into()],
+            pending_domains: vec!["mistyped.example".into()],
+            default_region: None,
+            kind: gaugedesk_app::org::OrgKind::Client,
+        };
+        shared
+            .lock()
+            .unwrap()
+            .store_mut()
+            .append_record("org", "org", &serde_json::to_string(&original).unwrap())
+            .unwrap();
+
+        let (status, proposed) = propose_organization(
+            &app,
+            "organization.domain.remove",
+            json!({ "domain": "mistyped.example" }),
+            "withdraw-1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proposed}");
+        accept_organization_proposal(
+            &app,
+            proposed["proposal"]["id"].as_str().unwrap(),
+            "withdraw-review-1",
+        )
+        .await;
+
+        let record = Org::rebuild(shared.lock().unwrap().store_ref())
+            .unwrap()
+            .org
+            .unwrap();
+        assert!(record.pending_domains.is_empty());
+        assert_eq!(record.verified_domains, vec!["keep.example"]);
+
+        let (status, refused) = propose_organization(
+            &app,
+            "organization.domain.remove",
+            json!({ "domain": "mistyped.example" }),
+            "withdraw-2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
     }
 
     #[tokio::test]

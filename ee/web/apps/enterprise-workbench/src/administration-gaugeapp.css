@@ -247,6 +247,11 @@
     grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; padding: 4px 8px 8px; }
 .gaugeapp-inline-form-wide { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
 .gaugeapp-inline-form label { display: grid; gap: 4px; color: var(--muted); font-size: var(--fs-small); }
+/* An explanatory line is not a field. The form is a two-column
+   `field | actions` grid, so a bare paragraph lands in the actions column and
+   squeezes the field beside it to nothing — which is what the ownership form
+   had been doing quietly, and what the new domain form made obvious. */
+.gaugeapp-inline-form > p { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: var(--fs-small); }
 .gaugeapp-inline-form input,
 .gaugeapp-device-edit input,
 .gaugeapp-setting-row input { min-width: 0; height: 30px; padding: 4px 7px; border-radius: 2px; }
@@ -338,6 +343,15 @@
 .gaugeapp-domain-row > div:first-child { display: flex; align-items: baseline; gap: 9px; min-width: 0; }
 .gaugeapp-domain-row > div:first-child strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gaugeapp-domain-row > div:first-child span { color: var(--ok, #8ca); font-size: var(--fs-label); letter-spacing: .04em; text-transform: uppercase; }
+/* A pending row carries its proof under the name, so the row stops being one
+   line and its controls stay top-aligned against the record. */
+.gaugeapp-domain-row[data-status="pending"] { align-items: start; }
+.gaugeapp-domain-row[data-status="pending"] > div:first-child span { color: var(--muted); }
+.gaugeapp-domain-proof { grid-column: 1 / -1; display: grid; gap: 4px; margin: 2px 0 1px; }
+.gaugeapp-domain-proof > div { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 8px; align-items: baseline; }
+.gaugeapp-domain-proof dt { color: var(--muted); font-size: var(--fs-label); letter-spacing: .04em; text-transform: uppercase; }
+.gaugeapp-domain-proof dd { min-width: 0; margin: 0; }
+.gaugeapp-domain-proof code { display: block; overflow: auto; padding: 4px 7px; background: color-mix(in srgb, var(--navy) 62%, var(--panel)); border: 1px solid color-mix(in srgb, var(--edge) 70%, transparent); font-size: var(--fs-small); }
 .gaugeapp-domain-challenge { display: grid; gap: 9px; margin: 0 8px 6px; padding: 10px;
     background: color-mix(in srgb, var(--panel) 74%, transparent); border: 1px solid var(--edge); }
 .gaugeapp-domain-challenge > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

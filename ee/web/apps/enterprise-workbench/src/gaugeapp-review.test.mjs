@@ -133,6 +133,7 @@ const examples = {
     "organization.display-name.set": [{ display_name: "New Example" }, organization],
     "organization.ownership.transfer": [{ id: member.id }, organization],
     "organization.delete": [{ confirmation: "Example Org" }, organization],
+    "organization.domain.add": [{ domain: "example.invalid" }, organization],
     "organization.domain.verify": [{ domain: "example.invalid" }, organization],
     "organization.domain.remove": [{ domain: "example.invalid" }, organization],
     "people.invitation.create": [{ emails: ["one@example.invalid", "two@example.invalid"], role: "member", team: "team-a" }, people],

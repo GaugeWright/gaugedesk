@@ -82,8 +82,9 @@ pub enum OrgKind {
 }
 
 /// The org's profile (B10): display name, verified email domains (the basis for
-/// domain-capture auto-join, `ID-6`), the default data-residency region new projects inherit
-/// (the ADR 0032 `region` attribute), and the tenant **kind** (party-neutral, ADR 0061).
+/// domain-capture auto-join, `ID-6`), the domains still awaiting their DNS
+/// proof, the default data-residency region new projects inherit (the ADR 0032
+/// `region` attribute), and the tenant **kind** (party-neutral, ADR 0061).
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct OrgRecord {
     pub id: String,
@@ -93,6 +94,15 @@ pub struct OrgRecord {
     pub display_name: String,
     #[serde(default)]
     pub verified_domains: Vec<String>,
+    /// Domains an administrator has claimed but not yet proved. A pending entry
+    /// is a durable place to publish the DNS challenge against and nothing
+    /// more: it admits no sign-in and carries no authority until
+    /// `organization.domain.verify` proves the TXT record and promotes it into
+    /// `verified_domains`. Holding the claim server-side is the whole point —
+    /// before it existed the domain lived only in the open form, so a reload
+    /// lost it and the page could never show what was still outstanding.
+    #[serde(default)]
+    pub pending_domains: Vec<String>,
     #[serde(default)]
     pub default_region: Option<String>,
     /// The tenant party (`DEPLOY-6`): `client` (default) or `consultant`.
@@ -1672,6 +1682,7 @@ mod tests {
             op: RecordOp::Upsert,
             display_name: "Acme".into(),
             verified_domains: vec!["acme.com".into()],
+            pending_domains: Vec::new(),
             default_region: None,
             kind: Default::default(),
         };
@@ -1985,6 +1996,7 @@ mod tests {
                 op: RecordOp::Upsert,
                 display_name: "Acme".into(),
                 verified_domains: vec!["acme.example".into()],
+                pending_domains: Vec::new(),
                 default_region: None,
                 kind: Default::default(),
             }),

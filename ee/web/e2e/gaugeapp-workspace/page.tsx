@@ -212,6 +212,10 @@ function Harness() {
     const streamingAgent = query.get("stream-agent") === "1";
     const persistentRun = query.get("run")?.trim() || "default";
     const identityMode = query.get("identity");
+    // Seeds the Organization page with a domain at each stage, so the pending
+    // claim and the record it asks the administrator to publish can be driven
+    // in the real page rather than only asserted against the server.
+    const domainState = query.get("domains");
     const projectHostMode = query.get("project-host") === "managed";
     const deviceLinkMode = query.get("device-link") === "1";
     const providerLifecycleMode = query.get("provider-lifecycle") === "1";
@@ -306,7 +310,9 @@ function Harness() {
     const record = (value: unknown) => setCalls((values) => [...values, value]);
     const scope = (): GaugeAppScope => ({ kind: app === "account-settings" ? "person" : app === "administration" ? "tenant" : "provider-tenant", id: scopeId() });
     const commandPages: Record<string, string[]> = allPages && actionablePages && app === "administration" ? {
-        organization: ["organization.display-name.set", "organization.domain.verify"],
+        organization: domainState
+            ? ["organization.display-name.set", "organization.domain.add", "organization.domain.verify", "organization.domain.remove"]
+            : ["organization.display-name.set", "organization.domain.verify"],
         "plans-services": ["subscription.service.add"],
         people: ["people.invitation.create"],
         sessions: ["organization-session.revoke"],
@@ -678,6 +684,20 @@ function Harness() {
                 },
             }],
             managed_enrollment: { available: false, reason: "This organization already has a managed Project Host.", region: "us-east", capacity: { storage_bytes: 10_000_000_000, concurrent_agents: 2 } },
+        };
+        if (id === "organization" && domainState) return {
+            ...administrationEmptyModels.organization,
+            domains: [
+                { domain: "verified.example", status: "verified", challenge: null },
+                {
+                    domain: "pending.example", status: "pending",
+                    challenge: {
+                        record_name: "_gaugewright-challenge.pending.example",
+                        record_type: "TXT",
+                        value: "gaugewright-domain-verification=fixture-challenge-token",
+                    },
+                },
+            ],
         };
         if (id === "model-providers") return { availability: "unavailable", reason: "not_configured" };
         if (id in administrationEmptyModels) return administrationEmptyModels[id as keyof typeof administrationEmptyModels];

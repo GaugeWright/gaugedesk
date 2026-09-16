@@ -11,12 +11,12 @@ use std::collections::BTreeSet;
 
 use gaugedesk_core::ids::{
     AuthorityId, CredentialVersionId, ModelConnectionId, ModelGrantId, ObservationId, ProjectId,
-    ScopeId,
+    ScopeId, SecretHandleId,
 };
 use gaugedesk_core::model_connection::{
     access, AuthenticationKind, AuthorityBinding, Basis, Capability, Command, ConnectionDefinition,
     ExecutionClass, ModelConnection, ModelPolicy, ModelSelection, Operation, ProviderBinding,
-    State,
+    State, VerificationCheck,
 };
 use gaugedesk_core::Rejection;
 use gaugedesk_store::{AdmitError, MaterializedAdmission, RequestAdmissionStatus, Store};
@@ -217,6 +217,8 @@ enum Action {
     Replace(ConnectionInput),
     #[serde(rename = "organization-provider.intake.cancel")]
     Cancel(CandidateInput),
+    #[serde(rename = "organization-provider.verify")]
+    Verify(CandidateInput),
     #[serde(rename = "organization-provider.version.activate")]
     Activate(CandidateInput),
     #[serde(rename = "organization-provider.rename")]
@@ -290,6 +292,7 @@ impl MetadataRequest {
             Action::BeginAccount(_) => "organization-provider.account.begin",
             Action::Replace(_) => "organization-provider.rotate",
             Action::Cancel(_) => "organization-provider.intake.cancel",
+            Action::Verify(_) => "organization-provider.verify",
             Action::Activate(_) => "organization-provider.version.activate",
             Action::Rename { .. } => "organization-provider.rename",
             Action::SetPolicy { .. } => "organization-provider.model.approve",
@@ -443,6 +446,23 @@ pub struct PolicyAdmission {
     pub connection: ModelConnectionId,
     pub policy: ModelPolicy,
 }
+/// The authority's own observation of one provider check.
+///
+/// The request body names only the candidate to check. Everything that makes
+/// the result true — which provider binding was contacted, which sealed
+/// material was resolved, what was checked, and whether it passed — is
+/// materialized here by the adapter that performed the check. A management body
+/// that could supply `passed` would let an administrator mark their own
+/// unverified key verified and then activate it.
+pub struct VerificationAdmission {
+    pub connection: ModelConnectionId,
+    pub version: CredentialVersionId,
+    pub provider: ProviderBinding,
+    pub handle: SecretHandleId,
+    pub check: VerificationCheck,
+    pub passed: bool,
+    pub evidence: ObservationId,
+}
 
 /// Materialized only by the authenticating authority adapter. The HTTP body
 /// cannot provide any of these fields. Fresh role/approval checks precede even
@@ -457,6 +477,7 @@ pub struct ManagementContext {
     pub validated_definition: Option<ConnectionDefinition>,
     pub validated_subject: Option<SubjectAdmission>,
     pub validated_policy: Option<PolicyAdmission>,
+    pub validated_verification: Option<VerificationAdmission>,
 }
 
 pub fn store_scope(organization: &ScopeId) -> String {
@@ -548,6 +569,25 @@ fn materialize(
             connection: value.connection.clone(),
             version: value.version.clone(),
         },
+        Action::Verify(value) => {
+            let admission = context
+                .validated_verification
+                .as_ref()
+                .ok_or(reject("verification admission is missing"))?;
+            require(
+                admission.connection == value.connection && admission.version == value.version,
+                "verification admission names a different candidate",
+            )?;
+            Operation::RecordVerification {
+                connection: value.connection.clone(),
+                version: value.version.clone(),
+                provider: admission.provider.clone(),
+                handle: admission.handle.clone(),
+                evidence: admission.evidence.clone(),
+                check: admission.check,
+                passed: admission.passed,
+            }
+        }
         Action::Activate(value) => Operation::Activate {
             connection: value.connection.clone(),
             version: value.version.clone(),
@@ -648,9 +688,16 @@ fn materialize(
     Ok(Command {
         binding: context.binding.clone(),
         actor: context.actor.clone(),
-        capability: match request.permission() {
-            Permission::ManageConnections => Capability::ManageConnections,
-            Permission::ManageGrants => Capability::ManageGrants,
+        // Recording a provider check is the authority's own observation and is
+        // admitted under its check capability. The requester's management
+        // capability is what `authorize` demanded in order to ask for the
+        // check; it is not what signs the result.
+        capability: match &request.0.action {
+            Action::Verify(_) => Capability::VerifyCandidate,
+            _ => match request.permission() {
+                Permission::ManageConnections => Capability::ManageConnections,
+                Permission::ManageGrants => Capability::ManageGrants,
+            },
         },
         basis: Basis::Metadata(request.0.expected_revision.0),
         now: context.now,

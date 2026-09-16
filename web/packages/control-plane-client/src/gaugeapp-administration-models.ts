@@ -18,7 +18,16 @@ export const parseOrganizationModel = nullable(shape({
         id: stringValue, authority: stringValue, email: stringValue, label: stringValue,
         role: stringValue,
     })),
-    domains: arrayOf(shape({ domain: stringValue, status: oneOf("verified") })),
+    // A pending row carries the exact record to publish; a verified one carries
+    // null rather than a stale challenge, so the page cannot render proof
+    // instructions for a domain that no longer needs them.
+    domains: arrayOf(shape({
+        domain: stringValue,
+        status: oneOf("verified", "pending"),
+        challenge: nullable(shape({
+            record_name: stringValue, record_type: stringValue, value: stringValue,
+        })),
+    })),
 }));
 export type OrganizationPageV1 = ReturnType<typeof parseOrganizationModel>;
 

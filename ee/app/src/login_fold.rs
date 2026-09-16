@@ -469,6 +469,7 @@ mod tests {
             op: RecordOp::Upsert,
             display_name: "Acme Research".into(),
             verified_domains: vec!["acme.example".into()],
+            pending_domains: Vec::new(),
             default_region: None,
             kind: Default::default(),
         };

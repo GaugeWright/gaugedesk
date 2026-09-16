@@ -10,6 +10,7 @@ const args = {
     "api-key.add": { name: "Team API", provider: connection.provider, endpoint: connection.endpoint, policy: connection.policy, reconnects: null },
     rotate: target,
     "intake.cancel": { ...target, version: connection.versions[0].id },
+    verify: { ...target, version: connection.versions[0].id },
     "version.activate": { ...target, version: connection.versions[0].id },
     rename: { ...target, name: "Shared research" },
     "model.approve": { ...target, policy: connection.policy },

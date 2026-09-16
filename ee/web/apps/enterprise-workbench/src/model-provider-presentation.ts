@@ -12,6 +12,7 @@ export const MODEL_PROVIDER_REVIEW_COMMANDS = {
     "organization-provider.api-key.add": ["administration", "model-providers", "Add organization API key"],
     "organization-provider.rotate": ["administration", "model-providers", "Replace organization key"],
     "organization-provider.intake.cancel": ["administration", "model-providers", "Cancel key setup"],
+    "organization-provider.verify": ["administration", "model-providers", "Check organization key"],
     "organization-provider.version.activate": ["administration", "model-providers", "Activate verified key"],
     "organization-provider.rename": ["administration", "model-providers", "Rename organization connection"],
     "organization-provider.model.approve": ["administration", "model-providers", "Change approved models"],
@@ -156,7 +157,7 @@ export function summarizeProviderChange(command: ProviderCommand, payload: unkno
             }
         }
     } else {
-        const extras = command.endsWith(".rename") ? ["name"] : command.endsWith(".model.approve") ? ["policy"] : command.endsWith(".intake.cancel") || command.endsWith(".version.activate") ? ["version"] : [];
+        const extras = command.endsWith(".rename") ? ["name"] : command.endsWith(".model.approve") ? ["policy"] : command.endsWith(".intake.cancel") || command.endsWith(".verify") || command.endsWith(".version.activate") ? ["version"] : [];
         closed(args, ["connection", ...extras]); const row = connection(args.connection);
         if (command.endsWith(".rename")) add("Name", text(args.name), text(row.name));
         else if (command.endsWith(".model.approve")) { policyFields(args.policy, row.policy); note = "Existing subject grants are not widened. Removing a model prevents new use even where a grant previously allowed it."; }
@@ -168,8 +169,14 @@ export function summarizeProviderChange(command: ProviderCommand, payload: unkno
                 if (verification.check !== "model_catalog_read") throw Error("Candidate check is unavailable");
                 add("Check performed", "Model catalog read");
             }
-            add("Result", command.endsWith(".intake.cancel") ? "Cancel setup and erase candidate material" : "Make this verified version current");
-            note = command.endsWith(".intake.cancel") ? "The current active version, if any, is unchanged." : "Inference access and billing have not been tested. Pending work using the old version must be readmitted. A suspended connection stays suspended.";
+            if (command.endsWith(".verify")) {
+                add("Check to perform", "Model catalog read");
+                add("Result", "Record whether the provider accepts this key");
+                note = "The authority resolves the stored key and asks the provider for its model catalogue. A pass makes this version activatable; a refusal ends the candidate and its material is erased. It proves that one read with that exact key — not inference access, model entitlement or billing readiness.";
+            } else {
+                add("Result", command.endsWith(".intake.cancel") ? "Cancel setup and erase candidate material" : "Make this verified version current");
+                note = command.endsWith(".intake.cancel") ? "The current active version, if any, is unchanged." : "Inference access and billing have not been tested. Pending work using the old version must be readmitted. A suspended connection stays suspended.";
+            }
         } else {
             const effects: Record<string, string> = { rotate: "Start replacement key setup", suspend: "Suspend new use", resume: "Resume eligible use", revoke: "Permanently revoke future use", erase: "Erase stored credentials and stop future use" };
             add("Result", text(effects[command.split(".").at(-1)!]));

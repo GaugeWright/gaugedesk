@@ -56,6 +56,12 @@ function ProviderManager(props: Props & { model: Providers }): JSX.Element {
     let epoch = 0;
     let draftBasis = "";
     const can = (suffix: string) => props.commands.includes(`organization-provider.${suffix}`);
+    // The check is admitted by `organization-provider.verify`. Until every
+    // operated authority advertises it, a session that admits key setup at all
+    // still offers the check, because the alternative is a sealed candidate
+    // with no way forward and no explanation. Drop the second clause once
+    // gaugewright-cloud's COMMAND_IDS carries `organization-provider.verify`.
+    const canVerify = () => can("verify") || can("intake.cancel");
     const clearSecret = () => { if (secretInput) secretInput.value = ""; upload?.abort(); upload = undefined; };
     const close = () => { epoch++; clearSecret(); setMode(null); setBusy(false); setError(""); };
     onCleanup(() => { epoch++; clearSecret(); });
@@ -198,7 +204,7 @@ function ProviderManager(props: Props & { model: Providers }): JSX.Element {
             <Show when={row().overrun_pending}><p role="alert" class="gaugeapp-host-note">A usage bound was exceeded. Capped execution is unavailable until the service resolves it.</p></Show>
             <For each={candidates()}>{(version) => <div class="gaugeapp-org-provider-candidate"><div><strong>Key setup</strong><span>{version.phase === "awaiting_secret" ? "API key needed" : version.phase === "sealed" ? "Stored · verification pending" : version.verification ? "Model catalog check passed · ready to activate" : "Check details unavailable · replace this candidate"}</span><Show when={version.verification}><small>Inference access and billing have not been tested.</small></Show></div><div class="gaugeapp-host-actions">
                 <Show when={version.phase === "awaiting_secret" && props.model.setup.api_key_intake && can("intake.cancel")}><button type="button" class="primary" disabled={busy()} onClick={() => { begin("secret"); setVersionId(version.id); }}>Enter key</button></Show>
-                <Show when={version.phase === "sealed" && props.model.setup.providers.some((option) => option.provider === row().provider && option.endpoint === row().endpoint && option.authentication === row().authentication && option.verification_check === "model_catalog_read") && can("intake.cancel")}><button type="button" class="primary" disabled={busy()} onClick={() => void verifyCandidate(row(), version)}>Check key</button></Show>
+                <Show when={version.phase === "sealed" && props.model.setup.providers.some((option) => option.provider === row().provider && option.endpoint === row().endpoint && option.authentication === row().authentication && option.verification_check === "model_catalog_read") && canVerify()}><button type="button" class="primary" disabled={busy()} onClick={() => void verifyCandidate(row(), version)}>Check key</button></Show>
                 <Show when={version.phase === "verified" && version.verification && can("version.activate")}><button type="button" class="primary" disabled={busy()} onClick={() => void submit("organization-provider.version.activate", { connection: row().id, version: version.id })}>Activate</button></Show>
                 <Show when={can("intake.cancel")}><button type="button" disabled={busy()} onClick={() => void submit("organization-provider.intake.cancel", { connection: row().id, version: version.id })}>Cancel setup</button></Show>
             </div></div>}</For>

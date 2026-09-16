@@ -751,26 +751,42 @@ function OrganizationPageReady(props: {
 
         <section class="gaugeapp-panel gaugeapp-section-stack">
             <div class="gaugeapp-section-head">
-                <div><h2>Verified domains</h2><p>Verified domains may admit corporate sign-in when Enterprise Identity is configured.</p></div>
-                <Show when={props.commands.includes("organization.domain.verify") && !addingDomain()}>
+                <div><h2>Domains</h2><p>A verified domain may admit corporate sign-in when Enterprise Identity is configured. A domain admits nobody until its DNS proof is published and verified.</p></div>
+                <Show when={props.commands.includes("organization.domain.add") && !addingDomain()}>
                     <button type="button" onClick={() => { setAddingDomain(true); setDomain(""); setChallengeError(""); }}>Add domain</button>
                 </Show>
             </div>
-            <Show when={model().domains.length > 0} fallback={<p class="gaugeapp-empty">No domains have been verified.</p>}>
+            <Show when={model().domains.length > 0} fallback={<p class="gaugeapp-empty">No domains have been added.</p>}>
                 <div class="gaugeapp-domain-list">
-                    <For each={model().domains}>{(entry) => <div class="gaugeapp-domain-row">
-                        <div><strong>{entry.domain}</strong><span>{entry.status}</span></div>
+                    <For each={model().domains}>{(entry) => <div class="gaugeapp-domain-row" data-status={entry.status}>
+                        <div><strong>{entry.domain}</strong><span>{entry.status === "pending" ? "awaiting DNS proof" : "verified"}</span></div>
                         <div class="gaugeapp-row-actions">
+                            <Show when={entry.status === "pending"}>
+                                <CommandButton command="organization.domain.verify" commands={props.commands} label="Verify DNS" payload={{ domain: entry.domain }} onSubmit={props.onSubmit} />
+                            </Show>
                             <button type="button" disabled={loadingChallenge()} onClick={() => void inspectDomain(entry.domain)}>Inspect</button>
                             <CommandButton command="organization.domain.remove" commands={props.commands} label="Remove" danger payload={{ domain: entry.domain }} onSubmit={props.onSubmit} />
                         </div>
+                        {/* The claim is server-held, so the record to publish is
+                            part of the page rather than something the
+                            administrator has to reopen a dialog to see again. */}
+                        <Show when={entry.challenge}>{(record) => <dl class="gaugeapp-domain-proof">
+                            <div><dt>Name</dt><dd><code>{record().record_name}</code></dd></div>
+                            <div><dt>Type</dt><dd><code>{record().record_type}</code></dd></div>
+                            <div><dt>Value</dt><dd><code>{record().value}</code></dd></div>
+                        </dl>}</Show>
                     </div>}</For>
                 </div>
             </Show>
-            <Show when={props.commands.includes("organization.domain.verify") && addingDomain() && !challenge()}>
-                <form class="gaugeapp-inline-form" onSubmit={(event) => { event.preventDefault(); void inspectDomain(domain()); }}>
-                    <label><span>Domain to verify</span><input type="text" inputMode="url" placeholder="example.com" required value={domain()} onInput={(event) => setDomain(event.currentTarget.value)} /></label>
-                    <div class="gaugeapp-actions"><button type="button" onClick={closeDomain}>Cancel</button><button type="submit" class="primary" disabled={!domain().trim() || loadingChallenge()}>{loadingChallenge() ? "Preparing…" : "Continue"}</button></div>
+            <Show when={props.commands.includes("organization.domain.add") && addingDomain() && !challenge()}>
+                <form class="gaugeapp-inline-form" onSubmit={(event) => {
+                    event.preventDefault();
+                    void props.onSubmit("organization.domain.add", { domain: domain().trim() })
+                        .then(() => closeDomain());
+                }}>
+                    <label><span>Domain to add</span><input type="text" inputMode="url" placeholder="example.com" required value={domain()} onInput={(event) => setDomain(event.currentTarget.value)} /></label>
+                    <p>Adding records the claim and shows the TXT record to publish. It grants nothing on its own — verification is a separate reviewed step.</p>
+                    <div class="gaugeapp-actions"><button type="button" onClick={closeDomain}>Cancel</button><button type="submit" class="primary" disabled={!domain().trim()}>Add domain</button></div>
                 </form>
             </Show>
             <Show when={challengeError()}>{(message) => <p class="gaugeapp-unavailable" role="alert">{message()}</p>}</Show>

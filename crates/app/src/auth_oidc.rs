@@ -3439,6 +3439,7 @@ iqlTEKVISscuchxZtKQJ4k8=
                     op: RecordOp::Upsert,
                     display_name: format!("{tenant} company"),
                     verified_domains: vec![domain.to_owned()],
+                    pending_domains: Vec::new(),
                     default_region: None,
                     kind: Default::default(),
                 })
