@@ -1,0 +1,429 @@
+{
+  "schemaVersion": 1,
+  "owner": "gaugedesk",
+  "gaugeApps": [
+    {
+      "id": "account-settings",
+      "scope": "person",
+      "threadIdentity": "person+account-settings",
+      "spec": "specs/experience/account.md",
+      "pages": [
+        {
+          "id": "account",
+          "title": "Account Settings",
+          "authority": "hosted-account-authority",
+          "readModel": "AccountSettingsPageV1",
+          "capability": "account.read",
+          "secretBoundary": "authenticator ceremonies and recovery codes are write-only/show-once",
+          "emptyState": "No memberships, invitations, other sessions, or optional authenticators are shown as empty sections rather than invented records.",
+          "unavailableState": "Signed-out shows Sign In; account-service failure shows Account Settings unavailable without blocking local work.",
+          "actions": [
+            { "id": "edit-profile", "operation": "account.profile.set", "lifecycle": "account-profile", "capability": "account.profile.write", "secretBoundary": "profile fields only" },
+            { "id": "add-authenticator", "operation": "account.authenticator.begin-add", "lifecycle": "authenticator-ceremony", "capability": "account.authenticator.manage", "secretBoundary": "provider exchange remains inside ceremony authority" },
+            { "id": "verify-authenticator", "operation": "account.authenticator.complete-add", "lifecycle": "authenticator-ceremony", "capability": "account.authenticator.manage", "secretBoundary": "proof is consumed and never projected" },
+            { "id": "remove-authenticator", "operation": "account.authenticator.remove", "lifecycle": "authenticator-ceremony", "capability": "account.authenticator.manage", "secretBoundary": "no provider token reads back" },
+            { "id": "reissue-recovery-codes", "operation": "account.recovery-codes.reissue", "lifecycle": "account-recovery", "capability": "account.recovery.manage", "secretBoundary": "new codes display once" },
+            { "id": "sign-out", "operation": "account.session.revoke-current", "lifecycle": "hosted-account-session", "capability": "account.session.revoke-self", "secretBoundary": "session secret is never returned" },
+            { "id": "revoke-session", "operation": "account.session.revoke", "lifecycle": "hosted-account-session", "capability": "account.session.revoke-self", "secretBoundary": "session secret is never returned" },
+            { "id": "revoke-other-sessions", "operation": "account.session.revoke-others", "lifecycle": "hosted-account-session", "capability": "account.session.revoke-self", "secretBoundary": "session secrets are never returned" },
+            { "id": "accept-invitation", "operation": "account.invitation.accept", "lifecycle": "organization-membership", "capability": "account.invitation.respond", "secretBoundary": "invitation token is consumed, not projected" },
+            { "id": "decline-invitation", "operation": "account.invitation.decline", "lifecycle": "organization-membership", "capability": "account.invitation.respond", "secretBoundary": "invitation token is consumed, not projected" },
+            { "id": "leave-organization", "operation": "account.membership.leave", "lifecycle": "organization-membership", "capability": "account.membership.leave", "secretBoundary": "no organization payload is exposed" },
+            { "id": "erase-account", "operation": "account.erase", "lifecycle": "cross-authority-account-erasure", "capability": "account.erase-self", "secretBoundary": "fresh authorization proof is consumed" }
+          ]
+        },
+        {
+          "id": "provider-connections",
+          "title": "Provider Connections",
+          "authority": "personal-provider-credential-broker",
+          "readModel": "ProviderConnectionsPageV1",
+          "capability": "provider-connections.read-personal",
+          "secretBoundary": "keys and OAuth/device tokens are sealed and never read back",
+          "emptyState": "No connection shows an add-connection action and managed-inference eligibility.",
+          "unavailableState": "Broker outage preserves connection references as stale and disables verification or mutation.",
+          "actions": [
+            { "id": "add-api-key-connection", "operation": "provider-connection.api-key.add", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "sealed key submission" },
+            { "id": "begin-provider-sign-in", "operation": "provider-connection.subscription.begin", "lifecycle": "provider-specific-account-link", "capability": "provider-connections.manage-personal", "secretBoundary": "provider token exchange stays server-side" },
+            { "id": "complete-provider-sign-in", "operation": "provider-connection.subscription.complete", "lifecycle": "provider-specific-account-link", "capability": "provider-connections.manage-personal", "secretBoundary": "device/OAuth proof is consumed" },
+            { "id": "add-compatible-endpoint", "operation": "provider-connection.compatible.add", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "endpoint is public; key is sealed" },
+            { "id": "verify-connection", "operation": "provider-connection.verify", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "verification returns status/models, never credentials" },
+            { "id": "rename-connection", "operation": "provider-connection.rename", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "metadata only" },
+            { "id": "revoke-connection", "operation": "provider-connection.revoke", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "sealed material is erased without readback" },
+            { "id": "set-personal-default-model", "operation": "provider-connection.default-model.set", "lifecycle": "personal-model-default", "capability": "provider-connections.manage-personal", "secretBoundary": "model reference only" },
+            { "id": "change-managed-inference", "operation": "managed-inference.plan.change", "lifecycle": "managed-inference-plan", "capability": "managed-inference.manage-personal", "secretBoundary": "billing handoff uses tenant billing authority" }
+          ]
+        },
+        {
+          "id": "trusted-devices",
+          "title": "Trusted Devices",
+          "authority": "account-device-registry",
+          "readModel": "TrustedDevicesPageV1",
+          "capability": "trusted-devices.read",
+          "secretBoundary": "device private keys and recovery material never enter the page model",
+          "emptyState": "The current trusted device is shown when present; otherwise the page offers a complete link-device ceremony.",
+          "unavailableState": "Registry or relay failure leaves existing evidence stale and does not imply revocation or enrollment.",
+          "actions": [
+            { "id": "begin-device-link", "operation": "trusted-device.link.begin", "lifecycle": "device-enrollment", "capability": "trusted-devices.link", "secretBoundary": "QR and human code are short-lived pairing references" },
+            { "id": "accept-device-link", "operation": "trusted-device.link.accept", "lifecycle": "device-enrollment", "capability": "trusted-devices.link", "secretBoundary": "device proof is verified without private-key transfer" },
+            { "id": "reject-device-link", "operation": "trusted-device.link.reject", "lifecycle": "device-enrollment", "capability": "trusted-devices.link", "secretBoundary": "pairing reference is invalidated" },
+            { "id": "cancel-device-link", "operation": "trusted-device.link.cancel", "lifecycle": "device-enrollment", "capability": "trusted-devices.link", "secretBoundary": "pairing reference is invalidated" },
+            { "id": "rename-trusted-device", "operation": "trusted-device.rename", "lifecycle": "trusted-device", "capability": "trusted-devices.manage", "secretBoundary": "metadata only" },
+            { "id": "revoke-trusted-device", "operation": "trusted-device.revoke", "lifecycle": "trusted-device", "capability": "trusted-devices.manage", "secretBoundary": "future access is blocked; history remains" },
+            { "id": "set-recovery-holder", "operation": "trusted-device.recovery-holder.set", "lifecycle": "backup-keyring", "capability": "trusted-devices.manage-recovery", "secretBoundary": "recovery material is device-held and never projected" }
+          ]
+        },
+        {
+          "id": "application-settings",
+          "title": "Application Settings",
+          "authority": "person-and-local-preference-authorities",
+          "readModel": "ApplicationSettingsPageV1",
+          "capability": "application-settings.read",
+          "secretBoundary": "preferences contain no credentials or protected project payload",
+          "emptyState": "Defaults are identified as defaults; absence is not persisted as a fake preference.",
+          "unavailableState": "Cross-device preference outage leaves local-only settings usable and remote values explicitly stale.",
+          "actions": [
+            { "id": "set-attention-routing", "operation": "application-settings.attention.set", "lifecycle": "person-preference", "capability": "application-settings.write", "secretBoundary": "preference only" },
+            { "id": "set-appearance-accessibility", "operation": "application-settings.appearance.set", "lifecycle": "person-preference", "capability": "application-settings.write", "secretBoundary": "preference only" },
+            { "id": "set-update-channel", "operation": "application-settings.update-channel.set", "lifecycle": "local-preference", "capability": "application-settings.write-unmanaged", "secretBoundary": "organization policy remains restrict-only" },
+            { "id": "set-automatic-keep-path", "operation": "application-settings.keep-path.set", "lifecycle": "local-preference", "capability": "application-settings.write", "secretBoundary": "path metadata remains local" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "administration",
+      "scope": "exact-personal-or-organization-tenant",
+      "threadIdentity": "person+administration+tenant",
+      "spec": "specs/experience/admin-console.md",
+      "pages": [
+        {
+          "id": "organization",
+          "title": "Organization",
+          "authority": "tenant-account-authority",
+          "readModel": "OrganizationPageV1",
+          "capability": "organization.read",
+          "secretBoundary": "no identity-provider credential or protected project payload",
+          "emptyState": "Unverified-domain absence is shown without inventing a handle or default region.",
+          "unavailableState": "Personal omits organization lifecycle actions; tenant service outage makes the page unavailable.",
+          "actions": [
+            { "id": "edit-display-name", "operation": "organization.display-name.set", "lifecycle": "organization", "capability": "organization.manage", "secretBoundary": "identity metadata only" },
+            { "id": "transfer-ownership", "operation": "organization.ownership.transfer", "lifecycle": "organization-ownership", "capability": "organization.transfer-ownership", "secretBoundary": "fresh authorization proof is consumed" },
+            { "id": "add-domain", "operation": "organization.domain.add", "lifecycle": "verified-domain", "capability": "enterprise-identity.manage", "secretBoundary": "verification challenge is not authority" },
+            { "id": "verify-domain", "operation": "organization.domain.verify", "lifecycle": "verified-domain", "capability": "enterprise-identity.manage", "secretBoundary": "DNS evidence only" },
+            { "id": "inspect-domain", "operation": "organization.domain.read", "lifecycle": "verified-domain", "capability": "enterprise-identity.read", "secretBoundary": "public domain evidence only" },
+            { "id": "remove-domain", "operation": "organization.domain.remove", "lifecycle": "verified-domain", "capability": "enterprise-identity.manage", "secretBoundary": "dependency checks reveal no IdP secret" },
+            { "id": "delete-organization", "operation": "organization.delete", "lifecycle": "organization-erasure", "capability": "organization.delete", "secretBoundary": "fresh authorization proof is consumed" }
+          ]
+        },
+        {
+          "id": "plans-services",
+          "title": "Plans & services",
+          "authority": "tenant-subscription-authority",
+          "readModel": "PlansServicesPageV1",
+          "capability": "subscription.read",
+          "secretBoundary": "payment method and processor verification stay in Stripe",
+          "emptyState": "Base/free truth is shown with start-plan actions and no fake payment method.",
+          "unavailableState": "Subscription outage disables changes while preserving the last model as stale.",
+          "actions": [
+            { "id": "change-plan", "operation": "subscription.plan.change", "lifecycle": "tenant-subscription", "capability": "subscription.manage", "secretBoundary": "commercial terms only" },
+            { "id": "manage-seats", "operation": "subscription.seats.change", "lifecycle": "tenant-subscription", "capability": "subscription.manage", "secretBoundary": "capacity does not assign people" },
+            { "id": "schedule-cancellation", "operation": "subscription.cancellation.schedule", "lifecycle": "tenant-subscription", "capability": "subscription.manage", "secretBoundary": "future entitlement effect only" },
+            { "id": "add-optional-service", "operation": "subscription.service.add", "lifecycle": "tenant-service", "capability": "subscription.manage", "secretBoundary": "processor onboarding remains external" },
+            { "id": "configure-optional-service", "operation": "subscription.service.configure", "lifecycle": "tenant-service", "capability": "subscription.manage", "secretBoundary": "enterprise/processor secrets stay with owning authority" },
+            { "id": "schedule-service-removal", "operation": "subscription.service.remove-scheduled", "lifecycle": "tenant-service", "capability": "subscription.manage", "secretBoundary": "future service effect only" },
+            { "id": "cancel-service-removal", "operation": "subscription.service.remove-cancel", "lifecycle": "tenant-service", "capability": "subscription.manage", "secretBoundary": "service record only" }
+          ]
+        },
+        {
+          "id": "people",
+          "title": "People",
+          "authority": "organization-membership-directory",
+          "readModel": "PeoplePageV1",
+          "capability": "people.read",
+          "secretBoundary": "invitation tokens and project payload stay outside the model",
+          "emptyState": "A tenant with only its owner shows that member and an invite action.",
+          "unavailableState": "Directory outage disables membership mutation; SCIM-owned rows remain explicitly external-managed.",
+          "actions": [
+            { "id": "invite-people", "operation": "people.invitation.create", "lifecycle": "organization-membership", "capability": "people.invite", "secretBoundary": "invitation token is delivered, not projected" },
+            { "id": "cancel-invitation", "operation": "people.invitation.cancel", "lifecycle": "organization-membership", "capability": "people.invite", "secretBoundary": "token is invalidated" },
+            { "id": "resend-invitation", "operation": "people.invitation.resend", "lifecycle": "organization-membership", "capability": "people.invite", "secretBoundary": "new delivery does not expose token" },
+            { "id": "change-role", "operation": "people.role.change", "lifecycle": "organization-membership", "capability": "people.role.manage-within-ceiling", "secretBoundary": "directory metadata only" },
+            { "id": "deactivate-member", "operation": "people.member.deactivate", "lifecycle": "organization-membership", "capability": "people.manage", "secretBoundary": "history remains; credentials are not revealed" },
+            { "id": "reactivate-member", "operation": "people.member.reactivate", "lifecycle": "organization-membership", "capability": "people.manage", "secretBoundary": "directory metadata only" },
+            { "id": "view-member", "operation": "people.member.read", "lifecycle": "organization-membership", "capability": "people.read", "secretBoundary": "references and admitted session metadata only" },
+            { "id": "grant-project-access", "operation": "project-access.grant", "lifecycle": "project-membership", "capability": "projects.access.manage", "secretBoundary": "grant reference only; no project payload" },
+            { "id": "revoke-project-access", "operation": "project-access.revoke", "lifecycle": "project-membership", "capability": "projects.access.manage", "secretBoundary": "future access only; history remains" },
+            { "id": "open-project-settings", "operation": "project-settings.read", "lifecycle": "project-admission", "capability": "projects.read", "secretBoundary": "exact Home admits the destination" }
+          ]
+        },
+        {
+          "id": "sessions",
+          "title": "Sessions",
+          "authority": "organization-session-registry",
+          "readModel": "OrganizationSessionsPageV1",
+          "capability": "organization-sessions.read",
+          "secretBoundary": "session bearer material never enters the model",
+          "emptyState": "No admitted organization sessions is a truthful empty list.",
+          "unavailableState": "Registry outage reports unknown freshness rather than compliant or revoked.",
+          "actions": [
+            { "id": "inspect-session", "operation": "organization-session.read", "lifecycle": "organization-session", "capability": "organization-sessions.read", "secretBoundary": "evidence only" },
+            { "id": "revoke-session", "operation": "organization-session.revoke", "lifecycle": "organization-session", "capability": "organization-sessions.revoke", "secretBoundary": "bearer is invalidated without readback" }
+          ]
+        },
+        {
+          "id": "enterprise-identity",
+          "title": "Enterprise Identity",
+          "authority": "enterprise-identity-authority",
+          "readModel": "EnterpriseIdentityPageV1",
+          "capability": "enterprise-identity.read",
+          "secretBoundary": "IdP secrets, SCIM bearer, and sign-in proof never read back",
+          "emptyState": "Enterprise-enabled but unconfigured shows one setup flow and prerequisites.",
+          "unavailableState": "Page is absent without Enterprise controls; verifier outage blocks validation/enforcement.",
+          "actions": [
+            { "id": "configure-corporate-sign-in", "operation": "enterprise-identity.connection.set", "lifecycle": "enterprise-identity-connection", "capability": "enterprise-identity.manage", "secretBoundary": "metadata/discovery input only; secrets sealed" },
+            { "id": "set-oidc-client-secret", "operation": "enterprise-identity.connection.credential.set", "lifecycle": "enterprise-identity-credential", "capability": "enterprise-identity.manage", "secretBoundary": "write-only intake; ciphertext and configured state only" },
+            { "id": "remove-oidc-client-secret", "operation": "enterprise-identity.connection.credential.remove", "lifecycle": "enterprise-identity-credential", "capability": "enterprise-identity.manage", "secretBoundary": "removal carries no credential material" },
+            { "id": "validate-configuration", "operation": "enterprise-identity.connection.validate", "lifecycle": "enterprise-identity-connection", "capability": "enterprise-identity.manage", "secretBoundary": "validation returns evidence, not credentials" },
+            { "id": "test-sign-in", "operation": "enterprise-identity.test.begin", "lifecycle": "isolated-enterprise-sign-in-test", "capability": "enterprise-identity.manage", "secretBoundary": "test proof bound to revision and creates no account" },
+            { "id": "set-admission-mode", "operation": "enterprise-identity.admission-mode.set", "lifecycle": "enterprise-admission", "capability": "enterprise-identity.manage", "secretBoundary": "verified-domain and mapping references only" },
+            { "id": "link-owner-subject", "operation": "enterprise-identity.owner-subject.link", "lifecycle": "enterprise-owner-link", "capability": "enterprise-identity.owner-link", "secretBoundary": "returned corporate subject is sealed to account link" },
+            { "id": "open-owner-recovery", "operation": "account.recovery.open", "lifecycle": "enterprise-break-glass", "capability": "account.read", "secretBoundary": "navigation to person-owned passkey and recovery controls; no organization recovery credential" },
+            { "id": "enforce-corporate-sign-in", "operation": "enterprise-identity.enforcement.enable", "lifecycle": "enterprise-admission", "capability": "enterprise-identity.enforce", "secretBoundary": "server-confirmed prerequisites only" },
+            { "id": "stop-requiring-corporate-sign-in", "operation": "enterprise-identity.enforcement.disable", "lifecycle": "enterprise-admission", "capability": "enterprise-identity.enforce", "secretBoundary": "fresh owner authorization; no identity credential material" },
+            { "id": "issue-scim-credential", "operation": "enterprise-identity.scim-credential.issue", "lifecycle": "scim-credential", "capability": "enterprise-identity.manage-scim", "secretBoundary": "credential displays once" },
+            { "id": "rotate-scim-credential", "operation": "enterprise-identity.scim-credential.rotate", "lifecycle": "scim-credential", "capability": "enterprise-identity.manage-scim", "secretBoundary": "new credential displays once; old is revoked" },
+            { "id": "add-group-mapping", "operation": "enterprise-identity.group-mapping.add", "lifecycle": "scim-group-mapping", "capability": "enterprise-identity.manage-scim", "secretBoundary": "group/role references only" },
+            { "id": "edit-group-mapping", "operation": "enterprise-identity.group-mapping.edit", "lifecycle": "scim-group-mapping", "capability": "enterprise-identity.manage-scim", "secretBoundary": "group/role references only" },
+            { "id": "remove-group-mapping", "operation": "enterprise-identity.group-mapping.remove", "lifecycle": "scim-group-mapping", "capability": "enterprise-identity.manage-scim", "secretBoundary": "mapping only" },
+            { "id": "inspect-sync-error", "operation": "enterprise-identity.scim-error.read", "lifecycle": "scim-provisioning", "capability": "enterprise-identity.read", "secretBoundary": "sanitized operational evidence" }
+          ]
+        },
+        {
+          "id": "projects",
+          "title": "Projects",
+          "authority": "project-route-and-home-authorities",
+          "readModel": "AdministrationProjectsPageV1",
+          "capability": "projects.read",
+          "secretBoundary": "only opaque routes and summaries; no project payload",
+          "emptyState": "No governed projects shows Create project when admitted.",
+          "unavailableState": "Home or route outage is shown per project as stale/unreachable and never as policy compliance.",
+          "actions": [
+            { "id": "create-project", "operation": "project.create", "lifecycle": "project", "capability": "projects.create", "secretBoundary": "Home selection grants no access" },
+            { "id": "view-project", "operation": "project.summary.read", "lifecycle": "project", "capability": "projects.read", "secretBoundary": "summary/reference only" },
+            { "id": "open-project-settings", "operation": "project-settings.read", "lifecycle": "project-admission", "capability": "projects.read", "secretBoundary": "exact Home admits the destination" }
+          ]
+        },
+        {
+          "id": "model-providers",
+          "title": "Model Providers",
+          "authority": "selected-organization-credential-and-spend-authority",
+          "readModel": "OrganizationModelProvidersPageV1",
+          "capability": "organization-model-providers.read",
+          "secretBoundary": "organization keys/tokens are sealed, reference-only, and never copied to a person or project",
+          "emptyState": "No shared connection shows add-connection; no grant means no project/member access.",
+          "unavailableState": "An unconfigured credential/spend authority disables shared use; outage fails closed without changing personal connections.",
+          "actions": [
+            { "id": "add-shared-api-key", "operation": "organization-provider.api-key.add", "lifecycle": "organization-provider-connection", "capability": "organization-model-providers.manage", "secretBoundary": "dedicated short-lived intake; generic commands and chat receive handles only" },
+            { "id": "cancel-credential-intake", "operation": "organization-provider.intake.cancel", "lifecycle": "organization-provider-connection", "capability": "organization-model-providers.manage", "secretBoundary": "candidate handle only; erase unactivated material" },
+            { "id": "verify-connection", "operation": "organization-provider.verify", "lifecycle": "organization-provider-connection", "capability": "organization-model-providers.manage", "secretBoundary": "status/models only" },
+            { "id": "activate-credential-version", "operation": "organization-provider.version.activate", "lifecycle": "organization-provider-connection", "capability": "organization-model-providers.manage", "secretBoundary": "verified candidate reference only; atomic activation invalidates undispatched old-version attempts" },
+            { "id": "rename-connection", "operation": "organization-provider.rename", "lifecycle": "organization-provider-connection", "capability": "organization-model-providers.manage", "secretBoundary": "metadata only" },
+            { "id": "rotate-connection", "operation": "organization-provider.rotate", "lifecycle": "organization-provider-connection", "capability": "organization-model-providers.manage", "secretBoundary": "dedicated candidate intake; old version remains explicit until verified activation, never read back" },
+            { "id": "suspend-connection", "operation": "organization-provider.suspend", "lifecycle": "organization-provider-connection", "capability": "organization-model-providers.manage", "secretBoundary": "stop new dispatch; retain history and consumed allowance" },
+            { "id": "resume-connection", "operation": "organization-provider.resume", "lifecycle": "organization-provider-connection", "capability": "organization-model-providers.manage", "secretBoundary": "current usable version and policy required; no allowance reset" },
+            { "id": "revoke-connection", "operation": "organization-provider.revoke", "lifecycle": "organization-provider-connection", "capability": "organization-model-providers.manage", "secretBoundary": "terminal future-use denial; already dispatched calls settle; provider revocation is separate" },
+            { "id": "erase-connection", "operation": "organization-provider.erase", "lifecycle": "organization-provider-connection", "capability": "organization-model-providers.manage", "secretBoundary": "destroy wrapped data keys and refresh material; retain secret-free history; old backups cannot resurrect access" },
+            { "id": "approve-model", "operation": "organization-provider.model.approve", "lifecycle": "organization-model-catalog", "capability": "organization-model-providers.manage", "secretBoundary": "model reference only" },
+            { "id": "set-organization-default", "operation": "organization-provider.default-model.set", "lifecycle": "organization-model-default", "capability": "organization-model-providers.manage", "secretBoundary": "model reference only" },
+            { "id": "grant-usage", "operation": "organization-provider.grant.create", "lifecycle": "organization-provider-grant", "capability": "organization-model-providers.grant", "secretBoundary": "grant references connection/model and never contains secret" },
+            { "id": "edit-usage-cap", "operation": "organization-provider.grant.cap.set", "lifecycle": "organization-provider-grant", "capability": "organization-model-providers.grant", "secretBoundary": "spend/token ceiling only" },
+            { "id": "suspend-usage", "operation": "organization-provider.grant.suspend", "lifecycle": "organization-provider-grant", "capability": "organization-model-providers.grant", "secretBoundary": "future admission only" },
+            { "id": "resume-usage", "operation": "organization-provider.grant.resume", "lifecycle": "organization-provider-grant", "capability": "organization-model-providers.grant", "secretBoundary": "recheck subject and connection; consumed allowance is unchanged" },
+            { "id": "revoke-usage", "operation": "organization-provider.grant.revoke", "lifecycle": "organization-provider-grant", "capability": "organization-model-providers.grant", "secretBoundary": "future admission only; usage evidence remains" }
+          ]
+        },
+        {
+          "id": "organization-policy",
+          "title": "Organization Policy",
+          "authority": "organization-policy-authority",
+          "readModel": "OrganizationPolicyPageV1",
+          "capability": "organization-policy.read",
+          "secretBoundary": "policy contains no credentials or protected payload",
+          "emptyState": "Current defaults are explicit; unchanged draft shows no fake pending change.",
+          "unavailableState": "Authority outage leaves the draft local, marks the server basis stale, and blocks apply/review.",
+          "actions": [
+            { "id": "apply-policy-changes", "operation": "organization-policy.set", "lifecycle": "organization-policy", "capability": "organization-policy.manage", "secretBoundary": "typed policy fields only" },
+            { "id": "discard-policy-draft", "operation": "organization-policy.draft.discard", "lifecycle": "client-draft", "capability": "organization-policy.read", "secretBoundary": "no server effect" },
+            { "id": "accept-policy-proposal", "operation": "organization-policy.proposal.accept", "lifecycle": "sensitive-change-review", "capability": "organization-policy.review", "secretBoundary": "review is bound to proposal revision" },
+            { "id": "discard-policy-proposal", "operation": "organization-policy.proposal.discard", "lifecycle": "sensitive-change-review", "capability": "organization-policy.review", "secretBoundary": "proposal evidence remains" }
+          ]
+        },
+        {
+          "id": "project-hosts",
+          "title": "Project Hosts",
+          "authority": "project-host-registry",
+          "readModel": "ProjectHostsPageV1",
+          "capability": "project-hosts.read",
+          "secretBoundary": "host credentials, recovery keys, and project payload never enter the model",
+          "emptyState": "No Project Host shows Add Project Host; signed-out local shows This Computer only when it is a real host.",
+          "unavailableState": "Unreachable is unknown, never compliant; registry outage does not block already admitted Home work.",
+          "actions": [
+            { "id": "add-project-host", "operation": "project-host.add", "lifecycle": "project-host-enrollment", "capability": "project-hosts.manage", "secretBoundary": "claim/pair proof is consumed" },
+            { "id": "inspect-project-host", "operation": "project-host.read", "lifecycle": "project-host", "capability": "project-hosts.read", "secretBoundary": "operational evidence only" },
+            { "id": "rename-project-host", "operation": "project-host.rename", "lifecycle": "project-host", "capability": "project-hosts.manage", "secretBoundary": "metadata only" },
+            { "id": "set-managed-policy", "operation": "project-host.managed-policy.set", "lifecycle": "managed-project-host", "capability": "project-hosts.manage", "secretBoundary": "policy reference only" },
+            { "id": "suspend-project-host", "operation": "project-host.suspend", "lifecycle": "project-host", "capability": "project-hosts.manage", "secretBoundary": "future admission only" },
+            { "id": "reinstate-project-host", "operation": "project-host.reinstate", "lifecycle": "project-host", "capability": "project-hosts.manage", "secretBoundary": "current proofs rechecked" },
+            { "id": "handoff-project-home", "operation": "project-home.handoff", "lifecycle": "project-handoff", "capability": "project-hosts.handoff", "secretBoundary": "Home content moves authority-to-authority and never through the page" },
+            { "id": "export-project-host", "operation": "project-host.export", "lifecycle": "project-host-export", "capability": "project-hosts.export", "secretBoundary": "export key/material uses protected native ceremony" },
+            { "id": "retire-project-host", "operation": "project-host.retire", "lifecycle": "project-host-erasure", "capability": "project-hosts.retire", "secretBoundary": "dependency checks reveal references, not payload" }
+          ]
+        },
+        {
+          "id": "backups",
+          "title": "Backups",
+          "authority": "backup-and-recovery-authority",
+          "readModel": "BackupsPageV1",
+          "capability": "backups.read",
+          "secretBoundary": "backup keys and recovery shares remain on admitted holders",
+          "emptyState": "Unconfigured protection shows enable and exact uncovered Host/Home scope.",
+          "unavailableState": "Unknown operation freshness is not a successful backup; recovery material remains unavailable.",
+          "actions": [
+            { "id": "enable-backups", "operation": "backups.enable", "lifecycle": "backup-configuration", "capability": "backups.manage", "secretBoundary": "key material remains holder-side" },
+            { "id": "disable-backups", "operation": "backups.disable", "lifecycle": "backup-configuration", "capability": "backups.manage", "secretBoundary": "dependency/retention effects shown" },
+            { "id": "edit-schedule-retention", "operation": "backups.schedule.set", "lifecycle": "backup-configuration", "capability": "backups.manage", "secretBoundary": "schedule metadata only" },
+            { "id": "add-recovery-holder", "operation": "backups.recovery-holder.add", "lifecycle": "backup-keyring", "capability": "backups.manage-recovery", "secretBoundary": "encrypted share delivered directly to Trusted Device" },
+            { "id": "remove-recovery-holder", "operation": "backups.recovery-holder.remove", "lifecycle": "backup-keyring", "capability": "backups.manage-recovery", "secretBoundary": "future keyring only" },
+            { "id": "create-recovery-point", "operation": "backups.point.create", "lifecycle": "backup-point", "capability": "backups.manage", "secretBoundary": "protected payload stays encrypted at authority" },
+            { "id": "view-recovery-points", "operation": "backups.points.read", "lifecycle": "backup-point", "capability": "backups.read", "secretBoundary": "metadata only" },
+            { "id": "restore-recovery-point", "operation": "backups.restore", "lifecycle": "backup-restore", "capability": "backups.restore", "secretBoundary": "recovery material goes only to admitted destination" }
+          ]
+        },
+        {
+          "id": "software-policy",
+          "title": "Software policy",
+          "authority": "organization-software-policy-authority",
+          "readModel": "SoftwarePolicyPageV1",
+          "capability": "software-policy.read",
+          "secretBoundary": "reported build/protocol evidence contains no bearer or payload",
+          "emptyState": "No override shows explicit product defaults.",
+          "unavailableState": "Unknown session posture remains unknown; stale policy basis blocks apply.",
+          "actions": [
+            { "id": "apply-software-policy", "operation": "software-policy.set", "lifecycle": "software-admission-policy", "capability": "software-policy.manage", "secretBoundary": "typed policy fields only" },
+            { "id": "discard-software-policy-draft", "operation": "software-policy.draft.discard", "lifecycle": "client-draft", "capability": "software-policy.read", "secretBoundary": "no server effect" },
+            { "id": "open-affected-sessions", "operation": "organization-sessions.read-affected", "lifecycle": "organization-session", "capability": "organization-sessions.read", "secretBoundary": "session metadata only" }
+          ]
+        },
+        {
+          "id": "billing",
+          "title": "Billing",
+          "authority": "tenant-billing-and-settlement-authority",
+          "readModel": "TenantBillingPageV1",
+          "capability": "billing.read",
+          "secretBoundary": "payment instruments and processor identity stay in Stripe",
+          "emptyState": "Free/base tenants show no payment method until needed and offer the paid-plan path.",
+          "unavailableState": "Processor outage preserves admitted invoices/usage as stale and disables processor-owned actions.",
+          "actions": [
+            { "id": "update-payment-method", "operation": "billing.payment-method.begin", "lifecycle": "stripe-customer-payment-method", "capability": "billing.manage", "secretBoundary": "Stripe-hosted collection only" },
+            { "id": "update-billing-contact", "operation": "billing.contact.set", "lifecycle": "tenant-billing", "capability": "billing.manage", "secretBoundary": "minimum billing contact metadata" },
+            { "id": "open-plans-services", "operation": "plans-services.read", "lifecycle": "tenant-subscription", "capability": "subscription.read", "secretBoundary": "navigation grants nothing" },
+            { "id": "inspect-usage", "operation": "billing.usage.read", "lifecycle": "usage-ledger", "capability": "billing.read", "secretBoundary": "aggregate metering, no project payload" },
+            { "id": "view-invoice-estimate", "operation": "billing.document.read", "lifecycle": "tenant-invoice", "capability": "billing.read", "secretBoundary": "processor-safe document link" },
+            { "id": "open-customer-portal", "operation": "billing.customer-portal.begin", "lifecycle": "stripe-customer-portal", "capability": "billing.manage", "secretBoundary": "processor-owned action and sensitive data" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "commercial-operations",
+      "scope": "exact-provider-tenant",
+      "threadIdentity": "person+commercial-operations+tenant",
+      "spec": "specs/experience/vend.md",
+      "pages": [
+        {
+          "id": "products",
+          "title": "Products",
+          "authority": "commercial-product-ledger",
+          "readModel": "ProductsPageV1",
+          "capability": "commercial-products.read",
+          "secretBoundary": "Library references and commercial facts only; no Agent source",
+          "emptyState": "No product shows New product and the admitted Library archetype picker.",
+          "unavailableState": "Library or commercial service outage distinguishes unavailable from no products.",
+          "actions": [
+            { "id": "create-product", "operation": "commercial-product.create", "lifecycle": "commercial-product", "capability": "commercial-products.manage", "secretBoundary": "real archetype/version reference only" },
+            { "id": "view-product", "operation": "commercial-product.read", "lifecycle": "commercial-product", "capability": "commercial-products.read", "secretBoundary": "commercial and engagement summaries only" },
+            { "id": "edit-product", "operation": "commercial-product.revise", "lifecycle": "commercial-product-revision", "capability": "commercial-products.manage", "secretBoundary": "does not modify Agent behavior/source" }
+          ]
+        },
+        {
+          "id": "clients",
+          "title": "Clients",
+          "authority": "commercial-client-ledger",
+          "readModel": "ClientsPageV1",
+          "capability": "commercial-clients.read",
+          "secretBoundary": "minimal identity and participant references; no CRM directory or project payload",
+          "emptyState": "No client shows Create client without inventing contacts.",
+          "unavailableState": "Commercial service outage distinguishes unavailable from no clients.",
+          "actions": [
+            { "id": "create-client", "operation": "commercial-client.create", "lifecycle": "commercial-client", "capability": "commercial-clients.manage", "secretBoundary": "minimal identity/billing reference only" },
+            { "id": "edit-client", "operation": "commercial-client.edit", "lifecycle": "commercial-client", "capability": "commercial-clients.manage", "secretBoundary": "minimal identity/billing reference only" },
+            { "id": "view-client", "operation": "commercial-client.read", "lifecycle": "commercial-client", "capability": "commercial-clients.read", "secretBoundary": "derived participant references only" },
+            { "id": "view-client-engagements", "operation": "commercial-engagements.read-by-client", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.read", "secretBoundary": "commercial references only" },
+            { "id": "view-client-payments", "operation": "commercial-payments.read-by-client", "lifecycle": "commercial-payment", "capability": "commercial-payments.read", "secretBoundary": "processor-safe evidence only" },
+            { "id": "close-client", "operation": "commercial-client.close", "lifecycle": "commercial-client", "capability": "commercial-clients.manage", "secretBoundary": "history preserved; no project/deployment revocation" }
+          ]
+        },
+        {
+          "id": "engagements",
+          "title": "Engagements",
+          "authority": "commercial-engagement-ledger",
+          "readModel": "EngagementsPageV1",
+          "capability": "commercial-engagements.read",
+          "secretBoundary": "commercial terms and admitted references only; no client project payload",
+          "emptyState": "No engagement shows New proposal; empty Open/Needs attention/Closed groups are not pages.",
+          "unavailableState": "Commercial, project, deployment, or settlement evidence may be unavailable independently and is freshness-labelled.",
+          "actions": [
+            { "id": "create-proposal", "operation": "commercial-engagement.proposal.create", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.manage", "secretBoundary": "recipient minimum identity and commercial terms only" },
+            { "id": "save-proposal", "operation": "commercial-engagement.proposal.save", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.manage", "secretBoundary": "typed commercial terms only" },
+            { "id": "send-proposal", "operation": "commercial-engagement.proposal.send", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.manage", "secretBoundary": "delivery token is not projected" },
+            { "id": "discard-proposal", "operation": "commercial-engagement.proposal.discard", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.manage", "secretBoundary": "draft history follows ledger policy" },
+            { "id": "revise-proposal", "operation": "commercial-engagement.proposal.revise", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.manage", "secretBoundary": "new revision does not mutate prior sent terms" },
+            { "id": "resend-proposal", "operation": "commercial-engagement.proposal.resend", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.manage", "secretBoundary": "delivery token is not projected" },
+            { "id": "withdraw-proposal", "operation": "commercial-engagement.proposal.withdraw", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.manage", "secretBoundary": "history preserved" },
+            { "id": "inspect-proposal-delivery", "operation": "commercial-engagement.proposal-delivery.read", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.read", "secretBoundary": "delivery evidence only" },
+            { "id": "record-accepted-agreement", "operation": "commercial-engagement.agreement.accept", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.accept-recipient", "secretBoundary": "recipient proof is consumed; terms freeze exactly" },
+            { "id": "link-or-create-placement", "operation": "commercial-engagement.placement.link", "lifecycle": "technical-placement", "capability": "commercial-engagements.fulfil", "secretBoundary": "project/deployment authority returns a reference only" },
+            { "id": "activate-entitlement", "operation": "commercial-engagement.entitlement.activate", "lifecycle": "deployment-entitlement", "capability": "commercial-engagements.fulfil", "secretBoundary": "payment is not access authority" },
+            { "id": "suspend-entitlement", "operation": "commercial-engagement.entitlement.suspend", "lifecycle": "deployment-entitlement", "capability": "commercial-engagements.fulfil", "secretBoundary": "future access only" },
+            { "id": "revoke-entitlement", "operation": "commercial-engagement.entitlement.revoke", "lifecycle": "deployment-entitlement", "capability": "commercial-engagements.fulfil", "secretBoundary": "future access only; history remains" },
+            { "id": "inspect-accepted-terms", "operation": "commercial-engagement.agreement.read", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.read", "secretBoundary": "frozen commercial snapshot only" },
+            { "id": "issue-engagement-invoice", "operation": "commercial-engagement.invoice.issue", "lifecycle": "commercial-payment", "capability": "commercial-payments.manage", "secretBoundary": "Stripe owns payment instrument and delivery" },
+            { "id": "inspect-engagement-charges", "operation": "commercial-engagement.payments.read", "lifecycle": "commercial-payment", "capability": "commercial-payments.read", "secretBoundary": "processor-safe evidence only" },
+            { "id": "close-engagement", "operation": "commercial-engagement.close", "lifecycle": "commercial-engagement", "capability": "commercial-engagements.manage", "secretBoundary": "agreement/payment/entitlement evidence preserved" }
+          ]
+        },
+        {
+          "id": "payments",
+          "title": "Payments",
+          "authority": "settlement-service-and-stripe-connect",
+          "readModel": "CommercialPaymentsPageV1",
+          "capability": "commercial-payments.read",
+          "secretBoundary": "Stripe owns bank, identity verification, payout, dispute, tax document, and support data",
+          "emptyState": "Not-onboarded shows exact unmet requirements and Begin onboarding; no fake account readiness.",
+          "unavailableState": "Stripe outage is external/unavailable; admitted GaugeDesk instructions and reconciliation remain separately readable.",
+          "actions": [
+            { "id": "begin-connect-onboarding", "operation": "commercial-payments.connect.begin", "lifecycle": "stripe-connect-onboarding", "capability": "commercial-payments.manage", "secretBoundary": "Stripe-hosted identity/business verification" },
+            { "id": "continue-connect-onboarding", "operation": "commercial-payments.connect.continue", "lifecycle": "stripe-connect-onboarding", "capability": "commercial-payments.manage", "secretBoundary": "Stripe-hosted identity/business verification" },
+            { "id": "open-connect-component", "operation": "commercial-payments.connect-component.open", "lifecycle": "stripe-connect-component-session", "capability": "commercial-payments.manage", "secretBoundary": "processor-owned bank/payout/balance/dispute UI" },
+            { "id": "create-engagement-checkout", "operation": "commercial-payments.checkout.create", "lifecycle": "commercial-payment", "capability": "commercial-payments.manage", "secretBoundary": "engagement basis inside GaugeDesk; payment entry in Stripe" },
+            { "id": "issue-engagement-invoice", "operation": "commercial-payments.invoice.issue", "lifecycle": "commercial-payment", "capability": "commercial-payments.manage", "secretBoundary": "engagement basis inside GaugeDesk; delivery/payment in Stripe" },
+            { "id": "inspect-payment", "operation": "commercial-payments.payment.read", "lifecycle": "commercial-payment", "capability": "commercial-payments.read", "secretBoundary": "processor-safe evidence only" },
+            { "id": "refund-payment", "operation": "commercial-payments.payment.refund", "lifecycle": "commercial-payment", "capability": "commercial-payments.refund", "secretBoundary": "Stripe result is external evidence until admitted" },
+            { "id": "open-processor-documents", "operation": "commercial-payments.processor-documents.open", "lifecycle": "stripe-connect", "capability": "commercial-payments.read", "secretBoundary": "processor-owned tax/support document" },
+            { "id": "open-processor-support", "operation": "commercial-payments.processor-support.open", "lifecycle": "stripe-connect", "capability": "commercial-payments.read", "secretBoundary": "processor-owned support surface" }
+          ]
+        }
+      ]
+    }
+  ]
+}
