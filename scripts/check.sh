@@ -97,6 +97,13 @@ run_contracts() {
     node scripts/check-whipplescript-workstream-contract.mjs
     python3 scripts/check-whipplescript-host-action.py
 
+    # The other direction across the same pin: WhippleScript meters, this
+    # repository prices. The runtime's own records say it does not price, so
+    # whether its report is sufficient to price FROM is a question only a
+    # consumer can answer, and this is where the answer is kept.
+    echo "== WhippleScript stats report contract =="
+    node scripts/check-whipplescript-stats-report.mjs
+
     echo "== TokenWright native-control metadata =="
     node scripts/check-tokenwright-environment.mjs
     node scripts/check-tokenwright-carried-surface.mjs

@@ -306,6 +306,7 @@ mod instance_view_tests {
 }
 
 pub mod gate_runner;
+pub mod whip_stats;
 /// The sans-I/O HTTP types a gate host implements its transport against.
 pub mod sansio_types {
     pub use whipplescript_kernel::sansio::{HttpRequest, HttpResponse, TransportError};
