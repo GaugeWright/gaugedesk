@@ -175,6 +175,7 @@ run_contracts() {
         web/e2e/production-native-session-canary.test.mjs
 
     echo "== client calls =="
+    node --test scripts/check-client-calls.test.mjs
     node scripts/check-client-calls.mjs
 
     # Absence has no line number: a crate nothing compiles and a lockfile

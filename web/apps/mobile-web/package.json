@@ -9,10 +9,10 @@
     "@gaugewright/control-plane-client": "0.0.0",
     "@gaugewright/workbench-ui": "0.0.0",
     "@tauri-apps/api": "^2.11.1",
-    "@tauri-apps/plugin-barcode-scanner": "^2.4.5",
-    "@tauri-apps/plugin-deep-link": "^2.4.9",
-    "@tauri-apps/plugin-opener": "^2.5.4",
-    "solid-js": "^1.9.0"
+    "@tauri-apps/plugin-barcode-scanner": "^2.4.6",
+    "@tauri-apps/plugin-deep-link": "^2.4.10",
+    "@tauri-apps/plugin-opener": "^2.5.5",
+    "solid-js": "^1.9.15"
   },
   "exports": {
     ".": "./src/index.ts",

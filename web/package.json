@@ -33,11 +33,11 @@
     "@git-diff-view/file": "^0.1.5",
     "@git-diff-view/solid": "^0.1.5",
     "@silurus/ooxml": "^0.86.1",
-    "@tauri-apps/plugin-dialog": "^2.7.1",
-    "officeparser": "^7.6.2",
-    "pdfjs-dist": "^6.2.108",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
+    "officeparser": "^7.8.0",
+    "pdfjs-dist": "^6.3.289",
     "qrcode-generator": "^2.0.4",
-    "solid-js": "^1.9.0"
+    "solid-js": "^1.9.15"
   },
   "_overrides": "officeparser pins pdfjs-dist at exactly 6.1.200, which GHSA-hq66-cqwq-w95j reports as high severity: a malicious PDF can execute arbitrary JavaScript. Every published officeparser through 7.5.1 pins that same version, so no upgrade resolves it, and `npm audit fix --force` would downgrade officeparser to 6.0.7 and an older pdfjs still. 6.2.108 is the first fixed release and is the same major, which is why forcing it here is safe. Remove this once officeparser ships a pin at or above 6.2.108.",
   "overrides": {
@@ -46,12 +46,12 @@
     }
   },
   "devDependencies": {
-    "@playwright/test": "^1.62.1",
-    "@types/node": "^26.2.0",
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^26.5.1",
     "fflate": "^0.8.3",
-    "playwright-bdd": "^9.0.0",
+    "playwright-bdd": "^9.2.1",
     "typescript": "^7.0.2",
-    "vite": "^8.2.1",
+    "vite": "^8.2.2",
     "vite-plugin-solid": "^2.11.12",
     "vitest": "^4.1.11"
   }
