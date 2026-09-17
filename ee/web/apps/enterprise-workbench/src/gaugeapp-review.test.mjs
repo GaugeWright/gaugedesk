@@ -55,6 +55,12 @@ const account = { profile: { account_id: "person-a", display_name: "Original nam
 const providers = { connections: [{ id: "connection-a", name: "Personal API", models: ["model-a"] }], default_model: { connection_id: "previous-connection", model: "previous-model" } };
 const hosts = { homes: [{ id: "host-a", name: "Research host", kind: "cloud", lifecycle: "active", managed_policy: { isolated_workspace_enabled: false, max_attempt_nanos_usd: 0 } }],
     managed_enrollment: { available: true, region: "test-region", capacity: { storage_bytes: 10000000, concurrent_agents: 2 } } };
+// Two hosts, because a handoff review that cannot name where the project comes
+// from and where it goes is not a review of anything.
+const handoffHosts = { homes: [
+    { id: "host-a", home_id: "home-a", name: "Research host", kind: "registered", lifecycle: "active", projects: [{ id: "project-a", name: "Trial results" }] },
+    { id: "host-b", home_id: "home-b", name: "Studio Mac", kind: "registered", lifecycle: "active", projects: [] },
+], managed_enrollment: { available: false, region: null, capacity: null } };
 const backups = {
     facility: { id: "cloud-backup", status: "active", config: { schedule_days: 1, retention_days: 30 } },
     project_host: { id: "host-a", name: "Research host", home_id: "home-a", home_lifecycle: "erased" },
@@ -116,6 +122,7 @@ const examples = {
     "project-host.reinstate": [{ id: "host-a" }, hosts],
     "project-host.retire": [{ id: "host-a", phase: "retention" }, hosts],
     "project-host.managed-policy.set": [{ id: "host-a", isolated_workspace_enabled: true, max_attempt_nanos_usd: 1500000000 }, hosts],
+    "project-home.handoff": [{ project_id: "project-a", expected_current_home_id: "home-a", target_home_id: "home-b" }, handoffHosts],
     "backups.enable": [{ schedule_days: 2, retention_days: 45 }, { ...backups, facility: null }],
     "backups.schedule.set": [{ schedule_days: 2, retention_days: 45 }, backups],
     "backups.disable": [{}, backups],
@@ -282,6 +289,12 @@ test("Project Host review uses exact targets, current policy and the declared se
     assert.ok(summary("project-host.rename", { id: "other-host", name: "Wrong" }, hosts).unavailable);
     assert.ok(summary("project-host.add", { kind: "managed", name: "Team" }, { ...hosts, managed_enrollment: { available: false } }).unavailable);
     assert.match(summary("project-host.suspend", ...examples["project-host.suspend"]).note, /history remains readable/);
+    const handoff = summary("project-home.handoff", ...examples["project-home.handoff"]);
+    assert.match(handoff.fields.find((field) => field.label === "Project").value, /Trial results/);
+    // The host field must carry both ends: `before` is where it leaves from.
+    const host = handoff.fields.find((field) => field.label === "Project Host");
+    assert.match(host.value, /Studio Mac/);
+    assert.match(host.before, /Research host/);
     const retirement = summary("project-host.retire", ...examples["project-host.retire"]);
     assert.equal(retirement.title, "Retire Project Host");
     assert.match(retirement.note, /can be reinstated/);

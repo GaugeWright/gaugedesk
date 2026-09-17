@@ -57,6 +57,7 @@ export const CLOUD_ADMIN_REVIEW_COMMANDS = {
 } as const;
 export const REVIEW_COMMANDS = {
     ...CLOUD_ADMIN_REVIEW_COMMANDS,
+    "project-home.handoff": ["administration", "project-hosts", "Move a project to another Project Host"],
     "project.create": ["administration", "projects", "Create project"],
     "organization.display-name.set": ["administration", "organization", "Change organization name"],
     "organization.ownership.transfer": ["administration", "organization", "Transfer ownership"],
@@ -314,6 +315,20 @@ export function summarizeGaugeAppChange(proposal: GaugeAppProposal, page: GaugeA
                 field("Metered Isolated workspace", enabled(p.isolated_workspace_enabled), enabled(policy.isolated_workspace_enabled));
                 field("Maximum per-attempt reservation", nanoDollars(p.max_attempt_nanos_usd), nanoDollars(policy.max_attempt_nanos_usd));
                 note = "Retries require a new reservation. Included workflows and project permissions are unchanged.";
+                break;
+            }
+            case "project-home.handoff": {
+                // The subject is the project, not the host, so this cannot lean
+                // on `target()` — which reads `p.id`. Naming the two hosts is
+                // the whole point of the review: a reviewer is agreeing to
+                // where the work ends up, not merely that a move happens.
+                const projectId = string(p.project_id);
+                const from = recordIn(m.homes, string(p.expected_current_home_id), "home_id");
+                const to = recordIn(m.homes, string(p.target_home_id), "home_id");
+                const project = (from.projects as Data[] | null ?? []).find((candidate) => candidate.id === projectId);
+                field("Project", project ? label(project, projectId) : projectId);
+                field("Project Host", label(to, string(p.target_home_id)), label(from, string(p.expected_current_home_id)));
+                note = "The two Project Hosts move the project between themselves. It stays readable on the current host until the receiving host holds all of it, and project permissions are unchanged.";
                 break;
             }
             case "project-host.suspend":

@@ -11,7 +11,8 @@ export function ProjectHostsPage(props: {
     const [selectedId, setSelectedId] = createSignal("");
     const selected = createMemo(() => model().homes.find((host) => host.id === selectedId()));
     const managed = createMemo(() => { const host = selected(); return host?.kind === "cloud" ? host : undefined; });
-    const [mode, setMode] = createSignal<"add" | "rename" | "policy" | "retire" | null>(null);
+    const [mode, setMode] = createSignal<"add" | "rename" | "policy" | "retire" | "handoff" | null>(null);
+    const [movingProjectId, setMovingProjectId] = createSignal("");
     const [name, setName] = createSignal("");
     const [enabled, setEnabled] = createSignal(false);
     const [cap, setCap] = createSignal("0");
@@ -30,6 +31,17 @@ export function ProjectHostsPage(props: {
         setMode("policy"); setError("");
     };
     const beginRetire = () => { setRetireConfirmation(""); setMode("retire"); setError(""); };
+    // Projects this Home could hand to the selected one. A host that reports no
+    // inventory is not offering an empty one — it has not been connected, so it
+    // contributes nothing here rather than appearing to hold nothing.
+    const movable = createMemo(() => {
+        const target = selected();
+        if (!target) return [];
+        return model().homes
+            .filter((host) => host.home_id !== target.home_id && host.projects !== null)
+            .flatMap((host) => host.projects!.map((project) => ({ ...project, from: host })));
+    });
+    const beginHandoff = () => { setMovingProjectId(movable()[0]?.id ?? ""); setMode("handoff"); setError(""); };
     const submit = async (command: string, payload: Readonly<Record<string, unknown>>) => {
         if (busy()) return;
         setBusy(true); setError("");
@@ -45,6 +57,13 @@ export function ProjectHostsPage(props: {
         else if (mode() === "policy" && host) {
             const amount = parseNanoUsd(cap());
             if (amount !== null) void submit("project-host.managed-policy.set", { id: host.id, isolated_workspace_enabled: enabled(), max_attempt_nanos_usd: amount });
+        }
+        else if (mode() === "handoff" && host) {
+            const project = movable().find((candidate) => candidate.id === movingProjectId());
+            // The Home the page believed it was moving from travels with the
+            // request, so a move that happened while this form was open is
+            // refused rather than silently retargeted.
+            if (project) void submit("project-home.handoff", { project_id: project.id, expected_current_home_id: project.from.home_id, target_home_id: host.home_id });
         }
         else if (mode() === "retire" && host?.kind === "cloud") {
             void submit("project-host.retire", {
@@ -76,6 +95,7 @@ export function ProjectHostsPage(props: {
                 <Show when={managed() && !retiredHost(host()) && can("project-host.managed-policy.set")}><button type="button" disabled={busy()} onClick={beginPolicy}>Compute policy</button></Show>
                 <Show when={managed() && host().lifecycle === "active" && can("project-host.suspend")}><button type="button" class="danger" disabled={busy()} onClick={() => void submit("project-host.suspend", { id: host().id })}>Suspend</button></Show>
                 <Show when={managed() && ["suspended", "retention"].includes(host().lifecycle) && can("project-host.reinstate")}><button type="button" class="primary" disabled={busy()} onClick={() => void submit("project-host.reinstate", { id: host().id })}>Reinstate</button></Show>
+                <Show when={!retiredHost(host()) && can("project-home.handoff")}><button type="button" disabled={busy() || movable().length === 0} title={movable().length === 0 ? "No other Project Host is reporting a project inventory to move from." : undefined} onClick={beginHandoff}>Move a project here</button></Show>
                 <Show when={managed() && ["active", "suspended", "retention"].includes(host().lifecycle) && can("project-host.retire")}><button type="button" class="danger" disabled={busy()} onClick={beginRetire}>{host().lifecycle === "retention" ? "Erase permanently" : "Retire"}</button></Show>
             </div>
             <dl class="gaugeapp-host-facts">
@@ -92,14 +112,23 @@ export function ProjectHostsPage(props: {
                 </>}</Show>
             </dl>
             <Show when={host().projects === null}><p class="gaugeapp-host-note">Project names and access come from a connection admitted by this host. Adding a host does not grant project access.</p></Show>
+            {/* ADR 0171 asks for a truthful unavailable state rather than a
+                server-made recovery key, so the page says why the recovery
+                export is not here instead of offering a control that could
+                only fail. */}
+            <p class="gaugeapp-host-note">Recovery export is unavailable: it seals the cut to a recovery holder whose private key stays in a trusted device's key store, and this organization has no such holder enrolled.</p>
             <Show when={host().projects !== null && host().projects!.length > 0}><ul class="gaugeapp-host-projects"><For each={host().projects!}>{(project) => <li>{project.name || project.id}</li>}</For></ul></Show>
             <details class="gaugeapp-host-diagnostics"><summary>Connection details</summary><dl class="gaugeapp-host-facts"><div><dt>Home identity</dt><dd><code>{host().home_id}</code></dd></div><div><dt>Endpoint</dt><dd>{host().endpoint || "This computer"}</dd></div></dl></details>
         </section>}</Show>
 
-        <Show when={mode() === "add" || ((mode() === "rename" || mode() === "policy" || mode() === "retire") && selected())}>
+        <Show when={mode() === "add" || ((mode() === "rename" || mode() === "policy" || mode() === "retire" || mode() === "handoff") && selected())}>
             <form class="gaugeapp-panel gaugeapp-host-editor" onSubmit={save}>
-                <h2>{mode() === "add" ? "Add managed Project Host" : mode() === "rename" ? "Rename Project Host" : mode() === "policy" ? "Compute policy" : managed()?.lifecycle === "retention" ? "Erase Project Host" : "Retire Project Host"}</h2>
-                <Show when={mode() !== "policy" && mode() !== "retire"}><label><span>Name</span><input value={name()} maxLength={120} required onInput={(event) => setName(event.currentTarget.value)} /></label></Show>
+                <h2>{mode() === "add" ? "Add managed Project Host" : mode() === "rename" ? "Rename Project Host" : mode() === "policy" ? "Compute policy" : mode() === "handoff" ? `Move a project to ${selected()?.name}` : managed()?.lifecycle === "retention" ? "Erase Project Host" : "Retire Project Host"}</h2>
+                <Show when={mode() === "handoff"}>
+                    <label><span>Project</span><select value={movingProjectId()} onChange={(event) => setMovingProjectId(event.currentTarget.value)}><For each={movable()}>{(project) => <option value={project.id}>{project.name || project.id} — currently on {project.from.name}</option>}</For></select></label>
+                    <p class="gaugeapp-host-note">The project moves between the two Project Hosts directly. Its content does not pass through this page, and the move completes only once the receiving host holds everything.</p>
+                </Show>
+                <Show when={mode() !== "policy" && mode() !== "retire" && mode() !== "handoff"}><label><span>Name</span><input value={name()} maxLength={120} required onInput={(event) => setName(event.currentTarget.value)} /></label></Show>
                 <Show when={mode() === "add"}><dl class="gaugeapp-host-facts"><div><dt>Service location</dt><dd>{model().managed_enrollment.region}</dd></div><div><dt>Plan capacity</dt><dd>{model().managed_enrollment.capacity ? `${hostBytes(model().managed_enrollment.capacity!.storage_bytes)} · ${model().managed_enrollment.capacity!.concurrent_agents} concurrent agents` : "Unavailable"}</dd></div></dl><p class="gaugeapp-host-note">Uses this organization's current hosting plan. Your plan is not changed.</p></Show>
                 <Show when={mode() === "policy"}>
                     <label class="gaugeapp-host-toggle"><input type="checkbox" checked={enabled()} onChange={(event) => setEnabled(event.currentTarget.checked)} /><span>Allow metered Isolated workspace compute</span></label>
@@ -113,7 +142,7 @@ export function ProjectHostsPage(props: {
                     </Show>
                     <label><span>Type {managed()?.name} to confirm</span><input value={retireConfirmation()} autocomplete="off" onInput={(event) => setRetireConfirmation(event.currentTarget.value)} /></label>
                 </Show>
-                <div class="gaugeapp-host-actions"><button type="button" disabled={busy()} onClick={close}>Cancel</button><button type="submit" classList={{ primary: mode() !== "retire", danger: mode() === "retire" }} disabled={busy() || (mode() === "policy" ? !policyValid() : mode() === "retire" ? retireConfirmation().trim() !== managed()?.name.trim() : !name().trim())}>{busy() ? "Preparing…" : mode() === "add" ? "Add host" : mode() === "retire" ? managed()?.lifecycle === "retention" ? "Erase permanently" : "Begin retention" : "Save"}</button></div>
+                <div class="gaugeapp-host-actions"><button type="button" disabled={busy()} onClick={close}>Cancel</button><button type="submit" classList={{ primary: mode() !== "retire", danger: mode() === "retire" }} disabled={busy() || (mode() === "policy" ? !policyValid() : mode() === "retire" ? retireConfirmation().trim() !== managed()?.name.trim() : mode() === "handoff" ? !movingProjectId() : !name().trim())}>{busy() ? "Preparing…" : mode() === "add" ? "Add host" : mode() === "handoff" ? "Move project" : mode() === "retire" ? managed()?.lifecycle === "retention" ? "Erase permanently" : "Begin retention" : "Save"}</button></div>
             </form>
         </Show>
         <Show when={error()}><p class="gaugeapp-host-error" role="alert">{error()}</p></Show>

@@ -340,7 +340,7 @@ function Harness() {
     } : app === "administration" && subscriptionLifecycleMode ? {
         "plans-services": ["subscription.plan.change", "subscription.seats.change", "subscription.cancellation.schedule"],
     } : app === "administration" && projectHostMode ? {
-        "project-hosts": ["project-host.rename", "project-host.suspend", "project-host.reinstate", "project-host.managed-policy.set", "project-host.retire"],
+        "project-hosts": ["project-host.rename", "project-host.suspend", "project-host.reinstate", "project-host.managed-policy.set", "project-host.retire", "project-home.handoff"],
     } : app === "administration" ? {
         "enterprise-identity": [
             "enterprise-identity.scim-credential.issue",

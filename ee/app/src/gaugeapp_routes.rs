@@ -349,6 +349,17 @@ const COMMANDS: &[CommandPolicy] = &[
         capability: Capability::ManageOrgLifecycle,
         review: ReviewPolicy::Human,
     },
+    // Both are entry points, not reducers. Handoff prepares an intent the
+    // existing project-handoff lifecycle carries out, and export prepares a
+    // recipient-sealed cut the source Home produces. Neither moves or reads
+    // project content here, and both are reviewed because they commit a
+    // durable move of, or a durable copy of, someone's work.
+    CommandPolicy {
+        id: "project-home.handoff",
+        page: "project-hosts",
+        capability: Capability::ManageOrgLifecycle,
+        review: ReviewPolicy::Human,
+    },
     CommandPolicy {
         id: "organization.domain.add",
         page: "organization",
@@ -1167,6 +1178,131 @@ fn extension_error(error: AdministrationExtensionError) -> Response {
     (error.status, Json(json!({ "error": error.message }))).into_response()
 }
 
+/// Say what stopped a handoff, in the administrator's terms.
+///
+/// Every one of these is a recheck against current truth rather than against
+/// the request, so each message names the thing that moved.
+fn handoff_refusal(error: gaugedesk_core::project_home_handoff::PreparationError) -> Response {
+    use gaugedesk_core::project_home_handoff::PreparationError as Why;
+    let (status, message) = match error {
+        Why::NotPermitted => (
+            StatusCode::FORBIDDEN,
+            "your current role does not admit moving a project between Project Hosts",
+        ),
+        Why::TenantMismatch => (
+            StatusCode::CONFLICT,
+            "the project and the Project Host belong to different organizations",
+        ),
+        Why::PersonalProjectNotTransferable => (
+            StatusCode::CONFLICT,
+            "Personal is your account space, not a transferable project",
+        ),
+        Why::StaleHomeBasis => (
+            StatusCode::CONFLICT,
+            "this project has moved since the page was read; reopen it and try again",
+        ),
+        Why::TargetNotRegistered => (
+            StatusCode::NOT_FOUND,
+            "that Project Host is not registered to this organization",
+        ),
+        Why::TargetPossessionStale => (
+            StatusCode::CONFLICT,
+            "that Project Host has not proved its current route recently enough to be offered a project",
+        ),
+        Why::TargetNotEligible => (
+            StatusCode::CONFLICT,
+            "that Project Host is not accepting new projects",
+        ),
+        Why::AlreadyHome => (
+            StatusCode::CONFLICT,
+            "this project already lives on that Project Host",
+        ),
+    };
+    (status, Json(json!({ "error": message }))).into_response()
+}
+
+/// Read current truth for a handoff. None of it is taken from the request: a
+/// page cannot assert that a target is registered, nor where a project lives.
+fn handoff_facts(
+    wb: &Workbench,
+    headers: &HeaderMap,
+    tenant: &str,
+    value: &HandoffPayload,
+) -> Result<gaugedesk_core::project_home_handoff::CurrentFacts, Response> {
+    let workspace = gaugedesk_app::library_routes::workspace_value(wb);
+    let project = workspace
+        .get("projects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|project| project.get("id").and_then(Value::as_str) == Some(&value.project_id))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "no such project on this Project Host" })),
+            )
+                .into_response()
+        })?;
+    let target = registered_target(wb, tenant, &value.target_home_id);
+    Ok(gaugedesk_core::project_home_handoff::CurrentFacts {
+        // The command's capability is already checked before planning; this is
+        // the recheck against the role held now, which is what the lifecycle
+        // requires and what a long-open review tab can invalidate.
+        actor_may_move_projects: wb
+            .admin_capabilities(bearer(headers), &req_scope(headers))
+            .is_ok_and(|capabilities| capabilities.contains(&Capability::ManageOrgLifecycle)),
+        project_tenant_id: tenant.to_owned(),
+        project_is_personal: project
+            .get("is_personal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        project_current_home_id: project
+            .get("home_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        target_tenant_id: tenant.to_owned(),
+        target_registered: target.is_some(),
+        target_possession_current: target
+            .as_ref()
+            .is_some_and(|target| target.possession_current),
+        target_accepts_placement: target
+            .as_ref()
+            .is_some_and(|target| target.accepts_placement),
+    })
+}
+
+/// What the registry currently says about one target Project Host.
+struct RegisteredTarget {
+    possession_current: bool,
+    accepts_placement: bool,
+}
+
+fn registered_target(wb: &Workbench, tenant: &str, home_id: &str) -> Option<RegisteredTarget> {
+    let directory =
+        gaugedesk_app::facility::Facilities::rebuild_tenant(wb.store_ref(), tenant).ok()?;
+    let record = directory.facilities.values().find(|record| {
+        record.owner == gaugedesk_app::facility::FacilityOwner::Tenant
+            && matches!(
+                record.kind,
+                gaugedesk_app::facility::FacilityKind::RegisteredHost
+                    | gaugedesk_app::facility::FacilityKind::HostedHomeNode
+            )
+            && record.config.get("home_id").and_then(Value::as_str) == Some(home_id)
+    })?;
+    Some(RegisteredTarget {
+        // A registration that carries a transport pin was admitted through the
+        // possession ceremony. One without it predates that ceremony and is not
+        // a current proof of route, so it cannot be offered a project.
+        possession_current: record
+            .config
+            .get("transport_pin")
+            .and_then(Value::as_str)
+            .is_some_and(|pin| !pin.trim().is_empty()),
+        accepts_placement: record.status == gaugedesk_app::facility::FacilityStatus::Active,
+    })
+}
+
 fn delete_organization_refusal(
     refusal: gaugedesk_app::tenancy::DeleteOrganizationRefusal,
 ) -> Response {
@@ -1262,6 +1398,11 @@ fn build_session(
                 && (!recovery_only || command.id == "enterprise-identity.enforcement.disable")
                 && has_capability(&capabilities, command.capability)
                 && (command.id != "organization.delete" || tenant != ORG_ID)
+                // A Personal tenant's Administration surface is deliberately
+                // narrow, and moving a project between Project Hosts is
+                // organization governance rather than one of the machine and
+                // billing facts a personal account space is presented with.
+                && (command.id != "project-home.handoff" || !personal_tenant(&tenant))
         }) {
             if let Some(extension) = extension {
                 if !extension
@@ -2011,6 +2152,15 @@ struct DomainPayload {
     domain: String,
 }
 #[derive(Deserialize)]
+struct HandoffPayload {
+    project_id: String,
+    /// Where the page believed the project lived. Carried so a concurrent move
+    /// is a refusal rather than a silent retarget.
+    expected_current_home_id: String,
+    target_home_id: String,
+}
+
+#[derive(Deserialize)]
 struct InvitePayload {
     emails: Vec<String>,
     role: String,
@@ -2416,6 +2566,32 @@ fn plan_command(
                 audit_action: "organization.delete",
                 audit_target: tenant.clone(),
                 transient_result: Some(json!({ "deleted_organization": tenant })),
+            }
+        }
+        "project-home.handoff" => {
+            let value: HandoffPayload = parse(&command.payload)?;
+            let tenant = tenant_id(headers);
+            let actor = wb.actor(bearer(headers));
+            let request = gaugedesk_core::project_home_handoff::HandoffRequest {
+                version: gaugedesk_core::project_home_handoff::HANDOFF_PREPARATION_VERSION,
+                tenant_id: tenant.clone(),
+                project_id: value.project_id.clone(),
+                expected_current_home_id: value.expected_current_home_id.clone(),
+                target_home_id: value.target_home_id.clone(),
+                requested_by: actor.as_str().to_owned(),
+            };
+            let facts = handoff_facts(wb, headers, &tenant, &value)?;
+            let intent = gaugedesk_core::project_home_handoff::prepare(&request, &facts)
+                .map_err(handoff_refusal)?;
+            // Nothing is written. Preparation produces an intent the origin Home
+            // offers into the project-handoff lifecycle, which is the only
+            // reducer that may change the one Home fact.
+            MutationPlan {
+                facts: Vec::new(),
+                notices: Vec::new(),
+                audit_action: "project-home.handoff",
+                audit_target: value.project_id,
+                transient_result: Some(json!({ "handoff_intent": intent })),
             }
         }
         "organization.domain.add" => {
@@ -5644,6 +5820,40 @@ mod tests {
             .all(|id| id.starts_with("machine.") || id.starts_with("billing.")));
     }
 
+    /// The Project Hosts page is one of the two a Personal tenant sees, so a
+    /// command added to that page reaches a personal account space unless it
+    /// says otherwise. Moving a project between Project Hosts is organization
+    /// governance, and presenting it here would make Personal the tiny
+    /// organization it is deliberately not.
+    #[tokio::test]
+    async fn a_personal_tenant_is_not_offered_project_handoff_on_the_page_it_shares() {
+        let tenant_id = "personal:owner";
+        let (_dir, _shared, app) = test_app_as_in("owner", tenant_id);
+        let session = open_in_tenant(&app, Some(tenant_id)).await;
+        let commands = session["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!commands.contains(&"project-home.handoff"), "{commands:?}");
+
+        // The same command is offered on the same page in an organization, so
+        // this is a boundary rather than the command being unreachable.
+        let (_dir, _shared, org_app) = test_app();
+        let org_session = open(&org_app).await;
+        let org_commands = org_session["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            org_commands.contains(&"project-home.handoff"),
+            "{org_commands:?}"
+        );
+    }
+
     #[tokio::test]
     async fn composition_extension_uses_the_same_session_review_and_receipt_path() {
         let (_dir, shared, _app) = test_app();
@@ -7600,6 +7810,139 @@ mod tests {
         assert_eq!(record.display_name, "Acme");
         assert_eq!(record.verified_domains, vec!["keep.example"]);
         assert_eq!(record.default_region.as_deref(), Some("us"));
+    }
+
+    /// Propose a handoff and take it through review, returning what the review
+    /// answered. A refusal that only appeared at propose time would be a
+    /// refusal the reviewed path never makes.
+    async fn review_handoff(app: &Router, payload: Value, key: &str) -> (StatusCode, Value) {
+        let session = open(app).await;
+        let hosts = session["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|page| page["id"] == "project-hosts")
+            .unwrap()
+            .clone();
+        let (status, proposed) = request(
+            app,
+            Method::POST,
+            "/gaugeapps/administration/commands",
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "page_id": "project-hosts", "command_id": "project-home.handoff",
+                "expected_basis": hosts["resource_basis"],
+                "idempotency_key": key,
+                "payload": payload, "client": "web",
+            }),
+            Some(key),
+        )
+        .await;
+        if status != StatusCode::OK {
+            return (status, proposed);
+        }
+        let proposal_id = proposed["proposal"]["id"].as_str().unwrap().to_owned();
+        request(
+            app,
+            Method::POST,
+            &format!("/gaugeapps/administration/proposals/{proposal_id}/review"),
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "decision": "accept", "client": "web",
+            }),
+            Some(&format!("{key}-review")),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_handoff_names_a_project_this_host_actually_serves() {
+        let (_dir, _shared, app) = test_app();
+        let (status, body) = review_handoff(
+            &app,
+            json!({
+                "project_id": "project:invented",
+                "expected_current_home_id": "home:anything",
+                "target_home_id": "home:elsewhere",
+            }),
+            "handoff-no-project",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no such project"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_target_must_be_registered_to_this_organization() {
+        let (_dir, shared, app) = test_app();
+        let project = {
+            let guard = shared.lock().unwrap();
+            gaugedesk_app::library_routes::workspace_value(&guard)["projects"]
+                .as_array()
+                .and_then(|projects| projects.first().cloned())
+        };
+        // A Home always serves at least its own default project; without one
+        // this test would pass for the wrong reason.
+        let project = project.expect("this Home serves no project to hand off");
+        let (status, body) = review_handoff(
+            &app,
+            json!({
+                "project_id": project["id"],
+                "expected_current_home_id": project["home_id"],
+                // Never registered here, so possession was never proved for it.
+                "target_home_id": "home:a-stranger",
+            }),
+            "handoff-unregistered-target",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not registered to this organization"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_built_on_a_stale_home_basis_is_refused_rather_than_retargeted() {
+        let (_dir, shared, app) = test_app();
+        let project = {
+            let guard = shared.lock().unwrap();
+            gaugedesk_app::library_routes::workspace_value(&guard)["projects"]
+                .as_array()
+                .and_then(|projects| projects.first().cloned())
+        }
+        .expect("this Home serves no project to hand off");
+        let (status, body) = review_handoff(
+            &app,
+            json!({
+                "project_id": project["id"],
+                // What a page would carry if another administrator had already
+                // moved this project while the review sat open.
+                "expected_current_home_id": "home:where-it-used-to-be",
+                "target_home_id": "home:a-stranger",
+            }),
+            "handoff-stale-basis",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("has moved since"),
+            "{body}"
+        );
     }
 
     async fn organization_page(app: &Router) -> Value {
