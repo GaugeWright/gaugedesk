@@ -1395,7 +1395,6 @@ mod tests {
     /// open: `shutdown` now runs inside a request handler.
     #[tokio::test]
     async fn a_dead_peer_bounds_the_survivors_teardown() {
-        tokio::time::pause();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let relay = tokio::spawn(async move {
@@ -1414,6 +1413,17 @@ mod tests {
         let mut leg = connect_websocket_stream(&route, WebSocketRelayRole::Source)
             .await
             .unwrap();
+        // Only now. A paused clock auto-advances to the nearest deadline
+        // whenever the runtime has nothing ready to poll, and it decides that
+        // by polling the I/O driver once with a zero timeout — which a real
+        // loopback socket routinely fails to answer inside. Pausing before the
+        // dial therefore jumped the clock the whole 35s to the pairing timeout
+        // while the handshake was still in flight (measured: 35.001s of clock
+        // for 0.45ms of work, on every run), leaving the timer and the socket
+        // to race for the scheduler. `Source` promises no keepalives, so from
+        // here the teardown deadline is the only deadline the clock can reach,
+        // and it is not armed until `shutdown` has really sent its `FIN`.
+        tokio::time::pause();
         let started = tokio::time::Instant::now();
         leg.shutdown().await.unwrap();
         let waited = started.elapsed();
