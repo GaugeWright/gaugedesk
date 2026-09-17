@@ -95,6 +95,7 @@ pub mod org;
 pub mod package_flow;
 pub mod package_store;
 pub mod policy_compiler;
+pub mod possession_exchange;
 pub mod project_credential_routes;
 pub mod project_model_selection;
 pub mod project_tracker;

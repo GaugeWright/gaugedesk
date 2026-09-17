@@ -68,8 +68,7 @@
             { "id": "reject-device-link", "operation": "trusted-device.link.reject", "lifecycle": "device-enrollment", "capability": "trusted-devices.link", "secretBoundary": "pairing reference is invalidated" },
             { "id": "cancel-device-link", "operation": "trusted-device.link.cancel", "lifecycle": "device-enrollment", "capability": "trusted-devices.link", "secretBoundary": "pairing reference is invalidated" },
             { "id": "rename-trusted-device", "operation": "trusted-device.rename", "lifecycle": "trusted-device", "capability": "trusted-devices.manage", "secretBoundary": "metadata only" },
-            { "id": "revoke-trusted-device", "operation": "trusted-device.revoke", "lifecycle": "trusted-device", "capability": "trusted-devices.manage", "secretBoundary": "future access is blocked; history remains" },
-            { "id": "set-recovery-holder", "operation": "trusted-device.recovery-holder.set", "lifecycle": "backup-keyring", "capability": "trusted-devices.manage-recovery", "secretBoundary": "recovery material is device-held and never projected" }
+            { "id": "revoke-trusted-device", "operation": "trusted-device.revoke", "lifecycle": "trusted-device", "capability": "trusted-devices.manage", "secretBoundary": "future access is blocked; history remains" }
           ]
         },
         {
