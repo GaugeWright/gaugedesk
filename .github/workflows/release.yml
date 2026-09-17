@@ -174,7 +174,7 @@ jobs:
 
       - name: authenticate Windows release identity
         if: matrix.os-label == 'windows' && vars.AZURE_ARTIFACT_SIGNING_ENABLED == 'true'
-        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
         with:
           client-id: ${{ vars.AZURE_ARTIFACT_SIGNING_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_ARTIFACT_SIGNING_TENANT_ID }}
@@ -668,7 +668,7 @@ jobs:
           scripts/check-deb-package.sh "${debs[0]}"
 
       - name: generate release SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26
         with:
           path: src-tauri/target/release/bundle
           format: spdx-json
