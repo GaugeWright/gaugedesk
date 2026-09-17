@@ -58,7 +58,12 @@ export interface SignInPasskeyActions {
 export interface SignInProvider {
     id: "google" | "apple" | "microsoft";
     label: string;
-    begin: () => void;
+    /** May be asynchronous, and may reject. A desktop does not redirect to an
+     *  IdP itself — it asks its control plane for a Hub login URL and opens the
+     *  system browser — so this is a round trip that can fail, and the card
+     *  reports the failure rather than leaving a pressed button that did
+     *  nothing. */
+    begin: () => void | Promise<void>;
 }
 
 export interface SignInRecoveryActions {
@@ -187,6 +192,12 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
         });
     };
 
+    /** Through `run` so a rejected handoff says so in the status line. */
+    const beginProvider = (provider: SignInProvider) =>
+        void run(`start ${provider.label}`, async () => {
+            await provider.begin();
+        });
+
     const signInWithPasskey = (address: string) =>
         void run("sign in with that passkey", async () => {
             await props.passkey!.signIn(address);
@@ -302,26 +313,6 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                         </button>
                     </Show>
                 </form>
-
-                <Show when={(props.providers?.length ?? 0) > 0}>
-                    <div class="signin__rule"><span>or</span></div>
-                    <div class="signin__providers" data-signin-providers>
-                        <For each={props.providers}>
-                            {(provider) => (
-                                <button
-                                    class="signin__provider"
-                                    data-signin-provider={provider.id}
-                                    type="button"
-                                    aria-label={provider.label}
-                                    title={provider.label}
-                                    onClick={() => provider.begin()}
-                                >
-                                    <ProviderMark id={provider.id} />
-                                </button>
-                            )}
-                        </For>
-                    </div>
-                </Show>
             </Show>
 
             <Show when={at('organization')}>
@@ -494,6 +485,37 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                             </Show>
                         </form>
                     )}
+            </Show>
+
+            {/* The consumer route, on both steps that can still take it. It used
+                to sit inside the opening step, so pressing Continue took Google,
+                Apple and Microsoft off the screen — and the personal branch is
+                exactly where someone whose account *is* a Google account arrives.
+                Not on the organization branch, where the connection the server
+                matched is the route, and not mid-ceremony. */}
+            <Show
+                when={
+                    (props.providers?.length ?? 0) > 0
+                    && (step().at === "identify" || step().at === "personal")
+                }
+            >
+                <div class="signin__rule"><span>or</span></div>
+                <div class="signin__providers" data-signin-providers>
+                    <For each={props.providers}>
+                        {(provider) => (
+                            <button
+                                class="signin__provider"
+                                data-signin-provider={provider.id}
+                                type="button"
+                                aria-label={provider.label}
+                                title={provider.label}
+                                onClick={() => beginProvider(provider)}
+                            >
+                                <ProviderMark id={provider.id} />
+                            </button>
+                        )}
+                    </For>
+                </div>
             </Show>
 
             <Show when={status()}>

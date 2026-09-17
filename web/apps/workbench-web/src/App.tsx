@@ -166,10 +166,17 @@ const codexLoginAvailable = import.meta.env.VITE_CODEX_LOGIN !== "false";
 /// and follows them to another machine.
 const FIRST_RUN_POSTPONED_SETTING = "first_run.postponed";
 const localDevLogin = import.meta.env.VITE_LOCAL_DEV_LOGIN === "true";
-// The welcome overlay's account step is offered only where the composition's
-// control plane serves the OIDC login shell (the hub-split hosted builds and the
-// dev-login harness); the core desktop build has no account plane to sign in to.
-const accountLoginAvailable = import.meta.env.VITE_HOME_SPLIT === "true" || localDevLogin;
+/// Whether *this* composition signs in by redirecting to the OIDC login shell.
+/// It does not decide whether sign-in is offered at all. The comment that used
+/// to stand here said "the core desktop build has no account plane to sign in
+/// to", and every use of it gated identity off that claim. The claim is false:
+/// `/auth/login`, `/auth/work-email` and the passkey and recovery ceremonies are
+/// all in `crates/app` (`auth_oidc.rs:290`, `:294`, `:318`), so every control
+/// plane serves them, the loopback desktop's own included. Believing it shipped
+/// a 0.4.13 desktop with no entrance to identity anywhere: the card rendered
+/// only behind a Home that had failed to authenticate, which a desktop that *is*
+/// its own Home never produces, and the account menu's action was `undefined`.
+const oidcRedirectAvailable = import.meta.env.VITE_HOME_SPLIT === "true" || localDevLogin;
 // OIDC login (ID-3): if we just returned from `/auth/callback`, capture the id-token
 // from the URL fragment before the first request, then hand the bearer to the
 // transport so gated `/admin/*` calls carry it. Signed-out / single-user local is the
@@ -439,7 +446,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         void props.gaugeApps?.onNativeAccountSessionChanged?.(linked);
     });
     const beginAccountAdmission = async (): Promise<void> => {
-        if (accountLoginAvailable) {
+        if (oidcRedirectAvailable) {
             beginLogin(controlPlaneBase());
             return;
         }
@@ -786,6 +793,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         refreshModelAccess();
     };
     const [firstRunDismissed, setFirstRunDismissed] = createSignal(false);
+    /// The first-run gate offers identity first and the local route behind it,
+    /// which is the order the founder asked for: opening the app with no
+    /// credential but an account means signing in is very likely what is wanted,
+    /// and it brings the credentials back with it. This carries "no, the local
+    /// route" — set by the card's footnote, cleared when that screen goes back.
+    const [modelSetupOpen, setModelSetupOpen] = createSignal(false);
+    /// The account menu's entrance to the same card, for a person who dismissed
+    /// the gate or signed out. Identity has one surface; this opens it rather
+    /// than starting a second flow beside it.
+    const [signInOpen, setSignInOpen] = createSignal(false);
     const hasAnyCredential = (): boolean | undefined => {
         const creds = startupCreds();
         const codex = startupCodex();
@@ -1960,12 +1977,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 openModels={modelsRequest}
                 onAccountChanged={refreshModelAccess}
                 openInvite={inviteDeepLink}
+                // Never `undefined` on a core build any more. A desktop signs
+                // in against its own control plane through the card; only the
+                // hosted GaugeApps shell takes the admission handoff instead.
                 onSignIn={
                     props.gaugeApps
                         ? beginAccountAdmission
-                        : accountLoginAvailable
-                            ? () => beginLogin(controlPlaneBase())
-                            : undefined
+                        : () => { setSignInOpen(true); }
                 }
                 onSignOut={signOutAccount}
                 environmentAction={props.environmentAction}
@@ -1974,6 +1992,94 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             />
         </div>
         </div>
+    );
+
+    /// Identity has one surface (the {@link SignInCard} docstring, and the
+    /// welcome overlay's), so every gate that can need it renders this one card
+    /// rather than its own arrangement of the same ceremonies. There are three:
+    /// a Home that answered "authenticate first", a first launch with neither a
+    /// credential nor a session, and the account menu. Only the first of those
+    /// had it in 0.4.13 — and it is the one a desktop never reaches, because a
+    /// desktop is its own Home and its discovery does not fail.
+    const signInCard = (footnote?: JSX.Element): JSX.Element => (
+        <SignInCard
+            footnote={footnote}
+            title="Sign in"
+            lede="Sign in to save model credentials, settings, and link your chats."
+            resolve={async (email) => {
+                const { organization } = await resolveSignInRoute(
+                    controlPlaneBase(),
+                    email,
+                );
+                return organization
+                    ? {
+                        kind: "organization",
+                        // Discovery will not name it; the card
+                        // reads "your organization" without one.
+                        go: () => beginWorkEmailLogin(controlPlaneBase(), email),
+                    }
+                    : { kind: "personal" };
+            }}
+            passkey={localDevLogin ? undefined : {
+                signIn: async (email) => {
+                    await signInWithPasskey(controlPlaneBase(), email);
+                },
+                beginCreation: (email) => startPasskeyAccountCreation(controlPlaneBase(), email),
+                finishCreation: async (challengeId, code, name) => {
+                    const created = await finishPasskeyAccountCreation(
+                        controlPlaneBase(),
+                        challengeId,
+                        code,
+                        name,
+                    );
+                    return created.recoveryCodes;
+                },
+                complete: () => {
+                    void refreshHostedAccountSession(controlPlaneBase())
+                        .finally(() => window.location.reload());
+                },
+            }}
+            providers={[
+                {
+                    id: "google",
+                    label: localDevLogin
+                        ? "Enter local dev account"
+                        : "Continue with Google",
+                    // Not `beginLogin` on a core build. A desktop cannot hold an
+                    // OAuth client secret, so its own `/auth/login` has no
+                    // connection to offer and answers 409 "no SSO connection
+                    // configured" — which is what pressing this did in 0.4.12
+                    // and 0.4.13. `beginAccountAdmission` takes the route a
+                    // desktop actually has (ADR 0123): the control plane mints
+                    // the verifier, the Hub at auth.gaugewright.com holds the
+                    // Google client and the secret, and the one-time code comes
+                    // home over `gaugewright://`. A composition that does serve
+                    // the login shell still redirects, which that function
+                    // decides.
+                    begin: beginAccountAdmission,
+                },
+                // Placeholders until a connection exists for each.
+                // They are rendered rather than hidden so the row
+                // is the shape it will keep, and they say what they
+                // are rather than failing silently when pressed.
+                { id: "apple", label: "Continue with Apple (not yet available)", begin: () => undefined },
+                { id: "microsoft", label: "Continue with Microsoft (not yet available)", begin: () => undefined },
+            ]}
+            recovery={localDevLogin ? undefined : {
+                start: (email) => startAccountRecovery(controlPlaneBase(), email),
+                finish: async (challengeId, emailCode, recoveryCode) => {
+                    await finishAccountRecovery(controlPlaneBase(), challengeId, emailCode, recoveryCode);
+                },
+                complete: () => {
+                    // Recovery establishes the durable HttpOnly session.
+                    // Rebuild the signed-in shell from that server
+                    // authority so no recovery input or stale
+                    // signed-out resource survives in client memory.
+                    void refreshHostedAccountSession(controlPlaneBase())
+                        .finally(() => window.location.reload());
+                },
+            }}
+        />
     );
 
     const composerModelToolbar = (stacked?: boolean) => (
@@ -2832,72 +2938,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 </>
                             }
                         >
-                            <SignInCard
-                                title="Sign in"
-                                lede="Sign in to save model credentials, settings, and link your chats."
-                                resolve={async (email) => {
-                                    const { organization } = await resolveSignInRoute(
-                                        controlPlaneBase(),
-                                        email,
-                                    );
-                                    return organization
-                                        ? {
-                                            kind: "organization",
-                                            // Discovery will not name it; the card
-                                            // reads "your organization" without one.
-                                            go: () => beginWorkEmailLogin(controlPlaneBase(), email),
-                                        }
-                                        : { kind: "personal" };
-                                }}
-                                passkey={localDevLogin ? undefined : {
-                                    signIn: async (email) => {
-                                        await signInWithPasskey(controlPlaneBase(), email);
-                                    },
-                                    beginCreation: (email) => startPasskeyAccountCreation(controlPlaneBase(), email),
-                                    finishCreation: async (challengeId, code, name) => {
-                                        const created = await finishPasskeyAccountCreation(
-                                            controlPlaneBase(),
-                                            challengeId,
-                                            code,
-                                            name,
-                                        );
-                                        return created.recoveryCodes;
-                                    },
-                                    complete: () => {
-                                        void refreshHostedAccountSession(controlPlaneBase())
-                                            .finally(() => window.location.reload());
-                                    },
-                                }}
-                                providers={[
-                                    {
-                                        id: "google",
-                                        label: localDevLogin
-                                            ? "Enter local dev account"
-                                            : "Continue with Google",
-                                        begin: () => beginLogin(controlPlaneBase()),
-                                    },
-                                    // Placeholders until a connection exists for each.
-                                    // They are rendered rather than hidden so the row
-                                    // is the shape it will keep, and they say what they
-                                    // are rather than failing silently when pressed.
-                                    { id: "apple", label: "Continue with Apple (not yet available)", begin: () => undefined },
-                                    { id: "microsoft", label: "Continue with Microsoft (not yet available)", begin: () => undefined },
-                                ]}
-                                recovery={localDevLogin ? undefined : {
-                                    start: (email) => startAccountRecovery(controlPlaneBase(), email),
-                                    finish: async (challengeId, emailCode, recoveryCode) => {
-                                        await finishAccountRecovery(controlPlaneBase(), challengeId, emailCode, recoveryCode);
-                                    },
-                                    complete: () => {
-                                        // Recovery establishes the durable HttpOnly session.
-                                        // Rebuild the signed-in shell from that server
-                                        // authority so no recovery input or stale
-                                        // signed-out resource survives in client memory.
-                                        void refreshHostedAccountSession(controlPlaneBase())
-                                            .finally(() => window.location.reload());
-                                    },
-                                }}
-                            />
+                            {signInCard()}
                         </Show>
                         <Show when={!homeNeedsLogin()}>
                             <div class="homegate-connect-row">
@@ -2916,8 +2957,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             <Show when={!homeState.loading && !homeFailure()}>
                 <HomeSetup />
             </Show>
-            {/* First-run credential gate (ADR 0075 Phase 0): overlays both shells
-                until a model is connected, then dismisses itself. */}
+            {/* First-run gate (ADR 0075 Phase 0): overlays both shells until
+                there is a working app, then dismisses itself. Either half is
+                enough — an account brings its own credentials back — so this
+                offers identity first and the local route behind it rather than
+                asking for an API key from someone who has an account already. */}
             <Show
                 when={
                     !homeState.loading &&
@@ -2926,18 +2970,69 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     showFirstRun()
                 }
             >
-                <FirstRunOverlay
-                    api={api}
-                    productName="GaugeDesk"
-                    codexLoginAvailable={codexLoginAvailable}
-                    openExternal={openExternal}
-                    onConnected={() => {
-                        void refetchStartupCreds();
-                        void refetchStartupCodex();
-                        refreshModelAccess();
-                    }}
-                    onDismiss={postponeFirstRun}
-                />
+                <Show
+                    when={modelSetupOpen()}
+                    fallback={
+                        <div class="homegate-scrim" data-first-run-signin>
+                            <section class="homegate-card">
+                                {signInCard(
+                                    <span class="signin__quiet">
+                                        No sign up necessary.{" "}
+                                        <button
+                                            class="signin__link"
+                                            type="button"
+                                            onClick={() => setModelSetupOpen(true)}
+                                        >
+                                            Configure a model credential
+                                        </button>
+                                    </span>,
+                                )}
+                            </section>
+                        </div>
+                    }
+                >
+                    <FirstRunOverlay
+                        api={api}
+                        productName="GaugeDesk"
+                        codexLoginAvailable={codexLoginAvailable}
+                        openExternal={openExternal}
+                        onConnected={() => {
+                            void refetchStartupCreds();
+                            void refetchStartupCodex();
+                            refreshModelAccess();
+                        }}
+                        onDismiss={postponeFirstRun}
+                    />
+                </Show>
+            </Show>
+            {/* The account menu's entrance, for a person who postponed the gate
+                above or signed out: the same card, over the running shell. */}
+            <Show
+                when={
+                    signInOpen()
+                    && !showFirstRun()
+                    // The Home gate above owns the screen while it is up, and it
+                    // renders this same card. Two of them at once would be two
+                    // `[data-signin]` nodes for one ceremony.
+                    && !homeState.loading
+                    && !homeFailure()
+                }
+            >
+                <div class="homegate-scrim" data-signin-overlay>
+                    <section class="homegate-card">
+                        {signInCard(
+                            <span class="signin__quiet">
+                                <button
+                                    class="signin__link"
+                                    type="button"
+                                    onClick={() => setSignInOpen(false)}
+                                >
+                                    Not now
+                                </button>
+                            </span>,
+                        )}
+                    </section>
+                </div>
             </Show>
             <Show when={!homeState.loading && !homeFailure() && homeState()?.kind !== "none"}>
                 <WorkbenchShell

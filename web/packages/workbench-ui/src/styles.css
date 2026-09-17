@@ -2422,11 +2422,15 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 
    360px is measured, not chosen: the opening line sets at 343px in the chrome
    face at --fs-body, and breaking a one-sentence lede across two lines makes
-   the card look like it has more to say than it does. The slack absorbs the
-   fallback face, whose metrics are wider than the web font's. A longer lede
-   than this one wraps, and should. */
+   the card look like it has more to say than it does. 360px was set to the web
+   font's own 343px and claimed to absorb the fallback; it does not. Palatino
+   sets the same sentence at 360.47px, so the lede wrapped on every machine that
+   had not yet loaded the licensed face — and on every dev fabric serving a
+   worktree, where the font 403s outright. 384px clears the wider of the two
+   with room to spare, which is what the slack was supposed to be for. A longer
+   lede than this one wraps, and should. */
 .signin { display: flex; flex-direction: column; gap: 11px;
-  width: 100%; max-width: 360px; margin: 0 auto; }
+  width: 100%; max-width: 384px; margin: 0 auto; }
 
 /* The masthead, arranged as the logo is: the mark to the left of the word, the
    gold figure hanging beneath it — centred, because this is the one screen with
