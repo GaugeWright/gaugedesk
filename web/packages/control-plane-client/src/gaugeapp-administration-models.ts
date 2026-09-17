@@ -199,11 +199,31 @@ export const parseOrganizationPolicyModel = shape({
 });
 export type OrganizationPolicyPageV1 = ReturnType<typeof parseOrganizationPolicyModel>;
 
+/// The sessions this policy reaches, as `organization-sessions.read-affected`
+/// declares on this page. A narrower row than the Sessions page projects: it
+/// carries who and what, and none of the timing an administrator reading a
+/// policy has no use for. Only `warning` and `blocked` appear, because
+/// `unmanaged` and `current` are exactly the sessions the policy does not
+/// affect.
+export const parseSoftwarePolicyAffectedSession = shape({
+    id: stringValue,
+    person: shape({ authority: stringValue, label: stringValue }),
+    client_label: stringValue,
+    client: shape({
+        version: nullable(stringValue), protocol: nullable(integerValue),
+        channel: nullable(stringValue), platform: nullable(stringValue),
+    }),
+    software_status: oneOf("warning", "blocked"),
+    software_reason: stringValue,
+    current: booleanValue,
+});
+
 export const parseSoftwarePolicyModel = shape({
     minimum_version: stringValue,
     minimum_protocol: integerValue,
     allowed_channels: arrayOf(oneOf("stable", "beta", "dev")),
     grace_until_unix_ms: nullable(integerValue),
+    affected_sessions: arrayOf(parseSoftwarePolicyAffectedSession),
 });
 export type SoftwarePolicyPageV1 = ReturnType<typeof parseSoftwarePolicyModel>;
 

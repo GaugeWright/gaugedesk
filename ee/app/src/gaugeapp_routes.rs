@@ -1123,7 +1123,50 @@ fn project_page(
             "placement": org.effective_placement_policy(),
             "archetype_approval": { "require_approval": org.effective_require_archetype_approval() },
         }),
-        "software-policy" => json!(org.software_policy.unwrap_or_default()),
+        // `organization-sessions.read-affected` is declared on this page, and
+        // until now nothing served it: the model carried the four policy fields
+        // and no session at all, while the coverage gate credited this read
+        // model with the operation. An administrator raising the minimum
+        // version could not see whose sessions it would cut off.
+        //
+        // The rows are the same secret-free session metadata the Sessions page
+        // projects — no bearer, no token, no transcript — and the status on
+        // each is the server's own `evaluate_client` verdict against the
+        // policy in force, not a number the page worked out for itself.
+        "software-policy" => {
+            let mut model = json!(org.software_policy.clone().unwrap_or_default());
+            if let Some(object) = model.as_object_mut() {
+                object.insert(
+                    "affected_sessions".into(),
+                    Value::Array(
+                        organization_session_rows(wb, store_scope, request_bearer, &org)?
+                            .into_iter()
+                            .filter(|row| {
+                                // Warning and Blocked are both "this policy
+                                // reaches this session". Unmanaged and Current
+                                // are not affected and would only pad the list.
+                                matches!(
+                                    row.get("software_status").and_then(Value::as_str),
+                                    Some("warning" | "blocked")
+                                )
+                            })
+                            .map(|row| {
+                                json!({
+                                    "id": row.get("id").cloned().unwrap_or(Value::Null),
+                                    "person": row.get("person").cloned().unwrap_or(Value::Null),
+                                    "client_label": row.get("client_label").cloned().unwrap_or(Value::Null),
+                                    "client": row.get("client").cloned().unwrap_or(Value::Null),
+                                    "software_status": row.get("software_status").cloned().unwrap_or(Value::Null),
+                                    "software_reason": row.get("software_reason").cloned().unwrap_or(Value::Null),
+                                    "current": row.get("current").cloned().unwrap_or(Value::Null),
+                                })
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            model
+        }
         "sessions" => json!({
             "sessions": organization_session_rows(wb, store_scope, request_bearer, &org)?,
         }),
@@ -7943,6 +7986,54 @@ mod tests {
                 .contains("has moved since"),
             "{body}"
         );
+    }
+
+    /// `organization-sessions.read-affected` is declared on Software Policy and
+    /// was served by nothing: the model carried four policy fields and no
+    /// session, while the coverage gate counted the operation as covered. An
+    /// administrator raising the minimum build could not see whose sessions it
+    /// would cut off.
+    #[tokio::test]
+    async fn software_policy_carries_the_sessions_its_policy_reaches() {
+        let (_dir, _shared, app) = test_app();
+        let session = open(&app).await;
+        let (status, response) = request(
+            &app,
+            Method::GET,
+            &format!(
+                "/gaugeapps/administration/pages/software-policy?session={}&generation={}&scope={}",
+                session["id"].as_str().unwrap(),
+                session["generation"].as_str().unwrap(),
+                session["scope"]["id"].as_str().unwrap(),
+            ),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let model = &response["page"]["model"];
+        // Present and an array even with no policy in force. An absent field
+        // would make the strict client reader refuse the page outright, which
+        // is a worse failure than an empty list.
+        let affected = model["affected_sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("software policy carries no affected_sessions: {model}"));
+        // Only sessions the policy actually reaches. `unmanaged` and `current`
+        // are precisely the ones it does not, and listing them would make the
+        // count mean nothing.
+        for row in affected {
+            assert!(
+                matches!(row["software_status"].as_str(), Some("warning" | "blocked")),
+                "unaffected session listed as affected: {row}"
+            );
+            // Session metadata only, per the action's declared boundary.
+            for forbidden in ["bearer", "token", "secret"] {
+                assert!(
+                    row.get(forbidden).is_none(),
+                    "{forbidden} leaked into an affected session row: {row}"
+                );
+            }
+        }
     }
 
     async fn organization_page(app: &Router) -> Value {

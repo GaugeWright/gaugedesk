@@ -382,6 +382,28 @@ function SoftwarePolicyEditor(props: {
             <div class="gaugeapp-policy-numbers"><label><span>Minimum GaugeDesk build</span><input placeholder="0.4.5" value={draft().minimumVersion} onInput={(event) => setDraft((value) => ({ ...value, minimumVersion: event.currentTarget.value }))} /></label><label><span>Minimum protocol</span><input type="number" min="0" step="1" value={draft().minimumProtocol} onInput={(event) => setDraft((value) => ({ ...value, minimumProtocol: Number(event.currentTarget.value) || 0 }))} /></label><label><span>Grace deadline</span><input type="datetime-local" value={draft().graceUntil} onInput={(event) => setDraft((value) => ({ ...value, graceUntil: event.currentTarget.value }))} /></label></div>
             <fieldset><legend>Permitted release channels</legend><For each={["stable", "beta", "dev"]}>{(channel) => <label><input type="checkbox" checked={draft().allowedChannels.includes(channel)} onChange={(event) => setDraft((value) => ({ ...value, allowedChannels: setMembership(value.allowedChannels, channel, event.currentTarget.checked) }))} />{channel}</label>}</For></fieldset>
         </section>
+        <section class="gaugeapp-panel gaugeapp-policy-group">
+            <h2>Sessions this policy reaches</h2>
+            <Show
+                when={props.page.model.affected_sessions.length}
+                fallback={<p>No signed-in session is warned or blocked by the policy in force.</p>}
+            >
+                {/* The server's own verdict against the policy in force, not a
+                    count this page worked out. A draft above changes nothing
+                    here until it is applied, which is what keeps the list an
+                    answer rather than a guess. */}
+                <p>{props.page.model.affected_sessions.length} session{props.page.model.affected_sessions.length === 1 ? " is" : "s are"} warned or blocked by the policy in force. Applying a stricter build or protocol can only widen this.</p>
+                <ul class="gaugeapp-policy-affected">
+                    <For each={props.page.model.affected_sessions}>{(session) => <li>
+                        <strong>{session.person.label}</strong>
+                        <span> · {session.client_label}{session.client.version ? ` ${session.client.version}` : ""}{session.client.channel ? ` (${session.client.channel})` : ""}</span>
+                        <span classList={{ "gaugeapp-policy-blocked": session.software_status === "blocked" }}> · {session.software_status === "blocked" ? "Blocked" : "Warned"}</span>
+                        <Show when={session.current}><span> · this session</span></Show>
+                        <p>{session.software_reason}</p>
+                    </li>}</For>
+                </ul>
+            </Show>
+        </section>
         <section class="gaugeapp-panel gaugeapp-change-summary" aria-live="polite">
             <div><h2>Software policy changes</h2><Show when={changed()} fallback={<p>No unsaved changes.</p>}><ul><For each={summary()}>{(item) => <li>{item}</li>}</For></ul></Show></div>
             <div class="gaugeapp-actions"><button type="button" disabled={!changed()} onClick={() => setDraft(baseline())}>Discard</button><button type="button" class="primary" disabled={!changed() || !props.commands.includes("software-policy.set")} onClick={() => void submit()}>Apply changes</button></div>

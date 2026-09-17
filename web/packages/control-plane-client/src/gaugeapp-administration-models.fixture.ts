@@ -64,6 +64,18 @@ export const administrationEmptyModels = {
     "software-policy": {
         minimum_version: "", minimum_protocol: 0, allowed_channels: [],
         grace_until_unix_ms: null,
+        // One warned session rather than none: an empty list would let a model
+        // that carries no sessions at all pass the same assertion, which is the
+        // hole this field was added to close.
+        affected_sessions: [{
+            id: "session-warned",
+            person: { authority: "authority:member", label: "member@example.test" },
+            client_label: "GaugeDesk desktop",
+            client: { version: "0.4.1", protocol: 3, channel: "stable", platform: "macos" },
+            software_status: "warning",
+            software_reason: "requires GaugeDesk 0.4.5 or newer",
+            current: false,
+        }],
     },
     billing,
 } as const;
