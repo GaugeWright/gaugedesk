@@ -54,7 +54,8 @@ const commerce = {
 const account = { profile: { account_id: "person-a", display_name: "Original name" }, invitations: [{ tenant_id: "org-a", display_name: "Example Org", role: "member" }], memberships: [{ id: "org-a", display_name: "Example Org", role: "member" }] };
 const providers = { connections: [{ id: "connection-a", name: "Personal API", models: ["model-a"] }], default_model: { connection_id: "previous-connection", model: "previous-model" } };
 const hosts = { homes: [{ id: "host-a", name: "Research host", kind: "cloud", lifecycle: "active", managed_policy: { isolated_workspace_enabled: false, max_attempt_nanos_usd: 0 } }],
-    managed_enrollment: { available: true, region: "test-region", capacity: { storage_bytes: 10000000, concurrent_agents: 2 } } };
+    managed_enrollment: { available: true, region: "test-region", capacity: { storage_bytes: 10000000, concurrent_agents: 2 } },
+    export: { available: true, reason: null, holders: ["holder-a"] } };
 // Two hosts, because a handoff review that cannot name where the project comes
 // from and where it goes is not a review of anything.
 const handoffHosts = { homes: [
@@ -122,6 +123,7 @@ const examples = {
     "project-host.reinstate": [{ id: "host-a" }, hosts],
     "project-host.retire": [{ id: "host-a", phase: "retention" }, hosts],
     "project-host.managed-policy.set": [{ id: "host-a", isolated_workspace_enabled: true, max_attempt_nanos_usd: 1500000000 }, hosts],
+    "project-host.export": [{ id: "host-a", holder_id: "holder-a" }, hosts],
     "project-home.handoff": [{ project_id: "project-a", expected_current_home_id: "home-a", target_home_id: "home-b" }, handoffHosts],
     "backups.enable": [{ schedule_days: 2, retention_days: 45 }, { ...backups, facility: null }],
     "backups.schedule.set": [{ schedule_days: 2, retention_days: 45 }, backups],
@@ -295,6 +297,19 @@ test("Project Host review uses exact targets, current policy and the declared se
     const host = handoff.fields.find((field) => field.label === "Project Host");
     assert.match(host.value, /Studio Mac/);
     assert.match(host.before, /Research host/);
+    const recovery = summary("project-host.export", ...examples["project-host.export"]);
+    assert.equal(recovery.title, "Export a recovery copy");
+    assert.equal(recovery.fields.find((field) => field.label === "Recovery holder").value, "holder-a");
+    // The two things a person cannot be left to infer: that only the named
+    // device opens this, and that our signature says we made it rather than
+    // that they asked for it (GaugeWright DR-0122).
+    assert.match(recovery.note, /Only that device can open it/);
+    assert.match(recovery.note, /signed as made by GaugeWright rather than as asked for by you/);
+    // A holder the page does not list, and a page that says export is
+    // unavailable, are both refusals rather than a review of something else.
+    assert.ok(summary("project-host.export", { id: "host-a", holder_id: "holder-z" }, hosts).unavailable);
+    assert.ok(summary("project-host.export", { id: "host-a", holder_id: "holder-a" },
+        { ...hosts, export: { available: false, reason: "No holder", holders: [] } }).unavailable);
     const retirement = summary("project-host.retire", ...examples["project-host.retire"]);
     assert.equal(retirement.title, "Retire Project Host");
     assert.match(retirement.note, /can be reinstated/);

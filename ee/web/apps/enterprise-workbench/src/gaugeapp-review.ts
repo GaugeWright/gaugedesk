@@ -41,6 +41,7 @@ export const CLOUD_ADMIN_REVIEW_COMMANDS = {
     "project-host.suspend": ["administration", "project-hosts", "Suspend Project Host"],
     "project-host.reinstate": ["administration", "project-hosts", "Reinstate Project Host"],
     "project-host.retire": ["administration", "project-hosts", "Retire Project Host"],
+    "project-host.export": ["administration", "project-hosts", "Export a recovery copy"],
     "backups.enable": ["administration", "backups", "Turn on backups"],
     "backups.schedule.set": ["administration", "backups", "Change backup schedule"],
     "backups.disable": ["administration", "backups", "Pause backups"],
@@ -362,6 +363,24 @@ export function summarizeGaugeAppChange(proposal: GaugeAppProposal, page: GaugeA
                     };
                 }
                 throw new Error("Invalid retirement phase");
+            }
+            case "project-host.export": {
+                const host = target("Project Host", m.homes);
+                if (host.kind !== "cloud") throw new Error("Managed host required");
+                const standing = data(m.export);
+                if (standing.available !== true) throw new Error("Recovery export unavailable");
+                const holder = string(p.holder_id);
+                if (!list(standing.holders).map(string).includes(holder)) {
+                    throw new Error("Recovery holder is not enrolled");
+                }
+                field("Recovery holder", holder);
+                // Two things a person should not have to infer before accepting:
+                // that only the named device can ever open this, and that our
+                // signature on it means we made it rather than that they asked
+                // for it (GaugeWright DR-0122). The second is the weaker claim,
+                // and saying it here is the point of recording the signer kind.
+                note = "Takes one sealed copy of everything on this Project Host and locks it to the chosen device's recovery key. Only that device can open it — not GaugeWright, and not anyone who gets the download link. Because GaugeWright runs this Project Host, the copy is signed as made by GaugeWright rather than as asked for by you. The link works for one day, and stops working sooner if you remove that recovery holder.";
+                break;
             }
             case "backups.enable":
             case "backups.schedule.set": {
