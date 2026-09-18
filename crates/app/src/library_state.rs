@@ -2110,6 +2110,39 @@ fn open_project_collaboration_workspaces(
     Ok(workspaces)
 }
 
+/// Every text file at a managed target's mainline head, as the `(path, body)`
+/// pairs under `prefix` that a collaboration workspace's partition for that
+/// target is seeded with — read from the store, with nothing created to read
+/// them. `.gaugedesk-runtime/` is runtime state a candidate materializes and
+/// never part of a partition. Both seeding paths used to make this read
+/// through a `partition-source` engagement created for the purpose and
+/// discarded, which left its worktree behind as the one directory a fresh
+/// root still carried under a target's `worktrees/`. An external target's
+/// mainline is its source, which only a candidate can read, so each path
+/// keeps that engagement for external targets.
+fn mainline_partition_files(
+    source: &dyn Workspace,
+    prefix: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let mut owned = Vec::new();
+    for entry in source.main_tree().map_err(|error| error.to_string())? {
+        if entry.is_dir || entry.path.starts_with(".gaugedesk-runtime/") {
+            continue;
+        }
+        let body = source
+            .read_main_file(&entry.path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "`{}` is listed at the target's mainline head but holds no text there",
+                    entry.path
+                )
+            })?;
+        owned.push((format!("{prefix}/{}", entry.path), body));
+    }
+    Ok(owned)
+}
+
 fn seed_empty_collaboration_workspaces(
     library: &crate::library::Library,
     targets: &BTreeMap<String, Box<dyn Workspace>>,
@@ -2138,10 +2171,17 @@ fn seed_empty_collaboration_workspaces(
                     format!("project target {} is not open", target.id),
                 )
             })?;
-            let source_probe_id = library::gen_id("partition-source");
-            let source_probe = source.create_engagement(&source_probe_id).map_err(io)?;
             let encoded = crate::library::target_id_path_v1(&target.id)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if target.kind == WorkTargetKind::Managed {
+                owned.extend(
+                    mainline_partition_files(source.as_ref(), &format!("targets/{encoded}"))
+                        .map_err(invalid_data)?,
+                );
+                continue;
+            }
+            let source_probe_id = library::gen_id("partition-source");
+            let source_probe = source.create_engagement(&source_probe_id).map_err(io)?;
             for entry in source_probe.tree().map_err(io)? {
                 if entry.is_dir || entry.path.starts_with(".gaugedesk-runtime/") {
                     continue;
@@ -3519,47 +3559,57 @@ impl Workbench {
         let workspace_id = record.workspace_id.clone();
         let root = format!("targets/{}", crate::library::target_id_path_v1(target_id)?);
 
+        // Both questions below are about a mainline's head — is the partition
+        // already there, and what does the source hold — and both used to be
+        // asked through an engagement created for the purpose and discarded,
+        // which left the source's worktree behind as the one directory a fresh
+        // root still carried under a target's `worktrees/`. A managed
+        // workspace answers from its store instead. The collaboration
+        // workspace is always managed; a target is not, and an external
+        // target's mainline is its source, which only a candidate can read, so
+        // that path keeps its engagement.
         let collaboration = self
             .collaboration_workspaces
             .get(&workspace_id)
             .ok_or_else(|| "project collaboration workspace is not open".to_owned())?;
-        let collab_probe_id = library::gen_id("partition-probe");
-        let collab_probe = collaboration
-            .create_engagement(&collab_probe_id)
-            .map_err(|error| error.to_string())?;
-        let exists = collab_probe
-            .tree()
+        let exists = collaboration
+            .main_tree()
             .map_err(|error| error.to_string())?
             .iter()
             .any(|entry| entry.path == root || entry.path.starts_with(&format!("{root}/")));
-        drop(collab_probe);
-        collaboration
-            .remove_engagement(&collab_probe_id)
-            .map_err(|error| error.to_string())?;
         if exists {
             return Ok(());
         }
 
-        let probe_id = library::gen_id("partition-source");
         let source = self
             .targets
             .get(target_id)
             .ok_or_else(|| "target storage is not open".to_owned())?;
-        let probe = source
-            .create_engagement(&probe_id)
-            .map_err(|error| error.to_string())?;
+        let managed = self
+            .library
+            .work_targets
+            .get(target_id)
+            .is_some_and(|target| target.kind == WorkTargetKind::Managed);
         let mut owned = Vec::new();
-        for entry in probe.tree().map_err(|error| error.to_string())? {
-            if entry.is_dir || entry.path.starts_with(".gaugedesk-runtime/") {
-                continue;
-            }
-            let body = probe
-                .read_file(&entry.path)
+        if managed {
+            owned = mainline_partition_files(source.as_ref(), &root)?;
+        } else {
+            let probe_id = library::gen_id("partition-source");
+            let probe = source
+                .create_engagement(&probe_id)
                 .map_err(|error| error.to_string())?;
-            owned.push((format!("{root}/{}", entry.path), body));
+            for entry in probe.tree().map_err(|error| error.to_string())? {
+                if entry.is_dir || entry.path.starts_with(".gaugedesk-runtime/") {
+                    continue;
+                }
+                let body = probe
+                    .read_file(&entry.path)
+                    .map_err(|error| error.to_string())?;
+                owned.push((format!("{root}/{}", entry.path), body));
+            }
+            drop(probe);
+            let _ = source.remove_engagement(&probe_id);
         }
-        drop(probe);
-        let _ = source.remove_engagement(&probe_id);
         let borrowed = owned
             .iter()
             .map(|(path, body)| (path.as_str(), body.as_str()))
@@ -7548,10 +7598,12 @@ mod managed_target_basis_tests {
     use super::*;
     use crate::LockUnpoisoned;
 
-    /// A managed target's recorded basis is its mainline's head cut, and
-    /// neither recording it nor deciding that its manifests need no migration
-    /// costs an engagement: nothing is created and discarded for either
-    /// answer, so nothing is left behind under the target's worktrees.
+    /// A managed target's recorded basis is its mainline's head cut, and none
+    /// of the questions startup asks a workspace — that basis, whether its
+    /// manifests need migrating, whether a project's partition exists and what
+    /// it should hold — costs an engagement: nothing is created and discarded
+    /// for an answer, so a fresh root has no worktree under any managed target
+    /// or collaboration workspace.
     #[test]
     fn a_fresh_managed_target_records_its_mainline_head_and_leaves_no_engagement_behind() {
         let root = tempfile::tempdir().unwrap();
@@ -7576,23 +7628,37 @@ mod managed_target_basis_tests {
                 target.id
             );
             let worktrees = workbench.targets_root.join(&target.id).join("worktrees");
-            let left_behind = std::fs::read_dir(&worktrees)
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                        .filter(|name| {
-                            name.starts_with("target-basis-")
-                                || name.starts_with("ability-migration-")
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let left_behind = worktree_names(&worktrees);
             assert!(
                 left_behind.is_empty(),
                 "{} left a startup engagement's worktree behind: {left_behind:?}",
                 target.id
             );
         }
+        let collaboration_root = workbench
+            .targets_root
+            .parent()
+            .expect("targets live under the root")
+            .join("collaboration-workspaces");
+        assert!(!workbench.collaboration_workspaces.is_empty());
+        for workspace_id in workbench.collaboration_workspaces.keys() {
+            let left_behind =
+                worktree_names(&collaboration_root.join(workspace_id).join("worktrees"));
+            assert!(
+                left_behind.is_empty(),
+                "collaboration workspace {workspace_id} left a probe's worktree behind: {left_behind:?}"
+            );
+        }
+    }
+
+    fn worktree_names(worktrees: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(worktrees)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }

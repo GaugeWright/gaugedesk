@@ -654,6 +654,14 @@
         "signature": "fn from_protected_export_at (& self , _dir : & Path , _export : & [u8] , _protection : & WorkflowProtection ,) -> Result < Box < dyn Workspace > >"
       },
       "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "main_tree",
+        "owner": "Workspace",
+        "signature": "fn main_tree (& self) -> Result < Vec < FileEntry > >"
+      },
+      "classification": "requires-provenance-review"
     }
   ],
   "profiles": {
@@ -1811,16 +1819,6 @@
         "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
         "capability": "create_engagement",
         "count": 1,
-        "expression": "collaboration . create_engagement (& collab_probe_id)",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
-        "capability": "create_engagement",
-        "count": 1,
         "expression": "source . create_engagement (& probe_id)",
         "file": "crates/app/src/library_state.rs"
       },
@@ -1841,16 +1839,6 @@
         "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
         "capability": "remove_engagement",
         "count": 1,
-        "expression": "collaboration . remove_engagement (& collab_probe_id)",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
-        "capability": "remove_engagement",
-        "count": 1,
         "expression": "source . remove_engagement (& probe_id)",
         "file": "crates/app/src/library_state.rs"
       },
@@ -1862,16 +1850,6 @@
         "capability": "seed_main",
         "count": 1,
         "expression": "self . collaboration_workspaces . get (& workspace_id) . ok_or_else (| | \"project collaboration workspace is not open\" . to_owned ()) ? . seed_main (& borrowed)",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
-        "capability": "tree",
-        "count": 1,
-        "expression": "collab_probe . tree ()",
         "file": "crates/app/src/library_state.rs"
       },
       "profile": "topology-and-settlement"
@@ -4825,6 +4803,46 @@
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
+        "capability": "main_tree",
+        "count": 1,
+        "expression": "collaboration . main_tree ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::main_tree",
+        "capability": "main_tree",
+        "count": 1,
+        "expression": "Self :: main_tree (self)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "mainline_partition_files",
+        "capability": "main_tree",
+        "count": 1,
+        "expression": "source . main_tree ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "mainline_partition_files",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "source . read_main_file (& entry . path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
     }
   ]
 }

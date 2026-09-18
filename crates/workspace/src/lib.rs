@@ -958,6 +958,41 @@ impl Instance {
         .read(MAINLINE_BRANCH_ID, relative)?)
     }
 
+    /// Every path the mainline's head records, listed from the store with
+    /// nothing created to list it: no engagement, no branch, no worktree, no
+    /// import, no cut. Directories appear the way an engagement's [`tree`]
+    /// shows them — derived from the files beneath them — so a reader that
+    /// walks either sees the same shape, sorted by path. Empty for a mainline
+    /// with no head.
+    ///
+    /// [`tree`]: Engagement::tree
+    pub fn main_tree(&self) -> Result<Vec<FileEntry>> {
+        let vcs = NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?;
+        let Some(manifest) = vcs.manifest(MAINLINE_BRANCH_ID)? else {
+            return Ok(Vec::new());
+        };
+        let mut entries = BTreeMap::new();
+        for path in manifest.keys() {
+            let mut ancestor = Path::new(path).parent();
+            while let Some(directory) =
+                ancestor.filter(|directory| !directory.as_os_str().is_empty())
+            {
+                entries
+                    .entry(directory.to_string_lossy().replace('\\', "/"))
+                    .or_insert(true);
+                ancestor = directory.parent();
+            }
+            entries.insert(path.clone(), false);
+        }
+        Ok(entries
+            .into_iter()
+            .map(|(path, is_dir)| FileEntry { path, is_dir })
+            .collect())
+    }
+
     /// Reclaim orphaned content (whip's conservative GC sweep): the
     /// residue of superseded saves and refused imports. Everything any
     /// recorded cut, branch pointer, resolution memory, or conflict row
@@ -2933,6 +2968,13 @@ pub trait Workspace: Send {
             "this workspace has no durable Main ref authority",
         ))
     }
+    /// Every path the mainline's head records, in the shape an engagement's
+    /// `tree` gives, with nothing created to list it.
+    fn main_tree(&self) -> Result<Vec<FileEntry>> {
+        Err(WorkspaceError::msg(
+            "this workspace has no durable Main ref authority",
+        ))
+    }
     fn purge_unreachable_objects(&self) -> Result<()>;
     fn reconcile_engagements(&self) -> Result<Vec<(String, Box<dyn ChatWorkspace>)>>;
     fn create_workstream(&self, ws_id: &str) -> Result<()>;
@@ -3279,6 +3321,9 @@ impl Workspace for Instance {
     }
     fn read_main_file(&self, relative: &str) -> Result<Option<String>> {
         Self::read_main_file(self, relative)
+    }
+    fn main_tree(&self) -> Result<Vec<FileEntry>> {
+        Self::main_tree(self)
     }
     fn purge_unreachable_objects(&self) -> Result<()> {
         Self::purge_unreachable_objects(self)
@@ -3751,6 +3796,43 @@ mod tests {
         assert!(std::fs::read_dir(&worktrees)
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true));
+    }
+
+    #[test]
+    fn main_tree_lists_the_mainline_head_in_an_engagement_tree_shape_and_creates_nothing() {
+        let (directory, workspace) = instance();
+        assert!(workspace.main_tree().expect("virgin").is_empty());
+        workspace
+            .seed_main(&[("a.txt", "a"), ("nested/deep/b.txt", "b")])
+            .expect("seed");
+        let listed = workspace.main_tree().expect("list");
+        let shape: Vec<(&str, bool)> = listed
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.is_dir))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("a.txt", false),
+                ("nested", true),
+                ("nested/deep", true),
+                ("nested/deep/b.txt", false),
+            ]
+        );
+        let worktrees = directory.path().join("worktrees");
+        assert!(std::fs::read_dir(&worktrees)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true));
+        // The same paths, in the same order, that an engagement materialized
+        // from that head walks — which is what the listing replaces.
+        let probe = workspace.create_engagement("probe").expect("engagement");
+        let walked: Vec<FileEntry> = probe
+            .tree()
+            .expect("tree")
+            .into_iter()
+            .filter(|entry| !entry.path.starts_with(".gaugedesk-runtime"))
+            .collect();
+        assert_eq!(walked, listed);
     }
 
     pub(super) fn observation_files(root: &Path) -> BTreeMap<PathBuf, String> {
