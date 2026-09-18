@@ -919,11 +919,27 @@ impl Instance {
         })
     }
 
+    /// Discard the engagement's line and remove its materialized worktree.
+    ///
+    /// The worktree is a projection of the line (INV-5): once the line is
+    /// discarded it is derivable from nothing and serves nothing — startup
+    /// reconciliation lists active lines, never directories — and it holds a
+    /// copy of the very files a governed removal was asked to remove. It used
+    /// to stay behind: every discarded engagement, a deleted chat's included,
+    /// left its files on disk, which the external adapter never did. The line
+    /// goes first, so a failure to remove the files leaves a discarded line
+    /// with a stale projection rather than a live line with none; a worktree
+    /// that is already gone is not an error, so removing twice is not either.
     pub fn remove_engagement(&self, id: &str) -> Result<()> {
+        let worktree = safe_path(&self.worktrees, id)?;
         let mut vcs = self.store()?;
         let _ = vcs.discard_branch(&engagement_line(id), &now_at())?;
         let _ = std::fs::remove_file(scratch_cache_path(&self.store_root, &engagement_line(id)));
-        Ok(())
+        match std::fs::remove_dir_all(&worktree) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WorkspaceError::io(error)),
+        }
     }
 
     /// Whether `descendant_cut` is on the immutable parent chain rooted at
@@ -1001,6 +1017,27 @@ impl Instance {
     pub fn purge_unreachable_objects(&self) -> Result<()> {
         let _ = self.store()?.purge_unreachable(&now_at())?;
         Ok(())
+    }
+
+    /// The identities of every active engagement line, read from the store
+    /// with nothing materialized: what reconciliation needs to decide which
+    /// lines still have a reason to exist before it opens any of them.
+    /// [`reconcile_engagements`](Self::reconcile_engagements) re-materializes
+    /// a missing checkout for every line it returns, which is right for the
+    /// lines a Home is about to serve and wrong for the ones it is about to
+    /// discard.
+    pub fn active_engagements(&self) -> Result<Vec<String>> {
+        let vcs = NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?;
+        let mut ids = vcs
+            .list_branches(Some(whipplescript_store::branches::BranchStatus::Active))?
+            .into_iter()
+            .filter_map(|row| row.branch_id.strip_prefix("engagement/").map(str::to_owned))
+            .collect::<Vec<_>>();
+        ids.sort();
+        Ok(ids)
     }
 
     pub fn reconcile_engagements(&self) -> Result<Vec<(String, Engagement)>> {
@@ -2976,6 +3013,13 @@ pub trait Workspace: Send {
         ))
     }
     fn purge_unreachable_objects(&self) -> Result<()>;
+    /// The identities of every active engagement line, with nothing
+    /// materialized to list them.
+    fn active_engagements(&self) -> Result<Vec<String>> {
+        Err(WorkspaceError::msg(
+            "this workspace has no durable engagement-line authority",
+        ))
+    }
     fn reconcile_engagements(&self) -> Result<Vec<(String, Box<dyn ChatWorkspace>)>>;
     fn create_workstream(&self, ws_id: &str) -> Result<()>;
     fn create_named_workstream(&self, ws_id: &str, _name: Option<&str>) -> Result<()> {
@@ -3327,6 +3371,9 @@ impl Workspace for Instance {
     }
     fn purge_unreachable_objects(&self) -> Result<()> {
         Self::purge_unreachable_objects(self)
+    }
+    fn active_engagements(&self) -> Result<Vec<String>> {
+        Self::active_engagements(self)
     }
     fn reconcile_engagements(&self) -> Result<Vec<(String, Box<dyn ChatWorkspace>)>> {
         Ok(Self::reconcile_engagements(self)?
@@ -3796,6 +3843,51 @@ mod tests {
         assert!(std::fs::read_dir(&worktrees)
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true));
+    }
+
+    #[test]
+    fn active_engagements_lists_live_lines_from_the_store_and_materializes_nothing() {
+        let (directory, workspace) = instance();
+        workspace.seed_main(&[("a.txt", "a")]).expect("seed");
+        assert!(workspace.active_engagements().expect("none").is_empty());
+        workspace.create_engagement("kept").expect("kept");
+        workspace.create_engagement("gone").expect("gone");
+        workspace.remove_engagement("gone").expect("remove");
+        assert_eq!(workspace.active_engagements().expect("list"), ["kept"]);
+        // A checkout removed by hand is not re-materialized by the listing.
+        std::fs::remove_dir_all(directory.path().join("worktrees").join("kept"))
+            .expect("drop checkout");
+        assert_eq!(workspace.active_engagements().expect("list"), ["kept"]);
+        assert!(!directory.path().join("worktrees").join("kept").exists());
+    }
+
+    #[test]
+    fn removing_an_engagement_discards_its_line_and_its_worktree() {
+        let (directory, workspace) = instance();
+        workspace.seed_main(&[("a.txt", "a")]).expect("seed");
+        let engagement = workspace.create_engagement("chat").expect("engagement");
+        engagement
+            .write_file("draft.txt", "never imported")
+            .expect("write");
+        let worktree = engagement.path().to_path_buf();
+        assert!(worktree.join("draft.txt").is_file());
+        drop(engagement);
+
+        workspace.remove_engagement("chat").expect("remove");
+        assert!(!worktree.exists(), "the worktree goes with the line");
+        // The line is discarded: reconciliation, which lists active lines,
+        // no longer offers it.
+        assert!(workspace
+            .reconcile_engagements()
+            .expect("reconcile")
+            .iter()
+            .all(|(id, _)| id != "chat"));
+        // Nothing left to remove is not a failure to remove.
+        workspace.remove_engagement("chat").expect("again");
+        // And an identity that would reach outside the worktrees is refused
+        // before anything is discarded.
+        assert!(workspace.remove_engagement("../repo").is_err());
+        assert!(directory.path().join("repo").is_dir());
     }
 
     #[test]

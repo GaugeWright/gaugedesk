@@ -662,6 +662,14 @@
         "signature": "fn main_tree (& self) -> Result < Vec < FileEntry > >"
       },
       "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "active_engagements",
+        "owner": "Workspace",
+        "signature": "fn active_engagements (& self) -> Result < Vec < String > >"
+      },
+      "classification": "requires-provenance-review"
     }
   ],
   "profiles": {
@@ -1786,30 +1794,10 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::delete_chat_cascade",
-        "capability": "purge_unreachable_objects",
-        "count": 1,
-        "expression": "inst . purge_unreachable_objects ()",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
         "callable": "impl inherent for Workbench::delete_project_cascade",
         "capability": "purge_unreachable_objects",
         "count": 1,
         "expression": "inst . purge_unreachable_objects ()",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::destroy_chat",
-        "capability": "remove_engagement",
-        "count": 1,
-        "expression": "inst . remove_engagement (chat_id)",
         "file": "crates/app/src/library_state.rs"
       },
       "profile": "topology-and-settlement"
@@ -4843,6 +4831,66 @@
         "file": "crates/app/src/library_state.rs"
       },
       "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "finish_deleted_collaboration_chats",
+        "capability": "active_engagements",
+        "count": 1,
+        "expression": "workspace . active_engagements ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "finish_deleted_collaboration_chats",
+        "capability": "purge_unreachable_objects",
+        "count": 1,
+        "expression": "workspace . purge_unreachable_objects ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "finish_deleted_collaboration_chats",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& chat_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::delete_chat_cascade",
+        "capability": "purge_unreachable_objects",
+        "count": 1,
+        "expression": "workspace . purge_unreachable_objects ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::destroy_chat",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (chat_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::active_engagements",
+        "capability": "active_engagements",
+        "count": 1,
+        "expression": "Self :: active_engagements (self)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
     }
   ]
 }

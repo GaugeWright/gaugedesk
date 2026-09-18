@@ -415,6 +415,7 @@ pub(crate) fn load_startup_library_state(
         &mut engagement_index,
         None,
     )?;
+    finish_deleted_collaboration_chats(&library, &collaboration_workspaces, &deleted_chats)?;
     Ok(StartupLibraryState {
         library,
         targets,
@@ -2557,6 +2558,50 @@ fn open_project_chat_engagements(
     Ok(())
 }
 
+/// The rule `open_startup_targets` applies to a target's engagement lines,
+/// applied to a collaboration workspace's: a line whose chat the library
+/// records as explicitly deleted is finished — governed removal — and one
+/// with no chat and no delete record is left in place and said so, because
+/// a missing record can also mean a failed append or a downgrade. The chats
+/// the library still holds were opened above and are not touched here.
+///
+/// Collaboration workspaces had no such pass. Their engagements are opened
+/// from the library's chat records, so a line whose chat was deleted before
+/// deletion reached collaboration-hosted chats — every deletion until the
+/// commit that fixed `destroy_chat`'s lookup — stayed active, with its
+/// worktree and its objects, on every open. This is what finishes those.
+fn finish_deleted_collaboration_chats(
+    library: &crate::library::Library,
+    collaborations: &BTreeMap<String, Box<dyn Workspace>>,
+    deleted_chats: &BTreeSet<String>,
+) -> std::io::Result<()> {
+    for (workspace_id, workspace) in collaborations {
+        let mut finished = false;
+        for chat_id in workspace.active_engagements().map_err(io)? {
+            if library.chats.contains_key(&chat_id) {
+                continue;
+            }
+            if deleted_chats.contains(&chat_id) {
+                // Finishing an explicit, recorded delete is governed removal.
+                let _ = workspace.remove_engagement(&chat_id);
+                finished = true;
+            } else {
+                tracing::warn!(
+                    chat = %chat_id,
+                    workspace = %workspace_id,
+                    "startup reconcile: collaboration engagement line has no library chat and no delete record; leaving it in place",
+                );
+            }
+        }
+        if finished {
+            // SECAUD-6, as deletion does: the finished lines' unique objects
+            // are unreachable now, and a deleted chat's content is not kept.
+            let _ = workspace.purge_unreachable_objects();
+        }
+    }
+    Ok(())
+}
+
 fn builtin_instance_id(archetype: &crate::app_support::BuiltinArchetype) -> String {
     if archetype.id == DEFAULT_AGENT {
         DEFAULT_INSTANCE.to_owned()
@@ -3880,9 +3925,14 @@ impl Workbench {
         if let Some(harness) = self.sessions.remove(chat_id) {
             crate::workbench_state::shutdown_shared_harness(harness);
         }
-        if let Some(inst_id) = self.engagement_index.remove(chat_id) {
-            if let Some(inst) = self.targets.get(&inst_id) {
-                let _ = inst.remove_engagement(chat_id);
+        // The chat's host is whichever storage the index names: a target, or —
+        // since ADR 0150 moved chats into them — a project's collaboration
+        // workspace. Looking only among targets left a collaboration-hosted
+        // chat's line active and its worktree and objects on disk after its
+        // records were tombstoned, and startup never finished the removal.
+        if let Some(storage_id) = self.engagement_index.remove(chat_id) {
+            if let Some(workspace) = self.workspace_by_storage_id(&storage_id) {
+                let _ = workspace.remove_engagement(chat_id);
             }
         }
         self.engagements.remove(chat_id);
@@ -6499,9 +6549,9 @@ impl Workbench {
         if !self.engagement_index.contains_key(id) && !self.library.chats.contains_key(id) {
             return false;
         }
-        // Capture the hosting instance before teardown drops the index entry, so we can
+        // Capture the hosting storage before teardown drops the index entry, so we can
         // purge its now-unreachable workspace blobs after the engagement line is gone (SECAUD-6).
-        let inst_id = self.engagement_index.get(id).cloned();
+        let storage_id = self.engagement_index.get(id).cloned();
         self.destroy_chat(id);
         // ADR 0141: this chat's records may still compose a live descendant's
         // effective log, so crypto-erasure is deferred to the reachability
@@ -6513,8 +6563,10 @@ impl Workbench {
         // deleted chat's workspace content is unrecoverable, matching the store crypto-erasure.
         // (`purge_unreachable_objects` is itself reachability-based: objects a
         // fork's branch still reaches survive, the workspace half of ADR 0141.)
-        if let Some(inst) = inst_id.and_then(|iid| self.targets.get(&iid)) {
-            let _ = inst.purge_unreachable_objects();
+        if let Some(workspace) =
+            storage_id.and_then(|storage_id| self.workspace_by_storage_id(&storage_id))
+        {
+            let _ = workspace.purge_unreachable_objects();
         }
         true
     }
@@ -7660,5 +7712,96 @@ mod managed_target_basis_tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod engagement_removal_tests {
+    use crate::{app_support::DEFAULT_PLACEMENT, LockUnpoisoned};
+
+    /// Deleting a chat is a governed removal of its working copy, and the
+    /// working copy is files on disk as well as a line in the store. Both go.
+    #[test]
+    fn deleting_a_chat_removes_its_worktree_from_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+        let mut workbench = shared.lock_unpoisoned();
+        let chat = workbench
+            .create_chat_in_instance(DEFAULT_PLACEMENT, "to be deleted")
+            .unwrap();
+        let chat_id = chat["id"].as_str().unwrap().to_owned();
+        let worktree = workbench.engagements[&chat_id].path().to_path_buf();
+        let draft = workbench.engagement_workspace_path(&chat_id, "draft.txt");
+        workbench.engagements[&chat_id]
+            .write_file(&draft, "unimported work")
+            .unwrap();
+        assert!(worktree.join(&draft).is_file());
+
+        assert!(workbench.delete_chat_cascade(&chat_id));
+        assert!(!workbench.engagements.contains_key(&chat_id));
+        assert!(
+            !worktree.exists(),
+            "the deleted chat's worktree stayed on disk at {}",
+            worktree.display()
+        );
+    }
+
+    /// A chat deleted before deletion reached collaboration-hosted chats left
+    /// its line active with its worktree; startup finishes that recorded
+    /// delete, and leaves a line nothing recorded as deleted where it is.
+    #[test]
+    fn startup_finishes_a_recorded_delete_a_collaboration_workspace_still_carries() {
+        let root = tempfile::tempdir().unwrap();
+        let (deleted_worktree, orphan_worktree) = {
+            let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+            let mut workbench = shared.lock_unpoisoned();
+            let mut chat_ids = Vec::new();
+            for title in ["deleted the old way", "never recorded"] {
+                let chat = workbench
+                    .create_chat_in_instance(DEFAULT_PLACEMENT, title)
+                    .unwrap();
+                chat_ids.push(chat["id"].as_str().unwrap().to_owned());
+            }
+            let worktrees = chat_ids
+                .iter()
+                .map(|id| workbench.engagements[id].path().to_path_buf())
+                .collect::<Vec<_>>();
+            // The deletion every release before the fix performed on a
+            // collaboration-hosted chat: records tombstoned, line untouched.
+            let deleted = chat_ids[0].clone();
+            let record = workbench.library.chats[&deleted].clone();
+            workbench.write_chat_record(crate::library::ChatRecord {
+                op: crate::library::RecordOp::Tombstone,
+                ..record
+            });
+            // And a line with no chat record at all: neither deleted nor
+            // live, which startup must not decide about.
+            let orphan = chat_ids[1].clone();
+            workbench.library.chats.remove(&orphan);
+            (worktrees[0].clone(), worktrees[1].clone())
+        };
+        assert!(deleted_worktree.is_dir() && orphan_worktree.is_dir());
+
+        let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+        let workbench = shared.lock_unpoisoned();
+        assert!(
+            !deleted_worktree.exists(),
+            "startup left the deleted chat's worktree at {}",
+            deleted_worktree.display()
+        );
+        let workspace_id = workbench
+            .collaboration_workspaces
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let active = workbench.collaboration_workspaces[&workspace_id]
+            .active_engagements()
+            .unwrap();
+        assert!(!active.iter().any(|id| deleted_worktree.ends_with(id)));
+        assert!(
+            orphan_worktree.is_dir(),
+            "an unrecorded line was decided about"
+        );
     }
 }
