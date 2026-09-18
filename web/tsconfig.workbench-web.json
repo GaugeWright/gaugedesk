@@ -9,6 +9,7 @@
     "apps/workbench-web/src/signin-lab.tsx",
     "apps/workbench-web/src/settings-lab.tsx",
     "apps/workbench-web/src/whip-lab.tsx",
-    "apps/workbench-web/src/tokenwright-lab.tsx"
+    "apps/workbench-web/src/tokenwright-lab.tsx",
+    "apps/workbench-web/src/gaugeapps-lab-entry.tsx"
   ]
 }

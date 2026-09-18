@@ -1,0 +1,1981 @@
+/* GaugeApp-specific content only. Workbench chrome, panes, chat, task bar,
+   controls, typography, and colours come from workbench-ui/styles.css. */
+.gaugeapp-scope-picker { position: relative; width: 100%; }
+.gaugeapp-scope-trigger { display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center; gap: 8px; width: 100%; min-height: 41px; padding: 6px 8px;
+    color: var(--ink); background: transparent; border: 1px solid transparent; border-radius: 4px;
+    text-align: left; cursor: pointer; font: inherit; }
+.gaugeapp-scope-trigger:hover,
+.gaugeapp-scope-trigger[aria-expanded="true"] { background: color-mix(in srgb, var(--panel) 45%, transparent); border-color: var(--edge); }
+.gaugeapp-scope-trigger[aria-expanded="true"] { border-color: color-mix(in srgb, var(--gold) 55%, var(--edge)); }
+.gaugeapp-scope-trigger-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
+.gaugeapp-scope-trigger-text strong { overflow: hidden; color: var(--ink); font-size: var(--fs-ui); font-weight: 600;
+    text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-scope-trigger-text small { overflow: hidden; color: var(--muted); font-size: var(--fs-label);
+    text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-scope-mark { width: 22px; height: 22px; display: inline-flex; align-items: center;
+    justify-content: center; border-radius: 4px; color: var(--gold);
+    border: 1px solid color-mix(in srgb, var(--gold) 48%, var(--edge));
+    flex: 0 0 auto; }
+.gaugeapp-scope-mark .icon { width: 12px; height: 12px; stroke-width: 1.8; }
+.gaugeapp-scope-menu { position: absolute; z-index: 62; bottom: calc(100% + 5px); left: 0;
+    min-width: 340px; padding: 5px; background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 6px; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
+.gaugeapp-menu-label { display: block; padding: 5px 8px; color: var(--muted);
+    font-size: var(--fs-label); text-transform: uppercase; letter-spacing: .08em; }
+.gaugeapp-scope-menu button { display: grid; grid-template-columns: 1fr auto; gap: 14px;
+    width: 100%; padding: 6px 8px; color: var(--ink); background: transparent; border: 0;
+    border-radius: 4px; text-align: left; cursor: pointer; font: inherit; }
+.gaugeapp-scope-menu button:hover,
+.gaugeapp-scope-menu button.active { background: var(--edge); }
+.gaugeapp-scope-menu button small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-scope-menu .gaugeapp-menu-label-organizations { margin-top: 7px; }
+.gaugeapp-scope-menu .gaugeapp-scope-choice { grid-template-columns: 20px minmax(130px, 1fr) minmax(115px, auto); align-items: center; gap: 8px; }
+.gaugeapp-scope-choice .gaugeapp-scope-mark { width: 20px; height: 20px; }
+.gaugeapp-scope-choice .gaugeapp-scope-mark .icon { width: 13px; height: 13px; }
+.gaugeapp-scope-choice > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-scope-choice strong { overflow: hidden; color: var(--ink); font-size: var(--fs-ui);
+    font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-scope-choice .gaugeapp-scope-posture { max-width: 142px; color: var(--gold); text-align: right; line-height: 1.25; }
+.gaugeapp-scope-menu .gaugeapp-new-organization { display: block; margin-top: 4px;
+    padding-top: 8px; border-top: 1px solid var(--edge); color: var(--accent); }
+.gaugeapp-scope-menu .gaugeapp-new-organization:disabled { color: var(--muted); cursor: default; opacity: .72; }
+.gaugeapp-scope-menu .gaugeapp-new-organization:disabled:hover { background: transparent; }
+.gaugeapp-scope-menu .account-menu-item { display: flex; align-items: center; gap: 8px; }
+.gaugeapp-scope-menu > .account-menu-branch > .account-menu-flyout { top: auto; bottom: -5px; }
+.gaugeapp-scope-menu .account-menu-flyout button { min-width: 0; }
+
+.gaugeapp-focus-field { display: flex; align-items: center; gap: 7px; width: 100%; min-width: 0;
+    padding: 3px 7px; border: 1px solid color-mix(in srgb, var(--edge) 74%, transparent); border-radius: 4px;
+    color: var(--muted); background: color-mix(in srgb, var(--panel) 18%, transparent); }
+.gaugeapp-focus-mark { flex: 0 0 auto; color: color-mix(in srgb, var(--muted) 82%, var(--gold)); font-size: 15px; line-height: 1; }
+.gaugeapp-focus-field input { box-sizing: border-box; width: 100%; min-width: 0; padding: 0; color: var(--muted);
+    background: transparent; border: 0; outline: 0; font: inherit; font-size: var(--fs-ui); }
+.gaugeapp-focus-field input:disabled { opacity: 1; cursor: default; }
+.gaugeapp-focus-field input::placeholder { color: color-mix(in srgb, var(--muted) 88%, transparent); opacity: 1; }
+
+.gaugeapp-settings-navigation { display: grid; align-content: start; gap: 2px; min-height: 100%; padding: 2px 0 18px; }
+.panel.workspace .gaugeapp-settings-navigation { box-sizing: border-box; padding-left: 24px; }
+.gaugeapp-settings-navigation button { width: 100%; padding: 7px 6px; color: var(--muted);
+    background: transparent; border: 0; border-radius: 4px; text-align: left; cursor: pointer;
+    font: inherit; line-height: 1.28; }
+.gaugeapp-settings-navigation button:hover,
+.gaugeapp-settings-navigation button.active { color: var(--ink); background: var(--edge); }
+.gaugeapp-navigation-destination { display: grid; gap: 2px; }
+.gaugeapp-navigation-label { display: block; padding: 5px 6px 3px;
+    color: color-mix(in srgb, var(--gold) 76%, var(--muted));
+    font-size: var(--fs-label); letter-spacing: .09em; text-transform: uppercase; }
+.gaugeapp-settings-navigation .gaugeapp-navigation-parent.selected { color: var(--gold);
+    background: color-mix(in srgb, var(--gold) 7%, var(--edge)); }
+.gaugeapp-navigation-children { display: grid; gap: 1px; padding: 1px 0 5px 10px; }
+.gaugeapp-settings-navigation .gaugeapp-navigation-child { position: relative; padding: 6px 7px 6px 16px;
+    font-size: var(--fs-label); }
+.gaugeapp-settings-navigation .gaugeapp-navigation-child.active { color: var(--gold); box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-settings-navigation .gaugeapp-navigation-detail {
+    width: calc(100% - 14px); margin-left: 14px; padding-left: 18px;
+    color: var(--ink); box-shadow: inset 2px 0 color-mix(in srgb, var(--accent) 75%, transparent); }
+.gaugeapp-settings-navigation .gaugeapp-navigation-detail:hover {
+    background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.gaugeapp-navigation-personal { display: grid; gap: 2px; margin-top: 11px; }
+.gaugeapp-scope-bar { position: relative; padding: 5px 8px 4px; border-top: 1px solid var(--edge); }
+.gaugeapp-account-footer .account-trigger.active { border-color: color-mix(in srgb, var(--gold) 55%, var(--edge));
+    box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-account-footer .account-menu-item[aria-expanded="true"] { color: var(--gold);
+    background: color-mix(in srgb, var(--gold) 7%, var(--edge)); }
+.gaugeapp-viewer { position: relative; }
+/* GaugeApp panels are application UI, not reading prose. Plex Serif is reserved
+   for the Chat transcript even though this fixture reuses markdown-body spacing. */
+.filebody.markdown-body.gaugeapp-content { box-sizing: border-box; width: calc(100% - 20px);
+    max-width: 952px; min-height: 100%; margin: 0 auto; padding: 26px 16px 64px;
+    container-type: inline-size;
+    font-family: var(--font-chrome); font-weight: 400; line-height: 1.45;
+    /* A restrained 5 / 8 / 13 / 21 / 34 modular rhythm gives the operated
+       surfaces proportion without manufacturing hierarchy from rules. */
+    --gaugeapp-column-width: 920px;
+    --gaugeapp-inline-inset: 11px;
+    /* Controls sit on two related measures: the visible button and the quiet
+       action bay which gives row controls a common right edge. The bay's faint
+       rule is structural, like a column line in a ledger, rather than another
+       box around the content. */
+    --gaugeapp-action-width: 132px; --gaugeapp-action-rail-width: 142px;
+    --gaugeapp-form-action-width: 140px;
+    --gaugeapp-rule: color-mix(in srgb, var(--gold) 46%, var(--edge));
+    --gaugeapp-rule-faint: color-mix(in srgb, var(--gold) 18%, var(--edge));
+    --gauge-space-1: 5px; --gauge-space-2: 8px; --gauge-space-3: 12px;
+    --gauge-space-4: 18px; --gauge-space-5: 28px; }
+.gaugeapp-content :is(h1, h2, h3, h4, strong, button, input, select, textarea) {
+    font-family: var(--font-chrome); font-weight: 400; }
+.gaugeapp-content .resource-title { display: flex; flex-direction: column; gap: 2px; }
+.gaugeapp-content .resource-title small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-content .tree-action { width: auto; flex: 0 0 auto; }
+.gaugeapp-page-header { display: flex; align-items: flex-start; justify-content: space-between;
+    box-sizing: border-box; gap: var(--gauge-space-5); width: 100%; max-width: var(--gaugeapp-column-width); margin: 0 auto 22px;
+    padding: 2px var(--gaugeapp-inline-inset) 2px calc(var(--gaugeapp-inline-inset) - 3px);
+    border-left: 0; }
+.gaugeapp-page-header h1 { margin: var(--gauge-space-1) 0 var(--gauge-space-2);
+    font-size: clamp(21px, 2vw, 28px); line-height: 1.08; letter-spacing: -.018em; }
+.gaugeapp-page-header p { max-width: 62ch; margin: 0; color: var(--muted); font-size: var(--fs-ui); }
+.gaugeapp-eyebrow { display: inline-flex; align-items: center; gap: 10px; color: var(--gold);
+    font-size: var(--fs-label); letter-spacing: .13em;
+    text-transform: uppercase; }
+.gaugeapp-eyebrow::after { content: ""; width: 5px; height: 5px; flex: 0 0 auto;
+    transform: rotate(45deg); border: 1px solid color-mix(in srgb, var(--gold) 70%, transparent); }
+.gaugeapp-page-actions { flex: 0 0 auto; padding-top: 3px; }
+.gaugeapp-page-actions button,
+.gaugeapp-section-heading > button,
+.gaugeapp-form-card > button { white-space: nowrap; }
+.gaugeapp-page-actions button,
+.gaugeapp-section-heading > button { box-sizing: border-box; width: var(--gaugeapp-action-width); min-height: 27px;
+    white-space: normal; text-align: center; line-height: 1.2; }
+
+.gaugeapp-notice { margin: 0 0 22px;
+    padding: 11px var(--gaugeapp-inline-inset) 11px calc(var(--gaugeapp-inline-inset) - 2px);
+    border: 0; border-left: 2px solid var(--gold); border-radius: 0 6px 6px 0;
+    background: color-mix(in srgb, var(--panel) 30%, transparent); color: var(--muted); }
+.gaugeapp-notice[data-tone="warn"] { border-left-color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 6%, transparent); color: var(--ink); }
+.gaugeapp-notice strong { color: var(--ink); }
+.gaugeapp-connect-alert { display: flex; align-items: center; justify-content: space-between;
+    gap: var(--gauge-space-4); margin: 0 0 28px; padding: 10px var(--gaugeapp-inline-inset);
+    border-radius: 6px; background: color-mix(in srgb, var(--warn) 7%, transparent);
+    box-shadow: inset 2px 0 var(--warn); }
+.gaugeapp-connect-alert > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-connect-alert strong { color: var(--ink); }
+.gaugeapp-connect-alert small { color: var(--muted); font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-connect-row { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; gap: var(--gauge-space-3); min-height: 43px; margin-bottom: var(--gauge-space-1);
+    padding: 8px var(--gaugeapp-inline-inset); border-radius: 6px; background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-connect-row > span:first-child { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-connect-row > span:first-child > span { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.gaugeapp-connect-row small { overflow: hidden; color: var(--muted); font-size: var(--fs-label);
+    line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-connect-row .badge { flex: 0 0 auto; }
+.gaugeapp-connect-row .tree-action { white-space: nowrap; }
+.gaugeapp-payment-setup-card, .gaugeapp-payment-account-card { display: grid; align-items: center; gap: 14px;
+    padding: 14px var(--gaugeapp-inline-inset) !important; border-radius: 3px; background: color-mix(in srgb, var(--panel) 48%, transparent); }
+.gaugeapp-payment-account-card { grid-template-columns: minmax(210px, 1fr) minmax(300px, 1.25fr) auto; }
+.gaugeapp-payment-status { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.gaugeapp-payment-status > span:last-child { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-payment-status small { color: var(--muted); font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-owner-chip { display: inline-flex; align-items: center; justify-content: center; min-width: 45px;
+    min-height: 25px; padding: 2px 7px; border-radius: 4px; color: var(--gold);
+    background: color-mix(in srgb, var(--gold) 8%, transparent); font-size: var(--fs-label);
+    letter-spacing: .08em; text-transform: uppercase; }
+.gaugeapp-payment-account-facts, .gaugeapp-payment-setup-facts { display: grid; gap: 6px; }
+.gaugeapp-payment-account-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.gaugeapp-payment-setup-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.gaugeapp-payment-account-facts > span, .gaugeapp-payment-setup-facts > span { display: flex; flex-direction: column;
+    min-width: 0; padding: 7px 9px; border-radius: 5px; background: color-mix(in srgb, var(--bg) 26%, transparent); }
+.gaugeapp-payment-account-facts small, .gaugeapp-payment-setup-facts small { color: var(--muted);
+    font-size: var(--fs-label); text-transform: uppercase; letter-spacing: .05em; }
+.gaugeapp-payment-account-facts strong, .gaugeapp-payment-setup-facts strong { overflow: hidden; margin-top: 2px;
+    color: var(--ink); text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-payment-setup-facts em { overflow: hidden; margin-top: 2px; color: var(--muted);
+    font-size: var(--fs-label); font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-prepayment-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--gauge-space-2); }
+.gaugeapp-prepayment-list > span { display: flex; flex-direction: column; padding: 9px 11px; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 28%, transparent); }
+.gaugeapp-prepayment-list small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-billing-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.gaugeapp-billing-heading > .gaugeapp-section-heading { flex: 1 1 auto; }
+.gaugeapp-billing-heading > span { display: inline-flex; align-items: center; gap: 6px; }
+.gaugeapp-payment-boundary-note { margin: -12px 0 0; color: var(--muted); font-size: var(--fs-label); line-height: 1.45; }
+.gaugeapp-stripe-owner-band { display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: baseline; gap: 7px 12px; margin: 0; padding: 8px 11px;
+    border: 1px solid var(--gaugeapp-rule); border-bottom-color: var(--gaugeapp-rule-faint);
+    border-radius: 4px 4px 0 0; color: var(--muted);
+    background: color-mix(in srgb, var(--panel) 52%, transparent); }
+.gaugeapp-stripe-owner-band > span { color: var(--gold); font-size: var(--fs-label);
+    letter-spacing: .1em; text-transform: uppercase; }
+.gaugeapp-stripe-owner-band > strong { color: var(--ink); }
+.gaugeapp-stripe-owner-band > small { font-size: var(--fs-label); }
+.gaugeapp-content .admin-section.gaugeapp-stripe-component { display: grid; gap: 14px; margin-bottom: 12px;
+    padding: 14px; border: 1px solid var(--gaugeapp-rule-faint); border-radius: 0 0 4px 4px;
+    background: color-mix(in srgb, var(--bg) 52%, var(--panel)); }
+.gaugeapp-stripe-component > header { display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: baseline; gap: 8px; }
+.gaugeapp-stripe-component > header > span { color: var(--gold); font-size: var(--fs-label);
+    letter-spacing: .08em; text-transform: uppercase; }
+.gaugeapp-stripe-component > header > strong { color: var(--ink); font-size: 16px; }
+.gaugeapp-stripe-component > header > small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-stripe-progress { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+.gaugeapp-stripe-progress > span { padding: 6px 8px; border-radius: 4px; color: var(--muted);
+    background: color-mix(in srgb, var(--panel) 68%, transparent); font-size: var(--fs-label); }
+.gaugeapp-stripe-progress > span.done { color: var(--ink); box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-stripe-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.gaugeapp-stripe-fields > label { display: flex; flex-direction: column; gap: 4px; color: var(--muted);
+    font-size: var(--fs-label); }
+.gaugeapp-stripe-fields :is(input, select) { width: 100%; margin: 0; }
+.gaugeapp-stripe-form-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.gaugeapp-stripe-complete { display: flex; flex-flow: row wrap; align-items: center; gap: 5px 12px;
+    padding: 11px; border-radius: 5px; background: color-mix(in srgb, var(--panel) 45%, transparent); }
+.gaugeapp-stripe-complete > strong { color: var(--ink); }
+.gaugeapp-stripe-complete > small { flex: 1 1 320px; color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-stripe-notification { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; gap: 12px; padding: 10px 11px; border-radius: 5px;
+    background: color-mix(in srgb, var(--warn) 7%, transparent); box-shadow: inset 2px 0 var(--warn); }
+.gaugeapp-stripe-notification.resolved { background: color-mix(in srgb, var(--accent) 6%, transparent);
+    box-shadow: inset 2px 0 var(--accent); }
+.gaugeapp-stripe-notification > span, .gaugeapp-stripe-list > div > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-stripe-notification small, .gaugeapp-stripe-list small { color: var(--muted);
+    font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-stripe-list { display: grid; gap: 4px; }
+.gaugeapp-stripe-list > div { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; gap: 12px; min-height: 43px; padding: 8px 10px; border-radius: 5px;
+    background: color-mix(in srgb, var(--panel) 40%, transparent); }
+.gaugeapp-stripe-list > div.warn { background: color-mix(in srgb, var(--warn) 7%, transparent); }
+.gaugeapp-stripe-list > div.warn strong { color: var(--warn); }
+.gaugeapp-stripe-balance { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.gaugeapp-stripe-balance > span { display: flex; flex-direction: column; padding: 10px 11px;
+    border-radius: 5px; background: color-mix(in srgb, var(--panel) 46%, transparent); }
+.gaugeapp-stripe-balance small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-stripe-balance strong { margin-top: 2px; color: var(--ink); font-size: 18px; }
+.gaugeapp-stripe-boundary { margin: 0; color: var(--muted); font-size: var(--fs-label); line-height: 1.45; }
+
+.gaugeapp-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0 var(--gauge-space-2); margin: 0 0 22px; padding: var(--gauge-space-2) 0;
+    border-top: 1px solid var(--gaugeapp-rule-faint); border-bottom: 1px solid var(--gaugeapp-rule-faint); }
+.gaugeapp-metrics-five { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.gaugeapp-metric { display: flex; flex-direction: column; min-width: 0; min-height: 64px;
+    padding: 9px var(--gaugeapp-inline-inset); border-radius: 0;
+    background: transparent; }
+.gaugeapp-metric > span { color: var(--muted); font-size: var(--fs-label); letter-spacing: .06em;
+    text-transform: uppercase; }
+.gaugeapp-metric strong { margin: var(--gauge-space-1) 0 2px; color: var(--gold);
+    font-size: clamp(17px, 1.5vw, 21px); line-height: 1.12; }
+.gaugeapp-metric small { color: var(--muted); font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-metric[data-tone="warn"] strong { color: var(--warn); }
+
+.gaugeapp-content .admin-section { box-sizing: border-box; width: 100%; min-width: 0; margin: 0 auto 22px;
+    padding: 0 var(--gaugeapp-inline-inset); border: 0;
+    container-type: inline-size; }
+.gaugeapp-content .admin-section:last-child { margin-bottom: 0; }
+
+/* Normal sections share one text/action axis. Shaded list rows extend back to
+   the column edge, then use the same inset internally. This removes the small
+   but cumulative horizontal drift between headings, fields, rows, and buttons. */
+.gaugeapp-content .admin-section:not(
+    .gaugeapp-form-card,
+    .gaugeapp-detail-actions,
+    .gaugeapp-danger-zone,
+    .gaugeapp-plan-summary,
+    .gaugeapp-stripe-component
+) > :is(
+    .gaugeapp-resource,
+    .gaugeapp-definition,
+    .gaugeapp-home-list,
+    .gaugeapp-project-governance-row,
+    .gaugeapp-project-access-row,
+    .gaugeapp-target-access-row,
+    .gaugeapp-placement-access-row,
+    .gaugeapp-member-row,
+    .gaugeapp-settings-row,
+    .gaugeapp-policy-row,
+    .gaugeapp-catalog-grid,
+    .gaugeapp-managed-engagement-row,
+    .gaugeapp-deployment-row,
+    .gaugeapp-policy-control-row,
+    .gaugeapp-policy-toggle-grid,
+    .gaugeapp-integration-value,
+    .gaugeapp-connect-row,
+    .gaugeapp-device-list,
+    .gaugeapp-plan-entitlement,
+    .gaugeapp-service-row,
+    .gaugeapp-plan-billing-link,
+    .gaugeapp-project-model-list
+) { margin-inline: calc(-1 * var(--gaugeapp-inline-inset)); }
+
+.gaugeapp-content .admin-section:not(
+    .gaugeapp-form-card,
+    .gaugeapp-detail-actions,
+    .gaugeapp-danger-zone,
+    .gaugeapp-plan-summary,
+    .gaugeapp-stripe-component
+) :is(.gaugeapp-model-connection-row, .gaugeapp-model-plan-row, .gaugeapp-settings-row) {
+    margin-inline: calc(-1 * var(--gaugeapp-inline-inset));
+}
+.gaugeapp-plan-summary { padding: 14px var(--gaugeapp-inline-inset); border-radius: 3px;
+    background: color-mix(in srgb, var(--panel) 46%, transparent); }
+.gaugeapp-plan-summary-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.gaugeapp-plan-summary-head > div { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-plan-summary-head span { color: var(--gold); font-size: var(--fs-label); letter-spacing: .08em; text-transform: uppercase; }
+.gaugeapp-plan-summary-head h3 { margin: 3px 0 2px; color: var(--ink); font-size: 18px; line-height: 1.2; }
+.gaugeapp-plan-summary-head p { margin: 0; color: var(--muted); }
+.gaugeapp-plan-summary-head > button { flex: 0 0 auto; }
+.gaugeapp-plan-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px;
+    margin: 12px 0 8px; }
+.gaugeapp-plan-facts > div { min-width: 0; padding: 8px 9px; border-radius: 5px;
+    background: color-mix(in srgb, var(--bg) 24%, transparent); }
+.gaugeapp-plan-facts dt { color: var(--muted); font-size: var(--fs-label); text-transform: uppercase; letter-spacing: .06em; }
+.gaugeapp-plan-facts dd { margin: 2px 0 0; color: var(--ink); line-height: 1.3; }
+.gaugeapp-plan-entitlement, .gaugeapp-service-row, .gaugeapp-plan-billing-link { display: grid; align-items: center;
+    gap: 10px; margin-bottom: var(--gauge-space-1); padding: 8px var(--gaugeapp-inline-inset); border: 0; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-plan-entitlement { grid-template-columns: minmax(0, 1.25fr) minmax(130px, .75fr) auto; }
+.gaugeapp-plan-entitlement > span:first-child, .gaugeapp-service-row > span, .gaugeapp-plan-billing-link > span {
+    display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-plan-entitlement small, .gaugeapp-service-row small, .gaugeapp-plan-billing-link small {
+    overflow: hidden; color: var(--muted); font-size: var(--fs-label); line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-plan-entitlement > span:nth-child(2) { color: var(--ink); }
+.gaugeapp-service-row { grid-template-columns: minmax(0, 1.2fr) minmax(150px, .8fr) auto; }
+.gaugeapp-service-row[data-state="active"] { box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-service-row > span:nth-child(2) strong { color: var(--gold); font-size: var(--fs-label); letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-service-row[data-state="available"] > span:nth-child(2) strong { color: var(--muted); }
+.gaugeapp-plan-billing-link { grid-template-columns: minmax(0, 1fr) auto; margin-top: -7px; }
+.gaugeapp-plan-choice-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--gauge-space-2); }
+.gaugeapp-plan-choice { display: flex; flex-direction: column; align-items: stretch; min-height: 150px; padding: 13px;
+    color: var(--muted); background: color-mix(in srgb, var(--panel) 30%, transparent); border: 1px solid transparent;
+    border-radius: 7px; text-align: left; cursor: pointer; font: inherit; }
+.gaugeapp-plan-choice:hover, .gaugeapp-plan-choice.active { color: var(--ink); background: color-mix(in srgb, var(--panel) 52%, transparent); }
+.gaugeapp-plan-choice.active { border-color: color-mix(in srgb, var(--gold) 55%, var(--edge)); box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-plan-choice > span { display: flex; flex-direction: column; }
+.gaugeapp-plan-choice strong { color: var(--ink); font-size: 16px; }
+.gaugeapp-plan-choice small { color: var(--gold); font-size: var(--fs-label); }
+.gaugeapp-plan-choice ul { display: grid; gap: 4px; margin: 12px 0 0; padding-left: 17px; color: var(--muted); }
+.gaugeapp-text-danger { margin-top: var(--gauge-space-3); padding: 4px 0; color: var(--bad); background: transparent;
+    border: 0; font: inherit; cursor: pointer; }
+.gaugeapp-text-danger:hover { color: color-mix(in srgb, var(--bad) 78%, white); }
+.gaugeapp-back-link { display: inline-flex; align-items: center; margin: 0 0 18px; padding: 2px 0;
+    color: var(--muted); background: transparent; border: 0; font: inherit; cursor: pointer; }
+.gaugeapp-back-link:hover { color: var(--ink); }
+.gaugeapp-detail-actions { padding: 15px var(--gaugeapp-inline-inset) !important; border-radius: 7px !important;
+    background: color-mix(in srgb, var(--panel) 36%, transparent); }
+.gaugeapp-detail-actions .bar { flex-wrap: wrap; margin: 0; }
+.gaugeapp-detail-grid { display: block; }
+.gaugeapp-dashboard-grid { display: block; width: 100%; max-width: var(--gaugeapp-column-width); margin: 0 auto; }
+.gaugeapp-section-heading { display: flex; justify-content: space-between; align-items: center;
+    gap: var(--gauge-space-4); margin-bottom: var(--gauge-space-3); }
+.gaugeapp-section-heading > div { display: flex; flex: 1 1 auto; align-items: baseline; gap: 10px; min-width: 0; }
+.gaugeapp-section-heading h4 { margin: 0; font-size: calc(var(--fs-ui) + 1px);
+    position: relative; color: var(--gold); letter-spacing: .11em; line-height: 1.25; }
+.gaugeapp-section-heading h4::after { content: ""; position: absolute; left: 9px; bottom: -6px;
+    width: 19px; height: 3px; border-top: 1px solid var(--gaugeapp-rule);
+    border-bottom: 1px solid var(--gaugeapp-rule-faint); }
+.gaugeapp-section-heading span { color: var(--muted); font-size: var(--fs-label);
+    font-style: italic; letter-spacing: .02em; }
+.gaugeapp-section-intro { max-width: 67ch; margin: -3px 0 var(--gauge-space-3); color: var(--muted); }
+.gaugeapp-inline-warning { margin: var(--gauge-space-3) 0 0; padding: 10px 12px; border-radius: 6px;
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 7%, transparent); }
+.gaugeapp-resource, .gaugeapp-definition { min-height: 42px; margin-bottom: var(--gauge-space-1);
+    padding: 9px 11px; border: 0; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-resource[data-tone="warn"] { background: color-mix(in srgb, var(--warn) 6%, transparent); }
+.gaugeapp-resource[data-tone="warn"] .resource-kind { color: var(--warn); }
+.gaugeapp-resource[data-tone="ready"] .resource-kind { color: var(--gold); }
+.gaugeapp-resource .tree-action { margin-left: 0; }
+.gaugeapp-definition .resource-title { color: var(--ink); }
+.gaugeapp-definition .resource-title, .gaugeapp-resource .resource-title {
+    overflow: visible; text-overflow: clip; white-space: normal; }
+.gaugeapp-definition > .gaugeapp-row-actions { flex: 0 0 auto; margin-left: auto; }
+
+.gaugeapp-home-list { display: grid; gap: var(--gauge-space-1); }
+.gaugeapp-home-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, .9fr) auto var(--gaugeapp-action-rail-width);
+    align-items: center; gap: 8px 14px; min-height: 48px; padding: 9px 11px;
+    border: 1px solid color-mix(in srgb, var(--edge) 54%, transparent); border-radius: 4px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-home-row > span:not(.badge, .gaugeapp-row-actions) { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-home-row small { overflow: hidden; color: var(--muted); font-size: var(--fs-label);
+    line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-home-row > span:nth-child(2) > small { margin-bottom: 2px; letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-home-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+.gaugeapp-project-access-row, .gaugeapp-target-access-row, .gaugeapp-placement-access-row {
+    display: grid; align-items: center; gap: var(--gauge-space-3); min-height: 48px;
+    margin-bottom: var(--gauge-space-1); padding: 10px 11px; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-project-governance-row { display: grid;
+    grid-template-columns: minmax(160px, 1.15fr) minmax(130px, 1fr) minmax(125px, .85fr)
+        minmax(125px, .85fr) auto auto;
+    align-items: center; gap: var(--gauge-space-3); min-height: 52px;
+    margin-bottom: var(--gauge-space-1); padding: 11px; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-project-governance-row[data-tone="warn"] { background: color-mix(in srgb, var(--warn) 6%, transparent); }
+.gaugeapp-project-governance-row > span:not(.badge, .gaugeapp-row-actions) { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-project-governance-row small { overflow: hidden; color: var(--muted); font-size: var(--fs-label);
+    line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-project-governance-row > span:nth-child(n+2):not(.badge, .gaugeapp-row-actions) > small {
+    margin-bottom: 2px; text-transform: uppercase; letter-spacing: .06em; }
+.gaugeapp-project-access-row { grid-template-columns: auto minmax(150px, 1.1fr) minmax(115px, .75fr)
+    minmax(145px, 1fr) auto; }
+.gaugeapp-project-access-row > span:not(.gaugeapp-avatar),
+.gaugeapp-target-access-row > span:not(.resource-kind),
+.gaugeapp-placement-access-row > span:not(.resource-kind, .badge, .gaugeapp-row-actions) {
+    display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-project-access-row small, .gaugeapp-target-access-row small,
+.gaugeapp-placement-access-row small { overflow: hidden; color: var(--muted); font-size: var(--fs-label);
+    line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-project-access-row > span:nth-child(n+3) > small,
+.gaugeapp-target-access-row > span:nth-child(3) > small,
+.gaugeapp-placement-access-row > span:nth-child(4) > small { margin-bottom: 2px; text-transform: uppercase;
+    letter-spacing: .06em; }
+.gaugeapp-danger-action { color: var(--bad) !important; }
+.gaugeapp-target-access-row { grid-template-columns: 80px minmax(160px, 1fr) minmax(90px, .55fr)
+    minmax(180px, .8fr) auto; }
+.gaugeapp-target-access-row code { color: var(--ink); font-size: var(--fs-label); }
+.gaugeapp-act-list { display: flex !important; flex-flow: row wrap !important; gap: 4px; }
+.gaugeapp-act-list > span { padding: 2px 5px; border-radius: 3px; color: var(--muted);
+    background: color-mix(in srgb, var(--edge) 58%, transparent); font-size: var(--fs-label); }
+.gaugeapp-placement-access-row { grid-template-columns: 80px minmax(180px, 1fr) auto minmax(105px, .65fr) auto; }
+.gaugeapp-placement-access-row[data-tone="warn"] { background: color-mix(in srgb, var(--warn) 6%, transparent); }
+.gaugeapp-placement-access-row[data-tone="warn"] .resource-kind { color: var(--warn); }
+.gaugeapp-placement-access-row[data-tone="ready"] .resource-kind { color: var(--accent); }
+
+.gaugeapp-member-row, .gaugeapp-settings-row, .gaugeapp-policy-row {
+    display: grid; align-items: center; gap: var(--gauge-space-3); min-height: 42px;
+    margin-bottom: var(--gauge-space-1); padding: 9px 11px; border: 0; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-member-row > span:nth-child(2),
+.gaugeapp-settings-row > span:first-child,
+.gaugeapp-policy-row > span:first-child { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-member-row small, .gaugeapp-settings-row small,
+.gaugeapp-policy-row small { overflow: hidden; color: var(--muted); font-size: var(--fs-label);
+    text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-catalog-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--gauge-space-2); }
+.gaugeapp-catalog-card { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 9px 11px;
+    border: 1px solid color-mix(in srgb, var(--edge) 58%, transparent); border-radius: 4px;
+    background: color-mix(in srgb, var(--panel) 42%, transparent); }
+.gaugeapp-catalog-card-head, .gaugeapp-catalog-card-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.gaugeapp-catalog-card-title { display: flex; align-items: baseline; min-width: 0; gap: 8px; }
+.gaugeapp-catalog-card-title > small { flex: 0 0 auto; color: var(--gold); font-size: var(--fs-label);
+    letter-spacing: .08em; text-transform: uppercase; }
+.gaugeapp-catalog-card h3 { overflow: hidden; margin: 0; color: var(--ink); font-size: 15px;
+    line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-catalog-card > p { overflow: hidden; margin: 3px 0 6px; color: var(--muted); font-size: var(--fs-label);
+    line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-catalog-card dl { display: grid; gap: 2px; margin: 0 0 5px; }
+.gaugeapp-catalog-card dl > div { display: grid; grid-template-columns: 50px minmax(0, 1fr); gap: 8px; }
+.gaugeapp-catalog-card dt { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-catalog-card dd { margin: 0; color: var(--ink); font-size: var(--fs-label); line-height: 1.3; }
+.gaugeapp-catalog-card-foot { margin-top: auto; padding-top: 1px; }
+.gaugeapp-catalog-card-foot > span:first-child { color: var(--gold); font-size: var(--fs-label); }
+
+.gaugeapp-agent-picker-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--gauge-space-2); }
+.gaugeapp-agent-choice { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-height: 82px;
+    padding: 11px 12px; color: var(--muted); background: color-mix(in srgb, var(--bg) 38%, transparent);
+    border: 1px solid transparent; border-radius: 6px; text-align: left; cursor: pointer; font: inherit; }
+.gaugeapp-agent-choice:hover { color: var(--ink); background: color-mix(in srgb, var(--panel) 58%, transparent); }
+.gaugeapp-agent-choice.active { color: var(--ink); border-color: color-mix(in srgb, var(--gold) 62%, var(--edge));
+    background: color-mix(in srgb, var(--gold) 6%, var(--panel)); box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-agent-choice > span { color: var(--gold); font-size: var(--fs-label); letter-spacing: .08em; text-transform: uppercase; }
+.gaugeapp-agent-choice small { color: var(--muted); font-size: var(--fs-label); line-height: 1.38; }
+.gaugeapp-library-picker { display: grid; gap: var(--gauge-space-2); }
+.gaugeapp-library-picker > input { width: 100%; margin: 0; }
+.gaugeapp-library-list { display: grid; gap: 4px; }
+.gaugeapp-library-row, .gaugeapp-selected-archetype { display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px;
+    min-height: 48px; padding: 8px 10px; border: 0; border-radius: 6px;
+    color: var(--ink); background: color-mix(in srgb, var(--bg) 30%, transparent); }
+.gaugeapp-library-row { width: 100%; text-align: left; cursor: pointer; font: inherit; }
+.gaugeapp-library-row:hover:not(:disabled), .gaugeapp-library-row.active {
+    background: color-mix(in srgb, var(--gold) 7%, var(--panel)); box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-library-row:disabled { cursor: default; opacity: .52; }
+.gaugeapp-library-row > span:nth-child(2), .gaugeapp-selected-archetype > span:nth-child(2) {
+    display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+.gaugeapp-library-row small, .gaugeapp-selected-archetype small { overflow: hidden; color: var(--muted);
+    font-size: var(--fs-label); line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-library-kind { display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 5px; color: var(--gold);
+    background: color-mix(in srgb, var(--gold) 8%, transparent); font-size: var(--fs-label); }
+.gaugeapp-empty-state { margin: 6px 0 0; color: var(--muted); }
+.gaugeapp-listing-editor-grid, .gaugeapp-listing-editor-main, .gaugeapp-listing-editor-side { display: grid; align-content: start; }
+.gaugeapp-listing-editor-grid { gap: 28px; }
+.gaugeapp-obligation-stack, .gaugeapp-charge-stack { display: grid; gap: var(--gauge-space-2); margin-bottom: var(--gauge-space-3); }
+.gaugeapp-obligation-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 11px;
+    min-height: 48px; padding: 9px 11px; border-radius: 6px; background: color-mix(in srgb, var(--panel) 27%, transparent); }
+.gaugeapp-obligation-card > span { display: inline-flex; align-items: center; justify-content: center; width: 23px; height: 23px;
+    border-radius: 50%; color: var(--gold); background: color-mix(in srgb, var(--gold) 8%, transparent); font-size: var(--fs-label); }
+.gaugeapp-obligation-card > div, .gaugeapp-charge-row > span, .gaugeapp-offer-agent-summary > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-obligation-card small, .gaugeapp-charge-row small, .gaugeapp-offer-agent-summary small,
+.gaugeapp-managed-engagement-row small { color: var(--muted); font-size: var(--fs-label); line-height: 1.38; }
+.gaugeapp-charge-row { display: grid; grid-template-columns: minmax(130px, .75fr) minmax(190px, 1.25fr) auto;
+    align-items: center; gap: var(--gauge-space-3); min-height: 48px; padding: 9px 11px; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 27%, transparent); }
+.gaugeapp-charge-row > span:nth-child(3) { grid-column: 2; }
+.gaugeapp-charge-row > button { grid-column: 3; grid-row: 1; }
+.gaugeapp-charge-editor { grid-template-columns: minmax(125px, .75fr) minmax(185px, 1.25fr) var(--gaugeapp-action-width);
+    align-items: end; gap: 7px 10px; min-height: 0; padding: 8px 10px; }
+.gaugeapp-charge-editor > label { min-width: 0; margin: 0; }
+.gaugeapp-charge-editor > label:nth-child(3) { grid-column: 1 / 3; grid-row: 2; }
+.gaugeapp-charge-editor > button { grid-column: 3; grid-row: 1 / 3; align-self: center; }
+.gaugeapp-obligation-editor { align-items: end; min-height: 0; padding: 8px 10px; }
+.gaugeapp-obligation-editor > div { display: grid !important; grid-template-columns: minmax(120px, .72fr) minmax(0, 1.28fr);
+    align-items: end; gap: 10px; }
+.gaugeapp-obligation-editor > div > label { min-width: 0; margin: 0; }
+.gaugeapp-charge-row > span:nth-child(n+2) > small, .gaugeapp-offer-agent-summary small,
+.gaugeapp-managed-engagement-row > span:nth-child(n+3) > small { margin-bottom: 2px; letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-inline-composer { display: grid; grid-template-columns: minmax(220px, 420px) auto; align-items: end; gap: 10px;
+    margin: 13px 0 21px; padding: 14px; border-radius: 6px; background: color-mix(in srgb, var(--panel) 38%, transparent); }
+.gaugeapp-inline-composer .bar { margin: 0; }
+.gaugeapp-price-example { display: grid; grid-template-columns: 130px minmax(0, 1fr); align-items: baseline; gap: 3px 15px;
+    margin-top: var(--gauge-space-3); padding: 13px 15px; border-radius: 7px; background: color-mix(in srgb, var(--gold) 6%, var(--panel));
+    box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-price-example > span { color: var(--gold); font-size: var(--fs-label); letter-spacing: .08em; text-transform: uppercase; }
+.gaugeapp-price-example > strong { color: var(--ink); font-size: 17px; }
+.gaugeapp-price-example > small { grid-column: 2; color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-offer-agent-summary { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--gauge-space-3);
+    margin-top: var(--gauge-space-3); padding: 14px; border-radius: 6px; background: color-mix(in srgb, var(--panel) 28%, transparent); }
+.gaugeapp-proposal-status { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px;
+    margin: 0 0 var(--gauge-space-3); overflow: hidden; border: 1px solid color-mix(in srgb, var(--edge) 62%, transparent);
+    border-radius: 5px; background: color-mix(in srgb, var(--edge) 48%, transparent); }
+.gaugeapp-proposal-status > span { display: flex; flex-direction: column; min-width: 0; padding: 9px 11px;
+    background: color-mix(in srgb, var(--panel) 54%, var(--bg)); color: var(--ink); }
+.gaugeapp-proposal-status > span:first-child { box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-proposal-status small { margin-bottom: 2px; color: var(--muted); font-size: var(--fs-label);
+    letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-proposal-status strong { color: var(--gold); font-weight: 500; }
+.gaugeapp-proposal-primary { border-top-color: color-mix(in srgb, var(--gold) 45%, var(--edge)) !important; }
+.gaugeapp-proposal-note { display: block; margin-top: var(--gauge-space-3); }
+.gaugeapp-proposal-note textarea { box-sizing: border-box; display: block; width: 100%; min-height: 68px;
+    margin-top: 3px; padding: 6px 8px; resize: vertical; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--edge); border-radius: 4px; }
+.gaugeapp-engagement-operation[data-tone="warn"] { border-color: color-mix(in srgb, var(--warn) 34%, var(--edge)) !important;
+    box-shadow: inset 2px 0 var(--warn); }
+.gaugeapp-engagement-close-review { max-width: none; margin: 0 0 var(--gauge-space-3); }
+.gaugeapp-engagement-activity .gaugeapp-definition { min-height: 36px; background: transparent; }
+.gaugeapp-engagement-filters { display: flex; flex-wrap: wrap; gap: 4px; margin: -2px 0 var(--gauge-space-3); }
+.gaugeapp-engagement-filters button { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px;
+    color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 5px; font: inherit; cursor: pointer; }
+.gaugeapp-engagement-filters button:hover, .gaugeapp-engagement-filters button.active {
+    color: var(--ink); background: color-mix(in srgb, var(--panel) 48%, transparent); }
+.gaugeapp-engagement-filters button.active { border-color: color-mix(in srgb, var(--gold) 52%, var(--edge)); }
+.gaugeapp-engagement-filters span { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-managed-engagement-row { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "identity controls" "facts facts"; align-items: center; gap: 5px 10px; min-height: 0;
+    margin-bottom: var(--gauge-space-1); padding: 7px var(--gaugeapp-inline-inset);
+    border: 1px solid color-mix(in srgb, var(--edge) 56%, transparent); border-radius: 4px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-managed-engagement-row[data-tone="warn"] {
+    border-color: color-mix(in srgb, var(--warn) 34%, var(--edge));
+    background: color-mix(in srgb, var(--warn) 6%, transparent); box-shadow: inset 2px 0 var(--warn); }
+.gaugeapp-engagement-identity { grid-area: identity; display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-engagement-facts { grid-area: facts; display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(0, .92fr); gap: 10px; min-width: 0; }
+.gaugeapp-engagement-facts > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-engagement-controls { grid-area: controls; display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.gaugeapp-engagement-facts small { margin-bottom: 1px; letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-deployment-row { display: grid; grid-template-columns: minmax(170px, 1.25fr) minmax(100px, .8fr)
+    minmax(110px, .8fr) auto auto auto; align-items: center; gap: var(--gauge-space-3);
+    margin-bottom: var(--gauge-space-1); padding: 11px; border: 0; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-deployment-row > div, .gaugeapp-deployment-row > span:not(.badge) { display: flex;
+    flex-direction: column; min-width: 0; }
+.gaugeapp-deployment-row code { overflow: hidden; color: var(--muted); font-size: var(--fs-label);
+    text-overflow: ellipsis; }
+.gaugeapp-deployment-row small { color: var(--muted); font-size: var(--fs-label); text-transform: uppercase; }
+.gaugeapp-member-row { grid-template-columns: auto minmax(180px, 1fr) auto auto auto; }
+.gaugeapp-member-row select { width: auto; margin: 0; }
+.gaugeapp-avatar { display: inline-flex; align-items: center; justify-content: center; width: 29px;
+    height: 29px; border-radius: 50%; color: var(--accent); font-size: var(--fs-label);
+    background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+.gaugeapp-policy-row { grid-template-columns: minmax(180px, 1fr) auto; }
+.gaugeapp-policy-row > span:last-child { color: var(--ink); }
+.gaugeapp-policy-row select { width: 124px; margin: 0; }
+.gaugeapp-policy-section { grid-column: 1 / -1; }
+.gaugeapp-policy-control-row { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(230px, .72fr);
+    align-items: center; gap: 18px; min-height: 48px; margin-bottom: var(--gauge-space-1); padding: 9px 11px;
+    border: 0; border-radius: 6px; background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-policy-control-row > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-policy-control-row small { margin-top: 2px; color: var(--muted);
+    font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-policy-control-row > span:last-child { align-items: flex-end; text-align: right; }
+.gaugeapp-policy-control-row select { width: min(100%, 310px); margin: 0; }
+.gaugeapp-policy-toggle-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--gauge-space-2); }
+.gaugeapp-policy-toggle-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px;
+    min-height: 62px; padding: 10px 11px; border-radius: 6px; cursor: pointer;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-policy-toggle-row > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-policy-toggle-row small { margin-top: 2px; color: var(--muted); font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-policy-toggle-row input { margin: 0; }
+.gaugeapp-policy-toggle-row:has(input:checked) { box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-policy-toggle-row:has(input:disabled) { cursor: default; }
+.gaugeapp-policy-review { grid-column: 1 / -1; }
+.gaugeapp-policy-change-list { display: grid; gap: var(--gauge-space-1); }
+.gaugeapp-policy-change-row { display: grid; grid-template-columns: minmax(155px, .8fr) minmax(170px, 1fr) auto minmax(170px, 1fr);
+    align-items: center; gap: 10px; min-height: 42px; padding: 8px 10px; border-radius: 6px;
+    background: color-mix(in srgb, var(--bg) 24%, transparent); }
+.gaugeapp-policy-change-row > span:first-child { color: var(--gold); font-size: var(--fs-label); letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-policy-change-row > span:nth-child(2) { color: var(--muted); }
+.gaugeapp-policy-change-row > span:nth-child(3) { color: var(--muted); }
+.gaugeapp-policy-change-row > strong { color: var(--ink); font-weight: 500; }
+.gaugeapp-policy-review > .bar { margin-top: var(--gauge-space-3); }
+.gaugeapp-settings-row { grid-template-columns: minmax(200px, 1fr) auto var(--gaugeapp-action-rail-width); }
+/* List actions form one calm vertical rail throughout the prototype. Keeping a
+   single width here prevents every label from inventing a new right edge. */
+.gaugeapp-row-actions { display: grid; grid-template-columns: minmax(0, 1fr); align-content: center;
+    box-sizing: border-box; justify-content: stretch; gap: 5px; width: var(--gaugeapp-action-rail-width);
+    padding-left: 9px; border-left: 1px solid var(--gaugeapp-rule-faint); }
+.gaugeapp-row-actions > button { box-sizing: border-box; width: 100% !important; min-height: 26px;
+    margin: 0 !important; white-space: normal; text-align: center; line-height: 1.18; }
+.gaugeapp-action-feedback { position: absolute; z-index: 8; right: 24px; bottom: 20px;
+    display: flex; align-items: center; gap: 13px; max-width: min(520px, calc(100% - 48px));
+    padding: 10px 12px; color: var(--ink); background: color-mix(in srgb, var(--panel) 94%, var(--bg));
+    border: 1px solid var(--edge); border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.32);
+    font-size: var(--fs-ui); }
+.gaugeapp-action-feedback button { margin-left: auto; padding: 0 2px; color: var(--muted);
+    background: transparent; border: 0; cursor: pointer; font: inherit; }
+
+.gaugeapp-form-card { border-radius: 3px; padding: 14px var(--gaugeapp-inline-inset) !important;
+    background: color-mix(in srgb, var(--panel) 54%, transparent); }
+/* The homepage's Guide uses a strong outer rule, a small interval, and a faint
+   inner rule. Reserve that plate treatment for the page's principal working
+   surface; ordinary rows remain unframed or carry one quiet edge at most. */
+.gaugeapp-content :is(
+    .gaugeapp-form-card,
+    .gaugeapp-plan-summary,
+    .gaugeapp-payment-setup-card,
+    .gaugeapp-payment-account-card,
+    .gaugeapp-device-enrollment,
+    .gaugeapp-managed-signup
+) { border: 1px solid var(--gaugeapp-rule-faint) !important;
+    outline: 1px solid var(--gaugeapp-rule); outline-offset: 3px; box-shadow: none; }
+.gaugeapp-setup-steps { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: var(--gauge-space-2); margin: 0 0 28px; padding: 0; list-style: none; }
+.gaugeapp-setup-steps li { margin: 0; }
+.gaugeapp-setup-steps button { display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 9px 10px; color: var(--muted); background: color-mix(in srgb, var(--panel) 28%, transparent);
+    border: 0; border-radius: 6px; text-align: left; font: inherit; cursor: pointer; }
+.gaugeapp-setup-steps button:hover, .gaugeapp-setup-steps li.active button { color: var(--ink);
+    background: color-mix(in srgb, var(--panel) 64%, transparent); }
+.gaugeapp-setup-steps li.active button { box-shadow: inset 0 -2px var(--gold); }
+.gaugeapp-setup-steps li.done button { color: var(--gold); }
+.gaugeapp-setup-steps button > span { display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; border-radius: 50%; color: inherit;
+    background: color-mix(in srgb, var(--edge) 70%, transparent); font-size: var(--fs-label); }
+.gaugeapp-protocol-choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--gauge-space-3); margin: 0 0 var(--gauge-space-4); }
+.gaugeapp-protocol-choices > button { display: flex; flex-direction: column; align-items: flex-start;
+    gap: 5px; min-height: 76px; padding: 14px 16px; color: var(--muted);
+    background: color-mix(in srgb, var(--panel) 28%, transparent); border: 1px solid transparent;
+    border-radius: 7px; text-align: left; font: inherit; cursor: pointer; }
+.gaugeapp-protocol-choices > button:hover { color: var(--ink); background: color-mix(in srgb, var(--panel) 52%, transparent); }
+.gaugeapp-protocol-choices > button.active { color: var(--ink); border-color: color-mix(in srgb, var(--gold) 72%, var(--edge));
+    background: color-mix(in srgb, var(--gold) 7%, var(--panel)); }
+.gaugeapp-protocol-choices small { color: var(--muted); font-size: var(--fs-label); line-height: 1.4; }
+.gaugeapp-integration-value { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; gap: var(--gauge-space-3); min-height: 46px; margin-bottom: var(--gauge-space-1);
+    padding: 10px 11px; border-radius: 6px; background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-integration-value > span { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.gaugeapp-integration-value small { color: color-mix(in srgb, var(--gold) 78%, var(--muted));
+    font-size: var(--fs-label); letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-integration-value code { overflow: hidden; color: var(--ink); font-size: var(--fs-label); text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-check-row { display: grid !important; grid-template-columns: auto minmax(0, 1fr);
+    align-items: start; gap: 10px; margin: 0 0 var(--gauge-space-2) !important; padding: 12px 13px;
+    border-radius: 6px; background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-check-row input { width: auto !important; margin: 3px 0 0 !important; }
+.gaugeapp-check-row > span { display: flex; flex-direction: column; gap: 3px; }
+.gaugeapp-check-row small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-setup-navigation { display: grid; grid-template-columns: auto 1fr auto; align-items: center;
+    gap: var(--gauge-space-3); margin-top: 28px; padding: 12px 14px; border-radius: 7px;
+    background: color-mix(in srgb, var(--panel) 36%, transparent); }
+.gaugeapp-setup-navigation > span { color: var(--muted); text-align: center; font-size: var(--fs-label); }
+.gaugeapp-content :is(input[type="checkbox"], input[type="radio"]) { accent-color: var(--gold); }
+.gaugeapp-content .gaugeapp-section-heading > .tree-action,
+.gaugeapp-content .gaugeapp-page-actions button { color: var(--gold);
+    border-color: color-mix(in srgb, var(--gold) 52%, var(--edge)); }
+.gaugeapp-content :is(
+    .gaugeapp-page-actions > button,
+    .gaugeapp-section-heading > button,
+    .gaugeapp-plan-summary-head > button,
+    .gaugeapp-model-plan-row > button,
+    .gaugeapp-project-model-route > button,
+    .gaugeapp-target-access-row > button,
+    .gaugeapp-plan-entitlement > button,
+    .gaugeapp-service-row > button,
+    .gaugeapp-plan-billing-link > button,
+    .gaugeapp-payment-account-card > button,
+    .gaugeapp-connect-alert > button,
+    .gaugeapp-connect-row > button,
+    .gaugeapp-integration-value > button,
+    .gaugeapp-obligation-card > button,
+    .gaugeapp-charge-row > button,
+    .gaugeapp-engagement-controls > button,
+    .gaugeapp-danger-zone > button,
+    .gaugeapp-device-enrollment-head > button,
+    .gaugeapp-managed-signup-head > button
+) { box-sizing: border-box; width: var(--gaugeapp-action-width) !important; min-height: 27px;
+    margin-left: 0; white-space: normal; text-align: center; line-height: 1.18; }
+.gaugeapp-content .gaugeapp-section-heading > .tree-action:hover,
+.gaugeapp-content .gaugeapp-page-actions button:hover { color: var(--ink); border-color: var(--gold);
+    background: color-mix(in srgb, var(--gold) 10%, transparent); }
+.gaugeapp-content .bar > button:not(.tree-action):not(:disabled),
+.gaugeapp-content .gaugeapp-primary-action:not(:disabled),
+.gaugeapp-setup-navigation > button:last-child:not(:disabled) { color: var(--navy); background: var(--gold); border-color: var(--gold); }
+.gaugeapp-content .bar > button:not(.tree-action):not(:disabled):hover,
+.gaugeapp-content .gaugeapp-primary-action:not(:disabled):hover,
+.gaugeapp-setup-navigation > button:last-child:not(:disabled):hover { color: var(--navy);
+    background: color-mix(in srgb, var(--gold) 86%, #fff); border-color: var(--gold); }
+.gaugeapp-content .bar { flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+.gaugeapp-content .bar > button { box-sizing: border-box; flex: 0 0 var(--gaugeapp-form-action-width);
+    width: var(--gaugeapp-form-action-width); min-height: 28px; margin: 0; white-space: normal;
+    text-align: center; line-height: 1.2; }
+.gaugeapp-billing-heading > span { display: grid; grid-template-columns: minmax(0, 1fr);
+    align-content: start; justify-content: stretch; gap: 5px; width: var(--gaugeapp-action-width); }
+.gaugeapp-content .gaugeapp-billing-heading > span > button { box-sizing: border-box;
+    width: var(--gaugeapp-action-width) !important; min-height: 27px; margin: 0; white-space: normal;
+    text-align: center; line-height: 1.18; }
+.gaugeapp-field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--gauge-space-2) var(--gauge-space-4); }
+.gaugeapp-field-grid-single { grid-template-columns: minmax(0, 520px); }
+.gaugeapp-field-span { grid-column: 1 / -1; }
+.gaugeapp-field-grid textarea { box-sizing: border-box; display: block; width: 100%; min-height: 72px;
+    margin-top: 3px; padding: 6px 8px; resize: vertical; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--edge); border-radius: 4px; }
+.gaugeapp-field-note { max-width: 67ch; margin: 3px 0 var(--gauge-space-3); color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-contact-assignment-grid { display: grid; grid-template-columns: 1fr; align-items: start; gap: var(--gauge-space-3); }
+.gaugeapp-contact-assignment-grid > label { margin: 0; }
+.gaugeapp-contact-choices { display: grid; gap: 4px; }
+.gaugeapp-contact-choices > span { margin-bottom: 1px; color: var(--muted); font-size: var(--fs-ui); }
+.gaugeapp-contact-choice { display: grid !important; grid-template-columns: auto minmax(0, 1fr); align-items: start;
+    gap: 9px; margin: 0 !important; padding: 7px 9px; border-radius: 5px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-contact-choice input { width: auto !important; margin: 3px 0 0 !important; }
+.gaugeapp-contact-choice > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-contact-choice small { color: var(--muted); font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-filter-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    align-items: end; gap: 10px; }
+.gaugeapp-filter-grid label { margin-bottom: 0; }
+.gaugeapp-filter-grid button { margin-bottom: 1px; white-space: nowrap; }
+.gaugeapp-danger-zone { padding: 14px var(--gaugeapp-inline-inset) !important; border-radius: 7px;
+    background: color-mix(in srgb, var(--bad) 5%, transparent); }
+.gaugeapp-danger-zone .tree-action { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 50%, var(--edge)); }
+.gaugeapp-danger-zone > button { display: block; margin-left: auto !important; }
+.gaugeapp-ownership-card { max-width: 680px; }
+.gaugeapp-danger-review { max-width: 680px; margin-top: var(--gauge-space-3); padding: 13px 14px;
+    border-radius: 6px; background: color-mix(in srgb, var(--bad) 7%, var(--panel)); }
+.gaugeapp-danger-review strong { color: var(--ink); }
+.gaugeapp-danger-review p { max-width: 64ch; margin: 5px 0 12px; color: var(--muted); }
+.gaugeapp-danger-zone .gaugeapp-danger-secondary { color: var(--muted); border-color: var(--edge); }
+.gaugeapp-enrollment-ticket { display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    margin: 10px 0 12px; padding: 10px 12px; border: 1px solid var(--edge); border-radius: 4px;
+    background: var(--bg); }
+.gaugeapp-enrollment-ticket code { color: var(--accent); font-size: var(--fs-body); }
+.gaugeapp-enrollment-ticket span { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-devices-section { max-width: 980px; }
+.gaugeapp-device-list { display: grid; gap: var(--gauge-space-1); }
+.gaugeapp-device-row { display: grid; grid-template-columns: 28px minmax(0, 1fr) 96px 83px;
+    align-items: center; gap: 8px; min-height: 44px; padding: 9px 11px;
+    border: 1px solid color-mix(in srgb, var(--edge) 54%, transparent); border-radius: 4px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-device-row[data-status="revoked"] { color: var(--muted); background: color-mix(in srgb, var(--panel) 16%, transparent); }
+.gaugeapp-device-row[data-status="revoked"] .badge { color: var(--muted); }
+.gaugeapp-device-identity { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-device-identity strong { overflow: hidden; color: var(--ink); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-device-row[data-status="revoked"] .gaugeapp-device-identity strong { color: var(--muted); }
+.gaugeapp-device-identity small { color: var(--muted); font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-device-title-line { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 6px; min-width: 0; }
+.gaugeapp-device-title-line > strong { flex: 0 0 auto; max-width: 100%; min-width: 0; }
+.gaugeapp-device-title-line > .badge { flex: none; }
+.gaugeapp-device-kind { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px;
+    color: var(--gold); border: 1px solid color-mix(in srgb, var(--gold) 42%, var(--edge)); border-radius: 5px; }
+.gaugeapp-device-route { display: flex; flex-direction: column; min-width: 0; color: var(--ink); }
+.gaugeapp-device-route small { margin-bottom: 2px; color: var(--muted); font-size: var(--fs-label);
+    letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-device-inline-edit, .gaugeapp-device-confirm { grid-column: 1 / -1; display: grid; align-items: end;
+    grid-template-columns: minmax(220px, 1fr) auto auto; gap: 8px; padding-top: 3px; }
+.gaugeapp-device-inline-edit label { margin: 0; color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-device-inline-edit input { box-sizing: border-box; width: 100%; margin-top: 3px; }
+.gaugeapp-device-confirm { align-items: center; padding: 9px 10px; border-radius: 5px;
+    background: color-mix(in srgb, var(--bad) 7%, transparent); }
+.gaugeapp-device-confirm > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-device-confirm strong { color: var(--ink); font-weight: 500; }
+.gaugeapp-device-confirm small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-device-enrollment { margin: 0 0 var(--gauge-space-2); padding: 12px; border-radius: 7px;
+    background: color-mix(in srgb, var(--panel) 45%, transparent); box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-device-enrollment-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.gaugeapp-device-enrollment-head > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-device-enrollment-head strong { color: var(--ink); font-size: var(--fs-ui); font-weight: 500; }
+.gaugeapp-device-enrollment-head small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-device-enrollment-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.gaugeapp-device-type-choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-bottom: 8px; }
+.gaugeapp-device-type-choices > button { display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    min-height: 54px; padding: 8px 10px; color: var(--muted); background: color-mix(in srgb, var(--bg) 24%, transparent);
+    border: 1px solid transparent; border-radius: 5px; text-align: left; font: inherit; cursor: pointer; }
+.gaugeapp-device-type-choices > button.active { color: var(--ink); border-color: color-mix(in srgb, var(--gold) 58%, var(--edge));
+    background: color-mix(in srgb, var(--gold) 5%, var(--bg)); box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-device-type-choices small { color: var(--muted); font-size: var(--fs-label); line-height: 1.3; }
+.gaugeapp-enrollment-step { display: grid; grid-template-columns: 22px minmax(0, 1fr); align-content: start;
+    gap: 8px; min-width: 0; padding: 10px; border-radius: 6px; background: color-mix(in srgb, var(--bg) 24%, transparent); }
+.gaugeapp-enrollment-step.active { background: color-mix(in srgb, var(--gold) 5%, var(--bg)); }
+.gaugeapp-enrollment-step > span:nth-child(2) { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-enrollment-step strong { color: var(--ink); font-weight: 500; }
+.gaugeapp-enrollment-step small { margin-top: 2px; color: var(--muted); font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-step-number { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px;
+    color: var(--gold); border-radius: 50%; background: color-mix(in srgb, var(--gold) 12%, transparent); font-size: var(--fs-label); }
+.gaugeapp-enrollment-step .gaugeapp-enrollment-ticket { grid-column: 1 / -1; margin: 7px 0 0; padding: 7px 8px; }
+.gaugeapp-enrollment-step .gaugeapp-enrollment-ticket code { font-size: var(--fs-ui); letter-spacing: .08em; }
+.gaugeapp-sas-code { grid-column: 1 / -1; margin: 9px 0 4px; color: var(--gold); font-size: 22px; letter-spacing: .15em; }
+.gaugeapp-device-enrollment-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 7px; }
+.gaugeapp-device-enrollment-actions > button { box-sizing: border-box; width: var(--gaugeapp-form-action-width); min-height: 28px;
+    white-space: normal; text-align: center; line-height: 1.2; }
+.gaugeapp-device-enrollment-actions > button:last-child { color: var(--navy); background: var(--gold); border-color: var(--gold); }
+.gaugeapp-pairing-invite { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 13px;
+    padding: 10px; border: 1px solid color-mix(in srgb, var(--edge) 58%, transparent); border-radius: 4px;
+    background: color-mix(in srgb, var(--bg) 24%, transparent); }
+.gaugeapp-pairing-qr { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
+    padding: 7px; color: var(--navy); background: #f7f3e7; border: 1px solid color-mix(in srgb, var(--gold) 48%, var(--edge)); }
+.gaugeapp-pairing-qr > div { display: flex; width: 112px; height: 112px; }
+.gaugeapp-pairing-qr svg { display: block; width: 100%; height: 100%; }
+.gaugeapp-pairing-qr small { color: #5d5645; font-size: 10px; line-height: 1.2; text-align: center; }
+.gaugeapp-pairing-instructions { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
+.gaugeapp-pairing-instructions > span { display: flex; flex-direction: column; }
+.gaugeapp-pairing-instructions .gaugeapp-enrollment-ticket { gap: 6px; padding: 7px; }
+.gaugeapp-pairing-instructions .gaugeapp-enrollment-ticket code { white-space: nowrap; font-size: 11px; }
+.gaugeapp-pairing-instructions strong, .gaugeapp-pairing-request strong, .gaugeapp-pairing-compare strong { color: var(--ink); font-weight: 500; }
+.gaugeapp-pairing-instructions small, .gaugeapp-pairing-request small, .gaugeapp-pairing-compare small { color: var(--muted); font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-pairing-approval { padding: 10px; border: 1px solid color-mix(in srgb, var(--gold) 45%, var(--edge)); border-radius: 4px;
+    background: color-mix(in srgb, var(--gold) 4%, var(--bg)); }
+.gaugeapp-pairing-request { display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: center; gap: 9px; }
+.gaugeapp-pairing-request > span:last-child, .gaugeapp-pairing-compare > span { display: flex; flex-direction: column; }
+.gaugeapp-pairing-compare { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px;
+    margin: 10px 0; padding: 9px 10px; background: color-mix(in srgb, var(--panel) 32%, transparent); }
+.gaugeapp-pairing-compare .gaugeapp-sas-code { grid-column: auto; margin: 0; white-space: nowrap; }
+.gaugeapp-inline-form { display: grid; grid-template-columns: minmax(220px, 1fr) var(--gaugeapp-action-width); align-items: end;
+    gap: 8px; max-width: 620px; margin-top: 12px; }
+.gaugeapp-inline-form label { margin: 0; color: var(--muted); font-size: var(--fs-ui); }
+.gaugeapp-inline-form input { box-sizing: border-box; display: block; width: 100%; margin-top: 3px; }
+.gaugeapp-inline-form button { box-sizing: border-box; width: var(--gaugeapp-action-width); min-height: 27px;
+    margin: 0 0 1px; white-space: normal; text-align: center; line-height: 1.18; }
+.gaugeapp-restore-form { display: grid; grid-template-columns: minmax(220px, 420px) auto;
+    align-items: end; gap: 10px; margin: 10px 6px 0; }
+.gaugeapp-restore-form label { margin: 0; }
+.gaugeapp-restore-form .bar { margin: 0; }
+.gaugeapp-plan { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
+    padding: 10px 11px; border-radius: 6px 6px 0 0;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-plan > div { display: flex; flex-direction: column; }
+.gaugeapp-plan span { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-usage { height: 4px; margin: 8px 11px 13px; overflow: hidden; border-radius: 3px;
+    background: color-mix(in srgb, var(--edge) 65%, transparent); }
+.gaugeapp-usage span { display: block; height: 100%; background: var(--accent); }
+.gaugeapp-model-access-section, .gaugeapp-project-model-section { max-width: 1040px; }
+.gaugeapp-model-add-card { margin-bottom: var(--gauge-space-3); padding: 13px var(--gaugeapp-inline-inset); border-radius: 7px;
+    background: color-mix(in srgb, var(--panel) 48%, transparent); box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-model-connection-form > .bar { margin-top: var(--gauge-space-2); }
+.gaugeapp-model-access-grid { display: grid; grid-template-columns: minmax(0, 1fr);
+    align-items: start; gap: 24px; }
+.gaugeapp-model-connection-row { display: grid; grid-template-columns: minmax(190px, 1fr) minmax(175px, .8fr) auto auto;
+    align-items: center; gap: 8px 12px; min-height: 42px; margin-bottom: var(--gauge-space-1); padding: 8px var(--gaugeapp-inline-inset);
+    border: 1px solid color-mix(in srgb, var(--edge) 54%, transparent); border-radius: 4px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-model-connection-row > span:not(.badge, .gaugeapp-row-actions) { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-model-connection-row small, .gaugeapp-project-model-route small { overflow: hidden; color: var(--muted);
+    font-size: var(--fs-label); line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-model-connection-row > span:nth-child(2) > small,
+.gaugeapp-project-model-route > span:nth-child(n+2):not(.badge) > small { margin-bottom: 2px; text-transform: uppercase; letter-spacing: .06em; }
+.gaugeapp-model-inline-editor, .gaugeapp-model-remove-confirm { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end; gap: 10px; margin-top: 5px; padding: 10px; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 42%, transparent); }
+.gaugeapp-model-inline-editor label { margin: 0; }
+.gaugeapp-model-inline-editor textarea { box-sizing: border-box; display: block; width: 100%; min-height: 58px;
+    margin-top: 3px; padding: 6px 8px; resize: vertical; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--edge); border-radius: 4px; }
+.gaugeapp-model-remove-confirm { align-items: center; background: color-mix(in srgb, var(--bad) 7%, transparent); }
+.gaugeapp-model-remove-confirm > span:first-child { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-model-remove-confirm small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-model-plan-row { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(120px, .45fr) auto auto;
+    align-items: center; gap: 10px 14px; margin-top: var(--gauge-space-2); padding: 9px var(--gaugeapp-inline-inset); border-radius: 6px;
+    background: color-mix(in srgb, var(--gold) 4%, var(--panel)); }
+.gaugeapp-model-plan-row[data-state="available"] { grid-template-columns: minmax(220px, 1fr) auto auto;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-model-plan-row > span:first-child { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-model-plan-row small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-model-plan-usage { height: 4px; overflow: hidden; border-radius: 3px;
+    background: color-mix(in srgb, var(--edge) 65%, transparent); }
+.gaugeapp-model-plan-usage > span { display: block; height: 100%; background: var(--gold); }
+.gaugeapp-model-plan-row > button,
+.gaugeapp-project-model-route > button,
+.gaugeapp-target-access-row > button,
+.gaugeapp-plan-entitlement > button,
+.gaugeapp-service-row > button,
+.gaugeapp-plan-billing-link > button,
+.gaugeapp-payment-account-card > button,
+.gaugeapp-connect-alert > button,
+.gaugeapp-connect-row > button,
+.gaugeapp-integration-value > button,
+.gaugeapp-obligation-card > button,
+.gaugeapp-charge-row > button,
+.gaugeapp-engagement-controls > button { box-sizing: border-box; width: var(--gaugeapp-action-width); min-height: 27px;
+    margin: 0; white-space: normal; text-align: center; line-height: 1.18; }
+.gaugeapp-managed-signup { margin-top: var(--gauge-space-2); padding: 13px var(--gaugeapp-inline-inset); border-radius: 7px;
+    background: color-mix(in srgb, var(--panel) 48%, transparent); box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-managed-signup-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.gaugeapp-managed-signup-head > span { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-managed-signup-head strong { color: var(--ink); font-weight: 500; }
+.gaugeapp-managed-signup-head small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-managed-signup-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin: 11px 0; }
+.gaugeapp-managed-signup-facts > span { display: flex; flex-direction: column; min-width: 0; padding: 8px 9px;
+    border-radius: 5px; background: color-mix(in srgb, var(--bg) 25%, transparent); }
+.gaugeapp-managed-signup-facts small { color: var(--muted); font-size: var(--fs-label); text-transform: uppercase; letter-spacing: .05em; }
+.gaugeapp-managed-signup-facts strong { overflow: hidden; margin-top: 2px; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; }
+.gaugeapp-managed-spending { display: grid !important; grid-template-columns: minmax(180px, 1fr) minmax(240px, .8fr);
+    align-items: center; gap: 12px; margin: 0 !important; padding: 9px 10px; border-radius: 5px;
+    background: color-mix(in srgb, var(--bg) 20%, transparent); }
+.gaugeapp-managed-spending select { margin: 0; }
+.gaugeapp-managed-signup > .bar { justify-content: flex-end; margin-top: var(--gauge-space-2); }
+.gaugeapp-managed-payment { margin: 10px 0 0; padding: 10px; border-radius: 6px;
+    background: color-mix(in srgb, var(--bg) 25%, transparent); }
+.gaugeapp-managed-payment-head { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; }
+.gaugeapp-managed-payment-head > span:last-child { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-managed-payment-head small { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-project-model-editor > .bar { margin-top: var(--gauge-space-2); }
+.gaugeapp-model-class-choice { display: flex !important; align-items: center; gap: 7px; margin: 1px 0 8px !important; }
+.gaugeapp-model-class-choice input { width: auto !important; margin: 0 !important; }
+.gaugeapp-project-model-list { display: grid; gap: var(--gauge-space-1); }
+.gaugeapp-project-model-route { display: grid;
+    grid-template-columns: minmax(160px, 1.05fr) minmax(175px, 1fr) minmax(125px, .7fr) auto auto;
+    align-items: center; gap: 8px 14px; min-height: 44px; padding: 9px 11px;
+    border: 1px solid color-mix(in srgb, var(--edge) 54%, transparent); border-radius: 4px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-project-model-route > span:not(.badge) { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-model-provider strong { color: var(--ink); font-weight: 500; }
+.gaugeapp-project-model-section > .gaugeapp-field-note { margin: 9px 2px 0; }
+.gaugeapp-switch { display: flex !important; align-items: center; gap: 6px; margin: 0 !important; }
+.gaugeapp-switch input { width: auto !important; margin: 0 !important; }
+.gaugeapp-switch span { color: var(--muted); }
+.gaugeapp-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.gaugeapp-chips > span { display: inline-flex; align-items: center; gap: 5px; padding: 3px 6px;
+    border: 1px solid var(--edge); border-radius: 3px; font-family: var(--mono); font-size: var(--fs-small); }
+.gaugeapp-chips button { padding: 0; color: var(--muted); background: transparent; border: 0; }
+
+@container (max-width: 480px) {
+    .gaugeapp-page-header { flex-direction: column; gap: 10px; }
+    .gaugeapp-section-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+        align-items: flex-start; gap: var(--gauge-space-3); }
+    .gaugeapp-section-heading > div { flex-wrap: wrap; gap: 4px 10px; }
+    .gaugeapp-section-heading h4 { min-width: 0; overflow-wrap: anywhere; }
+    .gaugeapp-section-heading > div > span { flex-basis: 100%; margin-top: 3px; }
+    .gaugeapp-charge-row { grid-template-columns: minmax(0, 1fr) minmax(84px, .6fr) auto; align-items: center; }
+    .gaugeapp-charge-row > span:first-child { grid-column: 1 / 3; grid-row: 1; }
+    .gaugeapp-charge-row > span:nth-child(2) { grid-column: 1; grid-row: 2; }
+    .gaugeapp-charge-row > span:nth-child(3) { grid-column: 2; grid-row: 2; }
+    .gaugeapp-charge-row > button { grid-column: 3; grid-row: 1; }
+    .gaugeapp-charge-editor { grid-template-columns: minmax(0, 1fr) var(--gaugeapp-action-width); align-items: end; }
+    .gaugeapp-charge-editor > label, .gaugeapp-charge-editor > label:nth-child(3) { grid-column: 1; grid-row: auto; }
+    .gaugeapp-charge-editor > button { grid-column: 2; grid-row: 1 / 4; }
+    .gaugeapp-obligation-editor > div { grid-template-columns: 1fr; }
+    .gaugeapp-inline-composer, .gaugeapp-offer-agent-summary { grid-template-columns: 1fr; }
+    .gaugeapp-inline-form { grid-template-columns: 1fr; }
+    .gaugeapp-inline-form > button { justify-self: end; }
+    .gaugeapp-price-example { grid-template-columns: 100px minmax(0, 1fr); }
+    .gaugeapp-price-example > small { grid-column: 2; }
+    .gaugeapp-metrics-five { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@container (max-width: 360px) {
+    .gaugeapp-catalog-card-head { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; }
+    .gaugeapp-catalog-card-head > .gaugeapp-row-actions { justify-self: end; margin-top: 6px; }
+    .gaugeapp-policy-row { grid-template-columns: minmax(0, 1fr); align-items: start; }
+    .gaugeapp-policy-row > select { justify-self: end; }
+    .gaugeapp-resource.gaugeapp-client-resource { display: grid; grid-template-columns: minmax(0, 1fr) var(--gaugeapp-action-rail-width); gap: 8px; }
+    .gaugeapp-client-resource > .resource-kind { display: none; }
+    .gaugeapp-client-resource > .resource-title { grid-column: 1; }
+    .gaugeapp-client-resource > .gaugeapp-row-actions { grid-column: 2; justify-self: end; }
+}
+
+/* A GaugeDesk content pane can be narrow while the browser viewport is wide.
+   These rows therefore respond to their section, not to the window. */
+@container (max-width: 620px) {
+    .gaugeapp-payment-account-card { grid-template-columns: minmax(0, 1fr) var(--gaugeapp-action-width); gap: 10px; }
+    .gaugeapp-payment-account-card > .gaugeapp-payment-status { grid-column: 1; grid-row: 1; }
+    .gaugeapp-payment-account-card > .gaugeapp-payment-account-facts { grid-column: 1 / -1; grid-row: 2; }
+    .gaugeapp-payment-account-card > button { grid-column: 2; grid-row: 1; justify-self: end; }
+    .gaugeapp-payment-setup-facts, .gaugeapp-prepayment-list { grid-template-columns: 1fr; }
+
+    .gaugeapp-policy-control-row { grid-template-columns: 1fr; gap: 8px; align-items: start; }
+    .gaugeapp-policy-control-row > span:last-child { align-items: flex-start; text-align: left; }
+    .gaugeapp-policy-control-row select { width: 100%; }
+    .gaugeapp-policy-toggle-grid { grid-template-columns: 1fr; }
+    .gaugeapp-policy-change-row { grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 4px 8px; }
+    .gaugeapp-policy-change-row > span:first-child { grid-column: 1 / -1; }
+
+    .gaugeapp-home-row { grid-template-columns: minmax(0, 1fr) auto var(--gaugeapp-action-rail-width); }
+    .gaugeapp-home-row > span:first-child { grid-column: 1; grid-row: 1; }
+    .gaugeapp-home-row > span:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+    .gaugeapp-home-row > .badge { grid-column: 2; grid-row: 1; }
+    .gaugeapp-home-row > .gaugeapp-row-actions { grid-column: 3; grid-row: 1; }
+
+    .gaugeapp-project-governance-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+    .gaugeapp-project-governance-row > span:first-child { grid-column: 1; grid-row: 1; }
+    .gaugeapp-project-governance-row > span:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+    .gaugeapp-project-governance-row > span:nth-child(3) { grid-column: 1; grid-row: 3; }
+    .gaugeapp-project-governance-row > span:nth-child(4) { grid-column: 2 / -1; grid-row: 3; }
+    .gaugeapp-project-governance-row > span:nth-child(5) { grid-column: 2; grid-row: 1; justify-self: end; }
+    .gaugeapp-project-governance-row > .gaugeapp-row-actions {
+        grid-column: 3; grid-row: 1; justify-self: end; }
+
+    .gaugeapp-project-access-row { grid-template-columns: minmax(0, 1fr) minmax(88px, .62fr) auto; }
+    .gaugeapp-project-access-row > .gaugeapp-avatar { display: none; }
+    .gaugeapp-project-access-row > span:nth-child(2) { grid-column: 1; grid-row: 1; }
+    .gaugeapp-project-access-row > span:nth-child(3) { grid-column: 2; grid-row: 1; }
+    .gaugeapp-project-access-row > span:nth-child(4) { grid-column: 1; grid-row: 2; }
+    .gaugeapp-project-access-row > .gaugeapp-row-actions,
+    .gaugeapp-project-access-row > button { grid-column: 3; grid-row: 1; justify-self: end; }
+
+    .gaugeapp-target-access-row { grid-template-columns: minmax(0, 1fr) minmax(120px, .7fr); }
+    .gaugeapp-target-access-row > span:first-child { grid-column: 1; grid-row: 1; }
+    .gaugeapp-target-access-row > button { grid-column: 2; grid-row: 1; justify-self: end; }
+    .gaugeapp-target-access-row > span:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+    .gaugeapp-target-access-row > span:nth-child(3) { grid-column: 1; grid-row: 3; }
+    .gaugeapp-target-access-row > span:nth-child(4) { grid-column: 2; grid-row: 3; justify-self: end; }
+
+    .gaugeapp-placement-access-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .gaugeapp-placement-access-row > span:nth-child(2) { grid-column: 1; grid-row: 1; }
+    .gaugeapp-placement-access-row > span:nth-child(3) { grid-column: 2; grid-row: 1; justify-self: end; }
+    .gaugeapp-placement-access-row > span:first-child { grid-column: 1; grid-row: 2; }
+    .gaugeapp-placement-access-row > span:nth-child(4) { grid-column: 2; grid-row: 2; }
+    .gaugeapp-placement-access-row > .gaugeapp-row-actions {
+        grid-column: 1 / -1; grid-row: 3; justify-self: end; }
+
+    .gaugeapp-member-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .gaugeapp-member-row > .gaugeapp-avatar { display: none; }
+    .gaugeapp-member-row > span:nth-child(2) { grid-column: 1; grid-row: 1; }
+    .gaugeapp-member-row > select { grid-column: 1; grid-row: 2; justify-self: start; }
+    .gaugeapp-member-row > span:nth-child(4) { grid-column: 2; grid-row: 1; justify-self: end; }
+    .gaugeapp-member-row > .gaugeapp-row-actions {
+        grid-column: 2; grid-row: 2; justify-self: end; }
+
+    .gaugeapp-settings-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .gaugeapp-settings-row > span:first-child { grid-column: 1; grid-row: 1; }
+    .gaugeapp-settings-row > span:nth-child(2) { grid-column: 2; grid-row: 1; justify-self: end; }
+    .gaugeapp-settings-row > .gaugeapp-row-actions {
+        grid-column: 1 / -1; grid-row: 2; justify-self: end; }
+
+    .gaugeapp-project-model-route { grid-template-columns: minmax(0, 1fr) auto var(--gaugeapp-action-width); }
+    .gaugeapp-project-model-route > span:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+    .gaugeapp-project-model-route > span:nth-child(3) { grid-column: 1; grid-row: 3; }
+    .gaugeapp-project-model-route > .badge { grid-column: 2; grid-row: 1; }
+    .gaugeapp-project-model-route > button { grid-column: 3; grid-row: 1; }
+}
+
+@container (min-width: 760px) {
+    .gaugeapp-catalog-grid, .gaugeapp-library-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .gaugeapp-contact-assignment-grid { grid-template-columns: minmax(250px, 1.15fr) repeat(2, minmax(180px, .85fr)); }
+    .gaugeapp-managed-engagement-row { grid-template-columns: minmax(150px, .9fr) minmax(0, 2fr) auto;
+        grid-template-areas: "identity facts controls"; }
+}
+
+@container (max-width: 520px) {
+    .gaugeapp-plan-choice-grid { grid-template-columns: 1fr; }
+    .gaugeapp-plan-entitlement, .gaugeapp-service-row { grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
+    .gaugeapp-plan-entitlement > span:nth-child(2), .gaugeapp-service-row > span:nth-child(2) { grid-column: 1; }
+    .gaugeapp-plan-entitlement > button, .gaugeapp-service-row > button { grid-column: 2; grid-row: 1 / 3; }
+    .gaugeapp-device-enrollment-grid, .gaugeapp-device-type-choices { grid-template-columns: 1fr; }
+    .gaugeapp-device-row { grid-template-columns: 28px minmax(0, 1fr) var(--gaugeapp-action-rail-width); align-items: start; }
+    .gaugeapp-device-row > .gaugeapp-device-kind { grid-column: 1; grid-row: 1; }
+    .gaugeapp-device-row > .gaugeapp-device-identity { grid-column: 2; grid-row: 1; }
+    .gaugeapp-device-row > .badge { grid-column: 2; grid-row: 3; justify-self: start; }
+    .gaugeapp-device-row > .gaugeapp-device-route { grid-column: 2; grid-row: 2; }
+    .gaugeapp-device-row > .gaugeapp-row-actions { grid-column: 3; grid-row: 1 / 4; justify-self: end; }
+    .gaugeapp-device-inline-edit, .gaugeapp-device-confirm { grid-template-columns: 1fr auto auto; }
+    .gaugeapp-model-access-grid { grid-template-columns: 1fr; gap: var(--gauge-space-4); }
+    .gaugeapp-model-connection-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .gaugeapp-model-connection-row > span:nth-child(2) { grid-column: 1; }
+    .gaugeapp-model-connection-row > .badge { grid-column: 2; grid-row: 1; }
+    .gaugeapp-model-connection-row > .gaugeapp-row-actions { grid-column: 2; grid-row: 2; }
+    .gaugeapp-model-plan-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .gaugeapp-model-plan-row[data-state="available"] { grid-template-columns: minmax(0, 1fr) auto; }
+    .gaugeapp-model-plan-usage { grid-column: 1 / -1; grid-row: 2; }
+    .gaugeapp-managed-signup-facts { grid-template-columns: 1fr; }
+    .gaugeapp-managed-spending { grid-template-columns: 1fr; }
+    .gaugeapp-project-model-route { grid-template-columns: minmax(0, 1fr) auto auto; }
+    .gaugeapp-project-model-route > span:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+    .gaugeapp-project-model-route > span:nth-child(3) { grid-column: 1; grid-row: 3; }
+    .gaugeapp-project-model-route > .badge { grid-column: 2; grid-row: 1; }
+    .gaugeapp-project-model-route > button { grid-column: 3; grid-row: 1; }
+}
+
+@media (max-width: 720px) {
+    .filebody.markdown-body.gaugeapp-content { width: calc(100% - 16px); padding: 21px 8px 55px; }
+    .gaugeapp-connect-alert { align-items: flex-start; }
+    .gaugeapp-metrics, .gaugeapp-metrics-five { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .gaugeapp-home-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .gaugeapp-managed-engagement-row { grid-template-columns: minmax(0, 1fr) auto;
+        grid-template-areas: "identity controls" "facts facts"; align-items: start; }
+    .gaugeapp-engagement-facts { grid-template-columns: 1fr; gap: 4px; }
+    .gaugeapp-avatar { display: none; }
+    .gaugeapp-setup-steps, .gaugeapp-protocol-choices, .gaugeapp-catalog-grid,
+    .gaugeapp-agent-picker-grid, .gaugeapp-offer-agent-summary, .gaugeapp-proposal-status { grid-template-columns: 1fr; }
+    .gaugeapp-setup-steps { gap: 3px; }
+    .gaugeapp-field-grid { grid-template-columns: 1fr; }
+    .gaugeapp-plan-summary-head { flex-direction: column; gap: 10px; }
+    .gaugeapp-plan-facts, .gaugeapp-plan-choice-grid { grid-template-columns: 1fr; }
+    .gaugeapp-plan-entitlement, .gaugeapp-service-row { grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
+    .gaugeapp-plan-entitlement > span:nth-child(2), .gaugeapp-service-row > span:nth-child(2) { grid-column: 1; }
+    .gaugeapp-plan-entitlement > button, .gaugeapp-service-row > button { grid-column: 2; grid-row: 1 / 3; }
+    .gaugeapp-payment-account-card { grid-template-columns: minmax(0, 1fr) var(--gaugeapp-action-width); }
+    .gaugeapp-payment-account-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .gaugeapp-payment-setup-facts, .gaugeapp-prepayment-list { grid-template-columns: 1fr; }
+    .gaugeapp-billing-heading { align-items: stretch; flex-direction: column; }
+    .gaugeapp-billing-heading > span { justify-content: flex-end; margin-left: auto; }
+    .gaugeapp-stripe-owner-band, .gaugeapp-stripe-component > header { grid-template-columns: auto minmax(0, 1fr); }
+    .gaugeapp-stripe-owner-band > small, .gaugeapp-stripe-component > header > small { grid-column: 2; }
+    .gaugeapp-stripe-fields { grid-template-columns: 1fr; }
+    .gaugeapp-field-span { grid-column: auto; }
+    .gaugeapp-filter-grid, .gaugeapp-restore-form { grid-template-columns: 1fr; align-items: stretch; }
+    .gaugeapp-enrollment-ticket { align-items: flex-start; flex-direction: column; gap: 3px; }
+    .gaugeapp-row-actions { justify-self: end; }
+    .gaugeapp-policy-control-row { grid-template-columns: 1fr; gap: 8px; align-items: start; }
+    .gaugeapp-policy-control-row > span:last-child { align-items: flex-start; text-align: left; }
+    .gaugeapp-policy-control-row select { width: 100%; }
+    .gaugeapp-policy-toggle-grid { grid-template-columns: 1fr; }
+    .gaugeapp-policy-change-row { grid-template-columns: 1fr auto 1fr; gap: 4px 8px; }
+    .gaugeapp-policy-change-row > span:first-child { grid-column: 1 / -1; }
+    .gaugeapp-model-access-grid { grid-template-columns: 1fr; }
+    .gaugeapp-model-connection-row, .gaugeapp-model-plan-row { grid-template-columns: 1fr auto; }
+    .gaugeapp-model-plan-row[data-state="available"] { grid-template-columns: 1fr auto; }
+    .gaugeapp-model-connection-row > span:nth-child(2), .gaugeapp-model-plan-usage { grid-column: 1 / -1; }
+}
+
+/* The GaugeApp composition uses classical order rather than ornamental
+   density: a strong crown, a measured body, and a quiet action plinth. The
+   rules below deliberately govern shared primitives so deep routes inherit the
+   same hierarchy as their parent pages. */
+.filebody.markdown-body.gaugeapp-content {
+    width: calc(100% - 24px); max-width: 856px; padding: 29px 18px 68px;
+    --gaugeapp-column-width: 800px;
+    --gaugeapp-inline-inset: 12px;
+    --gauge-space-3: 13px;
+    --gauge-space-4: 21px;
+    --gauge-space-5: 34px;
+}
+
+.gaugeapp-page-header {
+    position: relative; align-items: flex-end; gap: 34px; margin: 0 auto 25px;
+    padding: 0 12px; border-left: 0; border-bottom: 0;
+}
+.gaugeapp-page-header::after { display: none; }
+.gaugeapp-page-header h1 {
+    margin: 6px 0 7px; color: var(--ink); font-size: clamp(24px, 2.7vw, 31px);
+    font-weight: 500; line-height: 1.06; letter-spacing: -.022em;
+}
+.gaugeapp-page-header p { max-width: 58ch; font-size: var(--fs-ui); line-height: 1.5; }
+.gaugeapp-eyebrow { letter-spacing: .12em; }
+.gaugeapp-page-actions { padding: 0 0 2px; }
+.gaugeapp-page-actions:has(> :nth-child(2)), .gaugeapp-product-actions {
+    display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+}
+
+/* Control size follows consequence. A quiet verb is compact; the page's one
+   forward action receives the larger measure. Square shoulders keep controls
+   subordinate to the framed composition instead of turning each into a pill. */
+.gaugeapp-content button { min-height: 25px; padding: 4px 9px; border-radius: 2px !important; }
+.gaugeapp-content .tree-action { min-width: 0; padding-inline: 9px; }
+.gaugeapp-content .gaugeapp-page-actions > button { width: max-content !important; min-width: 96px; }
+.gaugeapp-page-actions button:last-child { min-width: 112px; }
+.gaugeapp-content .gaugeapp-section-heading > button { width: max-content !important; min-width: 94px; }
+.gaugeapp-detail-actions .bar > button,
+.gaugeapp-setup-navigation > button,
+.gaugeapp-device-enrollment-actions > button { width: auto; min-width: 92px; }
+.gaugeapp-detail-actions .bar > button:last-child,
+.gaugeapp-setup-navigation > button:last-child,
+.gaugeapp-device-enrollment-actions > button:last-child { min-width: 116px; }
+.gaugeapp-text-danger { min-height: 0 !important; padding: 3px 0 !important; }
+
+.gaugeapp-content .admin-section { margin-bottom: 25px; padding: 0 12px; }
+.gaugeapp-section-heading { align-items: flex-end; margin-bottom: 13px; }
+.gaugeapp-section-heading > div { align-items: center; gap: 9px; }
+.gaugeapp-section-heading h4 {
+    color: var(--ink); font-size: var(--fs-ui); font-weight: 500;
+    letter-spacing: .085em; line-height: 1.2; text-transform: uppercase;
+}
+.gaugeapp-section-heading h4::after {
+    display: none;
+}
+.gaugeapp-section-heading span { font-style: normal; letter-spacing: .04em; }
+.gaugeapp-section-intro { margin: -1px 0 13px; line-height: 1.48; }
+
+.gaugeapp-metrics {
+    grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 0;
+    margin: 4px 4px 26px; padding: 0; overflow: hidden;
+    border: 1px solid var(--gaugeapp-rule-faint); border-radius: 3px;
+    outline: 1px solid var(--gaugeapp-rule); outline-offset: 3px;
+    background: color-mix(in srgb, var(--panel) 43%, transparent);
+}
+.gaugeapp-metric {
+    min-height: 66px; padding: 10px 12px;
+    border-right: 1px solid var(--gaugeapp-rule-faint);
+}
+.gaugeapp-metric:last-child { border-right: 0; }
+.gaugeapp-metric strong { color: var(--ink); font-size: clamp(16px, 1.45vw, 20px); font-weight: 500; }
+.gaugeapp-metric:last-child strong { color: var(--gold); }
+.gaugeapp-metric[data-tone="warn"] strong { color: var(--warn); }
+
+.gaugeapp-definition {
+    display: grid !important; grid-template-columns: 118px minmax(0, 1fr) auto;
+    align-items: baseline; gap: 12px; min-height: 0; margin: 0; padding: 8px 0;
+    border: 0; border-radius: 0; background: transparent;
+}
+.gaugeapp-definition .resource-kind {
+    color: var(--muted); font-size: var(--fs-label); letter-spacing: .055em;
+    line-height: 1.35; text-transform: uppercase;
+}
+.gaugeapp-definition .resource-title { color: var(--ink); line-height: 1.38; }
+.gaugeapp-definition .resource-title small { margin-top: 2px; line-height: 1.38; }
+.gaugeapp-engagement-activity .gaugeapp-definition { min-height: 0; }
+
+.gaugeapp-resource,
+.gaugeapp-member-row, .gaugeapp-settings-row, .gaugeapp-policy-row,
+.gaugeapp-home-row, .gaugeapp-project-governance-row,
+.gaugeapp-project-access-row, .gaugeapp-target-access-row, .gaugeapp-placement-access-row,
+.gaugeapp-managed-engagement-row, .gaugeapp-model-connection-row,
+.gaugeapp-project-model-route, .gaugeapp-device-row {
+    border: 1px solid color-mix(in srgb, var(--edge) 52%, transparent);
+    border-radius: 3px; background: color-mix(in srgb, var(--panel) 22%, transparent);
+}
+.gaugeapp-resource:hover, .gaugeapp-catalog-card:hover,
+.gaugeapp-managed-engagement-row:hover {
+    border-color: color-mix(in srgb, var(--gold) 34%, var(--edge));
+    background: color-mix(in srgb, var(--panel) 38%, transparent);
+}
+.gaugeapp-row-actions { width: var(--gaugeapp-action-rail-width); padding-left: 6px; border-left: 0; }
+.gaugeapp-row-actions > button { min-height: 25px; }
+
+.gaugeapp-catalog-grid { gap: 8px; }
+.gaugeapp-catalog-card {
+    position: relative; padding: 10px 12px 10px 14px;
+    border-color: color-mix(in srgb, var(--edge) 52%, transparent);
+    background: color-mix(in srgb, var(--panel) 27%, transparent);
+}
+.gaugeapp-catalog-card::before {
+    content: ""; position: absolute; left: 4px; top: 9px; bottom: 9px;
+    border-left: 1px solid color-mix(in srgb, var(--gold) 60%, transparent);
+}
+.gaugeapp-catalog-card h3 { font-size: 16px; font-weight: 500; }
+.gaugeapp-catalog-card-foot > span:first-child { color: var(--muted); }
+
+.gaugeapp-form-card, .gaugeapp-plan-summary,
+.gaugeapp-device-enrollment, .gaugeapp-managed-signup {
+    margin-inline: 4px !important; padding: 16px !important;
+    background: color-mix(in srgb, var(--panel) 39%, transparent);
+}
+.gaugeapp-field-grid { gap: 10px 21px; }
+.gaugeapp-field-grid > label { line-height: 1.35; }
+.gaugeapp-field-grid :is(input, select, textarea) { margin-top: 4px; }
+.gaugeapp-listing-editor-grid { gap: 25px; }
+
+.gaugeapp-detail-actions {
+    margin-top: 8px !important; padding: 10px 12px !important;
+    border: 0 !important; border-radius: 3px !important;
+    background: color-mix(in srgb, var(--panel) 24%, transparent);
+}
+.gaugeapp-detail-actions .bar { justify-content: flex-end; gap: 6px; }
+.gaugeapp-detail-actions .status { flex-basis: 100%; }
+.gaugeapp-danger-zone {
+    margin-top: 34px !important; padding: 13px 12px !important;
+    border: 1px solid color-mix(in srgb, var(--bad) 23%, var(--edge));
+    border-radius: 3px; background: color-mix(in srgb, var(--bad) 4%, transparent);
+}
+
+.gaugeapp-setup-steps {
+    gap: 0; margin: 0 4px 26px; border-bottom: 1px solid var(--gaugeapp-rule-faint);
+}
+.gaugeapp-setup-steps button {
+    position: relative; justify-content: center; min-height: 42px; padding: 8px 10px 10px;
+    border-radius: 0; background: transparent;
+}
+.gaugeapp-setup-steps button::after {
+    content: ""; position: absolute; right: 0; bottom: -1px; left: 0; border-bottom: 1px solid transparent;
+}
+.gaugeapp-setup-steps li.active button { color: var(--ink); background: transparent; }
+.gaugeapp-setup-steps li.active button::after { border-bottom-color: var(--gold); }
+.gaugeapp-setup-steps li.done button { color: var(--muted); }
+.gaugeapp-setup-navigation {
+    margin-top: 29px; padding: 10px 12px;
+    border: 1px solid var(--gaugeapp-rule-faint);
+    background: color-mix(in srgb, var(--panel) 24%, transparent);
+}
+
+.gaugeapp-proposal-status {
+    margin: 4px 4px 21px; border-radius: 3px;
+    border-color: var(--gaugeapp-rule-faint); outline: 1px solid var(--gaugeapp-rule); outline-offset: 3px;
+}
+.gaugeapp-proposal-status > span { background: color-mix(in srgb, var(--panel) 42%, var(--bg)); }
+.gaugeapp-content .admin-section.gaugeapp-engagement-operation {
+    width: calc(100% - 8px); margin-inline: 4px !important; padding: 16px !important;
+    border: 1px solid var(--gaugeapp-rule-faint) !important;
+    outline: 1px solid var(--gaugeapp-rule); outline-offset: 3px;
+    background: color-mix(in srgb, var(--panel) 31%, transparent);
+}
+
+/* Product view is an object portrait, not a generic report. */
+.gaugeapp-product-portrait {
+    margin: 4px 4px 29px; padding: 18px 18px 0;
+    border: 1px solid var(--gaugeapp-rule-faint); border-radius: 2px;
+    outline: 1px solid var(--gaugeapp-rule); outline-offset: 3px;
+    background: color-mix(in srgb, var(--panel) 43%, transparent);
+}
+.gaugeapp-product-portrait > header {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 34px;
+    padding-bottom: 18px;
+}
+.gaugeapp-product-identity { min-width: 0; }
+.gaugeapp-product-identity > span {
+    color: var(--gold); font-size: var(--fs-label); letter-spacing: .105em; text-transform: uppercase;
+}
+.gaugeapp-product-identity h1 {
+    margin: 6px 0 7px; color: var(--ink); font-size: clamp(26px, 3vw, 33px);
+    font-weight: 500; line-height: 1.04; letter-spacing: -.025em;
+}
+.gaugeapp-product-identity p { max-width: 55ch; margin: 0; color: var(--muted); line-height: 1.5; }
+.gaugeapp-product-actions { align-self: start; }
+.gaugeapp-product-actions > button { box-sizing: border-box; width: auto; min-width: 76px; min-height: 28px; }
+.gaugeapp-product-actions > button:last-child { min-width: 112px; }
+.gaugeapp-product-actions > button:last-child { color: var(--navy); background: var(--gold); border-color: var(--gold); }
+.gaugeapp-product-ledger {
+    display: grid; grid-template-columns: minmax(230px, 1.8fr) repeat(3, minmax(75px, .6fr));
+    margin: 0 -18px; border-top: 1px solid var(--gaugeapp-rule-faint);
+}
+.gaugeapp-product-ledger > span {
+    display: flex; flex-direction: column; min-width: 0; min-height: 65px; padding: 10px 13px;
+    border-right: 1px solid var(--gaugeapp-rule-faint);
+}
+.gaugeapp-product-ledger > span:last-child { border-right: 0; }
+.gaugeapp-product-ledger small {
+    color: var(--muted); font-size: var(--fs-label); letter-spacing: .055em; text-transform: uppercase;
+}
+.gaugeapp-product-ledger strong { margin: 3px 0 1px; color: var(--ink); font-size: 18px; font-weight: 500; line-height: 1.2; }
+.gaugeapp-product-ledger em { color: var(--muted); font-size: var(--fs-label); font-style: normal; }
+.gaugeapp-product-ledger .gaugeapp-product-price strong { color: var(--gold); font-size: 20px; }
+.gaugeapp-product-terms { margin-bottom: 29px !important; }
+.gaugeapp-product-activity { display: grid; gap: 5px; }
+.gaugeapp-product-activity > button {
+    display: grid; grid-template-columns: 70px minmax(0, 1fr) minmax(150px, .8fr) 16px;
+    align-items: center; gap: 12px; width: 100%; min-height: 48px; padding: 8px 10px;
+    color: var(--ink); background: color-mix(in srgb, var(--panel) 23%, transparent);
+    border: 1px solid color-mix(in srgb, var(--edge) 50%, transparent); border-radius: 3px;
+    text-align: left; cursor: pointer; font: inherit;
+}
+.gaugeapp-product-activity > button:hover { border-color: color-mix(in srgb, var(--gold) 38%, var(--edge)); background: color-mix(in srgb, var(--panel) 38%, transparent); }
+.gaugeapp-product-activity > button[data-state="active"] { box-shadow: inset 2px 0 var(--gold); }
+.gaugeapp-product-activity > button[data-state="closed"] { opacity: .78; }
+.gaugeapp-product-activity-state { color: var(--gold); font-size: var(--fs-label); letter-spacing: .07em; text-transform: uppercase; }
+.gaugeapp-product-activity > button[data-state="closed"] .gaugeapp-product-activity-state { color: var(--muted); }
+.gaugeapp-product-activity > button > span:nth-child(2),
+.gaugeapp-product-activity > button > span:nth-child(3) { display: flex; flex-direction: column; min-width: 0; }
+.gaugeapp-product-activity small { color: var(--muted); font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-product-activity > button > span:last-child { color: var(--gold); font-size: 18px; text-align: right; }
+.gaugeapp-quiet-empty { margin: 9px 2px 0; color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-service-register { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; counter-reset: service; }
+.gaugeapp-service-register li {
+    display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: center;
+    min-height: 41px; padding: 6px 10px; border-radius: 3px;
+    background: color-mix(in srgb, var(--panel) 21%, transparent); counter-increment: service;
+}
+.gaugeapp-service-register li::before {
+    content: counter(service); display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; color: var(--gold); font-size: var(--fs-label);
+    border: 1px solid color-mix(in srgb, var(--gold) 36%, var(--edge)); border-radius: 50%;
+}
+
+@container (max-width: 620px) {
+    .gaugeapp-product-portrait > header { grid-template-columns: 1fr; gap: 18px; }
+    .gaugeapp-product-actions { justify-self: end; }
+    .gaugeapp-product-ledger { grid-template-columns: repeat(3, 1fr); }
+    .gaugeapp-product-ledger .gaugeapp-product-price { grid-column: 1 / -1; border-right: 0; border-bottom: 1px solid var(--gaugeapp-rule-faint); }
+    .gaugeapp-product-activity > button { grid-template-columns: 62px minmax(0, 1fr) 14px; }
+    .gaugeapp-product-activity > button > span:nth-child(3) { grid-column: 2; }
+    .gaugeapp-product-activity > button > span:last-child { grid-column: 3; grid-row: 1 / 3; }
+    .gaugeapp-definition { grid-template-columns: 100px minmax(0, 1fr) auto; }
+}
+
+@media (max-width: 720px) {
+    .filebody.markdown-body.gaugeapp-content { width: calc(100% - 14px); padding: 23px 8px 56px; }
+    .gaugeapp-page-header { align-items: flex-start; }
+    .gaugeapp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .gaugeapp-metric:nth-child(2) { border-right: 0; }
+    .gaugeapp-metric:nth-child(-n+2) { border-bottom: 1px solid var(--gaugeapp-rule-faint); }
+}
+
+/* The catalog is a working inventory, not a gallery. Its title bands carry
+   hierarchy so neither type scale nor empty space has to do that work. */
+.gaugeapp-content .admin-section.gaugeapp-catalog-section,
+.gaugeapp-content .admin-section.gaugeapp-ledger-section {
+    padding: 0; overflow: hidden;
+    border: 1px solid var(--gaugeapp-rule-faint);
+    border-radius: 3px;
+    outline: 1px solid var(--gaugeapp-rule); outline-offset: 3px;
+    box-shadow: none;
+    background: color-mix(in srgb, var(--panel) 14%, transparent);
+}
+.gaugeapp-catalog-section > .gaugeapp-section-heading,
+.gaugeapp-ledger-section > .gaugeapp-section-heading,
+.gaugeapp-ledger-section > .gaugeapp-billing-heading {
+    min-height: 39px; margin: 0; padding: 6px 9px 6px 11px;
+    border-bottom: 0;
+    background: color-mix(in srgb, var(--panel) 72%, var(--bg));
+}
+.gaugeapp-ledger-section > .gaugeapp-billing-heading {
+    align-items: center;
+}
+.gaugeapp-ledger-section > .gaugeapp-billing-heading > .gaugeapp-section-heading {
+    margin: 0; padding: 0;
+}
+.gaugeapp-catalog-section > .gaugeapp-section-heading h4,
+.gaugeapp-ledger-section > .gaugeapp-section-heading h4,
+.gaugeapp-ledger-section > .gaugeapp-billing-heading h4 {
+    font-size: var(--fs-label); letter-spacing: .11em;
+}
+.gaugeapp-catalog-section > .gaugeapp-section-heading h4::after { display: none; }
+.gaugeapp-catalog-section > .gaugeapp-section-heading span,
+.gaugeapp-ledger-section .gaugeapp-section-heading span { font-size: var(--fs-label); }
+.gaugeapp-content .gaugeapp-catalog-section > .gaugeapp-section-heading > button,
+.gaugeapp-content .gaugeapp-ledger-section > .gaugeapp-section-heading > button {
+    min-width: 0; min-height: 25px; padding: 3px 10px;
+    color: var(--navy); background: var(--gold); border-color: var(--gold);
+}
+.gaugeapp-content .gaugeapp-catalog-section > .gaugeapp-section-heading > button:hover,
+.gaugeapp-content .gaugeapp-ledger-section > .gaugeapp-section-heading > button:hover {
+    color: var(--navy); background: color-mix(in srgb, var(--gold) 86%, #fff);
+}
+.gaugeapp-catalog-section > .gaugeapp-catalog-grid { gap: 8px; padding: 8px; }
+.gaugeapp-ledger-section > .gaugeapp-engagement-filters {
+    margin: 0; padding: 7px 9px 5px;
+}
+.gaugeapp-ledger-section > :is(.gaugeapp-resource, .gaugeapp-managed-engagement-row) {
+    margin: 0 8px 5px;
+}
+.gaugeapp-ledger-section > .gaugeapp-section-heading + .gaugeapp-resource { margin-top: 8px; }
+.gaugeapp-ledger-section > :is(.gaugeapp-resource, .gaugeapp-managed-engagement-row):last-child {
+    margin-bottom: 8px;
+}
+.gaugeapp-resource.gaugeapp-ledger-resource {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; gap: 8px;
+}
+.gaugeapp-ledger-identity {
+    display: grid; grid-template-columns: auto auto minmax(0, 1fr);
+    align-items: baseline; gap: 1px 7px; min-width: 0;
+}
+.gaugeapp-ledger-identity > .resource-title {
+    grid-column: 1; color: var(--ink);
+}
+.gaugeapp-ledger-identity > .resource-kind {
+    grid-column: 2; font-size: calc(var(--fs-label) - 1px); letter-spacing: .075em;
+}
+.gaugeapp-ledger-identity > small {
+    grid-column: 1 / -1; color: var(--muted); font-size: var(--fs-label); line-height: 1.3;
+}
+.gaugeapp-content .gaugeapp-resource.gaugeapp-ledger-resource > .gaugeapp-row-actions {
+    display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px;
+    width: auto; padding: 0; border: 0;
+}
+.gaugeapp-content .gaugeapp-resource.gaugeapp-ledger-resource > .gaugeapp-row-actions > button,
+.gaugeapp-content .gaugeapp-ledger-section .gaugeapp-engagement-controls > button {
+    width: auto !important; min-width: 46px; min-height: 23px; padding: 2px 7px;
+}
+.gaugeapp-ledger-section > .gaugeapp-billing-heading > span {
+    display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; width: auto;
+}
+.gaugeapp-content .gaugeapp-ledger-section > .gaugeapp-billing-heading > span > button {
+    width: auto !important; min-width: 0; min-height: 25px; padding: 3px 9px;
+}
+.gaugeapp-content .gaugeapp-ledger-section > .gaugeapp-billing-heading > span > button:last-child {
+    color: var(--navy); background: var(--gold); border-color: var(--gold);
+}
+.gaugeapp-content .gaugeapp-catalog-card {
+    padding: 0; overflow: hidden;
+    border-color: color-mix(in srgb, var(--edge) 58%, transparent);
+    background: color-mix(in srgb, var(--bg) 25%, transparent);
+}
+.gaugeapp-content .gaugeapp-catalog-card::before { display: none; }
+.gaugeapp-content .gaugeapp-catalog-card-head {
+    min-height: 34px; padding: 5px 7px 5px 10px;
+    border-bottom: 1px solid color-mix(in srgb, var(--edge) 54%, transparent);
+    background: color-mix(in srgb, var(--panel) 58%, var(--bg));
+}
+.gaugeapp-content .gaugeapp-catalog-card-title { gap: 7px; }
+.gaugeapp-content .gaugeapp-catalog-card-title > small {
+    font-size: calc(var(--fs-label) - 1px); letter-spacing: .09em;
+}
+.filebody.markdown-body.gaugeapp-content .gaugeapp-catalog-card h3 {
+    font-size: 14px; font-weight: 500; line-height: 1.15;
+}
+.gaugeapp-content .gaugeapp-catalog-card-head > .gaugeapp-row-actions {
+    display: flex; flex: 0 0 auto; gap: 4px; width: auto;
+    padding: 0; border: 0;
+}
+.gaugeapp-content .gaugeapp-catalog-card-head > .gaugeapp-row-actions > button {
+    width: auto !important; min-width: 46px; min-height: 23px;
+    padding: 2px 7px; color: var(--muted);
+    background: transparent; border-color: color-mix(in srgb, var(--edge) 72%, transparent);
+}
+.gaugeapp-content .gaugeapp-catalog-card-head > .gaugeapp-row-actions > button:first-child {
+    color: var(--ink); background: color-mix(in srgb, var(--panel) 72%, transparent);
+}
+.gaugeapp-content .gaugeapp-catalog-card-head > .gaugeapp-row-actions > button:hover {
+    color: var(--ink); border-color: color-mix(in srgb, var(--gold) 55%, var(--edge));
+    background: color-mix(in srgb, var(--gold) 8%, var(--panel));
+}
+.gaugeapp-content .gaugeapp-catalog-card > p {
+    margin: 0; padding: 7px 10px 4px; font-size: var(--fs-label); line-height: 1.3;
+}
+.gaugeapp-content .gaugeapp-catalog-card dl {
+    gap: 1px; margin: 0; padding: 1px 10px 7px;
+}
+.gaugeapp-content .gaugeapp-catalog-card dl > div {
+    grid-template-columns: 45px minmax(0, 1fr); gap: 7px;
+}
+.gaugeapp-content .gaugeapp-catalog-card-foot {
+    margin: 0; padding: 5px 10px;
+    border-top: 1px solid color-mix(in srgb, var(--edge) 40%, transparent);
+    background: color-mix(in srgb, var(--panel) 24%, transparent);
+}
+.gaugeapp-content .gaugeapp-catalog-card-foot > span:first-child {
+    font-size: calc(var(--fs-label) - 1px);
+}
+
+/* Administration, account, and project settings share one architectural
+   plate. A shaded crown names each room; the stronger outer rule belongs to
+   the whole composition, while individual records carry only a quiet edge. */
+.gaugeapp-dashboard-grid.gaugeapp-guide-surface {
+    box-sizing: border-box; width: calc(100% - 8px); margin: 4px 4px 28px;
+    padding: 0; overflow: hidden;
+    border: 1px solid var(--gaugeapp-rule-faint); border-radius: 3px;
+    outline: 1px solid var(--gaugeapp-rule); outline-offset: 3px;
+    background: color-mix(in srgb, var(--panel) 14%, transparent);
+}
+.gaugeapp-content .gaugeapp-guide-surface > .admin-section {
+    width: 100%; max-width: none; margin: 0 !important; padding: 0 12px 10px !important;
+    border: 0 !important; border-radius: 0 !important; outline: 0 !important;
+    box-shadow: none !important; background: transparent;
+}
+.gaugeapp-guide-surface > .admin-section > .gaugeapp-section-heading,
+.gaugeapp-guide-surface .gaugeapp-model-access-grid > div > .gaugeapp-section-heading {
+    min-height: 39px; margin: 0 -12px 8px; padding: 6px 10px;
+    background: color-mix(in srgb, var(--panel) 72%, var(--bg));
+}
+.gaugeapp-guide-surface > .admin-section > .gaugeapp-section-heading h4,
+.gaugeapp-guide-surface .gaugeapp-model-access-grid > div > .gaugeapp-section-heading h4 {
+    font-size: var(--fs-label); letter-spacing: .11em;
+}
+.gaugeapp-guide-surface > .gaugeapp-notice {
+    margin: 10px 12px; padding-block: 8px;
+}
+.gaugeapp-guide-surface > .gaugeapp-notice + .admin-section > .gaugeapp-section-heading {
+    margin-top: 0;
+}
+.gaugeapp-guide-surface > .gaugeapp-metrics {
+    grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+    width: calc(100% - 24px); margin: 8px 12px 12px;
+    border-color: var(--gaugeapp-rule-faint); outline: 0;
+}
+.gaugeapp-guide-surface > .gaugeapp-setup-steps {
+    margin: 0; padding: 5px 8px 0;
+    border-bottom: 1px solid var(--gaugeapp-rule-faint);
+    background: color-mix(in srgb, var(--panel) 72%, var(--bg));
+}
+.gaugeapp-guide-surface > .gaugeapp-setup-navigation {
+    margin: 0; padding: 9px 12px;
+    border: 0; border-top: 1px solid var(--gaugeapp-rule-faint); border-radius: 0;
+    background: color-mix(in srgb, var(--panel) 30%, transparent);
+}
+.gaugeapp-guide-surface > .bar {
+    justify-content: flex-end; margin: 0; padding: 9px 12px 10px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent);
+}
+.gaugeapp-guide-surface > .gaugeapp-detail-grid { display: contents; }
+.gaugeapp-guide-surface > :is(.status, .gaugeapp-inline-warning) {
+    margin: 8px 12px 10px;
+}
+.gaugeapp-guide-surface > .gaugeapp-danger-zone {
+    margin-top: 8px !important; background: color-mix(in srgb, var(--bad) 4%, transparent);
+}
+.gaugeapp-guide-surface > .gaugeapp-danger-zone > .gaugeapp-section-heading {
+    background: color-mix(in srgb, var(--bad) 7%, var(--panel));
+}
+.gaugeapp-content .gaugeapp-guide-surface > .gaugeapp-detail-actions {
+    padding: 9px 12px 10px !important;
+    background: color-mix(in srgb, var(--panel) 25%, transparent);
+}
+.gaugeapp-guide-surface :is(
+    .gaugeapp-plan-summary,
+    .gaugeapp-device-enrollment,
+    .gaugeapp-managed-signup,
+    .gaugeapp-model-add-card
+) {
+    outline: 0 !important; box-shadow: none;
+}
+.gaugeapp-guide-surface .gaugeapp-plan-summary {
+    margin: 0 !important; padding: 11px 12px !important;
+    border-color: color-mix(in srgb, var(--edge) 58%, transparent) !important;
+}
+.gaugeapp-guide-surface > .gaugeapp-plan-billing-link {
+    width: calc(100% - 24px); margin: 8px 12px 10px !important; padding: 8px 10px !important;
+    border: 1px solid color-mix(in srgb, var(--edge) 52%, transparent) !important;
+    border-radius: 3px !important; background: color-mix(in srgb, var(--panel) 22%, transparent);
+}
+.gaugeapp-guide-surface :is(
+    .gaugeapp-plan-entitlement,
+    .gaugeapp-service-row,
+    .gaugeapp-policy-control-row,
+    .gaugeapp-policy-toggle-row,
+    .gaugeapp-model-plan-row,
+    .gaugeapp-integration-value,
+    .gaugeapp-connect-row
+) {
+    border: 1px solid color-mix(in srgb, var(--edge) 52%, transparent);
+    border-radius: 3px;
+}
+
+/* Once the row establishes the object, its controls can be short verbs. Their
+   edges align as a compact group instead of forming oversized button rails. */
+.gaugeapp-guide-surface .gaugeapp-row-actions {
+    display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px;
+    width: auto; padding: 0; border: 0;
+}
+.gaugeapp-content .gaugeapp-guide-surface .gaugeapp-row-actions > button,
+.gaugeapp-content .gaugeapp-guide-surface :is(
+    .gaugeapp-target-access-row,
+    .gaugeapp-project-model-route,
+    .gaugeapp-plan-entitlement,
+    .gaugeapp-service-row,
+    .gaugeapp-plan-billing-link,
+    .gaugeapp-connect-row,
+    .gaugeapp-model-plan-row
+) > button {
+    width: auto !important; min-width: 46px; min-height: 23px; padding: 2px 7px;
+}
+.gaugeapp-guide-surface .gaugeapp-settings-row {
+    grid-template-columns: minmax(200px, 1fr) auto auto;
+}
+.gaugeapp-guide-surface .gaugeapp-home-row {
+    grid-template-columns: minmax(180px, 1fr) minmax(180px, .9fr) auto auto;
+}
+.gaugeapp-guide-surface .gaugeapp-device-row {
+    grid-template-columns: 28px minmax(0, 1fr) 96px 83px;
+}
+.gaugeapp-guide-surface .gaugeapp-device-row > .gaugeapp-row-actions {
+    width: 83px;
+}
+.gaugeapp-guide-surface .gaugeapp-resource.gaugeapp-ledger-resource {
+    margin-bottom: 5px;
+}
+.gaugeapp-guide-surface .gaugeapp-ledger-identity > .resource-title {
+    font-weight: 500;
+}
+
+@container (max-width: 620px) {
+    .gaugeapp-guide-surface .gaugeapp-settings-row,
+    .gaugeapp-guide-surface .gaugeapp-home-row {
+        grid-template-columns: minmax(0, 1fr) auto;
+    }
+}
+
+.gaugeapp-content .gaugeapp-guide-surface .gaugeapp-definition {
+    margin-inline: 0 !important;
+}
+.gaugeapp-guide-surface .gaugeapp-inline-form {
+    grid-template-columns: minmax(220px, 1fr) auto;
+}
+.gaugeapp-content .gaugeapp-guide-surface .gaugeapp-inline-form > button {
+    width: auto; min-width: 59px;
+}
+
+@container (max-width: 620px) {
+    .gaugeapp-guide-surface .gaugeapp-home-row {
+        grid-template-columns: minmax(0, 1fr) auto auto;
+    }
+    .gaugeapp-guide-surface .gaugeapp-device-row {
+        grid-template-columns: 28px minmax(0, 1fr) 96px 83px;
+        align-items: center;
+    }
+    .gaugeapp-guide-surface .gaugeapp-device-row > :is(.gaugeapp-device-kind, .gaugeapp-device-identity, .gaugeapp-device-route, .gaugeapp-row-actions) {
+        grid-column: auto; grid-row: auto;
+    }
+    .gaugeapp-guide-surface .gaugeapp-model-plan-row,
+    .gaugeapp-guide-surface .gaugeapp-model-plan-row[data-state="available"] {
+        grid-template-columns: minmax(0, 1fr) auto;
+    }
+    .gaugeapp-guide-surface .gaugeapp-model-plan-row > span:first-child {
+        grid-column: 1; grid-row: 1;
+    }
+    .gaugeapp-guide-surface .gaugeapp-model-plan-row > .badge {
+        grid-column: 2; grid-row: 1; justify-self: end;
+    }
+    .gaugeapp-guide-surface .gaugeapp-model-plan-row > .gaugeapp-model-plan-usage {
+        grid-column: 1 / -1; grid-row: 2;
+    }
+    .gaugeapp-content .gaugeapp-guide-surface .gaugeapp-model-plan-row > button {
+        grid-column: 2; grid-row: 3; justify-self: end;
+    }
+    .gaugeapp-content .gaugeapp-guide-surface .gaugeapp-model-plan-row[data-state="available"] > button {
+        grid-row: 2;
+    }
+}
+
+@container (max-width: 360px) {
+    .gaugeapp-guide-surface .gaugeapp-device-row {
+        grid-template-columns: 28px minmax(0, 1fr) 83px;
+        align-items: start;
+    }
+    .gaugeapp-guide-surface .gaugeapp-device-row > .gaugeapp-device-kind { grid-column: 1; grid-row: 1; }
+    .gaugeapp-guide-surface .gaugeapp-device-row > .gaugeapp-device-identity { grid-column: 2; grid-row: 1; }
+    .gaugeapp-guide-surface .gaugeapp-device-row > .gaugeapp-device-route { grid-column: 2; grid-row: 2; }
+    .gaugeapp-guide-surface .gaugeapp-device-row > .gaugeapp-row-actions { grid-column: 3; grid-row: 1 / 3; }
+    .gaugeapp-device-title-line { flex-wrap: wrap; }
+    .gaugeapp-pairing-invite { grid-template-columns: 1fr; }
+    .gaugeapp-pairing-qr { justify-self: center; width: 132px; }
+    .gaugeapp-pairing-compare { grid-template-columns: 1fr; }
+    .gaugeapp-pairing-compare .gaugeapp-sas-code { margin-top: 3px; }
+}
+
+@container (max-width: 480px) {
+    .gaugeapp-guide-surface .gaugeapp-inline-form { grid-template-columns: 1fr; }
+    .gaugeapp-guide-surface .gaugeapp-inline-form > button { justify-self: end; }
+    .gaugeapp-page-actions { align-self: flex-end; }
+}
+
+@container (min-width: 350px) and (max-width: 520px) {
+    .gaugeapp-guide-surface .gaugeapp-plan-choice-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@container (max-width: 380px) {
+    .gaugeapp-guide-surface > .gaugeapp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.gaugeapp-record-identity { min-width: 0; }
+.gaugeapp-record-identity > span:first-child {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 7px; min-width: 0;
+}
+.gaugeapp-record-identity > span:first-child > strong {
+    color: var(--ink); font-weight: 500;
+}
+.gaugeapp-record-identity > span:first-child > .resource-kind {
+    font-size: calc(var(--fs-label) - 1px); letter-spacing: .075em;
+}
+.gaugeapp-record-identity > small {
+    color: var(--muted); font-size: var(--fs-label); line-height: 1.35;
+}
+.gaugeapp-guide-surface .gaugeapp-target-access-row {
+    grid-template-columns: minmax(190px, 1fr) minmax(90px, .55fr) minmax(180px, .8fr) auto;
+}
+.gaugeapp-guide-surface .gaugeapp-placement-access-row {
+    grid-template-columns: minmax(190px, 1fr) auto minmax(105px, .65fr) auto;
+}
+.gaugeapp-content .gaugeapp-guide-surface .gaugeapp-project-access-row > button {
+    width: auto !important; min-width: 46px; min-height: 23px; padding: 2px 7px;
+    justify-self: end;
+}
+
+@container (max-width: 620px) {
+    .gaugeapp-guide-surface .gaugeapp-target-access-row {
+        grid-template-columns: minmax(0, 1fr) auto;
+    }
+    .gaugeapp-guide-surface .gaugeapp-target-access-row > .gaugeapp-record-identity {
+        grid-column: 1; grid-row: 1;
+    }
+    .gaugeapp-guide-surface .gaugeapp-target-access-row > button {
+        grid-column: 2; grid-row: 1; justify-self: end;
+    }
+    .gaugeapp-guide-surface .gaugeapp-target-access-row > span:nth-child(2) {
+        grid-column: 1; grid-row: 2;
+    }
+    .gaugeapp-guide-surface .gaugeapp-target-access-row > span:nth-child(3) {
+        grid-column: 2; grid-row: 2; justify-self: end;
+    }
+    .gaugeapp-guide-surface .gaugeapp-placement-access-row {
+        grid-template-columns: minmax(0, 1fr) auto;
+    }
+    .gaugeapp-guide-surface .gaugeapp-placement-access-row > .gaugeapp-record-identity {
+        grid-column: 1; grid-row: 1;
+    }
+    .gaugeapp-guide-surface .gaugeapp-placement-access-row > .badge {
+        grid-column: 2; grid-row: 1; justify-self: end;
+    }
+    .gaugeapp-guide-surface .gaugeapp-placement-access-row > span:nth-child(3) {
+        grid-column: 1; grid-row: 2;
+    }
+    .gaugeapp-guide-surface .gaugeapp-placement-access-row > .gaugeapp-row-actions {
+        grid-column: 2; grid-row: 2; justify-self: end;
+    }
+}
+
+.gaugeapp-content .admin-section.gaugeapp-form-card {
+    width: calc(100% - 8px);
+}
+.gaugeapp-content .gaugeapp-guide-surface > .admin-section.gaugeapp-form-card {
+    width: 100%;
+}
+
+.gaugeapp-guide-surface > .gaugeapp-listing-editor-grid,
+.gaugeapp-guide-surface > .gaugeapp-listing-editor-grid > :is(.gaugeapp-listing-editor-main, .gaugeapp-listing-editor-side) {
+    gap: 0;
+}
+.gaugeapp-content .gaugeapp-guide-surface .gaugeapp-listing-editor-grid .admin-section {
+    width: 100%; max-width: none; margin: 0 !important; padding: 0 12px 10px !important;
+    border: 0 !important; border-radius: 0 !important; outline: 0 !important;
+    box-shadow: none !important; background: transparent;
+}
+.gaugeapp-guide-surface .gaugeapp-listing-editor-grid .admin-section > .gaugeapp-section-heading {
+    min-height: 39px; margin: 0 -12px 8px; padding: 6px 10px;
+    background: color-mix(in srgb, var(--panel) 72%, var(--bg));
+}
+.gaugeapp-guide-surface .gaugeapp-listing-editor-grid .admin-section > .gaugeapp-section-heading h4 {
+    font-size: var(--fs-label); letter-spacing: .11em;
+}
+.gaugeapp-guide-surface .gaugeapp-listing-editor-grid .gaugeapp-detail-actions {
+    padding: 9px 12px 10px !important;
+    background: color-mix(in srgb, var(--panel) 25%, transparent);
+}
+.gaugeapp-content .gaugeapp-guide-surface :is(.gaugeapp-charge-row, .gaugeapp-obligation-card) > button {
+    width: auto !important; min-width: 46px; min-height: 23px; padding: 2px 7px;
+    justify-self: end;
+}
+.gaugeapp-section-anchor { display: block; height: 0; scroll-margin-top: 12px; }
+
+/* Model access is a working inventory, not a stack of cards. Connections and
+   models share fixed column measures so the eye can scan a long list without
+   repeatedly re-parsing each row. */
+.gaugeapp-content .gaugeapp-model-access-section {
+    --gaugeapp-model-connection-columns: minmax(180px, 1fr) 116px 82px 126px;
+    --gaugeapp-model-picker-columns: 34px minmax(180px, 1fr) minmax(130px, .7fr) 72px;
+}
+.gaugeapp-model-connection-columns,
+.gaugeapp-model-picker-columns {
+    display: grid; align-items: center; gap: 8px;
+    min-height: 23px; padding: 0 8px;
+    color: var(--muted); font-size: calc(var(--fs-label) - 1px);
+    letter-spacing: .075em; text-transform: uppercase;
+}
+.gaugeapp-model-connection-columns { grid-template-columns: var(--gaugeapp-model-connection-columns); }
+.gaugeapp-model-picker-columns { grid-template-columns: var(--gaugeapp-model-picker-columns); }
+.gaugeapp-model-connection-row {
+    display: grid; grid-template-columns: var(--gaugeapp-model-connection-columns);
+    align-items: center; gap: 8px; min-height: 31px; margin: 0; padding: 3px 8px;
+    border: 0; border-radius: 0;
+    background: color-mix(in srgb, var(--panel) 20%, transparent);
+}
+.gaugeapp-model-connection-row:nth-of-type(even) {
+    background: color-mix(in srgb, var(--panel) 32%, transparent);
+}
+.gaugeapp-model-connection-row > span:not(.badge, .gaugeapp-row-actions) {
+    display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gaugeapp-model-connection-name strong,
+.gaugeapp-model-connection-name small { display: inline; }
+.gaugeapp-model-connection-name strong { font-weight: 500; }
+.gaugeapp-model-connection-name strong::after { content: " · "; color: var(--muted); font-weight: 400; }
+.gaugeapp-model-connection-name small,
+.gaugeapp-model-connection-owner { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-model-connection-row > .badge { justify-self: start; }
+.gaugeapp-model-connection-row > .gaugeapp-row-actions {
+    justify-self: end; width: 126px;
+}
+.gaugeapp-content .gaugeapp-model-connection-row .gaugeapp-row-actions > button {
+    min-width: 48px; min-height: 23px; padding: 2px 6px;
+}
+.gaugeapp-model-picker-toolbar {
+    display: flex; justify-content: flex-end; min-height: 30px; margin: -2px 0 2px; padding: 0 8px;
+}
+.gaugeapp-model-picker-toolbar input {
+    box-sizing: border-box; width: 210px; min-height: 25px; margin: 0; padding: 3px 7px;
+}
+.gaugeapp-model-picker-list { min-width: 0; }
+.gaugeapp-model-picker-row {
+    display: grid; grid-template-columns: var(--gaugeapp-model-picker-columns);
+    align-items: center; gap: 8px; min-height: 29px; padding: 2px 8px;
+    background: color-mix(in srgb, var(--panel) 20%, transparent);
+}
+.gaugeapp-model-picker-row:nth-child(even) {
+    background: color-mix(in srgb, var(--panel) 32%, transparent);
+}
+.gaugeapp-model-picker-row > :is(strong, span) {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gaugeapp-model-picker-row > strong { font-weight: 500; }
+.gaugeapp-model-picker-row > span { color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-model-picker-visibility,
+.gaugeapp-model-picker-default {
+    display: flex; align-items: center; min-width: 0; margin: 0;
+}
+.gaugeapp-model-picker-visibility { justify-content: center; }
+.gaugeapp-model-picker-default { gap: 5px; color: var(--gold); font-size: var(--fs-label); }
+.gaugeapp-model-picker-visibility input,
+.gaugeapp-model-picker-default input { margin: 0; }
+.gaugeapp-model-picker-empty { margin: 0; padding: 8px; color: var(--muted); font-size: var(--fs-ui); }
+.gaugeapp-model-section-note {
+    margin: -2px 8px 5px; color: var(--muted); font-size: var(--fs-label); line-height: 1.35;
+}
+.gaugeapp-model-empty-row {
+    min-height: 30px; margin: 0; padding: 6px 8px; color: var(--muted); font-size: var(--fs-ui);
+    background: color-mix(in srgb, var(--panel) 20%, transparent);
+}
+.gaugeapp-model-grant-columns,
+.gaugeapp-model-grant-row {
+    display: grid; grid-template-columns: minmax(160px, 1fr) minmax(155px, .85fr) 70px 90px 108px;
+    align-items: center; gap: 8px; padding-inline: 8px;
+}
+.gaugeapp-model-grant-columns {
+    min-height: 23px; color: var(--muted); font-size: calc(var(--fs-label) - 1px);
+    letter-spacing: .075em; text-transform: uppercase;
+}
+.gaugeapp-model-grant-row {
+    min-height: 31px; padding-block: 3px;
+    background: color-mix(in srgb, var(--panel) 20%, transparent);
+}
+.gaugeapp-model-grant-row:nth-of-type(even) {
+    background: color-mix(in srgb, var(--panel) 32%, transparent);
+}
+.gaugeapp-model-grant-row > span {
+    min-width: 0; overflow: hidden; color: var(--muted); font-size: var(--fs-label);
+    text-overflow: ellipsis; white-space: nowrap;
+}
+.gaugeapp-model-grant-row > span:first-child :is(strong, small) { display: inline; }
+.gaugeapp-model-grant-row > span:first-child strong { color: var(--ink); font-weight: 500; }
+.gaugeapp-model-grant-row > span:first-child strong::after { content: " · "; color: var(--muted); font-weight: 400; }
+.gaugeapp-model-grant-row > .gaugeapp-row-actions { justify-self: end; width: 108px; }
+.gaugeapp-content .gaugeapp-model-grant-row .gaugeapp-row-actions > button {
+    min-width: 46px; min-height: 23px; padding: 2px 6px;
+}
+.gaugeapp-model-grant-editor {
+    display: grid; grid-template-columns: 92px minmax(130px, .8fr) minmax(175px, 1fr) 110px auto;
+    align-items: end; gap: 7px; margin-top: 5px; padding: 8px;
+    background: color-mix(in srgb, var(--panel) 42%, transparent);
+}
+.gaugeapp-model-grant-editor label { min-width: 0; margin: 0; color: var(--muted); font-size: var(--fs-label); }
+.gaugeapp-model-grant-editor :is(select, input) {
+    box-sizing: border-box; width: 100%; min-height: 25px; margin: 2px 0 0; padding: 3px 6px;
+}
+.gaugeapp-model-grant-editor > .gaugeapp-row-actions { align-self: end; padding-bottom: 1px; }
+.gaugeapp-content .gaugeapp-model-grant-editor .gaugeapp-row-actions > button {
+    min-width: 46px; min-height: 25px; padding: 2px 7px;
+}
+.gaugeapp-model-access-grid { gap: 16px; }
+.gaugeapp-content .gaugeapp-model-plan-row {
+    min-height: 36px; margin-top: 8px; padding-block: 5px; border-radius: 3px;
+}
+
+@container (max-width: 620px) {
+    .gaugeapp-content .gaugeapp-model-access-section {
+        --gaugeapp-model-connection-columns: minmax(150px, 1fr) 90px 78px;
+        --gaugeapp-model-picker-columns: 28px minmax(140px, 1fr) 64px;
+    }
+    .gaugeapp-model-connection-columns > span:nth-child(2),
+    .gaugeapp-model-connection-row > .gaugeapp-model-connection-owner,
+    .gaugeapp-model-picker-columns > span:nth-child(3),
+    .gaugeapp-model-picker-row > span { display: none; }
+    .gaugeapp-model-connection-columns,
+    .gaugeapp-model-connection-row { grid-template-columns: var(--gaugeapp-model-connection-columns); }
+    .gaugeapp-model-connection-columns > span:nth-child(3),
+    .gaugeapp-model-connection-row > .badge { grid-column: 2; grid-row: 1; }
+    .gaugeapp-model-connection-columns > span:nth-child(4),
+    .gaugeapp-model-connection-row > .gaugeapp-row-actions { grid-column: 3; grid-row: 1; }
+    .gaugeapp-model-picker-columns,
+    .gaugeapp-model-picker-row { grid-template-columns: var(--gaugeapp-model-picker-columns); }
+    .gaugeapp-model-picker-columns > span:nth-child(4),
+    .gaugeapp-model-picker-row > .gaugeapp-model-picker-default { grid-column: 3; grid-row: 1; }
+    .gaugeapp-model-picker-toolbar { justify-content: stretch; }
+    .gaugeapp-model-picker-toolbar input { width: 100%; }
+    .gaugeapp-model-grant-columns,
+    .gaugeapp-model-grant-row { grid-template-columns: minmax(140px, 1fr) 64px 80px 100px; }
+    .gaugeapp-model-grant-columns > span:nth-child(2),
+    .gaugeapp-model-grant-row > span:nth-child(2) { display: none; }
+    .gaugeapp-model-grant-columns > span:nth-child(3),
+    .gaugeapp-model-grant-row > span:nth-child(3) { grid-column: 2; }
+    .gaugeapp-model-grant-columns > span:nth-child(4),
+    .gaugeapp-model-grant-row > span:nth-child(4) { grid-column: 3; }
+    .gaugeapp-model-grant-columns > span:nth-child(5),
+    .gaugeapp-model-grant-row > .gaugeapp-row-actions { grid-column: 4; }
+    .gaugeapp-model-grant-editor { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .gaugeapp-model-grant-editor > .gaugeapp-row-actions { grid-column: 1 / -1; justify-self: end; }
+}
