@@ -713,6 +713,17 @@ mod tests {
                 match host_listener.accept() {
                     Ok((mut s, _)) => {
                         use std::io::Write;
+                        // The same BSD inheritance the content-vault ledger
+                        // fixture was just fixed for: an accepted socket
+                        // inherits `O_NONBLOCK` from a non-blocking listener on
+                        // macOS and the BSDs, and `std` clears it on no
+                        // platform. This test is Linux-only today, where accept
+                        // does not inherit, so the line is a no-op here — but
+                        // the write is discarded with `let _`, so the day it
+                        // runs on a BSD host it would drop this reply silently
+                        // rather than fail. One line now, instead of a mystery
+                        // later.
+                        let _ = s.set_nonblocking(false);
                         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {

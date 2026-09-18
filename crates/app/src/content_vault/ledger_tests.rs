@@ -27,9 +27,19 @@ fn server(responses: Vec<(u16, String)>) -> (String, JoinHandle<Vec<String>>) {
             // flag (Linux clears it), so the first read below raced the client's
             // bytes and failed with EAGAIN whenever the machine was busy enough
             // for accept to win. The reads want the timeout, not the flag.
+            // Clearing the flag turns a spurious `EAGAIN` into a wait, which is
+            // the point — but a wait with no deadline is the other way this
+            // hangs. The read is bounded below; the response write was not, and
+            // the fixture thread is joined without a deadline of its own, so a
+            // client that connected and never drained would park it forever.
+            // Responses here are a few hundred bytes, so this is theoretical
+            // today; it is one line to keep it that way.
             stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut request = String::new();
