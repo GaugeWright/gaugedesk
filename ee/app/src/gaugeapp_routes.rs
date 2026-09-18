@@ -1171,11 +1171,32 @@ fn project_page(
             "sessions": organization_session_rows(wb, store_scope, request_bearer, &org)?,
         }),
         "project-hosts" => {
+            // This Home is the host, so it reports what it holds rather than
+            // sending `null`, which the page reads as a host it has not
+            // reached. Only the identity the page addresses a project by
+            // travels; the rest of the library belongs to the Projects page.
+            let projects = gaugedesk_app::library_routes::administration_project_references_value(
+                wb,
+            );
+            let held = projects
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|project| {
+                    project.get("home_id").and_then(Value::as_str) == Some(wb.home_id().as_str())
+                })
+                .filter_map(|project| {
+                    Some(json!({
+                        "id": project.get("id")?.as_str()?,
+                        "name": project.get("name")?.as_str()?,
+                    }))
+                })
+                .collect::<Vec<_>>();
             json!({ "homes": [{
                 "id": wb.home_id().as_str(), "home_id": wb.home_id().as_str(),
                 "name": "This computer", "kind": "local", "endpoint": "", "lifecycle": "active",
                 "state": "live", "repair_hint": Value::Null,
-                "projects": Value::Null,
+                "projects": held,
             }], "managed_enrollment": { "available": false,
                 "reason": "Managed hosting is not configured on this service.", "region": Value::Null, "capacity": Value::Null } })
         }
@@ -7898,6 +7919,36 @@ mod tests {
             Some(&format!("{key}-review")),
         )
         .await
+    }
+
+    /// The page exists to say which project lives on which Project Host. This
+    /// Home is the host, so it reports its own project Homes rather than the
+    /// `null` the page reads as a host that was never reached.
+    #[tokio::test]
+    async fn this_home_reports_the_project_homes_it_serves() {
+        let (_dir, shared, app) = test_app();
+        let expected = {
+            let guard = shared.lock().unwrap();
+            gaugedesk_app::library_routes::workspace_value(&guard)["projects"]
+                .as_array()
+                .and_then(|projects| projects.first().cloned())
+        }
+        .expect("this Home serves no project to report");
+        let session = open(&app).await;
+        let page = read_page_json(&app, &session, "project-hosts").await;
+        let host = &page["page"]["model"]["homes"][0];
+        assert_eq!(host["state"], "live");
+        assert_eq!(host["home_id"], host["id"]);
+        let listed = host["projects"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{host}"))
+            .iter()
+            .find(|project| project["id"] == expected["id"])
+            .unwrap_or_else(|| panic!("{host}"));
+        assert_eq!(listed["name"], expected["name"]);
+        // Only what the page addresses a project by; the rest of the library
+        // is the Projects page's subject, not this one's.
+        assert_eq!(listed.as_object().unwrap().len(), 2);
     }
 
     #[tokio::test]

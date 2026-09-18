@@ -873,3 +873,48 @@
     .proposal-sheet > footer { align-items: stretch; flex-direction: column; }
     .proposal-decision { margin-right: 0; }
 }
+
+/* The prototype's information design, ported from web/gaugeapps-lab.css. A
+   notice states the model before the page shows any of it; a metric counts one
+   fact above a section and tints when it is the one needing attention; a
+   resource row carries posture as tone rather than as a status column, and can
+   offer a second act without a menu. */
+.gaugeapp-notice { margin: 0 0 22px; padding: 11px 14px 11px 12px;
+    border-left: 2px solid var(--gold); border-radius: 0 6px 6px 0;
+    background: color-mix(in srgb, var(--panel) 30%, transparent); color: var(--muted); }
+.gaugeapp-notice[data-tone="warn"] { border-left-color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 6%, transparent); color: var(--ink); }
+.gaugeapp-notice strong { color: var(--ink); }
+
+.gaugeapp-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0 8px; margin: 0 0 22px; padding: 8px 0;
+    border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge); }
+.gaugeapp-metric { display: flex; flex-direction: column; min-width: 0; min-height: 64px; padding: 9px 12px; }
+.gaugeapp-metric > span { color: var(--muted); font-size: var(--fs-label);
+    letter-spacing: .06em; text-transform: uppercase; }
+.gaugeapp-metric strong { margin: 4px 0 2px; color: var(--gold);
+    font-size: clamp(17px, 1.5vw, 21px); font-weight: 500; line-height: 1.12; }
+.gaugeapp-metric small { color: var(--muted); font-size: var(--fs-label); line-height: 1.35; }
+.gaugeapp-metric[data-tone="warn"] strong { color: var(--warn); }
+
+.gaugeapp-section-heading { display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; margin-bottom: 10px; }
+.gaugeapp-section-heading > div { display: flex; flex: 1 1 auto; align-items: baseline; gap: 10px; min-width: 0; }
+.gaugeapp-section-heading h4 { margin: 0; color: var(--gold);
+    font-size: calc(var(--fs-ui) + 1px); letter-spacing: .11em; line-height: 1.25; }
+.gaugeapp-section-heading span { color: var(--muted); font-size: var(--fs-label);
+    font-style: italic; letter-spacing: .02em; }
+.gaugeapp-section-heading > button { white-space: nowrap; }
+
+.gaugeapp-resource { display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; min-height: 42px; margin-bottom: 4px; padding: 9px 11px; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 25%, transparent); }
+.gaugeapp-resource[data-tone="warn"] { background: color-mix(in srgb, var(--warn) 6%, transparent); }
+.gaugeapp-resource-identity { display: grid; gap: 2px; min-width: 0; }
+.gaugeapp-resource-title { overflow-wrap: anywhere; }
+.gaugeapp-resource-kind { color: var(--muted); font-size: var(--fs-label);
+    letter-spacing: .08em; text-transform: uppercase; }
+.gaugeapp-resource[data-tone="ready"] .gaugeapp-resource-kind { color: var(--gold); }
+.gaugeapp-resource[data-tone="warn"] .gaugeapp-resource-kind { color: var(--warn); }
+.gaugeapp-resource small { color: var(--muted); font-size: var(--fs-small); }
+.gaugeapp-resource-actions { display: flex; flex: 0 0 auto; gap: 6px; }

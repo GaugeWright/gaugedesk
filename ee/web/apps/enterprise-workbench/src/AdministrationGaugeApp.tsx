@@ -97,6 +97,7 @@ import {
     type DeviceLinkInvitation,
 } from "./account-device-link";
 import "./administration-gaugeapp.css";
+import { Notice, SectionHeading } from "./gaugeapp-design";
 
 const PAGE_LABELS: Readonly<Record<string, string>> = {
     account: "Account Settings",
@@ -126,6 +127,19 @@ const APP_LABELS: Readonly<Record<GaugeAppKind, string>> = {
     administration: "Administration",
     "commercial-operations": "Commercial Operations",
 };
+
+/** Administration renames itself by what it is administering.
+ *
+ *  "Administration" over a person's own tenant reads as though an organization
+ *  is involved, and a personal tenant has no members, identity provider or
+ *  policy to administer — it has services, Project Hosts, recovery and billing.
+ *  The prototype names the three cases apart and the pages differ accordingly;
+ *  `admin-console.md` carries the same split in its availability table.
+ */
+function appLabel(app: GaugeAppKind, scope: GaugeAppScope | undefined): string {
+    if (app !== "administration" || !scope) return APP_LABELS[app];
+    return scope.kind === "person" || scope.id.startsWith("personal:") ? "Your Account" : "Administration";
+}
 
 const valueRecord = (value: unknown): Record<string, unknown> | null =>
     typeof value === "object" && value !== null && !Array.isArray(value)
@@ -303,6 +317,7 @@ function OrganizationPolicyEditor(props: {
         };
     };
     return <>
+        <Notice tone="neutral">These settings add organization-wide restrictions after project access and resource consent. Changes are reviewed and applied as one policy revision.</Notice>
         <section class="gaugeapp-panel gaugeapp-policy-grid">
             <div class="gaugeapp-policy-group"><h2>Resource access &amp; export</h2><p>Organization policy can narrow a project grant; it never creates access.</p>
                 <fieldset><legend>Roles allowed to export</legend><For each={GOVERNED_ROLES}>{(role) => <label><input type="checkbox" checked={draft().exportRoles.includes(role)} onChange={(event) => setDraft((value) => ({ ...value, exportRoles: setMembership(value.exportRoles, role, event.currentTarget.checked) }))} />{role}</label>}</For></fieldset>
@@ -506,6 +521,9 @@ function PeoplePage(props: {
         </div>
     </Show>;
     return <>
+        <Notice tone="neutral">{props.page.model.members.some((member: { readonly managed_by_scim: boolean }) => member.managed_by_scim)
+            ? "People managed by your identity provider are configured in Enterprise Identity."
+            : "Direct invitations and fixed roles are included. Identity-provider-managed membership requires Enterprise controls."}</Notice>
         <section class="gaugeapp-panel gaugeapp-section-stack">
             <div class="gaugeapp-section-head"><div><h2>People</h2><p>{statusMembers("active").length} active · {statusMembers("invited").length + invitations().filter((invitation) => ["pending", "expired"].includes(text(invitation.status, ""))).length} invited</p></div><Show when={props.commands.includes("people.invitation.create")}><button type="button" onClick={() => setAdding((value) => !value)}>{adding() ? "Cancel" : "Invite"}</button></Show></div>
             <Show when={adding()}><div class="gaugeapp-people-invite">
@@ -614,6 +632,7 @@ function SessionsPage(props: {
     const recoveryCount = () => sessions().filter((session) => session.state === "recovery_only").length;
 
     return <>
+        <Notice tone="neutral">These are active GaugeDesk sessions. Commercial clients are in Commercial Operations.</Notice>
         <section class="gaugeapp-panel gaugeapp-section-stack">
             <div class="gaugeapp-section-head"><div><h2>Organization sessions</h2><p>{sessions().length} admitted · {recoveryCount()} recovery only</p></div></div>
             <Show when={sessions().length > 0} fallback={<p class="gaugeapp-empty">No admitted organization sessions.</p>}>
@@ -860,7 +879,7 @@ function AdministrationPage(props: { page: GaugeAppPageModel; session: GaugeAppS
     return <article class="gaugeapp-page" data-gaugeapp-page={page()}>
         <header class="gaugeapp-page-head">
             <div>
-                <span class="gaugeapp-eyebrow">Administration</span>
+                <span class="gaugeapp-eyebrow">{appLabel("administration", props.session.scope)}</span>
                 <h1>{PAGE_LABELS[page()] ?? page()}</h1>
             </div>
             <Show when={pageFreshnessCaveat(typedPage().freshness)}>{(caveat) => <span class="gaugeapp-freshness">{caveat()}</span>}</Show>
@@ -889,7 +908,7 @@ function AdministrationPage(props: { page: GaugeAppPageModel; session: GaugeAppS
 
         <Show when={policy()}>{(value) => <OrganizationPolicyEditor page={value()} commands={props.commands} onSubmit={props.onSubmit} />}</Show>
 
-        <Show when={hosts()}>{(value) => <ProjectHostsPage page={value()} commands={props.commands} onSubmit={props.onSubmit} />}</Show>
+        <Show when={hosts()}>{(value) => <ProjectHostsPage page={value()} commands={props.commands} onSubmit={props.onSubmit} onOpenProject={props.onOpenProject} />}</Show>
 
         <Show when={backups()}>{(value) => <BackupsPage model={value().model} session={props.session} commands={props.commands} onSubmit={props.onSubmit} api={props.api} />}</Show>
 
@@ -919,7 +938,8 @@ function ProjectsPage(props: {
         if (!value) return;
         await props.onSubmit("project.create", { name: value });
     };
-    return <section class="gaugeapp-panel gaugeapp-projects">
+    return <section class="gaugeapp-panel gaugeapp-section-stack">
+        <Notice tone="neutral">Administration discovers and inspects the projects this organization governs. Every change still resolves to the project’s authoritative Home; this page does not become a second project authority.</Notice>
         <div class="gaugeapp-section-head">
             <div>
                 <h2>Projects <small>{model().projects.length}</small></h2>
@@ -961,6 +981,16 @@ function ProjectsPage(props: {
                 <Fact label="Access" value={`${project().access_grants} direct grant${project().access_grants === 1 ? "" : "s"}`} note={project().is_personal ? "Personal never permits sharing or handoff" : "Owners and administrators retain organization-wide access"} />
                 <Fact label="Agents" value={String(project().agent_placements)} note={project().pending_placements ? `${project().pending_placements} awaiting acceptance` : "No pending placements"} />
                 <Fact label="Work targets" value={String(project().work_targets)} note={project().network_isolated ? "Network isolated" : "Network access open"} />
+            </div>
+            {/* The three statements a governance page has to make and this one
+                did not: Administration can discover and inspect a project, but
+                the authoritative Home still owns it. Without them the page reads
+                as a second project authority, which ADR 0171 says it is not. */}
+            <SectionHeading title="Authority" />
+            <div class="gaugeapp-detail-facts">
+                <Fact label="Project settings" value="Owned by the authoritative Home" note="Administration routes commands there" />
+                <Fact label="Organization policy" value="Restrict-only" note="the project cannot widen the tenant floor" />
+                <Fact label="Move project" value="Deliberate Home handoff" note="never a mutable region or Project Host field" />
             </div>
             <div class="gaugeapp-project-detail-foot">
                 <span>{project().freshness === "home-live" ? "Live from the Project Host" : "Project Host data is not current"}</span>
@@ -1078,6 +1108,7 @@ function CloudBackupsPageView(props: {
     const status = () => enabled() ? "On" : facility() ? "Paused" : "Off";
 
     return <>
+        <Notice tone="neutral">A backup is of the project Homes on this managed Project Host. Recovery opens only with a holder key kept on a trusted device; no GaugeWright service can open one.</Notice>
         <section class="gaugeapp-panel gaugeapp-section-stack">
             <div class="gaugeapp-section-head">
                 <div><h2>Protection</h2><p>{enabled() ? "Encrypted recovery points are being retained." : "No new recovery points will be scheduled."}</p></div>
@@ -1333,6 +1364,9 @@ function PlansServicesPage(props: { model: AdministrationBillingPageV1; commands
             </div>
         </section>
         <Show when={subscription() && !planEnded() ? subscription() : null}>{(current) => <section class="gaugeapp-panel gaugeapp-section-stack">
+            <Show when={current().cancel_at_period_end}>
+                <Notice tone="neutral"><strong>Plan change scheduled.</strong> Managed rights remain active until the end of the paid period; nothing is removed before then, and membership, roles and project access are unchanged.</Notice>
+            </Show>
             <div class="gaugeapp-section-head"><div><h2>Renewal</h2><p>{current().cancel_at_period_end ? `Access ends ${planRenewal(current().current_period_end)}.` : `Renews ${planRenewal(current().current_period_end)}.`}</p></div></div>
             <Show when={current().cancel_at_period_end} fallback={
                 <Show when={cloud().management.cancellation}>
@@ -1441,6 +1475,7 @@ function BillingPage(props: { model: AdministrationBillingPageV1; commands: read
     const paymentManagementAvailable = () => props.commands.includes("billing.payment-method.begin")
         || props.commands.includes("billing.customer-portal.begin");
     return <>
+        <Notice tone="neutral">Plan, seat, and organization-service changes are managed under Plans &amp; services. Billing contains payment and accounting records only.</Notice>
         <section class="gaugeapp-panel gaugeapp-section-stack">
             <div class="gaugeapp-section-head gaugeapp-plan-head">
                 <div><h2>Payment</h2><p>{presentation().issue ?? (presentation().mode ? "Test billing · no live payment account." : "Card and bank details are collected and retained by Stripe.")}</p></div>
@@ -1713,6 +1748,9 @@ function EnterpriseIdentityPage(props: { model: EnterpriseIdentityPageV1; resour
         }
     };
     return <>
+        <Notice tone={connection() ? "neutral" : "warn"}>{connection()
+            ? "SCIM owns the lifecycle of directory-managed members. A credential is revealed only once after its reviewed rotation command is admitted; it never enters this page, the agent, or a configuration diff."
+            : "No corporate identity provider is connected. Verify a company domain before enabling just-in-time membership, and test the connection before enforcing SSO."}</Notice>
         <section class="gaugeapp-panel gaugeapp-section-stack">
             <div class="gaugeapp-section-head gaugeapp-plan-head">
                 <div><h2>Corporate sign-in</h2><p>{connection() ? "Connection configured; enforcement remains separate." : "Connect an OIDC or SAML identity provider."}</p></div>
@@ -1868,10 +1906,10 @@ export interface OrganizationInvitationAccess {
     readonly proof: string;
 }
 
-function PageHeading(props: { app: GaugeAppKind; page: GaugeAppPageModel }): JSX.Element {
+function PageHeading(props: { app: GaugeAppKind; page: GaugeAppPageModel; scope?: GaugeAppScope }): JSX.Element {
     return <header class="gaugeapp-page-head">
         <div>
-            <span class="gaugeapp-eyebrow">{APP_LABELS[props.app]}</span>
+            <span class="gaugeapp-eyebrow">{appLabel(props.app, props.scope)}</span>
             <h1>{PAGE_LABELS[props.page.id] ?? props.page.id}</h1>
         </div>
         <Show when={pageFreshnessCaveat(props.page.freshness)}>{(caveat) => <span class="gaugeapp-freshness">{caveat()}</span>}</Show>
@@ -2368,6 +2406,10 @@ function AccountPage(props: {
         <Show when={props.page.id === "trusted-devices"}>
             <section class="gaugeapp-panel gaugeapp-section-stack">
                 <div class="gaugeapp-section-head"><div><h2>Trusted devices</h2><p>Computers and phones admitted to act as you.</p></div></div>
+                {/* Third of the three things a person has to keep apart, beside
+                    Project Hosts and project Homes. A device acts as you and
+                    reaches a Home; it never holds one. */}
+                <Notice tone="neutral"><strong>Trusted Devices are account clients, not Project Hosts.</strong> They act as you, discover opaque project routes, and ask each project Home for access. Project data stays on its Project Host.</Notice>
                 <Show when={(devices()?.devices.length ?? 0) > 0} fallback={<p class="gaugeapp-empty">No trusted devices are registered.</p>}>
                     <div class="gaugeapp-rows"><For each={devices()?.devices ?? []}>{(record) => {
                         const id = text(record.id, "");
@@ -3057,12 +3099,44 @@ function PaymentsPage(props: {
     };
     return <section class="gaugeapp-panel gaugeapp-section-stack gaugeapp-payments">
         <div class="gaugeapp-section-head"><div><h2>Payment account</h2><p>{paymentModeDescription(props.model.processor_mode)}</p></div><Show when={!processor().connected}><CommandButton command="commercial-payments.connect.begin" commands={props.commands} label="Set up payments" onSubmit={props.onSubmit} /></Show></div>
+        {/* The prototype opens this page by saying what the current readiness
+            lets you do, because "charges_ready: false" does not tell a person
+            whether they can still prepare an engagement. It can: readiness
+            gates checkout and invoices, not preparation. */}
+        <Notice tone={processor().connected && processor().charges_ready ? "neutral" : "warn"}>{
+            !processor().connected
+                ? "Payment readiness gates checkout and invoices, not the ability to prepare products, clients, and engagements. Connect a payment account when you are ready to charge."
+                : !processor().charges_ready
+                    ? "Products, clients and engagements can be prepared now. Checkout links and invoices wait until Stripe finishes verifying this account."
+                    : processor().payouts_ready
+                        ? "Charges and payouts are both active. The organization remains merchant of record."
+                        : "Charges are active and payouts are not. Money collected is held until the external account is verified."
+        }</Notice>
         <div class="gaugeapp-payment-readiness">
             <Fact label="Payment account" value={processor().connected ? "Connected" : "Not connected"} />
             <Fact label="Collect charges" value={paymentReadinessLabel(processor().connected, processor().charges_ready)} />
             <Fact label="Receive payouts" value={paymentReadinessLabel(processor().connected, processor().payouts_ready)} />
             <Fact label="Last verified" value={processor().verified_at === null ? (processor().connected ? "Not yet verified" : "—") : sessionTimestamp(processor().verified_at! * 1_000)} />
         </div>
+        {/* Before handing a provider to Stripe, say what activation does and what
+            Stripe will ask for. The prototype makes this its onboarding step;
+            the built page went straight to the embedded component, which asks
+            for tax and ownership details with no statement of why. */}
+        <Show when={!processor().connected}>
+            <SectionHeading title="Before connecting" />
+            <div class="gaugeapp-detail-facts">
+                <Fact label="Stripe collects" value="Business identity and representatives" note="address, ownership, and tax details" />
+                <Fact label="Money movement" value="Bank account and payout schedule" note="held by Stripe, never by GaugeDesk" />
+                <Fact label="Customer-facing" value="Statement descriptor and support contact" note="what a client sees on a charge" />
+            </div>
+            <SectionHeading title="Activation gates" />
+            <div class="gaugeapp-detail-facts">
+                <Fact label="Onboarding" value="Details submitted" note="Stripe-hosted collection complete" />
+                <Fact label="Payments" value="Charges enabled" note="checkout links and invoices become available" />
+                <Fact label="Payouts" value="External account verified" note="collected money can leave Stripe" />
+            </div>
+            <p class="gaugeapp-payment-note">This organization remains merchant of record. Activation adds no storefront, no client entitlement, and no project access.</p>
+        </Show>
         <Show when={processor().connected}>
             <div class="gaugeapp-stripe-tools" aria-label="Stripe financial tools"><For each={[
                 ["account-onboarding", "Onboarding"],
@@ -3965,7 +4039,12 @@ export function AdministrationGaugeApp(props: {
     });
     return <WorkbenchShell
         state={shell}
-        titles={{ nav: "Navigate", chat: "Administration agent", content: "Administration", files: "Menu" }}
+        titles={{
+            nav: "Navigate",
+            chat: `${appLabel(controller.app, controller.session()?.scope)} agent`,
+            content: appLabel(controller.app, controller.session()?.scope),
+            files: "Menu",
+        }}
         headings={{ chat: false, content: false, files: false }}
         nav={() => <div class="gaugeapp-nav"><button type="button" class="gaugeapp-back" data-admin-return onClick={props.onReturnToWork}>← Work</button></div>}
         chat={() => controller.chat({ mobile: shell.isMobile(), onCollapse: () => shell.setCollapsed("chat", true) })}

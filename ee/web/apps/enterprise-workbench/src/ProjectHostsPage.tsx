@@ -1,11 +1,13 @@
 import { createMemo, createSignal, For, Show, type JSX } from "solid-js";
 import { parseProjectHostsPage, type GaugeAppCommandResult, type GaugeAppPageModel, type ProjectHost } from "@gaugewright/control-plane-client";
 import { hostBytes, hostKind, hostStanding, nanoUsdInput, parseNanoUsd, retiredHost } from "./project-host-presentation";
+import { Metric, Notice, Resource, SectionHeading } from "./gaugeapp-design";
 
 export function ProjectHostsPage(props: {
     page: GaugeAppPageModel;
     commands: readonly string[];
     onSubmit: (command: string, payload: Readonly<Record<string, unknown>>) => Promise<GaugeAppCommandResult>;
+    onOpenProject?: (project: { readonly id: string; readonly name: string }) => void;
 }): JSX.Element {
     const model = createMemo(() => parseProjectHostsPage(props.page).model);
     const [selectedId, setSelectedId] = createSignal("");
@@ -73,16 +75,61 @@ export function ProjectHostsPage(props: {
         }
     };
     const policyValid = () => parseNanoUsd(cap()) !== null && (!enabled() || parseNanoUsd(cap())! > 0);
+    // Posture belongs on the row rather than in a status column: a host that is
+    // unreachable or retired is the one the reader is looking for.
+    const hostTone = (host: ProjectHost): "ready" | "warn" | "neutral" =>
+        retiredHost(host) || host.state === "unreachable" ? "warn"
+            : host.state === "live" && host.lifecycle === "active" ? "ready" : "neutral";
+    const attention = () => model().homes.some((host) => hostTone(host) === "warn");
+    // A host reporting `projects: null` has not been connected; it contributes
+    // no rows rather than an empty inventory that would read as "holds nothing".
+    const projectHomes = () => model().homes.flatMap((host) =>
+        (host.projects ?? []).map((project) => ({ project, host })));
     return <>
         <section class="gaugeapp-panel gaugeapp-hosts">
-            <header class="gaugeapp-host-section-head"><h2>{model().homes.length} Project Host{model().homes.length === 1 ? "" : "s"}</h2>
-                <Show when={can("project-host.add")}><button type="button" class="primary" disabled={busy() || !model().managed_enrollment.available} onClick={beginAdd}>Add managed host</button></Show>
-            </header>
+            {/* The page states the model before listing anything: what a Project
+                Host is, and that a Trusted Device is not one. Without it the
+                reader has to infer all three relationships from the rows. */}
+            <Notice tone="neutral"><strong>Every project has one authoritative Home on a Project Host.</strong> A Project Host stores one or more project Homes and can run background work. Trusted Devices connect to those Homes but never carry them.</Notice>
+            <div class="gaugeapp-metrics">
+                <Metric label="Project Hosts" value={`${model().homes.length}`}
+                    note={attention() ? "one needs attention" : "all available"}
+                    tone={attention() ? "warn" : undefined} />
+                <Metric label="Managed" value={`${model().homes.filter((host) => host.kind === "cloud").length}`} note="run by GaugeWright" />
+                <Metric label="Self-managed" value={`${model().homes.filter((host) => host.kind !== "cloud").length}`} note="run by this organization" />
+            </div>
+            {/* Which project lives where, and the way into each one. A page
+                about Project Hosts that never names a project Home leaves the
+                relationship it exists to explain entirely to the reader — this
+                is the section the design puts first. A host that reports no
+                inventory contributes nothing here rather than appearing to hold
+                nothing, which is the distinction `projects: null` carries. */}
+            <SectionHeading title="Project Homes" meta={projectHomes().length ? `${projectHomes().length} authoritative` : undefined} />
+            <p class="gaugeapp-host-note">Each project has exactly one Home. Moving it is an explicit handoff from the project’s settings.</p>
+            <Show when={projectHomes().length} fallback={
+                <p class="gaugeapp-empty">No Project Host is reporting a project inventory. Connect to one to see which project Homes it holds.</p>
+            }>
+                <div class="gaugeapp-host-list"><For each={projectHomes()}>{(entry) => <Resource
+                    kind={entry.host.name}
+                    title={entry.project.name || entry.project.id}
+                    detail={`project:${entry.project.id} · ${hostStanding(entry.host)}`}
+                    tone={hostTone(entry.host)}
+                    action={props.onOpenProject ? "settings" : undefined}
+                    onAction={() => props.onOpenProject?.({ id: entry.project.id, name: entry.project.name || entry.project.id })} />
+                }</For></div>
+            </Show>
+            <SectionHeading title="Admitted Project Hosts" meta={`${model().homes.length} admitted`}
+                action={can("project-host.add") && model().managed_enrollment.available ? "add managed host" : undefined}
+                onAction={beginAdd} />
             <Show when={model().homes.length} fallback={<p class="gaugeapp-empty">No Project Hosts have been added to this organization.</p>}>
-                <div class="gaugeapp-host-list"><For each={model().homes}>{(host) => <div class="gaugeapp-host-row" data-host-id={host.id}>
-                    <button type="button" class="gaugeapp-host-name" onClick={() => choose(host)}><strong>{host.name}</strong><span>{hostKind(host)}{host.kind === "cloud" && host.region ? ` · ${host.region}` : ""}</span></button>
-                    <span class="gaugeapp-host-standing">{hostStanding(host)}</span>
-                    <button type="button" onClick={() => choose(host)}>View</button>
+                <div class="gaugeapp-host-list"><For each={model().homes}>{(host) => <div data-host-id={host.id}>
+                    <Resource
+                        kind={`${hostKind(host)}${host.kind === "cloud" && host.region ? ` · ${host.region}` : ""}`}
+                        title={host.name}
+                        detail={hostStanding(host)}
+                        tone={hostTone(host)}
+                        action="view"
+                        onAction={() => choose(host)} />
                 </div>}</For></div>
             </Show>
             <Show when={!model().managed_enrollment.available && !model().homes.some((host) => host.kind === "cloud")}><p class="gaugeapp-host-note">{model().managed_enrollment.reason}</p></Show>

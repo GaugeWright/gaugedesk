@@ -11,7 +11,10 @@
 # `all` runs every section even when one of them fails and names the failures
 # together at the end, so a red `dependencies` — an advisory about the world,
 # not about the diff — can no longer decide whether the bar says anything about
-# the change under test. See run_all.
+# the change under test. The sections that never touch the cargo target
+# directory — contracts, web, dependencies — run alongside the ones that do,
+# and their transcripts are replayed in that order once the cargo sections
+# finish. See run_all.
 #
 # The set spans what used to be three workflows: the private Tier-0 lane
 # (architecture, license boundary, contracts, canaries, client calls, spec
@@ -352,6 +355,37 @@ run_rust() {
     # nextest does not run, and this workspace has them (ten in gaugedesk-app),
     # so `cargo test --doc` keeps them in the bar; it compiles nothing the run
     # before it has not already built.
+    # Where the tests write. The app crate's fixtures build a workbench on
+    # disk per test — SQLite stores, worktrees, seeded files — and that file
+    # churn is what the tests are bound by, not CPU: on the hosted runner the
+    # app crate's unit tests alone took 246 s of a 688 s job, against a
+    # disk-backed /tmp. On Linux, /dev/shm is a tmpfs, so a run whose tests
+    # fit there runs them from memory. A per-run directory, removed when the
+    # section ends however it ends, so a killed run leaves no roots behind. It
+    # is skipped, and says so, where there is no tmpfs to use or too little of
+    # it, because a test failing on ENOSPC would read as a broken tree; macOS
+    # has no tmpfs, so nothing changes there. What is asserted does not change:
+    # the same tests, writing the same roots, on a different device.
+    #
+    # It asks for 1 GB free. The whole suite peaks at 48 MB of temporary files
+    # across eighteen processes and leaves none behind (measured with a
+    # sampler over a dedicated TMPDIR), so that is twenty times the need; the
+    # hosted runner's /dev/shm has 3.9 GB, which a first cut asking for 4 GB
+    # missed by a rounding.
+    local tests_tmpdir="" free_kb
+    if [ "$(uname -s)" = Linux ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
+        free_kb="$(df -Pk /dev/shm | awk 'NR == 2 { print $4 }')"
+        if [ "${free_kb:-0}" -ge $((1024 * 1024)) ]; then
+            tests_tmpdir="$(mktemp -d /dev/shm/gaugedesk-check.XXXXXX)"
+            # shellcheck disable=SC2064 # expanded now on purpose: the path is fixed.
+            trap "rm -rf '$tests_tmpdir'" EXIT
+            export TMPDIR="$tests_tmpdir"
+            echo "-- tests write to $tests_tmpdir (tmpfs) --"
+        else
+            echo "-- tests write to the default TMPDIR: /dev/shm has ${free_kb:-0} KB free, under the 1 GB this asks for --"
+        fi
+    fi
+
     echo "== tests =="
     if command -v cargo-nextest >/dev/null 2>&1; then
         cargo nextest run --workspace --no-fail-fast
@@ -536,12 +570,16 @@ audit_npm_tree() {
     return 0
 }
 
+# $1 = "best-effort" (a developer asking for this section, and `all`) or
+# "required" (the security-baseline CI job), which decides whether an absent
+# cargo-audit or cargo-deny is reported or fails. Same reasoning as
+# run_contracts: this section is the advisory sweep over every tracked lockfile,
+# not the two cargo subcommands, and `all` must not end red about the host when
+# it has answered everything it could about the change.
 run_dependencies() {
+    local prerequisites="${1:-best-effort}"
+
     echo "== production dependency advisories =="
-    command -v cargo-audit >/dev/null || {
-        echo "cargo-audit is not installed; run: cargo install cargo-audit" >&2
-        exit 1
-    }
     # RustSec's advisory database is a third party, and the subject of this gate
     # is the lockfiles this repository tracks. Those are different things, and a
     # failure of the second used to be reported as a failure of the first — the
@@ -557,7 +595,11 @@ run_dependencies() {
     source scripts/advisory-database.sh
     resolve_advisory_database
 
-    if [ "$ADVISORY_DB_MISSING" -eq 0 ]; then
+    # `prerequisite` is first so that it always evaluates: behind the database
+    # test it would never be reached on a host whose RustSec copy is missing,
+    # and the gate would pass with cargo-audit absent.
+    if prerequisite cargo-audit "the cargo advisory audit" "cargo install cargo-audit" \
+       && [ "$ADVISORY_DB_MISSING" -eq 0 ]; then
         # Before trusting a clean audit, check that these flags can still report
         # a dirty one.
         assert_findings_still_fail
@@ -580,13 +622,11 @@ run_dependencies() {
     # moving advisory database through this gate too would only add
     # nondeterministic breakage. This gate is licenses, bans, and sources only —
     # the same split the whipplescript and cloud gates use.
-    command -v cargo-deny >/dev/null || {
-        echo "cargo-deny is not installed; run: cargo install cargo-deny --locked" >&2
-        exit 1
-    }
-    for manifest in Cargo.toml src-tauri/Cargo.toml src-tauri-mobile/Cargo.toml; do
-        cargo deny --manifest-path "$manifest" check licenses bans sources
-    done
+    if prerequisite cargo-deny "the supply-chain policy check" "cargo install cargo-deny --locked"; then
+        for manifest in Cargo.toml src-tauri/Cargo.toml src-tauri-mobile/Cargo.toml; do
+            cargo deny --manifest-path "$manifest" check licenses bans sources
+        done
+    fi
 
     # Production only. The dev trees are vite, wrangler, and playwright, none of
     # which reach a user.
@@ -749,6 +789,32 @@ prerequisite_policy() {
     if [ "${1:-}" = best-effort ]; then echo best-effort; else echo required; fi
 }
 
+# A step whose tool this host has not installed. Returns non-zero when the
+# caller must skip, so a guarded step reads `if prerequisite …; then`; under
+# `required` it never returns at all. It reads `$prerequisites` from the section
+# it is called in.
+#
+# A skip is also recorded, because the bar's last line already says what it
+# could not establish — an unreachable advisory service, an unrefreshed
+# database — and a step that did not run belongs in that same sentence rather
+# than only in a stderr notice a long run scrolls past.
+#
+#   $1 the tool, $2 what it gates, $3 the command that installs it
+skipped_prerequisites=""
+prerequisite() {
+    command -v "$1" >/dev/null 2>&1 && return 0
+    if [ "$prerequisites" = required ]; then
+        echo "$2 requires $1." >&2
+        echo "install: $3" >&2
+        exit 1
+    fi
+    echo "-- $2 SKIPPED: $1 is not installed --" >&2
+    echo "   the security-baseline CI job installs it and runs this on every pull request." >&2
+    echo "   To close the gap locally: $3" >&2
+    skipped_prerequisites="${skipped_prerequisites:+$skipped_prerequisites; }$2 not run"
+    return 1
+}
+
 # How `all` runs one section, named rather than inlined because it is the seam
 # `scripts/check-lanes.test.mjs` replaces. Sourcing this file defines the
 # sections and stops before the dispatch, so the test can override this one
@@ -758,6 +824,16 @@ prerequisite_policy() {
 # `run-production-wiring-canaries.mjs` taking a `spawnImpl`.
 lane_runner() {
     "$BASH" "$self" "$@"
+}
+
+# End the sections `all` started alongside the cargo ones: each is its own
+# process group, so the group is what to signal. Killing what has already
+# finished is not an error here.
+end_alongside() {
+    local pid
+    for pid in "$@"; do
+        kill -TERM -- "-$pid" 2>/dev/null || true
+    done
 }
 
 # `all` runs every section and reports the failures together, rather than
@@ -783,22 +859,55 @@ lane_runner() {
 # running past its first failed command and report the status of its last one —
 # which is worse than the masking this replaces, because it reports a pass. A
 # separate process has its own errexit and none of that state.
+#
+# The sections that never touch the cargo target directory — `contracts`,
+# `web`, `dependencies` — run alongside the ones that do. `rust` is most of the
+# bar and saturates the cores only while it compiles; the other three are
+# single-threaded scripts, node builds and network calls that on their own
+# leave the machine idle, and nothing they read or write meets what the cargo
+# sections read or write (`web`'s one cargo call builds a wasm target into its
+# own profile directory). So they start first, in the background, and the cargo
+# sections run in the foreground with their output live, which is where a
+# developer watching a long run wants to look; each background transcript is
+# replayed whole, under a banner, in a fixed order once the cargo sections are
+# done, so a failure lands under its own section rather than interleaved with
+# rustc. Measured on the founder's machine, warm tree, under a load average of
+# 15 from other sessions: 110 s sequential, 88 s overlapped — the same sections
+# and the same verdict, a fifth of the wall clock less.
+#
+# Each background section is its own process group, for the reason
+# `parallel_steps` gives: without job control an asynchronous list inherits an
+# ignored SIGINT, and an interrupted bar would leave three sections running to
+# completion. The trap ends every group.
 run_all() {
     local failed=()
-    local lane rc
+    local lane rc index
+    local transcripts
+    transcripts="$(mktemp -d)"
+    local alongside=(contracts web dependencies)
+    local pids=()
 
     # Ctrl-C used to stop the bar as a side effect of errexit seeing the
     # interrupted section's nonzero status. Collecting that status instead would
     # send the run on to the next section and make a developer interrupt a long
     # run once per section, so say what to do with a signal rather than leaving
-    # it to what bash does with one it received while waiting on a child.
-    trap 'echo >&2; echo "== gaugedesk green bar INTERRUPTED (all) ==" >&2; exit 130' INT TERM
+    # it to what bash does with one it received while waiting on a child. The
+    # sections running alongside are in their own process groups, which the
+    # terminal's interrupt does not reach, so the trap ends them itself.
+    trap 'echo >&2; echo "== gaugedesk green bar INTERRUPTED (all) ==" >&2; end_alongside "${pids[@]}"; rm -rf "$transcripts"; exit 130' INT TERM
 
-    for lane in contracts rust web desktop mobile windows dependencies; do
-        rc=0
+    set -m
+    for lane in "${alongside[@]}"; do
         # `contracts` needs no word here: a section name alone already means
         # best-effort for it, and `all` wants exactly what a developer asking
         # for that section wants. See prerequisite_policy.
+        lane_runner "$lane" > "$transcripts/$lane" 2>&1 &
+        pids+=("$!")
+    done
+    set +m
+
+    for lane in rust desktop mobile windows; do
+        rc=0
         case "$lane" in
             desktop|mobile) lane_runner "$lane" best-effort || rc=$? ;;
             *) lane_runner "$lane" || rc=$? ;;
@@ -810,11 +919,35 @@ run_all() {
         if [ "$rc" -ge 128 ]; then
             echo >&2
             echo "== gaugedesk green bar INTERRUPTED (all) during: $lane ==" >&2
+            end_alongside "${pids[@]}"
+            rm -rf "$transcripts"
             exit "$rc"
         fi
 
         [ "$rc" -eq 0 ] || failed+=("$lane")
     done
+
+    index=0
+    for lane in "${alongside[@]}"; do
+        rc=0
+        wait "${pids[$index]}" || rc=$?
+        index=$((index + 1))
+        echo
+        echo "== $lane ran alongside the cargo sections; its transcript follows =="
+        cat "$transcripts/$lane"
+
+        if [ "$rc" -ge 128 ]; then
+            echo >&2
+            echo "== gaugedesk green bar INTERRUPTED (all) during: $lane ==" >&2
+            end_alongside "${pids[@]}"
+            rm -rf "$transcripts"
+            exit "$rc"
+        fi
+
+        [ "$rc" -eq 0 ] || failed+=("$lane")
+    done
+    rm -rf "$transcripts"
+    trap - INT TERM
 
     [ ${#failed[@]} -eq 0 ] && return 0
 
@@ -837,7 +970,7 @@ dispatch() {
     case "${1:-all}" in
         all) run_all ;;
         contracts) run_contracts "$(prerequisite_policy "${2:-best-effort}")" ;;
-        dependencies) run_dependencies ;;
+        dependencies) run_dependencies "$(prerequisite_policy "${2:-best-effort}")" ;;
         desktop) run_desktop "$(prerequisite_policy "${2:-}")" ;;
         mobile) run_mobile "$(prerequisite_policy "${2:-}")" ;;
         rust) run_rust ;;
@@ -873,6 +1006,13 @@ if [ "${ADVISORY_DB_MISSING:-0}" -gt 0 ]; then
     unasserted="${unasserted:+$unasserted; }cargo advisories unaudited"
 elif [ "${ADVISORY_DB_STALE:-0}" -gt 0 ]; then
     unasserted="${unasserted:+$unasserted; }cargo advisories from an unrefreshed database"
+fi
+
+# A step that did not run for want of a tool is the same kind of fact as an
+# advisory service that could not be reached: the bar must not read as though it
+# had asserted what it skipped.
+if [ -n "$skipped_prerequisites" ]; then
+    unasserted="${unasserted:+$unasserted; }$skipped_prerequisites"
 fi
 
 if [ -n "$unasserted" ]; then
