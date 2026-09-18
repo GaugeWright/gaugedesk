@@ -547,7 +547,7 @@ async fn point_fork_rejects_an_unmapped_transcript_entry() {
 #[tokio::test]
 async fn archived_historical_home_requires_an_explicit_current_destination() {
     let _fake_agent = fake_agent_env();
-    let (_dir, wb) = seeded_workbench();
+    let (_dir, wb) = lean_workbench();
     let inspect = Arc::clone(&wb);
     let app = open_control_plane(wb);
 
@@ -1909,6 +1909,19 @@ fn seeded_workbench() -> (tempfile::TempDir, SharedWorkbench) {
     (dir, wb)
 }
 
+/// A workbench seeded with only what a chat in the default placement needs —
+/// the Default archetype, the Personal project and its target, no other
+/// archetype, no onboarding tracker (`StartupSeed::lean`). For a test that
+/// never reads the archetype library or the tracker; a test that does, or
+/// that reopens its root, uses [`seeded_workbench`]. The full seed is most of
+/// what a fresh open costs, and it is file churn, which is what contends when
+/// the suite runs eighteen processes wide.
+fn lean_workbench() -> (tempfile::TempDir, SharedWorkbench) {
+    let dir = tempfile::tempdir().unwrap();
+    let wb = crate::workbench_state::open_lean_workbench(dir.path()).unwrap();
+    (dir, wb)
+}
+
 #[test]
 fn startup_persists_the_agent_ability_hard_cutover_and_reconciles_frozen_refs() {
     let (dir, wb) = seeded_workbench();
@@ -2015,7 +2028,7 @@ fn startup_persists_the_agent_ability_hard_cutover_and_reconciles_frozen_refs() 
 
 #[test]
 fn placement_project_lookup_returns_only_the_exact_using_binding() {
-    let (_dir, wb) = seeded_workbench();
+    let (_dir, wb) = lean_workbench();
     let guard = wb.lock_unpoisoned();
     assert_eq!(
         guard.placement_project_id(DEFAULT_PLACEMENT),
@@ -2300,7 +2313,7 @@ async fn frictionless_default_admits_a_placement_active_at_once() {
 /// or removal can mutate state.
 #[tokio::test]
 async fn placement_routes_reject_a_mismatched_project_path_without_mutation() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
 
     let (_, first_body) = send(&app, "POST", "/projects", Some(r#"{"name":"first"}"#)).await;
@@ -2853,7 +2866,7 @@ async fn a_minted_context_is_owned_by_the_authority_the_agent_acts_for() {
     );
     // Seed first (a chat needs a placement and a work target), then attach the
     // IdP, so this is an ordinary workbench that has simply been signed in to.
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let instance_authority = {
         let mut guard = wb.lock_unpoisoned();
         guard.set_identity_provider(Some(Arc::new(idp)));
@@ -2915,7 +2928,7 @@ async fn a_minted_context_is_owned_by_the_authority_the_agent_acts_for() {
 /// and a context resource is minted.
 #[tokio::test]
 async fn context_upload_ingests_files_into_the_engagement() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
 
     // a live work chat (an engagement with a worktree).
@@ -2955,7 +2968,7 @@ async fn context_upload_ingests_files_into_the_engagement() {
 #[tokio::test]
 async fn context_upload_carries_bytes_that_are_not_text() {
     use base64::Engine as _;
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"bin-chat"}"#)).await;
     assert_eq!(s, StatusCode::CREATED);
@@ -2991,7 +3004,7 @@ async fn context_upload_carries_bytes_that_are_not_text() {
 /// Neither and both are refusals, not defaults.
 #[tokio::test]
 async fn context_upload_refuses_an_ambiguous_or_empty_file() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"amb-chat"}"#)).await;
     assert_eq!(s, StatusCode::CREATED);
@@ -3022,7 +3035,7 @@ async fn context_upload_refuses_an_ambiguous_or_empty_file() {
 /// A streamed upload lands byte-exact, without the body ever being buffered.
 #[tokio::test]
 async fn streamed_upload_lands_the_exact_bytes() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"stream-chat"}"#)).await;
     assert_eq!(s, StatusCode::CREATED);
@@ -3057,7 +3070,7 @@ async fn streamed_upload_lands_the_exact_bytes() {
 /// the reuse the guard calls out by name.
 #[tokio::test]
 async fn streamed_upload_refuses_a_replay_and_a_reused_key() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"replay-chat"}"#)).await;
     assert_eq!(s, StatusCode::CREATED);
@@ -3098,7 +3111,7 @@ async fn streamed_upload_refuses_a_replay_and_a_reused_key() {
 /// A refused upload admits nothing and leaves nothing staged.
 #[tokio::test]
 async fn a_refused_stream_leaves_no_partial_behind() {
-    let (dir, wb) = seeded_workbench();
+    let (dir, wb) = lean_workbench();
     let staging = wb.lock_unpoisoned().staging_uploads_dir();
     let app = open_control_plane(wb);
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"partial-chat"}"#)).await;
@@ -3135,7 +3148,7 @@ async fn a_refused_stream_leaves_no_partial_behind() {
 /// landing the same bytes the first attempt was trying to deliver.
 #[tokio::test]
 async fn an_interrupted_stream_resumes_from_what_arrived() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"resume-chat"}"#)).await;
     assert_eq!(s, StatusCode::CREATED);
@@ -3177,7 +3190,7 @@ async fn an_interrupted_stream_resumes_from_what_arrived() {
 /// being allowed to write a hole into someone's recording.
 #[tokio::test]
 async fn a_stream_resuming_from_the_wrong_place_is_refused() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"offset-chat"}"#)).await;
     assert_eq!(s, StatusCode::CREATED);
@@ -3208,7 +3221,7 @@ async fn a_stream_resuming_from_the_wrong_place_is_refused() {
 /// would produce bytes neither caller sent.
 #[tokio::test]
 async fn one_upload_receives_from_one_request_at_a_time() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"exclusive-chat"}"#)).await;
     assert_eq!(s, StatusCode::CREATED);
@@ -3250,7 +3263,7 @@ async fn one_upload_receives_from_one_request_at_a_time() {
 /// An upload carrying nothing is refused rather than admitted as an empty file.
 #[tokio::test]
 async fn a_stream_with_no_bytes_is_refused() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"big-chat"}"#)).await;
     assert_eq!(s, StatusCode::CREATED);
@@ -3926,7 +3939,7 @@ async fn publish_rejects_discipline_capability_drift_without_advancing_version()
 
 #[tokio::test]
 async fn file_reads_do_not_import_unrecorded_edits_or_claim_a_mismatched_cut() {
-    let (_dir, wb) = seeded_workbench();
+    let (_dir, wb) = lean_workbench();
     let app = open_control_plane(wb.clone());
     let (status, _) = send(&app, "POST", "/chats", Some(r#"{"id":"observed-file"}"#)).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -3980,7 +3993,7 @@ async fn the_viewer_read_serves_a_binary_worktree_file_as_bytes() {
     // text made every non-text file a 400 — a PNG or a PDF the agent produced
     // could be listed in Files and then not opened. The read serves the file's
     // own bytes instead, and text is untouched by that.
-    let (_dir, wb) = seeded_workbench();
+    let (_dir, wb) = lean_workbench();
     let inspect = wb.clone();
     let app = open_control_plane(wb);
     let (status, body) = send(&app, "POST", "/chats", Some(r#"{"id":"bin"}"#)).await;
@@ -4051,7 +4064,7 @@ async fn base_carrying_save_merges_concurrent_edits_and_folds_conflicts() {
     // token-level engine; overlapping rewrites 409 with the fold payload
     // and write nothing; the merge fact reaches the transcript while the
     // piece-level provenance lands on the audit plane.
-    let (_dir, wb) = seeded_workbench();
+    let (_dir, wb) = lean_workbench();
     let app = open_control_plane(wb);
     let (status, body) = send(&app, "POST", "/chats", Some(r#"{"id":"sub6"}"#)).await;
     assert_eq!(status, StatusCode::CREATED, "chat: {body}");
@@ -4150,7 +4163,7 @@ async fn cut_carrying_saves_mint_region_memory_and_preview_folds() {
     // region rides the resolve as durable memory, and the SAME divergence
     // in ANOTHER file later folds cleanly through the read-only preview —
     // resolved provenance, no re-ask.
-    let (_dir, wb) = seeded_workbench();
+    let (_dir, wb) = lean_workbench();
     let app = open_control_plane(wb);
     let (status, body) = send(&app, "POST", "/chats", Some(r#"{"id":"cut1"}"#)).await;
     assert_eq!(status, StatusCode::CREATED, "chat: {body}");
@@ -4311,7 +4324,7 @@ async fn file_edits_respect_draft_version_and_host_control_ownership() {
 /// ACTION-4: a projection can block an unsafe move without importing the edit.
 #[tokio::test]
 async fn workspace_projection_observes_manual_edits_without_importing_a_cut() {
-    let (_directory, wb) = seeded_workbench();
+    let (_directory, wb) = lean_workbench();
     let app = open_control_plane(wb.clone());
     let (status, body) = send(&app, "POST", "/chats", Some("{}")).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -4369,7 +4382,7 @@ async fn workspace_projection_observes_manual_edits_without_importing_a_cut() {
 /// The All-chats "+ new chat" quick-start mints a work chat server-side.
 #[tokio::test]
 async fn post_chats_without_id_mints_a_work_chat_on_the_default_placement() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
 
     // No id in the body ⇒ the server mints one (the UI never mints ids).
@@ -4800,7 +4813,7 @@ async fn archetype_abilities_update_only_the_draft_manifest() {
 /// WhippleScript adapter and the @live real-model fork scenario.
 #[tokio::test]
 async fn forking_a_chat_links_it_and_inherits_the_parent_worktree() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb.clone());
     // a work chat (back-compat path roots it on the default placement)
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"fork-src"}"#)).await;
@@ -5656,7 +5669,7 @@ fn a_claim_on_one_chat_leaves_every_other_chat_free() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_turn_on_a_busy_chat_is_refused() {
     let _fake_agent = fake_agent_env();
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"busy1"}"#)).await;
 
@@ -5744,7 +5757,7 @@ async fn a_second_turn_on_a_busy_chat_is_refused() {
 #[tokio::test]
 async fn a_run_left_running_by_a_dead_process_still_accepts_the_next_turn() {
     let _fake_agent = fake_agent_env();
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb.clone());
     send(&app, "POST", "/chats", Some(r#"{"id":"crashed1"}"#)).await;
     send(
@@ -5812,7 +5825,7 @@ async fn workstream_sync_route_is_clean_with_nothing_to_pull() {
 
 #[tokio::test]
 async fn unbinding_a_placement_preserves_project_owned_workstreams() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb.clone());
     let target_id = library_state::managed_project_target_id(DEFAULT_PROJECT);
     let (status, body) = send(
@@ -5922,7 +5935,7 @@ async fn instance_lifecycle_suspend_blocks_new_chats_then_resume_allows() {
 
 #[tokio::test]
 async fn placement_config_rejects_unreadable_json_without_replacing_the_last_good_value() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
 
     let valid = r#"{"SetLocalConfig":{"config":"{\"model\":\"wiring\"}","notes":"kept"}}"#;
@@ -5967,7 +5980,7 @@ async fn placement_config_rejects_unreadable_json_without_replacing_the_last_goo
 async fn project_credential_override_pins_seals_and_lists() {
     // LLM-2 (ADR 0062): the per-project credential surface pins a sealed BYOK token
     // in the project scope, lists provider+linked only (never the token), and unpins.
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb.clone());
 
     let (_, body) = send(&app, "POST", "/projects", Some(r#"{"name":"client-site"}"#)).await;
@@ -6042,7 +6055,7 @@ async fn project_credential_override_pins_seals_and_lists() {
 
 #[tokio::test]
 async fn project_creation_binds_the_serving_home_and_refuses_a_foreign_home() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb.clone());
 
     let (status, body) = send(
@@ -6112,7 +6125,7 @@ fn startup_rejects_a_project_without_a_home_bound_target() {
 
 #[tokio::test]
 async fn project_binds_an_agent_and_hosts_a_chat() {
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let inspect = wb.clone();
     let app = open_control_plane(wb);
 
@@ -6245,7 +6258,7 @@ async fn a_clean_turn_queues_no_task() {
 #[tokio::test]
 async fn every_clean_turn_auto_advances_without_queuing() {
     let _fake_agent = fake_agent_env();
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"noop1"}"#)).await;
 
@@ -6302,7 +6315,7 @@ async fn every_clean_turn_auto_advances_without_queuing() {
 #[tokio::test]
 async fn a_message_resent_under_its_composed_id_runs_exactly_one_turn() {
     let _fake_agent = fake_agent_env();
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"idem1"}"#)).await;
 
@@ -6464,7 +6477,7 @@ async fn task_queue_types_asks_repair_and_answer() {
 #[tokio::test]
 async fn attention_rules_reshape_queue_and_badges() {
     let _fake_agent = fake_agent_env();
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let wb2 = std::sync::Arc::clone(&wb);
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"at1"}"#)).await;
@@ -6535,7 +6548,7 @@ async fn attention_rules_reshape_queue_and_badges() {
 #[tokio::test]
 async fn advancement_rules_auto_advance_covered_turns_only() {
     let _fake_agent = fake_agent_env();
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
 
     // A rule covering the fake agent's write (`agent-note.txt` at the root).
@@ -6697,7 +6710,7 @@ async fn onboarding_checklist_appears_and_advances_on_credential() {
 /// satisfy this test and break that one.
 #[tokio::test]
 async fn a_runtime_store_that_cannot_be_read_is_not_an_empty_one() {
-    let (dir, wb) = seeded_workbench();
+    let (dir, wb) = lean_workbench();
     // Put something unreadable exactly where the gate's runtime store belongs.
     // A directory is the cheapest thing SQLite cannot open as a database, and
     // it needs no permission games that a root-running CI would ignore.
@@ -6746,7 +6759,7 @@ async fn a_project_s_whips_start_with_its_gate_s_structure_and_no_instances() {
     // instance list. That empty list is the honest answer, not a gap: the
     // marks in the Instances tab are read from runtime stores, and a store
     // that does not exist yet holds nothing.
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
 
     let (status, body) = send(
@@ -6797,7 +6810,7 @@ async fn a_project_s_whips_start_with_its_gate_s_structure_and_no_instances() {
 
 #[tokio::test]
 async fn every_project_is_created_with_the_default_gate() {
-    let (d, wb) = seeded_workbench();
+    let (d, wb) = lean_workbench();
     let app = open_control_plane(wb);
 
     // The project every account starts with.
@@ -6951,7 +6964,7 @@ async fn assignment_binds_to_the_roster_and_never_gates_a_claim() {
             it is run on demand with `--ignored` rather than in the gate"]
 async fn cmp17_busy_under_steer_pressure() {
     let _fake_agent = fake_agent_env();
-    let (_d, wb) = seeded_workbench();
+    let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb);
 
     const CHATS: usize = 6;
