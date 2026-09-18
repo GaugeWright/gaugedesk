@@ -63,8 +63,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 section="${1:-all}"
 
-# Stage 2 of the Buck2 migration (GaugeWright BUILD.md, DR-0124): each pure
-# section of the contracts lane is a Buck2 target declaring what it reads. When
+# The predicates and runners every lane shares. scripts/section.sh sources the
+# same file: from stage 3 a section's command runs in its own process — under
+# Buck2, one this shell cannot reach — so a helper defined here would not be
+# there when the command needs it.
+# shellcheck source=scripts/lane-helpers.sh
+. scripts/lane-helpers.sh
+
+# Stages 2 and 3 of the Buck2 migration (GaugeWright BUILD.md, DR-0124): every
+# section of every lane is a Buck2 target declaring what it reads, except the
+# two that read the sibling whipplescript checkout, which stage 4 owns. When
 # this checkout is a cell of a materialized workspace, a section runs through
 # Buck2, which spares the re-run when nothing the section declares has changed
 # and otherwise runs scripts/section.sh exactly as the direct path does. When
@@ -73,30 +81,55 @@ section="${1:-all}"
 # under this bar, never beside it. Inside a Buck2 action already running the
 # whole bar, the direct path is taken so no nested client meets the daemon.
 # (`section` is the lane variable above, hence the name.)
+#
+# A section whose answer comes from outside this tree is spared nothing: it is
+# a `check_world` target, which refuses to run unless the invocation names the
+# run, so it cannot be answered from a cache by accident.
 via_buck2=""
 if [ -z "${GREEN_BAR_INSIDE_BUCK2:-}" ] && command -v buck2 >/dev/null 2>&1 \
    && buck2 audit cell 2>/dev/null | grep -qx "gaugedesk: $(pwd -P)"; then
   via_buck2=1
 fi
+# One nonce for the whole run, and the prerequisite word beside it: the first
+# is what a world-reading section demands before it will run, the second is part
+# of every action's key, so a run that skipped a section is never served to one
+# that required an answer.
+#
+# EXPORTED, because `all` runs three lanes at once and each is a fresh
+# invocation of this script. Left unexported they mint three different nonces,
+# which are three different Buck2 CONFIGURATIONS arriving at one daemon at
+# once — and the daemon answers by cancelling a transaction, so a lane fails
+# for a reason that has nothing to do with the tree. One run is one nonce.
+export GREEN_BAR_RUN="${GREEN_BAR_RUN:-$(date +%s)-$$}"
+
+# What the sections could not establish. Each announces it on stdout as
+# `#unasserted: …` — it has to, because a section is a separate process now and
+# under Buck2 one this shell cannot reach at all, while the bar's closing line
+# has always said what a run did not assert. Output is still streamed as it
+# arrives; the tee is what makes it readable twice.
+section_unasserted=""
 gate_section() {
+  local transcript status=0
+  transcript="$(mktemp)"
   if [ -n "$via_buck2" ]; then
-    local log; log="$(buck2 build "//:$1" --show-full-simple-output)"
-    cat "$log"
+    local log
+    log="$(buck2 build "//:$1" -c "green_bar.run=$GREEN_BAR_RUN" \
+      -c "green_bar.prerequisites=${prerequisites:-required}" --show-full-simple-output)" || status=$?
+    [ "$status" -eq 0 ] && { cat "$log" | tee "$transcript"; status=$?; }
   else
-    prerequisites="${prerequisites:-required}" scripts/section.sh "$1"
+    prerequisites="${prerequisites:-required}" scripts/section.sh "$1" 2>&1 | tee "$transcript"
+    status=$?
   fi
+  while IFS= read -r line; do
+    case "$line" in
+      "#unasserted: "*)
+        section_unasserted="${section_unasserted:+$section_unasserted; }${line#\#unasserted: }" ;;
+    esac
+  done < "$transcript"
+  rm -f "$transcript"
+  return "$status"
 }
 
-# The Debian archive tooling `scripts/test-apt-repository.sh` drives. On Linux,
-# every runner that builds a package and every machine that installs one has it,
-# so an absence there is a workstation missing `dpkg-dev`, not a platform that
-# cannot answer.
-apt_repository_prerequisites_present() {
-    local tool
-    for tool in dpkg-deb dpkg-scanpackages gpg gpgv apt-get apt-cache xz; do
-        command -v "$tool" >/dev/null 2>&1 || return 1
-    done
-}
 
 # $1 = "best-effort" (a developer asking for this section, and `all`) or
 # "required" (the contracts CI job), which decides whether an absent docs
@@ -319,203 +352,32 @@ run_contracts() {
 }
 
 run_rust() {
+    # Reads the sibling whipplescript checkout, so it is not a target: an input
+    # outside this cell until stage 4 makes it an edge.
     echo "== resolved WhippleScript action contract =="
     python3 scripts/check-whipplescript-host-action.py --resolved
     python3 scripts/test-whipplescript-host-action.py
 
     echo "== formatting =="
-    cargo fmt --all --check
+    gate_section formatting
 
     echo "== lints =="
-    cargo clippy --workspace --all-targets -- -D warnings
+    gate_section lints
 
-    # cargo-nextest runs each test in its own process and schedules the whole
-    # set across cores itself, instead of handing one process per test binary to
-    # libtest's thread pool. Measured on this workspace's 2,315 tests, warm tree,
-    # on the founder's M5 Pro under a load average of 8-12 from other sessions:
-    #
-    #   cargo test --workspace                        120 s wall   149 s user   441 s sys
-    #   cargo nextest run --workspace --no-fail-fast   85 s wall   161 s user   353 s sys
-    #
-    # Less than the four-fold gain whipplescript-src measured, because these
-    # tests are bound by their own file I/O rather than by libtest's thread
-    # pool: the app crate's fixtures build a full workbench on disk, and that is
-    # where the sys column comes from either way. What nextest buys here is the
-    # scheduling — fifty-two binaries' tests interleaved across every core
-    # rather than one binary at a time.
-    #
-    # Use-if-present, never a new prerequisite: the bar has to mean the same
-    # thing on a host that does not carry it, so its absence falls back to
-    # exactly the command this line has always been. What is asserted does not
-    # change either way — the same test binaries, the same set — and CI installs
-    # nextest so the gating runner never takes the fallback.
-    #
-    # `--no-fail-fast` for the same reason `all` runs every section: the
-    # failures are reported together, in one run. Doctests are the one thing
-    # nextest does not run, and this workspace has them (ten in gaugedesk-app),
-    # so `cargo test --doc` keeps them in the bar; it compiles nothing the run
-    # before it has not already built.
-    # Where the tests write. The app crate's fixtures build a workbench on
-    # disk per test — SQLite stores, worktrees, seeded files — and that file
-    # churn is what the tests are bound by, not CPU: on the hosted runner the
-    # app crate's unit tests alone took 246 s of a 688 s job, against a
-    # disk-backed /tmp. On Linux, /dev/shm is a tmpfs, so a run whose tests
-    # fit there runs them from memory. A per-run directory, removed when the
-    # section ends however it ends, so a killed run leaves no roots behind. It
-    # is skipped, and says so, where there is no tmpfs to use or too little of
-    # it, because a test failing on ENOSPC would read as a broken tree; macOS
-    # has no tmpfs, so nothing changes there. What is asserted does not change:
-    # the same tests, writing the same roots, on a different device.
-    #
-    # It asks for 1 GB free. The whole suite peaks at 48 MB of temporary files
-    # across eighteen processes and leaves none behind (measured with a
-    # sampler over a dedicated TMPDIR), so that is twenty times the need; the
-    # hosted runner's /dev/shm has 3.9 GB, which a first cut asking for 4 GB
-    # missed by a rounding.
-    local tests_tmpdir="" free_kb
-    if [ "$(uname -s)" = Linux ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
-        free_kb="$(df -Pk /dev/shm | awk 'NR == 2 { print $4 }')"
-        if [ "${free_kb:-0}" -ge $((1024 * 1024)) ]; then
-            tests_tmpdir="$(mktemp -d /dev/shm/gaugedesk-check.XXXXXX)"
-            # shellcheck disable=SC2064 # expanded now on purpose: the path is fixed.
-            trap "rm -rf '$tests_tmpdir'" EXIT
-            export TMPDIR="$tests_tmpdir"
-            echo "-- tests write to $tests_tmpdir (tmpfs) --"
-        else
-            echo "-- tests write to the default TMPDIR: /dev/shm has ${free_kb:-0} KB free, under the 1 GB this asks for --"
-        fi
-    fi
-
+    # cargo-nextest, the tmpfs the fixtures write to, and the doctest run
+    # nextest does not do are stated once, in scripts/section.sh — including the
+    # tmpfs, which a section running as a Buck2 action has to set up itself
+    # because it inherits nothing from this shell.
     echo "== tests =="
-    if command -v cargo-nextest >/dev/null 2>&1; then
-        cargo nextest run --workspace --no-fail-fast
-        cargo test --workspace --doc
-    else
-        cargo test --workspace
-    fi
+    gate_section tests
 
-    # The open build must stay buildable without the enterprise features.
-    # Keep this feature graph out of the all-feature test graph's fingerprints.
-    # Cargo can otherwise remove a package fingerprint while the next graph is
-    # starting its build script, leaving an `invoked.timestamp` write aimed at
-    # a directory that no longer exists. The output is still owned by this
-    # worktree; only the incompatible graph gets its own subdirectory.
     echo "== no-default-features =="
-    CARGO_TARGET_DIR="$PWD/target/no-default-features" \
-        cargo check -p gaugedesk-app --no-default-features --all-targets
+    gate_section no-default-features
 }
 
-# Independent steps of one section, run at once.
-#
-# Most of `web` is single-threaded processes — six tsc runs, four vite builds,
-# a vitest run, three node test runs — that read one tree and write disjoint
-# outputs, and running them one after another left an eighteen-core machine
-# mostly idle for the length of the section. So they run together. Each step's
-# transcript is captured to its own file and printed, in the order the steps
-# were given, once every one of them has finished: the output reads exactly as
-# the sequential form did, and a failure appears under its own heading rather
-# than interleaved with whatever else was running. Every step runs to completion
-# even when another fails, for the same reason `all` runs every section — they
-# are independent, and the bar reports on each of them.
-#
-# A step is one string, run by this same bash under errexit, so a step of
-# several commands stops at its first failure exactly as it would inline; see
-# the note above `run_all` for why a function call in this shell would not.
-# Job control is on while the steps start so that each is its own process
-# group. Without it bash gives an asynchronous list an ignored SIGINT, which is
-# how an interrupted section would leave a dozen node processes running to
-# completion; with it the trap can stop every step's whole tree. It is off again
-# before the wait, so bash reports nothing about the jobs as they finish.
-parallel_steps() {
-    local dir n=0 i rc status=0
-    local pids=() headings=()
-    dir="$(mktemp -d)"
-    set -m
-    while [ $# -ge 2 ]; do
-        headings[$n]="$1"
-        "$BASH" -c "set -euo pipefail; $2" > "$dir/$n.log" 2>&1 &
-        pids[$n]=$!
-        n=$((n + 1))
-        shift 2
-    done
-    set +m
-    if [ $# -ne 0 ]; then
-        echo "parallel_steps: a heading with no command: $1" >&2
-        return 2
-    fi
-    trap 'for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null; done; exit 130' INT TERM
-    for ((i = 0; i < n; i++)); do
-        rc=0
-        wait "${pids[$i]}" || rc=$?
-        echo "${headings[$i]}"
-        cat "$dir/$i.log"
-        if [ "$rc" -ne 0 ]; then
-            echo "-- FAILED (exit $rc): ${headings[$i]} --" >&2
-            status=1
-        fi
-    done
-    trap - INT TERM
-    rm -rf "$dir"
-    return "$status"
-}
 
 run_web() {
-    [ -d web/node_modules ] || npm --prefix web ci
-    # The browser tunnel (DESK-7, ADR 0130) is generated and gitignored, so a
-    # fresh checkout has no module for the loader's dynamic import to resolve
-    # and `vite build` fails outright — it cannot bundle an unresolvable
-    # specifier, and a stub is not an option because the design refuses to
-    # silently degrade a Home to unreachable. Built on absence, exactly the way
-    # node_modules above is: a developer pays once, CI pays every run because
-    # its checkout is always fresh.
-    # Both modules, because either one missing fails the build the same way.
-    { [ -f web/packages/control-plane-client/src/generated/tunnel.js ] \
-        && [ -f web/packages/control-plane-client/src/generated/directory.js ]; } \
-        || scripts/build-wasm.sh
-    [ -d ee/web/node_modules ] || npm --prefix ee/web ci
-    [ -d ee/sidecar/saml-verify/node_modules ] || npm --prefix ee/sidecar/saml-verify ci
-
-    # Everything below reads the installed trees and the generated modules above
-    # and writes only its own output — the vite builds each to their own
-    # `dist-*` — so the steps are independent, and they run at once. The
-    # transcripts still print in this order, each under its heading.
-    #
-    # Brand tokens: both guard the same rule from opposite ends — nothing here
-    # writes a brand value by hand. The first fails on a hex the vendored
-    # company tokens already name; the second fails when the published
-    # customization file is not what the panel defaults actually resolve to.
-    # The embed carried a forked palette for as long as neither existed.
-    #
-    # CSS renderers: a stylesheet with no renderer is invisible to everything
-    # else here — the brand-token scan reads it, the typecheck compiles around
-    # it, vite bundles it, and the minifier ships it to a customer. Nothing
-    # asked whether anything drew it, which is how two component removals left
-    # 219 rules behind.
-    parallel_steps \
-        "== brand tokens ==" \
-        "node scripts/check-brand-tokens.mjs; node web/scripts/render-embed-theme.mjs --check" \
-        "== css renderers ==" \
-        "node scripts/check-css-renderers.mjs" \
-        "== web typecheck ==" \
-        "npm --prefix web run typecheck" \
-        "== web typecheck (each client in isolation) ==" \
-        "npm --prefix web run typecheck:split" \
-        "== web tests ==" \
-        "npm --prefix web run test" \
-        "== web build: open ==" \
-        "npm --prefix web run build:open" \
-        "== web build: embed ==" \
-        "npm --prefix web run build:embed" \
-        "== web build: apps (open) ==" \
-        "npm --prefix web run build:apps:open" \
-        "== enterprise web tests ==" \
-        "npm --prefix ee/web test" \
-        "== enterprise web typecheck ==" \
-        "npm --prefix ee/web run typecheck" \
-        "== enterprise web build ==" \
-        "npm --prefix ee/web run build" \
-        "== saml verify sidecar ==" \
-        "npm --prefix ee/sidecar/saml-verify test"
+    gate_section web
 }
 
 # The dependency audit lives here rather than in a workflow step so that the
@@ -541,34 +403,6 @@ run_web() {
 # risk-accepted.
 advisories_unavailable=0
 
-audit_npm_tree() {
-    local dir="$1" output attempt
-
-    for attempt in 1 2 3; do
-        if output="$(npm --prefix "$dir" audit --omit=dev --json 2>&1)"; then
-            echo "$dir: no production advisories"
-            return 0
-        fi
-
-        if printf '%s' "$output" | node scripts/npm-audit-outcome.mjs; then
-            # Re-run for the human-readable report: the operator needs the
-            # advisory, not the JSON this classification read.
-            npm --prefix "$dir" audit --omit=dev || true
-            echo "production advisories found in $dir" >&2
-            return 1
-        fi
-
-        if [ "$attempt" -lt 3 ]; then
-            sleep "$((attempt * 5))"
-        fi
-    done
-
-    advisories_unavailable=$((advisories_unavailable + 1))
-    echo "!! ADVISORIES NOT AUDITED for $dir: npm answered no report in 3 attempts." >&2
-    echo "!! This says nothing about $dir — the next run audits it again." >&2
-    printf '%s\n' "$output" | tail -3 >&2
-    return 0
-}
 
 # $1 = "best-effort" (a developer asking for this section, and `all`) or
 # "required" (the security-baseline CI job), which decides whether an absent
@@ -580,112 +414,16 @@ run_dependencies() {
     local prerequisites="${1:-best-effort}"
 
     echo "== production dependency advisories =="
-    # RustSec's advisory database is a third party, and the subject of this gate
-    # is the lockfiles this repository tracks. Those are different things, and a
-    # failure of the second used to be reported as a failure of the first — the
-    # same shape as the npm outage handled below, which failed a green bar four
-    # runs running over a tree nobody had touched.
-    #
-    # The cargo half recovers better, because the database is a git checkout
-    # that persists: an unreachable RustSec means "audited against the copy on
-    # disk", not "not audited". `resolve_advisory_database` separates reaching
-    # it from auditing against it, and its own tests run in the contracts
-    # section.
-    # shellcheck source=scripts/advisory-database.sh
-    source scripts/advisory-database.sh
-    resolve_advisory_database
-
-    # `prerequisite` is first so that it always evaluates: behind the database
-    # test it would never be reached on a host whose RustSec copy is missing,
-    # and the gate would pass with cargo-audit absent.
-    if prerequisite cargo-audit "the cargo advisory audit" "cargo install cargo-audit" \
-       && [ "$ADVISORY_DB_MISSING" -eq 0 ]; then
-        # Before trusting a clean audit, check that these flags can still report
-        # a dirty one.
-        assert_findings_still_fail
-
-        # Unquoted on purpose: ADVISORY_DB_FLAGS is a flag list this repository
-        # sets from a fixed set of literals, never from input.
-        # shellcheck disable=SC2086
-        cargo audit $ADVISORY_DB_FLAGS --file Cargo.lock
-        # shellcheck disable=SC2086
-        cargo audit $ADVISORY_DB_FLAGS --file src-tauri/Cargo.lock
-        # shellcheck disable=SC2086
-        cargo audit $ADVISORY_DB_FLAGS --file src-tauri-mobile/Cargo.lock
-    fi
-
-    # cargo-deny adds the license, bans, and source policy that cargo audit does
-    # not cover (deny.toml at the repo root, SOC 2 remediation 4.1). It operates
-    # per-manifest, so it runs once per workspace, next to the matching audit
-    # above. The advisories subcommand is deliberately excluded here: cargo audit
-    # is the single enforcing advisory gate on all three lockfiles, so running a
-    # moving advisory database through this gate too would only add
-    # nondeterministic breakage. This gate is licenses, bans, and sources only —
-    # the same split the whipplescript and cloud gates use.
-    if prerequisite cargo-deny "the supply-chain policy check" "cargo install cargo-deny --locked"; then
-        for manifest in Cargo.toml src-tauri/Cargo.toml src-tauri-mobile/Cargo.toml; do
-            cargo deny --manifest-path "$manifest" check licenses bans sources
-        done
-    fi
-
-    # Production only. The dev trees are vite, wrangler, and playwright, none of
-    # which reach a user.
-    #
-    # npm's advisory service is a third party too, and the same split applies: a
-    # finding is a fact about this repository and hard-fails; an unreachable
-    # endpoint is a fact about npm, and is retried, reported in a line nobody can
-    # miss, and survived. On 2026-09-04 the bulk advisories endpoint spent an
-    # hour answering `Service Unavailable`, which read here as a broken tree.
-    #
-    # `scripts/npm-audit-outcome.mjs` decides which of the two a non-zero exit
-    # was. It is a separate file with its own tests because misreading a finding
-    # as an outage is the one way this could hide a known-vulnerable dependency
-    # behind a warning nobody has to clear.
-    while IFS= read -r lock; do
-        audit_npm_tree "${lock%/package-lock.json}"
-    done < <(find . -name package-lock.json -not -path '*/node_modules/*' -print)
+    gate_section dependencies
 }
 
-# The desktop shell is its own cargo workspace, so nothing in `rust` above
-# compiles it. `--locked` is half the point: it fails when `src-tauri/Cargo.lock`
-# has drifted from its manifest, which is the state this section was written in
-# — the committed lock did not describe what a build resolved.
-#
-# Only the compile needs the native libraries. `cargo metadata --locked`
-# resolves the dependency graph without running a single build script, so the
-# drift half of this section is portable and runs unconditionally.
-desktop_prerequisites_present() {
-    # Tauri uses the system webview on macOS and Windows; only Linux needs the
-    # GTK/WebKit development packages.
-    [ "$(uname -s)" = "Linux" ] || return 0
-    command -v pkg-config >/dev/null 2>&1 || return 1
-    pkg-config --exists gtk+-3.0 webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 librsvg-2.0
-}
 
 # $1 = "required" (the `desktop` section and CI) or "best-effort" (inside `all`),
 # which decides whether absent GTK/WebKit libraries fail or are reported.
 run_desktop() {
     local prerequisites="${1:-required}"
     echo "== desktop shell =="
-
-    echo "-- lockfile is in sync with the manifest --"
-    cargo metadata --manifest-path src-tauri/Cargo.toml --locked --format-version 1 >/dev/null
-
-    if desktop_prerequisites_present; then
-        cargo check --manifest-path src-tauri/Cargo.toml --locked
-        return
-    fi
-
-    local missing="libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev"
-    if [ "$prerequisites" = required ]; then
-        echo "desktop shell compile requires GTK and WebKit development libraries." >&2
-        echo "install: sudo apt-get install -y $missing" >&2
-        exit 1
-    fi
-
-    echo "-- desktop shell compile SKIPPED: GTK/WebKit development libraries absent --" >&2
-    echo "   the lockfile check above still ran, and the native-shells CI job compiles it on every" >&2
-    echo "   pull request. To close the gap locally: sudo apt-get install -y $missing" >&2
+    gate_section desktop
 }
 
 # The release ships an MSI, and every gate above is Linux, so a change breaking
@@ -695,99 +433,16 @@ run_desktop() {
 # it cannot answer instead of passing silently.
 run_windows() {
     echo "== windows compile =="
-    scripts/check-windows-compile.sh
+    gate_section windows
 }
 
-# The mobile shell is a third cargo workspace, and it had the same two problems
-# the desktop one did: its lockfile had drifted from its manifest, and nothing
-# compiled it on a change — only `mobile-release.yml`, on dispatch.
-#
-# It compiles twice, because no single compile sees both halves of the crate.
-# `--target aarch64-linux-android` is the half that matters, and a host check
-# cannot stand in for it: only the mobile target sets `cfg(mobile)` and
-# `target_os = "android"`, so only it compiles
-# `plugins/device-identity/src/mobile.rs`, the plugin's command layer against
-# that implementation rather than the desktop one, and the barcode-scanner
-# registration behind the `cfg(any(target_os = "android", target_os = "ios"))`
-# target table. Those are the release-critical paths, and a host check omits
-# every one of them. The host check stays for what the mobile target drops in
-# turn — `plugins/device-identity/src/desktop.rs`, which no other workspace
-# compiles.
-#
-# Neither compile needs an Android NDK. `cargo check` emits metadata and never
-# links a target artifact, so the graph's one C dependency — `ring`, through
-# `rustls` — only needs a compiler that accepts its sources; nothing consumes
-# the objects. `gcc-aarch64-linux-gnu` supplies one for the ~30 MB an apt
-# package costs, against the ~1 GB of an SDK this check does not otherwise use.
-# The iOS-only bindings and the generated platform projects still belong to
-# `mobile-release.yml`, which has the SDKs and is where they are genuinely
-# required.
-mobile_target_prerequisites_present() {
-    rustup target list --installed 2>/dev/null | grep -qx aarch64-linux-android || return 1
-    command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || return 1
-    command -v aarch64-linux-gnu-ar >/dev/null 2>&1
-}
 
 run_mobile() {
     local prerequisites="${1:-required}"
     echo "== mobile shell =="
-
-    echo "-- lockfile is in sync with the manifest --"
-    cargo metadata --manifest-path src-tauri-mobile/Cargo.toml --locked --format-version 1 >/dev/null
-
-    local install_target="rustup target add aarch64-linux-android && sudo apt-get install -y gcc-aarch64-linux-gnu"
-    echo "-- mobile cfg paths compile for an Android target --"
-    if mobile_target_prerequisites_present; then
-        # cc-rs looks up an `aarch64-linux-android-` prefixed toolchain by name,
-        # which only an NDK installs; name the cross toolchain instead so
-        # `ring`'s build script runs. Nothing links what it emits.
-        CC_aarch64_linux_android=aarch64-linux-gnu-gcc \
-        AR_aarch64_linux_android=aarch64-linux-gnu-ar \
-            cargo check --manifest-path src-tauri-mobile/Cargo.toml --locked \
-            --target aarch64-linux-android
-    elif [ "$prerequisites" = required ]; then
-        echo "mobile target compile requires the Android standard library and an aarch64 cross toolchain." >&2
-        echo "install: $install_target" >&2
-        exit 1
-    else
-        echo "-- mobile target compile SKIPPED: Android std or aarch64 cross toolchain absent --" >&2
-        echo "   this is the half that compiles the mobile-only code; the native-shells CI job runs" >&2
-        echo "   it on every pull request. To close the gap locally: $install_target" >&2
-    fi
-
-    # Same Tauri crates as the desktop shell, so the same native libraries and
-    # the same predicate.
-    echo "-- host compile --"
-    if desktop_prerequisites_present; then
-        cargo check --manifest-path src-tauri-mobile/Cargo.toml --locked
-        return
-    fi
-
-    local missing="libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev"
-    if [ "$prerequisites" = required ]; then
-        echo "mobile shell host compile requires GTK and WebKit development libraries." >&2
-        echo "install: sudo apt-get install -y $missing" >&2
-        exit 1
-    fi
-
-    echo "-- mobile shell host compile SKIPPED: GTK/WebKit development libraries absent --" >&2
-    echo "   the lockfile check above still ran, and the native-shells CI job compiles it on every" >&2
-    echo "   pull request. To close the gap locally: sudo apt-get install -y $missing" >&2
+    gate_section mobile
 }
 
-# How a section resolves a prerequisite the host has not got. The word is the
-# same everywhere, and anything else — including a mistyped flag — resolves to
-# `required`, so a typo can never quietly buy a skip.
-#
-# Which caller has to say it differs, and that follows from what the section
-# name means. `desktop` and `mobile` exist to run a compile, so asking for one
-# by name is asking for that compile: they enforce by default, and `all` names
-# `best-effort`. `contracts` is two dozen checks of which the strict documentation
-# build is one, so asking for it by name is not asking for mkdocs: it is
-# best-effort by default, and the contracts CI job names `required` (ci.yml).
-prerequisite_policy() {
-    if [ "${1:-}" = best-effort ]; then echo best-effort; else echo required; fi
-}
 
 # A step whose tool this host has not installed. Returns non-zero when the
 # caller must skip, so a guarded step reads `if prerequisite …; then`; under
@@ -801,19 +456,6 @@ prerequisite_policy() {
 #
 #   $1 the tool, $2 what it gates, $3 the command that installs it
 skipped_prerequisites=""
-prerequisite() {
-    command -v "$1" >/dev/null 2>&1 && return 0
-    if [ "$prerequisites" = required ]; then
-        echo "$2 requires $1." >&2
-        echo "install: $3" >&2
-        exit 1
-    fi
-    echo "-- $2 SKIPPED: $1 is not installed --" >&2
-    echo "   the security-baseline CI job installs it and runs this on every pull request." >&2
-    echo "   To close the gap locally: $3" >&2
-    skipped_prerequisites="${skipped_prerequisites:+$skipped_prerequisites; }$2 not run"
-    return 1
-}
 
 # How `all` runs one section, named rather than inlined because it is the seam
 # `scripts/check-lanes.test.mjs` replaces. Sourcing this file defines the
@@ -880,6 +522,18 @@ end_alongside() {
 # ignored SIGINT, and an interrupted bar would leave three sections running to
 # completion. The trap ends every group.
 run_all() {
+    # One word for every lane of this run, exported for the same reason the
+    # nonce is: `all` starts three lanes at once, each a fresh invocation of
+    # this script, and the word is part of every Buck2 action's key. Two
+    # different words are two different CONFIGURATIONS arriving at one daemon
+    # together, and the daemon answers by cancelling a transaction — a lane
+    # failing for a reason that has nothing to do with the tree.
+    #
+    # best-effort is what `all` means: it is a developer's bar, and the lanes
+    # that take no word have no prerequisite-guarded step for it to change.
+    # The gate asks for lanes one at a time, with its own word, in sequence.
+    export prerequisites=best-effort
+
     local failed=()
     local lane rc index
     local transcripts
@@ -998,22 +652,11 @@ dispatch "$section" "${2:-}"
 # The bar says what it actually established. A run that could not reach an
 # advisory service passed everything it could assert and must not read as though
 # it had asserted that too.
-unasserted=""
-if [ "$advisories_unavailable" -gt 0 ]; then
-    unasserted="npm advisories unaudited for $advisories_unavailable tree(s)"
-fi
-if [ "${ADVISORY_DB_MISSING:-0}" -gt 0 ]; then
-    unasserted="${unasserted:+$unasserted; }cargo advisories unaudited"
-elif [ "${ADVISORY_DB_STALE:-0}" -gt 0 ]; then
-    unasserted="${unasserted:+$unasserted; }cargo advisories from an unrefreshed database"
-fi
-
-# A step that did not run for want of a tool is the same kind of fact as an
-# advisory service that could not be reached: the bar must not read as though it
-# had asserted what it skipped.
-if [ -n "$skipped_prerequisites" ]; then
-    unasserted="${unasserted:+$unasserted; }$skipped_prerequisites"
-fi
+# An advisory service that could not be reached, a database that was not
+# refreshed, a step that did not run for want of a tool: all the same kind of
+# fact, and all reported by the section that met them, as `#unasserted:` lines
+# the dispatcher collected.
+unasserted="$section_unasserted"
 
 if [ -n "$unasserted" ]; then
     echo "== gaugedesk green bar PASSED ($section — $unasserted) =="
