@@ -18,6 +18,7 @@ fn manifest(holder: &SigningKey) -> ExportManifest {
             holder_id: "device:studio-mac".into(),
             recipient_pubkey: holder.public_key().as_str().to_owned(),
         },
+        signer_kind: SignerKind::SelfManaged,
         entries: vec![
             ManifestEntry {
                 kind: "project".into(),
@@ -175,4 +176,37 @@ fn an_unsupported_version_or_an_empty_cut_is_refused() {
         sign_manifest(&source, empty).unwrap_err(),
         ExportError::Malformed
     );
+}
+
+/// The whole point of recording who signed is that a restore can tell an
+/// operator-produced cut from a tenant-produced one. That only holds if the
+/// field is inside the signature: a signer kind merely carried beside the
+/// manifest could be rewritten by anyone handling the artifact, and the lie
+/// would be the exact lie DR-0122 accepted the weaker claim in order to avoid.
+#[test]
+fn the_signer_kind_cannot_be_upgraded_after_signing() {
+    let home = key(1);
+    let holder = key(2);
+    let mut operator_signed = manifest(&holder);
+    operator_signed.signer_kind = SignerKind::OperatorManaged;
+    let signed = sign_manifest(&home, operator_signed).unwrap();
+    assert_eq!(signed.manifest.signer_kind, SignerKind::OperatorManaged);
+    verify_artifact(&signed, CIPHERTEXT).unwrap();
+
+    // Someone handling the artifact rewrites the one field that says whose
+    // claim this is, and changes nothing else.
+    let mut upgraded = signed.clone();
+    upgraded.manifest.signer_kind = SignerKind::SelfManaged;
+    assert!(
+        verify_artifact(&upgraded, CIPHERTEXT).is_err(),
+        "a rewritten signer kind verified: an operator's cut can be passed off as the tenant's"
+    );
+
+    // And the reverse, so the test is about the field being bound rather than
+    // about one direction being special.
+    let tenant_signed = sign_manifest(&home, manifest(&holder)).unwrap();
+    assert_eq!(tenant_signed.manifest.signer_kind, SignerKind::SelfManaged);
+    let mut downgraded = tenant_signed;
+    downgraded.manifest.signer_kind = SignerKind::OperatorManaged;
+    assert!(verify_artifact(&downgraded, CIPHERTEXT).is_err());
 }

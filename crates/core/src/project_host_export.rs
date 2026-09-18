@@ -51,6 +51,36 @@ pub struct ManifestEntry {
     pub bytes: u64,
 }
 
+/// Which Home signed this manifest, and therefore what its signature means.
+///
+/// A self-managed Home signs with a governance root it generated and holds, so
+/// its signature attests that the Home the tenant runs produced this cut. A
+/// managed Home signs with a key the operator generated and holds on the
+/// tenant's behalf, so its signature attests that the operator produced the cut
+/// — not that the tenant asked for one. That is a weaker claim, and it is
+/// recorded rather than smoothed over so a restore can say which it is looking
+/// at (GaugeWright DR-0122).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignerKind {
+    /// The tenant runs this Home and holds its governance root.
+    SelfManaged,
+    /// The operator runs this Home and holds the key that signed.
+    OperatorManaged,
+}
+
+impl SignerKind {
+    /// Stable token for the signing preimage. Written out rather than derived
+    /// from the enum's name so renaming a variant cannot silently change what
+    /// every previously signed manifest verifies against.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SelfManaged => "self-managed",
+            Self::OperatorManaged => "operator-managed",
+        }
+    }
+}
+
 /// The selected recovery holder, by stable identity and public recipient key.
 /// The private half never leaves the device's operating-system key store, and
 /// never appears in this type, a receipt, a transcript, or operator storage.
@@ -72,6 +102,9 @@ pub struct ExportManifest {
     /// restoring rather than "the latest".
     pub cut_basis: String,
     pub holder: RecoveryHolder,
+    /// Signed, not merely carried: a restore that trusted an unsigned signer
+    /// kind could be told an operator-produced cut was tenant-produced.
+    pub signer_kind: SignerKind,
     pub entries: Vec<ManifestEntry>,
     /// Digest of the sealed artifact as it crosses. A restore checks this
     /// before it decrypts, which is what makes a modified artifact a refusal
@@ -122,6 +155,7 @@ pub fn manifest_signing_bytes(manifest: &ExportManifest) -> Vec<u8> {
         encode(&manifest.cut_basis),
         encode(&manifest.holder.holder_id),
         manifest.holder.recipient_pubkey.clone(),
+        manifest.signer_kind.as_str().to_owned(),
         manifest.ciphertext_sha256.clone(),
         manifest.created_at.to_string(),
         manifest.entries.len().to_string(),
