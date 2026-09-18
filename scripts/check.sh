@@ -38,6 +38,12 @@
 # dispatch — ever compiled it. Leaving a shell out of CI entirely was worse: #125
 # landed a call to a crate the shell does not depend on, and nothing noticed for
 # a week because only `release.yml` ever built it.
+#
+# `contracts` carries the same split for the same reason and resolves it the
+# other way round, because the section is not its documentation build: a bare
+# `scripts/check.sh contracts` reports an absent mkdocs and runs everything
+# else, while the contracts CI job asks for `required` and refuses. See
+# prerequisite_policy.
 set -euo pipefail
 
 # `all` runs each section as a child invocation of this same script (see
@@ -54,6 +60,30 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 section="${1:-all}"
 
+# Stage 2 of the Buck2 migration (GaugeWright BUILD.md, DR-0124): each pure
+# section of the contracts lane is a Buck2 target declaring what it reads. When
+# this checkout is a cell of a materialized workspace, a section runs through
+# Buck2, which spares the re-run when nothing the section declares has changed
+# and otherwise runs scripts/section.sh exactly as the direct path does. When
+# it is not — a worktree, a CI runner, a host without buck2 — the same script
+# runs directly. Same order, same command, same output, same verdict; Buck2 is
+# under this bar, never beside it. Inside a Buck2 action already running the
+# whole bar, the direct path is taken so no nested client meets the daemon.
+# (`section` is the lane variable above, hence the name.)
+via_buck2=""
+if [ -z "${GREEN_BAR_INSIDE_BUCK2:-}" ] && command -v buck2 >/dev/null 2>&1 \
+   && buck2 audit cell 2>/dev/null | grep -qx "gaugedesk: $(pwd -P)"; then
+  via_buck2=1
+fi
+gate_section() {
+  if [ -n "$via_buck2" ]; then
+    local log; log="$(buck2 build "//:$1" --show-full-simple-output)"
+    cat "$log"
+  else
+    prerequisites="${prerequisites:-required}" scripts/section.sh "$1"
+  fi
+}
+
 # The Debian archive tooling `scripts/test-apt-repository.sh` drives. On Linux,
 # every runner that builds a package and every machine that installs one has it,
 # so an absence there is a workstation missing `dpkg-dev`, not a platform that
@@ -65,9 +95,15 @@ apt_repository_prerequisites_present() {
     done
 }
 
+# $1 = "best-effort" (a developer asking for this section, and `all`) or
+# "required" (the contracts CI job), which decides whether an absent docs
+# toolchain is reported or fails. See prerequisite_policy for why the default
+# runs the other way from the native shells'.
 run_contracts() {
+    local prerequisites="${1:-best-effort}"
+
     echo "== agent guide =="
-    node scripts/check-agent-guide.mjs
+    gate_section agent-guide
 
     # This script's own composition. `all` running every section and reporting
     # the failures together is a property with no line number — it shows only in
@@ -75,27 +111,25 @@ run_contracts() {
     # section working and every gate green. It is checked here because
     # `contracts` is a required context and this needs nothing but bash.
     echo "== check composition =="
-    node --test scripts/check-lanes.test.mjs scripts/check-live-fabric.test.mjs
+    gate_section check-composition
 
     echo "== architecture boundaries =="
-    python3 scripts/architecture-check.py
+    gate_section architecture-boundaries
 
     echo "== license boundary =="
-    python3 scripts/check-license-boundary.py
+    gate_section license-boundary
 
     echo "== product contracts =="
-    node scripts/check-product-contracts.mjs --enforce-local-evidence
+    gate_section product-contracts
 
     echo "== GaugeApp page/action contract =="
-    node scripts/check-gaugeapps-contract.mjs
+    gate_section gaugeapp-contract
     # The contract being well formed is not the same as the product having
     # built it. This proves every contracted operation exists in a tracked
     # source, or is named as a gap that has not been built yet.
-    node scripts/check-gaugeapp-operation-coverage.mjs
 
     echo "== action provenance inventory =="
-    node scripts/check-action-provenance.mjs
-    node --test scripts/check-action-provenance.test.mjs
+    gate_section action-provenance
 
     echo "== WhippleScript workstream host contract =="
     node scripts/check-whipplescript-workstream-contract.mjs
@@ -106,11 +140,10 @@ run_contracts() {
     # whether its report is sufficient to price FROM is a question only a
     # consumer can answer, and this is where the answer is kept.
     echo "== WhippleScript stats report contract =="
-    node scripts/check-whipplescript-stats-report.mjs
+    gate_section stats-report-contract
 
     echo "== TokenWright native-control metadata =="
-    node scripts/check-tokenwright-environment.mjs
-    node scripts/check-tokenwright-carried-surface.mjs
+    gate_section tokenwright-metadata
 
     # The updater endpoint is compiled into every shipped binary and cannot be
     # corrected for a client that already has it, so its mistakes are permanent
@@ -118,7 +151,7 @@ run_contracts() {
     # {{current_version}} keeps working — right up until a key rotation strands
     # every client not already on the current key (DR-0080).
     echo "== updater endpoint =="
-    node scripts/check-updater-endpoint.mjs
+    gate_section updater-endpoint
 
     # The neighbouring release fact, and it fails the same way: silently, in the
     # field. A release derives its version from its tag, and the version the app
@@ -127,7 +160,7 @@ run_contracts() {
     # then told the user, and every Home it spoke to, that it was 0.4.5. Every
     # gate was green throughout.
     echo "== release version sources =="
-    python3 scripts/check-release-version-sources.py
+    gate_section release-version-sources
 
     # The other bundle fact nothing else looks at. `generate_context!` requires
     # only that an icon be RGBA, which a flattened matte satisfies, so an icon
@@ -137,46 +170,27 @@ run_contracts() {
     # It runs here rather than in `desktop` because reading a PNG needs none of
     # what linking a Tauri shell needs.
     echo "== app icons =="
-    node scripts/check-app-icons.mjs
+    gate_section app-icons
 
     # The artifact side of the same manifest: what a built bundle says about the
     # contract it holds, and the canonical digest both this section and the
     # hosted surfaces compare (DR-0051). A test no section names is a test
     # nothing runs, which is the state this one was committed in.
     echo "== release identity =="
-    node --test scripts/build-release-identity.test.mjs
+    gate_section release-identity
 
     # The desktop sign-in helper. It is plain node with no npm tree of its own, so
     # it runs here rather than in `web`. What it guards is the fixed loopback
     # callback port: every way the helper can fail to let go of it is a way to
     # break the next sign-in, and nothing ran this file's subject before.
     echo "== codex login helper =="
-    node --test sidecar/codex-oauth-login.test.mjs
+    gate_section codex-login-helper
 
     echo "== production canary contract =="
-    node scripts/check-production-canaries.mjs
-    node --test \
-        scripts/canary-preflight.test.mjs \
-        scripts/provision-canary.test.mjs \
-        scripts/check-production-canaries.test.mjs \
-        scripts/production-wiring-canary.test.mjs \
-        scripts/run-production-wiring-canaries.test.mjs \
-        scripts/wiring-canary/runners.test.mjs \
-        scripts/wiring-canary/administration-agent-erasure.test.mjs \
-        scripts/wiring-canary/account-boxes.test.mjs \
-        scripts/wiring-canary/totp.test.mjs \
-        scripts/wiring-canary/capture-provider-state.test.mjs \
-        scripts/wiring-canary/diagnostic.test.mjs \
-        scripts/wiring-canary/hosted-account-session.test.mjs \
-        scripts/wiring-canary/managed-entitlement-mint.test.mjs \
-        scripts/wiring-canary/poll.test.mjs \
-        web/e2e/production-account-session-canary.test.mjs \
-        web/e2e/production-passkey-account-canary.test.mjs \
-        web/e2e/production-native-session-canary.test.mjs
+    gate_section production-canary-contract
 
     echo "== client calls =="
-    node --test scripts/check-client-calls.test.mjs
-    node scripts/check-client-calls.mjs
+    gate_section client-calls
 
     # Absence has no line number: a crate nothing compiles and a lockfile
     # nothing audits look exactly like a crate and a lockfile. This enumerates
@@ -191,12 +205,10 @@ run_contracts() {
     # non-zero audit fails this run, so the one way either could hide a real
     # vulnerability is by being wrong in the safe-looking direction.
     echo "== advisory outcome classification =="
-    node --test scripts/npm-audit-outcome.test.mjs
-    bash scripts/advisory-database.test.sh
+    gate_section advisory-classification
     # The same question one layer down: the bounded apt install decides
     # whether a runner's failing vendor index reddens a healthy tree, and
     # tolerating one must not tolerate a package that never installed.
-    bash scripts/apt-install-action.test.sh
 
     # The archive one layer up: that a built package is what the archive will
     # accept, that the indexes and signatures an `apt-get update` reads are the
@@ -230,7 +242,7 @@ run_contracts() {
     fi
 
     echo "== build coverage =="
-    node scripts/check-build-coverage.mjs
+    gate_section build-coverage
 
     # A job either blocks a merge or says why it does not, and a blocking job has
     # to be one that always reports (DR-0069 OPS-21). Reconciling the tables with
@@ -238,16 +250,14 @@ run_contracts() {
     # cannot, so that half is an operator command:
     #   python3 scripts/check-gate-enforcement.py --verify-protection GaugeWright/gaugedesk-src
     echo "== gate enforcement =="
-    python3 scripts/check-gate-enforcement.py
-    python3 scripts/check-gate-enforcement.py --self-test
+    gate_section gate-enforcement
 
     # Every place a failure is allowed not to count says which kind it is:
     # re-raised downstream, or tolerated. Whether a tolerated one has ever
     # actually worked is asked across every repository at once by
     # `tools/never-succeeded.mjs` in the GaugeWright repository, not here.
     echo "== suppressions =="
-    python3 scripts/check-suppressions.py
-    python3 scripts/check-suppressions.py --self-test
+    gate_section suppressions
 
     # The projection is default-deny, so a published workflow can reference a
     # path that is not published and nothing here notices — the private tree
@@ -259,13 +269,13 @@ run_contracts() {
     # tree itself, and the answer decides whether a bundle can build at all on
     # two of the three platforms a release targets.
     echo "== case collisions =="
-    node scripts/check-case-collisions.mjs
+    gate_section case-collisions
 
     echo "== mirror projection =="
-    node scripts/check-mirror-projection.mjs
+    gate_section mirror-projection
 
     echo "== spec audit =="
-    python3 scripts/audit-gate.py
+    gate_section spec-audit
 
     # `validation.anchors: warn` in mkdocs.yml only rejects a broken heading
     # link if something runs the strict build *before* the merge, and for a
@@ -280,19 +290,29 @@ run_contracts() {
     # caught before it reaches a publish rather than by one.
     #
     # Output goes to the gitignored `site/`.
+    #
+    # mkdocs is not a tool this host is missing the way a Mac is missing
+    # `dpkg-scanpackages`; it is one a workstation has not installed yet, which
+    # is the harder case the shared agent guide draws a line through. Failing
+    # every run of this section on a machine without the docs toolchain said
+    # nothing about the change under test — the two dozen checks above had already
+    # answered everything they could — and a red bar that is about the host is
+    # how a reader learns to wave red through. So the section reports the gap
+    # and names the command that closes it, and the gate refuses.
+    #
+    # What the gate covers is unchanged. The contracts CI job installs
+    # `docs/requirements.txt` in the step immediately before it and asks for
+    # `required` (ci.yml), so a dropped install step reddens the gate rather
+    # than quietly buying itself a skip.
+    #
+    # The theme check goes with the build rather than after it, because it reads
+    # the built site: with no `site/` it fails for want of a build that did not
+    # run, and with a stale one it answers about an older tree. Its other half —
+    # whether this repository still carries the theme it was given — is asked
+    # across every repository at once by `tools/docs-theme.mjs --check` in the
+    # GaugeWright repository.
     echo "== documentation =="
-    command -v mkdocs >/dev/null || {
-        echo "mkdocs is not installed; run: python3 -m pip install -r docs/requirements.txt" >&2
-        exit 1
-    }
-    mkdocs build --strict
-    # Rendered from tools/docs-theme/repo-check.mjs in the GaugeWright
-    # repository, which owns the documentation theme (DR-0093). It verifies both
-    # that this repository still carries what was rendered into it and that the
-    # theme reached the built page: --strict fails on a missing custom_dir but
-    # resolves neither extra_css nor a template's own references, so a build that
-    # lost its stylesheet, mark, or faces exits zero.
-    node scripts/check-docs-theme.mjs
+    gate_section documentation
 }
 
 run_rust() {
@@ -715,9 +735,16 @@ run_mobile() {
     echo "   pull request. To close the gap locally: sudo apt-get install -y $missing" >&2
 }
 
-# `all` asks the desktop and mobile sections for best-effort prerequisites
-# through a second word. Anything else — including a mistyped flag — is a direct
-# invocation, which is the enforced gate and refuses to skip.
+# How a section resolves a prerequisite the host has not got. The word is the
+# same everywhere, and anything else — including a mistyped flag — resolves to
+# `required`, so a typo can never quietly buy a skip.
+#
+# Which caller has to say it differs, and that follows from what the section
+# name means. `desktop` and `mobile` exist to run a compile, so asking for one
+# by name is asking for that compile: they enforce by default, and `all` names
+# `best-effort`. `contracts` is two dozen checks of which the strict documentation
+# build is one, so asking for it by name is not asking for mkdocs: it is
+# best-effort by default, and the contracts CI job names `required` (ci.yml).
 prerequisite_policy() {
     if [ "${1:-}" = best-effort ]; then echo best-effort; else echo required; fi
 }
@@ -769,6 +796,9 @@ run_all() {
 
     for lane in contracts rust web desktop mobile windows dependencies; do
         rc=0
+        # `contracts` needs no word here: a section name alone already means
+        # best-effort for it, and `all` wants exactly what a developer asking
+        # for that section wants. See prerequisite_policy.
         case "$lane" in
             desktop|mobile) lane_runner "$lane" best-effort || rc=$? ;;
             *) lane_runner "$lane" || rc=$? ;;
@@ -806,7 +836,7 @@ run_all() {
 dispatch() {
     case "${1:-all}" in
         all) run_all ;;
-        contracts) run_contracts ;;
+        contracts) run_contracts "$(prerequisite_policy "${2:-best-effort}")" ;;
         dependencies) run_dependencies ;;
         desktop) run_desktop "$(prerequisite_policy "${2:-}")" ;;
         mobile) run_mobile "$(prerequisite_policy "${2:-}")" ;;

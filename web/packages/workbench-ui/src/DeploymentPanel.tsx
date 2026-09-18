@@ -12,6 +12,7 @@ import type {
     PublicDeploymentOutcome,
 } from "@gaugewright/control-plane-client";
 import { startDeploymentMonitor } from "./deployment-monitor";
+import { originsDraftFrom, originsFromDraft } from "./deployment-origins";
 
 export interface DeploymentPanelApi {
     publishDeployment(input: PublicDeploymentInput): Promise<PublicDeploymentOutcome>;
@@ -69,7 +70,9 @@ export function DeploymentPanel(props: {
     const ceilingDays = () => Math.max(1, Math.floor(profile().retention.absolute_ttl_seconds / 86_400));
     const [deploymentId, setDeploymentId] = createSignal(slug(props.selection.archetypeName));
     const [edgeOrigin, setEdgeOrigin] = createSignal(props.defaultEdgeOrigin);
-    const [allowedOrigin, setAllowedOrigin] = createSignal(
+    // The allowlist as the owner edits it, one origin per line; `deployment-origins`
+    // translates it to and from the list the publisher and the edge hold.
+    const [originsDraft, setOriginsDraft] = createSignal(
         typeof window === "undefined" ? "https://example.com" : window.location.origin,
     );
     const [fundingMode, setFundingMode] = createSignal<"managed" | "byok">("managed");
@@ -131,7 +134,7 @@ export function DeploymentPanel(props: {
             const found = await props.api.inspectDeployment(binding.edgeOrigin, binding.deploymentId);
             const config = found.deployment.config;
             setInspection(found);
-            setAllowedOrigin(config.allowed_origins[0] ?? "");
+            setOriginsDraft(originsDraftFrom(config.allowed_origins));
             setLimits({
                 total: config.max_spend_cents ?? 1_000,
                 session: config.max_session_spend_cents ?? 100,
@@ -194,7 +197,7 @@ export function DeploymentPanel(props: {
             placement_id: props.selection.placementId,
             deployment_id: deploymentId().trim(),
             edge_origin: edgeOrigin().trim(),
-            allowed_origins: [allowedOrigin().trim()],
+            allowed_origins: originsFromDraft(originsDraft()),
             max_spend_cents: value.total,
             max_session_spend_cents: value.session,
             max_turn_spend_cents: value.turn,
@@ -382,7 +385,9 @@ export function DeploymentPanel(props: {
                 <label class="settings-field"><span class="settings-label">Deployment ID</span><input class="settings-input" value={deploymentId()} onInput={(e) => setDeploymentId(e.currentTarget.value)} /></label>
                 <label class="settings-field"><span class="settings-label">Edge origin</span><input class="settings-input" value={edgeOrigin()} onInput={(e) => setEdgeOrigin(e.currentTarget.value)} /></label>
             </div>
-            <label class="settings-field"><span class="settings-label">Allowed website origin</span><input class="settings-input" value={allowedOrigin()} onInput={(e) => setAllowedOrigin(e.currentTarget.value)} /></label>
+            <label class="settings-field"><span class="settings-label">Allowed website origins</span>
+                <textarea class="settings-input deployment-origins" rows={Math.min(8, Math.max(2, originsDraft().split("\n").length))} spellcheck={false} value={originsDraft()} onInput={(e) => setOriginsDraft(e.currentTarget.value)} />
+                <span class="settings-hint">One exact HTTPS origin per line. Visitors are admitted from these origins only, compared exactly, so an apex domain and its www form are two entries.</span></label>
             <fieldset class="deployment-fieldset"><legend>Who pays for public turns?</legend>
                 <label class="settings-checkbox"><input type="radio" checked={managedFunding()} disabled={!managedTenants().length} onChange={() => setFundingMode("managed")} /> GaugeWright managed inference</label>
                 <Show when={managedFunding()}><label class="settings-field"><span class="settings-label">Funding account</span><select class="settings-input" value={managedTenantId()} onChange={(event) => setManagedTenantId(event.currentTarget.value)}>
@@ -432,6 +437,7 @@ export function DeploymentPanel(props: {
         <Show when={inspection()}>{(current) => <section class="admin-section"><h3>Live deployment</h3>
             <div class="member-list"><div class="member-row"><span>Status</span><span class="member-id">{current().deployment.lifecycle}</span></div>
                 <div class="member-row"><span>Release</span><span class="member-id">{current().deployment.active_release_id}</span></div>
+                <div class="member-row"><span>Origins</span><span class="member-id deployment-origin-list">{current().deployment.config.allowed_origins.join(" · ")}</span></div>
                 <div class="member-row"><span>Usage</span><span class="member-id">{current().deployment.settled_turns} turns · {current().deployment.spent_cents}¢ · {current().deployment.sessions} sessions</span></div></div>
             <div class="deployment-actions"><Show when={current().deployment.lifecycle === "active"}><button type="button" disabled={busy()} onClick={() => void control("pause")}>Pause</button></Show>
                 <Show when={current().deployment.lifecycle === "paused"}><button type="button" disabled={busy()} onClick={() => void control("resume")}>Resume</button></Show>

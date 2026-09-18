@@ -1602,6 +1602,11 @@ input {
     .embed-snippet { background: var(--bg); border: 1px solid var(--edge); border-radius: 4px;
         padding: 8px; overflow-x: auto; white-space: pre; font-size: var(--fs-small); }
     .deployment-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    /* The origin allowlist is edited one origin per line, so it is a textarea that
+       dresses like the inputs beside it and never wraps an origin mid-way. */
+    .deployment-origins { display: block; box-sizing: border-box; width: 100%; resize: vertical;
+        font: inherit; white-space: pre; overflow-x: auto; background: var(--bg); color: var(--ink);
+        border: 1px solid var(--edge); border-radius: 4px; }
     .deployment-preview { min-height: 360px; height: 55vh; border: 1px solid var(--edge);
         border-radius: 4px; overflow: hidden; margin-top: 8px; }
     .deployment-preview gw-session { display: block; height: 100%; }
@@ -2228,6 +2233,9 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     .member-list { list-style: none; margin: 0 0 10px; padding: 0; }
     .member-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--edge); }
     .member-row .member-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* A live deployment's admitted origins are a list, and every entry matters, so
+       this one id wraps instead of eliding the rest behind an ellipsis. */
+    .member-row .deployment-origin-list { white-space: normal; overflow-wrap: anywhere; }
     .member-row select { width: auto; }
     .member-status { color: var(--muted); font-size: var(--fs-small); }
     .badge { font-size: var(--fs-label); padding: 1px 5px; border: 1px solid var(--edge); border-radius: 3px; color: var(--muted); }
