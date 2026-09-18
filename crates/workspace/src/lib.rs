@@ -945,6 +945,19 @@ impl Instance {
         .and_then(|branch| branch.head_cut_id))
     }
 
+    /// One file as the mainline's head records it, read from the store: no
+    /// engagement, no branch, no worktree, no import, no cut. `None` when the
+    /// mainline has no such file. This is the read for a decision — whether a
+    /// migration has anything to do — that used to cost an engagement created
+    /// and discarded, and a worktree left behind, to ask.
+    pub fn read_main_file(&self, relative: &str) -> Result<Option<String>> {
+        Ok(NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?
+        .read(MAINLINE_BRANCH_ID, relative)?)
+    }
+
     /// Reclaim orphaned content (whip's conservative GC sweep): the
     /// residue of superseded saves and refused imports. Everything any
     /// recorded cut, branch pointer, resolution memory, or conflict row
@@ -2913,6 +2926,13 @@ pub trait Workspace: Send {
             "this workspace has no durable Main ref authority",
         ))
     }
+    /// One file as the mainline's head records it, with nothing created to
+    /// read it; `None` when the mainline has no such file.
+    fn read_main_file(&self, _relative: &str) -> Result<Option<String>> {
+        Err(WorkspaceError::msg(
+            "this workspace has no durable Main ref authority",
+        ))
+    }
     fn purge_unreachable_objects(&self) -> Result<()>;
     fn reconcile_engagements(&self) -> Result<Vec<(String, Box<dyn ChatWorkspace>)>>;
     fn create_workstream(&self, ws_id: &str) -> Result<()>;
@@ -3256,6 +3276,9 @@ impl Workspace for Instance {
     }
     fn current_main_cut(&self) -> Result<Option<String>> {
         Self::current_main_cut(self)
+    }
+    fn read_main_file(&self, relative: &str) -> Result<Option<String>> {
+        Self::read_main_file(self, relative)
     }
     fn purge_unreachable_objects(&self) -> Result<()> {
         Self::purge_unreachable_objects(self)
@@ -3701,6 +3724,33 @@ mod tests {
             empty.current_main_cut().expect("head").as_deref(),
             Some(first.0.as_str())
         );
+    }
+
+    #[test]
+    fn read_main_file_answers_from_the_mainline_head_and_creates_nothing() {
+        let (directory, workspace) = instance();
+        workspace
+            .seed_main(&[("a.txt", "a"), ("nested/b.json", "{\"b\": 1}")])
+            .expect("seed");
+        assert_eq!(
+            workspace
+                .read_main_file("nested/b.json")
+                .expect("read")
+                .as_deref(),
+            Some("{\"b\": 1}")
+        );
+        assert_eq!(workspace.read_main_file("absent.txt").expect("read"), None);
+        // It reads what the head records, so a later seed is what it answers.
+        workspace.seed_main(&[("a.txt", "a2")]).expect("reseed");
+        assert_eq!(
+            workspace.read_main_file("a.txt").expect("read").as_deref(),
+            Some("a2")
+        );
+        // And nothing was created to answer: no engagement line, no worktree.
+        let worktrees = directory.path().join("worktrees");
+        assert!(std::fs::read_dir(&worktrees)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true));
     }
 
     pub(super) fn observation_files(root: &Path) -> BTreeMap<PathBuf, String> {

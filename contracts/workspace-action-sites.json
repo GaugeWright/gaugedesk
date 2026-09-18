@@ -329,6 +329,14 @@
     },
     {
       "declaration": {
+        "name": "read_main_file",
+        "owner": "Workspace",
+        "signature": "fn read_main_file (& self , _relative : & str) -> Result < Option < String > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
         "name": "cut_descends_from",
         "owner": "Workspace",
         "signature": "fn cut_descends_from (& self , _descendant_cut : & str , _ancestor_cut : & str) -> Result < bool >"
@@ -4787,6 +4795,36 @@
         "file": "ee/app/src/gaugeapp_routes.rs"
       },
       "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "ability_manifests_need_migration",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "workspace . read_main_file (& manifest_path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "ability_manifests_need_migration",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "workspace . read_main_file (& path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::read_main_file",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "Self :: read_main_file (self , relative)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
     }
   ]
 }

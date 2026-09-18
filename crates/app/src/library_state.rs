@@ -843,87 +843,104 @@ fn migrate_agent_ability_manifests(
             continue;
         }
         let workspace = provider_for(providers, &target.id).open_at(&targets_dir.join(&target.id));
-        let engagement_id = library::gen_id("ability-migration");
-        let engagement = workspace.create_engagement(&engagement_id).map_err(io)?;
-        let result = (|| {
-            let mut changed = false;
-            let mut roots = vec![
-                gaugedesk_boundary::definition::DRAFT_ROOT.to_owned(),
-                crate::discipline::DISCIPLINE_DRAFT_ROOT.to_owned(),
-            ];
-            for version in archetype.versions.keys() {
-                roots.push(gaugedesk_boundary::definition::version_root(*version));
-                roots.push(crate::discipline::discipline_version_root(*version));
-            }
+        let mut roots = vec![
+            gaugedesk_boundary::definition::DRAFT_ROOT.to_owned(),
+            crate::discipline::DISCIPLINE_DRAFT_ROOT.to_owned(),
+        ];
+        for version in archetype.versions.keys() {
+            roots.push(gaugedesk_boundary::definition::version_root(*version));
+            roots.push(crate::discipline::discipline_version_root(*version));
+        }
 
-            for package_root in roots.iter().step_by(2) {
-                let manifest_path = format!(
-                    "{package_root}/{}",
-                    gaugedesk_boundary::definition::MANIFEST_FILE
-                );
-                let text = engagement.read_file(&manifest_path).map_err(io)?;
-                let mut manifest: serde_json::Value =
-                    serde_json::from_str(&text).map_err(invalid_data)?;
-                if manifest.get("agent_abilities").is_some() {
-                    continue;
-                }
-                let capabilities = manifest
-                    .get_mut("capabilities")
-                    .and_then(serde_json::Value::as_array_mut)
-                    .ok_or_else(|| invalid_data("legacy package has no capability registry"))?;
-                capabilities.retain(|capability| capability.as_str() != Some("human.ask"));
-                let abilities = capabilities.clone();
-                manifest["agent_abilities"] = serde_json::Value::Array(abilities);
-                engagement
-                    .write_file(
-                        &manifest_path,
-                        &format!("{}\n", serde_json::to_string_pretty(&manifest).map_err(io)?),
-                    )
-                    .map_err(io)?;
+        // Decide from the mainline itself whether there is anything to do.
+        // This runs on every open for every archetype, and almost always
+        // there is nothing: the engagement below — a branch created, a
+        // worktree materialized and, because discarding a branch leaves its
+        // worktree, never removed — was being paid to read two manifests and
+        // find them current, and every root carried a
+        // `worktrees/ability-migration-*` copy of each archetype per open.
+        // The read-only check answers `false` only on proof; any doubt runs
+        // the migration exactly as before.
+        let changed = if !ability_manifests_need_migration(workspace.as_ref(), &roots)? {
+            false
+        } else {
+            let engagement_id = library::gen_id("ability-migration");
+            let engagement = workspace.create_engagement(&engagement_id).map_err(io)?;
+            let result = (|| {
+                let mut changed = false;
 
-                let source_path = format!(
-                    "{package_root}/{}",
-                    gaugedesk_boundary::definition::SOURCE_FILE
-                );
-                let source = engagement.read_file(&source_path).map_err(io)?;
-                let source = remove_legacy_human_authority(&source);
-                engagement.write_file(&source_path, &source).map_err(io)?;
-                changed = true;
-            }
-
-            for discipline_root in roots.iter().skip(1).step_by(2) {
-                let path = format!(
-                    "{discipline_root}/{}",
-                    crate::discipline::DISCIPLINE_MANIFEST
-                );
-                let text = engagement.read_file(&path).map_err(io)?;
-                let mut manifest: crate::discipline::DisciplineManifest =
-                    serde_json::from_str(&text).map_err(invalid_data)?;
-                if manifest.capabilities.remove("human.ask") {
+                for package_root in roots.iter().step_by(2) {
+                    let manifest_path = format!(
+                        "{package_root}/{}",
+                        gaugedesk_boundary::definition::MANIFEST_FILE
+                    );
+                    let text = engagement.read_file(&manifest_path).map_err(io)?;
+                    let mut manifest: serde_json::Value =
+                        serde_json::from_str(&text).map_err(invalid_data)?;
+                    if manifest.get("agent_abilities").is_some() {
+                        continue;
+                    }
+                    let capabilities = manifest
+                        .get_mut("capabilities")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .ok_or_else(|| invalid_data("legacy package has no capability registry"))?;
+                    capabilities.retain(|capability| capability.as_str() != Some("human.ask"));
+                    let abilities = capabilities.clone();
+                    manifest["agent_abilities"] = serde_json::Value::Array(abilities);
                     engagement
                         .write_file(
-                            &path,
+                            &manifest_path,
                             &format!("{}\n", serde_json::to_string_pretty(&manifest).map_err(io)?),
                         )
                         .map_err(io)?;
+
+                    let source_path = format!(
+                        "{package_root}/{}",
+                        gaugedesk_boundary::definition::SOURCE_FILE
+                    );
+                    let source = engagement.read_file(&source_path).map_err(io)?;
+                    let source = remove_legacy_human_authority(&source);
+                    engagement.write_file(&source_path, &source).map_err(io)?;
                     changed = true;
                 }
-            }
 
-            if changed {
-                engagement
-                    .commit_turn("migrate explicit agent ability ceilings")
-                    .map_err(io)?;
-                if engagement.merge_into_main().map_err(io)? != MergeOutcome::Clean {
-                    return Err(invalid_data(
-                        "archetype changed during agent-ability state migration",
-                    ));
+                for discipline_root in roots.iter().skip(1).step_by(2) {
+                    let path = format!(
+                        "{discipline_root}/{}",
+                        crate::discipline::DISCIPLINE_MANIFEST
+                    );
+                    let text = engagement.read_file(&path).map_err(io)?;
+                    let mut manifest: crate::discipline::DisciplineManifest =
+                        serde_json::from_str(&text).map_err(invalid_data)?;
+                    if manifest.capabilities.remove("human.ask") {
+                        engagement
+                            .write_file(
+                                &path,
+                                &format!(
+                                    "{}\n",
+                                    serde_json::to_string_pretty(&manifest).map_err(io)?
+                                ),
+                            )
+                            .map_err(io)?;
+                        changed = true;
+                    }
                 }
-            }
-            Ok(changed)
-        })();
-        let _ = workspace.remove_engagement(&engagement_id);
-        let changed = result?;
+
+                if changed {
+                    engagement
+                        .commit_turn("migrate explicit agent ability ceilings")
+                        .map_err(io)?;
+                    if engagement.merge_into_main().map_err(io)? != MergeOutcome::Clean {
+                        return Err(invalid_data(
+                            "archetype changed during agent-ability state migration",
+                        ));
+                    }
+                }
+                Ok(changed)
+            })();
+            let _ = workspace.remove_engagement(&engagement_id);
+            result?
+        };
 
         // Reconcile references even after an interrupted prior run that landed
         // the workspace commit but had not yet appended the library record.
@@ -956,6 +973,51 @@ fn migrate_agent_ability_manifests(
         migrated |= changed || references_changed;
     }
     Ok(migrated)
+}
+
+/// Whether `migrate_agent_ability_manifests` has anything to do for one
+/// archetype, decided from the mainline's head with nothing created to ask:
+/// no engagement, no worktree, no cut. It answers `false` only when it can
+/// prove there is nothing — every package manifest present, parsing, and
+/// carrying `agent_abilities`; no discipline manifest granting `human.ask`.
+/// Any doubt, a manifest absent or unreadable, is a `true`, so the migration
+/// proper runs and reports exactly what it always did.
+fn ability_manifests_need_migration(
+    workspace: &dyn Workspace,
+    roots: &[String],
+) -> std::io::Result<bool> {
+    for package_root in roots.iter().step_by(2) {
+        let manifest_path = format!(
+            "{package_root}/{}",
+            gaugedesk_boundary::definition::MANIFEST_FILE
+        );
+        let Some(text) = workspace.read_main_file(&manifest_path).map_err(io)? else {
+            return Ok(true);
+        };
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Ok(true);
+        };
+        if manifest.get("agent_abilities").is_none() {
+            return Ok(true);
+        }
+    }
+    for discipline_root in roots.iter().skip(1).step_by(2) {
+        let path = format!(
+            "{discipline_root}/{}",
+            crate::discipline::DISCIPLINE_MANIFEST
+        );
+        let Some(text) = workspace.read_main_file(&path).map_err(io)? else {
+            return Ok(true);
+        };
+        let Ok(manifest) = serde_json::from_str::<crate::discipline::DisciplineManifest>(&text)
+        else {
+            return Ok(true);
+        };
+        if manifest.capabilities.contains("human.ask") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn remove_legacy_human_authority(source: &str) -> String {
@@ -7487,10 +7549,11 @@ mod managed_target_basis_tests {
     use crate::LockUnpoisoned;
 
     /// A managed target's recorded basis is its mainline's head cut, and
-    /// recording it costs no engagement: nothing is created and discarded for
-    /// the answer, so nothing is left behind under the target's worktrees.
+    /// neither recording it nor deciding that its manifests need no migration
+    /// costs an engagement: nothing is created and discarded for either
+    /// answer, so nothing is left behind under the target's worktrees.
     #[test]
-    fn a_fresh_managed_target_records_its_mainline_head_and_leaves_no_probe_behind() {
+    fn a_fresh_managed_target_records_its_mainline_head_and_leaves_no_engagement_behind() {
         let root = tempfile::tempdir().unwrap();
         let shared = crate::open_workbench(root.path()).unwrap();
         let workbench = shared.lock_unpoisoned();
@@ -7513,22 +7576,21 @@ mod managed_target_basis_tests {
                 target.id
             );
             let worktrees = workbench.targets_root.join(&target.id).join("worktrees");
-            let probes = std::fs::read_dir(&worktrees)
+            let left_behind = std::fs::read_dir(&worktrees)
                 .map(|entries| {
                     entries
                         .flatten()
-                        .filter(|entry| {
-                            entry
-                                .file_name()
-                                .to_string_lossy()
-                                .starts_with("target-basis-")
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .filter(|name| {
+                            name.starts_with("target-basis-")
+                                || name.starts_with("ability-migration-")
                         })
-                        .count()
+                        .collect::<Vec<_>>()
                 })
-                .unwrap_or(0);
-            assert_eq!(
-                probes, 0,
-                "{} left a basis probe worktree behind",
+                .unwrap_or_default();
+            assert!(
+                left_behind.is_empty(),
+                "{} left a startup engagement's worktree behind: {left_behind:?}",
                 target.id
             );
         }
