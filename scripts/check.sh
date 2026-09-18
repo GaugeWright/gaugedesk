@@ -306,8 +306,39 @@ run_rust() {
     echo "== lints =="
     cargo clippy --workspace --all-targets -- -D warnings
 
+    # cargo-nextest runs each test in its own process and schedules the whole
+    # set across cores itself, instead of handing one process per test binary to
+    # libtest's thread pool. Measured on this workspace's 2,315 tests, warm tree,
+    # on the founder's M5 Pro under a load average of 8-12 from other sessions:
+    #
+    #   cargo test --workspace                        120 s wall   149 s user   441 s sys
+    #   cargo nextest run --workspace --no-fail-fast   85 s wall   161 s user   353 s sys
+    #
+    # Less than the four-fold gain whipplescript-src measured, because these
+    # tests are bound by their own file I/O rather than by libtest's thread
+    # pool: the app crate's fixtures build a full workbench on disk, and that is
+    # where the sys column comes from either way. What nextest buys here is the
+    # scheduling — fifty-two binaries' tests interleaved across every core
+    # rather than one binary at a time.
+    #
+    # Use-if-present, never a new prerequisite: the bar has to mean the same
+    # thing on a host that does not carry it, so its absence falls back to
+    # exactly the command this line has always been. What is asserted does not
+    # change either way — the same test binaries, the same set — and CI installs
+    # nextest so the gating runner never takes the fallback.
+    #
+    # `--no-fail-fast` for the same reason `all` runs every section: the
+    # failures are reported together, in one run. Doctests are the one thing
+    # nextest does not run, and this workspace has them (ten in gaugedesk-app),
+    # so `cargo test --doc` keeps them in the bar; it compiles nothing the run
+    # before it has not already built.
     echo "== tests =="
-    cargo test --workspace
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        cargo nextest run --workspace --no-fail-fast
+        cargo test --workspace --doc
+    else
+        cargo test --workspace
+    fi
 
     # The open build must stay buildable without the enterprise features.
     # Keep this feature graph out of the all-feature test graph's fingerprints.
@@ -318,6 +349,60 @@ run_rust() {
     echo "== no-default-features =="
     CARGO_TARGET_DIR="$PWD/target/no-default-features" \
         cargo check -p gaugedesk-app --no-default-features --all-targets
+}
+
+# Independent steps of one section, run at once.
+#
+# Most of `web` is single-threaded processes — six tsc runs, four vite builds,
+# a vitest run, three node test runs — that read one tree and write disjoint
+# outputs, and running them one after another left an eighteen-core machine
+# mostly idle for the length of the section. So they run together. Each step's
+# transcript is captured to its own file and printed, in the order the steps
+# were given, once every one of them has finished: the output reads exactly as
+# the sequential form did, and a failure appears under its own heading rather
+# than interleaved with whatever else was running. Every step runs to completion
+# even when another fails, for the same reason `all` runs every section — they
+# are independent, and the bar reports on each of them.
+#
+# A step is one string, run by this same bash under errexit, so a step of
+# several commands stops at its first failure exactly as it would inline; see
+# the note above `run_all` for why a function call in this shell would not.
+# Job control is on while the steps start so that each is its own process
+# group. Without it bash gives an asynchronous list an ignored SIGINT, which is
+# how an interrupted section would leave a dozen node processes running to
+# completion; with it the trap can stop every step's whole tree. It is off again
+# before the wait, so bash reports nothing about the jobs as they finish.
+parallel_steps() {
+    local dir n=0 i rc status=0
+    local pids=() headings=()
+    dir="$(mktemp -d)"
+    set -m
+    while [ $# -ge 2 ]; do
+        headings[$n]="$1"
+        "$BASH" -c "set -euo pipefail; $2" > "$dir/$n.log" 2>&1 &
+        pids[$n]=$!
+        n=$((n + 1))
+        shift 2
+    done
+    set +m
+    if [ $# -ne 0 ]; then
+        echo "parallel_steps: a heading with no command: $1" >&2
+        return 2
+    fi
+    trap 'for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null; done; exit 130' INT TERM
+    for ((i = 0; i < n; i++)); do
+        rc=0
+        wait "${pids[$i]}" || rc=$?
+        echo "${headings[$i]}"
+        cat "$dir/$i.log"
+        if [ "$rc" -ne 0 ]; then
+            echo "-- FAILED (exit $rc): ${headings[$i]} --" >&2
+            status=1
+        fi
+    done
+    trap - INT TERM
+    rm -rf "$dir"
+    return "$status"
 }
 
 run_web() {
@@ -333,43 +418,50 @@ run_web() {
     { [ -f web/packages/control-plane-client/src/generated/tunnel.js ] \
         && [ -f web/packages/control-plane-client/src/generated/directory.js ]; } \
         || scripts/build-wasm.sh
-    # Both guard the same rule from opposite ends: nothing here writes a brand
-    # value by hand. The first fails on a hex the vendored company tokens
-    # already name; the second fails when the published customization file is
-    # not what the panel defaults actually resolve to. The embed carried a
-    # forked palette for as long as neither existed.
-    echo "== brand tokens =="
-    node scripts/check-brand-tokens.mjs
-    node web/scripts/render-embed-theme.mjs --check
-
-    # A stylesheet with no renderer is invisible to everything else here: the
-    # brand-token scan reads it, the typecheck compiles around it, vite bundles
-    # it, and the minifier ships it to a customer. Nothing asked whether anything
-    # drew it, which is how two component removals left 219 rules behind.
-    echo "== css renderers =="
-    node scripts/check-css-renderers.mjs
-
-    echo "== web typecheck =="
-    npm --prefix web run typecheck
-    npm --prefix web run typecheck:split
-
-    echo "== web tests =="
-    npm --prefix web run test
-
-    echo "== web builds =="
-    npm --prefix web run build:open
-    npm --prefix web run build:embed
-    npm --prefix web run build:apps:open
-
     [ -d ee/web/node_modules ] || npm --prefix ee/web ci
-    echo "== enterprise web =="
-    npm --prefix ee/web test
-    npm --prefix ee/web run typecheck
-    npm --prefix ee/web run build
-
     [ -d ee/sidecar/saml-verify/node_modules ] || npm --prefix ee/sidecar/saml-verify ci
-    echo "== saml verify sidecar =="
-    npm --prefix ee/sidecar/saml-verify test
+
+    # Everything below reads the installed trees and the generated modules above
+    # and writes only its own output — the vite builds each to their own
+    # `dist-*` — so the steps are independent, and they run at once. The
+    # transcripts still print in this order, each under its heading.
+    #
+    # Brand tokens: both guard the same rule from opposite ends — nothing here
+    # writes a brand value by hand. The first fails on a hex the vendored
+    # company tokens already name; the second fails when the published
+    # customization file is not what the panel defaults actually resolve to.
+    # The embed carried a forked palette for as long as neither existed.
+    #
+    # CSS renderers: a stylesheet with no renderer is invisible to everything
+    # else here — the brand-token scan reads it, the typecheck compiles around
+    # it, vite bundles it, and the minifier ships it to a customer. Nothing
+    # asked whether anything drew it, which is how two component removals left
+    # 219 rules behind.
+    parallel_steps \
+        "== brand tokens ==" \
+        "node scripts/check-brand-tokens.mjs; node web/scripts/render-embed-theme.mjs --check" \
+        "== css renderers ==" \
+        "node scripts/check-css-renderers.mjs" \
+        "== web typecheck ==" \
+        "npm --prefix web run typecheck" \
+        "== web typecheck (each client in isolation) ==" \
+        "npm --prefix web run typecheck:split" \
+        "== web tests ==" \
+        "npm --prefix web run test" \
+        "== web build: open ==" \
+        "npm --prefix web run build:open" \
+        "== web build: embed ==" \
+        "npm --prefix web run build:embed" \
+        "== web build: apps (open) ==" \
+        "npm --prefix web run build:apps:open" \
+        "== enterprise web tests ==" \
+        "npm --prefix ee/web test" \
+        "== enterprise web typecheck ==" \
+        "npm --prefix ee/web run typecheck" \
+        "== enterprise web build ==" \
+        "npm --prefix ee/web run build" \
+        "== saml verify sidecar ==" \
+        "npm --prefix ee/sidecar/saml-verify test"
 }
 
 # The dependency audit lives here rather than in a workflow step so that the

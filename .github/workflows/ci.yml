@@ -80,6 +80,13 @@ jobs:
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # cargo-nextest is what the green bar's test section uses when it is
+      # present; without it the section falls back to `cargo test`, the same
+      # tests at several times the wall clock. Installed here so the gating
+      # runner never takes the fallback.
+      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2.87.8
+        with:
+          tool: nextest
       - run: scripts/check.sh rust
 
   # Mirror-only, and deliberately unlike the two lanes around it: on `-src`

@@ -27,6 +27,11 @@ set -uo pipefail
 : "${APT_PACKAGES:?APT_PACKAGES is required}"
 : "${APT_ATTEMPT_TIMEOUT:=480}"
 : "${APT_ATTEMPTS:=3}"
+# The pause between attempts. A variable rather than a literal so that
+# `scripts/apt-install-action.test.sh` can drive every retry path without
+# sleeping through it: its stubbed apt fails instantly, and the thirty seconds
+# the literal cost that test were the longest thing in the `contracts` section.
+: "${APT_RETRY_DELAY:=5}"
 
 # Fail an individual mirror fast so a retry can pick a different one, instead of
 # one attempt absorbing the whole budget on a dead host.
@@ -81,7 +86,7 @@ while [ "$attempt" -le "$APT_ATTEMPTS" ]; do
     sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend || true
     sudo dpkg --configure -a || true
     attempt=$((attempt + 1))
-    sleep 5
+    sleep "$APT_RETRY_DELAY"
 done
 
 echo "apt never completed in ${APT_ATTEMPTS} bounded attempts" >&2
