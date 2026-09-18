@@ -213,6 +213,9 @@ impl From<serde_json::Error> for AdmitError {
 /// Map the `GAUGEDESK_SQLITE_SYNCHRONOUS` setting to a SQLite `synchronous` mode
 /// (`SCALE-5`): `FULL` (case-insensitive) for a hosted data plane's fsync-per-commit
 /// durability, else the desktop default `NORMAL`. Pure, so the policy is unit-testable.
+/// How many prepared statements a connection keeps compiled. See `Store::init`.
+const STATEMENT_CACHE_CAPACITY: usize = 128;
+
 fn synchronous_mode(setting: Option<&str>) -> &'static str {
     match setting {
         Some(s) if s.trim().eq_ignore_ascii_case("full") => "FULL",
@@ -376,12 +379,11 @@ fn tx_chain_head(
     kind: &str,
 ) -> Result<Option<String>, AdmitError> {
     let raw: Option<String> = tx
-        .query_row(
+        .prepare_cached(
             "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 \
              ORDER BY position DESC LIMIT 1",
-            params![scope_id, kind],
-            |row| row.get(0),
-        )
+        )?
+        .query_row(params![scope_id, kind], |row| row.get(0))
         .optional()?;
     Ok(match (raw, codec) {
         (Some(raw), Some(codec)) => codec.decode(scope_id, kind, &raw),
@@ -446,6 +448,7 @@ impl Store {
         // `synchronous` is connection-local, so carry that one setting explicitly.
         let sync = synchronous_mode(gaugedesk_env::var("SQLITE_SYNCHRONOUS").as_deref());
         conn.execute_batch(&format!("PRAGMA synchronous={sync};"))?;
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         Ok(Self {
             conn,
             codec: self.codec.clone(),
@@ -503,7 +506,9 @@ impl Store {
     /// for a hosted data plane. Any other/absent value → `NORMAL`. The current level is
     /// readable via [`synchronous`](Self::synchronous).
     pub fn synchronous(&self) -> Result<i64, rusqlite::Error> {
-        self.conn.query_row("PRAGMA synchronous", [], |r| r.get(0))
+        self.conn
+            .prepare_cached("PRAGMA synchronous")?
+            .query_row([], |r| r.get(0))
     }
 
     /// Append one immutable declarative record revision. The revision is
@@ -520,24 +525,24 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let revision: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(revision), 0) + 1 FROM records WHERE record_id = ?1",
-            params![record_id],
-            |row| row.get(0),
-        )?;
-        tx.execute(
+        let revision: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(revision), 0) + 1 FROM records WHERE record_id = ?1",
+            )?
+            .query_row(params![record_id], |row| row.get(0))?;
+        tx.prepare_cached(
             "INSERT INTO records
              (record_id, revision, scope_id, kind, tombstone, payload)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                record_id,
-                revision,
-                scope_id,
-                kind,
-                i64::from(tombstone),
-                payload
-            ],
-        )?;
+        )?
+        .execute(params![
+            record_id,
+            revision,
+            scope_id,
+            kind,
+            i64::from(tombstone),
+            payload
+        ])?;
         tx.commit()?;
         Ok(RecordRevision {
             record_id: record_id.to_owned(),
@@ -551,7 +556,7 @@ impl Store {
 
     /// All immutable revisions for a record, oldest first.
     pub fn record_history(&self, record_id: &str) -> Result<Vec<RecordRevision>, AdmitError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT record_id, scope_id, kind, revision, tombstone, payload
              FROM records WHERE record_id = ?1 ORDER BY revision",
         )?;
@@ -563,12 +568,11 @@ impl Store {
     /// tombstoned record is visible; history is never collapsed.
     pub fn current_record(&self, record_id: &str) -> Result<Option<RecordRevision>, AdmitError> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT record_id, scope_id, kind, revision, tombstone, payload
                  FROM records WHERE record_id = ?1 ORDER BY revision DESC LIMIT 1",
-                params![record_id],
-                record_revision_from_row,
-            )
+            )?
+            .query_row(params![record_id], record_revision_from_row)
             .optional()
             .map_err(Into::into)
     }
@@ -576,8 +580,9 @@ impl Store {
     /// Insert or update metadata for out-of-line protected bytes. This API does
     /// not write the bytes: callers stage and atomically place them first.
     pub fn put_content_metadata(&mut self, content: &ContentMetadata) -> Result<(), AdmitError> {
-        self.conn.execute(
-            "INSERT INTO content(handle, resource_id, sha256, size_bytes, status)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO content(handle, resource_id, sha256, size_bytes, status)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(handle) DO UPDATE SET
                resource_id = excluded.resource_id,
@@ -585,33 +590,32 @@ impl Store {
                size_bytes = excluded.size_bytes,
                status = excluded.status,
                updated_at = CURRENT_TIMESTAMP",
-            params![
+            )?
+            .execute(params![
                 content.handle,
                 content.resource_id,
                 content.sha256,
                 content.size_bytes,
                 content.status
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
     pub fn content_metadata(&self, handle: &str) -> Result<Option<ContentMetadata>, AdmitError> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT handle, resource_id, sha256, size_bytes, status
                  FROM content WHERE handle = ?1",
-                params![handle],
-                |row| {
-                    Ok(ContentMetadata {
-                        handle: row.get(0)?,
-                        resource_id: row.get(1)?,
-                        sha256: row.get(2)?,
-                        size_bytes: row.get(3)?,
-                        status: row.get(4)?,
-                    })
-                },
-            )
+            )?
+            .query_row(params![handle], |row| {
+                Ok(ContentMetadata {
+                    handle: row.get(0)?,
+                    resource_id: row.get(1)?,
+                    sha256: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    status: row.get(4)?,
+                })
+            })
             .optional()
             .map_err(Into::into)
     }
@@ -625,12 +629,18 @@ impl Store {
         idempotency_key: &str,
         snapshot_json: &str,
     ) -> Result<CommandRecord, AdmitError> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO commands
+        self.conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO commands
              (command_id, scope_id, idempotency_key, status, snapshot_json)
              VALUES (?1, ?2, ?3, 'received', ?4)",
-            params![command_id, scope_id, idempotency_key, snapshot_json],
-        )?;
+            )?
+            .execute(params![
+                command_id,
+                scope_id,
+                idempotency_key,
+                snapshot_json
+            ])?;
         self.command_by_key(scope_id, idempotency_key)?
             .ok_or_else(|| AdmitError::Db(rusqlite::Error::QueryReturnedNoRows))
     }
@@ -648,27 +658,32 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT OR IGNORE INTO commands
              (command_id, scope_id, idempotency_key, status, snapshot_json)
              VALUES (?1, ?2, ?3, 'received', ?4)",
-            params![command_id, scope_id, idempotency_key, snapshot_json],
-        )?;
+        )?
+        .execute(params![
+            command_id,
+            scope_id,
+            idempotency_key,
+            snapshot_json
+        ])?;
         let mut record = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT command_id, scope_id, idempotency_key, status, snapshot_json
                  FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
-                params![scope_id, idempotency_key],
-                command_record_from_row,
-            )
+            )?
+            .query_row(params![scope_id, idempotency_key], command_record_from_row)
             .optional()?
             .ok_or_else(|| AdmitError::Db(rusqlite::Error::QueryReturnedNoRows))?;
         let claimed = if record.snapshot_json == snapshot_json && record.status == "received" {
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE commands SET status = 'processing', updated_at = CURRENT_TIMESTAMP
                  WHERE command_id = ?1 AND status = 'received'",
-                params![record.command_id],
-            )? == 1
+            )?
+            .execute(params![record.command_id])?
+                == 1
         } else {
             false
         };
@@ -684,22 +699,23 @@ impl Store {
         command_id: &str,
         status: &str,
     ) -> Result<bool, AdmitError> {
-        let changed = self.conn.execute(
-            "UPDATE commands SET status = ?2, updated_at = CURRENT_TIMESTAMP
+        let changed = self
+            .conn
+            .prepare_cached(
+                "UPDATE commands SET status = ?2, updated_at = CURRENT_TIMESTAMP
              WHERE command_id = ?1",
-            params![command_id, status],
-        )?;
+            )?
+            .execute(params![command_id, status])?;
         Ok(changed == 1)
     }
 
     pub fn command(&self, command_id: &str) -> Result<Option<CommandRecord>, AdmitError> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT command_id, scope_id, idempotency_key, status, snapshot_json
                  FROM commands WHERE command_id = ?1",
-                params![command_id],
-                command_record_from_row,
-            )
+            )?
+            .query_row(params![command_id], command_record_from_row)
             .optional()
             .map_err(Into::into)
     }
@@ -718,12 +734,11 @@ impl Store {
         idempotency_key: &str,
     ) -> Result<Option<CommandRecord>, AdmitError> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT command_id, scope_id, idempotency_key, status, snapshot_json
                  FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
-                params![scope_id, idempotency_key],
-                command_record_from_row,
-            )
+            )?
+            .query_row(params![scope_id, idempotency_key], command_record_from_row)
             .optional()
             .map_err(Into::into)
     }
@@ -736,7 +751,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (applied, expired) = {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "SELECT command_id, scope_id, idempotency_key FROM commands
                  WHERE status IN ('received', 'processing')",
             )?;
@@ -752,12 +767,11 @@ impl Store {
             for row in rows {
                 let (command_id, scope_id, key) = row?;
                 let committed = tx
-                    .query_row(
+                    .prepare_cached(
                         "SELECT 1 FROM command_receipts
                          WHERE scope_id = ?1 AND command_key = ?2",
-                        params![scope_id, key],
-                        |_| Ok(()),
-                    )
+                    )?
+                    .query_row(params![scope_id, key], |_| Ok(()))
                     .optional()?
                     .is_some();
                 let status = if committed {
@@ -767,11 +781,11 @@ impl Store {
                     expired += 1;
                     "expired"
                 };
-                tx.execute(
+                tx.prepare_cached(
                     "UPDATE commands SET status = ?2, updated_at = CURRENT_TIMESTAMP
                      WHERE command_id = ?1",
-                    params![command_id, status],
-                )?;
+                )?
+                .execute(params![command_id, status])?;
             }
             (applied, expired)
         };
@@ -809,11 +823,10 @@ impl Store {
         }
         let replayed = self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-                params![scope_id, idempotency_key],
-                |_| Ok(()),
-            )
+            )?
+            .query_row(params![scope_id, idempotency_key], |_| Ok(()))
             .optional()?
             .is_some();
         if replayed {
@@ -910,15 +923,16 @@ impl Store {
     ) -> Result<Option<String>, AdmitError> {
         let original: Option<(Option<String>, Option<String>)> = self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT commands.command_id, commands.snapshot_json
              FROM command_receipts AS receipts
              LEFT JOIN commands ON commands.scope_id = receipts.scope_id
                AND commands.idempotency_key = receipts.command_key
              WHERE receipts.scope_id = ?1 AND receipts.command_key = ?2",
-                params![command_scope, idempotency_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            )?
+            .query_row(params![command_scope, idempotency_key], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()?;
         let Some((id, snapshot)) = original else {
             return Ok(None);
@@ -934,8 +948,7 @@ impl Store {
         &self,
         command_scope: &str,
     ) -> Result<Vec<CommittedRecordSnapshot>, AdmitError> {
-        let mut query = self.conn.prepare(
-            "SELECT receipts.command_key, commands.command_id, commands.snapshot_json, receipts.applied_at
+        let mut query = self.conn.prepare_cached("SELECT receipts.command_key, commands.command_id, commands.snapshot_json, receipts.applied_at
              FROM command_receipts AS receipts
              LEFT JOIN commands ON commands.scope_id = receipts.scope_id
                AND commands.idempotency_key = receipts.command_key
@@ -1043,16 +1056,23 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT OR IGNORE INTO commands
              (command_id, scope_id, idempotency_key, status, snapshot_json)
              VALUES (?1, ?2, ?3, 'received', ?4)",
-            params![command_id, command_scope, idempotency_key, snapshot_json],
-        )?;
+        )?
+        .execute(params![
+            command_id,
+            command_scope,
+            idempotency_key,
+            snapshot_json
+        ])?;
         let record = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT command_id, scope_id, idempotency_key, status, snapshot_json
                  FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
+            )?
+            .query_row(
                 params![command_scope, idempotency_key],
                 command_record_from_row,
             )
@@ -1064,11 +1084,10 @@ impl Store {
             }));
         }
         let replayed = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-                params![command_scope, idempotency_key],
-                |_| Ok(()),
-            )
+            )?
+            .query_row(params![command_scope, idempotency_key], |_| Ok(()))
             .optional()?
             .is_some();
         for claim in claims {
@@ -1078,8 +1097,7 @@ impl Store {
                 idempotency_key,
                 claim.snapshot,
             ))?;
-            let claimed = tx.query_row(
-                "SELECT snapshot_json FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
+            let claimed = tx.prepare_cached("SELECT snapshot_json FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2")?.query_row(
                 params![command_scope, claim.key], |row| row.get::<_, String>(0),
             ).optional()?;
             match claimed {
@@ -1089,7 +1107,7 @@ impl Store {
                     }))
                 }
                 Some(_) => {
-                    let receipted = tx.query_row("SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2", params![command_scope, claim.key], |_| Ok(())).optional()?.is_some();
+                    let receipted = tx.prepare_cached("SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2")?.query_row( params![command_scope, claim.key], |_| Ok(())).optional()?.is_some();
                     if !receipted {
                         return Err(AdmitError::Rejected(Rejection {
                             reason: "additional command claim has no receipt",
@@ -1105,11 +1123,11 @@ impl Store {
             }
         }
         if replayed {
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
                  WHERE command_id = ?1",
-                params![record.command_id],
-            )?;
+            )?
+            .execute(params![record.command_id])?;
             tx.commit()?;
             return Ok(MaterializedRecordAdmission {
                 positions: Vec::new(),
@@ -1128,34 +1146,34 @@ impl Store {
             return Err(AdmitError::Rejected(Rejection { reason }));
         }
         if let Some((expected_scope, expected_position)) = expected_head {
-            let actual_position: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(position), -1) FROM events WHERE scope_id = ?1",
-                params![expected_scope],
-                |row| row.get(0),
-            )?;
+            let actual_position: i64 = tx
+                .prepare_cached(
+                    "SELECT COALESCE(MAX(position), -1) FROM events WHERE scope_id = ?1",
+                )?
+                .query_row(params![expected_scope], |row| row.get(0))?;
             if actual_position != expected_position {
                 return Err(AdmitError::Rejected(Rejection {
                     reason: "scope head changed before record admission",
                 }));
             }
         }
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE commands SET status = 'processing', updated_at = CURRENT_TIMESTAMP
              WHERE command_id = ?1 AND status = 'received'",
-            params![record.command_id],
-        )?;
+        )?
+        .execute(params![record.command_id])?;
 
         let mut positions = Vec::with_capacity(stored.len());
         for fact in stored {
-            let position: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-                params![fact.scope_id],
-                |row| row.get(0),
-            )?;
-            tx.execute(
+            let position: i64 = tx
+                .prepare_cached(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+                )?
+                .query_row(params![fact.scope_id], |row| row.get(0))?;
+            tx.prepare_cached(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![fact.scope_id, position, fact.kind, fact.payload],
-            )?;
+            )?
+            .execute(params![fact.scope_id, position, fact.kind, fact.payload])?;
             positions.push(position);
         }
         // Resolve the chain link against the head visible to *this* transaction and
@@ -1172,28 +1190,28 @@ impl Store {
                     .map_err(AdmitError::Codec)?,
                 None => payload.clone(),
             };
-            let position: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-                params![chained.scope_id],
-                |row| row.get(0),
-            )?;
-            tx.execute(
+            let position: i64 = tx
+                .prepare_cached(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+                )?
+                .query_row(params![chained.scope_id], |row| row.get(0))?;
+            tx.prepare_cached(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![chained.scope_id, position, chained.kind, encoded],
-            )?;
+            )?
+            .execute(params![chained.scope_id, position, chained.kind, encoded])?;
             positions.push(position);
             chained_payload = Some(payload);
         }
         let applied_at = positions.first().copied().unwrap_or(0);
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
-            params![command_scope, idempotency_key, applied_at],
-        )?;
-        tx.execute(
+        )?
+        .execute(params![command_scope, idempotency_key, applied_at])?;
+        tx.prepare_cached(
             "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
              WHERE command_id = ?1",
-            params![record.command_id],
-        )?;
+        )?
+        .execute(params![record.command_id])?;
         for claim in claims {
             let claim_id = format!(
                 "record-command:{}:{command_scope}{}",
@@ -1206,8 +1224,8 @@ impl Store {
                 idempotency_key,
                 claim.snapshot,
             ))?;
-            tx.execute("INSERT INTO commands (command_id, scope_id, idempotency_key, status, snapshot_json) VALUES (?1, ?2, ?3, 'applied', ?4)", params![claim_id, command_scope, claim.key, claim_snapshot])?;
-            tx.execute("INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)", params![command_scope, claim.key, applied_at])?;
+            tx.prepare_cached("INSERT INTO commands (command_id, scope_id, idempotency_key, status, snapshot_json) VALUES (?1, ?2, ?3, 'applied', ?4)")?.execute( params![claim_id, command_scope, claim.key, claim_snapshot])?;
+            tx.prepare_cached("INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)")?.execute( params![command_scope, claim.key, applied_at])?;
         }
         tx.commit()?;
         Ok(MaterializedRecordAdmission {
@@ -1218,8 +1236,9 @@ impl Store {
     }
 
     pub fn put_projection_meta(&mut self, meta: &ProjectionMeta) -> Result<(), AdmitError> {
-        self.conn.execute(
-            "INSERT INTO projection_meta
+        self.conn
+            .prepare_cached(
+                "INSERT INTO projection_meta
              (projection, scope_id, version, high_water, dirty)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(projection, scope_id) DO UPDATE SET
@@ -1227,14 +1246,14 @@ impl Store {
                high_water = excluded.high_water,
                dirty = excluded.dirty,
                updated_at = CURRENT_TIMESTAMP",
-            params![
+            )?
+            .execute(params![
                 meta.projection,
                 meta.scope_id,
                 meta.version,
                 meta.high_water,
                 i64::from(meta.dirty)
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -1244,20 +1263,19 @@ impl Store {
         scope_id: &str,
     ) -> Result<Option<ProjectionMeta>, AdmitError> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT projection, scope_id, version, high_water, dirty
                  FROM projection_meta WHERE projection = ?1 AND scope_id = ?2",
-                params![projection, scope_id],
-                |row| {
-                    Ok(ProjectionMeta {
-                        projection: row.get(0)?,
-                        scope_id: row.get(1)?,
-                        version: row.get(2)?,
-                        high_water: row.get(3)?,
-                        dirty: row.get::<_, i64>(4)? != 0,
-                    })
-                },
-            )
+            )?
+            .query_row(params![projection, scope_id], |row| {
+                Ok(ProjectionMeta {
+                    projection: row.get(0)?,
+                    scope_id: row.get(1)?,
+                    version: row.get(2)?,
+                    high_water: row.get(3)?,
+                    dirty: row.get::<_, i64>(4)? != 0,
+                })
+            })
             .optional()
             .map_err(Into::into)
     }
@@ -1271,15 +1289,16 @@ impl Store {
         lifecycle: Option<&str>,
         subject_id: Option<&str>,
     ) -> Result<(), AdmitError> {
-        self.conn.execute(
-            "INSERT INTO scopes(scope_id, authority, lifecycle, subject_id)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO scopes(scope_id, authority, lifecycle, subject_id)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(scope_id) DO UPDATE SET
                authority = excluded.authority,
                lifecycle = excluded.lifecycle,
                subject_id = excluded.subject_id",
-            params![scope_id, authority, lifecycle, subject_id],
-        )?;
+            )?
+            .execute(params![scope_id, authority, lifecycle, subject_id])?;
         Ok(())
     }
 
@@ -1292,12 +1311,13 @@ impl Store {
         kind: &str,
         payload_ref: Option<&str>,
     ) -> Result<ObservationRecord, AdmitError> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO observations
+        self.conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO observations
              (observation_id, run_ref, kind, payload_ref)
              VALUES (?1, ?2, ?3, ?4)",
-            params![observation_id, run_ref, kind, payload_ref],
-        )?;
+            )?
+            .execute(params![observation_id, run_ref, kind, payload_ref])?;
         self.observation(observation_id)?
             .ok_or_else(|| AdmitError::Db(rusqlite::Error::QueryReturnedNoRows))
     }
@@ -1312,23 +1332,22 @@ impl Store {
     ) -> Result<bool, AdmitError> {
         let event_exists = self
             .conn
-            .query_row(
-                "SELECT 1 FROM events WHERE scope_id = ?1 AND position = ?2",
-                params![scope_id, position],
-                |_| Ok(()),
-            )
+            .prepare_cached("SELECT 1 FROM events WHERE scope_id = ?1 AND position = ?2")?
+            .query_row(params![scope_id, position], |_| Ok(()))
             .optional()?
             .is_some();
         if !event_exists {
             return Ok(false);
         }
-        let changed = self.conn.execute(
-            "UPDATE observations
+        let changed = self
+            .conn
+            .prepare_cached(
+                "UPDATE observations
              SET admitted_scope = ?2, admitted_position = ?3
              WHERE observation_id = ?1
                AND admitted_scope IS NULL AND admitted_position IS NULL",
-            params![observation_id, scope_id, position],
-        )?;
+            )?
+            .execute(params![observation_id, scope_id, position])?;
         Ok(changed == 1)
     }
 
@@ -1337,22 +1356,21 @@ impl Store {
         observation_id: &str,
     ) -> Result<Option<ObservationRecord>, AdmitError> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT observation_id, run_ref, kind, payload_ref,
                         admitted_scope, admitted_position
                  FROM observations WHERE observation_id = ?1",
-                params![observation_id],
-                |row| {
-                    Ok(ObservationRecord {
-                        observation_id: row.get(0)?,
-                        run_ref: row.get(1)?,
-                        kind: row.get(2)?,
-                        payload_ref: row.get(3)?,
-                        admitted_scope: row.get(4)?,
-                        admitted_position: row.get(5)?,
-                    })
-                },
-            )
+            )?
+            .query_row(params![observation_id], |row| {
+                Ok(ObservationRecord {
+                    observation_id: row.get(0)?,
+                    run_ref: row.get(1)?,
+                    kind: row.get(2)?,
+                    payload_ref: row.get(3)?,
+                    admitted_scope: row.get(4)?,
+                    admitted_position: row.get(5)?,
+                })
+            })
             .optional()
             .map_err(Into::into)
     }
@@ -1361,11 +1379,9 @@ impl Store {
     /// ledger — after a successful open, always [`SUPPORTED_SCHEMA_VERSION`]
     /// (open applies every pending migration and refuses a newer database).
     pub fn schema_version(&self) -> Result<i64, rusqlite::Error> {
-        self.conn.query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )
+        self.conn
+            .prepare_cached("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")?
+            .query_row([], |row| row.get(0))
     }
 
     /// Open-time schema handshake (DR-0054 Phase B/C): read the recorded schema
@@ -1380,28 +1396,29 @@ impl Store {
     /// `CREATE TABLE IF NOT EXISTS` batch is a no-op over its existing tables
     /// and records it as v1.
     fn init(mut conn: Connection, path: String) -> Result<Self, rusqlite::Error> {
+        // Every statement this store runs is a constant, and every read and
+        // write prepares its statement through the connection's cache, so a
+        // statement is compiled once per connection rather than once per call.
+        // The store has about sixty distinct statements; rusqlite's default
+        // cache of sixteen would evict them against each other.
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                  version    INTEGER PRIMARY KEY,
                  applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
              );",
         )?;
-        let recorded: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )?;
+        let recorded: i64 = conn
+            .prepare_cached("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")?
+            .query_row([], |row| row.get(0))?;
         if recorded > SUPPORTED_SCHEMA_VERSION {
             return Err(schema_ahead_error(&path, recorded));
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for migration in MIGRATIONS {
             let applied = tx
-                .query_row(
-                    "SELECT 1 FROM schema_migrations WHERE version = ?1",
-                    [migration.version],
-                    |_| Ok(()),
-                )
+                .prepare_cached("SELECT 1 FROM schema_migrations WHERE version = ?1")?
+                .query_row([migration.version], |_| Ok(()))
                 .optional()?
                 .is_some();
             if applied {
@@ -1416,10 +1433,8 @@ impl Store {
                     )),
                 )
             })?;
-            tx.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1)",
-                [migration.version],
-            )?;
+            tx.prepare_cached("INSERT INTO schema_migrations(version) VALUES (?1)")?
+                .execute([migration.version])?;
         }
         tx.commit()?;
         Ok(Self {
@@ -1434,7 +1449,7 @@ impl Store {
     /// state is the fold). Events are filtered by `L::KIND` so distinct
     /// lifecycles (a run, its review, its export) can coexist in one scope.
     pub fn fold<L: Lifecycle>(&self, scope_id: &str) -> Result<L::State, AdmitError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![scope_id, L::KIND], |r| r.get::<_, String>(0))?;
@@ -1471,15 +1486,15 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-            params![scope_id],
-            |r| r.get(0),
-        )?;
-        tx.execute(
+        let position: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            )?
+            .query_row(params![scope_id], |r| r.get(0))?;
+        tx.prepare_cached(
             "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-            params![scope_id, position, kind, stored],
-        )?;
+        )?
+        .execute(params![scope_id, position, kind, stored])?;
         tx.commit()?;
         Ok(position)
     }
@@ -1512,15 +1527,15 @@ impl Store {
                 .map_err(AdmitError::Codec)?,
             None => payload.clone(),
         };
-        let position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-            params![scope_id],
-            |r| r.get(0),
-        )?;
-        tx.execute(
+        let position: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            )?
+            .query_row(params![scope_id], |r| r.get(0))?;
+        tx.prepare_cached(
             "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-            params![scope_id, position, kind, stored],
-        )?;
+        )?
+        .execute(params![scope_id, position, kind, stored])?;
         tx.commit()?;
         Ok((position, payload))
     }
@@ -1550,15 +1565,15 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut positions = Vec::with_capacity(stored.len());
         for (scope, kind, payload) in stored {
-            let position: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-                params![scope],
-                |row| row.get(0),
-            )?;
-            tx.execute(
+            let position: i64 = tx
+                .prepare_cached(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+                )?
+                .query_row(params![scope], |row| row.get(0))?;
+            tx.prepare_cached(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![scope, position, kind, payload],
-            )?;
+            )?
+            .execute(params![scope, position, kind, payload])?;
             positions.push(position);
         }
         tx.commit()?;
@@ -1584,30 +1599,32 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(position) = tx
-            .query_row(
+        // Bound before the `if let`: a scrutinee's cached statement would
+        // otherwise live through the block that commits, and moves, the
+        // transaction it borrows.
+        let already_applied = tx
+            .prepare_cached(
                 "SELECT applied_at FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-                params![scope_id, command_key],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        {
+            )?
+            .query_row(params![scope_id, command_key], |row| row.get::<_, i64>(0))
+            .optional()?;
+        if let Some(position) = already_applied {
             tx.commit()?;
             return Ok((position, false));
         }
-        let position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-            params![scope_id],
-            |row| row.get(0),
-        )?;
-        tx.execute(
+        let position: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            )?
+            .query_row(params![scope_id], |row| row.get(0))?;
+        tx.prepare_cached(
             "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-            params![scope_id, position, kind, stored],
-        )?;
-        tx.execute(
+        )?
+        .execute(params![scope_id, position, kind, stored])?;
+        tx.prepare_cached(
             "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
-            params![scope_id, command_key, position],
-        )?;
+        )?
+        .execute(params![scope_id, command_key, position])?;
         tx.commit()?;
         Ok((position, true))
     }
@@ -1616,7 +1633,7 @@ impl Store {
     /// source (e.g. the transcript snapshot). A content codec (`SECAUD-9/6`) decodes
     /// each row; a crypto-erased row (`decode` ⇒ `None`) is dropped (content gone).
     pub fn records(&self, scope_id: &str, kind: &str) -> Result<Vec<String>, AdmitError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![scope_id, kind], |r| r.get::<_, String>(0))?;
@@ -1644,7 +1661,7 @@ impl Store {
     /// Callers still have to authorize and filter the returned domain records;
     /// this is an internal storage primitive, not a projection API.
     pub fn records_across_scopes(&self, kind: &str) -> Result<Vec<(String, String)>, AdmitError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT scope_id, payload FROM events WHERE kind = ?1 ORDER BY scope_id, position",
         )?;
         let rows = stmt.query_map(params![kind], |row| {
@@ -1687,7 +1704,7 @@ impl Store {
         scope_id: &str,
         require_retained: bool,
     ) -> Result<Vec<(i64, String, String)>, AdmitError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT position, kind, payload FROM events WHERE scope_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![scope_id], |r| {
@@ -1722,7 +1739,7 @@ impl Store {
     pub fn scope_high_water_marks(
         &self,
     ) -> Result<std::collections::BTreeMap<String, i64>, AdmitError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare_cached(
             "SELECT scope_id, MAX(position) FROM events GROUP BY scope_id ORDER BY scope_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1748,7 +1765,7 @@ impl Store {
     pub fn scope_ids(&self) -> Result<Vec<String>, AdmitError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT scope_id FROM events ORDER BY scope_id")?;
+            .prepare_cached("SELECT DISTINCT scope_id FROM events ORDER BY scope_id")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -1772,7 +1789,7 @@ impl Store {
                 reason: "scope discovery page size is out of range",
             })
         })?;
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT DISTINCT scope_id FROM events
              WHERE kind = ?1 AND (?2 IS NULL OR scope_id > ?2)
              ORDER BY scope_id LIMIT ?3",
@@ -1805,7 +1822,7 @@ impl Store {
 
         // Fold the scope's current state from *committed* events, inside the lock.
         let state = {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
             )?;
             let rows = stmt.query_map(params![scope_id, L::KIND], |r| r.get::<_, String>(0))?;
@@ -1820,19 +1837,19 @@ impl Store {
 
         // Next position is global per scope so the per-scope order is total
         // across all lifecycles, even though the fold filters by kind.
-        let base: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-            params![scope_id],
-            |r| r.get(0),
-        )?;
+        let base: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            )?
+            .query_row(params![scope_id], |r| r.get(0))?;
         let mut new_state = state;
         for (offset, event) in events.into_iter().enumerate() {
             let position = base + offset as i64;
             let payload = serde_json::to_string(&event)?;
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![scope_id, position, L::KIND, payload],
-            )?;
+            )?
+            .execute(params![scope_id, position, L::KIND, payload])?;
             new_state = L::evolve(&new_state, event);
         }
         tx.commit()?;
@@ -1862,7 +1879,7 @@ impl Store {
 
         // Fold inside the lock (same serializability as `admit`, RF-C12).
         let fold = |tx: &rusqlite::Transaction| -> Result<L::State, AdmitError> {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
             )?;
             let rows = stmt.query_map(params![scope_id, L::KIND], |r| r.get::<_, String>(0))?;
@@ -1876,11 +1893,10 @@ impl Store {
 
         // Already applied this key? Idempotent no-op: return current state.
         let seen: bool = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-                params![scope_id, command_key],
-                |_| Ok(()),
-            )
+            )?
+            .query_row(params![scope_id, command_key], |_| Ok(()))
             .optional()?
             .is_some();
         if seen {
@@ -1891,28 +1907,28 @@ impl Store {
 
         let state = fold(&tx)?;
         let events = L::decide(&state, command).map_err(AdmitError::Rejected)?;
-        let base: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-            params![scope_id],
-            |r| r.get(0),
-        )?;
+        let base: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            )?
+            .query_row(params![scope_id], |r| r.get(0))?;
         let mut new_state = state;
         for (offset, event) in events.into_iter().enumerate() {
             let position = base + offset as i64;
             let payload = serde_json::to_string(&event)?;
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![scope_id, position, L::KIND, payload],
-            )?;
+            )?
+            .execute(params![scope_id, position, L::KIND, payload])?;
             new_state = L::evolve(&new_state, event);
         }
         // Record the receipt only on a *successful* (non-rejected) admission, in
         // the same transaction — so a rejected command leaves no receipt and can
         // be legitimately retried, while an accepted one is sealed against replay.
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
-            params![scope_id, command_key, base],
-        )?;
+        )?
+        .execute(params![scope_id, command_key, base])?;
         tx.commit()?;
         Ok(new_state)
     }

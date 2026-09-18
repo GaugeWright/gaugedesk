@@ -56,16 +56,23 @@ pub(crate) fn commit(
         "record-command:{}:{command_scope}{idempotency_key}",
         command_scope.len()
     );
-    tx.execute(
+    tx.prepare_cached(
         "INSERT OR IGNORE INTO commands
              (command_id, scope_id, idempotency_key, status, snapshot_json)
              VALUES (?1, ?2, ?3, 'received', ?4)",
-        params![command_id, command_scope, idempotency_key, snapshot_json],
-    )?;
+    )?
+    .execute(params![
+        command_id,
+        command_scope,
+        idempotency_key,
+        snapshot_json
+    ])?;
     let record = tx
-        .query_row(
+        .prepare_cached(
             "SELECT command_id, scope_id, idempotency_key, status, snapshot_json
                  FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
+        )?
+        .query_row(
             params![command_scope, idempotency_key],
             command_record_from_row,
         )
@@ -77,19 +84,16 @@ pub(crate) fn commit(
         }));
     }
     if tx
-        .query_row(
-            "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-            params![command_scope, idempotency_key],
-            |_| Ok(()),
-        )
+        .prepare_cached("SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2")?
+        .query_row(params![command_scope, idempotency_key], |_| Ok(()))
         .optional()?
         .is_some()
     {
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
                  WHERE command_id = ?1",
-            params![record.command_id],
-        )?;
+        )?
+        .execute(params![record.command_id])?;
         tx.commit()?;
         return Ok(MaterializedRecordAdmission {
             positions: Vec::new(),
@@ -107,23 +111,23 @@ pub(crate) fn commit(
         };
         return Err(AdmitError::Rejected(Rejection { reason }));
     }
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE commands SET status = 'processing', updated_at = CURRENT_TIMESTAMP
              WHERE command_id = ?1 AND status = 'received'",
-        params![record.command_id],
-    )?;
+    )?
+    .execute(params![record.command_id])?;
 
     let mut positions = Vec::with_capacity(stored.len());
     for fact in stored {
-        let position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-            params![fact.scope_id],
-            |row| row.get(0),
-        )?;
-        tx.execute(
+        let position: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            )?
+            .query_row(params![fact.scope_id], |row| row.get(0))?;
+        tx.prepare_cached(
             "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-            params![fact.scope_id, position, fact.kind, fact.payload],
-        )?;
+        )?
+        .execute(params![fact.scope_id, position, fact.kind, fact.payload])?;
         positions.push(position);
     }
     // Resolve the chain link against the head visible to *this* transaction and
@@ -140,28 +144,28 @@ pub(crate) fn commit(
                 .map_err(AdmitError::Codec)?,
             None => payload.clone(),
         };
-        let position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-            params![chained.scope_id],
-            |row| row.get(0),
-        )?;
-        tx.execute(
+        let position: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            )?
+            .query_row(params![chained.scope_id], |row| row.get(0))?;
+        tx.prepare_cached(
             "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-            params![chained.scope_id, position, chained.kind, encoded],
-        )?;
+        )?
+        .execute(params![chained.scope_id, position, chained.kind, encoded])?;
         positions.push(position);
         chained_payload = Some(payload);
     }
     let applied_at = positions.first().copied().unwrap_or(0);
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
-        params![command_scope, idempotency_key, applied_at],
-    )?;
-    tx.execute(
+    )?
+    .execute(params![command_scope, idempotency_key, applied_at])?;
+    tx.prepare_cached(
         "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
              WHERE command_id = ?1",
-        params![record.command_id],
-    )?;
+    )?
+    .execute(params![record.command_id])?;
     tx.commit()?;
     Ok(MaterializedRecordAdmission {
         positions,

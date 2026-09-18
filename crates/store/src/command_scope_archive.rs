@@ -126,7 +126,7 @@ fn read_scope(
     codec: Option<&Arc<dyn ContentCodec>>,
     id: &str,
 ) -> Result<Scope, AdmitError> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT position, kind, payload FROM events WHERE scope_id = ?1 ORDER BY position",
     )?;
     let mut events = Vec::new();
@@ -147,7 +147,7 @@ fn read_scope(
         events.push((position, kind, payload));
     }
     let commands = conn
-        .prepare(
+        .prepare_cached(
             "SELECT command_id, idempotency_key, status, snapshot_json, updated_at
          FROM commands WHERE scope_id = ?1 ORDER BY idempotency_key",
         )?
@@ -161,8 +161,7 @@ fn read_scope(
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let receipts = conn.prepare(
-        "SELECT command_key, applied_at FROM command_receipts WHERE scope_id = ?1 ORDER BY command_key",
+    let receipts = conn.prepare_cached("SELECT command_key, applied_at FROM command_receipts WHERE scope_id = ?1 ORDER BY command_key",
     )?.query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Scope {
@@ -183,7 +182,7 @@ impl Store {
     ) -> Result<CommandScopeArchive, AdmitError> {
         let tx = self.conn.unchecked_transaction()?;
         let ids = tx
-            .prepare(
+            .prepare_cached(
                 "SELECT scope_id FROM events UNION SELECT scope_id FROM commands
              UNION SELECT scope_id FROM command_receipts ORDER BY scope_id",
             )?
@@ -250,18 +249,18 @@ pub(crate) fn import_into(
                     .map_err(AdmitError::Codec)?,
                 None => payload.clone(),
             };
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![scope.id, position, kind, stored],
-            )?;
+            )?
+            .execute(params![scope.id, position, kind, stored])?;
         }
         for command in &scope.commands {
-            tx.execute("INSERT INTO commands (command_id, scope_id, idempotency_key, status, snapshot_json, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            tx.prepare_cached("INSERT INTO commands (command_id, scope_id, idempotency_key, status, snapshot_json, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?.execute(
                 params![command.id, scope.id, command.key, command.status, command.snapshot, command.updated_at])?;
         }
         for (key, position) in &scope.receipts {
-            tx.execute("INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
+            tx.prepare_cached("INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)")?.execute(
                 params![scope.id, key, position])?;
         }
     }

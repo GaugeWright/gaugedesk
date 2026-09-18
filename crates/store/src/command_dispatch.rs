@@ -198,11 +198,9 @@ fn check_dispatch_basis(
         }));
     }
     for (scope, expected) in &basis.heads {
-        let current: Option<i64> = tx.query_row(
-            "SELECT MAX(position) FROM events WHERE scope_id = ?1",
-            params![scope],
-            |row| row.get(0),
-        )?;
+        let current: Option<i64> = tx
+            .prepare_cached("SELECT MAX(position) FROM events WHERE scope_id = ?1")?
+            .query_row(params![scope], |row| row.get(0))?;
         if &current != expected {
             return Err(AdmitError::Rejected(Rejection {
                 reason: "dispatch authorization changed during preparation",
@@ -296,11 +294,9 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let mut heads = std::collections::BTreeMap::new();
         for scope in scopes {
-            let head: Option<i64> = tx.query_row(
-                "SELECT MAX(position) FROM events WHERE scope_id = ?1",
-                params![scope],
-                |row| row.get(0),
-            )?;
+            let head: Option<i64> = tx
+                .prepare_cached("SELECT MAX(position) FROM events WHERE scope_id = ?1")?
+                .query_row(params![scope], |row| row.get(0))?;
             heads.insert((*scope).to_owned(), head);
         }
         let value = read(self)?;
@@ -357,11 +353,10 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
         let receipted = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-                params![scope_id, idempotency_key],
-                |_| Ok(()),
-            )
+            )?
+            .query_row(params![scope_id, idempotency_key], |_| Ok(()))
             .optional()?
             .is_some();
         if !receipted {
@@ -369,8 +364,7 @@ impl Store {
         }
         let expected_id = format!("command:{}:{scope_id}{idempotency_key}", scope_id.len());
         let original: Option<(String, String)> = tx
-            .query_row(
-                "SELECT command_id, snapshot_json FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
+            .prepare_cached("SELECT command_id, snapshot_json FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2")?.query_row(
                 params![scope_id, idempotency_key],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -396,7 +390,7 @@ impl Store {
         };
         let mut matches = 0;
         {
-            let mut statement = tx.prepare(
+            let mut statement = tx.prepare_cached(
                 "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
             )?;
             for row in statement.query_map(params![scope_id, DISPATCH_KIND], |row| {
@@ -546,14 +540,14 @@ where
         command_id,
         intent,
     } = prepared;
-    let inserted = tx.execute(
-        "INSERT OR IGNORE INTO commands
+    let inserted = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO commands
              (command_id, scope_id, idempotency_key, status, snapshot_json)
              VALUES (?1, ?2, ?3, 'received', ?4)",
-        params![command_id, scope_id, idempotency_key, snapshot],
-    )?;
-    let (original, status): (String, String) = tx.query_row(
-        "SELECT snapshot_json, status FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
+        )?
+        .execute(params![command_id, scope_id, idempotency_key, snapshot])?;
+    let (original, status): (String, String) = tx.prepare_cached("SELECT snapshot_json, status FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2")?.query_row(
         params![scope_id, idempotency_key],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -563,17 +557,14 @@ where
         }));
     }
     let replayed = tx
-        .query_row(
-            "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-            params![scope_id, idempotency_key],
-            |_| Ok(()),
-        )
+        .prepare_cached("SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2")?
+        .query_row(params![scope_id, idempotency_key], |_| Ok(()))
         .optional()?
         .is_some();
     if replayed {
         // A legacy receipt without an original snapshot/outbox cannot be
         // upgraded into a successful dispatch admission on a retry.
-        let mut statement = tx.prepare(
+        let mut statement = tx.prepare_cached(
             "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
         )?;
         let mut matches = 0;
@@ -603,7 +594,7 @@ where
     }
     let mut state = L::State::default();
     {
-        let mut statement = tx.prepare(
+        let mut statement = tx.prepare_cached(
             "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
         )?;
         for row in statement.query_map(params![scope_id, L::KIND], |row| row.get::<_, String>(0))? {
@@ -612,43 +603,43 @@ where
     }
     if !replayed {
         let events = L::decide(&state, command).map_err(AdmitError::Rejected)?;
-        let base: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-            params![scope_id],
-            |row| row.get(0),
-        )?;
+        let base: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            )?
+            .query_row(params![scope_id], |row| row.get(0))?;
         let dispatch_position = base + events.len() as i64;
         for (offset, event) in events.into_iter().enumerate() {
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    scope_id,
-                    base + offset as i64,
-                    L::KIND,
-                    serde_json::to_string(&event)?
-                ],
-            )?;
+            )?
+            .execute(params![
+                scope_id,
+                base + offset as i64,
+                L::KIND,
+                serde_json::to_string(&event)?
+            ])?;
             state = L::evolve(&state, event);
         }
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                scope_id,
-                dispatch_position,
-                DISPATCH_KIND,
-                serde_json::to_string(&intent)?
-            ],
-        )?;
-        tx.execute(
+        )?
+        .execute(params![
+            scope_id,
+            dispatch_position,
+            DISPATCH_KIND,
+            serde_json::to_string(&intent)?
+        ])?;
+        tx.prepare_cached(
             "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
-            params![scope_id, idempotency_key, base],
-        )?;
+        )?
+        .execute(params![scope_id, idempotency_key, base])?;
     }
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP
              WHERE scope_id = ?1 AND idempotency_key = ?2",
-        params![scope_id, idempotency_key],
-    )?;
+    )?
+    .execute(params![scope_id, idempotency_key])?;
     tx.commit()?;
     Ok(MaterializedAdmission { state, replayed })
 }

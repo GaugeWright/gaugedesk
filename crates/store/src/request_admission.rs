@@ -82,7 +82,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut state = L::State::default();
         {
-            let mut statement = tx.prepare(
+            let mut statement = tx.prepare_cached(
                 "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
             )?;
             let rows =
@@ -94,19 +94,17 @@ impl Store {
         authorize(&state).map_err(AdmitError::Rejected)?;
 
         let previous = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT command_id, scope_id, idempotency_key, status, snapshot_json
              FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
-                params![scope, key],
-                command_record_from_row,
-            )
+            )?
+            .query_row(params![scope, key], command_record_from_row)
             .optional()?;
         let receipt = tx
-            .query_row(
+            .prepare_cached(
                 "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-                params![scope, key],
-                |_| Ok(()),
-            )
+            )?
+            .query_row(params![scope, key], |_| Ok(()))
             .optional()?
             .is_some();
         if let Some(previous) = previous {
@@ -152,21 +150,21 @@ impl Store {
             materialized,
         })?;
         let command_id = format!("request-command:{}:{scope}{key}", scope.len());
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO commands (command_id, scope_id, idempotency_key, status, snapshot_json)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                command_id,
-                scope,
-                key,
-                if decision.is_ok() {
-                    "applied"
-                } else {
-                    "rejected"
-                },
-                snapshot
-            ],
-        )?;
+        )?
+        .execute(params![
+            command_id,
+            scope,
+            key,
+            if decision.is_ok() {
+                "applied"
+            } else {
+                "rejected"
+            },
+            snapshot
+        ])?;
         let events = match decision {
             Ok(events) => events,
             Err(rejection) => {
@@ -174,27 +172,27 @@ impl Store {
                 return Err(AdmitError::Rejected(rejection));
             }
         };
-        let base: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-            [scope],
-            |row| row.get(0),
-        )?;
+        let base: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            )?
+            .query_row([scope], |row| row.get(0))?;
         for (offset, event) in events.into_iter().enumerate() {
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    scope,
-                    base + offset as i64,
-                    L::KIND,
-                    serde_json::to_string(&event)?
-                ],
-            )?;
+            )?
+            .execute(params![
+                scope,
+                base + offset as i64,
+                L::KIND,
+                serde_json::to_string(&event)?
+            ])?;
             state = L::evolve(&state, event);
         }
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
-            params![scope, key, base],
-        )?;
+        )?
+        .execute(params![scope, key, base])?;
         tx.commit()?;
         Ok(MaterializedAdmission {
             state,

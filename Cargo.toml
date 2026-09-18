@@ -24,6 +24,41 @@ license = "AGPL-3.0-only"
 # Dependencies are built without debug info. They dominate target/debug/deps,
 # and debug info measured ~78% of binary size (whipplescript, 2026-07-25).
 # Local crates keep full debuggability: panics and the debugger still work here.
+# The pure-Rust crypto the product signs and verifies with, and the two C
+# libraries every store and every TLS handshake go through, optimized even in
+# a development build. Unoptimized, P-256 and its big-integer arithmetic were a
+# third of a file-action test and SQLite compiled at -O0 sat under every store
+# read; these crates change rarely, compile once per worktree, and are never
+# what a debugger is pointed at. Workspace crates stay unoptimized.
+[profile.dev.package.p256]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.ecdsa]
+opt-level = 3
+[profile.dev.package.primeorder]
+opt-level = 3
+[profile.dev.package.ff]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
+[profile.dev.package.rfc6979]
+opt-level = 3
+[profile.dev.package.subtle]
+opt-level = 3
+[profile.dev.package.generic-array]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.libsqlite3-sys]
+opt-level = 2
+[profile.dev.package.ring]
+opt-level = 2
+
 [profile.dev.package."*"]
 debug = false
 
