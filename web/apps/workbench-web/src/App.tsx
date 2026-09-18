@@ -22,9 +22,12 @@ import {
     authority,
     bearer,
     beginLogin,
+    claimConsumerSignup,
     clientRequestId,
+    consumeAccountSignupTicket,
     consumeCallbackToken,
     endSession,
+    finishConsumerSignupAccount,
     finishAccountRecovery,
     finishPasskeyAccountCreation,
     refreshHostedAccountSession,
@@ -182,6 +185,12 @@ const oidcRedirectAvailable = import.meta.env.VITE_HOME_SPLIT === "true" || loca
 // transport so gated `/admin/*` calls carry it. Signed-out / single-user local is the
 // no-op default (no header sent).
 consumeCallbackToken();
+/// The return leg of a first-time "Continue with Google" (ADR 0146 §1). The
+/// provider verified an address for somebody who has no account, so the callback
+/// parked those facts and sent the browser here to finish the ceremony that does
+/// create accounts. Read out of the fragment at load, with the rest of the
+/// callback material, so the ticket never survives in the address bar.
+const accountSignupTicket = consumeAccountSignupTicket();
 api.setBearer(bearer());
 // Hosted Console (ADR 0077): keep the `.gaugewright.com` cookie session alive by pinging
 // `/auth/refresh` on a timer under the id-token's ~1h life. No-op on the loopback desktop.
@@ -802,7 +811,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     /// The account menu's entrance to the same card, for a person who dismissed
     /// the gate or signed out. Identity has one surface; this opens it rather
     /// than starting a second flow beside it.
-    const [signInOpen, setSignInOpen] = createSignal(false);
+    // A person returning from Google with a signup ticket is, by definition,
+    // signed out and mid-ceremony. Open the card for them rather than leaving
+    // them on a shell with the one step they still owe hidden behind a menu.
+    const [signInOpen, setSignInOpen] = createSignal(accountSignupTicket !== null);
+    // The non-secret projection of that ticket: the address Google attested and
+    // the name it offered, so the card can say whose account it is about to
+    // create. Reading it does not spend the ticket.
+    const [signupClaim] = createResource(
+        () => accountSignupTicket,
+        (ticket) => claimConsumerSignup(controlPlaneBase(), ticket).catch(() => null),
+    );
     const hasAnyCredential = (): boolean | undefined => {
         const creds = startupCreds();
         const codex = startupCodex();
@@ -2001,6 +2020,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     /// credential nor a session, and the account menu. Only the first of those
     /// had it in 0.4.13 — and it is the one a desktop never reaches, because a
     /// desktop is its own Home and its discovery does not fail.
+    let pendingNativeReturn: string | undefined;
     const signInCard = (footnote?: JSX.Element): JSX.Element => (
         <SignInCard
             footnote={footnote}
@@ -2020,6 +2040,36 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     }
                     : { kind: "personal" };
             }}
+            providerSignup={(() => {
+                const claim = signupClaim();
+                if (!accountSignupTicket || !claim) return undefined;
+                return {
+                    email: claim.email,
+                    suggestedName: claim.displayName ?? undefined,
+                    create: async (name: string) => {
+                        const created = await finishConsumerSignupAccount(
+                            controlPlaneBase(),
+                            accountSignupTicket,
+                            name,
+                        );
+                        pendingNativeReturn = created.nativeReturn;
+                        return created.recoveryCodes;
+                    },
+                    complete: () => {
+                        // A desktop signup finished in the system browser and
+                        // hands back over `gaugewright://` — but only now, after
+                        // the person has said they saved the codes. Following it
+                        // any earlier raises the desktop window over the only tab
+                        // that will ever show them.
+                        if (pendingNativeReturn) {
+                            window.location.assign(pendingNativeReturn);
+                            return;
+                        }
+                        void refreshHostedAccountSession(controlPlaneBase())
+                            .finally(() => window.location.reload());
+                    },
+                };
+            })()}
             passkey={localDevLogin ? undefined : {
                 signIn: async (email) => {
                     await signInWithPasskey(controlPlaneBase(), email);

@@ -51,6 +51,26 @@ pub fn session_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
     None
 }
 
+/// The signup-binding cookie: which browser completed the provider round trip
+/// that minted a signup ticket. Set on the callback redirect, required back at
+/// redemption.
+pub const SIGNUP_BINDING_COOKIE: &str = "gw_signup_binding";
+
+/// The [`SIGNUP_BINDING_COOKIE`] value from the `Cookie` header, if present and
+/// non-empty.
+pub fn signup_binding_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    for part in raw.split(';') {
+        if let Some(v) = part.trim().strip_prefix("gw_signup_binding=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 /// Liveness/readiness probe handler — a fixed 200 once the router is serving.
 /// No store access (`INV-5`): it reports the process is up, not any truth.
 ///

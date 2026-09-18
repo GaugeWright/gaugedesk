@@ -271,6 +271,138 @@ impl PendingAuthStore {
     }
 }
 
+/// Verified Google facts parked between a first-time provider callback and the
+/// passkey ceremony that will actually create the account (ADR 0146 §1).
+///
+/// A provider callback for a subject nobody has linked used to be a dead end: a
+/// 403 telling a person with no account to sign in with the passkey they do not
+/// have. It is not a dead end because the facts are missing — the id-token has
+/// already been signature-, issuer-, audience- and nonce-verified by the time
+/// this is built. It was a dead end because nothing carried those facts to the
+/// ceremony that creates accounts.
+///
+/// This is what carries them. It writes **no** account state: an abandoned
+/// signup leaves nothing behind. Nothing here is minted into an account until
+/// [`finish_registration`](crate::account_auth_ceremony) commits the root, the
+/// passkey, this subject link and the recovery batch in one append — so the
+/// Google subject is an authenticator *on* the account, never the account.
+#[derive(Clone, Debug)]
+pub struct PendingConsumerSignup {
+    /// From `id_token_verified_email` — the provider's `email` claim, admitted
+    /// only with `email_verified == true`. Never callback input.
+    pub verified_email: String,
+    pub connection_id: String,
+    pub connection_revision: String,
+    pub issuer: String,
+    /// The provider subject that will be linked, not used as the account id.
+    pub subject: String,
+    /// The `name` claim, offered to prefill the ceremony's name field. A
+    /// convenience; the person may replace it.
+    pub display_name: Option<String>,
+    /// Carried only so a desktop signup's native handoff can seal the same
+    /// durable grant an ordinary desktop login does. Redacted from `Debug`.
+    pub refresh_token: Option<crate::secret::Secret>,
+    pub provider_expires_at_ms: u64,
+    /// Both carried through from [`PendingAuth`] so a desktop signup ends where
+    /// a desktop login ends, over `gaugewright://`.
+    pub native_return: Option<String>,
+    pub native_handoff_challenge: Option<String>,
+    /// Which browser completed the provider round trip that minted this ticket.
+    ///
+    /// Without it the ticket is a pure bearer in a URL fragment: an attacker
+    /// signs in with their OWN Google account, takes the resulting link, and
+    /// sends it to someone else. That person's browser claims it, is shown the
+    /// attacker's address, and — if they do not read it — finishes a passkey
+    /// ceremony that creates an account the attacker can sign into with Google.
+    /// Everything the person then puts in it is the attacker's. That is
+    /// pre-account fixation, and reading the address is a hope rather than a
+    /// control.
+    ///
+    /// So the callback also sets this secret as an `HttpOnly` cookie, and both
+    /// redemption routes require it back. The cookie lands on the browser that
+    /// did the round trip and nowhere else; a planted link arrives without it.
+    /// Redacted from `Debug` for the same reason the refresh token is.
+    pub browser_binding: crate::secret::Secret,
+}
+
+struct PendingSignupEntry {
+    signup: PendingConsumerSignup,
+    expires_at: Instant,
+}
+
+/// Signup tickets awaiting their passkey ceremony.
+///
+/// A ticket is a bearer for one verified email and one provider subject:
+/// whoever holds it can create an account bound to that Google identity. So it
+/// gets exactly the custody [`PendingAuthStore`] has — a CSPRNG token, a single
+/// consuming [`take`](Self::take), [`PENDING_AUTH_TTL`], and a
+/// [`PENDING_AUTH_MAX`] ceiling that holds even when nothing has expired. It
+/// travels in a URL fragment so it never reaches history, a `Referer`, or a
+/// server log, and it is never accepted anywhere a WebAuthn ceremony id is.
+#[derive(Default)]
+pub struct PendingConsumerSignupStore {
+    by_ticket: BTreeMap<String, PendingSignupEntry>,
+}
+
+impl PendingConsumerSignupStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Park verified provider facts and return the ticket that redeems them.
+    pub fn begin(&mut self, signup: PendingConsumerSignup, now: Instant) -> Option<String> {
+        self.by_ticket.retain(|_, entry| entry.expires_at > now);
+        while self.by_ticket.len() >= PENDING_AUTH_MAX {
+            let oldest = self
+                .by_ticket
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(ticket, _)| ticket.clone());
+            match oldest {
+                Some(ticket) => {
+                    self.by_ticket.remove(&ticket);
+                }
+                None => break,
+            }
+        }
+        let mut bytes = [0_u8; 32];
+        getrandom::getrandom(&mut bytes).ok()?;
+        let ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        self.by_ticket.insert(
+            ticket.clone(),
+            PendingSignupEntry {
+                signup,
+                expires_at: now + PENDING_AUTH_TTL,
+            },
+        );
+        Some(ticket)
+    }
+
+    /// Read without consuming, for the non-secret projection the signup page
+    /// renders before it touches the authenticator. Deliberately not `take`:
+    /// rendering "create your account for jack@…" must not spend the ticket the
+    /// ceremony still needs.
+    pub fn peek(&self, ticket: &str, now: Instant) -> Option<&PendingConsumerSignup> {
+        let entry = self.by_ticket.get(ticket)?;
+        (entry.expires_at > now).then_some(&entry.signup)
+    }
+
+    /// Consume the ticket (single-use). An unknown, replayed, or expired ticket
+    /// finds nothing.
+    pub fn take(&mut self, ticket: &str, now: Instant) -> Option<PendingConsumerSignup> {
+        let entry = self.by_ticket.remove(ticket)?;
+        (entry.expires_at > now).then_some(entry.signup)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_ticket.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_ticket.is_empty()
+    }
+}
+
 /// The consumer login shell's route table (ADR 0122): every composition of
 /// the core control plane can serve `/auth/*`. The caller supplies the shell
 /// state — with its composition fold registered (enterprise), or plain for a
@@ -330,6 +462,7 @@ pub fn auth_routes(state: AuthShellState) -> axum::Router<SharedWorkbench> {
 #[derive(Clone, Default)]
 pub struct AuthShellState {
     pending_auth: Arc<Mutex<PendingAuthStore>>,
+    pending_consumer_signup: Arc<Mutex<PendingConsumerSignupStore>>,
     native_handoffs: Arc<Mutex<NativeHandoffStore>>,
     login_fold: Option<LoginFold>,
     enterprise_test_fold: Option<EnterpriseConnectionTestFold>,
@@ -432,10 +565,45 @@ impl AuthShellState {
         self.pending_auth.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// First-time provider signup tickets (ADR 0146 §1). `/auth/callback` parks
+    /// verified facts here; the account ceremony consumes them.
+    pub fn pending_consumer_signup_mut(&self) -> MutexGuard<'_, PendingConsumerSignupStore> {
+        self.pending_consumer_signup
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn native_handoffs_mut(&self) -> MutexGuard<'_, NativeHandoffStore> {
         self.native_handoffs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Issue the same one-time native handoff an ordinary provider login issues,
+    /// for a desktop signup that finished its passkey ceremony in the system
+    /// browser. The account is already resolved — this mints no identity, and
+    /// the code is still redeemable only with the verifier whose challenge the
+    /// desktop pinned at `/auth/login`.
+    pub(crate) fn issue_account_native_handoff(
+        &self,
+        account_id: &str,
+        session_method: &str,
+        label: &str,
+        provider_expires_at_ms: u64,
+        refresh_token: Option<String>,
+        challenge: String,
+    ) -> String {
+        self.native_handoffs_mut().issue(
+            NativeHandoffIssue {
+                account_id: account_id.to_owned(),
+                session_method: session_method.to_owned(),
+                label: label.to_owned(),
+                provider_expires_at_ms,
+                refresh_token,
+                challenge,
+            },
+            Instant::now(),
+        )
     }
 
     fn begin_enterprise_saml(&self, request: EnterpriseSamlStartRequest) -> Result<String, String> {
@@ -866,6 +1034,18 @@ fn id_token_display_label(id_token: &str) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+/// The provider's `name` claim, offered only to prefill a signup form. It is a
+/// convenience string: it names nobody, authenticates nothing, and the person
+/// can replace it before the account exists.
+fn id_token_display_name(id_token: &str) -> Option<String> {
+    id_token_claims(id_token)?
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// Email admitted from an already-verified OIDC token. Organization admission
@@ -2031,6 +2211,226 @@ fn resolve_consumer_oidc_account(
     })
 }
 
+/// What a verified consumer-provider callback means for this person.
+///
+/// Three answers, not two, and the whole judgement lives here — with no store,
+/// no clock and no HTTP in it — so each can be held to its meaning by a test
+/// rather than by a reading of the handler. The refusal that shipped the bug
+/// this repairs had no test at all: the string appeared exactly once in the
+/// repository, and the only coverage nearby asserted that the resolver was
+/// strict, which it was and which was never the problem.
+#[derive(Debug, PartialEq, Eq)]
+enum ConsumerCallbackDecision {
+    /// An exact active link: this subject is an authenticator on an account.
+    Login(LoginResolution),
+    /// Nobody has this subject and the provider attested an address: ADR 0146
+    /// §1 step 1 is satisfied, so carry the person into passkey creation.
+    Signup { verified_email: String },
+    /// The bounded product message the browser receives.
+    Refuse(StatusCode, &'static str),
+}
+
+fn decide_consumer_callback(
+    account_auth: &crate::account_auth::AccountAuth,
+    connection: &SsoConnectionRecord,
+    verified_issuer: &str,
+    subject: &str,
+    verified_email: Option<String>,
+) -> ConsumerCallbackDecision {
+    if let Some(resolution) =
+        resolve_consumer_oidc_account(account_auth, connection, verified_issuer, subject)
+    {
+        return ConsumerCallbackDecision::Login(resolution);
+    }
+    let Some(verified_email) = verified_email else {
+        return ConsumerCallbackDecision::Refuse(
+            StatusCode::FORBIDDEN,
+            "Google did not return a verified email address for this account, so GaugeDesk cannot create one. Create your account with a passkey instead.",
+        );
+    };
+    let Some(verified_email) = crate::account_auth::normalize_email_contact(&verified_email) else {
+        return ConsumerCallbackDecision::Refuse(
+            StatusCode::BAD_REQUEST,
+            "Google returned an email address GaugeDesk cannot use",
+        );
+    };
+    if account_auth
+        .external_subject_of_any_status(&connection.id, verified_issuer, subject)
+        .is_some()
+    {
+        return ConsumerCallbackDecision::Refuse(
+            StatusCode::FORBIDDEN,
+            "this Google sign-in was removed from a GaugeDesk account; sign in with your passkey or a recovery code, then link Google again in Account Settings",
+        );
+    }
+    if account_auth
+        .account_holding_active_email(&verified_email)
+        .is_some()
+    {
+        return ConsumerCallbackDecision::Refuse(
+            StatusCode::CONFLICT,
+            "a GaugeDesk account already uses this email address; sign in with your passkey or a recovery code, then link Google in Account Settings",
+        );
+    }
+    ConsumerCallbackDecision::Signup { verified_email }
+}
+
+/// A provider callback whose subject resolves to no account: park the verified
+/// facts and send the browser to the ceremony that creates accounts (ADR 0146 §1).
+///
+/// Everything this admits is already signature-, issuer-, audience- and
+/// nonce-verified. Nothing it admits creates an account: it writes one
+/// single-use ticket into memory and redirects. The account, its root, its
+/// passkey, its recovery batch and this subject link are committed together or
+/// not at all, later, by `finish_registration`.
+///
+/// It still refuses three things, and each refusal is the correct one:
+///
+/// - **No verified email.** Step 1 of §1 is "verify an email address", and the
+///   provider is the only thing here that can attest one. Without
+///   `email_verified` there is no step 1 to satisfy.
+/// - **A subject whose link was revoked.** An account deliberately removed this
+///   Google sign-in. Minting a *second* account for it would hand the same
+///   person a stranger's-looking empty account and leave the first one where it
+///   was.
+/// - **An address already verified on an account.** ADR 0146 §1 is explicit
+///   that email is "not silently trusted as an account-merge key": anyone who
+///   can obtain a Google account bearing an address could otherwise walk into
+///   the GaugeDesk account that verified it. The refusal says what to do
+///   instead, which is the sentence the old 403 was reaching for and gave to
+///   entirely the wrong person.
+fn begin_consumer_signup(
+    auth: &AuthShellState,
+    verified_email: String,
+    connection: &SsoConnectionRecord,
+    verified_issuer: &str,
+    verified: &VerifiedOidcIdentity,
+    native_return: Option<String>,
+    native_handoff_challenge: Option<String>,
+) -> axum::response::Response {
+    let Some(runtime) = auth.account_auth() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "account creation is not configured on this server",
+        )
+            .into_response();
+    };
+    let subject = verified.authority.as_str();
+    let now_ms = crate::account::session_now_ms();
+    // The browser binding. Minted here, where the provider round trip actually
+    // finished, so it can only reach the browser that finished it.
+    let binding = {
+        let mut bytes = [0_u8; 32];
+        if getrandom::getrandom(&mut bytes).is_err() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "account creation is temporarily unavailable",
+            )
+                .into_response();
+        }
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    };
+    let signup = PendingConsumerSignup {
+        verified_email,
+        connection_id: connection.id.clone(),
+        connection_revision: connection.current_revision(),
+        issuer: verified_issuer.to_owned(),
+        subject: subject.to_owned(),
+        display_name: id_token_display_name(&verified.id_token),
+        refresh_token: verified
+            .refresh_token
+            .as_deref()
+            .map(crate::secret::Secret::new),
+        provider_expires_at_ms: id_token_expiry_ms(&verified.id_token)
+            .unwrap_or_else(|| now_ms.saturating_add(60 * 60 * 1000)),
+        native_return,
+        native_handoff_challenge,
+        browser_binding: crate::secret::Secret::new(&binding),
+    };
+    let Some(ticket) = auth
+        .pending_consumer_signup_mut()
+        .begin(signup, Instant::now())
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "account creation is temporarily unavailable",
+        )
+            .into_response();
+    };
+
+    // The WebAuthn origin, not this callback's host and not the post-login
+    // Console: `navigator.credentials.create` has to run on the one origin the
+    // verifier accepts. A fragment, not a query, so the ticket never reaches
+    // browser history, a `Referer`, or a server log.
+    //
+    // The desktop lane redirects here too. It cannot run this ceremony against
+    // its own control plane — that composition has no account runtime and 404s
+    // these routes — so the system browser stays on the web app until the codes
+    // have been shown, and only then hands back over `gaugewright://`.
+    let mut response = Redirect::to(&format!(
+        "{}/#account_signup={ticket}",
+        runtime.origin().trim_end_matches('/')
+    ))
+    .into_response();
+    // Same domain and `Secure` derivation as the session cookie, so a
+    // multi-subdomain deployment works without a second knob. `SameSite=Lax` is
+    // enough: the WebAuthn origin and this account API are siblings under one
+    // registrable domain by construction — `AccountAuthConfig::new` admits an RP
+    // id that is a registrable suffix of the origin host precisely so they can
+    // be — and SameSite is judged on the registrable domain, so the redemption
+    // POST is same-site and carries this. `HttpOnly` because nothing in the page
+    // needs to read it; the page holds the ticket, the browser holds the proof
+    // it earned the ticket, and neither alone is enough.
+    append_signup_binding_cookie(&mut response, &binding);
+    response
+}
+
+/// The signup binding's `Set-Cookie`, built from the same env as the session
+/// cookie so the two cannot drift apart in a deployment.
+fn signup_binding_cookie_header(binding: &str) -> String {
+    let domain = gaugedesk_env::var("SESSION_COOKIE_DOMAIN");
+    let insecure = gaugedesk_env::var("SESSION_COOKIE_INSECURE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let mut c = format!(
+        "{}={binding}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        crate::net_http::SIGNUP_BINDING_COOKIE,
+        PENDING_AUTH_TTL.as_secs(),
+    );
+    if !insecure {
+        c.push_str("; Secure");
+    }
+    if let Some(d) = domain.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        c.push_str("; Domain=");
+        c.push_str(d);
+    }
+    c
+}
+
+fn append_signup_binding_cookie(resp: &mut axum::response::Response, binding: &str) {
+    if let Ok(value) = axum::http::HeaderValue::from_str(&signup_binding_cookie_header(binding)) {
+        resp.headers_mut()
+            .append(axum::http::header::SET_COOKIE, value);
+    }
+}
+
+/// Constant-time equality for the binding secret. Both sides are base64url of
+/// 32 random bytes; a length difference is itself an answer, so it short-circuits
+/// only there.
+pub(crate) fn binding_matches(expected: &str, presented: &str) -> bool {
+    let (expected, presented) = (expected.as_bytes(), presented.as_bytes());
+    if expected.len() != presented.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(presented.iter())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
 /// Begin linking the configured consumer provider to the account authenticated
 /// by this request. The returned authorization URL is opened by the Desk in a
 /// real browser; the provider callback needs no access to the Desk webview's
@@ -2679,19 +3079,36 @@ pub async fn get_callback(
                 }
             }
         };
-        let Some(resolution) = resolve_consumer_oidc_account(
+        // Three answers, not two. A subject with an active link signs in. A
+        // subject nobody has linked is a person who has never had an account
+        // here, and ADR 0146 §1 says what happens to them: the provider's
+        // verified email satisfies step 1, and they go on to create a passkey
+        // and an account, with this subject linked onto it. The refusal that
+        // used to stand here told them to sign in with a passkey they had no
+        // way to own and link Google from a settings page they could not reach.
+        match decide_consumer_callback(
             &account_auth,
             &connection,
             &pending_issuer,
             verified.authority.as_str(),
-        ) else {
-            return (
-                StatusCode::FORBIDDEN,
-                "this Google account is not linked; sign in with a passkey or recovery code, then link Google in Account Settings",
-            )
-                .into_response();
-        };
-        resolution
+            id_token_verified_email(&verified.id_token),
+        ) {
+            ConsumerCallbackDecision::Login(resolution) => resolution,
+            ConsumerCallbackDecision::Signup { verified_email } => {
+                return begin_consumer_signup(
+                    &auth,
+                    verified_email,
+                    &connection,
+                    &pending_issuer,
+                    &verified,
+                    native_return,
+                    native_handoff_challenge,
+                );
+            }
+            ConsumerCallbackDecision::Refuse(status, message) => {
+                return (status, message).into_response()
+            }
+        }
     };
 
     let VerifiedOidcIdentity {
@@ -4741,6 +5158,350 @@ iqlTEKVISscuchxZtKQJ4k8=
             "google-subject-7",
         )
         .is_none());
+    }
+
+    /// The sibling the repository was missing. `consumer_login_resolves_only_an
+    /// _exact_active_subject_link` proves the resolver is strict — which was
+    /// true and was never the problem. Nothing asked what happens to the person
+    /// the resolver correctly declines to recognise, and the answer shipped as
+    /// a 403 telling someone with no account to sign in with their passkey.
+    /// The decision is tested in isolation above, and on its own that is not
+    /// enough: `get_callback` is free to stop calling it. Restoring the old
+    /// `let Some(resolution) = resolve_consumer_oidc_account(..) else { 403 }`
+    /// in the callback — the literal bug a founder hit on a released 0.4.14
+    /// desktop — leaves `decide_consumer_callback` fully covered and green while
+    /// putting the refusal back in front of every new person.
+    ///
+    /// This is a structural assertion, deliberately and with its limits stated:
+    /// driving `get_callback` for real needs a provider to redeem a code and
+    /// sign an id-token, which this crate has no harness for. It reads the
+    /// source with comments stripped, because an assertion that matches prose
+    /// rather than code is not an assertion — that mistake has been made twice
+    /// in this repository already.
+    #[test]
+    fn the_consumer_callback_routes_through_the_decision_it_is_given() {
+        let source = include_str!("auth_oidc.rs");
+        // Production code only, twice over. Comments are stripped because an
+        // assertion that matches prose is not an assertion, and the test module
+        // is cut off because this very test names the old message in a string
+        // literal — without the cut it matches itself and fails on a correct
+        // tree, which is the most useless possible gate.
+        let production = source
+            .split_once("\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+        let code: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.contains("match decide_consumer_callback("),
+            "the consumer callback must route through decide_consumer_callback; \
+             a second, private answer to \"who is this subject\" is how the \
+             refusal came back",
+        );
+
+        // The exact message the founder was shown. Its absence is the cheapest
+        // true statement about this regression: the old behaviour cannot be
+        // restored without restoring a blanket refusal, and this one was it.
+        assert!(
+            !code.contains("this Google account is not linked"),
+            "the blanket refusal for an unlinked subject is gone; a first-time \
+             person now begins signup, and the remaining refusals each name a \
+             specific, correct reason",
+        );
+
+        // And the refusals that SHOULD remain, so this test cannot be satisfied
+        // by deleting the refusal path altogether.
+        assert!(
+            code.contains("was removed from a GaugeDesk account"),
+            "a revoked link must still be refused",
+        );
+        assert!(
+            code.contains("already uses this email address"),
+            "an existing account with the same email must still be refused \
+             rather than merged into (ADR 0146 section 1)",
+        );
+    }
+
+    #[test]
+    fn a_first_time_google_subject_begins_signup_instead_of_being_refused() {
+        let connection = google_sso("https://accounts.google.com", "client");
+        let state = crate::account_auth::AccountAuth::default();
+
+        // Nobody has this subject, and the resolver says so.
+        assert!(resolve_consumer_oidc_account(
+            &state,
+            &connection,
+            &connection.issuer,
+            "google-subject-new",
+        )
+        .is_none());
+
+        // That is now the beginning of account creation, not a dead end. The
+        // address is normalized on the way in, because it becomes a verified
+        // contact on an account and contacts are compared, not displayed.
+        assert_eq!(
+            decide_consumer_callback(
+                &state,
+                &connection,
+                &connection.issuer,
+                "google-subject-new",
+                Some("  New.Person@Example.COM ".to_string()),
+            ),
+            ConsumerCallbackDecision::Signup {
+                verified_email: "new.person@example.com".to_string(),
+            },
+        );
+
+        // And the other arm is unchanged: a subject that *is* linked signs in
+        // to the account holding it, never to a second one minted beside it.
+        let mut linked = crate::account_auth::AccountAuth::default();
+        let link = crate::account_auth::ExternalSubjectRecord::new(
+            "account:alice",
+            &connection.id,
+            &connection.issuer,
+            "google-subject-7",
+            crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+            1_000,
+        )
+        .unwrap();
+        linked.external_subjects.insert(link.id.clone(), link);
+        assert_eq!(
+            decide_consumer_callback(
+                &linked,
+                &connection,
+                &connection.issuer,
+                "google-subject-7",
+                Some("someone.else@example.com".to_string()),
+            ),
+            ConsumerCallbackDecision::Login(LoginResolution {
+                account_id: "account:alice".to_string(),
+                session_method: "consumer-oidc:consumer-google".to_string(),
+            }),
+        );
+    }
+
+    /// The one remaining dead end, and it is the correct one: step 1 of ADR 0146
+    /// §1 is "verify an email address", and without `email_verified` the
+    /// provider has attested nothing to satisfy it with. `id_token_verified_email`
+    /// is what enforces that, and it is strict — a missing claim, `false`, or the
+    /// *string* `"true"` all yield `None`.
+    #[test]
+    fn google_without_a_verified_email_still_refuses_rather_than_creating_an_account() {
+        let connection = google_sso("https://accounts.google.com", "client");
+        let state = crate::account_auth::AccountAuth::default();
+        let decision = decide_consumer_callback(
+            &state,
+            &connection,
+            &connection.issuer,
+            "google-subject-new",
+            None,
+        );
+        assert!(matches!(
+            decision,
+            ConsumerCallbackDecision::Refuse(StatusCode::FORBIDDEN, message)
+                if message.contains("did not return a verified email"),
+        ));
+
+        // The claim reader itself, since it is what produces that `None`.
+        assert_eq!(
+            id_token_verified_email(&unsigned_id_token(json!({
+                "email": "person@example.com",
+                "email_verified": true,
+            })))
+            .as_deref(),
+            Some("person@example.com")
+        );
+        for unverified in [
+            json!({"email": "person@example.com"}),
+            json!({"email": "person@example.com", "email_verified": false}),
+            json!({"email": "person@example.com", "email_verified": "true"}),
+            json!({"email": "", "email_verified": true}),
+        ] {
+            assert_eq!(
+                id_token_verified_email(&unsigned_id_token(unverified)),
+                None
+            );
+        }
+    }
+
+    /// An account let this Google sign-in go. Minting a second account for the
+    /// same subject would hand the person an empty account that looks like
+    /// somebody else's and leave the real one exactly where it was — so the
+    /// refusal that the link ceremony's tests already pin
+    /// (`consumer_login_resolves_only_an_exact_active_subject_link`, revoked
+    /// case) has to survive the new entrance too.
+    #[test]
+    fn a_revoked_google_link_cannot_be_laundered_into_a_new_account() {
+        let connection = google_sso("https://accounts.google.com", "client");
+        let mut state = crate::account_auth::AccountAuth::default();
+        let mut link = crate::account_auth::ExternalSubjectRecord::new(
+            "account:alice",
+            &connection.id,
+            &connection.issuer,
+            "google-subject-7",
+            crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+            1_000,
+        )
+        .unwrap();
+        link.status = crate::account_auth::AuthMethodStatus::Revoked;
+        state.external_subjects.insert(link.id.clone(), link);
+
+        // Sign-in still refuses it — that is the behaviour under test elsewhere
+        // and it stays green.
+        assert!(resolve_consumer_oidc_account(
+            &state,
+            &connection,
+            &connection.issuer,
+            "google-subject-7",
+        )
+        .is_none());
+        // And signup refuses it too, rather than treating "no active link" as
+        // "never seen".
+        assert!(matches!(
+            decide_consumer_callback(
+                &state,
+                &connection,
+                &connection.issuer,
+                "google-subject-7",
+                Some("alice@example.com".to_string()),
+            ),
+            ConsumerCallbackDecision::Refuse(StatusCode::FORBIDDEN, message)
+                if message.contains("was removed from a GaugeDesk account"),
+        ));
+    }
+
+    /// ADR 0146 §1: email is a verified contact and discovery identifier, and is
+    /// "not silently trusted as an account-merge key". So an address that an
+    /// existing account has already verified is a refusal, not a login — anyone
+    /// who could obtain a Google account bearing that address would otherwise
+    /// walk into the GaugeDesk account behind it. The refusal carries the
+    /// sentence the old 403 was reaching for, now given to the person it is
+    /// actually true of.
+    #[test]
+    fn an_existing_account_with_the_same_email_is_never_merged_into() {
+        let connection = google_sso("https://accounts.google.com", "client");
+        let mut state = crate::account_auth::AccountAuth::default();
+        let email = crate::account_auth::VerifiedEmailRecord::new(
+            "account:alice",
+            "alice@example.com",
+            1_000,
+        )
+        .unwrap();
+        state.emails.insert(email.id.clone(), email);
+
+        let decision = decide_consumer_callback(
+            &state,
+            &connection,
+            &connection.issuer,
+            "google-subject-new",
+            // Case and surrounding space must not be a way around the check.
+            Some(" Alice@Example.com ".to_string()),
+        );
+        match decision {
+            ConsumerCallbackDecision::Refuse(status, message) => {
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert!(message.contains("already uses this email address"));
+                assert!(message.contains("passkey or a recovery code"));
+            }
+            other => panic!("an existing account's address must refuse, got {other:?}"),
+        }
+        // Nothing about that decision names the account it declined to merge
+        // into: refusing must not become a way to ask whether an address has an
+        // account by reading back whose it is.
+        assert_eq!(
+            state.account_holding_active_email("alice@example.com"),
+            Some("account:alice"),
+        );
+        // A different address on the same store is still free to sign up.
+        assert_eq!(
+            decide_consumer_callback(
+                &state,
+                &connection,
+                &connection.issuer,
+                "google-subject-new",
+                Some("bob@example.com".to_string()),
+            ),
+            ConsumerCallbackDecision::Signup {
+                verified_email: "bob@example.com".to_string(),
+            },
+        );
+    }
+
+    /// The ticket is a bearer for one verified email and one provider subject,
+    /// so it gets the custody the PKCE state beside it has: one use, a TTL, and
+    /// a ceiling that holds when nothing has expired.
+    #[test]
+    fn a_signup_ticket_is_single_use_bounded_and_readable_without_being_spent() {
+        let now = Instant::now();
+        let mut store = PendingConsumerSignupStore::new();
+        let ticket = store
+            .begin(test_signup("new.person@example.com"), now)
+            .unwrap();
+        assert_eq!(store.len(), 1);
+
+        // Reading the projection the page renders must not spend the ticket the
+        // ceremony still needs.
+        assert_eq!(
+            store
+                .peek(&ticket, now)
+                .map(|s| s.verified_email.clone())
+                .as_deref(),
+            Some("new.person@example.com"),
+        );
+        assert_eq!(store.len(), 1);
+        assert!(store.peek("not-a-ticket", now).is_none());
+
+        assert_eq!(
+            store.take(&ticket, now).map(|s| s.subject),
+            Some("google-subject-new".to_string()),
+        );
+        // Single use: a replay finds nothing.
+        assert!(store.take(&ticket, now).is_none());
+        assert!(store.is_empty());
+
+        // And a ticket nobody redeemed ages out rather than waiting forever.
+        let stale = store.begin(test_signup("later@example.com"), now).unwrap();
+        assert!(store.peek(&stale, now + PENDING_AUTH_TTL).is_none());
+        assert!(store.take(&stale, now + PENDING_AUTH_TTL).is_none());
+    }
+
+    /// The refresh token a desktop signup carries must not be one `{:?}` away
+    /// from a log file, the way every other secret in this module is not.
+    #[test]
+    fn a_parked_signup_never_renders_its_provider_refresh_token() {
+        let mut signup = test_signup("new.person@example.com");
+        signup.refresh_token = Some(crate::secret::Secret::new("google-refresh-token"));
+        let rendered = format!("{signup:?}");
+        assert!(!rendered.contains("google-refresh-token"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+    }
+
+    fn test_signup(email: &str) -> PendingConsumerSignup {
+        PendingConsumerSignup {
+            verified_email: email.to_string(),
+            connection_id: CONSUMER_GOOGLE_CONNECTION_ID.to_string(),
+            connection_revision: "revision".to_string(),
+            issuer: "https://accounts.google.com".to_string(),
+            subject: "google-subject-new".to_string(),
+            display_name: Some("New Person".to_string()),
+            refresh_token: None,
+            provider_expires_at_ms: 0,
+            native_return: None,
+            native_handoff_challenge: None,
+            browser_binding: crate::secret::Secret::new("test-binding"),
+        }
+    }
+
+    /// An id-token body with these claims. Every caller here reads claims from
+    /// an *already verified* token, so the signature is not what is under test.
+    fn unsigned_id_token(claims: serde_json::Value) -> String {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        format!("header.{payload}.signature")
     }
 
     #[test]

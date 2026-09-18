@@ -2,8 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     bearer,
     beginLogin,
+    claimConsumerSignup,
+    consumeAccountSignupTicket,
     consumeCallbackToken,
     decodeSubject,
+    finishConsumerSignupAccount,
     endSession,
     exchangeMobileAccountHandoff,
     finishAccountRecovery,
@@ -350,6 +353,130 @@ describe("provider-neutral passkey account entry", () => {
             "Person One",
             { create, get: vi.fn() },
         )).rejects.toThrow(/no recovery codes/i);
+    });
+
+    it("creates a Google-first account without ever sending an email code", async () => {
+        // ADR 0146 §1 step 1 is "verify an email address", not "send a code" —
+        // the provider already attested one, so the two email calls the passkey
+        // entrance makes are absent here and the ticket stands in their place.
+        // Everything after is the same route on the same server, because there
+        // is only one place an account is created.
+        const fetch = vi.fn()
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                email: "person@example.test",
+                display_name: "Person One",
+                provider: "google",
+            }), { status: 200, headers: { "content-type": "application/json" } }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                ceremony_id: "registration-1",
+                public_key: {
+                    challenge: "AQI",
+                    rp: { name: "GaugeWright", id: "auth.example" },
+                    user: { id: "AwQ", name: "person@example.test", displayName: "Person One" },
+                    pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+                },
+            }), { status: 200, headers: { "content-type": "application/json" } }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                account_id: "person-one",
+                recovery_codes: ["HKPR-7T2M-QJ4X", "B9WD-LN3F-VZ6K"],
+                native_return: "gaugewright://auth/callback#code=handoff-1",
+            }), {
+                status: 200,
+                headers: { "content-type": "application/json", "set-cookie": "opaque-session" },
+            }));
+        vi.stubGlobal("fetch", fetch);
+        const create = vi.fn(async (_options: CredentialCreationOptions): Promise<Credential | null> =>
+            registrationCredential);
+
+        await expect(claimConsumerSignup("https://auth.example/", "ticket-1")).resolves.toEqual({
+            email: "person@example.test",
+            displayName: "Person One",
+            provider: "google",
+        });
+        await expect(finishConsumerSignupAccount(
+            "https://auth.example/",
+            "ticket-1",
+            "Person One",
+            { create, get: vi.fn() },
+        )).resolves.toEqual({
+            accountId: "person-one",
+            recoveryCodes: ["HKPR-7T2M-QJ4X", "B9WD-LN3F-VZ6K"],
+            // Returned, not followed: the page shows the codes first, because
+            // following this raises the desktop window over the one tab that
+            // will ever hold them.
+            nativeReturn: "gaugewright://auth/callback#code=handoff-1",
+        });
+
+        expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+            "https://auth.example/auth/account/consumer-signup/claim",
+            "https://auth.example/auth/account/consumer-signup/register/start",
+            // The same finish as the email entrance. A provider-specific twin
+            // would be a second place to get the atomic append wrong.
+            "https://auth.example/auth/account/passkey/register/finish",
+        ]);
+        expect(fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+            { ticket: "ticket-1" },
+            { ticket: "ticket-1", display_name: "Person One" },
+            {
+                ceremony_id: "registration-1",
+                label: "Passkey",
+                credential: {
+                    id: "-vs",
+                    transports: ["internal"],
+                    attestationObject: "AQI",
+                    clientDataJSON: "AwQ",
+                },
+            },
+        ]);
+        // The session is the server's HttpOnly cookie, never a JS bearer.
+        expect(bearer()).toBeNull();
+    });
+
+    it("refuses a Google-first account the server created without recovery codes", async () => {
+        // The same guard as the passkey entrance, run here rather than trusted
+        // from there: an account whose only authenticator is a Google login the
+        // person could lose, with no codes, is unrecoverable.
+        const fetch = vi.fn()
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                ceremony_id: "registration-1",
+                public_key: {
+                    challenge: "AQI",
+                    rp: { name: "GaugeWright", id: "auth.example" },
+                    user: { id: "AwQ", name: "person@example.test", displayName: "Person One" },
+                    pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+                },
+            }), { status: 200, headers: { "content-type": "application/json" } }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                account_id: "person-one",
+                recovery_codes: [],
+            }), { status: 200, headers: { "content-type": "application/json" } }));
+        vi.stubGlobal("fetch", fetch);
+        await expect(finishConsumerSignupAccount(
+            "https://auth.example/",
+            "ticket-1",
+            "Person One",
+            {
+                create: vi.fn(async (): Promise<Credential | null> => registrationCredential),
+                get: vi.fn(),
+            },
+        )).rejects.toThrow(/no recovery codes/i);
+    });
+
+    it("takes a signup ticket out of the fragment and out of history", () => {
+        // The ticket is a bearer for one verified email and one provider
+        // subject. It must not survive in the address bar for the next person
+        // at that machine, and it must never have been in a query string at all.
+        const replaceState = vi.fn();
+        vi.stubGlobal("window", {
+            location: { hash: "#account_signup=ticket-1&other=keep", pathname: "/", search: "" },
+        });
+        vi.stubGlobal("history", { replaceState });
+
+        expect(consumeAccountSignupTicket()).toBe("ticket-1");
+        expect(replaceState).toHaveBeenCalledWith(null, "", "/#other=keep");
+
+        vi.stubGlobal("window", { location: { hash: "#id_token=x", pathname: "/", search: "" } });
+        expect(consumeAccountSignupTicket()).toBeNull();
     });
 
     it("signs in with a passkey through a fresh server ceremony", async () => {

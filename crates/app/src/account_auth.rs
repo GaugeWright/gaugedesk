@@ -565,6 +565,37 @@ impl AccountAuth {
         })
     }
 
+    /// Any link for this exact provider subject, whatever its status.
+    ///
+    /// [`active_external_subject`](Self::active_external_subject) answers "may
+    /// this subject sign in", and returns `None` both for a subject nobody has
+    /// ever linked and for one whose link was revoked. Those two are the same
+    /// answer to sign-in and opposite answers to signing *up*: the first person
+    /// should be carried into account creation, and the second must not be —
+    /// their subject belongs to an account that deliberately let it go.
+    pub fn external_subject_of_any_status(
+        &self,
+        connection_id: &str,
+        issuer: &str,
+        subject: &str,
+    ) -> Option<&ExternalSubjectRecord> {
+        let id = external_subject_id(connection_id, issuer, subject);
+        self.external_subjects.get(&id)
+    }
+
+    /// The account holding this exact address as an active verified contact.
+    ///
+    /// Callers use this to *refuse*, never to resolve: ADR 0146 §1 says email
+    /// is a verified contact and discovery identifier, and is "not silently
+    /// trusted as an account-merge key". Matching an address to an account and
+    /// then signing that person in would be the takeover this forbids.
+    pub fn account_holding_active_email(&self, email: &str) -> Option<&str> {
+        self.emails
+            .values()
+            .find(|record| record.email == email && record.status == AuthMethodStatus::Active)
+            .map(|record| record.account_id.as_str())
+    }
+
     pub fn active_webauthn_count(&self, account_id: &str) -> usize {
         self.webauthn_methods
             .values()

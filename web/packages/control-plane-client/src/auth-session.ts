@@ -125,6 +125,34 @@ export function consumeCallbackToken(): boolean {
     return true;
 }
 
+/** Read a first-time provider signup ticket out of the URL fragment and remove
+ *  it from the address bar and history.
+ *
+ *  The ticket is a bearer for one verified email address and one provider
+ *  subject: whoever holds it can create an account bound to that Google
+ *  identity. It rides the fragment rather than a query so it never reaches a
+ *  `Referer` or a server log, and it is taken out of the visible URL the moment
+ *  it is read, the way the callback token beside it is. */
+export function consumeAccountSignupTicket(): string | null {
+    if (typeof window === "undefined") return null;
+    let ticket: string | null = null;
+    try {
+        const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+        ticket = fragment.get("account_signup");
+        if (!ticket) return null;
+        fragment.delete("account_signup");
+        const remaining = fragment.toString();
+        history.replaceState(
+            null,
+            "",
+            `${window.location.pathname}${window.location.search}${remaining ? `#${remaining}` : ""}`,
+        );
+    } catch {
+        /* a ticket that cannot be cleaned out of the URL is still usable */
+    }
+    return ticket;
+}
+
 /**
  * Begin OIDC login: navigate the browser to the control plane's `/auth/login`, which
  * redirects to the configured IdP. After the IdP, `/auth/callback` returns to this
@@ -268,14 +296,100 @@ export async function finishPasskeyAccountCreation(
         },
         "The passkey could not be verified. Start account creation again.",
     );
-    if (typeof finished.account_id !== "string" || !finished.account_id) {
-        throw new Error("Account authentication response is malformed.");
-    }
     // The only copy. The store holds salted hashes, so nothing can reissue these
     // — a later batch is a different batch and invalidates this one. A response
     // without them is a server that did not mint them, which is the state this
     // whole path existed in until recently; say so rather than show an empty list
     // as though the account were recoverable.
+    return createdAccount(finished);
+}
+
+/** A created passkey account, with the one copy of its recovery codes. */
+export interface PasskeyAccountCreated {
+    readonly accountId: string;
+    readonly recoveryCodes: readonly string[];
+    /** Present only for a desktop signup: the `gaugewright://` URL that hands
+     *  the desktop its session. Deliberately returned rather than redirected to,
+     *  so the page can show the recovery codes first — following it raises the
+     *  desktop window over the one tab that will ever hold them. */
+    readonly nativeReturn?: string;
+}
+
+/** What the signup page may know about a parked provider ticket before it asks
+ *  for a passkey: the address the provider attested, and the name it offered. */
+export interface ConsumerSignupClaim {
+    readonly email: string;
+    readonly displayName: string | null;
+    readonly provider: string;
+}
+
+/** Read the non-secret projection of a signup ticket. Does not spend it. */
+export async function claimConsumerSignup(
+    controlPlaneBase: string,
+    ticket: string,
+): Promise<ConsumerSignupClaim> {
+    const body = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/consumer-signup/claim",
+        { ticket },
+        "That sign-in link has expired. Press Continue with Google again.",
+    );
+    if (typeof body.email !== "string" || !body.email) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    return {
+        email: body.email,
+        displayName: typeof body.display_name === "string" && body.display_name
+            ? body.display_name
+            : null,
+        provider: typeof body.provider === "string" ? body.provider : "google",
+    };
+}
+
+/** Create the account a provider signup ticket describes.
+ *
+ * This is {@link finishPasskeyAccountCreation} without its two email calls:
+ * step 1 of ADR 0146 §1 is already satisfied by the provider's verified-email
+ * claim, so the ticket stands where the emailed code would. Everything after is
+ * the same route on the same server — including the finish, which keys off the
+ * ceremony id and so needs no provider-specific twin. */
+export async function finishConsumerSignupAccount(
+    controlPlaneBase: string,
+    ticket: string,
+    displayName: string,
+    credentials: CredentialContainer = navigator.credentials,
+): Promise<PasskeyAccountCreated> {
+    const started = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/consumer-signup/register/start",
+        { ticket, display_name: displayName },
+        "Could not start passkey creation. Press Continue with Google again.",
+    );
+    if (typeof started.ceremony_id !== "string" || !started.ceremony_id) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    const credential = await credentials.create({ publicKey: publicKeyCreationOptions(started.public_key) });
+    if (!credential || credential.type !== "public-key") throw new Error("Passkey creation was cancelled.");
+    const finished = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/passkey/register/finish",
+        {
+            ceremony_id: started.ceremony_id,
+            label: "Passkey",
+            credential: accountRegistrationResponse(credential as PublicKeyCredential),
+        },
+        "The passkey could not be verified. Start account creation again.",
+    );
+    return createdAccount(finished);
+}
+
+/** The shared reading of a `register/finish` body. The empty-codes guard is the
+ *  check that would have caught a botched mint, so both entrances run it rather
+ *  than one of them trusting the other's server. */
+function createdAccount(finished: Record<string, unknown>): PasskeyAccountCreated {
+    if (typeof finished.account_id !== "string" || !finished.account_id) {
+        throw new Error("Account authentication response is malformed.");
+    }
     const codes = Array.isArray(finished.recovery_codes)
         ? finished.recovery_codes.filter((code): code is string => typeof code === "string" && !!code)
         : [];
@@ -285,13 +399,10 @@ export async function finishPasskeyAccountCreation(
             + "Sign in and issue a batch before relying on this account.",
         );
     }
-    return { accountId: finished.account_id, recoveryCodes: codes };
-}
-
-/** A created passkey account, with the one copy of its recovery codes. */
-export interface PasskeyAccountCreated {
-    readonly accountId: string;
-    readonly recoveryCodes: readonly string[];
+    const nativeReturn = typeof finished.native_return === "string" && finished.native_return
+        ? finished.native_return
+        : undefined;
+    return { accountId: finished.account_id, recoveryCodes: codes, nativeReturn };
 }
 
 /** Authenticate an existing passkey account. Account discovery uses the

@@ -216,11 +216,46 @@ struct VerifiedEmailTicket {
     expires_at: u64,
 }
 
+/// The verified provider facts a first-time Google signup carries into the
+/// passkey ceremony (ADR 0146 §1).
+///
+/// It is deliberately not an account, a session, or a credential. It is the
+/// evidence that lets `finish_registration` attach one more authenticator in
+/// the same atomic append that creates the account — so the Google subject is
+/// linked *to* the root rather than standing in for it, and an account never
+/// exists whose only way in is a provider login the person could lose.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerSignupContext {
+    pub connection_id: String,
+    pub issuer: String,
+    pub subject: String,
+    /// Non-secret label for the native session this signup may hand a desktop.
+    pub label: String,
+    pub provider_expires_at_ms: u64,
+    pub refresh_token: Option<crate::secret::Secret>,
+    pub native_return: Option<String>,
+    pub native_handoff_challenge: Option<String>,
+}
+
+/// What one finished account creation produced. The recovery codes are the one
+/// and only plaintext copy; the signup context comes back so the route can hand
+/// a desktop its session *after* those codes have been shown.
+#[derive(Debug, PartialEq, Eq)]
+struct RegistrationOutcome {
+    account_id: String,
+    session: String,
+    recovery_codes: Vec<String>,
+    consumer_signup: Option<ConsumerSignupContext>,
+}
+
 struct PendingRegistration {
     email: String,
     account_id: String,
     root_seed: [u8; 32],
     state: RegistrationState,
+    /// Present only for the provider entrance. `None` is the email-code
+    /// entrance, which links no subject.
+    consumer_signup: Option<ConsumerSignupContext>,
     expires_at: u64,
 }
 
@@ -267,6 +302,9 @@ pub struct AccountAuthRuntime {
     sender: Arc<dyn EmailChallengeSender>,
     pending: Mutex<PendingCeremonies>,
     session_ttl_secs: u64,
+    /// The one origin WebAuthn will accept, kept so the provider callback can
+    /// send a first-time signup to exactly the page that can complete it.
+    origin: String,
 }
 
 impl AccountAuthRuntime {
@@ -283,7 +321,21 @@ impl AccountAuthRuntime {
             sender,
             pending: Mutex::new(PendingCeremonies::default()),
             session_ttl_secs: config.session_ttl_secs,
+            origin: config.origin.clone(),
         })
+    }
+
+    /// The exact origin a passkey ceremony must be served from.
+    ///
+    /// `passkey-auth` compares `clientDataJSON.origin` to this by string
+    /// equality, so a signup redirected anywhere else — the API host that
+    /// served the provider callback, or the post-login Console — meets the
+    /// authenticator and *then* fails verification, after the person has
+    /// already been asked for their fingerprint. Reading it off the runtime
+    /// rather than re-deriving it from the environment is what makes the two
+    /// the same value by construction instead of by convention.
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     pub fn from_env() -> Option<Arc<Self>> {
@@ -545,16 +597,36 @@ impl AccountAuthRuntime {
             .remove(email_ticket)
             .filter(|ticket| ticket.expires_at > now)
             .ok_or(CeremonyError::UnknownOrExpired)?;
+        self.start_registration_for_verified_email(&ticket.email, display_name, None, now)
+    }
+
+    /// Begin passkey registration for an address whose control is already
+    /// proved, whichever way it was proved.
+    ///
+    /// Step 1 of ADR 0146 §1 is "verify an email address", not "send a code".
+    /// An emailed code proves it, and so does an `email_verified` claim on a
+    /// signature-verified id-token — the same claim the enterprise lane already
+    /// admits as its organization-admission input. The caller owns that proof
+    /// and consumes it; nothing in here re-derives it, and nothing in here
+    /// accepts an address a request merely asserted.
+    fn start_registration_for_verified_email(
+        &self,
+        email: &str,
+        display_name: &str,
+        consumer_signup: Option<ConsumerSignupContext>,
+        now: u64,
+    ) -> Result<(String, serde_json::Value), CeremonyError> {
+        let email = normalize_email_contact(email).ok_or(CeremonyError::InvalidEmail)?;
         let (root_seed, account_id) = generate_account_root()?;
         let user_handle = account_user_handle(&account_id);
         let display_name = if display_name.trim().is_empty() {
-            ticket.email.as_str()
+            email.as_str()
         } else {
             display_name.trim()
         };
         let (challenge, state) =
             self.webauthn
-                .start_registration(&user_handle, &ticket.email, display_name, &[]);
+                .start_registration(&user_handle, &email, display_name, &[]);
         let ceremony_id = random_token(24)?;
         let challenge = serde_json::to_value(challenge).map_err(|_| CeremonyError::Unavailable)?;
         let mut store = self.lock();
@@ -565,10 +637,11 @@ impl AccountAuthRuntime {
         store.registrations.insert(
             ceremony_id.clone(),
             PendingRegistration {
-                email: ticket.email,
+                email,
                 account_id,
                 root_seed,
                 state,
+                consumer_signup,
                 expires_at: now.saturating_add(CEREMONY_TTL_SECS),
             },
         );
@@ -582,7 +655,7 @@ impl AccountAuthRuntime {
         response: &RegistrationResponse,
         label: &str,
         now: u64,
-    ) -> Result<(String, String, Vec<String>), CeremonyError> {
+    ) -> Result<RegistrationOutcome, CeremonyError> {
         let pending = self
             .lock()
             .registrations
@@ -629,19 +702,59 @@ impl AccountAuthRuntime {
             )
             .map_err(|_| CeremonyError::AlreadyExists)?,
         );
+        // A provider entrance attaches its verified subject here, in this list,
+        // and nowhere else. Writing it at the callback instead — or in any
+        // follow-up request once the account exists — opens a window in which
+        // an account's only authenticator is the Google login, which is exactly
+        // the unrecoverable account ADR 0146 §1 forbids. This is the same
+        // reducer the link ceremony uses, so a subject already held by another
+        // account is refused rather than stolen.
+        if let Some(signup) = &pending.consumer_signup {
+            facts.extend(
+                crate::account_auth::decide_link_external_subject(
+                    &state,
+                    crate::account_auth::ExternalSubjectRecord::new(
+                        &pending.account_id,
+                        &signup.connection_id,
+                        &signup.issuer,
+                        &signup.subject,
+                        crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+                        now,
+                    )
+                    .map_err(|_| CeremonyError::Unavailable)?,
+                )
+                .map_err(|_| CeremonyError::AlreadyExists)?,
+            );
+        }
         // ADR 0146 §2 requires provider-neutral recovery: a verified email
         // challenge plus one unused recovery code. An account created without a
         // batch can never satisfy that, so the batch is part of creating the
         // account rather than a later step somebody may not take.
+        //
+        // One mint site for both entrances. A provider signup that minted its
+        // own batch somewhere else would be a second place this can be got
+        // wrong, and getting it wrong means an account nobody can get back into.
         let (recovery_facts, recovery_codes) =
             mint_recovery_batch(&state, &pending.account_id, now)?;
         facts.extend(recovery_facts);
+        // Root custody, verified email, passkey, provider subject and recovery
+        // batch in one append: either the whole account exists, with a way back
+        // in, or none of it does.
         append_facts(wb.store_mut(), &facts).map_err(|_| CeremonyError::Unavailable)?;
         crate::auth_oidc::provision_web_account(wb, &pending.account_id, true);
+        // "passkey" on both entrances, and load-bearing: the person did just
+        // prove a passkey, and `independent_account_method` admits it — so they
+        // can link a second provider immediately instead of being told to sign
+        // in again with the credential they are holding.
         let session = wb
             .mint_account_session(&pending.account_id, "passkey", self.session_ttl_secs)
             .ok_or(CeremonyError::Unavailable)?;
-        Ok((pending.account_id, session, recovery_codes))
+        Ok(RegistrationOutcome {
+            account_id: pending.account_id,
+            session,
+            recovery_codes,
+            consumer_signup: pending.consumer_signup,
+        })
     }
 
     fn start_authentication(
@@ -1062,6 +1175,20 @@ struct FinishRegistrationRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimConsumerSignupRequest {
+    ticket: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartConsumerSignupRegistrationRequest {
+    ticket: String,
+    #[serde(default)]
+    display_name: String,
+}
+
+#[derive(Deserialize)]
 struct StartAuthenticationRequest {
     email: String,
 }
@@ -1171,7 +1298,109 @@ async fn post_registration_finish(
         &body.label,
         unix_now(),
     );
-    registration_response(result)
+    registration_response(result, &auth)
+}
+
+/// What the signup page may read about a parked provider ticket.
+///
+/// Non-secret projection only: the address the provider attested and the name
+/// it offered, so the page can say whose account it is about to create before
+/// it asks for a fingerprint. It deliberately does not consume the ticket —
+/// rendering a sentence must not spend the credential the ceremony still needs
+/// — and it returns nothing that could be replayed anywhere else.
+async fn post_consumer_signup_claim(
+    Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
+    Json(body): Json<ClaimConsumerSignupRequest>,
+) -> Response {
+    if let Err(error) = runtime(&auth) {
+        return error.response();
+    }
+    let presented = crate::net_http::signup_binding_cookie(&headers).unwrap_or_default();
+    let Some(signup) = auth
+        .pending_consumer_signup_mut()
+        .peek(&body.ticket, std::time::Instant::now())
+        // The browser that earned the ticket, or nobody. Refused here and not
+        // only at registration so a planted link dead-ends before it can print
+        // somebody else's address on a card that says "create your account".
+        .filter(|signup| {
+            crate::auth_oidc::binding_matches(signup.browser_binding.expose(), presented)
+        })
+        .map(|signup| {
+            json!({
+                "email": signup.verified_email,
+                "display_name": signup.display_name,
+                "provider": "google",
+            })
+        })
+    else {
+        return CeremonyError::UnknownOrExpired.response();
+    };
+    Json(signup).into_response()
+}
+
+/// Begin passkey creation for a first-time provider signup.
+///
+/// This is `post_registration_start` with step 1 already satisfied: the ticket
+/// is spent here instead of an emailed code, and the address inside it came
+/// from a verified id-token rather than from this request. Everything after —
+/// the fresh root, the user handle, the WebAuthn ceremony — is the same code
+/// the email entrance runs, because there is only one way to create an account.
+async fn post_consumer_signup_registration_start(
+    Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
+    Json(body): Json<StartConsumerSignupRegistrationRequest>,
+) -> Response {
+    let runtime = match runtime(&auth) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.response(),
+    };
+    let presented = crate::net_http::signup_binding_cookie(&headers).unwrap_or_default();
+    // Checked BEFORE the take, so a mismatched browser cannot spend somebody
+    // else's ticket even to fail. `take` is still the only exit that consumes
+    // it, so the rightful browser's ticket survives an attacker's attempt.
+    let matches_binding = auth
+        .pending_consumer_signup_mut()
+        .peek(&body.ticket, std::time::Instant::now())
+        .map(|signup| crate::auth_oidc::binding_matches(signup.browser_binding.expose(), presented))
+        .unwrap_or(false);
+    if !matches_binding {
+        return CeremonyError::UnknownOrExpired.response();
+    }
+    let Some(signup) = auth
+        .pending_consumer_signup_mut()
+        .take(&body.ticket, std::time::Instant::now())
+    else {
+        return CeremonyError::UnknownOrExpired.response();
+    };
+    let display_name = if body.display_name.trim().is_empty() {
+        signup.display_name.clone().unwrap_or_default()
+    } else {
+        body.display_name.clone()
+    };
+    let context = ConsumerSignupContext {
+        connection_id: signup.connection_id.clone(),
+        issuer: signup.issuer.clone(),
+        subject: signup.subject.clone(),
+        label: signup.verified_email.clone(),
+        provider_expires_at_ms: signup.provider_expires_at_ms,
+        refresh_token: signup.refresh_token.clone(),
+        native_return: signup.native_return.clone(),
+        native_handoff_challenge: signup.native_handoff_challenge.clone(),
+    };
+    match runtime.start_registration_for_verified_email(
+        &signup.verified_email,
+        &display_name,
+        Some(context),
+        unix_now(),
+    ) {
+        Ok((ceremony_id, public_key)) => Json(StartCeremonyResponse {
+            ceremony_id,
+            public_key,
+        })
+        .into_response(),
+        Err(error) => error.response(),
+    }
 }
 
 async fn post_authentication_start(
@@ -1396,13 +1625,58 @@ async fn post_authorization_finish(
 /// codes: they exist in plaintext for the length of this response and nowhere
 /// else, because the store holds salted hashes. A client that drops them cannot
 /// ask again — it has to mint a new batch, which invalidates these.
-fn registration_response(result: Result<(String, String, Vec<String>), CeremonyError>) -> Response {
+fn registration_response(
+    result: Result<RegistrationOutcome, CeremonyError>,
+    auth: &AuthShellState,
+) -> Response {
     match result {
-        Ok((account_id, token, recovery_codes)) => {
-            let mut response =
-                Json(json!({"account_id": account_id, "recovery_codes": recovery_codes}))
-                    .into_response();
-            crate::auth_oidc::append_session_cookies(&mut response, &token);
+        Ok(outcome) => {
+            let mut body = json!({
+                "account_id": outcome.account_id,
+                "recovery_codes": outcome.recovery_codes,
+            });
+            // A desktop signup finished its ceremony in the system browser, so
+            // the browser is where the codes are. Return the handoff URL rather
+            // than redirecting to it: a 302 to `gaugewright://` raises the
+            // desktop window over the one tab that will ever hold these codes,
+            // and the person closes it without having read them. The page shows
+            // them and navigates only when they say they have saved them.
+            let handoff = outcome.consumer_signup.as_ref().and_then(|signup| {
+                let native_return = signup.native_return.as_deref()?;
+                let challenge = signup.native_handoff_challenge.clone()?;
+                let code = auth.issue_account_native_handoff(
+                    &outcome.account_id,
+                    "passkey",
+                    &signup.label,
+                    signup.provider_expires_at_ms,
+                    signup
+                        .refresh_token
+                        .as_ref()
+                        .map(|token| token.expose().to_owned()),
+                    challenge,
+                );
+                Some(format!("{native_return}#code={code}"))
+            });
+            let native = handoff.is_some();
+            if let (Some(handoff), Some(map)) = (handoff, body.as_object_mut()) {
+                map.insert("native_return".into(), json!(handoff));
+            }
+            let mut response = Json(body).into_response();
+            // The same rule the login lane follows, and for the same reason.
+            // `requires_account_session(native_login) -> !native_login`
+            // (auth_oidc.rs): an ordinary desktop login mints NO browser session
+            // — it hands back a single-use code and the sealed grant lives in
+            // the control plane. A desktop SIGNUP was leaving a live
+            // `gw_session` behind in the system browser as well as issuing that
+            // code, so finishing signup silently left a second, longer-lived way
+            // into the account on a browser the person may not even think of as
+            // signed in, and which the desktop cannot sign out.
+            //
+            // The page needs no session to finish: the codes are in this body,
+            // and the button navigates to the handoff URL already in it.
+            if !native {
+                crate::auth_oidc::append_session_cookies(&mut response, &outcome.session);
+            }
             response
         }
         Err(error) => error.response(),
@@ -1428,6 +1702,18 @@ pub fn routes() -> axum::Router<SharedWorkbench> {
         .route(
             "/auth/account/passkey/register/start",
             post(post_registration_start),
+        )
+        // The provider entrance to the same ceremony (ADR 0146 §1). There is
+        // deliberately no `consumer-signup/register/finish`: the finish above
+        // keys off the ceremony id and already knows what it is finishing, so a
+        // second finish route would be a second place to get atomicity wrong.
+        .route(
+            "/auth/account/consumer-signup/claim",
+            post(post_consumer_signup_claim),
+        )
+        .route(
+            "/auth/account/consumer-signup/register/start",
+            post(post_consumer_signup_registration_start),
         )
         .route(
             "/auth/account/passkey/register/finish",
@@ -1804,7 +2090,11 @@ mod tests {
         ));
         let mut wb = crate::Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
             .with_content_vault(vault);
-        let (account_id, _, issued_codes) = runtime
+        let RegistrationOutcome {
+            account_id,
+            recovery_codes: issued_codes,
+            ..
+        } = runtime
             .finish_registration(&mut wb, &registration_id, &registration, "Laptop", 4)
             .unwrap();
         // Creating the account issues the batch (ADR 0146 §2). This used to seed
@@ -1937,6 +2227,395 @@ mod tests {
         );
     }
 
+    fn test_signup_context() -> ConsumerSignupContext {
+        ConsumerSignupContext {
+            connection_id: "consumer-google".into(),
+            issuer: "https://accounts.google.com".into(),
+            subject: "google-subject-new".into(),
+            label: "new.person@example.com".into(),
+            provider_expires_at_ms: 0,
+            refresh_token: None,
+            native_return: None,
+            native_handoff_challenge: None,
+        }
+    }
+
+    fn signup_workbench() -> (tempfile::TempDir, crate::Workbench) {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(crate::content_vault::ContentVault::new(
+            vault_dir.path(),
+            Box::new(crate::at_rest::LoopbackKeyWrap::new([9_u8; 32])),
+        ));
+        let wb = crate::Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
+            .with_content_vault(vault);
+        (vault_dir, wb)
+    }
+
+    /// The whole of ADR 0146 §1 for the Google entrance, in one assertion set.
+    ///
+    /// The order is the decision: root custody, verified email, passkey, *then*
+    /// the provider subject, then the recovery batch — all in the single append
+    /// this asserts. Move the link out of here and there is a moment when an
+    /// account's only way in is a Google login the person could lose, which is
+    /// exactly the unrecoverable account §1 exists to forbid.
+    /// A desktop signup must not leave a browser session behind.
+    ///
+    /// The login lane has always held this rule —
+    /// `requires_account_session(native_login) -> !native_login` — because a
+    /// native login hands back a single-use code and keeps the sealed grant in
+    /// the control plane, deliberately leaving the system browser signed out.
+    /// Signup issued that code AND set `gw_session`, so finishing it left a
+    /// second, longer-lived way into a brand-new account on a browser the
+    /// person may not think of as signed in and the desktop cannot sign out of.
+    #[test]
+    fn a_native_signup_leaves_no_session_in_the_system_browser() {
+        let cookies = |response: &Response| -> Vec<String> {
+            response
+                .headers()
+                .get_all(axum::http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .map(str::to_owned)
+                .collect()
+        };
+
+        let (runtime, _sender) = runtime();
+        let auth = crate::auth_oidc::AuthShellState::default()
+            .with_account_auth(std::sync::Arc::new(runtime));
+
+        // The web entrance: no native return, so the browser IS the client and
+        // keeps its session exactly as it always has.
+        let web = registration_response(
+            Ok(RegistrationOutcome {
+                account_id: "account:web".into(),
+                session: "web-session-token".into(),
+                recovery_codes: vec!["AAAA-BBBB-CCCC".into()],
+                consumer_signup: None,
+            }),
+            &auth,
+        );
+        let web_cookies = cookies(&web);
+        assert!(
+            web_cookies
+                .iter()
+                .any(|c| c.starts_with(crate::net_http::SESSION_COOKIE)),
+            "a browser signup still gets its session; this rule is about the \
+             native lane only",
+        );
+
+        // The desktop entrance: a native return and a handoff challenge, so the
+        // one-time code is the way back and the browser must stay signed out.
+        let native = registration_response(
+            Ok(RegistrationOutcome {
+                account_id: "account:desk".into(),
+                session: "desk-session-token".into(),
+                recovery_codes: vec!["DDDD-EEEE-FFFF".into()],
+                consumer_signup: Some(ConsumerSignupContext {
+                    connection_id: "consumer-google".into(),
+                    issuer: "https://accounts.google.com".into(),
+                    subject: "google-subject-desk".into(),
+                    label: "desk.person@example.com".into(),
+                    provider_expires_at_ms: 0,
+                    refresh_token: None,
+                    native_return: Some("gaugewright://auth/callback".into()),
+                    native_handoff_challenge: Some("challenge-1".into()),
+                }),
+            }),
+            &auth,
+        );
+        let native_cookies = cookies(&native);
+        assert!(
+            !native_cookies
+                .iter()
+                .any(|c| c.starts_with(crate::net_http::SESSION_COOKIE)),
+            "a desktop signup must not set gw_session in the system browser; \
+             got {native_cookies:?}",
+        );
+    }
+
+    /// The route, not the store. The store's `take` was already single-use and
+    /// already tested, and that is exactly why this gap survived review: the
+    /// handler is free to call `peek` instead, and nothing noticed. Changing
+    /// `post_consumer_signup_registration_start` from `.take(..)` to
+    /// `.peek(..).cloned()` left the whole 1294-test suite green while making
+    /// one Google callback able to mint unlimited accounts against the same
+    /// verified identity for the ticket's ten-minute life.
+    ///
+    /// So this drives the handler itself, twice, with the same ticket.
+    #[tokio::test]
+    async fn the_signup_route_spends_its_ticket_exactly_once() {
+        const BINDING: &str = "binding-secret-for-this-browser";
+        let (runtime, _sender) = runtime();
+        let auth = crate::auth_oidc::AuthShellState::default()
+            .with_account_auth(std::sync::Arc::new(runtime));
+
+        let ticket = auth
+            .pending_consumer_signup_mut()
+            .begin(
+                crate::auth_oidc::PendingConsumerSignup {
+                    verified_email: "new.person@example.com".into(),
+                    connection_id: "consumer-google".into(),
+                    connection_revision: "rev-1".into(),
+                    issuer: "https://accounts.google.com".into(),
+                    subject: "google-subject-new".into(),
+                    display_name: Some("New Person".into()),
+                    refresh_token: None,
+                    provider_expires_at_ms: 0,
+                    native_return: None,
+                    native_handoff_challenge: None,
+                    browser_binding: crate::secret::Secret::new(BINDING),
+                },
+                std::time::Instant::now(),
+            )
+            .expect("a ticket is minted");
+
+        let request = || StartConsumerSignupRegistrationRequest {
+            ticket: ticket.clone(),
+            display_name: "New Person".into(),
+        };
+
+        // The browser that earned the ticket presents its binding cookie; a
+        // planted link arrives without one.
+        let bound = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::COOKIE,
+                format!("gw_signup_binding={BINDING}").parse().unwrap(),
+            );
+            headers
+        };
+
+        let unbound = post_consumer_signup_registration_start(
+            Extension(auth.clone()),
+            HeaderMap::new(),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(
+            unbound.status(),
+            CeremonyError::UnknownOrExpired.response().status(),
+            "a ticket presented without its binding is refused — that is a link \
+             planted on somebody else's browser",
+        );
+        let wrong = {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::COOKIE,
+                "gw_signup_binding=not-the-binding".parse().unwrap(),
+            );
+            post_consumer_signup_registration_start(
+                Extension(auth.clone()),
+                headers,
+                Json(request()),
+            )
+            .await
+        };
+        assert_eq!(
+            wrong.status(),
+            CeremonyError::UnknownOrExpired.response().status(),
+            "a wrong binding is refused",
+        );
+        assert!(
+            auth.pending_consumer_signup_mut()
+                .peek(&ticket, std::time::Instant::now())
+                .is_some(),
+            "and neither attempt SPENT the ticket — an attacker must not be able \
+             to burn the ticket the rightful browser still needs",
+        );
+
+        let first = post_consumer_signup_registration_start(
+            Extension(auth.clone()),
+            bound(),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(
+            first.status(),
+            axum::http::StatusCode::OK,
+            "the first redemption starts the WebAuthn ceremony",
+        );
+
+        let second = post_consumer_signup_registration_start(
+            Extension(auth.clone()),
+            bound(),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(
+            second.status(),
+            CeremonyError::UnknownOrExpired.response().status(),
+            "a replayed ticket must find nothing — a bearer for one verified \
+             identity that can be redeemed twice is a bearer for two accounts",
+        );
+
+        assert!(
+            auth.pending_consumer_signup_mut()
+                .peek(&ticket, std::time::Instant::now())
+                .is_none(),
+            "the ticket is gone from the store, not merely refused",
+        );
+    }
+
+    #[test]
+    fn a_google_signup_creates_the_account_its_passkey_its_codes_and_its_link_together() {
+        let (runtime, _sender) = runtime();
+        let (_vault_dir, mut wb) = signup_workbench();
+        let signup = test_signup_context();
+
+        // No emailed code anywhere on this path: step 1 arrived verified.
+        let (ceremony_id, options) = runtime
+            .start_registration_for_verified_email(
+                "New.Person@Example.com",
+                "New Person",
+                Some(signup.clone()),
+                10,
+            )
+            .unwrap();
+        let authenticator = FakeAuthenticator::new();
+        let response = authenticator.registration_response(options["challenge"].as_str().unwrap());
+        let outcome = runtime
+            .finish_registration(&mut wb, &ceremony_id, &response, "Laptop", 11)
+            .unwrap();
+
+        // Recovery codes: minted exactly once, by the one mint site, and
+        // returned here and nowhere else.
+        assert_eq!(outcome.recovery_codes.len(), RECOVERY_CODE_COUNT);
+        assert_eq!(
+            outcome
+                .recovery_codes
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            RECOVERY_CODE_COUNT,
+        );
+
+        let state = AccountAuth::rebuild(wb.store_ref()).unwrap();
+        // The account is the root, not the Google subject.
+        assert!(state.roots.contains_key(&outcome.account_id));
+        assert_ne!(outcome.account_id, signup.subject);
+        // The address Google attested is a verified contact on it, normalized.
+        assert_eq!(
+            state.account_holding_active_email("new.person@example.com"),
+            Some(outcome.account_id.as_str()),
+        );
+        // A passkey — the independent authenticator §1 requires before the
+        // account exists at all.
+        assert_eq!(state.active_webauthn_count(&outcome.account_id), 1);
+        // Recovery is possible, because a batch exists.
+        assert!(state
+            .find_active_recovery_code(&outcome.account_id, &outcome.recovery_codes[0])
+            .is_some());
+        // And Google is linked *onto* that account, which is what makes the
+        // next sign-in resolve. This assertion is the one that proves the bug
+        // is fixed rather than merely routed around.
+        let link = state
+            .active_external_subject(
+                &signup.connection_id,
+                &signup.issuer,
+                &signup.subject,
+                crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+            )
+            .expect("the Google subject is linked to the new account");
+        assert_eq!(link.account_id, outcome.account_id);
+
+        // The session names the passkey that was just proved, so this person can
+        // link a second provider without being asked to authenticate again.
+        assert_eq!(
+            wb.account_sessions()
+                .resolve(&outcome.session, 12)
+                .as_deref(),
+            Some(outcome.account_id.as_str()),
+        );
+
+        // The ceremony is single-use, like the email-code entrance beside it.
+        assert_eq!(
+            runtime.finish_registration(&mut wb, &ceremony_id, &response, "Laptop", 13),
+            Err(CeremonyError::UnknownOrExpired),
+        );
+    }
+
+    /// The link goes through the same reducer the link ceremony uses, so a
+    /// subject another account already holds is refused rather than stolen —
+    /// and because the refusal happens before the single append, the attempt
+    /// leaves no half-made account behind.
+    #[test]
+    fn a_google_subject_another_account_holds_is_refused_and_writes_nothing() {
+        let (runtime, _sender) = runtime();
+        let (_vault_dir, mut wb) = signup_workbench();
+        let signup = test_signup_context();
+
+        // Somebody else already holds this subject.
+        let existing = crate::account_auth::ExternalSubjectRecord::new(
+            "account:alice",
+            &signup.connection_id,
+            &signup.issuer,
+            &signup.subject,
+            crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+            5,
+        )
+        .unwrap();
+        append_facts(
+            wb.store_mut(),
+            &[AccountAuthFact::ExternalSubject(existing)],
+        )
+        .unwrap();
+        let before = AccountAuth::rebuild(wb.store_ref()).unwrap();
+
+        let (ceremony_id, options) = runtime
+            .start_registration_for_verified_email(
+                "new.person@example.com",
+                "New Person",
+                Some(signup.clone()),
+                10,
+            )
+            .unwrap();
+        let authenticator = FakeAuthenticator::new();
+        let response = authenticator.registration_response(options["challenge"].as_str().unwrap());
+        assert_eq!(
+            runtime.finish_registration(&mut wb, &ceremony_id, &response, "Laptop", 11),
+            Err(CeremonyError::AlreadyExists),
+        );
+
+        let after = AccountAuth::rebuild(wb.store_ref()).unwrap();
+        assert_eq!(after.roots.len(), before.roots.len());
+        assert_eq!(after.emails.len(), before.emails.len());
+        assert_eq!(after.webauthn_methods.len(), before.webauthn_methods.len());
+        assert_eq!(after.recovery_batches.len(), before.recovery_batches.len());
+        assert_eq!(
+            after
+                .active_external_subject(
+                    &signup.connection_id,
+                    &signup.issuer,
+                    &signup.subject,
+                    crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+                )
+                .map(|link| link.account_id.clone()),
+            Some("account:alice".to_string()),
+        );
+    }
+
+    /// The email entrance is unchanged by all of this: no context, no link, and
+    /// the same batch. Worth pinning, because the shared `finish_registration`
+    /// is now the only thing standing between the two entrances.
+    #[test]
+    fn the_email_entrance_still_links_no_provider_subject() {
+        let (runtime, sender) = runtime();
+        let (_vault_dir, mut wb) = signup_workbench();
+        let challenge = runtime.begin_email("alice@example.com", 10).unwrap();
+        let code = sender.0.lock().unwrap()[0].1.clone();
+        let ticket = runtime.complete_email(&challenge, &code, 11).unwrap();
+        let (ceremony_id, options) = runtime.start_registration(&ticket, "Alice", 12).unwrap();
+        let authenticator = FakeAuthenticator::new();
+        let response = authenticator.registration_response(options["challenge"].as_str().unwrap());
+        let outcome = runtime
+            .finish_registration(&mut wb, &ceremony_id, &response, "Laptop", 13)
+            .unwrap();
+        assert!(outcome.consumer_signup.is_none());
+        assert_eq!(outcome.recovery_codes.len(), RECOVERY_CODE_COUNT);
+        let state = AccountAuth::rebuild(wb.store_ref()).unwrap();
+        assert!(state.external_subjects.is_empty());
+    }
+
     #[test]
     fn real_passkey_round_trip_creates_and_reauthenticates_the_same_account() {
         let (runtime, sender) = runtime();
@@ -1959,7 +2638,11 @@ mod tests {
         let mut wb = crate::Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
             .with_content_vault(vault);
 
-        let (account_id, first_session, _) = runtime
+        let RegistrationOutcome {
+            account_id,
+            session: first_session,
+            ..
+        } = runtime
             .finish_registration(&mut wb, &registration_id, &registration, "Laptop", 13)
             .unwrap();
         assert_eq!(

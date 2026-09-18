@@ -26,7 +26,7 @@
  * is why this takes a list instead of naming Google.
  */
 
-import { createSignal, For, Show, type JSX } from "solid-js";
+import { createEffect, createSignal, For, Show, untrack, type JSX } from "solid-js";
 
 // The company mark, rendered here from `brand/logos/` by the GaugeWright
 // repository's `tools/palette.mjs`, exactly as the brand tokens beside it are.
@@ -66,6 +66,25 @@ export interface SignInProvider {
     begin: () => void | Promise<void>;
 }
 
+/** A first-time provider signup already half done.
+ *
+ *  The provider has attested an address, which is step 1 of ADR 0146 §1; all
+ *  that is left is the passkey and the account. The card renders it as the
+ *  account-creation step it is, with the email field gone because asking again
+ *  for an address Google already proved would be theatre. */
+export interface SignInProviderSignup {
+    /** The address the provider verified. Not editable here: it is evidence,
+     *  not a field. */
+    email: string;
+    /** The provider's `name` claim, if it offered one, to prefill the form. */
+    suggestedName?: string;
+    /** Creates the account, attaches the passkey and links the provider
+     *  subject, and resolves with the one copy of the recovery codes. */
+    create(displayName: string): Promise<readonly string[]>;
+    /** Called only once the person has said they saved the codes. */
+    complete(): void;
+}
+
 export interface SignInRecoveryActions {
     start(email: string): Promise<{ readonly challengeId: string; readonly expiresIn: number }>;
     finish(challengeId: string, emailCode: string, recoveryCode: string): Promise<void>;
@@ -81,6 +100,8 @@ export interface SignInCardProps {
      *  ones this control plane has a connection for; an empty list hides the row
      *  and its rule rather than leaving a labelled gap. */
     providers?: readonly SignInProvider[];
+    /** Present only when this load *is* the return leg of a provider signup. */
+    providerSignup?: SignInProviderSignup;
     recovery?: SignInRecoveryActions;
     /** The card's own heading and opening line. They belong to the card because
      *  the mark, the title and the lede are one masthead; splitting them across
@@ -96,7 +117,12 @@ type Step =
     | { at: "organization"; email: string; label?: string; go: () => void }
     | { at: "personal"; email: string }
     | { at: "create"; email: string; challenge?: { id: string; expiresIn: number } }
-    | { at: "codes"; email: string; codes: readonly string[] }
+    | { at: "provider-create"; email: string }
+    // `done` rather than a fixed call, because both entrances end here and they
+    // hand over differently — a desktop signup leaves for `gaugewright://`, a
+    // browser one reloads. The one thing they share is that neither may run
+    // until the codes have been read.
+    | { at: "codes"; email: string; codes: readonly string[]; done: () => void }
     | { at: "recover"; email: string; challenge?: { id: string; expiresIn: number } };
 
 
@@ -136,13 +162,41 @@ function ProviderMark(props: { id: SignInProvider["id"] }): JSX.Element {
 }
 
 export function SignInCard(props: SignInCardProps): JSX.Element {
-    const [step, setStep] = createSignal<Step>({ at: "identify" });
-    const [email, setEmail] = createSignal("");
-    const [displayName, setDisplayName] = createSignal("");
+    // A provider signup arrives mid-ceremony: the address is already proved, so
+    // the card opens on the step that is actually left rather than on a field
+    // asking for what the person just finished handing over.
+    const [step, setStep] = createSignal<Step>(
+        props.providerSignup
+            ? { at: "provider-create", email: props.providerSignup.email }
+            : { at: "identify" },
+    );
+    const [email, setEmail] = createSignal(props.providerSignup?.email ?? "");
+    const [displayName, setDisplayName] = createSignal(props.providerSignup?.suggestedName ?? "");
     const [code, setCode] = createSignal("");
     const [recoveryCode, setRecoveryCode] = createSignal("");
     const [busy, setBusy] = createSignal(false);
     const [status, setStatus] = createSignal("");
+
+    // The initializers above run ONCE, when the card is constructed. A provider
+    // signup does not arrive then: the host claims the ticket over the network,
+    // so `props.providerSignup` is undefined through the first render and
+    // resolves a moment later. Reading it only above left the card permanently
+    // on `identify` — it typechecked, every test passed, and the person came
+    // back from Google to the same email field they started at.
+    //
+    // This is what makes the step follow the prop. It moves only on the
+    // transition INTO a signup, and only while the person is still on the
+    // opening step, so it cannot pull a card out from under someone who has
+    // already started typing or gone to recovery. `untrack` keeps the effect
+    // from subscribing to its own writes.
+    createEffect(() => {
+        const signup = props.providerSignup;
+        if (!signup) return;
+        if (untrack(step).at !== "identify") return;
+        setEmail(signup.email);
+        setDisplayName(signup.suggestedName ?? "");
+        setStep({ at: "provider-create", email: signup.email });
+    });
 
     /** The current step when it is `kind`, else undefined — the shape `<Show>`
      *  wants, so each branch gets its own narrowed step instead of a boolean. */
@@ -224,7 +278,12 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                 );
                 // The account exists and the session is live, but the codes are in
                 // this response and nowhere else. Show them before handing over.
-                setStep({ at: "codes", email: current.email, codes });
+                setStep({
+                    at: "codes",
+                    email: current.email,
+                    codes,
+                    done: () => props.passkey!.complete(),
+                });
                 return;
             } catch (error) {
                 // Email tickets and WebAuthn ceremonies are single-use: drop the
@@ -234,6 +293,24 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                 setCode("");
                 throw error;
             }
+        });
+    };
+
+    /** The provider entrance's only submit. One call: it creates the account,
+     *  attaches the passkey and links the provider subject in one server-side
+     *  append, and comes back with the codes that must be shown before anything
+     *  navigates. */
+    const finishProviderSignup = (event: SubmitEvent, current: Extract<Step, { at: "provider-create" }>) => {
+        event.preventDefault();
+        if (!displayName().trim()) return;
+        void run("create that account", async () => {
+            const codes = await props.providerSignup!.create(displayName().trim());
+            setStep({
+                at: "codes",
+                email: current.email,
+                codes,
+                done: () => props.providerSignup!.complete(),
+            });
         });
     };
 
@@ -416,6 +493,34 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                     )}
             </Show>
 
+            <Show when={at('provider-create')}>
+                {(current) => (
+                        <form class="signin__act" data-signin-provider-create onSubmit={(event) => finishProviderSignup(event, current())}>
+                            <p class="signin__resolved">
+                                <span>Google verified {current().email}</span>
+                            </p>
+                            <p class="signin__status">
+                                Create a passkey to finish setting up your GaugeDesk
+                                account. Google becomes one way to sign in, not the
+                                account itself — so losing it never loses the account.
+                            </p>
+                            <label class="signin__field">
+                                <span class="signin__label">Your name</span>
+                                <input
+                                    name="display-name"
+                                    autocomplete="name"
+                                    required
+                                    value={displayName()}
+                                    onInput={(event) => setDisplayName(event.currentTarget.value)}
+                                />
+                            </label>
+                            <button class="signin__primary" data-signin-provider-continue type="submit" disabled={busy() || !displayName().trim()}>
+                                {busy() ? "Creating…" : "Create account with a passkey"}
+                            </button>
+                        </form>
+                    )}
+            </Show>
+
             <Show when={at('codes')}>
                 {(current) => (
                     <div class="signin__act" data-signin-codes>
@@ -432,7 +537,7 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                             class="signin__primary"
                             data-signin-codes-saved
                             type="button"
-                            onClick={() => props.passkey!.complete()}
+                            onClick={() => current().done()}
                         >
                             I've saved them
                         </button>

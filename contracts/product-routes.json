@@ -2262,6 +2262,78 @@
       }
     },
     {
+      "id": "account.consumer-signup.claim",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/consumer-signup/claim",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser returning from a consumer provider",
+      "authentication": "single-use-verified-provider-signup-ticket",
+      "scope": "non-secret-projection-of-a-parked-provider-signup",
+      "capability": "read-own-pending-provider-signup",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/ClaimConsumerSignupRequest",
+      "responseSchema": "gw://schemas/account/consumer-signup-claim/v1",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#a_google_signup_creates_the_account_its_passkey_its_codes_and_its_link_together"
+        ],
+        "authority": [
+          "crates/app/src/auth_oidc.rs#a_first_time_google_subject_begins_signup_instead_of_being_refused"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#a_google_signup_creates_the_account_its_passkey_its_codes_and_its_link_together"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/auth_oidc.rs#a_first_time_google_subject_begins_signup_instead_of_being_refused"
+        ]
+      }
+    },
+    {
+      "id": "account.consumer-signup.registration.start",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/consumer-signup/register/start",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk account browser using the WebAuthn API",
+      "authentication": "single-use-verified-provider-signup-ticket",
+      "scope": "pending-account-and-webauthn-registration",
+      "capability": "begin-account-passkey-registration-from-a-verified-provider-email",
+      "requestSchema": "rust:gaugedesk-app/account_auth_ceremony/StartConsumerSignupRegistrationRequest",
+      "responseSchema": "webauthn/PublicKeyCredentialCreationOptions",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_auth_ceremony.rs#a_google_signup_creates_the_account_its_passkey_its_codes_and_its_link_together"
+        ],
+        "authority": [
+          "crates/app/src/auth_oidc.rs#a_first_time_google_subject_begins_signup_instead_of_being_refused"
+        ],
+        "journey": [
+          "crates/app/src/account_auth_ceremony.rs#a_google_signup_creates_the_account_its_passkey_its_codes_and_its_link_together"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/auth_oidc.rs#a_first_time_google_subject_begins_signup_instead_of_being_refused"
+        ]
+      }
+    },
+    {
       "id": "account.passkey.login.start",
       "jurisdiction": "hosted-person-account-session",
       "transport": "http-json",
