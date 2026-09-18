@@ -180,7 +180,9 @@ export function FacetBrowser(props: {
         profile: import("@gaugewright/control-plane-client").PanelPublicProfile;
         deployments: Workspace["projects"][number]["placements"][number]["deployments"];
     }) => void;
-    onPreviewPanel?: (agent: Workspace["archetypes"][number], project?: Workspace["projects"][number]) => void;
+    /** Open a Panel agent — its edit chat in Chat, the agent itself in Content — or,
+     *  with a project, the same surface pinned to that project's placement (PANEL-12). */
+    onOpenPanelAgent?: (agent: Workspace["archetypes"][number], project?: Workspace["projects"][number]) => void;
     onOpenInbox?: (project: ProjectId, name: string) => void;
     onAttachTarget?: (id: ProjectId, name: string, kind: "external-vcs" | "external-folder") => void;
     onOpenForkTree: (chat: EngagementId) => void;
@@ -1041,9 +1043,9 @@ export function FacetBrowser(props: {
 
     // A placement row's menu (shared by right-click and the row's ⋯ button).
     const placementMenuItems = (p: ProjectNode, pl: ProjectNode["placements"][number]): MenuState["items"] => pl.kind === "panel" ? [
-        ...(props.onPreviewPanel ? [{ label: "preview", hint: "Run the pinned public contract without writing production Inbox data", run: () => {
+        ...(props.onOpenPanelAgent ? [{ label: "open", hint: "Open this placement: its pinned contract, Preview, and deployments", run: () => {
             const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
-            if (agent) props.onPreviewPanel?.(agent, p);
+            if (agent) props.onOpenPanelAgent?.(agent, p);
         } }] : []),
         ...(props.onDeployPlacement && pl.panelProfile ? [{
             label: pl.deployments.length ? "manage deployments…" : "deploy…",
@@ -1085,16 +1087,16 @@ export function FacetBrowser(props: {
                 role="treeitem"
                 tabindex="0"
                 aria-label={`Panel agent ${pl.archetypeName} on ${p.name}`}
-                title="Preview, deploy, manage, or open Inbox"
+                title="Open this placement: pinned contract, Preview, deployments, Inbox"
                 onClick={() => {
                     const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                    if (agent) props.onPreviewPanel?.(agent, p);
+                    if (agent) props.onOpenPanelAgent?.(agent, p);
                 }}
                 onKeyDown={(event) => {
                     if (event.key !== "Enter" && event.key !== " ") return;
                     event.preventDefault();
                     const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                    if (agent) props.onPreviewPanel?.(agent, p);
+                    if (agent) props.onOpenPanelAgent?.(agent, p);
                 }}
                 onContextMenu={(event) => openMenu(event, placementMenuItems(p, pl))}
             >
@@ -1110,14 +1112,14 @@ export function FacetBrowser(props: {
                     }}
                 >update available</button></Show>
                 {rowActions({
-                    primary: props.onPreviewPanel ? {
+                    primary: props.onOpenPanelAgent ? {
                         icon: "robot",
-                        title: "Preview this Panel agent",
-                        aria: `preview ${pl.archetypeName}`,
-                        data: "preview-panel-agent",
+                        title: "Open this Panel agent placement",
+                        aria: `open ${pl.archetypeName}`,
+                        data: "open-panel-agent",
                         run: () => {
                             const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                            if (agent) props.onPreviewPanel?.(agent, p);
+                            if (agent) props.onOpenPanelAgent?.(agent, p);
                         },
                     } : undefined,
                     menuAria: `actions for ${pl.archetypeName} on ${p.name}`,
@@ -1132,8 +1134,8 @@ export function FacetBrowser(props: {
     const archetypeMenuItems = (a: ArchetypeNode): MenuState["items"] => [
         ...(a.kind === "work"
             ? [{ label: "test", hint: "Try this Agent in a Personal work chat", run: () => void useArchetype(a.id) }]
-            : props.onPreviewPanel
-                ? [{ label: "preview", hint: "Run the disposable public contract without creating a project or production Inbox data", run: () => props.onPreviewPanel?.(a) }]
+            : props.onOpenPanelAgent
+                ? [{ label: "open", hint: "Open this Panel agent: its edit chat, public contract, and Preview", run: () => props.onOpenPanelAgent?.(a) }]
                 : []),
         { label: "edit", hint: "Open a chat to edit what this Agent does — you review every change before it's kept", run: () => newEditChat(a.id) },
         { label: "new workstream", hint: "Create a shared auto-sync line over this method's edit chats", run: () => startEdit({ kind: "new-workstream", placementId: a.instanceId }) },
@@ -1930,7 +1932,7 @@ export function FacetBrowser(props: {
                                                                 ? `Agent ${pl.archetypeName} on ${p.name} — open its chats`
                                                                 : `Agent ${pl.archetypeName} on ${p.name} — start a chat`
                                                         }
-                                                        title={pl.kind === "panel" ? "Preview, deploy, manage, or open Inbox" : pl.chats.length > 0 ? "open this Agent's chats" : "start a chat with this Agent"}
+                                                        title={pl.kind === "panel" ? "Open this placement: pinned contract, Preview, deployments, Inbox" : pl.chats.length > 0 ? "open this Agent's chats" : "start a chat with this Agent"}
                                                         // Clicking the row is the obvious "start working" path: with no
                                                         // chats yet it opens a new work chat; otherwise it reveals the
                                                         // existing ones (the `+ chat` button always adds another).
@@ -1938,7 +1940,7 @@ export function FacetBrowser(props: {
                                                             pl.kind === "panel"
                                                                 ? (() => {
                                                                     const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                                                                    if (agent) props.onPreviewPanel?.(agent, p);
+                                                                    if (agent) props.onOpenPanelAgent?.(agent, p);
                                                                 })()
                                                                 : pl.chats.length > 0
                                                                 ? toggleCollapse(pl.placementId)
@@ -1949,7 +1951,7 @@ export function FacetBrowser(props: {
                                                                 e.preventDefault();
                                                                 if (pl.kind === "panel") {
                                                                     const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                                                                    if (agent) props.onPreviewPanel?.(agent, p);
+                                                                    if (agent) props.onOpenPanelAgent?.(agent, p);
                                                                 } else if (pl.chats.length > 0) toggleCollapse(pl.placementId);
                                                                 else void newWorkChat(p.id, pl.placementId);
                                                             }
@@ -2000,14 +2002,14 @@ export function FacetBrowser(props: {
                                                                 aria: `new chat with ${pl.archetypeName}`,
                                                                 data: "new-placement-chat",
                                                                 run: () => void newWorkChat(p.id, pl.placementId),
-                                                            } : props.onPreviewPanel ? {
+                                                            } : props.onOpenPanelAgent ? {
                                                                 icon: "robot",
-                                                                title: "Preview this Panel agent",
-                                                                aria: `preview ${pl.archetypeName}`,
-                                                                data: "preview-panel-agent",
+                                                                title: "Open this Panel agent placement",
+                                                                aria: `open ${pl.archetypeName}`,
+                                                                data: "open-panel-agent",
                                                                 run: () => {
                                                                     const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                                                                    if (agent) props.onPreviewPanel?.(agent, p);
+                                                                    if (agent) props.onOpenPanelAgent?.(agent, p);
                                                                 },
                                                             } : undefined,
                                                             menuAria: `actions for ${pl.archetypeName} on ${p.name}`,
@@ -2062,8 +2064,17 @@ export function FacetBrowser(props: {
                                             tabindex="0"
                                             aria-expanded={archetypeHasChildren(a) ? !isCollapsed(a.id) : undefined}
                                             aria-label={`${a.kind === "panel" ? "Panel agent" : "Agent"} ${a.name}`}
+                                            title={a.kind === "panel" ? "Open this Panel agent: its edit chat, public contract, and Preview" : undefined}
+                                            // Opening a Panel agent is one movement across the panes
+                                            // (navigation.md, PANEL-12); a work Agent's row still only
+                                            // folds its edit chats, since editing it is the pencil.
+                                            onClick={() => {
+                                                if (a.kind === "panel" && !editingIs("rename-archetype", a.id)) props.onOpenPanelAgent?.(a);
+                                            }}
                                             onKeyDown={(e) => {
-                                                if ((e.key === "Enter" || e.key === " ") && archetypeHasChildren(a)) { e.preventDefault(); toggleCollapse(a.id); }
+                                                if (e.key !== "Enter" && e.key !== " ") return;
+                                                if (a.kind === "panel") { e.preventDefault(); props.onOpenPanelAgent?.(a); }
+                                                else if (archetypeHasChildren(a)) { e.preventDefault(); toggleCollapse(a.id); }
                                             }}
                                             onContextMenu={(e) => openMenu(e, archetypeMenuItems(a))}
                                         >

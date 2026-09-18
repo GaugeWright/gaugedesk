@@ -212,6 +212,11 @@ export type {
     DeploymentSelection,
 } from "./DeploymentPanel";
 export { PanelAgentPreview } from "./PanelAgentPreview";
+export { PanelAgentSurface } from "./PanelAgentSurface";
+export type { PanelAgentSurfaceApi } from "./PanelAgentSurface";
+export { PanelContractEditor } from "./PanelContractEditor";
+export { editChatToOpen, panelAgentSurfacePlan } from "./panel-agent-opening";
+export type { PanelAgentSurfacePlan } from "./panel-agent-opening";
 export { ProjectInbox } from "./ProjectInbox";
 export type { ProjectInboxApi } from "./ProjectInbox";
 export { SessionProvider, useSession, localTurnActivity, TURN_ACTIVITIES } from "./session-context";

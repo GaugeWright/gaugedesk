@@ -743,15 +743,20 @@ Then("the Panel agent {string} is in the Library", async ({ page }, name: string
     await expect(row.locator(".cfg-badge", { hasText: "Panel agent" })).toBeVisible();
 });
 
-When("I preview the Panel agent {string}", async ({ page }, name: string) => {
+// Opening a Panel agent is one movement across the panes (PANEL-12): its edit
+// chat in Chat, the agent itself — contract and Preview — in Content.
+When("I open the Panel agent {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Library" }).click();
-    await page.locator("[data-archetype]", { hasText: name }).locator(".tree-node.archetype").click({ button: "right" });
-    await page.locator(".menu-item-label", { hasText: /^preview$/ }).click();
+    await page.locator("[data-archetype]", { hasText: name }).locator(".tree-node.archetype").click();
 });
 
-Then("its disposable public preview is open", async ({ page }) => {
-    await expect(page.getByRole("dialog", { name: /Preview/ })).toBeVisible();
-    await expect(page.getByText(/Disposable public session/)).toBeVisible();
+Then("the Panel agent is open as the Library draft", async ({ page }) => {
+    const surface = page.locator("[data-panel-agent-surface]");
+    await expect(surface).toBeVisible();
+    await expect(surface).toHaveAttribute("data-panel-agent-scope", "draft");
+    await expect(surface.getByText("Library draft", { exact: true })).toBeVisible();
+    await expect(surface.locator("[data-panel-public-profile]")).toBeVisible();
+    await expect(surface.getByText(/Disposable public session/)).toBeVisible();
 });
 
 Then("the preview says it writes no production Inbox data", async ({ page }) => {
@@ -759,17 +764,15 @@ Then("the preview says it writes no production Inbox data", async ({ page }) => 
 });
 
 Then("the preview offers a real disposable Session", async ({ page }) => {
-    const dialog = page.getByRole("dialog", { name: /Preview/ });
-    await expect(dialog.getByRole("button", { name: "Start real Preview" })).toBeVisible();
-    await expect(dialog.getByText("GaugeWright managed inference", { exact: true })).toBeVisible();
-    await expect(dialog.getByText("Bring your own provider key", { exact: true })).toBeVisible();
+    const preview = page.locator("[data-panel-preview]");
+    await expect(preview.getByRole("button", { name: "Start real Preview" })).toBeVisible();
+    await expect(preview.getByText("GaugeWright managed inference", { exact: true })).toBeVisible();
+    await expect(preview.getByText("Bring your own provider key", { exact: true })).toBeVisible();
 });
 
-When("I close the Panel agent preview", async ({ page }) => {
-    await page
-        .getByRole("dialog", { name: /Preview/ })
-        .locator('button[aria-label="Close"]')
-        .click();
+When("I close the opened Panel agent", async ({ page }) => {
+    await page.locator("[data-panel-agent-surface]").getByRole("button", { name: "Close" }).click();
+    await expect(page.locator("[data-panel-agent-surface]")).toHaveCount(0);
 });
 
 When("I open settings for the Panel agent {string}", async ({ page }, name: string) => {
@@ -798,7 +801,7 @@ Then("project {string} has a Panel-agent placement without a new-chat action", a
     const placement = page.locator("[data-project]", { hasText: project }).locator(".tree-subgroup[data-placement]", { hasText: "Panel agent" });
     await expect(placement).toBeVisible();
     await expect(placement.locator("[data-create='new-placement-chat']")).toHaveCount(0);
-    await expect(placement.locator("[data-create='preview-panel-agent']")).toBeVisible();
+    await expect(placement.locator("[data-create='open-panel-agent']")).toBeVisible();
 });
 
 When("I open deployment for the Panel agent in project {string}", async ({ page }, project: string) => {

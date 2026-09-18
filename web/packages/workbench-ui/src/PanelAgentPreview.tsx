@@ -1,3 +1,11 @@
+/**
+ * A Panel agent's Preview (ADR 0143 §3, PANEL-3, PANEL-12): the real
+ * public-session release of the Library draft or a placement's pinned version,
+ * run disposably. It lives inside the opened Panel agent, mounted but idle
+ * until the owner starts it, because starting spends real funding. Unmounting
+ * revokes a running session.
+ */
+
 import { createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import type {
@@ -24,7 +32,6 @@ export function PanelAgentPreview(props: {
     placementId?: PlacementId;
     defaultEdgeOrigin: string;
     defaultCredentialRef: string;
-    onClose: () => void;
 }): JSX.Element {
     const profile = () => props.agent.panelProfile;
     const [fundingMode, setFundingMode] = createSignal<"managed" | "byok">("managed");
@@ -90,20 +97,19 @@ export function PanelAgentPreview(props: {
         }
     }
 
-    async function close() {
+    async function end() {
         const active = preview();
-        if (active && !stopped) {
-            setBusy(true);
-            try {
-                await props.api.stopPanelPreview(active.preview_id);
-                stopped = true;
-            } catch (reason) {
-                setError(`Could not revoke Preview: ${String(reason)}`);
-                setBusy(false);
-                return;
-            }
+        if (!active || stopped) return;
+        setBusy(true);
+        try {
+            await props.api.stopPanelPreview(active.preview_id);
+            stopped = true;
+            setPreview(null);
+        } catch (reason) {
+            setError(`Could not revoke Preview: ${String(reason)}`);
+        } finally {
+            setBusy(false);
         }
-        props.onClose();
     }
 
     onCleanup(() => {
@@ -111,46 +117,34 @@ export function PanelAgentPreview(props: {
         if (active && !stopped) void props.api.stopPanelPreview(active.preview_id);
     });
 
-    return <div class="modal-overlay" role="presentation" onClick={(event) => {
-        if (event.target === event.currentTarget) void close();
-    }}><section class="modal embed-monitor" role="dialog" aria-modal="true" aria-label={`Preview ${props.agent.name}`}>
-        <header class="modal-head"><div><strong>{props.agent.name} · Preview</strong>
-            <div class="muted">Disposable public session · {props.project ? `${props.project.name} pinned placement` : "Library draft"}</div></div>
-            <button type="button" class="icon-button" aria-label="Close" disabled={busy()} onClick={() => void close()}>×</button></header>
+    return <section class="admin-section panel-agent-preview" data-panel-preview aria-label={`Preview ${props.agent.name}`}>
+        <h3>Preview</h3>
+        <div class="muted">Disposable public session · {props.project ? `${props.project.name} pinned placement` : "Library draft"}</div>
         <div class="settings-hint warn">Preview runs the real public-session release. Its workspace and output expire, never enter Personal or a project Inbox, and admit no production collection recipient.</div>
         <Show when={profile()} fallback={<p class="error">This Panel agent has no public profile.</p>}>
-            {(contract) => <>
-                <section class="admin-section"><h3>Contract under test</h3><div class="member-list">
-                    <div class="member-row"><span>Panels</span><span class="member-id">{contract().panels.components.join(", ")}</span></div>
-                    <div class="member-row"><span>Abilities</span><span class="member-id">{contract().public_abilities.join(", ") || "Chat only"}</span></div>
-                    <div class="member-row"><span>Inputs</span><span class="member-id">{contract().audience_inputs.join(", ")}</span></div>
-                    <div class="member-row"><span>Provider</span><span class="member-id">{contract().provider.provider} · {contract().provider.model}</span></div>
-                    <div class="member-row"><span>Collection</span><span class="member-id">{contract().collection?.schema_ref ? `${contract().collection?.schema_ref} (test output only)` : "Off"}</span></div>
-                </div></section>
-                <Show when={!preview()}><section class="admin-section"><h3>Preview funding</h3>
-                    <p class="settings-hint">Preview uses the frozen provider path and a small one-hour, one-session spend envelope.</p>
-                    <label class="settings-checkbox"><input type="radio" checked={fundingMode() === "managed"} disabled={!managedTenants().length} onChange={() => setFundingMode("managed")} /> GaugeWright managed inference</label>
-                    <Show when={fundingMode() === "managed"}><label class="settings-field"><span class="settings-label">Funding account</span><select class="settings-input" value={managedTenantId()} onChange={(event) => setManagedTenantId(event.currentTarget.value)}>
-                        <For each={managedTenants()}>{(tenant) => <option value={tenant.id}>{tenant.displayName}{tenant.personal ? " (Personal)" : ""}</option>}</For>
-                    </select></label></Show>
-                    <label class="settings-checkbox"><input type="radio" checked={fundingMode() === "byok"} onChange={() => setFundingMode("byok")} /> Bring your own provider key</label>
-                    <Show when={fundingMode() === "byok"}><label class="settings-field"><span class="settings-label">Exact credential</span><select class="settings-input" value={credentialRef()} onChange={(event) => setCredentialRef(event.currentTarget.value)}>
-                        <option value="">Choose a credential…</option><For each={credentials()}>{(credential) => <option value={credential.credential_ref}>{credential.label} · {credential.provider}</option>}</For>
-                    </select></label></Show>
-                    <button type="button" class="primary" disabled={busy()} onClick={() => void start()}>{busy() ? "Starting Preview…" : "Start real Preview"}</button>
-                </section></Show>
-                <Show when={preview()}>{(active) => <section class="admin-section"><h3>Disposable session</h3>
-                    <p class="settings-hint">Release {active().release_id} · expires {new Date(active().expires_at_unix_ms).toLocaleTimeString()}</p>
-                    <div class="deployment-preview"><Dynamic component="gw-session" ref={(element: HTMLElement) => {
-                        element.setAttribute("host", active().deployment_url);
-                        element.setAttribute("panels", active().panels.map((panel) => panel.replace(/^gw-/, "")).join(","));
-                    }}>
-                        <For each={active().panels}>{(panel) => <Dynamic component={panel} />}</For>
-                    </Dynamic></div>
-                </section>}</Show>
-            </>}
+            <Show when={!preview()}><div class="settings-form"><h4>Preview funding</h4>
+                <p class="settings-hint">Preview uses the frozen provider path and a small one-hour, one-session spend envelope. Nothing runs until you start it.</p>
+                <label class="settings-checkbox"><input type="radio" checked={fundingMode() === "managed"} disabled={!managedTenants().length} onChange={() => setFundingMode("managed")} /> GaugeWright managed inference</label>
+                <Show when={fundingMode() === "managed"}><label class="settings-field"><span class="settings-label">Funding account</span><select class="settings-input" value={managedTenantId()} onChange={(event) => setManagedTenantId(event.currentTarget.value)}>
+                    <For each={managedTenants()}>{(tenant) => <option value={tenant.id}>{tenant.displayName}{tenant.personal ? " (Personal)" : ""}</option>}</For>
+                </select></label></Show>
+                <label class="settings-checkbox"><input type="radio" checked={fundingMode() === "byok"} onChange={() => setFundingMode("byok")} /> Bring your own provider key</label>
+                <Show when={fundingMode() === "byok"}><label class="settings-field"><span class="settings-label">Exact credential</span><select class="settings-input" value={credentialRef()} onChange={(event) => setCredentialRef(event.currentTarget.value)}>
+                    <option value="">Choose a credential…</option><For each={credentials()}>{(credential) => <option value={credential.credential_ref}>{credential.label} · {credential.provider}</option>}</For>
+                </select></label></Show>
+                <div class="deployment-actions"><button type="button" class="primary" disabled={busy()} onClick={() => void start()}>{busy() ? "Starting Preview…" : "Start real Preview"}</button></div>
+            </div></Show>
+            <Show when={preview()}>{(active) => <div class="settings-form"><h4>Disposable session</h4>
+                <p class="settings-hint">Release {active().release_id} · expires {new Date(active().expires_at_unix_ms).toLocaleTimeString()}</p>
+                <div class="deployment-preview"><Dynamic component="gw-session" ref={(element: HTMLElement) => {
+                    element.setAttribute("host", active().deployment_url);
+                    element.setAttribute("panels", active().panels.map((panel) => panel.replace(/^gw-/, "")).join(","));
+                }}>
+                    <For each={active().panels}>{(panel) => <Dynamic component={panel} />}</For>
+                </Dynamic></div>
+                <div class="deployment-actions"><button type="button" disabled={busy()} onClick={() => void end()}>End Preview</button></div>
+            </div>}</Show>
         </Show>
         <Show when={error()}><p class="error">{error()}</p></Show>
-        <div class="deployment-actions"><button type="button" disabled={busy()} onClick={() => void close()}>{preview() ? "End Preview" : "Close"}</button></div>
-    </section></div>;
+    </section>;
 }

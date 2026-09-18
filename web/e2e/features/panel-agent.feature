@@ -5,11 +5,11 @@ Feature: Panel agents belong to the Library and deploy through projects
     Given the workbench is open
     When I create a Panel agent named "Public intake"
     Then the Panel agent "Public intake" is in the Library
-    When I preview the Panel agent "Public intake"
-    Then its disposable public preview is open
+    When I open the Panel agent "Public intake"
+    Then the Panel agent is open as the Library draft
     And the preview says it writes no production Inbox data
     And the preview offers a real disposable Session
-    When I close the Panel agent preview
+    When I close the opened Panel agent
     And I open settings for the Panel agent "Public intake"
     Then its Panel contract editor is open
     When I close the Agent settings

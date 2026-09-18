@@ -44,6 +44,7 @@ import {
     type EngagementId,
     type ProjectId,
     type ProjectNode,
+    type PlacementNode,
     type ProjectShareCandidate,
     Rejected,
     scopeId,
@@ -95,7 +96,8 @@ import {
     fileFromSearch,
     freshnessEventForMarker,
     FacetBrowser,
-    PanelAgentPreview,
+    PanelAgentSurface,
+    editChatToOpen,
     ProjectInbox,
     forkSource,
     FreshnessBanner,
@@ -588,10 +590,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // UX-8: the fork-tree panel (chat fork lineage); holds the chat that opened it.
     const [forkTreeFor, setForkTreeFor] = createSignal<EngagementId | null>(null);
     const [deployment, setDeployment] = createSignal<DeploymentSelection | null>(null);
-    const [panelPreview, setPanelPreview] = createSignal<{
+    // The opened Panel agent (navigation.md Library, PANEL-12): it takes the
+    // Content pane the way project settings do, while its edit chat is in Chat.
+    // With a placement it is pinned to that placement's frozen version.
+    const [openedPanelAgent, setOpenedPanelAgent] = createSignal<{
         agent: ArchetypeNode;
         project?: ProjectNode;
-        placementId?: PlacementId;
+        placement?: PlacementNode;
     } | null>(null);
     const [projectInbox, setProjectInbox] = createSignal<{ id: ProjectId; name: string } | null>(null);
 
@@ -1371,6 +1376,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     let composerEl: HTMLTextAreaElement | undefined;
     function openChat(id: EngagementId) {
         closeProjectSettings();
+        setOpenedPanelAgent(null);
         setSelected(id);
         // UX-4: mirror the selection into the URL (`?chat=<id>`) so it's deep-linkable.
         if (typeof window !== "undefined") {
@@ -1379,6 +1385,30 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         // A folded chat reopens, and a narrow shell navigates straight to it.
         workbenchShell.openPane("chat", { chatSelected: true, fileSelected: false });
         queueMicrotask(() => composerEl?.focus());
+    }
+
+    // Opening a Panel agent is one movement across the panes (navigation.md,
+    // PANEL-12): its latest edit chat in Chat — a new one when it has none — and
+    // the agent itself in Content. From a project it opens pinned to that
+    // placement and leaves the chat alone, because a panel placement hosts no
+    // chats.
+    async function openPanelAgent(agent: ArchetypeNode, project?: ProjectNode) {
+        const placement = project?.placements.find((candidate) =>
+            candidate.kind === "panel" && candidate.archetypeId === agent.id);
+        if (!placement) {
+            const existing = editChatToOpen(agent.chats);
+            const chat = existing ?? await api.createChatUnderArchetype(agent.id, "edit chat");
+            if (!existing) bumpNav();
+            openChat(chat);
+        }
+        setOpenedPanelAgent({ agent, project, placement });
+        workbenchShell.openPane("content");
+    }
+    async function newEditChatFor(opened: { agent: ArchetypeNode; project?: ProjectNode; placement?: PlacementNode }) {
+        const chat = await api.createChatUnderArchetype(opened.agent.id, "edit chat");
+        bumpNav();
+        openChat(chat);
+        setOpenedPanelAgent(opened);
     }
 
     // UX-4: mirror the in-chat file selection into the URL (`?chat=<id>&file=<path>`) so a
@@ -1881,6 +1911,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onOpenEngagement={(id, name) => setEngagement({ id, name })}
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}
             onOpenProjectHome={(id, name) => {
+                setOpenedPanelAgent(null);
                 setRoutedProject(id);
                 api.setCurrentProject(id);
                 setProjectSettings({ id, name });
@@ -1888,16 +1919,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             }}
             onOpenProjectTasks={(id, name) => setProjectTasks({ id, name })}
             onDeployPlacement={setDeployment}
-            onPreviewPanel={(agent, project) => {
-                const placement = project?.placements.find((candidate) =>
-                    candidate.kind === "panel" && candidate.archetypeId === agent.id);
-                const pinnedProfile = placement?.panelProfile;
-                setPanelPreview({
-                    agent: pinnedProfile ? { ...agent, panelProfile: pinnedProfile } : agent,
-                    project,
-                    placementId: placement?.placementId,
-                });
-            }}
+            onOpenPanelAgent={(agent, project) => void openPanelAgent(agent, project)}
             onOpenInbox={(id, name) => setProjectInbox({ id, name })}
             onAttachTarget={(id, name, kind) => void attachTarget(id, name, kind)}
             onOpenForkTree={(chat) => setForkTreeFor(chat)}
@@ -2296,6 +2318,36 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         </>
     );
 
+    const panelAgentOrContent = () => (
+        <Show when={openedPanelAgent()} fallback={contentPane()}>
+            {(opened) => <PanelAgentSurface
+                api={api}
+                agent={opened().agent}
+                project={opened().project}
+                placement={opened().placement}
+                defaultEdgeOrigin={import.meta.env.VITE_PUBLIC_EDGE_ORIGIN || PUBLIC_EDGE_ORIGIN}
+                defaultCredentialRef={import.meta.env.VITE_PUBLIC_CREDENTIAL_REF || "credential:production:openai:v1"}
+                onClose={() => setOpenedPanelAgent(null)}
+                onNewEditChat={() => void newEditChatFor(opened())}
+                onDeploy={opened().project && opened().placement?.panelProfile
+                    ? () => setDeployment({
+                        projectId: opened().project!.id,
+                        projectName: opened().project!.name,
+                        placementId: opened().placement!.placementId,
+                        archetypeName: opened().placement!.archetypeName,
+                        version: opened().placement!.version,
+                        profile: opened().placement!.panelProfile!,
+                        deployments: opened().placement!.deployments,
+                    })
+                    : undefined}
+                onOpenInbox={opened().project
+                    ? () => setProjectInbox({ id: opened().project!.id, name: opened().project!.name })
+                    : undefined}
+                onPublished={(version) => { bumpNav(); setStatus(`published v${version}`); }}
+            />}
+        </Show>
+    );
+
     const filesPane = () => (
         <>
             <h2>
@@ -2656,18 +2708,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     onClose={() => setDeployment(null)}
                 />
             )}</Show>
-
-            <Show when={panelPreview()}>{(preview) => <PanelAgentPreview
-                api={api}
-                agent={preview().agent}
-                project={preview().project}
-                placementId={preview().placementId}
-                defaultEdgeOrigin={import.meta.env.VITE_PUBLIC_EDGE_ORIGIN
-                    || PUBLIC_EDGE_ORIGIN}
-                defaultCredentialRef={import.meta.env.VITE_PUBLIC_CREDENTIAL_REF
-                    || "credential:production:openai:v1"}
-                onClose={() => setPanelPreview(null)}
-            />}</Show>
 
             <Show when={projectInbox()}>{(inbox) => <ProjectInbox
                 api={api}
@@ -3241,7 +3281,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             onCollapse: () => workbenchShell.setCollapsed("chat", true),
                         })}</Show>
                     </>}
-                    content={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={projectSettings()} fallback={contentPane()}>
+                    content={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={projectSettings()} fallback={panelAgentOrContent()}>
                         <Show when={currentProjectSettingsWorkspace()} fallback={
                             <Show when={projectSettingsWorkspace.error} fallback={<p class="project-settings-empty" role="status">Loading project settings…</p>}>
                                 {(error) => <div class="project-settings-empty" role="alert">
