@@ -82,8 +82,48 @@ describe("hosted Home bootstrap", () => {
         vi.stubGlobal("fetch", fetch);
         const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
 
-        await expect(api.bootstrapHome()).resolves.toEqual({ kind: "none", homes: [], routes: [] });
+        await expect(api.bootstrapHome()).resolves.toEqual({
+            kind: "none",
+            homes: [],
+            routes: [],
+            selectedHome: null,
+        });
         expect(fetch).not.toHaveBeenCalledWith("https://hub.example/workspace", expect.anything());
+    });
+
+    // "No Home is serving you" covers three different people, and the surface
+    // that meets them can only tell them apart if this says which. Without the
+    // selection, someone whose laptop is asleep is indistinguishable from
+    // someone who has never installed anything, and both were told to install.
+    it("says which Home was selected when the selected Home is the one not serving", async () => {
+        const fetch = vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            if (url === "https://hub.example/account/homes") {
+                return new Response(JSON.stringify({
+                    homes: [
+                        { id: "home:laptop", kind: "registered", endpoint: "https://laptop.example" },
+                        { id: "home:studio", kind: "registered", endpoint: "https://studio.example" },
+                    ],
+                    selected_home: "home:laptop",
+                }));
+            }
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(JSON.stringify({ routes: [] }));
+            }
+            if (url === "https://laptop.example/home/admissions") {
+                return new Response(JSON.stringify({ error: "Home has no active owner" }), { status: 403 });
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        });
+        vi.stubGlobal("fetch", fetch);
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+
+        const state = await api.bootstrapHome();
+        expect(state).toMatchObject({ kind: "none", selectedHome: "home:laptop" });
+        // Both Homes travel with it, so the surface can offer the other one
+        // rather than only naming the one that is down.
+        expect(state.kind === "none" && state.homes.map((home) => home.id))
+            .toEqual(["home:laptop", "home:studio"]);
     });
 
     it("treats an unprovisioned managed Home as setup state, not an access error", async () => {

@@ -2317,9 +2317,21 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .homegate-scrim { position: fixed; inset: 0; z-index: 1100; display: flex;
     align-items: center; justify-content: center; padding: 24px;
     background: var(--bg); }
-.homegate-card { width: min(560px, 100%); padding: 32px; display: flex;
-    flex-direction: column; gap: 16px; border: 1px solid var(--edge);
-    border-radius: 14px; background: var(--panel); box-shadow: 0 18px 60px rgba(0,0,0,.35); }
+/* The double rule, heavy outside and fine within, which `specs/company.md`
+   defines as the only frame the system has and reserves for a live panel — a
+   thing a visitor may act inside. This card is one.
+
+   Proportions and colours are the site's `.plate`, not a second invention:
+   2px outer, a 5px gap of ground, 1px within, square. `--rule` and
+   `--rule-faint` are the gold at 62% and 28%, the same two values, so the two
+   surfaces cannot drift. Square corners are the point rather than a detail —
+   a rounded frame is the boxed card the composition rule exists to replace. */
+.homegate-card { width: min(560px, 100%); border: 2px solid var(--gate-rule);
+    padding: 5px; background: var(--bg); box-shadow: 0 18px 60px rgba(0,0,0,.35); }
+.homegate-card-inner { display: flex; flex-direction: column; gap: 16px;
+    padding: 32px; border: 1px solid var(--gate-rule-faint); background: var(--panel); }
+.homegate-card { --gate-rule: color-mix(in srgb, var(--gold) 62%, transparent);
+    --gate-rule-faint: color-mix(in srgb, var(--gold) 28%, transparent); }
 .homegate-kicker { margin: 0; color: var(--accent); font-size: var(--fs-small);
     font-weight: 400; text-transform: uppercase; letter-spacing: .09em; }
 .homegate-card h1 { margin: -8px 0 0; font-size: 24px; color: var(--ink); }
@@ -2332,7 +2344,32 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .homegate-home { display: flex; align-items: flex-start; justify-content: space-between;
     gap: 16px; padding: 9px 11px; border: 1px solid var(--edge); border-radius: 7px;
     background: var(--bg); color: var(--ink); cursor: pointer; text-align: left; }
+/* Not gold. `specs/company.md` reserves it for section titles, the tagline and
+   rules, and says a surface needing to emphasise something else reaches for
+   scale, case, spacing or placement first — a hover tint is precisely the
+   general-purpose accent use it refuses. The rule brightens instead. */
+.homegate-home:hover:not(:disabled) { border-color: var(--muted); }
+.homegate-home:disabled { opacity: .55; cursor: default; }
 .homegate-home small { color: var(--muted); overflow-wrap: anywhere; }
+/* An engraved label, which is what `specs/company.md` says a control is:
+   square corners, a hairline rule, letterspaced capitals, and the gold fill
+   reserved for the one action a surface most wants taken. The trailing
+   letterspace is invisible, so the text indents by the same amount to stay
+   optically centred — the site's own correction, not a new one.
+
+   Emphasis here comes from case, spacing and the rule rather than from weight
+   or a rounded fill, which is the rule the type system already binds. A
+   full-width button would also claim the width of a form this card is not.
+
+   Centred on the card's axis: composition is axial, and a lone control set
+   against one edge is the asymmetry that rule exists to refuse. */
+.homegate-card-inner .firstrun-connect { align-self: center;
+    padding: 10px 22px; border-radius: 0; border: 1px solid var(--gold);
+    background: var(--gold); color: var(--navy); font-size: var(--fs-small);
+    font-weight: 400; text-transform: uppercase; letter-spacing: .22em;
+    text-indent: .22em; }
+.homegate-card-inner .firstrun-connect:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--gold) 86%, #fff); }
 .homegate-connect-row { display: flex; gap: 8px; }
 .homegate-connect-row input { flex: 1; min-width: 0; padding: 9px 10px; border: 1px solid var(--edge);
     border-radius: 7px; background: var(--bg); color: var(--ink); }

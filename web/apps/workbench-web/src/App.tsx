@@ -2728,39 +2728,155 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             const downloadUrl = props.downloadUrl
                 || import.meta.env.VITE_DOWNLOAD_URL
                 || "https://gaugewright.com/gaugedesk/download";
+            // "No Home is serving you" is three different people, and until now
+            // all three met the same card. Someone whose laptop is asleep was
+            // told to install GaugeDesk and make a first Home — software they
+            // have, and a Home they already made. The state has carried what
+            // distinguishes them all along.
+            const homes = () => noHomeState()?.homes ?? [];
+            const offlineHome = () => {
+                const state = noHomeState();
+                if (!state?.selectedHome) return null;
+                return state.homes.find((home) => home.id === state.selectedHome) ?? null;
+            };
+            const switchTo = (id: import("@gaugewright/control-plane-client").HomeId) =>
+                void api.selectHome(id).then(() => refetchHome());
+            // One row, so the cards cannot drift apart in how they name a Home.
+            //
+            // It shows the Home id, because that is the only name a Home has:
+            // `AccountHome` carries id, kind, endpoint and relay, and the
+            // registration body adds nothing else. For a recovery affordance an
+            // opaque id was defensible; for "which of your computers?" it is
+            // not, and giving a Home a name its owner chose is real work rather
+            // than a field to invent here.
+            const homeRow = (
+                home: import("@gaugewright/control-plane-client").AccountHome,
+                current: boolean,
+            ) => (
+                <button
+                    type="button"
+                    class="homegate-home"
+                    data-home-choice={home.id}
+                    disabled={homeBusy() || current}
+                    onClick={() => switchTo(home.id)}
+                >
+                    <span>{home.id}</span>
+                    <small>{current ? "Not responding" : home.endpoint}</small>
+                </button>
+            );
             return (
                 <Show when={noHomeState()}>
                     <div class="homegate-scrim" data-home-setup>
-                        <section class="homegate-card" aria-labelledby="homegate-title">
-                            <p class="homegate-kicker">Welcome to GaugeDesk</p>
-                            <h1 id="homegate-title">Your work needs a Home</h1>
-                            <p class="homegate-lede">
-                                Projects, chats, and files live on a Home — a computer you
-                                control — rather than in this browser. Install GaugeDesk and
-                                sign in there, and that computer becomes your first Home.
-                                This page then opens it from anywhere you sign in.
-                            </p>
-                            <a
-                                class="firstrun-connect"
-                                data-home-download
-                                href={downloadUrl}
-                                rel="noreferrer"
+                        <Show
+                            when={homes().length > 0}
+                            fallback={
+                                <section class="homegate-card" aria-labelledby="homegate-title">
+                                  <div class="homegate-card-inner">
+                                    <p class="homegate-kicker">Welcome to GaugeDesk</p>
+                                    <h1 id="homegate-title">Your work needs a Home</h1>
+                                    <p class="homegate-lede">
+                                        Projects, chats, and files live on a Home — a computer you
+                                        control — rather than in this browser. Install GaugeDesk and
+                                        sign in there, and that computer becomes your first Home.
+                                        This page then opens it from anywhere you sign in.
+                                    </p>
+                                    <a
+                                        class="firstrun-connect"
+                                        data-home-download
+                                        href={downloadUrl}
+                                        rel="noreferrer"
+                                    >
+                                        Download GaugeDesk
+                                    </a>
+                                    <p class="homegate-auth-note">
+                                        GaugeWright-hosted Homes, where we run one for you, are coming.
+                                        {" "}
+                                        <button
+                                            type="button"
+                                            class="homegate-link"
+                                            data-home-recovery
+                                            onClick={() => setHomeRecovery(true)}
+                                        >
+                                            Already have a Home?
+                                        </button>
+                                    </p>
+                                  </div>
+                                </section>
+                            }
+                        >
+                            <Show
+                                when={offlineHome()}
+                                fallback={
+                                    <section class="homegate-card" aria-labelledby="homegate-title" data-home-choose>
+                                      <div class="homegate-card-inner">
+                                        <p class="homegate-kicker">Welcome back</p>
+                                        <h1 id="homegate-title">Choose a Home</h1>
+                                        <p class="homegate-lede">
+                                            Your projects live on a Home. Pick the one to open when
+                                            you are not already in a project — opening a project
+                                            always goes to the Home that holds it.
+                                        </p>
+                                        <div class="homegate-homes">
+                                            <For each={homes()}>{(home) => homeRow(home, false)}</For>
+                                        </div>
+                                        <p class="homegate-auth-note">
+                                            <button
+                                                type="button"
+                                                class="homegate-link"
+                                                data-home-recovery
+                                                onClick={() => setHomeRecovery(true)}
+                                            >
+                                                Connect a different Home
+                                            </button>
+                                        </p>
+                                      </div>
+                                    </section>
+                                }
                             >
-                                Download GaugeDesk
-                            </a>
-                            <p class="homegate-auth-note">
-                                GaugeWright-hosted Homes, where we run one for you, are coming.
-                                {" "}
-                                <button
-                                    type="button"
-                                    class="homegate-link"
-                                    data-home-recovery
-                                    onClick={() => setHomeRecovery(true)}
-                                >
-                                    Already have a Home?
-                                </button>
-                            </p>
-                        </section>
+                                {(home) => (
+                                    <section class="homegate-card" aria-labelledby="homegate-title" data-home-offline>
+                                      <div class="homegate-card-inner">
+                                        <p class="homegate-kicker">Cannot reach your Home</p>
+                                        <h1 id="homegate-title">
+                                            {home().id} is not responding
+                                        </h1>
+                                        <p class="homegate-lede">
+                                            Your projects are on it and they are fine — this page
+                                            just cannot reach it. Wake that computer and make sure
+                                            GaugeDesk is running, or open a different Home.
+                                        </p>
+                                        <button
+                                            type="button"
+                                            class="firstrun-connect"
+                                            data-home-retry
+                                            disabled={homeBusy()}
+                                            onClick={() => void refetchHome()}
+                                        >
+                                            {homeBusy() ? "Checking…" : "Try again"}
+                                        </button>
+                                        <Show when={homes().length > 1}>
+                                            <div class="homegate-homes">
+                                                <span class="homegate-label">Your other Homes</span>
+                                                <For each={homes().filter((other) => other.id !== home().id)}>
+                                                    {(other) => homeRow(other, false)}
+                                                </For>
+                                            </div>
+                                        </Show>
+                                        <p class="homegate-auth-note">
+                                            <button
+                                                type="button"
+                                                class="homegate-link"
+                                                data-home-recovery
+                                                onClick={() => setHomeRecovery(true)}
+                                            >
+                                                Connect a different Home
+                                            </button>
+                                        </p>
+                                      </div>
+                                    </section>
+                                )}
+                            </Show>
+                        </Show>
                     </div>
                 </Show>
             );

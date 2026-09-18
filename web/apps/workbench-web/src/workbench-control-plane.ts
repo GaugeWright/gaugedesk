@@ -83,6 +83,13 @@ export type HomeBootstrapState =
           readonly kind: "none";
           readonly homes: AccountHome[];
           readonly routes: OpaqueHomeRoute[];
+          /** The Home the account selected, when it named one that is not
+           * serving. Carried because "no Home is serving you" covers three
+           * different people — nobody has registered a Home, several are
+           * registered and none is chosen, or the chosen one is not reachable —
+           * and a surface that cannot tell them apart can only address the
+           * first. Null when no Home is selected at all. */
+          readonly selectedHome: HomeId | null;
       };
 
 /** A Console-safe pointer: the owning workspace and a count, never review data. */
@@ -623,7 +630,12 @@ export class WorkbenchControlPlane implements ControlPlane {
                 accountClient.accountHomes(this.route),
                 this.homeRoutes(),
             ]);
-            return { kind: "none", homes: state.homes, routes };
+            return {
+                kind: "none",
+                homes: state.homes,
+                routes,
+                selectedHome: state.selectedHome,
+            };
         }
     }
 
