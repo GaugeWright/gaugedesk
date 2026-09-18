@@ -232,7 +232,7 @@ impl Workspace for ExternalWorkspace {
         ))
     }
 
-    fn seed_main(&self, _files: &[(&str, &str)]) -> Result<()> {
+    fn seed_main(&self, _files: &[(&str, &str)]) -> Result<RevisionId> {
         Err(WorkspaceError::msg(
             "an external target is seeded by its authority",
         ))

@@ -739,7 +739,15 @@ impl Instance {
         }
     }
 
-    pub fn seed_main(&self, files: &[(&str, &str)]) -> Result<()> {
+    /// Seed the mainline with `files` and return its head cut afterwards: the
+    /// exact revision a target's basis names. The import mints a cut when the
+    /// files changed the mainline. When they did not — an empty seed, or files
+    /// already there — the head stands, and a virgin mainline with no head yet
+    /// is given one, the way a turn boundary gives an engagement a durable
+    /// address before its first turn. Every seeded mainline therefore has an
+    /// exact revision to hand out, without an engagement being created to ask
+    /// for one.
+    pub fn seed_main(&self, files: &[(&str, &str)]) -> Result<RevisionId> {
         for (relative, content) in files {
             let path = safe_path(&self.repo, relative)?;
             if let Some(parent) = path.parent() {
@@ -748,8 +756,20 @@ impl Instance {
             std::fs::write(path, content).map_err(WorkspaceError::io)?;
         }
         let mut vcs = self.store()?;
-        sync_in(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
-        Ok(())
+        let scan = sync_in(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
+        if let Some(cut) = scan.cut {
+            return Ok(RevisionId(cut));
+        }
+        if let Some(head) = vcs
+            .get_branch(MAINLINE_BRANCH_ID)?
+            .and_then(|branch| branch.head_cut_id)
+        {
+            return Ok(RevisionId(head));
+        }
+        let cut = vcs
+            .cut_at_quiescence(MAINLINE_BRANCH_ID, &fresh_cut_id("seed"), &now_at())?
+            .ok_or_else(|| WorkspaceError::msg("no mainline to seed"))?;
+        Ok(RevisionId(cut.cut_id))
     }
 
     pub fn create_engagement(&self, id: &str) -> Result<Engagement> {
@@ -2962,7 +2982,9 @@ pub trait Workspace: Send {
         ))
     }
     fn promote_workstream_to_main(&self, ws_id: &str) -> Result<MergeOutcome>;
-    fn seed_main(&self, files: &[(&str, &str)]) -> Result<()>;
+    /// Seed the mainline and return its head cut: the exact revision a
+    /// target's basis names.
+    fn seed_main(&self, files: &[(&str, &str)]) -> Result<RevisionId>;
     fn export(&self) -> Result<WorkspaceExport>;
     fn export_protected_workflow(
         &self,
@@ -3302,7 +3324,7 @@ impl Workspace for Instance {
     fn promote_workstream_to_main(&self, id: &str) -> Result<MergeOutcome> {
         Self::promote_workstream_to_main(self, id)
     }
-    fn seed_main(&self, files: &[(&str, &str)]) -> Result<()> {
+    fn seed_main(&self, files: &[(&str, &str)]) -> Result<RevisionId> {
         Self::seed_main(self, files)
     }
     fn export(&self) -> Result<WorkspaceExport> {
@@ -3651,6 +3673,34 @@ mod tests {
         )
         .expect("init");
         (directory, instance)
+    }
+
+    #[test]
+    fn seed_main_answers_with_the_mainline_head() {
+        let (_directory, workspace) = instance();
+        let seeded = workspace.seed_main(&[("a.txt", "a")]).expect("seed");
+        assert_eq!(
+            workspace.current_main_cut().expect("head").as_deref(),
+            Some(seeded.0.as_str())
+        );
+        // An engagement nothing has touched stands exactly there, which is why
+        // recording a target's basis no longer creates one to ask.
+        let probe = workspace.create_engagement("probe").expect("engagement");
+        assert_eq!(probe.boundary_cut().expect("boundary"), seeded);
+        // Seeding what is already there mints nothing and answers the same head.
+        assert_eq!(
+            workspace.seed_main(&[("a.txt", "a")]).expect("reseed"),
+            seeded
+        );
+
+        // A virgin mainline seeded with nothing still gets an exact revision,
+        // and gets it on the mainline itself rather than on a throwaway line.
+        let (_directory, empty) = instance();
+        let first = empty.seed_main(&[]).expect("empty seed");
+        assert_eq!(
+            empty.current_main_cut().expect("head").as_deref(),
+            Some(first.0.as_str())
+        );
     }
 
     pub(super) fn observation_files(root: &Path) -> BTreeMap<PathBuf, String> {

@@ -467,7 +467,7 @@
       "declaration": {
         "name": "seed_main",
         "owner": "Workspace",
-        "signature": "fn seed_main (& self , files : & [(& str , & str)]) -> Result < () >"
+        "signature": "fn seed_main (& self , files : & [(& str , & str)]) -> Result < RevisionId >"
       },
       "classification": "requires-provenance-review"
     },
@@ -2261,39 +2261,9 @@
     {
       "site": {
         "callable": "init_managed_target",
-        "capability": "boundary_cut",
-        "count": 1,
-        "expression": "probe . boundary_cut ()",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "startup-and-migration"
-    },
-    {
-      "site": {
-        "callable": "init_managed_target",
-        "capability": "create_engagement",
-        "count": 1,
-        "expression": "workspace . create_engagement (& probe_id)",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "startup-and-migration"
-    },
-    {
-      "site": {
-        "callable": "init_managed_target",
         "capability": "init_at",
         "count": 1,
         "expression": "provider_for (providers , target_id) . init_at (& targets_dir . join (target_id))",
-        "file": "crates/app/src/library_state.rs"
-      },
-      "profile": "startup-and-migration"
-    },
-    {
-      "site": {
-        "callable": "init_managed_target",
-        "capability": "remove_engagement",
-        "count": 1,
-        "expression": "workspace . remove_engagement (& probe_id)",
         "file": "crates/app/src/library_state.rs"
       },
       "profile": "startup-and-migration"

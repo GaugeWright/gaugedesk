@@ -713,6 +713,17 @@ fn default_gate_files() -> [(&'static str, &'static str); 2] {
     ]
 }
 
+/// Initialize a managed target's workspace, seed its mainline, and return the
+/// exact basis its record carries: the mainline's head cut.
+///
+/// This used to create a probe engagement, commit a turn boundary on it, and
+/// discard it, recording that boundary cut as the basis. A boundary on an
+/// engagement nothing has touched is the cut it branched from, so the value
+/// was the mainline's head all along — checked cut for cut — and what the
+/// probe added was a branch created and discarded, and a worktree materialized
+/// and, because discarding a branch leaves its worktree, never removed: a third
+/// of a target's initialization, and a `worktrees/target-basis-*` copy of every
+/// seed left behind in every root. The seed now answers with the head itself.
 fn init_managed_target(
     targets_dir: &std::path::Path,
     providers: &WorkspaceProviders,
@@ -722,13 +733,7 @@ fn init_managed_target(
     let workspace = provider_for(providers, target_id)
         .init_at(&targets_dir.join(target_id))
         .map_err(io)?;
-    workspace.seed_main(files).map_err(io)?;
-    let probe_id = library::gen_id("target-basis");
-    let probe = workspace.create_engagement(&probe_id).map_err(io)?;
-    let basis = probe.boundary_cut().map_err(io)?.0;
-    drop(probe);
-    workspace.remove_engagement(&probe_id).map_err(io)?;
-    Ok(basis)
+    Ok(workspace.seed_main(files).map_err(io)?.0)
 }
 
 /// ADR 0104's one-time additive migration. This recognizes only the untouched
@@ -3501,6 +3506,7 @@ impl Workbench {
             .get(&workspace_id)
             .ok_or_else(|| "project collaboration workspace is not open".to_owned())?
             .seed_main(&borrowed)
+            .map(|_seeded| ())
             .map_err(|error| error.to_string())
     }
 
@@ -7472,5 +7478,59 @@ mod startup_reconcile_tests {
                 .all(|(id, _)| id != "chat-deleted"),
             "an explicitly deleted chat's branch is released"
         );
+    }
+}
+
+#[cfg(test)]
+mod managed_target_basis_tests {
+    use super::*;
+    use crate::LockUnpoisoned;
+
+    /// A managed target's recorded basis is its mainline's head cut, and
+    /// recording it costs no engagement: nothing is created and discarded for
+    /// the answer, so nothing is left behind under the target's worktrees.
+    #[test]
+    fn a_fresh_managed_target_records_its_mainline_head_and_leaves_no_probe_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let workbench = shared.lock_unpoisoned();
+        let managed = workbench
+            .library
+            .work_targets
+            .values()
+            .filter(|target| target.kind == WorkTargetKind::Managed)
+            .collect::<Vec<_>>();
+        assert!(!managed.is_empty(), "a fresh root seeds managed targets");
+        for target in managed {
+            let head = workbench.targets[&target.id]
+                .current_main_cut()
+                .unwrap()
+                .expect("a seeded mainline has a head cut");
+            assert_eq!(
+                target.current_basis.as_deref(),
+                Some(head.as_str()),
+                "{} records something other than its mainline head",
+                target.id
+            );
+            let worktrees = workbench.targets_root.join(&target.id).join("worktrees");
+            let probes = std::fs::read_dir(&worktrees)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with("target-basis-")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            assert_eq!(
+                probes, 0,
+                "{} left a basis probe worktree behind",
+                target.id
+            );
+        }
     }
 }
