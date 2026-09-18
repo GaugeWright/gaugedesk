@@ -361,15 +361,30 @@ pub(crate) fn load_startup_library_state(
     targets_dir: &std::path::Path,
     providers: &WorkspaceProviders,
     home_id: &gaugedesk_core::ids::HomeId,
+    archetypes: &[crate::app_support::BuiltinArchetype],
 ) -> std::io::Result<StartupLibraryState> {
     let mut library = crate::library::Library::rebuild(store).map_err(io)?;
     if migrate_exact_pre_target_defaults(store, &library, home_id)? {
         library = crate::library::Library::rebuild(store).map_err(io)?;
     }
     if library.is_empty() {
-        seed_default_agent(store, &mut library, targets_dir, providers, home_id)?;
+        seed_default_agent(
+            store,
+            &mut library,
+            targets_dir,
+            providers,
+            home_id,
+            archetypes,
+        )?;
     }
-    ensure_builtin_archetypes(store, &mut library, targets_dir, providers, home_id)?;
+    ensure_builtin_archetypes(
+        store,
+        &mut library,
+        targets_dir,
+        providers,
+        home_id,
+        archetypes,
+    )?;
     if migrate_project_workspaces_and_target_sets(store, &library)? {
         library = crate::library::Library::rebuild(store).map_err(io)?;
     }
@@ -2562,18 +2577,24 @@ fn ensure_builtin_placement(
     Ok(())
 }
 
+/// Seed whichever of `archetypes` the library does not yet hold, and give each
+/// its placement in the Personal project. Production passes every builtin
+/// (`StartupSeed::production`), so an archetype added to a release reaches
+/// every existing root on its next open; a test's lean startup passes only
+/// the Default archetype (`StartupSeed::lean`).
 fn ensure_builtin_archetypes(
     store: &mut Store,
     library: &mut crate::library::Library,
     targets_dir: &std::path::Path,
     providers: &WorkspaceProviders,
     home_id: &gaugedesk_core::ids::HomeId,
+    archetypes: &[crate::app_support::BuiltinArchetype],
 ) -> std::io::Result<()> {
-    for archetype in crate::app_support::builtin_archetypes() {
+    for archetype in archetypes {
         seed_builtin_archetype(store, library, targets_dir, providers, home_id, archetype)?;
     }
     if library.projects.contains_key(DEFAULT_PROJECT) {
-        for archetype in crate::app_support::builtin_archetypes() {
+        for archetype in archetypes {
             ensure_builtin_placement(store, library, archetype)?;
         }
     }
@@ -2588,11 +2609,12 @@ pub(crate) fn seed_default_agent(
     targets_dir: &std::path::Path,
     providers: &WorkspaceProviders,
     home_id: &gaugedesk_core::ids::HomeId,
+    archetypes: &[crate::app_support::BuiltinArchetype],
 ) -> std::io::Result<()> {
-    let general = crate::app_support::builtin_archetypes()
+    let general = archetypes
         .iter()
         .find(|archetype| archetype.id == DEFAULT_AGENT)
-        .expect("the Default archetype is built in");
+        .expect("the Default archetype is built in and every startup seed carries it");
     seed_builtin_archetype(store, library, targets_dir, providers, home_id, general)?;
 
     let proj = ProjectRecord {
@@ -2668,7 +2690,7 @@ pub(crate) fn seed_default_agent(
     append_library_record(store, "placement_targets", &eligibility)?;
     library.apply_placement_targets(eligibility);
     activate_instance(store, DEFAULT_PLACEMENT);
-    ensure_builtin_archetypes(store, library, targets_dir, providers, home_id)?;
+    ensure_builtin_archetypes(store, library, targets_dir, providers, home_id, archetypes)?;
     Ok(())
 }
 

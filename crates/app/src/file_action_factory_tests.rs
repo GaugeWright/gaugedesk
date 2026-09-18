@@ -112,7 +112,10 @@ fn setup_content(
     base_body: &str,
     draft: &str,
 ) -> (SharedWorkbench, Intent, String) {
-    let wb = crate::open_workbench(root).unwrap();
+    // Lean: these tests host one chat in the default placement and read
+    // neither the archetype library nor the onboarding tracker, and a full
+    // seed was most of what each of them cost (`StartupSeed::lean`).
+    let wb = crate::workbench_state::open_lean_workbench(root).unwrap();
     let (intent, token) = {
         let mut wb = wb.lock_unpoisoned();
         wb.set_identity_provider(Some(Arc::new(

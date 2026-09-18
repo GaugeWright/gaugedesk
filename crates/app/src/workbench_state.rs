@@ -201,9 +201,88 @@ pub fn open_workbench_with_content_keywrap(
     root: &std::path::Path,
     content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
 ) -> std::io::Result<SharedWorkbench> {
-    let wb = build_workbench_with_content_keywrap_for_home(root, None, content_keywrap)?
-        .with_attestation_mode(attestation_mode_from_env())
-        .with_attestation_enabled(attestation_enabled());
+    let wb = build_workbench_with_content_keywrap_for_home(
+        root,
+        None,
+        content_keywrap,
+        StartupSeed::production(),
+    )?
+    .with_attestation_mode(attestation_mode_from_env())
+    .with_attestation_enabled(attestation_enabled());
+    Ok(Arc::new(Mutex::new(wb)))
+}
+
+/// What a startup seeds into a fresh root beyond the store itself, and keeps
+/// seeded on every open. Production seeds everything; a test that needs a
+/// workbench but not the full library asks for less (see [`StartupSeed::lean`]).
+#[derive(Clone, Copy)]
+pub(crate) struct StartupSeed {
+    /// The builtin archetypes to seed. The Default archetype must be among
+    /// them: the Personal project's default placement is an instance of it.
+    archetypes: &'static [crate::app_support::BuiltinArchetype],
+    /// Whether to stand up and seed the account-global onboarding tracker.
+    onboarding: bool,
+}
+
+impl StartupSeed {
+    /// Every builtin archetype and the onboarding tracker: what a user's root
+    /// gets, and what every non-test opener above uses.
+    pub(crate) fn production() -> Self {
+        Self {
+            archetypes: crate::app_support::builtin_archetypes(),
+            onboarding: true,
+        }
+    }
+
+    /// Only what a test workbench needs to host a chat in the default
+    /// placement: the Default archetype, the Personal project and its target,
+    /// and no onboarding tracker. Each archetype is its own WhippleScript
+    /// workspace on disk — a SQLite branch store, a seeded mainline, a probe
+    /// engagement created and discarded for its basis — and the tracker is
+    /// another store, so a full seed is most of what a fresh open costs. The
+    /// file-action tests open a fresh root each, 172 of them, and none reads
+    /// an archetype or the tracker; this is the difference between a fixture
+    /// that builds what the test uses and one that builds the product.
+    ///
+    /// A root opened lean is a valid root: a later production open finds the
+    /// other archetypes missing and seeds them, exactly as it does for a root
+    /// from a release that predates them. A test that reads the archetype
+    /// library or the onboarding tracker opens the workbench the ordinary way.
+    #[cfg(test)]
+    pub(crate) fn lean() -> Self {
+        let builtins = crate::app_support::builtin_archetypes();
+        let default = builtins
+            .iter()
+            .position(|archetype| archetype.id == crate::app_support::DEFAULT_AGENT)
+            .expect("the Default archetype is built in");
+        Self {
+            archetypes: &builtins[default..=default],
+            onboarding: false,
+        }
+    }
+}
+
+/// [`open_workbench`] with the lean startup seed. Test-only; see
+/// [`StartupSeed::lean`] for what it leaves out and who may use it.
+#[cfg(test)]
+pub(crate) fn open_lean_workbench(root: &std::path::Path) -> std::io::Result<SharedWorkbench> {
+    open_lean_workbench_with_content_keywrap(root, at_rest::local_content_keywrap)
+}
+
+/// [`open_workbench_with_content_keywrap`] with the lean startup seed.
+#[cfg(test)]
+pub(crate) fn open_lean_workbench_with_content_keywrap(
+    root: &std::path::Path,
+    content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
+) -> std::io::Result<SharedWorkbench> {
+    let wb = build_workbench_with_content_keywrap_for_home(
+        root,
+        None,
+        content_keywrap,
+        StartupSeed::lean(),
+    )?
+    .with_attestation_mode(attestation_mode_from_env())
+    .with_attestation_enabled(attestation_enabled());
     Ok(Arc::new(Mutex::new(wb)))
 }
 
@@ -222,6 +301,7 @@ pub fn open_workbench_for_home_with_content_keywrap(
         root,
         Some((home_id, authority_id)),
         content_keywrap,
+        StartupSeed::production(),
     )?
     .with_attestation_mode(attestation_mode_from_env())
     .with_attestation_enabled(attestation_enabled());
@@ -240,13 +320,19 @@ pub(crate) fn build_workbench_with_content_keywrap(
     root: &std::path::Path,
     content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
 ) -> std::io::Result<Workbench> {
-    build_workbench_with_content_keywrap_for_home(root, None, content_keywrap)
+    build_workbench_with_content_keywrap_for_home(
+        root,
+        None,
+        content_keywrap,
+        StartupSeed::production(),
+    )
 }
 
 fn build_workbench_with_content_keywrap_for_home(
     root: &std::path::Path,
     explicit_identity: Option<(HomeId, AuthorityId)>,
     content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
+    seed: StartupSeed,
 ) -> std::io::Result<Workbench> {
     crate::protected_profiles::scavenge_stale_materializations();
     let (root, targets_dir) = prepare_workbench_root(root)?;
@@ -257,8 +343,13 @@ fn build_workbench_with_content_keywrap_for_home(
         .as_ref()
         .map(|(home_id, _)| home_id.clone())
         .unwrap_or_else(Workbench::configured_home_id);
-    let startup_state =
-        library_state::load_startup_library_state(&mut store, &targets_dir, &providers, &home_id)?;
+    let startup_state = library_state::load_startup_library_state(
+        &mut store,
+        &targets_dir,
+        &providers,
+        &home_id,
+        seed.archetypes,
+    )?;
 
     let mut wb = Workbench::new(store).with_home_id(home_id);
     wb.providers = providers;
@@ -280,7 +371,9 @@ fn build_workbench_with_content_keywrap_for_home(
     // Stand up + seed the account-global onboarding tracker (ADR 0075). Runs
     // after the root is applied so the tracker's store files resolve under it;
     // best-effort, so a tracker failure never aborts workbench startup.
-    wb.ensure_onboarding_seeded();
+    if seed.onboarding {
+        wb.ensure_onboarding_seeded();
+    }
     federation::activate_configured_federation(&mut wb)?;
     // Enterprise SSO activation (`ID-3`) moved with the ee band (`gaugedesk-ee`,
     // SPLIT-1): the ee/hosted compositions call `activate_configured_idp` right

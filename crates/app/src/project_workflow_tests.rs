@@ -14,7 +14,10 @@ const LIMITS: ProjectWorkflowLimits = ProjectWorkflowLimits {
     input_bytes: 64 * 1024,
 };
 fn open(root: &std::path::Path) -> crate::SharedWorkbench {
-    crate::open_workbench_with_content_keywrap(root, |_| {
+    // Lean: a project workflow runs in the Personal project's target and reads
+    // neither the archetype library nor the onboarding tracker
+    // (`StartupSeed::lean`).
+    crate::workbench_state::open_lean_workbench_with_content_keywrap(root, |_| {
         Ok(Box::new(LoopbackKeyWrap::new([37; 32])))
     })
     .unwrap()

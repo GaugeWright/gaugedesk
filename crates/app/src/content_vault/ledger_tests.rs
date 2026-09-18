@@ -23,6 +23,11 @@ fn server(responses: Vec<(u16, String)>) -> (String, JoinHandle<Vec<String>>) {
                     Err(error) => panic!("ledger fixture accept: {error}"),
                 }
             };
+            // On macOS an accepted socket inherits the listener's non-blocking
+            // flag (Linux clears it), so the first read below raced the client's
+            // bytes and failed with EAGAIN whenever the machine was busy enough
+            // for accept to win. The reads want the timeout, not the flag.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
