@@ -16,6 +16,33 @@ When("I open my account", async ({ page }) => {
     await openAccountMenu(page);
 });
 
+// The account menu's entrance to identity (LOGIN-3/4/5), on every distro.
+// `[data-account-menu-item="sign-in"]` renders whether or not it does anything
+// useful, so asserting the row is visible is not a test of this. Pressing it is.
+When("I choose sign-in from the account menu", async ({ page }) => {
+    await page.locator('[data-account-menu-item="sign-in"]').click();
+});
+
+Then("the sign-in card is open over the workbench", async ({ page }) => {
+    const overlay = page.locator("[data-signin-overlay]");
+    await expect(overlay).toBeVisible();
+    await expect(overlay.locator("[data-signin]")).toBeVisible();
+    // Over the running shell, not behind a failed Home — that branch is the one
+    // a desktop never reaches, and it is where this card used to live.
+    await expect(page.locator("[data-home-error]")).toHaveCount(0);
+});
+
+Then("it offers an address, a passkey, and the provider marks", async ({ page }) => {
+    const card = page.locator("[data-signin-overlay] [data-signin]");
+    // The point of the card: a choice. The behaviour this replaces made that
+    // choice for the person by opening one provider.
+    await expect(card.locator("[data-signin-email]")).toBeVisible();
+    await expect(card.locator("[data-signin-create-open]")).toBeVisible();
+    for (const provider of ["google", "apple", "microsoft"]) {
+        await expect(card.locator(`[data-signin-provider="${provider}"]`)).toBeVisible();
+    }
+});
+
 When("I open my model access", async ({ page }) => {
     await openSettings(page, "models");
 });

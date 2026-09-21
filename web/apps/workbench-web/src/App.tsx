@@ -2021,11 +2021,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 // Never `undefined` on a core build any more. A desktop signs
                 // in against its own control plane through the card; only the
                 // hosted GaugeApps shell takes the admission handoff instead.
-                onSignIn={
-                    props.gaugeApps
-                        ? beginAccountAdmission
-                        : () => { setSignInOpen(true); }
-                }
+                // Always the card. `props.gaugeApps` is set on the ENTERPRISE
+                // composition, and `src-tauri/tauri.conf.json` ships
+                // `frontendDist: ../ee/web/dist-enterprise-workbench` — so that
+                // branch was the desktop, and the desktop went straight to
+                // `beginAccountAdmission`, which opens the Hub, which 303s to
+                // Google. Pressing "Sign in" teleported people to a provider
+                // they had not chosen, and returned them to a passkey prompt
+                // with no context for it. The card we designed was never on
+                // screen for the distro that ships.
+                //
+                // Nothing is lost by going through it: the card's Google mark
+                // calls the same `beginAccountAdmission`. It just asks first,
+                // beside an address field, a passkey, and two other providers.
+                onSignIn={() => { setSignInOpen(true); }}
                 onSignOut={signOutAccount}
                 environmentAction={props.environmentAction}
                 gaugeAppActions={props.gaugeApps?.accountActions}
