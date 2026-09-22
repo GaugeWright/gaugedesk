@@ -27,7 +27,7 @@ import {
     consumeAccountSignupTicket,
     consumeCallbackToken,
     endSession,
-    finishConsumerSignupAccount,
+    completeConsumerSignup,
     finishAccountRecovery,
     finishPasskeyAccountCreation,
     refreshHostedAccountSession,
@@ -2077,11 +2077,15 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 return {
                     email: claim.email,
                     suggestedName: claim.displayName ?? undefined,
-                    create: async (name: string) => {
-                        const created = await finishConsumerSignupAccount(
+                    // DR-0177: the provider's verified email satisfies ADR
+                    // 0146 §1's step 1, so this finishes without a passkey
+                    // ceremony. `name` is no longer asked for — Google attested
+                    // one, and a form field between a person and being signed
+                    // in was the friction this decision removed.
+                    create: async () => {
+                        const created = await completeConsumerSignup(
                             controlPlaneBase(),
                             accountSignupTicket,
-                            name,
                         );
                         pendingNativeReturn = created.nativeReturn;
                         return created.recoveryCodes;

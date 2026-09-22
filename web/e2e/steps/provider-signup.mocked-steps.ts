@@ -52,3 +52,13 @@ Then("it shows the address the provider attested", async ({ page }) => {
         "attested@example.com",
     );
 });
+
+Then("it asks for nothing but a confirmation", async ({ page }) => {
+    const step = page.locator("[data-signin-provider-create]");
+    // DR-0177 removed the passkey ceremony and, with it, the name field that
+    // asked for something the provider had already attested. One button.
+    await expect(step.locator("input")).toHaveCount(0);
+    await expect(step.locator("[data-signin-provider-continue]")).toBeVisible();
+    await expect(step.locator("[data-signin-provider-continue]")).toBeEnabled();
+    await expect(step.locator("[data-signin-provider-continue]")).toContainText("Attested Person");
+});

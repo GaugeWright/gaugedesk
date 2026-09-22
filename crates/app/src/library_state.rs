@@ -2889,7 +2889,14 @@ impl Workbench {
         let mut wb = Self::new(store);
         // This explicit constructor is a test/composition seam; its caller may
         // provide a standalone repo rather than the production nested layout.
+        // The state root follows the target too: an empty root resolves the
+        // per-boundary tracker stores (`<root>/trackers/<boundary>/`) against
+        // the process's working directory, which for a test is the crate, so a
+        // checkout reused across schema revisions opened a store it could not
+        // read (2026-09-22). Every fixture that reaches this seam already owns a
+        // temp dir; the state lives there.
         if let Some(root) = target.repo().parent() {
+            wb.root = root.to_path_buf();
             wb.targets_root = root.join("targets");
         }
         wb.targets.insert(target_id.clone(), Box::new(target));

@@ -76,11 +76,15 @@ export interface SignInProviderSignup {
     /** The address the provider verified. Not editable here: it is evidence,
      *  not a field. */
     email: string;
-    /** The provider's `name` claim, if it offered one, to prefill the form. */
+    /** The provider's `name` claim, if it offered one. Shown, not asked for. */
     suggestedName?: string;
-    /** Creates the account, attaches the passkey and links the provider
-     *  subject, and resolves with the one copy of the recovery codes. */
-    create(displayName: string): Promise<readonly string[]>;
+    /** Creates the account and links the provider subject, resolving with the
+     *  one copy of the recovery codes. No passkey: DR-0177 narrows ADR 0146
+     *  §1's enumerated owner path to the email entrance, and a provider that
+     *  attests a verified email satisfies its step 1 on its own. Adding a
+     *  passkey afterwards is what makes the provider replaceable, and is
+     *  offered rather than required. */
+    create(): Promise<readonly string[]>;
     /** Called only once the person has said they saved the codes. */
     complete(): void;
 }
@@ -302,9 +306,8 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
      *  navigates. */
     const finishProviderSignup = (event: SubmitEvent, current: Extract<Step, { at: "provider-create" }>) => {
         event.preventDefault();
-        if (!displayName().trim()) return;
         void run("create that account", async () => {
-            const codes = await props.providerSignup!.create(displayName().trim());
+            const codes = await props.providerSignup!.create();
             setStep({
                 at: "codes",
                 email: current.email,
@@ -499,23 +502,16 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                             <p class="signin__resolved">
                                 <span>Google verified {current().email}</span>
                             </p>
-                            <p class="signin__status">
-                                Create a passkey to finish setting up your GaugeDesk
-                                account. Google becomes one way to sign in, not the
-                                account itself — so losing it never loses the account.
-                            </p>
-                            <label class="signin__field">
-                                <span class="signin__label">Your name</span>
-                                <input
-                                    name="display-name"
-                                    autocomplete="name"
-                                    required
-                                    value={displayName()}
-                                    onInput={(event) => setDisplayName(event.currentTarget.value)}
-                                />
-                            </label>
-                            <button class="signin__primary" data-signin-provider-continue type="submit" disabled={busy() || !displayName().trim()}>
-                                {busy() ? "Creating…" : "Create account with a passkey"}
+                            {/* One button. The name field that used to sit here
+                                asked for something the provider had already
+                                attested, between a person and being signed in —
+                                which is the friction DR-0177 removed. */}
+                            <button class="signin__primary" data-signin-provider-continue type="submit" disabled={busy()}>
+                                {busy()
+                                    ? "Setting up…"
+                                    : props.providerSignup?.suggestedName
+                                        ? `Continue as ${props.providerSignup.suggestedName}`
+                                        : "Continue"}
                             </button>
                         </form>
                     )}

@@ -4,6 +4,7 @@
 # run here and a passing gate cannot mean different things.
 #
 #   scripts/check.sh            everything below
+#   scripts/check.sh required   everything below, as the gate (every prerequisite enforced)
 #   scripts/check.sh rust       one section, while iterating
 #   scripts/check.sh web
 #   scripts/check.sh contracts
@@ -531,8 +532,14 @@ run_all() {
     #
     # best-effort is what `all` means: it is a developer's bar, and the lanes
     # that take no word have no prerequisite-guarded step for it to change.
-    # The gate asks for lanes one at a time, with its own word, in sequence.
-    export prerequisites=best-effort
+    # `required` is the same bar as the gate: one invocation, every
+    # prerequisite enforced, which is what the shared guide's
+    # `scripts/check.sh required` promises and what the bridge off the forge
+    # invokes (GaugeWright DR-0131). The hosted jobs asked for lanes one at a
+    # time, each with its own word.
+    export prerequisites="${1:-best-effort}"
+    local word=()
+    [ "$prerequisites" = required ] && word=(required)
 
     local failed=()
     local lane rc index
@@ -552,10 +559,11 @@ run_all() {
 
     set -m
     for lane in "${alongside[@]}"; do
-        # `contracts` needs no word here: a section name alone already means
-        # best-effort for it, and `all` wants exactly what a developer asking
-        # for that section wants. See prerequisite_policy.
-        lane_runner "$lane" > "$transcripts/$lane" 2>&1 &
+        # Under `all`, `contracts` needs no word here: a section name alone
+        # already means best-effort for it, and `all` wants exactly what a
+        # developer asking for that section wants. Under `required` the word
+        # travels, so the lane enforces. See prerequisite_policy.
+        lane_runner "$lane" ${word[@]+"${word[@]}"} > "$transcripts/$lane" 2>&1 &
         pids+=("$!")
     done
     set +m
@@ -563,7 +571,7 @@ run_all() {
     for lane in rust desktop mobile windows; do
         rc=0
         case "$lane" in
-            desktop|mobile) lane_runner "$lane" best-effort || rc=$? ;;
+            desktop|mobile) lane_runner "$lane" "$prerequisites" || rc=$? ;;
             *) lane_runner "$lane" || rc=$? ;;
         esac
 
@@ -623,6 +631,7 @@ run_all() {
 dispatch() {
     case "${1:-all}" in
         all) run_all ;;
+        required) run_all required ;;
         contracts) run_contracts "$(prerequisite_policy "${2:-best-effort}")" ;;
         dependencies) run_dependencies "$(prerequisite_policy "${2:-best-effort}")" ;;
         desktop) run_desktop "$(prerequisite_policy "${2:-}")" ;;
@@ -630,7 +639,7 @@ dispatch() {
         rust) run_rust ;;
         web) run_web ;;
         windows) run_windows ;;
-        *) echo "usage: scripts/check.sh [all|contracts|dependencies|desktop|mobile|rust|web|windows]" >&2; exit 2 ;;
+        *) echo "usage: scripts/check.sh [all|required|contracts|dependencies|desktop|mobile|rust|web|windows]" >&2; exit 2 ;;
     esac
 }
 

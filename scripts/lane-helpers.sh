@@ -170,7 +170,8 @@ mobile_target_prerequisites_present() {
 # by name is asking for that compile: they enforce by default, and `all` names
 # `best-effort`. `contracts` is two dozen checks of which the strict documentation
 # build is one, so asking for it by name is not asking for mkdocs: it is
-# best-effort by default, and the contracts CI job names `required` (ci.yml).
+# best-effort by default, and the gate the fleet runs names `required`
+# (GaugeWright DR-0131).
 prerequisite_policy() {
     if [ "${1:-}" = best-effort ]; then echo best-effort; else echo required; fi
 }
@@ -183,7 +184,7 @@ prerequisite() {
         exit 1
     fi
     echo "-- $2 SKIPPED: $1 is not installed --" >&2
-    echo "   the security-baseline CI job installs it and runs this on every pull request." >&2
+    echo "   the fleet installs it and runs this on every push and pull request (gaugewright/bar)." >&2
     echo "   To close the gap locally: $3" >&2
     skipped_prerequisites="${skipped_prerequisites:+$skipped_prerequisites; }$2 not run"
     echo "#unasserted: $2 not run"

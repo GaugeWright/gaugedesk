@@ -346,6 +346,31 @@ export async function claimConsumerSignup(
     };
 }
 
+/** Create the account from the provider identity alone (DR-0177).
+ *
+ * The default provider entrance. ADR 0146 §1's enumerated owner path is the
+ * email one; a provider that returns an email it attests as verified satisfies
+ * its step 1, so no passkey ceremony runs here. Adding a passkey afterwards is
+ * what makes the provider replaceable, and DR-0177 offers that rather than
+ * requiring it — which is why the passkey entrance below is kept beside this
+ * rather than deleted.
+ *
+ * The empty-codes guard is the same one both other entrances run: an account
+ * created without a recovery batch cannot satisfy ADR 0146 §2, and this path
+ * has no passkey to fall back on, so it matters here most of all. */
+export async function completeConsumerSignup(
+    controlPlaneBase: string,
+    ticket: string,
+): Promise<PasskeyAccountCreated> {
+    const finished = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/consumer-signup/complete",
+        { ticket },
+        "That sign-in link has expired. Press Continue with Google again.",
+    );
+    return createdAccount(finished);
+}
+
 /** Create the account a provider signup ticket describes.
  *
  * This is {@link finishPasskeyAccountCreation} without its two email calls:

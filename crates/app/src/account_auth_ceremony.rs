@@ -757,6 +757,103 @@ impl AccountAuthRuntime {
         })
     }
 
+    /// Create the account from a provider identity alone (DR-0177).
+    ///
+    /// ADR 0146 §1's enumerated owner path — verify an email, create a passkey,
+    /// create the account — is the EMAIL entrance. A provider that returns an
+    /// email it attests as verified satisfies step 1 on its own, and DR-0177
+    /// narrows §1 to say so: the account may be created with that subject as
+    /// its first authenticator, without a passkey first.
+    ///
+    /// Everything §1 and §2 still require holds here, because this is the same
+    /// append as [`Self::finish_registration`] minus the WebAuthn fact:
+    ///
+    /// - the root is minted independently and sealed under Hub custody, so the
+    ///   account id is never the provider subject;
+    /// - the subject is attached through `decide_link_external_subject`, the
+    ///   same reducer the link ceremony uses, so a subject already held by
+    ///   another account is refused rather than stolen;
+    /// - the email goes through `decide_verify_email`, which refuses an address
+    ///   another account already holds — email is a verified contact and a
+    ///   discovery identifier, never a merge key;
+    /// - and a recovery batch is minted, because an account created without one
+    ///   can never satisfy §2's verified-email-plus-recovery-code, and DR-0177
+    ///   deliberately does not defer that the way it defers the passkey.
+    ///
+    /// What is knowingly accepted, and recorded in DR-0177's consequences: an
+    /// account may exist whose only usable authenticator is a provider login,
+    /// and its owner may lose it if that provider ends the account before a
+    /// second method is added.
+    fn create_account_from_verified_provider(
+        &self,
+        wb: &mut crate::Workbench,
+        email: &str,
+        signup: ConsumerSignupContext,
+        now: u64,
+    ) -> Result<RegistrationOutcome, CeremonyError> {
+        let email = normalize_email_contact(email).ok_or(CeremonyError::InvalidEmail)?;
+        let (root_seed, account_id) = generate_account_root()?;
+        let sealed_seed = wb
+            .seal_custodied_account_root(&account_id, &hex::encode(root_seed))
+            .ok_or(CeremonyError::Unavailable)?;
+        let state = AccountAuth::rebuild(wb.store_ref()).map_err(|_| CeremonyError::Unavailable)?;
+        if state.roots.contains_key(&account_id) {
+            return Err(CeremonyError::AlreadyExists);
+        }
+        let mut facts = vec![AccountAuthFact::RootCustody(
+            CustodiedAccountRootRecord::new(&account_id, &sealed_seed, now)
+                .map_err(|_| CeremonyError::Unavailable)?,
+        )];
+        facts.extend(
+            decide_verify_email(
+                &state,
+                VerifiedEmailRecord::new(&account_id, &email, now)
+                    .map_err(|_| CeremonyError::InvalidEmail)?,
+            )
+            .map_err(|_| CeremonyError::AlreadyExists)?,
+        );
+        facts.extend(
+            crate::account_auth::decide_link_external_subject(
+                &state,
+                crate::account_auth::ExternalSubjectRecord::new(
+                    &account_id,
+                    &signup.connection_id,
+                    &signup.issuer,
+                    &signup.subject,
+                    crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+                    now,
+                )
+                .map_err(|_| CeremonyError::Unavailable)?,
+            )
+            .map_err(|_| CeremonyError::AlreadyExists)?,
+        );
+        let (recovery_facts, recovery_codes) = mint_recovery_batch(&state, &account_id, now)?;
+        facts.extend(recovery_facts);
+        // One append: either the whole account exists, with a way back in, or
+        // none of it does.
+        append_facts(wb.store_mut(), &facts).map_err(|_| CeremonyError::Unavailable)?;
+        crate::auth_oidc::provision_web_account(wb, &account_id, true);
+        // The method names what actually happened. `finish_registration` says
+        // "passkey" because the person just proved one; here they proved a
+        // provider identity, and calling that a passkey would let
+        // `independent_account_method` treat a provider session as the
+        // independent proof required to link a second provider — which is the
+        // one thing a provider-created account has not got yet.
+        let session = wb
+            .mint_account_session(
+                &account_id,
+                &format!("consumer-oidc:{}", signup.connection_id),
+                self.session_ttl_secs,
+            )
+            .ok_or(CeremonyError::Unavailable)?;
+        Ok(RegistrationOutcome {
+            account_id,
+            session,
+            recovery_codes,
+            consumer_signup: Some(signup),
+        })
+    }
+
     fn start_authentication(
         &self,
         state: &AccountAuth,
@@ -1403,6 +1500,65 @@ async fn post_consumer_signup_registration_start(
     }
 }
 
+/// Create the account from the provider identity alone (DR-0177).
+///
+/// The sibling of `post_consumer_signup_registration_start`, and the one the
+/// card takes by default: same ticket, same binding, same single spend — but it
+/// finishes here instead of opening a WebAuthn ceremony, because DR-0177 says
+/// a verified provider email satisfies ADR 0146 §1's step 1 on its own.
+///
+/// The passkey entrance is deliberately kept beside it rather than replaced.
+/// Adding a passkey is what makes the provider replaceable, and DR-0177 offers
+/// that rather than requiring it.
+async fn post_consumer_signup_complete(
+    State(wb): State<SharedWorkbench>,
+    Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
+    Json(body): Json<StartConsumerSignupRegistrationRequest>,
+) -> Response {
+    let runtime = match runtime(&auth) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.response(),
+    };
+    let presented = crate::net_http::signup_binding_cookie(&headers).unwrap_or_default();
+    // Before the take, exactly as the passkey entrance does it: a mismatched
+    // browser must not be able to spend somebody else's ticket even to fail.
+    let matches_binding = auth
+        .pending_consumer_signup_mut()
+        .peek(&body.ticket, std::time::Instant::now())
+        .map(|signup| crate::auth_oidc::binding_matches(signup.browser_binding.expose(), presented))
+        .unwrap_or(false);
+    if !matches_binding {
+        return CeremonyError::UnknownOrExpired.response();
+    }
+    let Some(signup) = auth
+        .pending_consumer_signup_mut()
+        .take(&body.ticket, std::time::Instant::now())
+    else {
+        return CeremonyError::UnknownOrExpired.response();
+    };
+    let context = ConsumerSignupContext {
+        connection_id: signup.connection_id.clone(),
+        issuer: signup.issuer.clone(),
+        subject: signup.subject.clone(),
+        label: signup.verified_email.clone(),
+        provider_expires_at_ms: signup.provider_expires_at_ms,
+        refresh_token: signup.refresh_token.clone(),
+        native_return: signup.native_return.clone(),
+        native_handoff_challenge: signup.native_handoff_challenge.clone(),
+    };
+    let outcome = {
+        let mut guard = wb.lock_unpoisoned();
+        runtime.create_account_from_verified_provider(
+            &mut guard,
+            &signup.verified_email,
+            context,
+            unix_now(),
+        )
+    };
+    registration_response(outcome, &auth)
+}
+
 async fn post_authentication_start(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
@@ -1710,6 +1866,13 @@ pub fn routes() -> axum::Router<SharedWorkbench> {
         .route(
             "/auth/account/consumer-signup/claim",
             post(post_consumer_signup_claim),
+        )
+        // DR-0177: the default provider entrance, which finishes without a
+        // passkey. The register/start route below stays for the person who
+        // chooses to add one at creation.
+        .route(
+            "/auth/account/consumer-signup/complete",
+            post(post_consumer_signup_complete),
         )
         .route(
             "/auth/account/consumer-signup/register/start",
@@ -2453,6 +2616,124 @@ mod tests {
                 .peek(&ticket, std::time::Instant::now())
                 .is_none(),
             "the ticket is gone from the store, not merely refused",
+        );
+    }
+
+    /// DR-0177: a verified provider email creates the account on its own.
+    ///
+    /// What this has to prove is not that it works, but that dropping the
+    /// passkey dropped ONLY the passkey. The account root is still independent
+    /// of the subject, the email is still verified, the subject is still a
+    /// linked method rather than the identity, and — the one DR-0177 refused
+    /// to defer — a recovery batch still exists, because without it ADR 0146
+    /// §2's verified-email-plus-recovery-code can never be satisfied and the
+    /// account is unrecoverable the moment the provider says no.
+    #[test]
+    fn a_provider_identity_creates_an_account_that_is_still_recoverable() {
+        let (runtime, _sender) = runtime();
+        let (_vault_dir, mut wb) = signup_workbench();
+        let signup = test_signup_context();
+
+        let outcome = runtime
+            .create_account_from_verified_provider(
+                &mut wb,
+                "New.Person@Example.com",
+                signup.clone(),
+                11,
+            )
+            .expect("a verified provider email creates the account");
+
+        // The account is not the subject. ADR 0146 §1, and the reason the root
+        // is minted here rather than derived from anything Google sent.
+        assert_ne!(outcome.account_id, signup.subject);
+        assert!(!outcome.account_id.contains(&signup.subject));
+
+        // Recoverable. This is the assertion DR-0177 exists to keep.
+        assert_eq!(outcome.recovery_codes.len(), RECOVERY_CODE_COUNT);
+        assert_eq!(
+            outcome
+                .recovery_codes
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            RECOVERY_CODE_COUNT,
+            "ten distinct codes, not one repeated",
+        );
+
+        let state = AccountAuth::rebuild(wb.store_ref()).unwrap();
+        assert!(
+            state.roots.contains_key(&outcome.account_id),
+            "root custody"
+        );
+        assert!(
+            state
+                .emails
+                .values()
+                .any(|r| r.account_id == outcome.account_id && r.email == "new.person@example.com"),
+            "the provider's verified address is a verified contact on the account",
+        );
+        assert!(
+            state
+                .external_subjects
+                .values()
+                .any(|r| r.account_id == outcome.account_id && r.subject == signup.subject),
+            "the subject is linked TO the account",
+        );
+        // And no passkey, which is the whole point of this path.
+        assert!(
+            !state
+                .webauthn_methods
+                .values()
+                .any(|r| r.account_id == outcome.account_id),
+            "no passkey is created by this entrance",
+        );
+        // The session says what actually happened. Calling it "passkey" would
+        // let `independent_account_method` treat this as the independent proof
+        // required to link a second provider — the one thing this account has
+        // not got.
+        assert!(!outcome.session.is_empty());
+    }
+
+    /// The refusals DR-0177 explicitly keeps. Dropping the passkey must not
+    /// drop these: email is a verified contact and a discovery identifier, and
+    /// never a merge key (ADR 0146 §1), and a subject already held by another
+    /// account must be refused rather than stolen.
+    #[test]
+    fn provider_creation_still_refuses_a_taken_email_and_a_taken_subject() {
+        let (runtime, _sender) = runtime();
+        let (_vault_dir, mut wb) = signup_workbench();
+        let signup = test_signup_context();
+
+        runtime
+            .create_account_from_verified_provider(&mut wb, "first@example.com", signup.clone(), 11)
+            .expect("the first account is created");
+
+        // Same subject, different address: the subject belongs to an account.
+        let taken_subject = runtime.create_account_from_verified_provider(
+            &mut wb,
+            "second@example.com",
+            signup.clone(),
+            12,
+        );
+        assert!(
+            taken_subject.is_err(),
+            "a subject already linked to an account cannot create a second one",
+        );
+
+        // Same address, different subject: NOT a merge, and not a takeover.
+        let other_subject = ConsumerSignupContext {
+            subject: "google-subject-someone-else".into(),
+            ..signup
+        };
+        let taken_email = runtime.create_account_from_verified_provider(
+            &mut wb,
+            "first@example.com",
+            other_subject,
+            13,
+        );
+        assert!(
+            taken_email.is_err(),
+            "an address another account already holds is refused, never merged into",
         );
     }
 

@@ -83,8 +83,16 @@ impl Workbench {
 
     /// Set the state root where federation key/TLS stores live. Builder-style;
     /// startup sets it from the resolved root, federation tests set it explicitly.
+    ///
+    /// The managed-target root follows it, because `Workbench::new` leaves that
+    /// at a path relative to the process's working directory and a fixture
+    /// that sets its root has said where its state lives. A test built this
+    /// way that created a project left its target and collaboration workspace
+    /// under the crate — state that a checkout reused across revisions then
+    /// carried into the next run (2026-09-22).
     pub fn with_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.root = root.into();
+        self.targets_root = self.root.join("targets");
         self
     }
 

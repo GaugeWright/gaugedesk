@@ -22,3 +22,4 @@ Feature: Coming back from the provider opens the step that is left (LOGIN-3/4/5)
     Given a signup ticket from the provider is on the URL
     Then the card opens on the provider account step
     And it shows the address the provider attested
+    And it asks for nothing but a confirmation
