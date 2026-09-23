@@ -820,8 +820,20 @@ pub(crate) struct PreparedProtectedPackage {
 /// materializations are younger than the conservative age bound and remain
 /// owned by their `TempDir` guard; only directories carrying our exact prefix
 /// are candidates.
+///
+/// Once per process. What it cleans up is what an EARLIER process left, so
+/// the first workbench this process opens answers the question for every
+/// later one, and a process that opens many — the cloud server's tests open
+/// one per fixture, a workbench per test — does not read the whole temporary
+/// directory again each time. That read is proportional to everything else
+/// on the machine that ever left a temporary directory behind: on the
+/// founder's machine it was 27,000 entries, and half the busy time of a
+/// cloud host test.
 pub(crate) fn scavenge_stale_materializations() {
-    scavenge_stale_materializations_in(&std::env::temp_dir(), std::time::SystemTime::now());
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        scavenge_stale_materializations_in(&std::env::temp_dir(), std::time::SystemTime::now());
+    });
 }
 
 fn scavenge_stale_materializations_in(parent: &Path, now: std::time::SystemTime) {

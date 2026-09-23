@@ -438,6 +438,12 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .resizer { background: var(--edge); cursor: col-resize; }
 .resizer:hover, .resizer.dragging { background: var(--accent); }
 .run .transcript { flex: 1; overflow: auto; min-height: 0; }
+/* The work shell wraps the chat pane in a slot so GaugeApps can swap its own
+   chat in beside it. The slot has to carry .run's column layout through, or the
+   transcript stops absorbing the pane's slack and the composer rides up under
+   the last turn instead of docking at the bottom. */
+[data-work-chat-slot] { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+[data-work-chat-slot][hidden] { display: none; }
 /* No-selection chat pane (the quick-start on-ramp): same anatomy as a live
    chat — this empty transcript absorbs the slack so the composer docks at the
    bottom, with one quiet line of guidance where the conversation will be. */

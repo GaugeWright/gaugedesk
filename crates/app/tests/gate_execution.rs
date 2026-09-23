@@ -138,7 +138,7 @@ fn the_gate_runs_and_returns_a_keep() {
 /// spelling of the store's location, and the `structure` under the instance is
 /// the program the gate actually ran.
 #[test]
-fn a_gate_that_ran_is_projected_as_an_instance_of_program_gate() {
+fn a_gate_that_ran_is_projected_as_an_instance_of_its_workflow() {
     let quarantine = staged(r#"{"q1":"the coffee was cold"}"#);
     let state = tempfile::tempdir().unwrap();
     run_gate(
@@ -155,8 +155,10 @@ fn a_gate_that_ran_is_projected_as_an_instance_of_program_gate() {
         .expect("the gate's own store reads back");
     assert_eq!(instances.len(), 1, "one item screened, one instance");
     let instance = &instances[0];
-    assert_eq!(instance.program, "gate");
-    assert_eq!(instance.view["schema"], "whipplescript.instance_view.v0");
+    // The version carries the workflow's declared name, which the kernel
+    // holds it to; "gate" is the slot the view files it under, not the name.
+    assert_eq!(instance.program, "InboundGate");
+    assert_eq!(instance.view["schema"], "whipplescript.instance_view.v1");
     assert_eq!(
         instance.view["structure"]["available"], true,
         "the snapshot was retained with the version"
@@ -521,9 +523,11 @@ fn gate_edits_and_missing_markers_preserve_each_items_original_program() {
         assert_ne!(version.ir_hash, "gate");
         let source = stores.get_content(&version.source_hash).unwrap().unwrap();
         let ir = whipplescript_parser::compile_program(&source).ir.unwrap();
+        // The retained snapshot is the identity projection, the snapshot with
+        // its source offsets erased, which is what the kernel captures under.
         assert_eq!(
             stores.get_content(&version.ir_hash).unwrap().as_deref(),
-            Some(ir.to_snapshot().as_str())
+            Some(whipplescript_parser::snapshot::identity_projection(&ir.to_snapshot()).as_str())
         );
     }
 }
@@ -617,7 +621,12 @@ fn a_legacy_gate_without_program_evidence_keeps_its_question_and_refuses_rescree
         let ir = whipplescript_parser::compile_program(REVIEW_BY_HAND_GATE)
             .ir
             .unwrap();
-        let snapshot = ir.to_snapshot();
+        // The kernel refuses a version whose recorded snapshot is not the
+        // identity projection of the program it captures, so the "different"
+        // IR here is a genuinely recorded one: the source retained beside it
+        // is another gate's, which is what the current compiler then cannot
+        // reproduce.
+        let snapshot = whipplescript_parser::snapshot::identity_projection(&ir.to_snapshot());
         let source_hash = if matches!(mode, "missing-source" | "ambiguous-history") {
             "gate".to_owned()
         } else {
@@ -631,7 +640,7 @@ fn a_legacy_gate_without_program_evidence_keeps_its_question_and_refuses_rescree
         let legacy = kernel
             .create_program_version_for_program(
                 ProgramVersionInput {
-                    program_name: "gate",
+                    program_name: &ir.workflow,
                     source_hash: &source_hash,
                     ir_hash: &ir_hash,
                     compiler_version: env!("CARGO_PKG_VERSION"),
@@ -647,11 +656,14 @@ fn a_legacy_gate_without_program_evidence_keeps_its_question_and_refuses_rescree
             let candidate = whipplescript_parser::compile_program(COERCE_SCREEN_GATE)
                 .ir
                 .unwrap();
-            assert_ne!(candidate.to_snapshot(), snapshot);
+            assert_ne!(
+                whipplescript_parser::snapshot::identity_projection(&candidate.to_snapshot()),
+                snapshot
+            );
             let other = kernel
                 .create_program_version_for_program(
                     ProgramVersionInput {
-                        program_name: "gate",
+                        program_name: &candidate.workflow,
                         source_hash: "gate",
                         ir_hash: "gate",
                         compiler_version: env!("CARGO_PKG_VERSION"),

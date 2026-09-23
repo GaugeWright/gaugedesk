@@ -50,7 +50,10 @@ impl Workbench {
             .ok()
             .and_then(|source| gaugedesk_whip_runtime::program_structure(&source));
         let gate_store = gate_runtime_store(&root, project_id);
-        let (gate_instances, gate_unread) = projected(&gate_store, Some("gate"));
+        // The gate's store holds the gate's instances and no others; the
+        // program name recorded there is the workflow's own, so nothing is
+        // filtered by name.
+        let (gate_instances, gate_unread) = projected(&gate_store, None);
         whips.push(json!({
             "path": gate_path,
             "program": "gate",

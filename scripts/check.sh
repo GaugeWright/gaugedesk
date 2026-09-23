@@ -142,6 +142,12 @@ run_contracts() {
     echo "== agent guide =="
     gate_section agent-guide
 
+    # What this repository carries of the GaugeWright repository's, compared
+    # against what that repository builds (DR-0124 stage 4).
+    echo "== agent guide, as an edge =="
+    gate_section carries-agent-guide
+    gate_section carries-agent-guide-checker
+
     # This script's own composition. `all` running every section and reporting
     # the failures together is a property with no line number — it shows only in
     # what a failing run still manages to say — and reverting it leaves every
@@ -358,6 +364,9 @@ run_rust() {
     echo "== resolved WhippleScript action contract =="
     python3 scripts/check-whipplescript-host-action.py --resolved
     python3 scripts/test-whipplescript-host-action.py
+
+    echo "== lockfile =="
+    gate_section lockfile
 
     echo "== formatting =="
     gate_section formatting

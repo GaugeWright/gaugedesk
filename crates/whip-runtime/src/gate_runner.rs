@@ -413,12 +413,21 @@ pub fn run_gate<T: GateTransport>(
         let retained = retained_program(&kernel, &instance, program)?;
         (instance.instance_id, retained)
     } else {
-        let snapshot = program.ir.to_snapshot();
+        // The version's identity is the snapshot with its source offsets
+        // erased, which is what the kernel recomputes and compares on capture:
+        // a compiler change that only moves a caret must not mint a new
+        // version, and a snapshot the kernel would not reproduce is refused.
+        let snapshot =
+            whipplescript_parser::snapshot::identity_projection(&program.ir.to_snapshot());
         let source_hash = kernel.store().put_content(&program.source)?;
         let ir_hash = stable_hash_hex(&snapshot);
         let version = kernel.create_program_version_for_program(
             ProgramVersionInput {
-                program_name: "gate",
+                // The kernel refuses a version whose name is not the workflow
+                // it captures, so the gate is recorded under the name its
+                // author gave it. What makes an instance a gate's is the
+                // store it lives in: `state_dir` holds one program.
+                program_name: &program.ir.workflow,
                 source_hash: &source_hash,
                 ir_hash: &ir_hash,
                 compiler_version: concat!("gaugedesk-whip-runtime/", env!("CARGO_PKG_VERSION")),
@@ -540,16 +549,18 @@ fn drive_gate<T: GateTransport>(
     disposition_from(&driver, item)
 }
 
+/// Every instance in the gate's own store. The store under `state_dir` holds
+/// the gate and nothing else, so membership is the discriminator; the program
+/// name is the workflow's own, which its author chooses. An instance whose
+/// version is gone is a store that needs repair, not a non-gate.
 fn gate_instances(kernel: &RuntimeKernel<NativeStores>) -> Result<Vec<InstanceView>, GateRunError> {
     let mut gates = Vec::new();
     for instance in kernel.store().list_instances()? {
-        let version = kernel.store().get_program_version(&instance.version_id)?
+        kernel.store().get_program_version(&instance.version_id)?
             .ok_or_else(|| GateRunError::NoDisposition(format!(
                 "instance {} has no retained program version; preserve its queue and repair the store", instance.instance_id
             )))?;
-        if version.program_name == "gate" {
-            gates.push(instance);
-        }
+        gates.push(instance);
     }
     Ok(gates)
 }
@@ -618,7 +629,7 @@ fn retained_program(
     // A program edit selects the next arrival's workflow, not this item's.
     // Current governance still admits/refuses the old workflow before effects.
     let retained = GateProgram::compile(&source, &current.envelope)?;
-    if retained.ir.to_snapshot() != snapshot {
+    if whipplescript_parser::snapshot::identity_projection(&retained.ir.to_snapshot()) != snapshot {
         return Err(repair(
             "the current compiler does not reproduce the recorded IR",
         ));

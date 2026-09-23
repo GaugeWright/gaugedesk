@@ -138,6 +138,20 @@ if ! command -v "$AR_wasm32_unknown_unknown" >/dev/null; then
   echo "       install llvm, or set AR_wasm32_unknown_unknown" >&2
   exit 1
 fi
+# The standard library for the target, not just the target's name. `rustup
+# target add` applies to the DEFAULT toolchain, while this tree pins its own in
+# rust-toolchain.toml, so adding it in the obvious way leaves the pinned
+# toolchain without it — and the failure is `can't find crate for \`core\``
+# partway through the dependency graph, which names neither the target nor the
+# toolchain that is missing it. It cost the first run of the macOS release lane
+# on a new host.
+if ! rustc --print target-libdir --target wasm32-unknown-unknown >/dev/null 2>&1; then
+  toolchain="$(rustup show active-toolchain 2>/dev/null | cut -d' ' -f1)"
+  echo "error: the active toolchain (${toolchain:-unknown}) has no wasm32-unknown-unknown standard library" >&2
+  echo "       rustup target add wasm32-unknown-unknown --toolchain ${toolchain:-\$(cat rust-toolchain.toml)}" >&2
+  echo "       note that a bare \`rustup target add\` adds it to the default toolchain, not this pinned one" >&2
+  exit 1
+fi
 if ! command -v wasm-bindgen >/dev/null; then
   echo "error: wasm-bindgen not found — cargo install wasm-bindgen-cli --version 0.2.126" >&2
   exit 1

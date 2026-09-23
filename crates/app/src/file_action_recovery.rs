@@ -123,6 +123,9 @@ fn original_save(
     // Reuse the owner's data fingerprint. Building this value conveys no
     // scheduling authority and does not query the pending-effect queue.
     let observed = ClaimableEffect {
+        // The attempt admission a snapshot selects is scheduling state the
+        // fingerprint never covers; this rebuild observes, it does not claim.
+        attempt_admission_event_id: None,
         effect_id: effect.effect_id,
         kind: effect.kind,
         target: effect.target,

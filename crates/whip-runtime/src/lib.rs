@@ -149,12 +149,16 @@ pub fn chat_runtime_database(runtime_root: &Path, chat_id: &str) -> PathBuf {
 /// One instance, projected, with the program it belongs to.
 #[derive(Clone, Debug)]
 pub struct ProjectedInstance {
-    /// The program version's `program_name`: `"gate"` for the inbound gate,
-    /// the agent's name for a chat's package.
+    /// The program version's `program_name`: the workflow's declared name for
+    /// the inbound gate, the agent's name for a chat's package.
     pub program: String,
-    /// `whipplescript.instance_view.v0`, as `whip view --json` prints it.
+    /// `whipplescript.instance_view.v1`, as `whip view --json` prints it.
     pub view: serde_json::Value,
 }
+
+/// The coercion-config fingerprint of a kernel built by `RuntimeKernel::new`
+/// with nothing else configured, which is every kernel this crate builds.
+const KERNEL_COERCION_FINGERPRINT: &str = "fixture";
 
 /// Every instance in a runtime store, projected.
 ///
@@ -166,6 +170,11 @@ pub struct ProjectedInstance {
 /// or migrates a store; unavailable storage remains an error for the caller.
 pub fn instance_views(store_path: &Path) -> io::Result<Vec<ProjectedInstance>> {
     use whipplescript::instance_view;
+    // The projection explains each coercion under the fingerprint its
+    // admission keys were built with. Every kernel GaugeDesk constructs is
+    // `RuntimeKernel::new(store)` with no fingerprint configured, so the value
+    // to read back under is the constructor's own; the test below holds the
+    // two together.
     // `StoreError` is not a `std::error::Error`, so it is carried by its text.
     let store_io = |error: whipplescript_store::StoreError| io::Error::other(format!("{error:?}"));
     let store = whipplescript_store::SqliteStore::open_read_only(store_path).map_err(store_io)?;
@@ -176,7 +185,10 @@ pub fn instance_views(store_path: &Path) -> io::Result<Vec<ProjectedInstance>> {
             .map_err(store_io)?
             .map(|version| version.program_name)
             .unwrap_or_default();
-        if let Some(view) = instance_view::load(&store, &instance.instance_id).map_err(store_io)? {
+        if let Some(view) =
+            instance_view::load(&store, &instance.instance_id, KERNEL_COERCION_FINGERPRINT)
+                .map_err(store_io)?
+        {
             projected.push(ProjectedInstance { program, view });
         }
     }
@@ -198,6 +210,17 @@ pub fn program_structure(source: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod instance_view_tests {
     use super::*;
+
+    #[test]
+    fn the_projection_reads_under_the_fingerprint_the_kernels_are_built_with() {
+        let store = whipplescript_store::SqliteStore::open_in_memory().expect("store opens");
+        let kernel = whipplescript_kernel::RuntimeKernel::new(store);
+        assert_eq!(
+            kernel.coercion_config_fingerprint(),
+            KERNEL_COERCION_FINGERPRINT,
+            "a projection under another fingerprint would explain every coercion as stale"
+        );
+    }
 
     #[test]
     fn a_chat_s_runtime_database_is_named_by_its_id_in_one_place() {

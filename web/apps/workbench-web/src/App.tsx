@@ -3286,7 +3286,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     >{navPane()}</div>}
                     navFooter={navFooter}
                     chat={() => <>
-                        <div hidden={props.gaugeApps?.active()} style={{ height: "100%" }} data-work-chat-slot>
+                        <div hidden={props.gaugeApps?.active()} data-work-chat-slot>
                             {chatPane()}
                         </div>
                         <Show when={props.gaugeApps?.active()}>{props.gaugeApps?.chat({

@@ -30,8 +30,45 @@ cd "$(dirname "$0")/.."
 # shellcheck source=scripts/lane-helpers.sh
 . scripts/lane-helpers.sh
 
+# Whether this tree is the curated public projection rather than the trunk.
+#
+# `specs/` is fully private and is never published (see the ALLOW list in
+# scripts/publish-public-mirror.sh), so its absence is what distinguishes the
+# mirror from a checkout of this repository.
+projected() { [ ! -d specs ]; }
+
+# A section whose script this tree does not carry.
+#
+# On the trunk that is a broken checkout and fails, loudly, naming the file.
+# On the projection it is the publish filter deliberately not carrying it, and
+# until 2026-09-22 the whole bar died there: `scripts/check.sh` on the
+# published mirror failed three sections with "No such file or directory", so
+# anyone who cloned the public repository and ran the documented command got
+# errors about files that were never meant to be there.
+#
+# The honest answer is the split the shared guide draws for a prerequisite the
+# host cannot supply, applied to a file the tree was never given: say what was
+# not established, on stdout where the fleet's ledger reads it, and let every
+# other section run.
+carries() {
+    [ -e "$1" ] && return 0
+    if projected; then
+        echo "#unasserted: $2 not run: the public tree does not carry $1"
+        echo "-- $2 SKIPPED: $1 is not published to the mirror --" >&2
+        return 1
+    fi
+    echo "$2 requires $1, which this checkout does not have." >&2
+    exit 1
+}
+
 case "${1:-}" in
-  agent-guide)             node scripts/check-agent-guide.mjs ;;
+  agent-guide)             if carries scripts/check-agent-guide.mjs "the agent guide check"; then node scripts/check-agent-guide.mjs; fi ;;
+  carries-agent-guide|carries-agent-guide-checker)
+    # The cross-repository edge (GaugeWright DR-0124 stage 4). In a workspace
+    # the bar builds the `carries` target and never reaches here; reaching here
+    # means there is no `gaugewright` cell to compare against.
+    echo "#unasserted: $1 needs a materialized workspace; the digest check answered instead"
+    echo "-- $1 SKIPPED: no gaugewright cell outside a workspace --" >&2 ;;
   check-composition)       node --test scripts/check-lanes.test.mjs scripts/check-live-fabric.test.mjs ;;
   architecture-boundaries) python3 scripts/architecture-check.py ;;
   license-boundary)        python3 scripts/check-license-boundary.py ;;
@@ -49,7 +86,8 @@ case "${1:-}" in
   updater-endpoint)        node scripts/check-updater-endpoint.mjs ;;
   release-version-sources) python3 scripts/check-release-version-sources.py ;;
   app-icons)               node scripts/check-app-icons.mjs ;;
-  release-identity)        node --test scripts/build-release-identity.test.mjs ;;
+  release-identity)        node --test scripts/build-release-identity.test.mjs \
+                                      scripts/check-updater-signature.test.mjs ;;
   codex-login-helper)      node --test sidecar/codex-oauth-login.test.mjs ;;
   production-canary-contract)
     node scripts/check-production-canaries.mjs
@@ -108,6 +146,12 @@ case "${1:-}" in
         echo "   check that reads what it builds, on every pull request. To close the gap" >&2
         echo "   locally: python3 -m pip install -r docs/requirements.txt" >&2
     fi ;;
+  # A lockfile that no longer satisfies the manifests is a red the gate meets
+  # and the workstation does not, because every other cargo section resolves
+  # freely and writes the lock on its way past. `--locked` refuses instead, so
+  # the drift fails where `cargo metadata` alone repairs it, rather than after
+  # a round trip through the fleet.
+  lockfile)                cargo metadata --locked --format-version 1 >/dev/null ;;
   formatting)              cargo fmt --all --check ;;
   lints)                   cargo clippy --workspace --all-targets -- -D warnings ;;
   tests)
@@ -227,6 +271,7 @@ case "${1:-}" in
     # disk", not "not audited". `resolve_advisory_database` separates reaching
     # it from auditing against it, and its own tests run in the contracts
     # section.
+    carries scripts/advisory-database.sh "the cargo advisory audit" || exit 0
     # shellcheck source=scripts/advisory-database.sh
     source scripts/advisory-database.sh
     resolve_advisory_database
@@ -307,6 +352,7 @@ case "${1:-}" in
     echo "   the lockfile check above still ran, and the native-shells CI job compiles it on every" >&2
     echo "   pull request. To close the gap locally: sudo apt-get install -y $missing" >&2 ;;
   windows)
+    carries scripts/check-windows-compile.sh "the Windows compile" || exit 0
     scripts/check-windows-compile.sh ;;
   mobile)
     echo "-- lockfile is in sync with the manifest --"

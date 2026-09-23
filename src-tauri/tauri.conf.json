@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "GaugeDesk",
-  "version": "0.4.15",
+  "version": "0.4.16",
   "identifier": "com.gaugewright.gaugedesk",
   "build": {
     "frontendDist": "../ee/web/dist-enterprise-workbench",
@@ -78,7 +78,7 @@
       "endpoints": [
         "https://updates.gaugewright.com/update/{{target}}/{{arch}}/{{current_version}}"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYxNTg4RUI0OUEyMDE5QwpSV1NjQWFKSjY0Z1ZCdXdXMXN0VGRvSnp1SVR0RzhTbU5maUMxMEtPY3ZWbUp2ZllNOUdJZVY2Kwo="
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUxRTQ4RDVCOTE5MUE1NQpSV1JWR2htNTFVZ2VEbnV1eEtCMnlrVFdmeDBDbjdpWGFyQml6LzhDMHNLNDNpUUxrYWwxUy9neAo="
     },
     "deep-link": {
       "desktop": {

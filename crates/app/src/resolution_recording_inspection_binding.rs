@@ -111,6 +111,9 @@ pub(super) fn verified(
     let binding: ResolutionRecordingBinding =
         serde_json::from_value(payload["metadata"]["resolution_recording"].clone())?;
     let observed = ClaimableEffect {
+        // The attempt admission a snapshot selects is scheduling state the
+        // fingerprint never covers; this rebuild observes, it does not claim.
+        attempt_admission_event_id: None,
         effect_id: effect.effect_id,
         kind: effect.kind,
         target: effect.target,
