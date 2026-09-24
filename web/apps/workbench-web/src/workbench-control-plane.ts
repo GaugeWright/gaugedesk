@@ -535,6 +535,11 @@ export class WorkbenchControlPlane implements ControlPlane {
                             const url = `${relay.endpoint}/v1/relay/${relay.handle}`;
                             return { tunnel, socket: await browserTunnelSocket(url, handshake) };
                         },
+                        // The same credentials the direct route carries. Without
+                        // them a carried revocation is refused, and a Home that
+                        // gates its work routes admits a caller it then refuses.
+                        bearer: auth.bearer,
+                        homeAdmission: auth.homeAdmission,
                     });
                     // A re-admission after a rotation builds a new carrier for a
                     // Home that already has one. Hang the old one up here rather

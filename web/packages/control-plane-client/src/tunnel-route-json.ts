@@ -42,13 +42,20 @@ export interface TunnelSocket {
  *
  * A carried surface may demand one: TokenWright admits nothing without
  * `Authorization`, so a tunnel that sent no headers could reach a box, claim it,
- * and then never use it. */
-function headersFor(bearer: (() => string | null) | undefined,
+ * and then never use it. A Home demands two: its work routes and the revocation
+ * of an admission refuse a login bearer that arrives without the admission the
+ * Home minted (`HOME-1`). */
+function headersFor(credentials: TunnelCredentials,
                     method: string,
                     options?: RouteOptions): Record<string, string> | undefined {
     const headers: Record<string, string> = {};
-    const token = bearer?.();
+    const token = credentials.bearer?.();
     if (token) headers.authorization = `Bearer ${token}`;
+    // Read per call, like the bearer: the pool's getter answers null until
+    // `POST /home/admissions` has returned, and the admission itself is the one
+    // call that must go without it.
+    const admission = credentials.homeAdmission?.();
+    if (admission) headers["x-gaugewright-home-admission"] = admission;
     // Every mutating call carries a key, minted here when the caller brought
     // none — exactly as `browserRouteJson` does. A Home refuses a command
     // without one, and the first command any relay-only Home ever receives is
@@ -75,7 +82,13 @@ export interface TunnelRouteOptions {
      * key is used without rebuilding the route. Shaped like `browserRouteJson`'s
      * so the two transports are configured the same way. */
     readonly bearer?: () => string | null;
+    /** The Home's admission for this caller, read per call for the same reason.
+     * `HomePool` hands one to every transport it builds; a tunnel that dropped
+     * it could be admitted to a Home and then refused by it. */
+    readonly homeAdmission?: () => string | null;
 }
+
+type TunnelCredentials = Pick<TunnelRouteOptions, "bearer" | "homeAdmission">;
 
 class TunnelClosed extends Error {}
 
@@ -150,7 +163,7 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
             tunnel.sendRequest(
                 method, path,
                 body === undefined ? undefined : JSON.stringify(body),
-                headersFor(options.bearer, method, routeOptions),
+                headersFor(options, method, routeOptions),
             );
             const deadline = now() + timeoutMs;
             for (;;) {

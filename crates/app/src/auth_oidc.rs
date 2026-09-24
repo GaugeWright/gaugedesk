@@ -3368,6 +3368,89 @@ pub struct LoginQuery {
     provider: Option<String>,
 }
 
+/// Hand the one-time code back to the client that began the login (DR-0203).
+///
+/// A loopback web return (ADR 0140) is an ordinary origin, so it is redirected
+/// to and renders its own page. The `gaugewright://` scheme is not: handing a
+/// custom scheme to the browser never commits a document, and neither does the
+/// 303 in front of it, so the tab keeps displaying the last page that did —
+/// the identity provider's. The person is signed in and their browser still
+/// shows the consent screen, which reads as a hang and was reported as one.
+///
+/// So the scheme gets a real document: it says what happened, it opens the app
+/// itself, and it leaves a link for the browser that would not.
+fn native_return_response(native_return: &str, code: &str) -> axum::response::Response {
+    if !native_return.starts_with("gaugewright://") {
+        return Redirect::to(&format!("{native_return}#code={code}")).into_response();
+    }
+    // The code rides the fragment, as it did when this was a redirect: a
+    // fragment is not sent to a server, kept in a Referer, or logged by a
+    // proxy. What changes is only that a document exists to carry it.
+    let target = escape_html(&format!("{native_return}#code={code}"));
+    let body = format!(
+        "<!doctype html>\n\
+         <html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>Signed in</title>\
+         <style>\
+         :root{{color-scheme:light dark}}\
+         body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;\
+         font:16px/1.6 -apple-system,BlinkMacSystemFont,\"Segoe UI\",system-ui,sans-serif;\
+         text-align:center;padding:24px}}\
+         main{{max-width:34rem}}\
+         h1{{font-size:1.5rem;font-weight:600;margin:0 0 .5rem}}\
+         p{{margin:0 0 1rem;opacity:.8}}\
+         a{{color:inherit}}\
+         </style></head><body><main>\
+         <h1>You're signed in</h1>\
+         <p>GaugeDesk is finishing up. You can close this tab.</p>\
+         <p><a href=\"{target}\">Open GaugeDesk</a> if it did not come to the front.</p>\
+         </main>\
+         <script>location.replace({target_js})</script>\
+         </body></html>\n",
+        target = target,
+        target_js = js_string(&format!("{native_return}#code={code}")),
+    );
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // One-time code in the document: never stored by a cache, and
+            // never re-served by a back navigation.
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Minimal HTML-text/attribute escape. The values this carries come from our
+/// own base64url and a matched constant, so this is defence in depth rather
+/// than the only thing standing between a code and an injection.
+fn escape_html(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// The same value as a JavaScript string literal. `serde_json` escapes exactly
+/// what a JSON string must, and `/` is additionally escaped so the literal can
+/// never close the `<script>` element around it.
+fn js_string(raw: &str) -> String {
+    serde_json::Value::String(raw.to_string())
+        .to_string()
+        .replace('/', "\\/")
+}
+
 fn native_return_uri(
     raw: Option<&str>,
     challenge: Option<&str>,
@@ -4112,8 +4195,7 @@ pub async fn get_callback(
             },
             Instant::now(),
         );
-        let target = format!("{native_return}#code={code}");
-        return Redirect::to(&target).into_response();
+        return native_return_response(&native_return, &code);
     }
 
     // Hosted web account (ADR 0077 / ADR 0147 §1): deliver the session as the shared
@@ -5338,6 +5420,70 @@ iqlTEKVISscuchxZtKQJ4k8=
         ] {
             assert!(!loopback_web_return(refused), "should refuse {refused}");
         }
+    }
+
+    #[test]
+    fn the_scheme_return_gets_a_document_and_the_loopback_one_still_redirects() {
+        let native = native_return_response("gaugewright://auth/callback", "code-abc_123");
+        assert_eq!(native.status(), StatusCode::OK, "a page, not a redirect");
+        assert_eq!(
+            native.headers().get("cache-control").unwrap(),
+            "no-store",
+            "a one-time code must not be cached or re-served by a back navigation"
+        );
+        assert!(native
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+
+        // A loopback dev return is an ordinary origin and renders its own page,
+        // so ADR 0140's flow is untouched.
+        let web = native_return_response("http://localhost:5176/auth/native-return", "code-abc");
+        assert_eq!(web.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            web.headers().get("location").unwrap(),
+            "http://localhost:5176/auth/native-return#code=code-abc"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_return_page_carries_the_code_only_in_the_fragment() {
+        let response = native_return_response("gaugewright://auth/callback", "code-abc_123");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        // Both the automatic hand-off and the link a browser without script
+        // still needs.
+        assert!(body.contains("location.replace"));
+        assert!(body.contains("gaugewright://auth/callback#code=code-abc_123"));
+        // The fragment is the only place it appears: a query would reach a
+        // server, a Referer, and a proxy log.
+        assert!(!body.contains("?code="));
+        assert!(body.contains("You're signed in"));
+    }
+
+    #[test]
+    fn the_return_page_cannot_be_broken_out_of() {
+        // Neither value can carry these today — the return is a matched
+        // constant and the code is base64url — but the page must not depend on
+        // that remaining true.
+        let hostile = "abc\"</script><script>alert(1)</script>";
+        let response = native_return_response("gaugewright://auth/callback", hostile);
+        let body = futures::executor::block_on(async {
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        });
+        assert!(
+            !body.contains("<script>alert(1)</script>"),
+            "the injected element must not survive into the document: {body}"
+        );
+        assert!(!body.contains("</script><script>"));
     }
 
     #[test]

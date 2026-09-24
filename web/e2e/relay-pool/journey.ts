@@ -54,6 +54,8 @@ interface HarnessDescription {
 export interface JourneyResult {
     readonly homeId: string;
     readonly state: string;
+    /** A work call carried after admission, answered by the Home it reached. */
+    readonly worked: string;
     /** The Home reached by id alone, with no project named (DESK-8). */
     readonly byHome: string;
     /** How the pool refused a route naming the wrong Home. */
@@ -91,7 +93,7 @@ function poolFor(route: OpaqueHomeRoute): HomePool<{ json: RouteJson }> {
     // this a test of the seam rather than of a fixture built to pass.
     const tunnels = new Map<HomeId, TunnelRoute>();
     return new HomePool<{ json: RouteJson }>([route], () => "hermetic-bearer", {
-        routeJson: (_endpoint, _auth, resolved) => {
+        routeJson: (_endpoint, auth, resolved) => {
             const carried = tunnelRouteJson({
                 open: async () => {
                     const relay = resolved.relay!;
@@ -99,6 +101,8 @@ function poolFor(route: OpaqueHomeRoute): HomePool<{ json: RouteJson }> {
                     const url = `${relay.endpoint}/v1/relay/${relay.handle}`;
                     return { tunnel, socket: await browserTunnelSocket(url, handshake) };
                 },
+                bearer: auth.bearer,
+                homeAdmission: auth.homeAdmission,
             });
             tunnels.get(resolved.homeId)?.close();
             tunnels.set(resolved.homeId, carried);
@@ -128,6 +132,15 @@ export async function runJourney(): Promise<JourneyResult> {
     if (connection.state !== "live") {
         throw new Error(`the connection settled ${connection.state}`);
     }
+    // Admission is not the journey; the work after it is. The Home refuses a
+    // work call that brings the login bearer without the admission it minted
+    // (HOME-1), so this proves the tunnel carries both — which it once did not,
+    // while every step above passed.
+    const work = (await connection.api.json("GET", "/workspace")) as { home?: unknown };
+    if (work.home !== description.home_id) {
+        throw new Error(`a carried work call was answered as ${String(work.home)}`);
+    }
+    const worked = work.home;
 
     // Hang up before dialing again, and note what that costs to get wrong: the
     // Home stays spliced to a client that has gone, never re-parks, and the
@@ -160,7 +173,13 @@ export async function runJourney(): Promise<JourneyResult> {
     if (!/Home identity mismatch/.test(mismatch)) {
         throw new Error(`a Home answering as another id was accepted: ${mismatch || "no error"}`);
     }
-    return { homeId: connection.homeId, state: connection.state, byHome: byHome.homeId, mismatch };
+    return {
+        homeId: connection.homeId,
+        state: connection.state,
+        worked,
+        byHome: byHome.homeId,
+        mismatch,
+    };
 }
 
 declare global {

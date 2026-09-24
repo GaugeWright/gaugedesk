@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { setTunnelModuleLoader } from "@gaugewright/control-plane-client";
+import {
+    setDirectoryModuleLoader,
+    setTunnelModuleLoader,
+    type TunnelFacade,
+} from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane } from "./workbench-control-plane";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -772,6 +776,131 @@ describe("the tunnel payload is only fetched when it is needed (DESK-7)", () => 
         } finally {
             setTunnelModuleLoader(null);
         }
+    });
+});
+
+describe("work carried to a relay-only Home (DESK-7, HOME-1)", () => {
+    afterEach(() => {
+        setTunnelModuleLoader(null);
+        setDirectoryModuleLoader(null);
+    });
+
+    /** Stand in for the two wasm modules and the relay socket, so the app's own
+     * `routeJson` wiring builds the tunnel. The Home behind it answers the way
+     * `require_home_admission` does: a work call without the admission it
+     * minted is refused, whatever bearer comes with it. */
+    function relayOnlyHome() {
+        const carried: Array<{ call: string; headers: Record<string, string> | undefined }> = [];
+        class Tunnel implements TunnelFacade {
+            private reply: { status: number; body: string } | null = null;
+            receiveFrame(): void {}
+            takeOutgoing(): Uint8Array { return new Uint8Array(); }
+            isHandshaking(): boolean { return false; }
+            isPaired(): boolean { return true; }
+            pollStatus(): number | undefined { return this.reply?.status; }
+            takeBody(): string {
+                const body = this.reply?.body ?? "";
+                this.reply = null;
+                return body;
+            }
+            sendRequest(method: string, path: string, _body?: string,
+                        headers?: Record<string, string>): void {
+                const call = `${method} ${path}`;
+                carried.push({ call, headers });
+                const admitted = headers?.["x-gaugewright-home-admission"] === "minted"
+                    && headers?.authorization === "Bearer person-token";
+                if (call === "POST /home/admissions") {
+                    this.reply = { status: 201, body: '{"home":"home:r","admission":"minted"}' };
+                } else if (!admitted) {
+                    this.reply = { status: 401, body: '{"error":"present the Home admission"}' };
+                } else if (call === "GET /workspace") {
+                    this.reply = {
+                        status: 200,
+                        body: JSON.stringify({
+                            archetypes: [], projects: [], recent: [], workstreams: [],
+                            work_targets: [], personal_placement: null,
+                        }),
+                    };
+                } else {
+                    this.reply = { status: 204, body: "" };
+                }
+            }
+        }
+        setTunnelModuleLoader(async () => ({
+            BrowserTunnel: Object.assign(Tunnel, {
+                relayHandshake: () => new Uint8Array([1]),
+            }) as never,
+        }));
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        class Socket {
+            readonly OPEN = 1;
+            readyState = 1;
+            binaryType = "blob";
+            onopen: (() => void) | null = null;
+            onclose: (() => void) | null = null;
+            onmessage: ((event: MessageEvent) => void) | null = null;
+            onerror: (() => void) | null = null;
+            constructor() { setTimeout(() => this.onopen?.(), 0); }
+            send(): void {}
+            close(): void { this.readyState = 3; this.onclose?.(); }
+        }
+        vi.stubGlobal("WebSocket", Socket);
+        const held = new Map<string, string>();
+        vi.stubGlobal("localStorage", {
+            getItem: (key: string) => held.get(key) ?? null,
+            setItem: (key: string, value: string) => void held.set(key, value),
+        });
+        const locator = {
+            endpoint: "wss://relay.example",
+            handle: "A".repeat(43),
+            proof: "B".repeat(42) + "A",
+            route_epoch: 1,
+            home_fingerprint: "ab".repeat(32),
+        };
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            if (url === "https://hub.example/account/directory") {
+                return new Response(JSON.stringify({
+                    root_pubkey: "ed25519:root",
+                    origin: "https://dir.example",
+                    subject: "person-1",
+                }));
+            }
+            if (url === `https://dir.example/directory/${encodeURIComponent("ed25519:root")}`) {
+                return new Response(JSON.stringify({
+                    entry: { directory: {
+                        root_pubkey: "ed25519:root",
+                        home_routes: [{
+                            project: "proj-relay", home_id: "home:r", endpoint: "", relay: locator,
+                        }],
+                    } },
+                }));
+            }
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(JSON.stringify({ routes: [] }));
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        api.setBearer("person-token");
+        api.setCurrentProject("proj-relay" as never);
+        return { api, carried };
+    }
+
+    it("carries the bearer and the Home's admission on the work after admission", async () => {
+        // The direct route sent both and the tunnel sent neither, so a Home
+        // that gates its work routes admitted a caller over the relay and then
+        // refused every call it made.
+        const { api, carried } = relayOnlyHome();
+        await api.getWorkspace();
+        expect(carried.map((c) => c.call)).toEqual(["POST /home/admissions", "GET /workspace"]);
+        const [admission, work] = carried;
+        expect(admission?.headers?.["x-gaugewright-home-admission"]).toBeUndefined();
+        expect(admission?.headers?.authorization).toBe("Bearer person-token");
+        expect(work?.headers).toMatchObject({
+            authorization: "Bearer person-token",
+            "x-gaugewright-home-admission": "minted",
+        });
     });
 });
 

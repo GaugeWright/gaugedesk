@@ -105,6 +105,52 @@ describe("routeJson over the tunnel (DESK-7)", () => {
             .toEqual(["Bearer first", "Bearer second"]);
     });
 
+    it("carries the Home admission beside the bearer, as the direct transport does", async () => {
+        // A Home's work routes refuse a login bearer that arrives without the
+        // admission it minted (HOME-1), and so does revoking one. The tunnel
+        // sent only the bearer, so a caller admitted over it was then refused.
+        const tunnel = fakeTunnel([{ status: 200, body: "{}" }]);
+        const { socket } = fakeSocket();
+        const json = tunnelRouteJson({
+            open: async () => ({ tunnel, socket }),
+            tick: async () => undefined,
+            bearer: () => "login",
+            homeAdmission: () => "admitted",
+        });
+        await json("GET", "/workspace");
+        expect(tunnel.headers[0]).toEqual({
+            authorization: "Bearer login",
+            "x-gaugewright-home-admission": "admitted",
+        });
+    });
+
+    it("reads the admission per call: absent for the admission, present for the work after it", async () => {
+        // Exactly how `HomePool` wires it: one getter answering null until
+        // `POST /home/admissions` returns, then the admission for every later
+        // call over the same route — the revocation included.
+        const tunnel = fakeTunnel([
+            { status: 201, body: '{"home":"home:a","admission":"minted"}' },
+            { status: 200, body: "{}" },
+            { status: 200, body: "{}" },
+        ]);
+        const { socket } = fakeSocket();
+        let admission: string | null = null;
+        const json = tunnelRouteJson({
+            open: async () => ({ tunnel, socket }),
+            tick: async () => undefined,
+            bearer: () => "login",
+            homeAdmission: () => admission,
+        });
+        const admitted = (await json("POST", "/home/admissions")) as { admission: string };
+        admission = admitted.admission;
+        await json("GET", "/workspace");
+        await json("DELETE", "/home/admissions");
+        expect(tunnel.headers.map((h) => h?.["x-gaugewright-home-admission"]))
+            .toEqual([undefined, "minted", "minted"]);
+        expect(tunnel.headers.map((h) => h?.authorization))
+            .toEqual(["Bearer login", "Bearer login", "Bearer login"]);
+    });
+
     it("carries an idempotency key, which it previously dropped on the floor", async () => {
         // The route took no `RouteOptions` at all, so a command's key never
         // crossed the tunnel — and a replayed command would have done the work

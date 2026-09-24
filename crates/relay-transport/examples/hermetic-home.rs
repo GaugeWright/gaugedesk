@@ -7,7 +7,8 @@
 //!
 //!   * a blind WSS relay (`test_relay`),
 //!   * a Home leg parked on it under a freshly generated TLS identity,
-//!   * a stub behind that leg answering `POST /home/admissions`,
+//!   * a stub behind that leg answering `POST /home/admissions`, its revocation,
+//!     and one work route gated the way a Home gates its work routes,
 //!   * and a **config endpoint on a fixed port** describing all of it.
 //!
 //! The config endpoint is the part that is not obvious. `TestRelay::bind()`
@@ -29,6 +30,11 @@ const CONFIG_ADDR: &str = "127.0.0.1:7908";
 /// The Home this harness serves. The browser asserts the responding Home is
 /// exactly this, which is the identity check the journey exists to prove.
 const HOME_ID: &str = "home:hermetic";
+
+/// The admission the stub mints, and the bearer the journey's pool presents.
+/// Fixed, because the stub checks for them rather than authenticating anything.
+const ADMISSION: &str = "hermetic-admission";
+const BEARER: &str = "hermetic-bearer";
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -98,14 +104,43 @@ async fn serve_admissions(listener: TcpListener) {
                     + 4;
                 let request = String::from_utf8_lossy(&pending[..end]).to_string();
                 pending.drain(..end);
+                // What `require_home_admission` asks of a work call: the login
+                // bearer *and* the admission this Home minted. Revoking needs the
+                // admission too. Checked, because a stub that answered 200 to a
+                // bare request is how a tunnel that dropped both was green.
+                let carries = |name: &str, value: &str| {
+                    request.lines().any(|line| {
+                        line.split_once(':').is_some_and(|(header, given)| {
+                            header.trim().eq_ignore_ascii_case(name) && given.trim() == value
+                        })
+                    })
+                };
+                let admitted = carries("x-gaugewright-home-admission", ADMISSION);
+                let bearer = carries("authorization", &format!("Bearer {BEARER}"));
+                let refused = || {
+                    (
+                        "401 Unauthorized",
+                        r#"{"error":"present the Home admission"}"#.to_owned(),
+                    )
+                };
 
                 let (status, body) = if request.starts_with("POST /home/admissions") {
                     (
                         "201 Created",
-                        format!(r#"{{"home":"{HOME_ID}","admission":"hermetic-admission"}}"#),
+                        format!(r#"{{"home":"{HOME_ID}","admission":"{ADMISSION}"}}"#),
                     )
                 } else if request.starts_with("DELETE /home/admissions") {
-                    ("200 OK", "{}".to_owned())
+                    if admitted {
+                        ("200 OK", "{}".to_owned())
+                    } else {
+                        refused()
+                    }
+                } else if request.starts_with("GET /workspace ") {
+                    if admitted && bearer {
+                        ("200 OK", format!(r#"{{"home":"{HOME_ID}"}}"#))
+                    } else {
+                        refused()
+                    }
                 } else {
                     // Anything else is a mistake in the test, and saying so beats
                     // a silent 200 that makes a broken journey look complete.
