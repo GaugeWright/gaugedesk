@@ -225,18 +225,69 @@ fn unattended_authority_serves_only_its_own_launch() {
     );
 }
 
-async fn notice(
+async fn settles(
     notices: &mut tokio::sync::mpsc::Receiver<ProjectWorkflowNotice>,
     scope: &str,
-) -> ProjectWorkflowOutcome {
+    expected: ProjectWorkflowOutcome,
+) {
     loop {
         let notice = tokio::time::timeout(Duration::from_secs(30), notices.recv())
             .await
-            .expect("the supervisor answers")
+            .unwrap_or_else(|_| panic!("the supervisor reports {expected:?} for {scope}"))
             .expect("the supervisor is running");
-        if notice.scope == scope {
-            return notice.outcome;
+        if notice.scope != scope {
+            continue;
         }
+        if let ProjectWorkflowOutcome::NeedsAttention { detail } = &notice.outcome {
+            panic!("{scope} needs attention instead of reporting {expected:?}: {detail}");
+        }
+        if notice.outcome == expected {
+            return;
+        }
+    }
+}
+
+/// The one open task, once the supervisor has filed it.
+///
+/// Waits rather than reading once, because the supervisor is asynchronous and
+/// a notice is not a receipt for the caller's own action. It promises to drive
+/// a scope whenever something hints at it, not to emit one notice per action:
+/// its sweep interval fires its FIRST tick immediately, so a launch that lands
+/// before that tick is driven by both the startup sweep and its own hint and
+/// reports `Parked` twice. A caller taking one notice per action then runs a
+/// step ahead of the supervisor and reads the tracker before the next task is
+/// filed.
+///
+/// That is not hypothetical. On 2026-09-24 the public mirror's bar failed here
+/// on `open.len()` being 0 where 1 was expected, while the trunk's bar passed
+/// the identical commit — the only difference being that the mirror's lane
+/// runs the suite at full parallelism in a cold clone and the trunk's runs as
+/// a Buck2 action with a declared core count. Thirty-six runs of this test
+/// under six-way parallelism on a quiet machine did not reproduce it, which is
+/// the point: the assertion was about scheduling rather than about behaviour.
+async fn open_task(
+    shared: &crate::SharedWorkbench,
+    invocation: &ProjectWorkflowInvocation,
+) -> whipplescript_store::items::WorkItem {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        {
+            let wb = shared.lock_unpoisoned();
+            let mut open = open_items(&wb, invocation);
+            assert!(
+                open.len() <= 1,
+                "one task is open at a time, found {}",
+                open.len()
+            );
+            if let Some(task) = open.pop() {
+                return task;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the supervisor files the next task"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -266,10 +317,7 @@ async fn the_supervisor_drives_basics_from_launch_to_completion() {
             .unwrap()
     };
     let scope = invocation.product_scope.clone();
-    assert_eq!(
-        notice(&mut notices, &scope).await,
-        ProjectWorkflowOutcome::Parked
-    );
+    settles(&mut notices, &scope, ProjectWorkflowOutcome::Parked).await;
     for (index, title) in [
         "Create a chat in Personal",
         "Make your personal assistant",
@@ -279,11 +327,9 @@ async fn the_supervisor_drives_basics_from_launch_to_completion() {
     .into_iter()
     .enumerate()
     {
+        assert_eq!(open_task(&shared, &invocation).await.title, title);
         {
             let mut wb = shared.lock_unpoisoned();
-            let open = open_items(&wb, &invocation);
-            assert_eq!(open.len(), 1);
-            assert_eq!(open[0].title, title);
             close_open_task(&mut wb, &context, &invocation, &format!("close-{index}"));
         }
         let expected = if index == 3 {
@@ -291,11 +337,7 @@ async fn the_supervisor_drives_basics_from_launch_to_completion() {
         } else {
             ProjectWorkflowOutcome::Parked
         };
-        assert_eq!(
-            notice(&mut notices, &scope).await,
-            expected,
-            "after {title}"
-        );
+        settles(&mut notices, &scope, expected).await;
     }
     let result = shared
         .lock_unpoisoned()
@@ -334,11 +376,13 @@ async fn startup_rediscovers_a_launch_nobody_hinted() {
         shutdown,
         tx,
     ));
-    assert_eq!(
-        notice(&mut notices, &invocation.product_scope).await,
-        ProjectWorkflowOutcome::Parked
-    );
-    assert_eq!(open_items(&shared.lock_unpoisoned(), &invocation).len(), 1);
+    settles(
+        &mut notices,
+        &invocation.product_scope,
+        ProjectWorkflowOutcome::Parked,
+    )
+    .await;
+    open_task(&shared, &invocation).await;
     stop.send(true).unwrap();
     supervisor.await.unwrap().unwrap();
 }
@@ -387,11 +431,13 @@ async fn supervision_survives_the_workbench_being_replaced_in_place() {
         wb.launch_project_workflow(&context, &request, LIMITS)
             .unwrap()
     };
-    assert_eq!(
-        notice(&mut notices, &invocation.product_scope).await,
+    // The replaced workbench's launch is still driven.
+    settles(
+        &mut notices,
+        &invocation.product_scope,
         ProjectWorkflowOutcome::Parked,
-        "the replaced workbench's launch is still driven"
-    );
+    )
+    .await;
     assert!(
         !supervisor.is_finished(),
         "and the supervisor is still running"
