@@ -772,6 +772,41 @@ impl Instance {
         Ok(RevisionId(cut.cut_id))
     }
 
+    /// Make the mainline's top-level `*.{extension}` files exactly `files`:
+    /// write each one, remove any other file of that extension at the top
+    /// level, and return the head cut. For content a product maintains in its
+    /// own target (DR-0192), where a release may add, change or retire a file.
+    /// Files of other extensions, and anything below the top level, are left
+    /// alone, so this never reaches past the content it owns.
+    pub fn seed_main_exactly(&self, files: &[(&str, &str)], extension: &str) -> Result<RevisionId> {
+        let suffix = format!(".{extension}");
+        for (relative, _) in files {
+            if !relative.ends_with(&suffix) || relative.contains('/') {
+                return Err(WorkspaceError::msg(format!(
+                    "{relative} is not a top-level .{extension} file"
+                )));
+            }
+        }
+        let entries = match std::fs::read_dir(&self.repo) {
+            Ok(entries) => entries
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(WorkspaceError::io)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(WorkspaceError::io(error)),
+        };
+        for entry in entries {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.ends_with(&suffix)
+                && entry.file_type().map_err(WorkspaceError::io)?.is_file()
+                && !files.iter().any(|(relative, _)| *relative == name)
+            {
+                std::fs::remove_file(entry.path()).map_err(WorkspaceError::io)?;
+            }
+        }
+        self.seed_main(files)
+    }
+
     pub fn create_engagement(&self, id: &str) -> Result<Engagement> {
         self.create_engagement_on(id, MAINLINE_BRANCH_ID)
     }
@@ -3091,6 +3126,12 @@ pub trait Workspace: Send {
     /// Seed the mainline and return its head cut: the exact revision a
     /// target's basis names.
     fn seed_main(&self, files: &[(&str, &str)]) -> Result<RevisionId>;
+    /// Make the mainline's top-level files of `extension` exactly `files`.
+    fn seed_main_exactly(&self, _files: &[(&str, &str)], _extension: &str) -> Result<RevisionId> {
+        Err(WorkspaceError::msg(
+            "this workspace cannot reconcile maintained content",
+        ))
+    }
     fn export(&self) -> Result<WorkspaceExport>;
     fn export_protected_workflow(
         &self,
@@ -3442,6 +3483,9 @@ impl Workspace for Instance {
     fn seed_main(&self, files: &[(&str, &str)]) -> Result<RevisionId> {
         Self::seed_main(self, files)
     }
+    fn seed_main_exactly(&self, files: &[(&str, &str)], extension: &str) -> Result<RevisionId> {
+        Self::seed_main_exactly(self, files, extension)
+    }
     fn export(&self) -> Result<WorkspaceExport> {
         Self::export(self)
     }
@@ -3788,6 +3832,59 @@ mod tests {
         )
         .expect("init");
         (directory, instance)
+    }
+
+    /// DR-0192: a product-maintained target's head is exactly what the release
+    /// ships — added, changed and retired files alike — and nothing outside
+    /// that extension or below the top level is touched.
+    #[test]
+    fn seed_main_exactly_makes_the_maintained_files_the_shipped_set() {
+        let (_directory, workspace) = instance();
+        let first = workspace
+            .seed_main_exactly(&[("basics.whip", "v1"), ("later.whip", "x")], "whip")
+            .expect("first release");
+        workspace
+            .seed_main(&[("notes/keep.whip", "nested"), ("README.md", "keep")])
+            .expect("other files");
+        let second = workspace
+            .seed_main_exactly(&[("basics.whip", "v2")], "whip")
+            .expect("second release");
+        assert_ne!(first, second);
+        assert_eq!(
+            workspace.read_main_file("basics.whip").unwrap().as_deref(),
+            Some("v2")
+        );
+        assert_eq!(
+            workspace.read_main_file("later.whip").unwrap(),
+            None,
+            "retired"
+        );
+        assert_eq!(
+            workspace.read_main_file("README.md").unwrap().as_deref(),
+            Some("keep")
+        );
+        assert_eq!(
+            workspace
+                .read_main_file("notes/keep.whip")
+                .unwrap()
+                .as_deref(),
+            Some("nested")
+        );
+        let before = workspace.current_main_cut().unwrap();
+        workspace
+            .seed_main_exactly(&[("basics.whip", "v2")], "whip")
+            .expect("again");
+        assert_eq!(
+            workspace.current_main_cut().unwrap(),
+            before,
+            "an unchanged release mints nothing"
+        );
+        assert!(workspace
+            .seed_main_exactly(&[("nested/a.whip", "x")], "whip")
+            .is_err());
+        assert!(workspace
+            .seed_main_exactly(&[("a.txt", "x")], "whip")
+            .is_err());
     }
 
     #[test]

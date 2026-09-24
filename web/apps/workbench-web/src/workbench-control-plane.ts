@@ -900,12 +900,22 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.subscribeProjectTrackerChanges(await this.projectTrackerTransport(project), project, onChange);
     }
 
+    /** Any project's tracker changed on this Home — for the personal queue. */
+    subscribeAnyProjectTrackerChanges(onChange: (project: string) => void): () => void {
+        return workbenchClient.subscribeAnyProjectTrackerChanges(this.workbenchTransport(), onChange);
+    }
+
     async readProjectTrackerBacklog(project: ProjectId, queue: string) {
         return workbenchClient.readProjectTrackerBacklog(await this.projectTrackerTransport(project), project, queue);
     }
 
     async readProjectTrackerTasks(project: ProjectId, queue: string) {
         return workbenchClient.readProjectTrackerTasks(await this.projectTrackerTransport(project), project, queue);
+    }
+
+    /** Start, or find, this Home owner's run of a shipped tutorial (WHIP-5). */
+    startShippedTutorial(name: string) {
+        return workbenchClient.startShippedTutorial(this.workbenchTransport(), name);
     }
 
     async completeProjectTrackerIssue(project: ProjectId, queue: string, item: string, intent: workbenchClient.TrackerCompletionIntent) {

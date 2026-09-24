@@ -667,7 +667,7 @@ fn append_library_record<T: serde::Serialize>(
         .map_err(io)
 }
 
-fn managed_target_record(
+pub(crate) fn managed_target_record(
     id: String,
     name: String,
     owner: WorkTargetOwner,

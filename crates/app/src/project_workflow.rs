@@ -96,6 +96,26 @@ pub(crate) fn launch_scope_parts(scope: &str) -> Option<(String, String, String)
         .then(|| (project.into(), actor, request))
 }
 
+impl Workbench {
+    /// Whether `actor` has already launched `request` in `project`: the one
+    /// question a caller with a fixed request id needs before choosing between
+    /// launching and resuming. Grants nothing.
+    pub(crate) fn project_workflow_launched(
+        &self,
+        project: &str,
+        actor: &str,
+        request: &str,
+    ) -> Result<bool, String> {
+        let scope = request_scope(project, actor, request)?;
+        Ok(self
+            .store_ref()
+            .fold::<ProductActionAdmission>(&scope)
+            .map_err(debug_error)?
+            .command
+            .is_some())
+    }
+}
+
 /// The launcher a launch scope was keyed to, or `None` if `scope` is not one.
 pub(crate) fn launch_scope_actor(scope: &str) -> Option<String> {
     launch_scope_parts(scope).map(|(_, actor, _)| actor)

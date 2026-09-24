@@ -137,6 +137,15 @@ fn native_workflow_launch_command(method: &Method, path: &str) -> bool {
         ["", "projects", project, "workflows"] if !project.is_empty())
 }
 
+// Starting a shipped tutorial keys its launch by the tutorial itself, so every
+// ask answers with the one run (WHIP-5); it needs no caller key to be safe.
+fn shipped_tutorial_start_command(method: &Method, path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    method == Method::POST
+        && matches!(parts.as_slice(),
+        ["", "tutorials", name, "start"] if !name.is_empty())
+}
+
 // This exact typed command owns its receipted outbox and replay. Wrapping it in
 // the legacy HTTP claim would hide its admitted result behind a second status
 // and reject a safe replay before the command's current authority checks run.
@@ -207,6 +216,7 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
         // must not prevent delivery of that original result.
         || native_tracker_command_path(request.uri().path())
         || native_workflow_launch_command(&method, request.uri().path())
+        || shipped_tutorial_start_command(&method, request.uri().path())
         || native_file_save_command(&method, request.uri().path())
         || streamed_upload_path(&method, request.uri().path())
     {

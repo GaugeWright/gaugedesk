@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { completeProjectTrackerIssue, listProjectTrackers, parseProjectTrackerBacklog, readProjectTrackerBacklog, readProjectTrackerTasks, subscribeProjectTrackerChanges, type TrackerCompletionIntent } from "./project-tracker";
+import { completeProjectTrackerIssue, listProjectTrackers, subscribeAnyProjectTrackerChanges, parseProjectTrackerBacklog, readProjectTrackerBacklog, readProjectTrackerTasks, subscribeProjectTrackerChanges, type TrackerCompletionIntent } from "./project-tracker";
 import type { WorkbenchTransport } from "./control-plane-workbench";
 
 const tracker = { project_id: "personal", workspace_id: "workspace-personal", queue: "tutorials", resource_id: "native-tracker", can_complete: true };
@@ -34,6 +34,16 @@ describe("project tracker native client", () => {
         }
         await expect(readProjectTrackerTasks(response({ actor: "learner", tracker: { ...tracker, queue: "other" }, issues: [] }), "personal", "tutorials")).rejects.toThrow("requested tracker");
         await expect(readProjectTrackerTasks({ base: "", json: async () => { throw new Error("unavailable"); } }, "personal", "tutorials")).rejects.toThrow("unavailable");
+    });
+    it("hears a tracker change in any project, and nothing else", () => {
+        let accept: (data: string) => void = () => {};
+        const heard: string[] = [];
+        const transport: WorkbenchTransport = { base: "", json: async () => null, events: (_path, receive) => { accept = receive; return () => {}; } };
+        subscribeAnyProjectTrackerChanges(transport, project => heard.push(project));
+        for (const frame of ["malformed", JSON.stringify({ type: "workspacechanged", record: "chat", id: "personal" }), JSON.stringify({ type: "workspacechanged", record: "project_tracker" })]) accept(frame);
+        accept(JSON.stringify({ type: "workspacechanged", record: "project_tracker", id: "personal" }));
+        accept(JSON.stringify({ type: "workspacechanged", record: "project_tracker", id: "work" }));
+        expect(heard).toEqual(["personal", "work"]);
     });
     it("refreshes only for native tracker references in the requested project", () => {
         let accept: (data: string) => void = () => {};

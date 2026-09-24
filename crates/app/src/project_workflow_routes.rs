@@ -62,3 +62,27 @@ pub async fn launch(
         }
     }
 }
+
+/// `POST /tutorials/:name/start` — start, or find, the signed-in owner's run of
+/// a tutorial GaugeDesk ships (WHIP-5, DR-0192). The Home supplies the source,
+/// revision and learner; the request carries nothing but who is asking. Asked
+/// again, it answers with the run that exists.
+pub async fn start_shipped_tutorial(
+    State(wb): State<SharedWorkbench>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+) -> Response {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(context) = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+    else {
+        return problem(StatusCode::UNAUTHORIZED, "Sign in to start a tutorial");
+    };
+    match wb.start_shipped_tutorial(&context, &name) {
+        Ok(invocation) => Json(invocation).into_response(),
+        Err(error) => {
+            tracing::info!(tutorial = %name, %error, "tutorial start refused");
+            problem(StatusCode::CONFLICT, "The tutorial could not be started")
+        }
+    }
+}

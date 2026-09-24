@@ -55,6 +55,20 @@ export function subscribeProjectTrackerChanges(transport: WorkbenchTransport, pr
     stream.onmessage = event => accept(event.data);
     return () => stream.close();
 }
+/** Any project's tracker changed. For a surface that spans projects — the
+ *  personal queue — rather than one project's backlog. Carries no content. */
+export function subscribeAnyProjectTrackerChanges(transport: WorkbenchTransport, onChange: (project: string) => void): () => void {
+    const accept = (data: string) => {
+        try {
+            const event = JSON.parse(data);
+            if (event?.type === "workspacechanged" && event.record === "project_tracker" && typeof event.id === "string") onChange(event.id);
+        } catch { /* malformed event frames cannot change a view */ }
+    };
+    if (transport.events) return transport.events("/workspace/events", accept);
+    const stream = new EventSource(`${transport.base}/workspace/events`, { withCredentials: true });
+    stream.onmessage = event => accept(event.data);
+    return () => stream.close();
+}
 function record(value: unknown): Record<string, unknown> {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid tracker response");
     return value as Record<string, unknown>;

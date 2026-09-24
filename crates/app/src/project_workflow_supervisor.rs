@@ -121,6 +121,14 @@ fn drive(
             Ok(step) => step,
             Err(detail) => return Some(ProjectWorkflowOutcome::NeedsAttention { detail }),
         };
+        if step.executed_effect.is_some() || step.recovered_effect.is_some() {
+            // A reference wakes clients; the issue itself stays behind its own
+            // authenticated read, as it does after a human completion.
+            if let Some((project, _, _)) = launch_scope_parts(scope) {
+                wb.lock_unpoisoned()
+                    .notify_library_changed("project_tracker", &project, "upsert");
+            }
+        }
         if let Some(status) = finished(&step.snapshot.instance_status) {
             return Some(ProjectWorkflowOutcome::Finished(status));
         }

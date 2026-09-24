@@ -149,6 +149,7 @@ import {
     Shelf,
     FirstRunOverlay,
     TaskBar,
+    readAssignedTrackerTasks,
     thinkingLevelsFor,
     titleFromPrompt,
     type ChatRunTone,
@@ -674,6 +675,15 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         });
         onCleanup(stop);
     });
+    // Tracker changes are not workspace records, so they wake only what reads
+    // trackers: the personal queue in the bar (WHIP-4).
+    const [trackerTick, setTrackerTick] = createSignal(0);
+    createEffect(() => {
+        const home = homeState();
+        if (!home || home.kind === "none" || home.kind === "failure") return;
+        const stop = api.subscribeAnyProjectTrackerChanges(() => setTrackerTick((k) => k + 1));
+        onCleanup(stop);
+    });
 
     // Keep the transport's bearer in lock-step with the login session (ID-3), so a
     // sign-out (or sign-in without a full reload) takes effect on the next request.
@@ -884,6 +894,28 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         && hasAnyCredential() === false
         && !hasAccountSession()
         && !firstRunPostponed();
+    // The welcome hands off to Basics (`experience/onboarding.md`, WHIP-5):
+    // once the welcome has been on screen and the person has signed in and
+    // holds a Home session, Basics starts — or its existing run is found — and
+    // the bar is refreshed to show its first task. Only from the welcome: a
+    // person who dismissed it long ago is not handed a tutorial on upgrade.
+    let welcomeShown = false;
+    let basicsAsked = false;
+    createEffect(() => {
+        if (showFirstRun()) welcomeShown = true;
+        if (!welcomeShown || basicsAsked || bearer() === null) return;
+        basicsAsked = true;
+        void api.startShippedTutorial("basics").then(
+            () => {
+                bumpNav();
+                setStatus("Basics has started — your first task is in the task bar above");
+            },
+            () => {
+                // Not started (no owner yet, or offline): the next sign-in asks again.
+                basicsAsked = false;
+            },
+        );
+    });
     // The operator's curated "which models show" preference (managed in the Account panel,
     // persisted in the account-settings KV). `null` = never curated → default-visible subset.
     const [acctSettings, { refetch: refetchAcctSettings }] = createResource(() => selected() ?? "startup", () => api.accountSettings().catch((): Record<string, string> => ({})));
@@ -3325,12 +3357,25 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         <TaskBar
                             api={api}
                             selected={selected()}
-                            refreshKey={navRefresh()}
+                            refreshKey={[navRefresh(), trackerTick()]}
                             onSelect={(item) => {
                                 props.gaugeApps?.close();
                                 openChat(item);
                             }}
                             onReviewInbound={(project, id) => setReviewingProject(project, id)}
+                            assigned={bearer() !== null ? {
+                                // The personal queue across every project this Home
+                                // lists (WHIP-4). Only with an account session: the
+                                // assigned-task read derives its actor from it.
+                                read: async () => {
+                                    const workspace = await api.getWorkspace();
+                                    return readAssignedTrackerTasks(api, workspace.projects);
+                                },
+                                onOpen: (task) => {
+                                    props.gaugeApps?.close();
+                                    setProjectTasks({ id: task.project, name: task.projectName, queue: task.queue, subject: task.subjectId });
+                                },
+                            } : undefined}
                         />
                     )}
                     nav={() => <div

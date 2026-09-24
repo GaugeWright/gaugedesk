@@ -35,3 +35,13 @@ export async function launchProjectWorkflow(transport: WorkbenchTransport, proje
     if (result.project !== project) throw new Error("Launch differs from its requested project");
     return result;
 }
+
+/** Start, or find, the signed-in person's run of a tutorial GaugeDesk ships
+ *  (WHIP-5). The Home supplies source, revision and learner; asking again
+ *  answers with the run that exists, so no request key is needed. */
+export async function startShippedTutorial(transport: WorkbenchTransport, name: string): Promise<ProjectWorkflowLaunchResult> {
+    identity(name);
+    const raw = record(await transport.json("POST", `/tutorials/${encodeURIComponent(name)}/start`));
+    const admission = record(raw.admission);
+    return { project: identity(raw.project), workspace: identity(raw.workspace), instanceId: identity(admission.instance_ref) };
+}

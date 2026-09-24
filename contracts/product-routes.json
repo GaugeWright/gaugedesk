@@ -6908,6 +6908,42 @@
       }
     },
     {
+      "id": "home.tutorial.start",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/tutorials/:name/start",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "home-owner-personal-shipped-tutorial",
+      "capability": "start-shipped-tutorial",
+      "requestSchema": "http/empty",
+      "responseSchema": "rust:gaugedesk-app/project_workflow/ProjectWorkflowInvocation",
+      "sideEffect": "mutation",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-workflow.test.ts#starts a shipped tutorial by name alone, never naming a learner"
+        ],
+        "authority": [
+          "crates/app/src/shipped_tutorials_tests.rs#a_home_without_an_owner_cannot_start_a_tutorial"
+        ],
+        "journey": [
+          "crates/app/src/shipped_tutorials_tests.rs#the_start_route_starts_basics_once_for_the_signed_in_owner"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/shipped_tutorials_tests.rs#basics_starts_once_from_the_tutorials_folder"
+        ]
+      }
+    },
+    {
       "id": "home.navigation.tasks",
       "jurisdiction": "private-home",
       "transport": "http-json",

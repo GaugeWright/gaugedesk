@@ -226,6 +226,8 @@ export type { ShelfApi } from "./Shelf";
 export { StatusGem, gemState } from "./StatusGem";
 export type { GemKind, GemState } from "./StatusGem";
 export { TaskBar } from "./TaskBar";
+export { readAssignedTrackerTasks } from "./assigned-tracker-tasks";
+export type { AssignedTrackerTask, AssignedTrackerTasks, UnavailableTrackerRead } from "./assigned-tracker-tasks";
 export { TopBar } from "./TopBar";
 export type { TopBarProps } from "./TopBar";
 export { contextHeader, dotState, dotView, nextTaskBadge, topBarView } from "./top-bar";

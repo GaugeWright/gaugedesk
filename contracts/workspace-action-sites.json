@@ -481,6 +481,14 @@
     },
     {
       "declaration": {
+        "name": "seed_main_exactly",
+        "owner": "Workspace",
+        "signature": "fn seed_main_exactly (& self , _files : & [(& str , & str)] , _extension : & str) -> Result < RevisionId >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
         "name": "transfer_engagement_to_workstream",
         "owner": "Workspace",
         "signature": "fn transfer_engagement_to_workstream (& self , _engagement_id : & str , _workstream_id : & str ,) -> Result < WorkstreamTransferOutcome >"
@@ -4888,6 +4896,66 @@
         "capability": "active_engagements",
         "count": 1,
         "expression": "Self :: active_engagements (self)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_shipped_tutorials",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "target . current_main_cut ()",
+        "file": "crates/app/src/shipped_tutorials.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_shipped_tutorials",
+        "capability": "init_at",
+        "count": 1,
+        "expression": "self . workspace_provider (TUTORIALS_TARGET) . init_at (& self . targets_dir () . join (TUTORIALS_TARGET))",
+        "file": "crates/app/src/shipped_tutorials.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_shipped_tutorials",
+        "capability": "seed_main_exactly",
+        "count": 1,
+        "expression": "self . targets [TUTORIALS_TARGET] . seed_main_exactly (SHIPPED , \"whip\")",
+        "file": "crates/app/src/shipped_tutorials.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::seed_main_exactly",
+        "capability": "seed_main_exactly",
+        "count": 1,
+        "expression": "Self :: seed_main_exactly (self , files , extension)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::seed_main_exactly",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (entry . path ())",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Instance::seed_main_exactly",
+        "capability": "seed_main",
+        "count": 1,
+        "expression": "self . seed_main (files)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"

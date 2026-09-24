@@ -177,6 +177,15 @@ pub(crate) async fn supervise_home_reachability(
             Ok(_) => {}
             Err(error) => tracing::warn!("Home owner not claimed: {error}"),
         }
+        // The owner's Tutorials folder, brought to this release (DR-0192).
+        // After the first pass it is one comparison that writes nothing.
+        match wb.lock_unpoisoned().ensure_shipped_tutorials() {
+            Ok(crate::shipped_tutorials::ShippedTutorials::Updated(_)) => {
+                eprintln!("[tutorials] the Tutorials folder now holds this release's tutorials")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("shipped tutorials not reconciled: {error}"),
+        }
         // Read and release: this is a std mutex, and holding it across the wait
         // below would stop every request this Home serves.
         let publishes = wb.lock_unpoisoned().library_sync_active();

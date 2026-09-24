@@ -955,6 +955,9 @@ pub async fn post_signin_callback(
             if let Err(error) = crate::home_owner::claim_if_never_claimed(&wb) {
                 tracing::warn!("Home owner not claimed: {error}");
             }
+            if let Err(error) = wb.lock_unpoisoned().ensure_shipped_tutorials() {
+                tracing::warn!("shipped tutorials not reconciled: {error}");
+            }
             Json(status_json(Some(&record), true)).into_response()
         }
         Err(message) => {

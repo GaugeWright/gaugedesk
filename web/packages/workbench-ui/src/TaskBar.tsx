@@ -12,12 +12,18 @@
  * hold, and nothing replaced the shortcut — acting on work from the bar without
  * looking at it was never the part worth keeping.
  *
- * A thin renderer (`INV-5`): it shows a projection (`GET /tasks`); it owns no
- * truth.
+ * Beside those, the issues native trackers assign to the signed-in person
+ * (`experience/onboarding.md`, WHIP-4): each opens the ordinary task backlog in
+ * its own project. A tracker the bar could not read says so rather than
+ * reading as nothing to do.
+ *
+ * A thin renderer (`INV-5`): it shows projections (`GET /tasks`, and each
+ * tracker's assigned-task read); it owns no truth.
  */
 
 import { createResource, createSignal, For, Show } from "solid-js";
 import type { EngagementId, HumanTask, RosterPerson } from "@gaugewright/control-plane-client";
+import type { AssignedTrackerTask, AssignedTrackerTasks } from "./assigned-tracker-tasks";
 import { displayChatTitle } from "./chat-title";
 
 /** Per-ask presentation: the pill's verb chip and its hover explanation. */
@@ -68,6 +74,13 @@ export function TaskBar(props: {
      *  (ADR 0110 §7). Optional: an environment with no review surface still
      *  renders the count, and clicking it just opens the chat. */
     onReviewInbound?: (project: string, id: EngagementId) => void;
+    /** The signed-in person's tracker assignments, and where each opens.
+     *  Absent when there is no account session: a signed-out person has no
+     *  personal queue, which is different from one that could not be read. */
+    assigned?: {
+        read: () => Promise<AssignedTrackerTasks>;
+        onOpen: (task: AssignedTrackerTask) => void;
+    };
 }) {
     const [tasks, { refetch: refetchTasks }] = createResource(
         () => props.refreshKey,
@@ -78,15 +91,73 @@ export function TaskBar(props: {
         () => props.api.getRoster(),
     );
     const [assigning, setAssigning] = createSignal<string | null>(null);
+    const [assignedRead] = createResource(
+        () => (props.assigned ? [props.refreshKey, props.assigned] as const : false),
+        async ([, assigned]) => {
+            try {
+                return await assigned.read();
+            } catch {
+                return null;
+            }
+        },
+    );
+    const assignedTasks = () => assignedRead()?.tasks ?? [];
+    const unreadable = () => {
+        const read = assignedRead();
+        if (read === undefined || !props.assigned) return [];
+        if (read === null) return [{ projectName: "your projects", queue: null }];
+        return read.unavailable;
+    };
+    const empty = () =>
+        (tasks() ?? []).length === 0 && assignedTasks().length === 0 && unreadable().length === 0;
 
     return (
         <div class="taskbar" data-testid="taskbar">
             <span class="taskbar-label">tasks</span>
             <div class="task-tabs">
-                <For
-                    each={tasks() ?? []}
-                    fallback={<span class="status">no reviews pending</span>}
-                >
+                <Show when={empty()}>
+                    <span class="status">nothing waiting on you</span>
+                </Show>
+                <For each={assignedTasks()}>
+                    {(task) => {
+                        const open = () => props.assigned?.onOpen(task);
+                        return (
+                            <span
+                                class="task-tab task-tracker"
+                                data-task={task.itemId}
+                                data-task-kind="tracker"
+                                data-task-project={task.project}
+                                data-task-queue={task.queue}
+                                role="button"
+                                tabindex="0"
+                                aria-label={`open task ${task.title} in ${task.projectName}`}
+                                title={`Assigned to you in ${task.projectName} — open it to do it, then mark it complete`}
+                                onKeyDown={(e) => {
+                                    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+                                }}
+                                onClick={open}
+                            >
+                                <span class="task-kind">task</span>
+                                <span class="task-title">{task.title}</span>
+                                <span class="task-agent">{task.projectName}</span>
+                            </span>
+                        );
+                    }}
+                </For>
+                <Show when={unreadable().length > 0}>
+                    <span
+                        class="task-tab task-unavailable"
+                        data-task-kind="unavailable"
+                        role="note"
+                        title={`Could not read tasks in ${unreadable()
+                            .map((u) => (u.queue ? `${u.projectName} (${u.queue})` : u.projectName))
+                            .join(", ")}. Nothing here means they are empty.`}
+                    >
+                        <span class="task-kind">tasks</span>
+                        <span class="task-title">some tasks could not be read</span>
+                    </span>
+                </Show>
+                <For each={tasks() ?? []}>
                     {(t: HumanTask) => {
                         // Onboarding issue (ADR 0075): its id is a whip work-item
                         // id (`WS-N`), not an engagement, so it neither jumps to a

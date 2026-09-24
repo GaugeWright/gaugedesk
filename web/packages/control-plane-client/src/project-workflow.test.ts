@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { launchProjectWorkflow, type ProjectWorkflowLaunchIntent } from "./project-workflow";
+import { launchProjectWorkflow, startShippedTutorial, type ProjectWorkflowLaunchIntent } from "./project-workflow";
 import type { WorkbenchTransport } from "./control-plane-workbench";
 
 const intent: ProjectWorkflowLaunchIntent = { target: "target-personal", path: "tutorials/basics.whip", cut: "cut-1", inputs: { learner: { authority: "learner" } }, requestId: "basics-once" };
@@ -30,5 +30,12 @@ describe("project workflow launch client", () => {
         }
         await expect(launchProjectWorkflow(response({ ...launched, project: "other" }), "personal", intent)).rejects.toThrow("requested project");
         await expect(launchProjectWorkflow(response({ ...launched, admission: {} }), "personal", intent)).rejects.toThrow();
+    });
+    it("starts a shipped tutorial by name alone, never naming a learner", async () => {
+        const requests: unknown[] = [];
+        const transport: WorkbenchTransport = { base: "", json: async (...args) => { requests.push(args); return launched; } };
+        expect(await startShippedTutorial(transport, "basics")).toEqual({ project: "personal", workspace: "workspace-personal", instanceId: "workflow-root" });
+        expect(requests).toEqual([["POST", "/tutorials/basics/start"]]);
+        await expect(startShippedTutorial(transport, " ")).rejects.toThrow();
     });
 });
