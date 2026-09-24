@@ -637,6 +637,9 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     display: inline-flex; align-items: center; justify-content: center;
     background: var(--accent-strong); color: var(--accent-contrast);
     font-size: var(--fs-label); font-weight: 700; letter-spacing: 0.02em; }
+/* A photograph fills the same circle the initials do, so the row never shifts
+   between the two. The panel colour shows through only while it decodes. */
+.account-avatar-image { object-fit: cover; background: var(--panel); padding: 0; }
 /* Signed out is a state with its own mark, not an empty circle — absence should
    never be able to read as "still loading". */
 .account-avatar-anon { background: transparent; border: 1px dashed var(--edge); color: var(--muted); }

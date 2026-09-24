@@ -70,6 +70,10 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     "software_policy",
     "archetype_approval",
     // Account-scope personal-data records.
+    //
+    // `avatar` is a person's photograph (DR-0195). Sealing is by kind, so the
+    // avatar is erased with the account scope only because it is listed here.
+    "avatar",
     "setting",
     "device",
     "home",

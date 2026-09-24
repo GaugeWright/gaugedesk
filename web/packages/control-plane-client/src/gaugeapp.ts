@@ -196,6 +196,7 @@ export const gaugeAppRoutes = {
         deviceLinkRead: controlPlaneOperation("GET", "/gaugeapps/account-settings/device-links/:id"),
         deviceLinkComplete: controlPlaneOperation("POST", "/gaugeapps/account-settings/device-links/:id/complete"),
         consumerOidcLink: controlPlaneOperation("POST", "/auth/account/consumer-oidc/link/start"),
+        consumerOidcAvatar: controlPlaneOperation("POST", "/auth/account/consumer-oidc/avatar/start"),
         proposals: controlPlaneOperation("GET", "/gaugeapps/account-settings/proposals"),
         review: controlPlaneOperation("POST", "/gaugeapps/account-settings/proposals/:id/review"),
         agentRead: controlPlaneOperation("GET", "/gaugeapps/account-settings/agent/messages"),
@@ -380,13 +381,23 @@ export async function submitOrganizationSsoCredential(
     }>;
 }
 
-export async function startConsumerOidcLink(json: RouteJson): Promise<string> {
-    const route = gaugeAppRoutes["account-settings"].consumerOidcLink;
+async function providerAuthorizationUrl(json: RouteJson, route: { readonly method: string; readonly path: string }): Promise<string> {
     const value = await json(route.method, route.path) as { readonly authorization_url?: unknown };
     if (typeof value.authorization_url !== "string" || !/^https:\/\//.test(value.authorization_url)) {
         throw new Error("The account service did not return a valid provider authorization URL.");
     }
     return value.authorization_url;
+}
+
+export async function startConsumerOidcLink(json: RouteJson): Promise<string> {
+    return providerAuthorizationUrl(json, gaugeAppRoutes["account-settings"].consumerOidcLink);
+}
+
+/** Begin the person's explicit re-fetch of their photo from the provider
+ * already linked to their account (DR-0195 §3). The provider round trip is the
+ * point: the photo's URL changes when the photo does, so none is kept. */
+export async function startConsumerOidcAvatar(json: RouteJson): Promise<string> {
+    return providerAuthorizationUrl(json, gaugeAppRoutes["account-settings"].consumerOidcAvatar);
 }
 
 export async function claimAccountDeviceLink(

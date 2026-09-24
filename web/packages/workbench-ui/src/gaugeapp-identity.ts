@@ -28,5 +28,10 @@ export function gaugeAppMenuIdentity(
     const contacts = Array.isArray(model?.verified_contacts) ? model.verified_contacts : [];
     const email = contacts.map((contact) => text(record(contact)?.email)).find(Boolean);
     const name = text(profile.display_name) ?? email?.split("@")[0] ?? session.actor;
-    return { name, ...(email ? { email } : {}) };
+    // Already validated as a re-encoded image URI by the page parser; checked
+    // again here because this reads the model as a record, not as that type.
+    const avatar = typeof profile.avatar === "string" && /^data:image\/(?:png|jpeg);base64,/.test(profile.avatar)
+        ? profile.avatar
+        : undefined;
+    return { name, ...(email ? { email } : {}), ...(avatar ? { avatar } : {}) };
 }

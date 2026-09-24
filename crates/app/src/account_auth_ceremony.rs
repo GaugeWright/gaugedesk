@@ -235,6 +235,10 @@ pub struct ConsumerSignupContext {
     pub refresh_token: Option<crate::secret::Secret>,
     pub native_return: Option<String>,
     pub native_handoff_challenge: Option<String>,
+    /// The verified assertion's `picture` URL, held in memory for the length of
+    /// the ceremony and never stored: once the account exists it is fetched and
+    /// adopted as the account's first avatar, then dropped (DR-0195 §2).
+    pub picture: Option<String>,
 }
 
 /// What one finished account creation produced. The recovery codes are the one
@@ -1406,6 +1410,7 @@ async fn post_registration_finish(
         &body.label,
         unix_now(),
     );
+    adopt_signup_picture(&wb, &result);
     registration_response(result, &auth)
 }
 
@@ -1515,6 +1520,7 @@ async fn post_consumer_signup_registration_start(
         refresh_token: signup.refresh_token.clone(),
         native_return: signup.native_return.clone(),
         native_handoff_challenge: signup.native_handoff_challenge.clone(),
+        picture: signup.picture.clone(),
     };
     match runtime.start_registration_for_verified_email(
         &attested,
@@ -1630,6 +1636,7 @@ async fn post_consumer_signup_email_complete(
         refresh_token: signup.refresh_token.clone(),
         native_return: signup.native_return.clone(),
         native_handoff_challenge: signup.native_handoff_challenge.clone(),
+        picture: signup.picture.clone(),
     };
     // `create_account_from_verified_provider` runs `decide_verify_email`, which
     // refuses an address another account already holds — so the ADR 0146 §1
@@ -1639,6 +1646,7 @@ async fn post_consumer_signup_email_complete(
         let mut guard = wb.lock_unpoisoned();
         runtime.create_account_from_verified_provider(&mut guard, &email, context, unix_now())
     };
+    adopt_signup_picture(&wb, &outcome);
     registration_response(outcome, &auth)
 }
 
@@ -1708,12 +1716,34 @@ async fn post_consumer_signup_complete(
         refresh_token: signup.refresh_token.clone(),
         native_return: signup.native_return.clone(),
         native_handoff_challenge: signup.native_handoff_challenge.clone(),
+        picture: signup.picture.clone(),
     };
     let outcome = {
         let mut guard = wb.lock_unpoisoned();
         runtime.create_account_from_verified_provider(&mut guard, &attested, context, unix_now())
     };
+    adopt_signup_picture(&wb, &outcome);
     registration_response(outcome, &auth)
+}
+
+/// A provider signup's picture becomes the new account's first avatar. Only
+/// after the account exists — the ticket writes no account state — and
+/// detached, so the codes reach the browser without waiting on a photograph.
+fn adopt_signup_picture(wb: &SharedWorkbench, result: &Result<RegistrationOutcome, CeremonyError>) {
+    let Ok(outcome) = result else {
+        return;
+    };
+    if let Some(picture) = outcome
+        .consumer_signup
+        .as_ref()
+        .and_then(|signup| signup.picture.clone())
+    {
+        crate::account_avatar::spawn_provider_adoption(
+            wb.clone(),
+            outcome.account_id.clone(),
+            picture,
+        );
+    }
 }
 
 async fn post_authentication_start(
@@ -2568,6 +2598,7 @@ mod tests {
             refresh_token: None,
             native_return: None,
             native_handoff_challenge: None,
+            picture: None,
         }
     }
 
@@ -2650,6 +2681,7 @@ mod tests {
                     refresh_token: None,
                     native_return: Some("gaugewright://auth/callback".into()),
                     native_handoff_challenge: Some("challenge-1".into()),
+                    picture: None,
                 }),
             }),
             &auth,
@@ -2696,6 +2728,7 @@ mod tests {
                     provider_expires_at_ms: 0,
                     native_return: None,
                     native_handoff_challenge: None,
+                    picture: None,
                     browser_binding: crate::secret::Secret::new(BINDING),
                 },
                 std::time::Instant::now(),

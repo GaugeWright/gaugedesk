@@ -707,6 +707,7 @@ pub async fn enterprise_auth(
             "/auth/account/authorization/start"
                 | "/auth/account/authorization/finish"
                 | "/auth/account/consumer-oidc/link/start"
+                | "/auth/account/consumer-oidc/avatar/start"
         );
     if req
         .extensions()

@@ -32,14 +32,43 @@ function RecoveryEntryHarness() {
     </main>;
 }
 
-function AccountMenuHarness(props: { state: "signed-out" | "signed-in"; fail?: boolean }) {
+/** A fixture portrait drawn at load, standing in for a photograph the account
+ * authority has already re-encoded (DR-0195). */
+function fixturePortrait(): string {
+    const canvas = document.createElement("canvas");
+    canvas.width = 128;
+    canvas.height = 128;
+    const context = canvas.getContext("2d");
+    if (!context) return "";
+    const backdrop = context.createLinearGradient(0, 0, 0, 128);
+    backdrop.addColorStop(0, "rgb(143 179 217)");
+    backdrop.addColorStop(1, "rgb(223 232 241)");
+    context.fillStyle = backdrop;
+    context.fillRect(0, 0, 128, 128);
+    context.fillStyle = "rgb(61 74 92)";
+    context.beginPath();
+    context.ellipse(64, 134, 48, 42, 0, 0, Math.PI * 2);
+    context.fill();
+    context.fillStyle = "rgb(224 179 147)";
+    context.beginPath();
+    context.arc(64, 58, 24, 0, Math.PI * 2);
+    context.fill();
+    context.fillStyle = "rgb(74 50 34)";
+    context.beginPath();
+    context.arc(64, 52, 26, Math.PI, Math.PI * 2);
+    context.fill();
+    return canvas.toDataURL("image/jpeg", 0.9);
+}
+
+function AccountMenuHarness(props: { state: "signed-out" | "signed-in"; fail?: boolean; photo?: boolean }) {
     const [result, setResult] = createSignal("");
+    const avatar = props.photo ? fixturePortrait() : undefined;
     return <main style="max-width:320px;margin:64px auto;padding:20px">
         <OpenSettingsMenu
             api={{} as OpenSettingsMenuApi}
             composition="desktop"
             identity={() => props.state === "signed-in"
-                ? { name: "Ada Lovelace", email: "ada@example.test", edition: "Personal" }
+                ? { name: "Ada Lovelace", email: "ada@example.test", edition: "Personal", ...(avatar ? { avatar } : {}) }
                 : null}
             gaugeAppActions={() => []}
             onSignIn={async () => {
@@ -271,6 +300,7 @@ function Harness() {
         version: 1, interface_scale: "standard", contrast: "standard", motion: "system",
     });
     const [fixtureAppearanceSaved, setFixtureAppearanceSaved] = createSignal(false);
+    const [fixtureAvatar, setFixtureAvatar] = createSignal<string | null>(null);
     const accountLifecycleKey = query.get("run")?.trim() || "A";
     const [fixtureAccount, setFixtureAccount] = createSignal<FixtureAccountLifecycleState | null>(null);
     const [accountErased, setAccountErased] = createSignal(false);
@@ -373,7 +403,7 @@ function Harness() {
             "account.invitation.accept", "account.invitation.decline", "account.membership.leave",
         ],
     } : app === "account-settings" ? {
-        account: ["account.profile.set", "account.authenticator.begin-add", "account.authenticator.complete-add", "account.authenticator.remove", "account.recovery-codes.reissue", "account.membership.leave"],
+        account: ["account.profile.set", "account.avatar.set", "account.avatar.remove", "account.authenticator.begin-add", "account.authenticator.complete-add", "account.authenticator.remove", "account.recovery-codes.reissue", "account.membership.leave"],
         "provider-connections": ["provider-connection.api-key.add", "provider-connection.subscription.begin"],
     } : commercialLifecycle ? {
         products: ["commercial-product.create", "commercial-product.read", "commercial-product.revise"],
@@ -405,7 +435,7 @@ function Harness() {
             ];
             const authenticatorIds = lifecycle?.authenticator_ids ?? [`passkey-${idScope}`];
             return {
-            profile: { account_id: idScope, display_name: lifecycle?.display_name ?? `Person ${idScope}${serverRevision() ? ` · revision ${serverRevision()}` : ""}` },
+            profile: { account_id: idScope, display_name: lifecycle?.display_name ?? `Person ${idScope}${serverRevision() ? ` · revision ${serverRevision()}` : ""}`, avatar: fixtureAvatar() },
             consumer_oidc: { available: true, connection_id: "consumer-google", label: "Google" },
             verified_contacts: [],
             authenticators: [
@@ -867,6 +897,22 @@ function Harness() {
                 proposals.set(id, [proposal(id, request.command_id, request.payload)]);
                 return response(null, "proposed");
             }
+            // The fixture stores the browser's already-shrunk image as sent; the
+            // real authority decodes and re-encodes it (DR-0195).
+            if (request.command_id === "account.avatar.set") {
+                const image = (request.payload as { image?: unknown }).image;
+                if (typeof image !== "string" || !/^data:image\/(?:png|jpeg);base64,/.test(image)) {
+                    throw new Error("fixture rejected an avatar that is not an image data URI");
+                }
+                setFixtureAvatar(image);
+                setServerRevision((value) => value + 1);
+                return response(null);
+            }
+            if (request.command_id === "account.avatar.remove") {
+                setFixtureAvatar(null);
+                setServerRevision((value) => value + 1);
+                return response(null);
+            }
             if (request.command_id === "application-settings.appearance.set") {
                 const appearance = (request.payload as { value: AppearancePreferenceV1 }).value;
                 if (appearanceMode) {
@@ -1299,6 +1345,10 @@ function Harness() {
             setServerRevision((value) => value + 1);
             return fixtureDeviceStatus(false);
         },
+        startConsumerOidcAvatar: async () => {
+            requireActionAuthority();
+            return `https://accounts.example.invalid/avatar?state=server-held-${encodeURIComponent(accountLifecycleKey)}`;
+        },
         startConsumerOidcLink: async () => {
             requireActionAuthority();
             if (accountLifecycleMode) {
@@ -1438,6 +1488,7 @@ render(
         if (query.get("account-menu") === "signed-out") return <AccountMenuHarness state="signed-out" />;
         if (query.get("account-menu") === "signed-out-failure") return <AccountMenuHarness state="signed-out" fail />;
         if (query.get("account-menu") === "signed-in-failure") return <AccountMenuHarness state="signed-in" fail />;
+        if (query.get("account-menu") === "signed-in-photo") return <AccountMenuHarness state="signed-in" photo />;
         return <Harness />;
     },
     document.getElementById("root")!,

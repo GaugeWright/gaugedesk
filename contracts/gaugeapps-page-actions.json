@@ -19,6 +19,8 @@
           "unavailableState": "Signed-out shows Sign In; account-service failure shows Account Settings unavailable without blocking local work.",
           "actions": [
             { "id": "edit-profile", "operation": "account.profile.set", "lifecycle": "account-profile", "capability": "account.profile.write", "secretBoundary": "profile fields only" },
+            { "id": "set-avatar", "operation": "account.avatar.set", "lifecycle": "account-profile", "capability": "account.profile.write", "secretBoundary": "the image is re-encoded server-side; neither the uploaded bytes nor any provider URL is stored" },
+            { "id": "remove-avatar", "operation": "account.avatar.remove", "lifecycle": "account-profile", "capability": "account.profile.write", "secretBoundary": "profile fields only" },
             { "id": "add-authenticator", "operation": "account.authenticator.begin-add", "lifecycle": "authenticator-ceremony", "capability": "account.authenticator.manage", "secretBoundary": "provider exchange remains inside ceremony authority" },
             { "id": "verify-authenticator", "operation": "account.authenticator.complete-add", "lifecycle": "authenticator-ceremony", "capability": "account.authenticator.manage", "secretBoundary": "proof is consumed and never projected" },
             { "id": "remove-authenticator", "operation": "account.authenticator.remove", "lifecycle": "authenticator-ceremony", "capability": "account.authenticator.manage", "secretBoundary": "no provider token reads back" },

@@ -38,6 +38,11 @@ hex = "0.4"
 # not introduce OpenSSL into the desktop/mobile cross-builds.
 passkey-auth = "0.1.3"
 url = "2"
+# The account avatar (DR-0195): every provider picture and upload is decoded
+# under limits and re-encoded. Already in the graph through whipplescript-kernel
+# with these features, so this names what the avatar code uses without adding a
+# crate to the lockfile.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 # OIDC login shell (ADR 0122): id-token (JWT) verification for the consumer
 # login the core control plane serves. `ring` backend keeps the build
 # OpenSSL/cmake-free (matches `crypto_nossl`); `use_pem` gives RS256/ES256 PEM keys.

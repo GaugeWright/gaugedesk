@@ -47,6 +47,56 @@ pub struct AccountProfileRecord {
     pub display_name: String,
 }
 
+/// The latest-wins record kind and singleton id for the person's avatar
+/// (DR-0195). Its own kind rather than a field on [`AccountProfileRecord`], so
+/// that renaming never re-appends image bytes and replacing the image never
+/// re-appends the name — and so it can be sealed at rest by kind
+/// (`content_vault::DEFAULT_CONTENT_KINDS`) without also moving the profile.
+pub const ACCOUNT_AVATAR_KIND: &str = "avatar";
+pub const ACCOUNT_AVATAR_ID: &str = "avatar";
+
+/// Where the current avatar came from. `Removed` is a real state and not the
+/// absence of one: a person who removed their avatar has answered the question a
+/// provider sign-in would otherwise answer for them, so a removal is never
+/// silently undone by the next sign-in (DR-0195 §4).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AvatarSource {
+    Provider,
+    Upload,
+    Removed,
+}
+
+/// The person's avatar: re-encoded image bytes, never a provider URL (DR-0195
+/// §1). Presentation metadata only; it authenticates and identifies nobody.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AccountAvatarRecord {
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    pub source: AvatarSource,
+    /// `image/png` or `image/jpeg`; empty when removed.
+    #[serde(default)]
+    pub media_type: String,
+    /// Standard base64 of the re-encoded image; empty when removed.
+    #[serde(default)]
+    pub data: String,
+    pub set_at_ms: u64,
+}
+
+impl AccountAvatarRecord {
+    /// The image as a `data:` URI, which every surface's `img-src` already admits
+    /// (DR-0195 §5). `None` for a removed avatar or a record whose media type is
+    /// not one this module writes.
+    pub fn data_uri(&self) -> Option<String> {
+        if self.source == AvatarSource::Removed || self.data.is_empty() {
+            return None;
+        }
+        matches!(self.media_type.as_str(), "image/png" | "image/jpeg")
+            .then(|| format!("data:{};base64,{}", self.media_type, self.data))
+    }
+}
+
 /// A device's standing in the registry.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
@@ -434,6 +484,9 @@ impl From<HomeRouteRecord> for crate::home::OpaqueHomeRoute {
 #[derive(Default, Clone, Debug)]
 pub struct Account {
     pub profile: Option<AccountProfileRecord>,
+    /// Absent until a provider supplies one or the person uploads one; a removed
+    /// avatar is present with [`AvatarSource::Removed`].
+    pub avatar: Option<AccountAvatarRecord>,
     pub devices: BTreeMap<String, DeviceRecord>,
     /// Durable refresh grants, folded latest-wins by opaque session id (ADR
     /// 0147). Native grants additionally name their enrolled device; a
@@ -499,6 +552,12 @@ impl Account {
             fold(&mut profiles, record.id.clone(), record.op, record);
         }
         acct.profile = profiles.remove(ACCOUNT_PROFILE_ID);
+        let mut avatars = BTreeMap::new();
+        for row in store.records(scope, ACCOUNT_AVATAR_KIND)? {
+            let record: AccountAvatarRecord = serde_json::from_str(&row)?;
+            fold(&mut avatars, record.id.clone(), record.op, record);
+        }
+        acct.avatar = avatars.remove(ACCOUNT_AVATAR_ID);
         for row in store.records(scope, "device")? {
             let r: DeviceRecord = serde_json::from_str(&row)?;
             fold(&mut acct.devices, r.id.clone(), r.op, r);

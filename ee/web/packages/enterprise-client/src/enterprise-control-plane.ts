@@ -24,6 +24,7 @@ import {
     subscribeGaugeAppAgentEvents,
     stopGaugeAppAgentTurn,
     startConsumerOidcLink,
+    startConsumerOidcAvatar,
     submitGaugeAppCommand,
     submitAccountProviderSecret,
     submitOrganizationSsoCredential,
@@ -175,6 +176,9 @@ export class EnterpriseControlPlane implements EnterpriseAdminApi {
     }
     startConsumerOidcLink() {
         return startConsumerOidcLink(this.json);
+    }
+    startConsumerOidcAvatar() {
+        return startConsumerOidcAvatar(this.json);
     }
     submitOrganizationProviderSecret(candidate: OrganizationProviderCandidate, secret: string, signal: AbortSignal) {
         return submitOrganizationProviderSecret(this.json, candidate, secret, { signal });

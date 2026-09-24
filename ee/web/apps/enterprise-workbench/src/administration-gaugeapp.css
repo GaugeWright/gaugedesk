@@ -921,3 +921,14 @@
 .gaugeapp-resource[data-tone="warn"] .gaugeapp-resource-kind { color: var(--warn); }
 .gaugeapp-resource small { color: var(--muted); font-size: var(--fs-small); }
 .gaugeapp-resource-actions { display: flex; flex: 0 0 auto; gap: 6px; }
+
+/* --- account photo (DR-0195) ---------------------------------------------- */
+/* The same circle holds a photograph or initials, so choosing, replacing or
+   removing a photo never moves the controls beside it. */
+.gaugeapp-avatar-row { display: flex; align-items: center; gap: 12px; padding: 4px 8px; }
+.gaugeapp-avatar-row .gaugeapp-actions { flex-wrap: wrap; }
+.gaugeapp-avatar { flex: 0 0 auto; width: 48px; height: 48px; border-radius: 999px;
+    object-fit: cover; background: var(--panel); border: 1px solid var(--edge); }
+.gaugeapp-avatar-initials { display: inline-flex; align-items: center; justify-content: center;
+    background: var(--accent-strong); color: var(--accent-contrast); border-color: transparent;
+    font-size: var(--fs-ui); font-weight: 700; letter-spacing: 0.02em; }

@@ -35,8 +35,17 @@ const accountMembership = (value: unknown, path: string) => {
     }
     return membership;
 };
+// The avatar is a `data:` URI the account authority re-encoded (DR-0195). An
+// authority that predates avatars omits the field, which reads as "none" rather
+// than as an incompatible response; anything present must be an image URI the
+// page can put in an `img` without further checks.
+const AVATAR_URI = /^data:image\/(?:png|jpeg);base64,[A-Za-z0-9+/]+={0,2}$/;
+const avatarUri: ModelReader<string | null> = (value, path) => {
+    if (value === undefined || value === null) return null;
+    return typeof value === "string" && AVATAR_URI.test(value) ? value : invalidModel(path);
+};
 export const parseAccountSettingsModel = shape({
-    profile: shape({ account_id: stringValue, display_name: nullable(stringValue) }),
+    profile: shape({ account_id: stringValue, display_name: nullable(stringValue), avatar: avatarUri }),
     consumer_oidc: shape({
         available: booleanValue,
         connection_id: nullable(stringValue),

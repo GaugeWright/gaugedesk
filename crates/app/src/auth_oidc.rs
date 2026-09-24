@@ -142,6 +142,22 @@ pub struct PendingConsumerOidcLink {
     pub connection_revision: String,
 }
 
+/// Server-held context for the person's explicit re-fetch of their avatar from
+/// the consumer provider already linked to their account (DR-0195 §3).
+///
+/// It is a provider round trip rather than a stored URL because the URL is the
+/// photograph: a provider mints a new one when the person changes theirs, so a
+/// kept URL would re-fetch the old picture. The callback replaces the avatar
+/// only when the returning subject is the one actively linked to this account;
+/// it links nothing, mints no session, and stores no token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingConsumerOidcAvatar {
+    pub account_id: String,
+    pub session_id: String,
+    pub connection_id: String,
+    pub connection_revision: String,
+}
+
 /// All server-held inputs the enterprise composition needs to begin an
 /// ordinary SAML login. The returned URL carries only a random RelayState;
 /// tenant, connection revision, native handoff, and trust material stay here.
@@ -167,6 +183,7 @@ pub enum PendingAuthPurpose {
     #[default]
     Login,
     ConsumerOidcLink(PendingConsumerOidcLink),
+    ConsumerOidcAvatar(PendingConsumerOidcAvatar),
     EnterpriseConnectionTest(PendingEnterpriseConnectionTest),
 }
 
@@ -348,6 +365,9 @@ pub struct PendingConsumerSignup {
     /// a desktop login ends, over `gaugewright://`.
     pub native_return: Option<String>,
     pub native_handoff_challenge: Option<String>,
+    /// The verified `picture` URL, adopted as the first avatar once the account
+    /// exists (DR-0195 §2). Held in memory with the ticket; never stored.
+    pub picture: Option<String>,
     /// Which browser completed the provider round trip that minted this ticket.
     ///
     /// Without it the ticket is a pure bearer in a URL fragment: an attacker
@@ -473,6 +493,10 @@ pub fn auth_routes(state: AuthShellState) -> axum::Router<SharedWorkbench> {
         .route(
             "/auth/account/consumer-oidc/link/start",
             post(post_consumer_oidc_link_start),
+        )
+        .route(
+            "/auth/account/consumer-oidc/avatar/start",
+            post(post_consumer_oidc_avatar_start),
         )
         // Safe current-session projection for the Account menu. This is not a
         // linked-method or recovery/custody declaration.
@@ -1099,6 +1123,12 @@ fn id_token_display_name(id_token: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// The provider's `picture` claim, if it is an `https` URL. Offered to the
+/// account as its first avatar and never stored as a URL (DR-0195).
+fn id_token_picture(id_token: &str) -> Option<String> {
+    crate::account_avatar::picture_claim(&id_token_claims(id_token)?)
 }
 
 /// Email admitted from an already-verified OIDC token. Organization admission
@@ -2475,6 +2505,117 @@ fn independent_account_method(method: &str) -> bool {
     matches!(method, "passkey" | "recovery")
 }
 
+/// A live account session for this account, by any method. The avatar
+/// re-fetch needs no independent proof: it links nothing, and a person signed
+/// in with Google may ask Google for their own photograph.
+fn durable_account_session(
+    state: &crate::account_auth::AccountAuth,
+    session_id: &str,
+    account_id: &str,
+    now_ms: u64,
+) -> bool {
+    state.roots.contains_key(account_id)
+        && state.sessions.get(session_id).is_some_and(|session| {
+            session.account_id == account_id
+                && session
+                    .issued_at_ms
+                    .checked_add(session.lifetime_secs.saturating_mul(1000))
+                    .is_some_and(|expires_at| expires_at > now_ms)
+        })
+}
+
+/// What a callback holds about the assertion that returned: the issuer and
+/// audiences pinned on the authorize leg, and the verified token's own issuer
+/// and subject.
+#[derive(Clone, Copy)]
+struct ReturnedConsumerIdentity<'a> {
+    pinned_issuer: &'a str,
+    pinned_audiences: &'a [String],
+    token_issuer: Option<&'a str>,
+    subject: &'a str,
+}
+
+/// Whether a returning provider identity may replace the avatar of the account
+/// that asked (DR-0195 §3). Everything is server-held except the verified
+/// subject: the connection must be the one the ceremony started against, the
+/// initiating session must still be live, and the subject must be the one
+/// already linked to that account — a person signed into a second Google
+/// account in the same browser does not get that account's photo.
+fn admit_consumer_avatar_refresh(
+    account_auth: &crate::account_auth::AccountAuth,
+    context: &PendingConsumerOidcAvatar,
+    connection: &SsoConnectionRecord,
+    returned: &ReturnedConsumerIdentity<'_>,
+    now_ms: u64,
+) -> Result<(), (StatusCode, &'static str)> {
+    let ReturnedConsumerIdentity {
+        pinned_issuer,
+        pinned_audiences,
+        token_issuer,
+        subject,
+    } = *returned;
+    if connection.id != context.connection_id
+        || connection.current_revision() != context.connection_revision
+        || !connection_still_accepts(connection, pinned_issuer, pinned_audiences)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Google sign-in changed while you were updating your photo; return to GaugeDesk and start again",
+        ));
+    }
+    if !durable_account_session(
+        account_auth,
+        &context.session_id,
+        &context.account_id,
+        now_ms,
+    ) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "the account session that asked for this photo is no longer current",
+        ));
+    }
+    // A link records the issuer its token carried (DR-0189), so the subject is
+    // matched against this token's issuer, not the connection's template.
+    let Some(token_issuer) = token_issuer else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "the sign-in result could not be read",
+        ));
+    };
+    if !consumer_subject_linked_to(
+        account_auth,
+        &context.account_id,
+        &connection.id,
+        token_issuer,
+        subject,
+    ) {
+        return Err((
+            StatusCode::CONFLICT,
+            "that Google account is not the one linked to this GaugeDesk account",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `subject` at `issuer` is the consumer identity actively linked to
+/// `account_id` through `connection_id`.
+fn consumer_subject_linked_to(
+    state: &crate::account_auth::AccountAuth,
+    account_id: &str,
+    connection_id: &str,
+    issuer: &str,
+    subject: &str,
+) -> bool {
+    state.external_subjects.values().any(|link| {
+        link.account_id == account_id
+            && link.connection_id == connection_id
+            && link.issuer == issuer
+            && link.subject == subject
+            && link.kind == crate::account_auth::ExternalSubjectKind::ConsumerOidc
+            && link.status == crate::account_auth::AuthMethodStatus::Active
+    })
+}
+
 fn durable_independent_session(
     state: &crate::account_auth::AccountAuth,
     session_id: &str,
@@ -2710,6 +2851,7 @@ fn begin_consumer_signup(
         issuer: verified_issuer.to_owned(),
         subject: subject.to_owned(),
         display_name: id_token_display_name(&verified.id_token),
+        picture: id_token_picture(&verified.id_token),
         refresh_token: verified
             .refresh_token
             .as_deref()
@@ -2925,6 +3067,117 @@ pub async fn post_consumer_oidc_link_start(
             .into_response(),
         Err(response) => response,
     }
+}
+
+/// Begin the person's explicit re-fetch of their avatar from the linked
+/// consumer provider (DR-0195 §3). Any live account session may ask; the
+/// callback accepts the result only from the subject already linked here.
+pub async fn post_consumer_oidc_avatar_start(
+    State(wb): State<SharedWorkbench>,
+    Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if crate::net_http::bearer(&headers).is_none()
+        && crate::account_signin::hub_session_actor(&wb).is_some()
+    {
+        return crate::account_signin::proxy_account_authority(
+            &wb,
+            axum::http::Method::POST,
+            "/auth/account/consumer-oidc/avatar/start".to_owned(),
+            headers,
+            axum::body::Bytes::new(),
+        )
+        .await;
+    }
+    let Some(token) = crate::net_http::bearer(&headers).map(str::to_owned) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "sign in before updating your photo",
+        )
+            .into_response();
+    };
+    // Google's connection by name. Of the consumer entrances, Google is the one
+    // whose id-token carries a `picture`; a Microsoft token carries none
+    // (DR-0189), so a Microsoft round trip could only ever answer "no photo".
+    let Some((provider, connection)) =
+        configured_consumer_connection(CONSUMER_GOOGLE_CONNECTION_ID)
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Google sign-in is not configured",
+        )
+            .into_response();
+    };
+    let session_id = crate::account_session::session_id(&token);
+    let account_id = {
+        let guard = wb.lock_unpoisoned();
+        let Some((account_id, _method)) = guard.resolve_account_session(&token) else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "the account session is not active",
+            )
+                .into_response();
+        };
+        let Ok(account_auth) = crate::account_auth::AccountAuth::rebuild(guard.store_ref()) else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "account authentication state is unavailable",
+            )
+                .into_response();
+        };
+        let linked = account_auth.external_subjects.values().any(|link| {
+            link.account_id == account_id
+                && link.connection_id == connection.id
+                && link.kind == crate::account_auth::ExternalSubjectKind::ConsumerOidc
+                && link.status == crate::account_auth::AuthMethodStatus::Active
+        });
+        if !linked {
+            return (
+                StatusCode::CONFLICT,
+                "link Google to this account before using its photo",
+            )
+                .into_response();
+        }
+        account_id
+    };
+    let purpose = PendingAuthPurpose::ConsumerOidcAvatar(PendingConsumerOidcAvatar {
+        account_id,
+        session_id,
+        connection_id: connection.id.clone(),
+        connection_revision: connection.current_revision(),
+    });
+    match prepare_oidc_browser_login(
+        auth,
+        &headers,
+        connection,
+        OidcBrowserOptions {
+            authority: OidcConnectionAuthority::Consumer(provider),
+            native_return: None,
+            native_handoff_challenge: None,
+            purpose,
+        },
+    )
+    .await
+    {
+        Ok(authorization_url) => (
+            StatusCode::OK,
+            Json(json!({ "authorization_url": authorization_url })),
+        )
+            .into_response(),
+        Err(response) => response,
+    }
+}
+
+/// The small page the browser lands on after a link or photo ceremony.
+fn ceremony_result_page(title: &str, message: &str) -> axum::response::Response {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><main><h1>{title}</h1><p>{message}</p></main></body></html>"
+        ),
+    )
+        .into_response()
 }
 
 /// Submitted by the signed-out account entry point. POST keeps the work email
@@ -3360,12 +3613,108 @@ pub async fn get_callback(
             true
         };
         debug_assert!(linked);
+        if let Some(picture) = id_token_picture(&verified.id_token) {
+            crate::account_avatar::spawn_provider_adoption(
+                wb.clone(),
+                context.account_id.clone(),
+                picture,
+            );
+        }
         return (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
             "<!doctype html><html><head><meta charset=\"utf-8\"><title>Google linked</title></head><body><main><h1>Google linked</h1><p>You can close this window and return to GaugeDesk.</p></main></body></html>",
         )
             .into_response();
+    }
+
+    // The person asked for their provider photo. This is an account mutation
+    // on an existing link, never a login: it runs only for the subject already
+    // linked to the account that started it, and it replaces the avatar
+    // because that is what the person asked for (DR-0195 §3).
+    if let PendingAuthPurpose::ConsumerOidcAvatar(context) = &purpose {
+        let Some((_, connection)) = configured_consumer_connection(&context.connection_id) else {
+            return (
+                StatusCode::CONFLICT,
+                "Google sign-in is no longer configured",
+            )
+                .into_response();
+        };
+        {
+            let guard = wb.lock_unpoisoned();
+            let Ok(account_auth) = crate::account_auth::AccountAuth::rebuild(guard.store_ref())
+            else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "account authentication state is unavailable",
+                )
+                    .into_response();
+            };
+            let token_issuer = id_token_issuer(&verified.id_token);
+            if let Err(refusal) = admit_consumer_avatar_refresh(
+                &account_auth,
+                context,
+                &connection,
+                &ReturnedConsumerIdentity {
+                    pinned_issuer: &pending_issuer,
+                    pinned_audiences: &pending_audiences,
+                    token_issuer: token_issuer.as_deref(),
+                    subject: verified.authority.as_str(),
+                },
+                crate::account::session_now_ms(),
+            ) {
+                return refusal.into_response();
+            }
+        }
+        let Some(picture) = id_token_picture(&verified.id_token) else {
+            return ceremony_result_page(
+                "No photo from Google",
+                "Google did not send a photo for this account. Your GaugeDesk photo is unchanged.",
+            );
+        };
+        let fetched = tokio::task::spawn_blocking(move || {
+            crate::account_avatar::fetch_provider_picture(&picture)
+                .and_then(|bytes| crate::account_avatar::normalize(&bytes).ok())
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(avatar) = fetched else {
+            return ceremony_result_page(
+                "Photo not updated",
+                "Google's photo could not be fetched. Your GaugeDesk photo is unchanged.",
+            );
+        };
+        let written = {
+            let mut guard = wb.lock_unpoisoned();
+            crate::account_avatar::replace_avatar(
+                &mut guard,
+                &context.account_id,
+                Some(&avatar),
+                crate::account::AvatarSource::Provider,
+                crate::account::session_now_ms(),
+            )
+            .map(|()| {
+                crate::audit::record_in(
+                    &mut guard,
+                    &crate::account::account_scope(&context.account_id),
+                    &context.account_id,
+                    "account.avatar.provider",
+                    &connection.id,
+                );
+            })
+        };
+        return match written {
+            Ok(()) => ceremony_result_page(
+                "Photo updated",
+                "Your Google photo is now your GaugeDesk photo. You can close this window and return to GaugeDesk.",
+            ),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the photo could not be saved",
+            )
+                .into_response(),
+        };
     }
 
     // A connection test proves the real browser callback and mapped subject,
@@ -3421,6 +3770,13 @@ pub async fn get_callback(
         };
         match folded {
             Ok(resolution) => {
+                if let Some(picture) = id_token_picture(&verified.id_token) {
+                    crate::account_avatar::spawn_provider_adoption(
+                        wb.clone(),
+                        resolution.account_id.clone(),
+                        picture,
+                    );
+                }
                 let now_ms = crate::account::session_now_ms();
                 let display_label = id_token_display_label(&verified.id_token)
                     .unwrap_or_else(|| resolution.account_id.clone());
@@ -3560,6 +3916,11 @@ pub async fn get_callback(
     } = verified;
     let account_id = resolution.account_id;
     let session_method = resolution.session_method;
+    // A sign-in supplies the account's first avatar and never the next one:
+    // adoption writes only where the account has no avatar record at all.
+    if let Some(picture) = id_token_picture(&id_token) {
+        crate::account_avatar::spawn_provider_adoption(wb.clone(), account_id.clone(), picture);
+    }
 
     // Browser and programmatic corporate callbacks mint here. A native handoff
     // delays the same opaque-session mint until its PKCE-bound code is redeemed,
@@ -5936,6 +6297,112 @@ iqlTEKVISscuchxZtKQJ4k8=
         .is_none());
     }
 
+    #[test]
+    fn a_photo_refresh_is_admitted_only_for_the_linked_subject_and_a_live_session() {
+        let connection = google_sso("https://accounts.google.com", "client");
+        let mut state = crate::account_auth::AccountAuth::default();
+        for account in ["account:alice", "account:bob"] {
+            state.roots.insert(
+                account.to_owned(),
+                crate::account_auth::CustodiedAccountRootRecord::new(account, "sealed", 1).unwrap(),
+            );
+        }
+        for (account, subject) in [
+            ("account:alice", "google-alice"),
+            ("account:bob", "google-bob"),
+        ] {
+            let link = crate::account_auth::ExternalSubjectRecord::new(
+                account,
+                &connection.id,
+                &connection.issuer,
+                subject,
+                crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+                1,
+            )
+            .unwrap();
+            state.external_subjects.insert(link.id.clone(), link);
+        }
+        // A provider session is enough: the refresh links nothing.
+        let session = crate::account_auth::AccountSessionRecord::new(
+            "session-alice",
+            "account:alice",
+            "consumer-oidc:consumer-google",
+            1_000,
+            60,
+        )
+        .unwrap();
+        state.sessions.insert(session.id.clone(), session);
+        let context = PendingConsumerOidcAvatar {
+            account_id: "account:alice".into(),
+            session_id: "session-alice".into(),
+            connection_id: connection.id.clone(),
+            connection_revision: connection.current_revision(),
+        };
+        let returned =
+            |token_issuer: Option<&'static str>, subject: &'static str| ReturnedConsumerIdentity {
+                pinned_issuer: "https://accounts.google.com",
+                pinned_audiences: std::slice::from_ref(&connection.audiences[0]),
+                token_issuer,
+                subject,
+            };
+        let admit = |subject: &'static str, now_ms: u64, context: &PendingConsumerOidcAvatar| {
+            admit_consumer_avatar_refresh(
+                &state,
+                context,
+                &connection,
+                &returned(Some("https://accounts.google.com"), subject),
+                now_ms,
+            )
+            .map_err(|(status, _)| status)
+        };
+
+        assert_eq!(admit("google-alice", 2_000, &context), Ok(()));
+        // Bob's Google identity, signed in in alice's browser, is not hers.
+        assert_eq!(
+            admit("google-bob", 2_000, &context),
+            Err(StatusCode::CONFLICT)
+        );
+        assert_eq!(
+            admit("google-nobody", 2_000, &context),
+            Err(StatusCode::CONFLICT)
+        );
+        // The initiating session expired while the browser was at Google.
+        assert_eq!(
+            admit("google-alice", 70_000, &context),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        // A session that belongs to another account cannot be borrowed.
+        let borrowed = PendingConsumerOidcAvatar {
+            account_id: "account:bob".into(),
+            ..context.clone()
+        };
+        assert_eq!(
+            admit("google-bob", 2_000, &borrowed),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        // The connection changed under the ceremony.
+        let stale = PendingConsumerOidcAvatar {
+            connection_revision: "an older revision".into(),
+            ..context.clone()
+        };
+        assert_eq!(
+            admit("google-alice", 2_000, &stale),
+            Err(StatusCode::CONFLICT)
+        );
+        // A token whose issuer cannot be read is refused rather than matched.
+        assert_eq!(
+            admit_consumer_avatar_refresh(
+                &state,
+                &context,
+                &connection,
+                &returned(None, "google-alice"),
+                2_000,
+            )
+            .map_err(|(status, _)| status),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
     /// The sibling the repository was missing. `consumer_login_resolves_only_an
     /// _exact_active_subject_link` proves the resolver is strict — which was
     /// true and was never the problem. Nothing asked what happens to the person
@@ -6270,6 +6737,7 @@ iqlTEKVISscuchxZtKQJ4k8=
             provider_expires_at_ms: 0,
             native_return: None,
             native_handoff_challenge: None,
+            picture: None,
             browser_binding: crate::secret::Secret::new("test-binding"),
         }
     }

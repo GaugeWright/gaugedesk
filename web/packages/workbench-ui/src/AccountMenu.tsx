@@ -16,7 +16,7 @@
  * anything — the previous surface could only answer "am I signed in?" from inside
  * the modal it gated.
  */
-import { For, Show, type JSX } from "solid-js";
+import { createEffect, createSignal, For, Show, type JSX } from "solid-js";
 
 /**
  * Which composition is rendering. It changes what the menu may offer, rather than
@@ -32,6 +32,9 @@ export interface MenuIdentity {
     readonly email?: string;
     /** The edition or plan this account carries, shown beside the name. */
     readonly edition?: string;
+    /** The account's avatar as a re-encoded image `data:` URI (DR-0195). Absent
+     *  for most accounts; initials are the steady state, not a loading state. */
+    readonly avatar?: string;
 }
 
 export interface AccountMenuItem {
@@ -79,6 +82,14 @@ export function AccountMenu(props: AccountMenuProps): JSX.Element {
         if (!showsAccount()) return "browser client";
         return props.identity?.edition ?? null;
     };
+    // An image that fails to decode falls back to initials rather than to a
+    // broken-image glyph. Keyed on the source, so a replaced avatar is tried.
+    const [avatarFailed, setAvatarFailed] = createSignal(false);
+    const avatar = () => (showsAccount() && !avatarFailed() ? props.identity?.avatar : undefined);
+    createEffect(() => {
+        void props.identity?.avatar;
+        setAvatarFailed(false);
+    });
     const initials = () => {
         const name = props.identity?.name;
         if (!showsAccount() || !name) return null;
@@ -97,10 +108,26 @@ export function AccountMenu(props: AccountMenuProps): JSX.Element {
                 onClick={() => props.onToggle()}
             >
                 <Show
-                    when={initials()}
-                    fallback={<span class="account-avatar account-avatar-anon" aria-hidden="true">◇</span>}
+                    when={avatar()}
+                    fallback={
+                        <Show
+                            when={initials()}
+                            fallback={<span class="account-avatar account-avatar-anon" aria-hidden="true">◇</span>}
+                        >
+                            {(text) => <span class="account-avatar" aria-hidden="true">{text()}</span>}
+                        </Show>
+                    }
                 >
-                    {(text) => <span class="account-avatar" aria-hidden="true">{text()}</span>}
+                    {(src) => (
+                        <img
+                            class="account-avatar account-avatar-image"
+                            src={src()}
+                            alt=""
+                            aria-hidden="true"
+                            data-account-avatar
+                            onError={() => setAvatarFailed(true)}
+                        />
+                    )}
                 </Show>
                 <span class="account-trigger-text">
                     <span class="account-trigger-name">{triggerLabel()}</span>

@@ -11,7 +11,7 @@ const signIn = (provider: string) => ({ provider, linked: false, expires: null, 
 const usage = { runs: 2, input_tokens: 800, output_tokens: 200, total_tokens: 1000, included_tokens: 5000, overage_tokens: 0, unattributed_runs: 0, unattributed_tokens: 0 };
 const models = {
     account: {
-        profile: { account_id: "person-a", display_name: null }, verified_contacts: [], authenticators: [],
+        profile: { account_id: "person-a", display_name: null, avatar: null }, verified_contacts: [], authenticators: [],
         consumer_oidc: { available: true, connection_id: "consumer-google", label: "Google" },
         recovery: { batches: [] }, sessions: [], memberships: [{
             id: "organization-a", display_name: "Organization A", role: "owner",
@@ -254,5 +254,31 @@ describe("GaugeApp page wire contracts", () => {
         expect(parsed.model.default_model?.connection_id).toBe("openai");
         await expect(readGaugeAppPage(async () => ({ page: page("trusted-devices") }), session, "account")).rejects.toThrow(/page.id/);
         await expect(readGaugeAppPage(async () => ({}), session, "account")).rejects.toThrow(/at page/);
+    });
+});
+
+describe("account avatar", () => {
+    const withAvatar = (avatar: unknown) => {
+        const { avatar: _omitted, ...profile } = models.account.profile;
+        return { ...models.account, profile: avatar === undefined ? profile : { ...profile, avatar } };
+    };
+
+    it("reads an absent avatar as none, so an authority that predates avatars stays compatible", () => {
+        expect(parseAccountSettingsModel(withAvatar(undefined), "model").profile.avatar).toBeNull();
+        expect(parseAccountSettingsModel(withAvatar(null), "model").profile.avatar).toBeNull();
+    });
+
+    it("admits only a PNG or JPEG data URI the authority re-encoded", () => {
+        const jpeg = "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+        expect(parseAccountSettingsModel(withAvatar(jpeg), "model").profile.avatar).toBe(jpeg);
+        for (const refused of [
+            "https://lh3.googleusercontent.com/a/photo=s96-c",
+            "data:image/svg+xml;base64,PHN2Zy8+",
+            "data:text/html;base64,PGgxPg==",
+            "data:image/png;base64,not base64!",
+            42,
+        ]) {
+            expect(() => parseAccountSettingsModel(withAvatar(refused), "model")).toThrow(/model\.profile\.avatar/);
+        }
     });
 });

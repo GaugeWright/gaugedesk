@@ -16,6 +16,21 @@ const page = (displayName: unknown = "Avery", actor = session.actor): GaugeAppPa
 });
 
 describe("GaugeApp account menu identity", () => {
+    it("carries the account's avatar and never a URL that is not an image data URI", () => {
+        const withAvatar = (avatar: unknown): GaugeAppPageModel => {
+            const base = page();
+            const model = base.model as { profile: Record<string, unknown> };
+            return { ...base, model: { ...model, profile: { ...model.profile, avatar } } };
+        };
+        const jpeg = "data:image/jpeg;base64,/9j/4AAQ";
+        expect(gaugeAppMenuIdentity(session, withAvatar(jpeg))).toEqual({
+            name: "Avery", email: "avery@example.invalid", avatar: jpeg,
+        });
+        expect(gaugeAppMenuIdentity(session, withAvatar(null))).toEqual({ name: "Avery", email: "avery@example.invalid" });
+        expect(gaugeAppMenuIdentity(session, withAvatar("https://lh3.googleusercontent.com/a/x")))
+            .toEqual({ name: "Avery", email: "avery@example.invalid" });
+    });
+
     it("uses the admitted account profile without a desktop bearer", () => {
         expect(gaugeAppMenuIdentity(session, page())).toEqual({ name: "Avery", email: "avery@example.invalid" });
     });

@@ -97,6 +97,7 @@ import {
     type DeviceLinkInvitation,
 } from "./account-device-link";
 import "./administration-gaugeapp.css";
+import { AvatarFileError, avatarInitials, avatarUploadImage } from "./account-avatar-upload";
 import { Notice, SectionHeading } from "./gaugeapp-design";
 
 const PAGE_LABELS: Readonly<Record<string, string>> = {
@@ -1979,6 +1980,10 @@ function AccountPage(props: {
     const [linkingConsumer, setLinkingConsumer] = createSignal(false);
     const [consumerLinkUrl, setConsumerLinkUrl] = createSignal("");
     const [consumerLinkMessage, setConsumerLinkMessage] = createSignal("");
+    const [avatarBusy, setAvatarBusy] = createSignal(false);
+    const [avatarMessage, setAvatarMessage] = createSignal("");
+    const [avatarLinkUrl, setAvatarLinkUrl] = createSignal("");
+    let avatarInput: HTMLInputElement | undefined;
     const [advancementPath, setAdvancementPath] = createSignal("");
     const [advancementMessage, setAdvancementMessage] = createSignal("");
     const [projectHostSettings, { refetch: refetchProjectHostSettings }] = createGaugeAppResource(
@@ -2118,6 +2123,47 @@ function AccountPage(props: {
             setLinkingConsumer(false);
         }
     };
+    // The photo re-fetch is Google's: of the consumer entrances, only Google's
+    // token carries a picture (DR-0189, DR-0195), so it is offered only when
+    // that exact connection is linked — not for any consumer sign-in.
+    const pictureProviderLinked = () => {
+        const connection = account()?.consumer_oidc.connection_id;
+        return Boolean(connection && account()?.authenticators.some((record) =>
+            record.kind === "consumer-oidc" && record.connection_id === connection));
+    };
+    const uploadAvatar = async (file: File | undefined) => {
+        if (!file) return;
+        setAvatarBusy(true);
+        setAvatarMessage("");
+        setAvatarLinkUrl("");
+        try {
+            const image = await avatarUploadImage(file);
+            await props.onSubmit("account.avatar.set", { image });
+        } catch (error) {
+            if (error instanceof AvatarFileError) setAvatarMessage(error.message);
+            else ignoreReportedAction();
+        } finally {
+            setAvatarBusy(false);
+            if (avatarInput) avatarInput.value = "";
+        }
+    };
+    const useProviderAvatar = async () => {
+        setAvatarBusy(true);
+        setAvatarMessage("");
+        setAvatarLinkUrl("");
+        try {
+            const url = await props.api.startConsumerOidcAvatar();
+            setAvatarLinkUrl(url);
+            const opened = await props.openExternal?.(url) ?? false;
+            setAvatarMessage(opened
+                ? `Finish in your browser, then refresh to see your ${account()?.consumer_oidc.label ?? "Google"} photo.`
+                : "Your browser did not open. Copy the secure link to continue.");
+        } catch (error) {
+            setAvatarMessage(error instanceof Error ? error.message : String(error));
+        } finally {
+            setAvatarBusy(false);
+        }
+    };
     const openManagedInference = async (action: "subscribe" | "manage") => {
         const response = await props.onSubmit("managed-inference.plan.change", { action });
         const url = text(valueRecord(response.result)?.url, "");
@@ -2223,7 +2269,34 @@ function AccountPage(props: {
                 </section>
             </Show>
             <section class="gaugeapp-panel gaugeapp-section-stack">
-                <div class="gaugeapp-section-head"><div><h2>Profile</h2><p>The name shown across GaugeDesk.</p></div></div>
+                <div class="gaugeapp-section-head"><div><h2>Profile</h2><p>The name and photo shown across GaugeDesk.</p></div></div>
+                <div class="gaugeapp-avatar-row" data-account-avatar-editor>
+                    <Show
+                        when={account()?.profile.avatar}
+                        fallback={<span class="gaugeapp-avatar gaugeapp-avatar-initials" aria-hidden="true">{avatarInitials(displayName() || account()?.verified_contacts[0]?.email || "")}</span>}
+                    >
+                        {(src) => <img class="gaugeapp-avatar" src={src()} alt="Your photo" />}
+                    </Show>
+                    <div class="gaugeapp-actions">
+                        <input
+                            ref={avatarInput}
+                            type="file"
+                            accept="image/png,image/jpeg,image/webp,image/gif"
+                            hidden
+                            onChange={(event) => void uploadAvatar(event.currentTarget.files?.[0])}
+                        />
+                        <button type="button" disabled={avatarBusy() || !props.commands.includes("account.avatar.set")} onClick={() => avatarInput?.click()}>
+                            {account()?.profile.avatar ? "Change photo" : "Upload photo"}
+                        </button>
+                        <Show when={account()?.consumer_oidc.available && pictureProviderLinked()}>
+                            <button type="button" disabled={avatarBusy()} onClick={() => void useProviderAvatar()}>{`Use ${account()?.consumer_oidc.label ?? "Google"} photo`}</button>
+                        </Show>
+                        <Show when={account()?.profile.avatar}>
+                            <button type="button" disabled={avatarBusy() || !props.commands.includes("account.avatar.remove")} onClick={() => void props.onSubmit("account.avatar.remove", {}).catch(ignoreReportedAction)}>Remove photo</button>
+                        </Show>
+                    </div>
+                </div>
+                <Show when={avatarMessage()}>{(message) => <div class="gaugeapp-inline-notice" role="status"><span>{message()}</span><div class="gaugeapp-actions"><Show when={avatarLinkUrl()}>{(url) => <button type="button" onClick={() => void navigator.clipboard.writeText(url())}>Copy link</button>}</Show><Show when={avatarLinkUrl()}><button type="button" onClick={() => void props.onRefresh()}>Refresh</button></Show></div></div>}</Show>
                 <form class="gaugeapp-inline-form" onSubmit={(event) => {
                     event.preventDefault();
                     void props.onSubmit("account.profile.set", { display_name: displayName() }).catch(ignoreReportedAction);

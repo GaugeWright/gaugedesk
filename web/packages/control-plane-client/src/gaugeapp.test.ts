@@ -20,6 +20,7 @@ import {
     stopGaugeAppAgentTurn,
     startAccountAuthorization,
     startConsumerOidcLink,
+    startConsumerOidcAvatar,
     subscribeGaugeAppAgentEvents,
     submitGaugeAppCommand,
     submitAccountProviderSecret,
@@ -78,7 +79,7 @@ describe("typed GaugeApp client", () => {
         for (const app of gaugeAppKinds) {
             const routes = Object.keys(gaugeAppRoutes[app]).sort();
             expect(routes).toEqual(app === "account-settings" ? [
-                "agentErase", "agentEvents", "agentRead", "agentSend", "agentStop", "command", "consumerOidcLink", "deviceLinkClaim", "deviceLinkComplete", "deviceLinkRead", "page", "proposals", "providerSecret", "review", "session", "updates",
+                "agentErase", "agentEvents", "agentRead", "agentSend", "agentStop", "command", "consumerOidcAvatar", "consumerOidcLink", "deviceLinkClaim", "deviceLinkComplete", "deviceLinkRead", "page", "proposals", "providerSecret", "review", "session", "updates",
             ] : app === "administration" ? [
                 "agentErase", "agentEvents", "agentRead", "agentSend", "agentStop", "command", "page", "proposals", "providerCredential", "providerIntake", "providerVerify", "review", "session", "ssoCredential", "updates",
             ] : [
@@ -138,6 +139,16 @@ describe("typed GaugeApp client", () => {
             ["POST", "/auth/account/consumer-oidc/link/start", undefined, undefined],
         ]);
         await expect(startConsumerOidcLink(fakeJson({ authorization_url: "javascript:alert(1)" }).json))
+            .rejects.toThrow(/valid provider authorization URL/);
+    });
+
+    it("starts the photo re-fetch through its own authenticated account route", async () => {
+        const route = fakeJson({ authorization_url: "https://accounts.example.test/authorize" });
+        await expect(startConsumerOidcAvatar(route.json)).resolves.toBe("https://accounts.example.test/authorize");
+        expect(route.calls).toEqual([
+            ["POST", "/auth/account/consumer-oidc/avatar/start", undefined, undefined],
+        ]);
+        await expect(startConsumerOidcAvatar(fakeJson({ authorization_url: "http://accounts.example.test" }).json))
             .rejects.toThrow(/valid provider authorization URL/);
     });
 

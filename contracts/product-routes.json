@@ -2514,6 +2514,42 @@
       }
     },
     {
+      "id": "account.consumer-oidc.avatar.start",
+      "jurisdiction": "hosted-person-account-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/auth/account/consumer-oidc/avatar/start",
+      "producer": "gaugedesk-app provider-neutral account ceremony router",
+      "consumer": "GaugeDesk Account Settings provider-photo re-fetch",
+      "authentication": "current-account-session",
+      "scope": "exact-account-session-linked-consumer-subject-and-configured-provider-revision",
+      "capability": "refetch-own-avatar-from-linked-consumer-oidc",
+      "requestSchema": "http/empty",
+      "responseSchema": "gw://schemas/account/consumer-oidc-authorization/v1",
+      "sideEffect": "pending-account-avatar-refresh",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/auth_oidc.rs#a_photo_refresh_is_admitted_only_for_the_linked_subject_and_a_live_session"
+        ],
+        "authority": [
+          "crates/app/src/auth_oidc.rs#a_photo_refresh_is_admitted_only_for_the_linked_subject_and_a_live_session"
+        ],
+        "journey": [
+          "crates/app/src/account_avatar.rs#a_removal_is_not_undone_by_the_next_sign_in_but_an_upload_replaces_it"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/auth_oidc.rs#a_photo_refresh_is_admitted_only_for_the_linked_subject_and_a_live_session"
+        ]
+      }
+    },
+    {
       "id": "account.authorization.start",
       "jurisdiction": "hosted-person-account-session",
       "transport": "http-json",

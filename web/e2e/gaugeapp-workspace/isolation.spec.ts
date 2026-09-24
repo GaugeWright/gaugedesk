@@ -145,6 +145,48 @@ test("GaugeDesk keeps a failed sign-out actionable only for its current menu ope
     await expect(page.getByRole("menuitem", { name: "Sign out", exact: true })).toBeEnabled();
 });
 
+test("the account menu shows the account's photo in place of its initials", async ({ page }, info) => {
+    await page.goto("/?account-menu=signed-in-photo");
+    const trigger = page.locator("[data-account-menu-trigger]");
+    const photo = trigger.locator("img[data-account-avatar]");
+    await expect(photo).toBeVisible();
+    await expect(photo).toHaveAttribute("src", /^data:image\/jpeg;base64,/);
+    await expect(trigger.getByText("AL", { exact: true })).toHaveCount(0);
+    // The photo occupies exactly the circle the initials would, so the row
+    // cannot shift when an avatar arrives.
+    const box = await photo.boundingBox();
+    expect(box?.width).toBe(22);
+    expect(box?.height).toBe(22);
+    await page.screenshot({ path: info.outputPath("account-menu-photo.png"), scale: "css" });
+});
+
+test("a person uploads, sees, and removes their account photo", async ({ page }, info) => {
+    await go(page, "account-settings");
+    const editor = page.locator("[data-account-avatar-editor]");
+    await expect(editor.getByRole("img", { name: "Your photo" })).toHaveCount(0);
+    await expect(editor.locator(".gaugeapp-avatar-initials")).toHaveText("PA");
+    await expect(editor.getByRole("button", { name: "Remove photo", exact: true })).toHaveCount(0);
+
+    await editor.locator('input[type="file"]').setInputFiles({
+        name: "portrait.png",
+        mimeType: "image/png",
+        buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAB3klEQVR4nA3LIc6GIACA4f843wE8gAfwAI7oSCZmdCQTIzISiRmZyb3BERnJxMwe5vfpz99P0Al6wSAYBVKgBFpgBF4QBYfgElRBE7yCv99EN9FPDBPjhJxQE3rCTPiJOHFMXBN1ok280xdmupl+ZpgZZ+SMmtEzZsbPxJlj5pqpM23mnb+w0C30C8PCuCAX1IJeMAt+IS4cC9dCXWgL7/KFlW6lXxlWxhW5olb0ilnxK3HlWLlW6kpbedcvbHQb/cawMW7IDbWhN8yG34gbx8a1UTfaxrt9wdJZestgGS3SoizaYizeEi2H5bJUS7O89guOztE7BsfokA7l0A7j8I7oOByXozqa43VfCHSBPjAExoAMqIAOmIAPxMARuAI10AJv+MJOt9PvDDvjjtxRO3rH7PiduHPsXDt1p+28+xcSXaJPDIkxIRMqoRMm4RMxcSSuRE20xJu+cNKd9CfDyXgiT9SJPjEn/iSeHCfXST1pJ+/5hUyX6TNDZszIjMrojMn4TMwcmStTMy3z5i8UukJfGApjQRZUQRdMwRdi4ShchVpohbd84aa76W+Gm/FG3qgbfWNu/E28OW6um3rTbt77Cw/dQ/8wPIwP8kE96Afz4B/iw/FwPdSH9vA+/APRNMwQA4k0/gAAAABJRU5ErkJggg==", "base64"),
+    });
+    await expect(editor.getByRole("img", { name: "Your photo" })).toBeVisible();
+    const submitted = (await calls(page)).find((call) => call.command === "account.avatar.set");
+    // The browser sends a shrunk image, never the file as chosen.
+    expect((submitted?.payload as { image?: string } | undefined)?.image).toMatch(/^data:image\/png;base64,/);
+    await page.screenshot({ path: info.outputPath("account-settings-photo.png"), scale: "css" });
+
+    await editor.locator('input[type="file"]').setInputFiles({ name: "notes.pdf", mimeType: "application/pdf", buffer: Buffer.from("%PDF-1.7") });
+    await expect(page.locator(".gaugeapp-inline-notice").filter({ hasText: "Choose a PNG, JPEG, WebP or GIF image." })).toBeVisible();
+    expect((await calls(page)).filter((call) => call.command === "account.avatar.set")).toHaveLength(1);
+
+    await click(page, "Remove photo");
+    await expect(editor.getByRole("img", { name: "Your photo" })).toHaveCount(0);
+    await expect(editor.locator(".gaugeapp-avatar-initials")).toHaveText("PA");
+});
+
 test("signed-out Desk completes provider-neutral account recovery without retaining proofs", async ({ page }, info) => {
     await page.goto("/?account-entry=recovery");
     await click(page, "Use a recovery code");
