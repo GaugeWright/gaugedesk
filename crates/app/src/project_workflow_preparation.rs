@@ -56,7 +56,7 @@ impl Workbench {
         let protection =
             WorkflowProtection::new(&authority.workspace, key.clone()).map_err(debug_error)?;
         let storage = self.workflow_storage(&authority.workspace)?;
-        let (root, trust_basis) = self.workflow_policy_root(&command.issuer)?;
+        let (root, trust_basis) = self.workflow_policy_root(&project, &command.issuer)?;
         authority.basis = authority.basis.combine(trust_basis).map_err(debug_error)?;
         let identity = ActionPolicyIdentity {
             issuer: command.issuer.clone(),

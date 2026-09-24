@@ -595,6 +595,9 @@ impl Workbench {
             .declaration
             .clone()
             .ok_or_else(|| "settlement declaration is absent".to_owned())?;
+        if self.project_moving(&declaration.project_id) {
+            return Err(crate::federation::PAUSED_FOR_MOVE.to_owned());
+        }
         let member = declaration
             .members
             .iter()
@@ -625,6 +628,9 @@ impl Workbench {
             .declaration
             .clone()
             .ok_or_else(|| "settlement declaration is absent".to_owned())?;
+        if self.project_moving(&declaration.project_id) {
+            return Err(crate::federation::PAUSED_FOR_MOVE.to_owned());
+        }
         let member = declaration
             .members
             .iter()
@@ -1644,6 +1650,17 @@ impl Workbench {
     }
 }
 
+/// Whether a settlement's project is mid-move, when writes to it are refused
+/// (DR-0201 §3). An unreadable settlement is left to its own refusal.
+fn settlement_paused(workbench: &Workbench, declaration_id: &str) -> bool {
+    workbench
+        .store_ref()
+        .fold::<TargetSettlementState>(&settlement_scope(declaration_id))
+        .ok()
+        .and_then(|state| state.declaration)
+        .is_some_and(|declaration| workbench.project_moving(&declaration.project_id))
+}
+
 pub async fn create_target_settlement(
     State(workbench): State<crate::SharedWorkbench>,
     Path(chat_id): Path<String>,
@@ -1652,6 +1669,9 @@ pub async fn create_target_settlement(
     let mut workbench = workbench.lock_unpoisoned();
     if !workbench.library.chats.contains_key(&chat_id) {
         return (StatusCode::NOT_FOUND, "no such chat").into_response();
+    }
+    if workbench.chat_project_moving(&chat_id) {
+        return (StatusCode::CONFLICT, crate::federation::PAUSED_FOR_MOVE).into_response();
     }
     let requested = body
         .members
@@ -1781,6 +1801,9 @@ pub async fn compensate_target_settlement(
     Json(body): Json<CompensateTargetSettlementBody>,
 ) -> impl IntoResponse {
     let mut workbench = workbench.lock_unpoisoned();
+    if settlement_paused(&workbench, &declaration_id) {
+        return (StatusCode::CONFLICT, crate::federation::PAUSED_FOR_MOVE).into_response();
+    }
     match workbench.compensate_target_settlement(&declaration_id, body.receipt_links) {
         Ok(state) => (StatusCode::OK, Json(state)).into_response(),
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
@@ -1793,6 +1816,9 @@ pub async fn abandon_target_settlement(
     Json(body): Json<AbandonTargetSettlementBody>,
 ) -> impl IntoResponse {
     let mut workbench = workbench.lock_unpoisoned();
+    if settlement_paused(&workbench, &declaration_id) {
+        return (StatusCode::CONFLICT, crate::federation::PAUSED_FOR_MOVE).into_response();
+    }
     match workbench.abandon_target_settlement(&declaration_id, &body.reason) {
         Ok(state) => (StatusCode::OK, Json(state)).into_response(),
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
@@ -1805,6 +1831,9 @@ pub async fn cancel_target_settlement(
     Json(body): Json<CancelTargetSettlementBody>,
 ) -> impl IntoResponse {
     let mut workbench = workbench.lock_unpoisoned();
+    if settlement_paused(&workbench, &declaration_id) {
+        return (StatusCode::CONFLICT, crate::federation::PAUSED_FOR_MOVE).into_response();
+    }
     match workbench.cancel_target_settlement(&declaration_id, &body.reason) {
         Ok(state) => (StatusCode::OK, Json(state)).into_response(),
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
@@ -1817,6 +1846,9 @@ pub async fn supersede_target_settlement_member(
     Json(body): Json<SupersedeTargetSettlementMemberBody>,
 ) -> impl IntoResponse {
     let mut workbench = workbench.lock_unpoisoned();
+    if settlement_paused(&workbench, &declaration_id) {
+        return (StatusCode::CONFLICT, crate::federation::PAUSED_FOR_MOVE).into_response();
+    }
     match workbench.supersede_settlement_member(
         &declaration_id,
         &member_id,

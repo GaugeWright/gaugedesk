@@ -286,7 +286,7 @@ impl Workbench {
             ),
             request_id: request.request_id.clone(),
         };
-        let (root, trust_basis) = self.workflow_policy_root(&identity.issuer)?;
+        let (root, trust_basis) = self.workflow_policy_root(&request.project, &identity.issuer)?;
         basis = basis.combine(trust_basis).map_err(debug_error)?;
         let policy = if let Some(command) = &original {
             load_project_action_policy(
@@ -481,7 +481,7 @@ impl Workbench {
                 },
             )
             .map_err(debug_error)?;
-        let (root, trust_basis) = self.workflow_policy_root(&identity.issuer)?;
+        let (root, trust_basis) = self.workflow_policy_root(&request.project, &identity.issuer)?;
         // The command commit changed the product head. Re-verify the retained
         // signature against this fresh trust observation rather than carrying a
         // verifier derived from an earlier pairing into its new basis.

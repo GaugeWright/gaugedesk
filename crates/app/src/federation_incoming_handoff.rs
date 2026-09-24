@@ -582,6 +582,20 @@ pub(super) fn commit(
         }
     }
     facts.extend(home_facts(wire, &home)?);
+    // Pin the key the origin signs its runs with, as the pairing that verified
+    // this move vouches for it now, so the runs arriving here stay checkable
+    // after that pairing expires or is revoked (DR-0201). A revoked pairing
+    // stops new moves; it does not strand runs that already arrived.
+    let origin = super::active_bridge(guard.store_ref(), &wire.source)
+        .ok_or_else(|| refused("handoff origin has no active pairing to pin"))?;
+    facts.push(fact(
+        &super::workflow_signers_scope(&wire.project),
+        super::WORKFLOW_SIGNER_PIN_KIND,
+        &super::WorkflowSignerPin {
+            issuer: wire.source.clone(),
+            governance_pubkey: origin.ticket.governance_pubkey,
+        },
+    )?);
     for (authority, owns) in [
         (wire.target.as_str(), PayloadClass::Data),
         (wire.source.as_str(), PayloadClass::Archetypes),

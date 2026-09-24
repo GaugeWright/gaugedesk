@@ -143,8 +143,13 @@ impl Workbench {
             .map(Arc::new)
             .map_err(debug_error)
     }
-    fn workflow_policy_root(
+    /// The root a run's signed policy is checked against. This Home's own key
+    /// for its own runs; for a run that arrived with a relocated project, the key
+    /// pinned when that move was admitted (DR-0201), which outlives the pairing;
+    /// otherwise the issuer's current, unexpired pairing.
+    pub(super) fn workflow_policy_root(
         &self,
+        project: &str,
         issuer: &str,
     ) -> Result<
         (
@@ -154,9 +159,10 @@ impl Workbench {
         String,
     > {
         use crate::federation::{BridgeRecord, BRIDGE_SCOPE};
+        let pins = crate::federation::workflow_signers_scope(project);
         let ((key, expiry), basis) = self
             .store_ref()
-            .read_for_dispatch(&[BRIDGE_SCOPE], |store| {
+            .read_for_dispatch(&[BRIDGE_SCOPE, &pins], |store| {
                 if issuer == self.authority().as_str() {
                     let key = SigningKey::from_seed(&self.governance_seed()).map_err(|_| {
                         gaugedesk_store::AdmitError::Rejected(gaugedesk_core::Rejection {
@@ -164,6 +170,17 @@ impl Workbench {
                         })
                     })?;
                     return Ok((key.public_key(), None));
+                }
+                store.retained_events(&pins)?;
+                let mut pinned = None;
+                for row in store.records(&pins, crate::federation::WORKFLOW_SIGNER_PIN_KIND)? {
+                    let pin: crate::federation::WorkflowSignerPin = serde_json::from_str(&row)?;
+                    if pin.issuer == issuer {
+                        pinned = Some(pin.governance_pubkey);
+                    }
+                }
+                if let Some(key) = pinned {
+                    return Ok((gaugedesk_core::ids::PublicKey::new(key), None));
                 }
                 // Read the authoritative roster, including tombstones and revokes.
                 // A cached pairing or a key carried by the offer is not this evidence.
@@ -326,7 +343,7 @@ impl Workbench {
             &authority.policy,
             &signing_key,
         )?;
-        let (root, _) = self.workflow_policy_root(&identity.issuer)?;
+        let (root, _) = self.workflow_policy_root(&request.project, &identity.issuer)?;
         let envelope =
             ifc::VerifiedEnvelope::verify_signed_text_with(policy.signed_envelope(), &root)?;
         if !ifc::check_with_envelope(action.program(), &envelope).is_empty() {

@@ -27,7 +27,7 @@ use gaugedesk_core::run::{RunPhase, RunState};
 use gaugedesk_core::target_settlement::{
     SettlementMemberPhase, SettlementPhase, TargetSettlementState,
 };
-use gaugedesk_workspace::{MergeOutcome, WorkstreamTransferOutcome};
+use gaugedesk_workspace::WorkstreamTransferOutcome;
 use whipplescript_store::workstreams::StreamStatus;
 
 const PROMOTION_CONFLICT_PATHS: &str = "promotion_conflict_paths";
@@ -201,18 +201,6 @@ impl Workbench {
         run_active || candidate_active || workspace_dirty
     }
 
-    /// Create the native shared workstream line under an open managed target.
-    pub fn create_workstream_ref(
-        &self,
-        storage_id: &str,
-        workstream_id: &str,
-    ) -> std::io::Result<()> {
-        self.workspace_by_storage_id(storage_id)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "workspace missing"))?
-            .create_named_workstream(workstream_id, None)
-            .map_err(crate::io)
-    }
-
     /// Append a workstream declaration to the library log, apply it to the in-memory
     /// projection, and publish the workspace-change reference (`INV-10`).
     pub fn write_workstream(&mut self, record: WorkstreamRecord) -> i64 {
@@ -278,18 +266,6 @@ impl Workbench {
         self.library_chat_placement(chat_id)
     }
 
-    /// Promote a workstream ref into project collaboration Main.
-    pub fn promote_workstream_ref_to_main(
-        &self,
-        workstream_id: &str,
-        storage_id: &str,
-    ) -> std::io::Result<MergeOutcome> {
-        self.workspace_by_storage_id(storage_id)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "workspace missing"))?
-            .promote_workstream_to_main(workstream_id)
-            .map_err(crate::io)
-    }
-
     /// Refresh every live chat still homed to a target's implicit Main after that
     /// mainline advances. Promotion updates the managed target store; without this
     /// reconciliation, existing Main chat worktrees keep their old cut and make a
@@ -320,6 +296,16 @@ impl Workbench {
 /// Create a named workstream in a placement (a user **or** an agent may call this).
 /// Branches `workstream/<id>/main` off the placement mainline, admits `CreateWorkstream`
 /// on the new workstream scope, and records the nav declaration.
+/// A workstream's project mid-move takes no writes (DR-0201 §3).
+fn workstream_paused(wb: &Workbench, ws_id: &str) -> bool {
+    wb.workstream_root(ws_id)
+        .is_some_and(|root| wb.project_moving(&root.project_id))
+}
+
+fn paused_response() -> axum::response::Response {
+    (StatusCode::CONFLICT, crate::federation::PAUSED_FOR_MOVE).into_response()
+}
+
 pub async fn create_workstream(
     State(wb): State<SharedWorkbench>,
     Path(iid): Path<String>,
@@ -333,6 +319,9 @@ pub async fn create_workstream(
         )
             .into_response();
     };
+    if wb.project_moving(&project_id) {
+        return paused_response();
+    }
     if let Some(target_id) = body.target_id.as_deref() {
         if let Err(error) = wb.resolve_placement_target(&iid, Some(target_id)) {
             return (StatusCode::BAD_REQUEST, error).into_response();
@@ -467,6 +456,9 @@ pub async fn join_workstream(
     Json(body): Json<MemberBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if workstream_paused(&wb, &ws_id) {
+        return paused_response();
+    }
     if !wb.has_workstream(&ws_id) {
         return (StatusCode::NOT_FOUND, "no such workstream").into_response();
     }
@@ -539,6 +531,9 @@ pub async fn leave_workstream(
     Json(body): Json<MemberBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if workstream_paused(&wb, &ws_id) {
+        return paused_response();
+    }
     if !wb.has_workstream(&ws_id) {
         return (StatusCode::NOT_FOUND, "no such workstream").into_response();
     }
@@ -648,6 +643,9 @@ pub async fn archive_workstream(
     Path(ws_id): Path<String>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if workstream_paused(&wb, &ws_id) {
+        return paused_response();
+    }
     let Some(rec) = wb.workstream(&ws_id) else {
         return (StatusCode::NOT_FOUND, "no such workstream").into_response();
     };
@@ -670,6 +668,9 @@ pub async fn promote_workstream(
     body: Option<Json<PromoteWorkstreamBody>>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if workstream_paused(&wb, &ws_id) {
+        return paused_response();
+    }
     if !wb.has_workstream(&ws_id) {
         return (StatusCode::NOT_FOUND, "no such workstream").into_response();
     }
@@ -933,6 +934,9 @@ pub async fn create_workstream_settlement(
     Json(body): Json<CreateWorkstreamSettlementBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if workstream_paused(&wb, &ws_id) {
+        return paused_response();
+    }
     let Some(root) = wb.workstream_root(&ws_id) else {
         return (StatusCode::NOT_FOUND, "no such workstream").into_response();
     };

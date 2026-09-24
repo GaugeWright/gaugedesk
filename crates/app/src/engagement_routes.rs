@@ -167,6 +167,11 @@ impl Workbench {
             .get(&root_id)
             .and_then(|instance| instance.project_id.clone())
             .ok_or_else(|| EngagementCreateError::Git("default placement has no project".into()))?;
+        if self.project_moving(&project_id) {
+            return Err(EngagementCreateError::Git(
+                crate::federation::PAUSED_FOR_MOVE.into(),
+            ));
+        }
         self.ensure_collaboration_target_partition(&project_id, &target.id)
             .map_err(EngagementCreateError::Git)?;
         let collaboration_workspace_id = self
@@ -285,6 +290,9 @@ impl Workbench {
         id: &str,
         body: &str,
     ) -> Option<Result<(), WorkspaceError>> {
+        if self.chat_project_moving(id) {
+            return Some(Err(crate::federation::paused_for_move()));
+        }
         self.engagements.get(id)?;
         let instance_id = self.library.chats.get(id)?.instance_id.clone();
         let notes = self
@@ -417,6 +425,9 @@ impl Workbench {
         path: &std::path::Path,
         target_id: Option<&str>,
     ) -> Option<Result<(usize, String), String>> {
+        if self.chat_project_moving(chat_id) {
+            return Some(Err(crate::federation::PAUSED_FOR_MOVE.to_owned()));
+        }
         let prefix = match self.engagement_context_target_root(chat_id, target_id) {
             Ok(prefix) => prefix,
             Err(error) => return Some(Err(error)),
@@ -447,6 +458,9 @@ impl Workbench {
         files: &[(String, Vec<u8>)],
         target_id: Option<&str>,
     ) -> Option<Result<(usize, String), String>> {
+        if self.chat_project_moving(chat_id) {
+            return Some(Err(crate::federation::PAUSED_FOR_MOVE.to_owned()));
+        }
         let prefix = match self.engagement_context_target_root(chat_id, target_id) {
             Ok(prefix) => prefix,
             Err(error) => return Some(Err(error)),
@@ -491,6 +505,9 @@ impl Workbench {
         source: &std::path::Path,
         target_id: Option<&str>,
     ) -> Option<Result<(usize, String), String>> {
+        if self.chat_project_moving(chat_id) {
+            return Some(Err(crate::federation::PAUSED_FOR_MOVE.to_owned()));
+        }
         let prefix = match self.engagement_context_target_root(chat_id, target_id) {
             Ok(prefix) => prefix,
             Err(error) => return Some(Err(error)),
@@ -584,6 +601,9 @@ impl Workbench {
         path: &str,
         body: &str,
     ) -> Option<Result<(), WorkspaceError>> {
+        if self.chat_project_moving(chat_id) {
+            return Some(Err(crate::federation::paused_for_move()));
+        }
         let workspace_path = self.engagement_workspace_path(chat_id, path);
         let eng = self.engagements.get(chat_id)?;
         let result = eng
@@ -616,6 +636,9 @@ impl Workbench {
         base: SaveBase<'_>,
         resolutions: &[RegionResolution],
     ) -> Option<Result<SaveFileOutcome, WorkspaceError>> {
+        if self.chat_project_moving(chat_id) {
+            return Some(Err(crate::federation::paused_for_move()));
+        }
         let workspace_path = self.engagement_workspace_path(chat_id, path);
         let eng = self.engagements.get(chat_id)?;
         let outcome = match eng.save_file_with_base(&workspace_path, draft, base, resolutions) {
@@ -792,6 +815,9 @@ impl Workbench {
     }
 
     pub(crate) fn revert_engagement(&mut self, id: &str) -> Option<Result<(), WorkspaceError>> {
+        if self.chat_project_moving(id) {
+            return Some(Err(crate::federation::paused_for_move()));
+        }
         let eng = self.engagements.get(id)?;
         let result = eng.revert_to_main();
         if result.is_ok() {
@@ -821,6 +847,9 @@ impl Workbench {
         id: &str,
         action: EngagementMergeAction,
     ) -> Option<Result<MergeState, String>> {
+        if self.chat_project_moving(id) {
+            return Some(Err(crate::federation::PAUSED_FOR_MOVE.to_owned()));
+        }
         if !self.engagements.contains_key(id) {
             return None;
         }
@@ -959,6 +988,9 @@ impl Workbench {
         &mut self,
         id: &str,
     ) -> Option<Result<MergeOutcome, WorkspaceError>> {
+        if self.chat_project_moving(id) {
+            return Some(Err(crate::federation::paused_for_move()));
+        }
         let eng = self.engagements.get(id)?;
         let result = eng.sync_from_main();
         if matches!(result, Ok(MergeOutcome::Clean)) {

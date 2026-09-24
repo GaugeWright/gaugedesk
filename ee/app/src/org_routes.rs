@@ -44,13 +44,8 @@ use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
     {
         let mut guard = wb.lock_unpoisoned();
+        // Also back-links legacy consumer sign-ins (GAUGEAPP-9) when Google is configured.
         crate::auth_oidc::activate_configured_idp(&mut guard);
-        // GAUGEAPP-9: repair legacy consumer sign-in before the router exists, so no
-        // account that predates the linking rule meets a refusal it cannot resolve.
-        let linked = gaugedesk_app::auth_oidc::backlink_legacy_consumer_accounts(&mut guard);
-        if linked > 0 {
-            println!("account-auth: back-linked {linked} legacy consumer sign-in(s)");
-        }
     }
     // ENTSEC-1: the middleware needs its own handle to the workbench (the router
     // moves `wb` into `.with_state`).

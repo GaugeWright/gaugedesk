@@ -561,6 +561,10 @@ impl Workbench {
     /// a project whose collaboration workspace does not exist yet gets it once
     /// it does. Returns whether it was declared now.
     pub fn ensure_project_tasks_tracker(&mut self, project: &str) -> Result<bool, String> {
+        // A project mid-move is declared on by whichever Home keeps it.
+        if self.project_moving(project) {
+            return Ok(false);
+        }
         let home = self.home_id().clone();
         let Some(workspace) = self
             .library

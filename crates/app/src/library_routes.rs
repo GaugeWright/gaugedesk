@@ -1092,6 +1092,13 @@ pub async fn delete_project(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if wb.project_moving(&id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": crate::federation::PAUSED_FOR_MOVE })),
+        )
+            .into_response();
+    }
     if wb.delete_project_cascade(&id) {
         (StatusCode::OK, Json(json!({ "deleted": id }))).into_response()
     } else {
@@ -1571,6 +1578,13 @@ pub async fn delete_chat(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if wb.chat_project_moving(&id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": crate::federation::PAUSED_FOR_MOVE })),
+        )
+            .into_response();
+    }
     if wb.delete_chat_cascade(&id) {
         (StatusCode::OK, Json(json!({ "deleted": id }))).into_response()
     } else {

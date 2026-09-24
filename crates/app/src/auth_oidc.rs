@@ -1473,14 +1473,36 @@ pub fn build_oidc_idp(
 /// calls it before serving, and the hosted shell (`gaugewright-cloud-server`)
 /// calls it right after workbench open. Installs the verifier via the open
 /// `Workbench::set_identity_provider` seam.
+///
+/// It also back-links legacy consumer accounts
+/// ([`backlink_legacy_consumer_accounts`]) whenever consumer Google sign-in is
+/// configured. That repair used to be a second call each composition had to
+/// remember, and the hosted shell never made it: from the 2026-09-16 cutover
+/// until this change, every pre-ADR-0146 Google account signing in to the Hub
+/// fell through to new-account signup. Every composition that can verify a
+/// consumer callback runs this function, so this is the one place the repair
+/// cannot be forgotten.
 pub fn activate_configured_idp(wb: &mut Workbench) {
+    activate_configured_idp_with(wb, web_account_sso_from_env());
+}
+
+/// [`activate_configured_idp`] with the hosted consumer connection supplied by
+/// the caller rather than read from the environment, so a test can hold the
+/// composition to its meaning without mutating process-wide state.
+pub fn activate_configured_idp_with(wb: &mut Workbench, web_account: Option<SsoConnectionRecord>) {
+    if let Some(connection) = web_account.as_ref() {
+        let linked = backlink_legacy_consumer_accounts(wb, connection);
+        if linked > 0 {
+            println!("account-auth: back-linked {linked} legacy consumer sign-in(s)");
+        }
+    }
     // Prefer a stored SSO connection; else (hosted web account) the Google connection from env,
     // so the verifier that honors the callback's id-token is built even without an /admin/sso
     // record (ADR 0077).
     let sso = Org::rebuild(wb.store_ref())
         .ok()
         .and_then(|o| o.sso)
-        .or_else(web_account_sso_from_env);
+        .or(web_account);
     if let Some((idp, warm)) = build_oidc_idp(sso.as_ref()) {
         if !warm {
             eprintln!(
@@ -1904,7 +1926,8 @@ pub fn web_account_sso_from_env() -> Option<SsoConnectionRecord> {
 }
 
 /// Back-link every legacy consumer account once, before this composition serves a
-/// request (GAUGEAPP-9).
+/// request (GAUGEAPP-9). [`activate_configured_idp`] runs it with the configured
+/// Google connection; nothing else should need to.
 ///
 /// This initiative made the callback resolve an external-subject link before minting a
 /// session. An account created by consumer sign-in under the previous rule carries the
@@ -1912,29 +1935,26 @@ pub fn web_account_sso_from_env() -> Option<SsoConnectionRecord> {
 /// again and no route can repair it: linking requires a live passkey-or-recovery
 /// session it cannot obtain.
 ///
-/// Runs where configured IdP activation already runs, so the repair lands before the
-/// router exists rather than racing the first sign-in. It is a no-op when consumer
-/// sign-in is unconfigured, and idempotent, so repeated boots cost one read.
-pub fn backlink_legacy_consumer_accounts(wb: &mut Workbench) -> usize {
-    let Some(connection) = web_account_sso_from_env() else {
-        return 0;
-    };
+/// The candidates are every account the current projection would authenticate,
+/// whatever its custody standing. An account whose payloads were never moved to
+/// an independently keyed scope (ADR 0170) is still authenticated, from the
+/// legacy projection, and [`crate::account_auth::append_facts`] already writes
+/// its link to the scope its standing selects. Requiring a completed migration
+/// here made the repair depend on a copy only one composition performs, and on
+/// that copy having run first. An account behind an erasure fence is not a
+/// candidate: the current projection has already removed it.
+///
+/// It is a no-op when every account already resolves, so repeated boots cost one read.
+pub fn backlink_legacy_consumer_accounts(
+    wb: &mut Workbench,
+    connection: &SsoConnectionRecord,
+) -> usize {
     let Ok(state) = crate::account_auth::AccountAuth::rebuild(wb.store_ref()) else {
         return 0;
     };
-    let Ok(catalog) =
-        crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild(wb.store_ref())
-    else {
-        return 0;
-    };
-    // Only accounts this composition would actually authenticate. A pending erasure or
-    // an unmigrated custody scope is not a sign-in problem to solve here.
-    let candidates: Vec<String> = catalog
-        .authenticatable_account_scoped_account_ids()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    let facts: Vec<crate::account_auth::AccountAuthFact> = candidates
+    let now_ms = crate::account::session_now_ms();
+    let facts: Vec<crate::account_auth::AccountAuthFact> = state
+        .account_ids()
         .iter()
         .filter_map(|account_id| {
             crate::account_auth::decide_backlink_legacy_consumer_subject(
@@ -1942,7 +1962,7 @@ pub fn backlink_legacy_consumer_accounts(wb: &mut Workbench) -> usize {
                 account_id,
                 &connection.id,
                 &connection.issuer,
-                crate::account::session_now_ms(),
+                now_ms,
             )
         })
         .collect();
@@ -6968,5 +6988,157 @@ iqlTEKVISscuchxZtKQJ4k8=
             session_method(Some(&oidc)),
             ("saml", "Single sign-on (SAML)")
         );
+    }
+
+    // ---- legacy consumer back-link at activation (GAUGEAPP-9) -----------------
+
+    /// A pre-ADR-0146 Google account: the verified subject is its id.
+    const LEGACY_GOOGLE_SUBJECT: &str = "110378459139719984149";
+
+    /// The consumer Google connection, at an issuer that refuses connections at
+    /// once, so activation attaches a cold verifier without leaving the machine.
+    fn offline_google() -> SsoConnectionRecord {
+        google_sso("http://127.0.0.1:9", "legacy-client")
+    }
+
+    /// A workbench holding one legacy consumer account as production holds it:
+    /// sessions from its old sign-ins and no authentication method at all.
+    fn workbench_with_legacy_google_account() -> Workbench {
+        use crate::account_auth::{AccountAuthFact, AccountSessionRecord};
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        crate::account_auth::append_facts(
+            wb.store_mut(),
+            &[AccountAuthFact::Session(
+                AccountSessionRecord::new("legacy-session", LEGACY_GOOGLE_SUBJECT, "oidc", 1, 60)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        wb
+    }
+
+    /// What the callback does with this person's next Google sign-in.
+    fn next_google_sign_in(
+        wb: &Workbench,
+        connection: &SsoConnectionRecord,
+    ) -> ConsumerCallbackDecision {
+        let state = crate::account_auth::AccountAuth::rebuild(wb.store_ref()).unwrap();
+        decide_google(
+            &state,
+            connection,
+            &connection.issuer,
+            LEGACY_GOOGLE_SUBJECT,
+            Some("legacy@example.com".into()),
+        )
+    }
+
+    fn logs_in_to_the_legacy_account(decision: &ConsumerCallbackDecision) -> bool {
+        matches!(decision, ConsumerCallbackDecision::Login(resolution)
+            if resolution.account_id == LEGACY_GOOGLE_SUBJECT)
+    }
+
+    #[test]
+    fn activation_back_links_a_legacy_google_account_whose_custody_was_never_migrated() {
+        // The composition is what failed in production: the Hub activated its
+        // IdP and never ran the back-link, so the canary's Google sign-in
+        // became a signup for a second, empty account. The enterprise server
+        // has no custody migration at all, so a repair that demanded one never
+        // reached anybody there either.
+        let connection = offline_google();
+        let mut wb = workbench_with_legacy_google_account();
+        assert!(
+            matches!(
+                next_google_sign_in(&wb, &connection),
+                ConsumerCallbackDecision::Signup { .. }
+            ),
+            "the fixture must start as the lockout it models",
+        );
+
+        activate_configured_idp_with(&mut wb, Some(connection.clone()));
+
+        let decision = next_google_sign_in(&wb, &connection);
+        assert!(
+            logs_in_to_the_legacy_account(&decision),
+            "a legacy Google account must sign in to itself after activation, got {decision:?}",
+        );
+    }
+
+    #[test]
+    fn activation_back_links_a_migrated_legacy_account_into_its_own_scope() {
+        // The Hub copies custody at boot before it activates the IdP, so every
+        // production legacy account reaches activation already migrated. Its
+        // link must land in its independently keyed scope, not the legacy one.
+        use crate::account_auth_custody::{
+            account_auth_scope, command_record_facts as custody_record_facts, AccountAuthCustody,
+            CustodyCommand,
+        };
+        let connection = offline_google();
+        let mut wb = workbench_with_legacy_google_account();
+        // What the Hub's copy admits: the marker, and the account's legacy facts
+        // re-encoded into its own scope.
+        let legacy = crate::account_auth::AccountAuth::rebuild_legacy(wb.store_ref()).unwrap();
+        let mut copy = custody_record_facts(
+            LEGACY_GOOGLE_SUBJECT,
+            &AccountAuthCustody::default(),
+            CustodyCommand::BeginMigration {
+                operation_id: "copy-legacy".into(),
+                source_basis: "legacy-position-0".into(),
+            },
+        )
+        .unwrap();
+        copy.extend(
+            crate::account_auth::account_scoped_command_record_facts(
+                LEGACY_GOOGLE_SUBJECT,
+                &legacy.facts_for_account(LEGACY_GOOGLE_SUBJECT),
+            )
+            .unwrap(),
+        );
+        for fact in copy {
+            wb.store_mut()
+                .append_record(&fact.scope_id, &fact.kind, &fact.payload)
+                .unwrap();
+        }
+        let scope = account_auth_scope(LEGACY_GOOGLE_SUBJECT).unwrap();
+
+        activate_configured_idp_with(&mut wb, Some(connection.clone()));
+
+        assert!(logs_in_to_the_legacy_account(&next_google_sign_in(
+            &wb,
+            &connection
+        )));
+        assert_eq!(
+            wb.store_ref()
+                .records(&scope, "account_auth_subject")
+                .unwrap()
+                .len(),
+            1,
+            "the link belongs to the account's own scope",
+        );
+        assert!(
+            wb.store_ref()
+                .records(
+                    crate::account_auth::ACCOUNT_AUTH_SCOPE,
+                    "account_auth_subject"
+                )
+                .unwrap()
+                .is_empty(),
+            "a migrated account's link must never be written to the legacy scope",
+        );
+    }
+
+    #[test]
+    fn activation_without_consumer_google_back_links_nobody() {
+        let mut wb = workbench_with_legacy_google_account();
+        activate_configured_idp_with(&mut wb, None);
+        let state = crate::account_auth::AccountAuth::rebuild(wb.store_ref()).unwrap();
+        assert!(state.external_subjects.is_empty());
+    }
+
+    #[test]
+    fn a_second_activation_links_nothing_more() {
+        let connection = offline_google();
+        let mut wb = workbench_with_legacy_google_account();
+        activate_configured_idp_with(&mut wb, Some(connection.clone()));
+        assert_eq!(backlink_legacy_consumer_accounts(&mut wb, &connection), 0);
     }
 }

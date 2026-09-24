@@ -290,6 +290,9 @@ impl Workbench {
         project_id: &str,
         body: AttachTargetBody,
     ) -> Result<WorkTargetRecord, String> {
+        if self.project_moving(project_id) {
+            return Err(crate::federation::PAUSED_FOR_MOVE.to_owned());
+        }
         if body.name.trim().is_empty() {
             return Err("target name is required".to_owned());
         }
@@ -445,6 +448,9 @@ pub async fn request_terminal_target_act(
         }
     };
     let mut workbench = workbench.lock_unpoisoned();
+    if workbench.chat_project_moving(&chat_id) {
+        return (StatusCode::CONFLICT, crate::federation::PAUSED_FOR_MOVE).into_response();
+    }
     let Some(binding) = workbench.library.chat_targets.get(&chat_id).cloned() else {
         return (StatusCode::NOT_FOUND, "no such target-bound chat").into_response();
     };

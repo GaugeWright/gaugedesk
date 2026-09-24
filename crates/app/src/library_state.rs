@@ -415,7 +415,7 @@ pub(crate) fn load_startup_library_state(
         &mut engagement_index,
         None,
     )?;
-    finish_deleted_collaboration_chats(&library, &collaboration_workspaces, &deleted_chats)?;
+    finish_deleted_collaboration_chats(store, &library, &collaboration_workspaces, &deleted_chats)?;
     Ok(StartupLibraryState {
         library,
         targets,
@@ -2223,6 +2223,13 @@ fn recover_project_workstream_promotions(
         if root.project_id.is_empty() {
             continue;
         }
+        // A project mid-move takes no writes, recovery included: the move
+        // carries it as it stands, and whichever Home keeps it recovers it on
+        // its next start (DR-0201 §3).
+        if crate::federation::require_project_writes_available(store, &root.project_id).is_err() {
+            tracing::info!(workstream = %workstream.id, "startup: skipping promotion recovery for a project that is mid-move");
+            continue;
+        }
         let workspace = collaborations.get(&root.workspace_id).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2571,11 +2578,24 @@ fn open_project_chat_engagements(
 /// commit that fixed `destroy_chat`'s lookup — stayed active, with its
 /// worktree and its objects, on every open. This is what finishes those.
 fn finish_deleted_collaboration_chats(
+    store: &Store,
     library: &crate::library::Library,
     collaborations: &BTreeMap<String, Box<dyn Workspace>>,
     deleted_chats: &BTreeSet<String>,
 ) -> std::io::Result<()> {
     for (workspace_id, workspace) in collaborations {
+        // As above: a project mid-move is left exactly as the move carries it.
+        let moving = library
+            .project_collaboration_workspaces
+            .values()
+            .find(|binding| &binding.workspace_id == workspace_id)
+            .is_some_and(|binding| {
+                crate::federation::require_project_writes_available(store, &binding.project_id)
+                    .is_err()
+            });
+        if moving {
+            continue;
+        }
         let mut finished = false;
         for chat_id in workspace.active_engagements().map_err(io)? {
             if library.chats.contains_key(&chat_id) {
@@ -4346,6 +4366,13 @@ impl Workbench {
         let Some(inst_rec) = self.library.instances.get(inst_id).cloned() else {
             return Err("no such instance".into());
         };
+        if inst_rec
+            .project_id
+            .as_deref()
+            .is_some_and(|project| self.project_moving(project))
+        {
+            return Err(crate::federation::PAUSED_FOR_MOVE.into());
+        }
         if inst_rec.kind == InstanceKind::Using && inst_rec.placement_kind == PlacementKind::Panel {
             return Err("panel placements do not host work chats".into());
         }
@@ -4562,6 +4589,9 @@ impl Workbench {
     ) -> Result<serde_json::Value, String> {
         if requested.is_empty() {
             return Err("a chat target set cannot be empty".to_owned());
+        }
+        if self.chat_project_moving(chat_id) {
+            return Err(crate::federation::PAUSED_FOR_MOVE.to_owned());
         }
         if crate::engine::turn_is_live(chat_id) {
             return Err("target set cannot change while a turn is live".to_owned());
@@ -5371,6 +5401,12 @@ impl Workbench {
             .get(id)
             .map(|agent| agent.name.clone())
             .ok_or(ForkArchetypeError::NotFound)?;
+        // It removes the copy's Personal placements, a Personal write (DR-0201 §3).
+        if self.project_moving(DEFAULT_PROJECT) {
+            return Err(ForkArchetypeError::Create(
+                crate::federation::PAUSED_FOR_MOVE.into(),
+            ));
+        }
         let created = self.fork_archetype(
             id,
             Some(name.unwrap_or_else(|| format!("{source_name} Panel"))),
@@ -6098,6 +6134,11 @@ impl Workbench {
         let Some(src_chat) = self.library.chats.get(id).cloned() else {
             return Err(ForkChatError::NotFound);
         };
+        if self.chat_project_moving(id) {
+            return Err(ForkChatError::Create(
+                crate::federation::PAUSED_FOR_MOVE.into(),
+            ));
+        }
         let runtime_placement_id = self.library_placement_of_chat(id);
         let inst_id = src_chat.instance_id.clone();
         let source_binding = self.library.chat_targets.get(id).cloned();

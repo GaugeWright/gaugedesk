@@ -865,7 +865,7 @@ pub fn run_task_streaming<G: EgressGate>(
     sink: &mut dyn FnMut(&Observation),
 ) -> Result<TaskResult, EngineError> {
     run_task_streaming_billed(
-        store, engagement, scope, harness, gate, task, images, sink, None, None, "", None,
+        store, engagement, scope, harness, gate, task, images, sink, None, None, "", None, None,
     )
 }
 
@@ -885,6 +885,10 @@ fn run_task_streaming_billed<G: EgressGate>(
     // as user text — currently answers to questions this agent asked (ADR 0113).
     prompt_prefix: &str,
     mut fork_snapshot: Option<TurnForkSnapshot>,
+    // The chat's project: a turn commits nothing while a move of it is pending
+    // (DR-0201 §3). Checked on this turn's own store connection, since the
+    // Workbench lock is not held while the model runs.
+    pause_project: Option<&str>,
 ) -> Result<TaskResult, EngineError> {
     // Observability span (RF-A8): scope + task size only — never the task text or
     // any content (those are protected; the span is operational metadata). The
@@ -1025,6 +1029,9 @@ fn run_task_streaming_billed<G: EgressGate>(
     }
 
     // 3b. Auto-commit the worktree (per-turn), then capture the reviewer's diff.
+    if let Some(project) = pause_project {
+        crate::federation::require_project_writes_available(store, project)?;
+    }
     let commit = engagement.commit_turn(task)?;
     let diff = engagement.diff_against_main()?;
     admit_runtime_evidence_pointers(
@@ -2617,6 +2624,10 @@ impl Workbench {
         sender: &broadcast::Sender<ServerEvent>,
         contribution_by: Option<&str>,
     ) {
+        // A settled turn does not sync into a project that is mid-move (DR-0201 §3).
+        if self.chat_project_moving(id) {
+            return;
+        }
         let Some(target) = self.engagements.get(id).map(|e| e.target().to_string()) else {
             return;
         };
@@ -2723,6 +2734,10 @@ impl Workbench {
         sender: &broadcast::Sender<ServerEvent>,
         guarantee_outcomes: &[gaugedesk_harness::GuaranteeOutcome],
     ) {
+        // Nor does it advance into one (DR-0201 §3).
+        if self.chat_project_moving(id) {
+            return;
+        }
         let Some(target) = self.engagements.get(id).map(|e| e.target().to_string()) else {
             return;
         };
@@ -2885,8 +2900,16 @@ fn drive_persistent_turn(
     process_declaration: Option<crate::target_change_set::TurnProcessDeclaration>,
 ) -> Result<TaskResult, EngineError> {
     // 1. Check out this turn's resources under a brief lock, then drop it.
-    let (mut store, engagement, harness, persistent, answers, fork_snapshot) = {
+    let (mut store, engagement, harness, persistent, answers, fork_snapshot, pause_project) = {
         let mut g = wb.lock_unpoisoned();
+        if g.chat_project_moving(id) {
+            return Err(EngineError::Admit(AdmitError::Rejected(
+                gaugedesk_core::Rejection {
+                    reason: crate::federation::PAUSED_FOR_MOVE,
+                },
+            )));
+        }
+        let pause_project = g.library.project_of_chat(id).map(str::to_owned);
         let engagement = g
             .engagements
             .get(id)
@@ -2935,6 +2958,7 @@ fn drive_persistent_turn(
             persistent,
             answers,
             fork_snapshot,
+            pause_project,
         )
     };
 
@@ -2972,6 +2996,7 @@ fn drive_persistent_turn(
             managed_funding_ref,
             &answers,
             fork_snapshot,
+            pause_project.as_deref(),
         );
         // The claim is released by its guard when the turn returns, not here: the
         // bookkeeping below is still part of this turn, and freeing the chat before
@@ -3931,6 +3956,7 @@ mod tests {
             Some(crate::account::ACCOUNT_SCOPE),
             Some("gaugedesk:managed-plan:v1:test"),
             "",
+            None,
             None,
         )
         .unwrap();

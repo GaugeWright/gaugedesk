@@ -61,7 +61,7 @@ use crate::library::LIBRARY_SCOPE;
 use crate::net_server::{CertFingerprint, PinnedTlsClientConfig};
 use crate::net_tls::{tls_accept, tls_connect, TlsIdentity};
 use crate::stream::ServerEvent;
-use crate::{io, LockUnpoisoned, SharedWorkbench, Workbench};
+use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
 
 /// The fixed rendezvous session-token width (matches the broker). Tokens are
 /// opaque routing metadata, never payload.
@@ -182,58 +182,6 @@ impl Workbench {
     /// or federation relocation.
     pub fn has_target(&self, target_id: &str) -> bool {
         self.targets.contains_key(target_id)
-    }
-
-    /// Re-materialize a relocated target from its handoff content bundle: lay
-    /// its store down under `targets/<id>`, register it, and rehydrate
-    /// its engagement worktrees before the home commit lands.
-    pub fn materialize_target(
-        &mut self,
-        target_id: &str,
-        format: &str,
-        bundle: &[u8],
-    ) -> std::io::Result<()> {
-        let dir = self.root.join("targets").join(target_id);
-        let provider = self.workspace_provider(target_id);
-        if !provider.accepts_export_format(format) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "workspace export format `{format}` is incompatible with `{}`",
-                    provider.export_format()
-                ),
-            ));
-        }
-        let target = provider.from_export_at(&dir, bundle).map_err(io)?;
-        for (chat_id, eng) in target.reconcile_engagements().map_err(io)? {
-            self.register_engagement(chat_id, target_id.to_string(), eng);
-        }
-        self.register_target(target_id.to_string(), target);
-        Ok(())
-    }
-
-    pub fn materialize_collaboration_workspace(
-        &mut self,
-        workspace_id: &str,
-        format: &str,
-        bundle: &[u8],
-    ) -> std::io::Result<()> {
-        let dir = self
-            .root
-            .join("collaboration-workspaces")
-            .join(workspace_id);
-        let provider = self.workspace_provider(workspace_id);
-        if !provider.accepts_export_format(format) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "collaboration workspace export format is incompatible",
-            ));
-        }
-        let workspace = provider.from_export_at(&dir, bundle).map_err(io)?;
-        self.collaboration_workspaces
-            .insert(workspace_id.to_owned(), workspace);
-        self.reopen_collaboration_workspace_engagements(workspace_id)?;
-        Ok(())
     }
 
     /// Collect the content bundles for every live managed target owned by a
@@ -1202,33 +1150,6 @@ async fn runtime_serve_once(
     Ok(())
 }
 
-/// Owner side: send a RunReq to the peer's runtime over the cert-pinned TLS leg and
-/// return the observations the peer produced. The owner admits them separately
-/// (INV-4) — the network call only fetches the evidence.
-async fn remote_run_rpc(
-    broker: &str,
-    me: &AuthorityId,
-    peer: &AuthorityId,
-    pins: Arc<PinnedTlsClientConfig>,
-    run_scope: &str,
-    prompt: &str,
-) -> std::io::Result<RunResp> {
-    let req = RunReq {
-        run_scope: run_scope.to_string(),
-        prompt: prompt.to_string(),
-    };
-    let token = runtime_token(me.as_str(), peer.as_str());
-    let tcp = join_relay(broker, &token).await?;
-    let mut tls = tls_connect(tcp, peer, pins).await?;
-    let bytes = serde_json::to_vec(&req)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    write_frame(&mut tls, &bytes).await?;
-    let resp_bytes = read_frame(&mut tls).await?;
-    let _ = tls.shutdown().await;
-    serde_json::from_slice(&resp_bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
 /// Drive a run scope to `Running` from wherever it is (idempotent across the
 /// happy-path prefix), so the owner can admit observations into it (INV-4).
 fn ensure_running(store: &mut gaugedesk_store::Store, run_scope: &str) {
@@ -1875,61 +1796,6 @@ pub struct RemoteRunRequest {
     pub prompt: String,
 }
 
-/// `POST /federation/remote-run` — place a run on a paired peer (Flow 1 /
-/// OBSERVATION-FEDERATION-1): send the prompt over the cert-pinned TLS leg, the
-/// peer executes a turn, and the owner admits each returned observation as run
-/// evidence (standing truth only via the owner's admission, INV-4). Returns how
-/// many observations the owner admitted.
-pub async fn post_remote_run(
-    State(wb): State<SharedWorkbench>,
-    Json(req): Json<RemoteRunRequest>,
-) -> impl IntoResponse {
-    let peer = AuthorityId::new(&req.peer);
-    let (broker, me, pins, paired) = {
-        let guard = wb.lock_unpoisoned();
-        let me = guard.federation_authority().clone();
-        match guard.federation_ref() {
-            Some(fed) => (
-                fed.broker_addr.clone(),
-                me,
-                fed.pins_arc(),
-                fed.grant_for(peer.as_str()).is_some(),
-            ),
-            None => {
-                return (StatusCode::SERVICE_UNAVAILABLE, "federation not configured")
-                    .into_response()
-            }
-        }
-    };
-    if !paired {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("not paired with {}", req.peer),
-        )
-            .into_response();
-    }
-    match remote_run_rpc(&broker, &me, &peer, pins, &req.run_scope, &req.prompt).await {
-        Ok(resp) => {
-            let admitted = admit_observations(
-                &wb,
-                &req.run_scope,
-                peer.as_str(),
-                &resp.observations,
-                &resp.delegation,
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "observations_admitted": admitted,
-                    "assistant_text": resp.assistant_text,
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("remote run failed: {e}")).into_response(),
-    }
-}
-
 // --- Co-drive: host admission of operator-driven runs (FED-7) ---------------------
 //
 // After a handoff the project's home is the HOST; the OPERATOR may drive runs, but each
@@ -2285,6 +2151,34 @@ pub(crate) fn require_project_writes_available(
     Ok(())
 }
 
+/// What every writer says while a move of its project is pending (DR-0201 §3).
+pub(crate) const PAUSED_FOR_MOVE: &str = "project writes are paused for pending handoff";
+
+impl Workbench {
+    /// Whether writes to `project` are paused because a move of it is pending.
+    /// A handoff that cannot be read counts as pending: a writer never guesses
+    /// its way past the pause. Checked under the Workbench lock, it is atomic
+    /// with an offer, which takes the same lock.
+    pub(crate) fn project_moving(&self, project: &str) -> bool {
+        require_project_writes_available(self.store_ref(), project).is_err()
+    }
+
+    /// [`Self::project_moving`] for the project a chat belongs to. A chat with no
+    /// project (an authoring chat) belongs to no move.
+    pub(crate) fn chat_project_moving(&self, chat: &str) -> bool {
+        self.library
+            .project_of_chat(chat)
+            .is_some_and(|project| self.project_moving(project))
+    }
+}
+
+/// The workspace error a paused writer returns.
+pub(crate) fn paused_for_move() -> gaugedesk_workspace::WorkspaceError {
+    gaugedesk_workspace::WorkspaceError {
+        message: PAUSED_FOR_MOVE.to_owned(),
+    }
+}
+
 fn retained_handoff(
     store: &Store,
     project: &str,
@@ -2590,12 +2484,10 @@ mod workflow_keys;
 /// What a handoff message asks the receiver to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum HandoffMsgKind {
-    /// origin → target: a relocation offer (carries the log). The target admits it —
-    /// auto if pre-authorized, else it lands pending for explicit consent (`INV-13`).
-    Offer,
-    /// A relocation carrying original product commands and receipts. A distinct
-    /// wire kind makes older receivers refuse before importing an event-only
-    /// view that they cannot safely resume.
+    /// origin → target: a relocation offer, carrying the log and the project's
+    /// original product commands and receipts. The target admits it — auto if
+    /// pre-authorized, else it lands pending for explicit consent (`INV-13`).
+    /// An offer without that evidence is not a kind at all (DR-0201).
     OfferWithCommands,
     /// Complete native protected workflow carriage. Older receivers must refuse
     /// this kind rather than silently drop a key they do not understand.
@@ -2654,6 +2546,41 @@ struct HandoffWire {
 /// Whether a scope belongs to `project` — its owned event scopes: the canonical
 /// `project_log::<id>` plus any `project::<id>::*` sub-scope. The trailing `::` guards
 /// against an id that is a prefix of another (`eng` vs `eng2`).
+/// The project-owned scope where a receiving Home pins the signing key each
+/// relocated run arrived under (DR-0201). Project-owned, so a later move carries
+/// the pins onward with the runs they vouch for.
+pub(crate) fn workflow_signers_scope(project: &str) -> String {
+    format!("project::{project}::workflow-signers")
+}
+
+pub(crate) const WORKFLOW_SIGNER_PIN_KIND: &str = "workflow_signer_pin_v1";
+
+/// One pinned signer: the governance key an origin Home signed its runs with,
+/// recorded when a move from it was admitted over a verified pairing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowSignerPin {
+    pub issuer: String,
+    pub governance_pubkey: String,
+}
+
+/// The current pairing record for `peer`, if it is active: what a move from it
+/// is verified against, and the key a pin records.
+pub(crate) fn active_bridge(store: &Store, peer: &str) -> Option<BridgeRecord> {
+    let mut current = None;
+    for row in store.records(BRIDGE_SCOPE, "bridge").ok()? {
+        let record: BridgeRecord = serde_json::from_str(&row).ok()?;
+        if record.id == peer {
+            current = Some(record);
+        }
+    }
+    current.filter(|record| {
+        record.op == crate::library::RecordOp::Upsert
+            && record.active
+            && record.ticket.authority == peer
+    })
+}
+
 fn is_project_scope(scope: &str, project: &str) -> bool {
     scope == project_log_scope(project)
         || scope == format!("project::{project}")
@@ -3672,9 +3599,7 @@ fn pending_handoff_wire(offer: &serde_json::Value) -> Result<HandoffWire, &'stat
         || offer["source"].as_str() != Some(wire.source.as_str())
         || !matches!(
             wire.kind,
-            HandoffMsgKind::Offer
-                | HandoffMsgKind::OfferWithCommands
-                | HandoffMsgKind::OfferWithWorkflowKeys
+            HandoffMsgKind::OfferWithCommands | HandoffMsgKind::OfferWithWorkflowKeys
         )
     {
         return Err("incoming offer identity does not match its original evidence");
@@ -3814,23 +3739,16 @@ fn verify_handoff(guard: &Workbench, wire: &HandoffWire) -> Result<BridgeGrant, 
     }
     if matches!(
         wire.kind,
-        HandoffMsgKind::Offer
-            | HandoffMsgKind::OfferWithCommands
-            | HandoffMsgKind::OfferWithWorkflowKeys
+        HandoffMsgKind::OfferWithCommands | HandoffMsgKind::OfferWithWorkflowKeys
     ) {
         workflow_keys::validate(wire)?;
-        if wire.kind != HandoffMsgKind::Offer && wire.project_commands.is_none() {
-            return Err("project command archive is required");
-        }
-        if let Some(archive) = &wire.project_commands {
-            if !project_commands_match_log(&wire.project, &wire.log, archive) {
-                return Err("project command archive does not match the offered log");
-            }
-        } else if wire.log.iter().any(|record| {
-            is_project_scope(&record.scope, &wire.project)
-                && record.kind == gaugedesk_store::command_dispatch::DISPATCH_KIND
-        }) {
-            return Err("original project command evidence is required");
+        // Every offer carries the project's original command evidence (DR-0201).
+        let archive = wire
+            .project_commands
+            .as_ref()
+            .ok_or("project command archive is required")?;
+        if !project_commands_match_log(&wire.project, &wire.log, archive) {
+            return Err("project command archive does not match the offered log");
         }
         // DEPLOY-4 / ITGOV-3: every offer crosses the placement floor before
         // *any* admission branch. Standing preauthorization and a combined
@@ -3871,9 +3789,7 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
     };
     // `registered` = the target imported a relocated project (its library changed).
     let (verdict, registered) = match wire.kind {
-        HandoffMsgKind::Offer
-        | HandoffMsgKind::OfferWithCommands
-        | HandoffMsgKind::OfferWithWorkflowKeys => {
+        HandoffMsgKind::OfferWithCommands | HandoffMsgKind::OfferWithWorkflowKeys => {
             // Three admission paths (INV-13), all the target's: a standing per-peer
             // pre-auth, or a one-shot from an accepted invite (consumed with the
             // receiving commit, ADR 0047), else explicit consent. An existing
@@ -7784,5 +7700,21 @@ mod handoff_in_doubt_tests {
             unresolved_outgoing(&store, "bob"),
             vec!["project-mid-send".to_string()],
         );
+    }
+}
+
+#[cfg(test)]
+mod offer_kind_tests {
+    use super::HandoffMsgKind;
+
+    /// Only an offer carrying the project's command evidence is a kind at all:
+    /// the older evidence-free offer no longer parses, so it is refused before
+    /// any admission path is reached (DR-0201).
+    #[test]
+    fn an_offer_without_command_evidence_is_not_a_kind() {
+        assert!(serde_json::from_value::<HandoffMsgKind>(serde_json::json!("Offer")).is_err());
+        for kind in ["OfferWithCommands", "OfferWithWorkflowKeys"] {
+            assert!(serde_json::from_value::<HandoffMsgKind>(serde_json::json!(kind)).is_ok());
+        }
     }
 }

@@ -79,6 +79,10 @@ impl Workbench {
         if !self.library.projects.contains_key(DEFAULT_PROJECT) {
             return Ok(ShippedTutorials::NoOwner);
         }
+        // Personal mid-move takes no writes; the next reconcile catches up.
+        if self.project_moving(DEFAULT_PROJECT) {
+            return Err(crate::federation::PAUSED_FOR_MOVE.into());
+        }
         if !self.targets.contains_key(TUTORIALS_TARGET) {
             let workspace = self
                 .workspace_provider(TUTORIALS_TARGET)

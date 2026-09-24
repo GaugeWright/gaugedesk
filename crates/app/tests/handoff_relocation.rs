@@ -2048,18 +2048,46 @@ async fn relocated_workstream_chat(protected: bool) {
                 &serde_json::to_string(&bridge).unwrap(),
             )
             .unwrap();
-        // Deliberately leave the in-memory federation projection stale. Resume
-        // must see the durable revoke, not accept its cached original root.
-        assert!(guard.federation_ref().unwrap().grant_for("alice").is_some());
-        let error = guard
+        // The pairing is revoked, but the run already arrived: it is checked
+        // against the key pinned when the move was admitted, not the pairing,
+        // so revoking stops new moves without stranding it (DR-0201).
+        let pins = guard
+            .store_ref()
+            .records(
+                &format!("project::{project_id}::workflow-signers"),
+                "workflow_signer_pin_v1",
+            )
+            .unwrap();
+        assert_eq!(pins.len(), 1, "the move pinned alice's signing key");
+        assert!(pins[0].contains("\"issuer\":\"alice\""), "{}", pins[0]);
+        let resumed = guard
             .resume_project_workflow(
                 &context,
                 &project_id,
                 "relocated-folder-launch",
                 launch_limits,
             )
-            .unwrap_err();
-        assert!(error.contains("not currently trusted"), "{error}");
+            .expect("a relocated run outlives its origin's pairing");
+        assert_eq!(resumed.command.issuer, "alice");
+
+        // A pin is only what the verifying pairing vouched for: a forged one
+        // for this issuer takes precedence and so must fail the signature check.
+        guard
+            .store_mut()
+            .append_record(
+                &format!("project::{project_id}::workflow-signers"),
+                "workflow_signer_pin_v1",
+                &json!({"issuer": "alice", "governance_pubkey": "00".repeat(65)}).to_string(),
+            )
+            .unwrap();
+        assert!(guard
+            .resume_project_workflow(
+                &context,
+                &project_id,
+                "relocated-folder-launch",
+                launch_limits,
+            )
+            .is_err());
     }
 }
 

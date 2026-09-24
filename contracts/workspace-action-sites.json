@@ -1352,56 +1352,6 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::materialize_collaboration_workspace",
-        "capability": "accepts_export_format",
-        "count": 1,
-        "expression": "provider . accepts_export_format (format)",
-        "file": "crates/app/src/federation.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::materialize_collaboration_workspace",
-        "capability": "from_export_at",
-        "count": 1,
-        "expression": "provider . from_export_at (& dir , bundle)",
-        "file": "crates/app/src/federation.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::materialize_target",
-        "capability": "accepts_export_format",
-        "count": 1,
-        "expression": "provider . accepts_export_format (format)",
-        "file": "crates/app/src/federation.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::materialize_target",
-        "capability": "from_export_at",
-        "count": 1,
-        "expression": "provider . from_export_at (& dir , bundle)",
-        "file": "crates/app/src/federation.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::materialize_target",
-        "capability": "reconcile_engagements",
-        "count": 1,
-        "expression": "target . reconcile_engagements ()",
-        "file": "crates/app/src/federation.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
         "callable": "commit",
         "capability": "accepts_export_format",
         "count": 1,
@@ -3302,30 +3252,10 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::create_workstream_ref",
-        "capability": "create_named_workstream",
-        "count": 1,
-        "expression": "self . workspace_by_storage_id (storage_id) . ok_or_else (| | std :: io :: Error :: new (std :: io :: ErrorKind :: NotFound , \"workspace missing\")) ? . create_named_workstream (workstream_id , None)",
-        "file": "crates/app/src/workstream_routes.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
         "callable": "impl inherent for Workbench::engagement_rehome_blocked",
         "capability": "observe",
         "count": 1,
         "expression": "engagement . observe ()",
-        "file": "crates/app/src/workstream_routes.rs"
-      },
-      "profile": "topology-and-settlement"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::promote_workstream_ref_to_main",
-        "capability": "promote_workstream_to_main",
-        "count": 1,
-        "expression": "self . workspace_by_storage_id (storage_id) . ok_or_else (| | std :: io :: Error :: new (std :: io :: ErrorKind :: NotFound , \"workspace missing\")) ? . promote_workstream_to_main (workstream_id)",
         "file": "crates/app/src/workstream_routes.rs"
       },
       "profile": "topology-and-settlement"
