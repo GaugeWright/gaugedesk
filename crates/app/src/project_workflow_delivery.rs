@@ -11,7 +11,14 @@ impl Workbench {
         limits: ProjectWorkflowLimits,
     ) -> Result<ProjectWorkflowInvocation, String> {
         let scope = request_scope(project, context.actor().as_str(), request_id)?;
-        crate::identity::revalidate_action_context(self.store_ref(), self.home_id(), context)
+        if let crate::identity::ActorAuthentication::ProjectWorkflowInvocation { scope: bound } =
+            context.authentication()
+        {
+            if bound != &scope {
+                return Err("workflow authority serves only its own invocation".into());
+            }
+        }
+        crate::identity::revalidate_workflow_context(self.store_ref(), self.home_id(), context)
             .map_err(debug_error)?;
         let command = self
             .store_ref()

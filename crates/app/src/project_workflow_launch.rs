@@ -213,6 +213,30 @@ impl Workbench {
         request: &ProjectWorkflowLaunch,
         limits: ProjectWorkflowLimits,
     ) -> Result<ProjectWorkflowInvocation, String> {
+        let result = self.launch_project_workflow_admitted(context, request, limits);
+        if result.is_ok() {
+            self.hint_project_workflows(
+                result
+                    .as_ref()
+                    .map(|invocation| invocation.product_scope.clone())
+                    .unwrap_or_default(),
+            );
+        }
+        result
+    }
+
+    fn launch_project_workflow_admitted(
+        &mut self,
+        context: &AuthenticatedActionContext,
+        request: &ProjectWorkflowLaunch,
+        limits: ProjectWorkflowLimits,
+    ) -> Result<ProjectWorkflowInvocation, String> {
+        if matches!(
+            context.authentication(),
+            crate::identity::ActorAuthentication::ProjectWorkflowInvocation { .. }
+        ) {
+            return Err("workflow authority cannot launch a workflow".into());
+        }
         let scope = request_scope(
             &request.project,
             context.actor().as_str(),

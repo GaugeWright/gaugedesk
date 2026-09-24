@@ -42,8 +42,11 @@ impl Workbench {
                     &handoff,
                 ],
                 |store: &Store| {
-                    let deadline =
-                        crate::identity::revalidate_action_context(store, self.home_id(), context)?;
+                    let deadline = crate::identity::revalidate_workflow_context(
+                        store,
+                        self.home_id(),
+                        context,
+                    )?;
                     crate::federation::require_project_writes_available(store, &request.project)?;
                     store.retained_events(LIBRARY_SCOPE)?;
                     store.retained_events(ORG_SCOPE)?;

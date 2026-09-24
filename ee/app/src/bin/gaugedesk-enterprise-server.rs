@@ -31,6 +31,7 @@ async fn main() {
 
     let wb = open_workbench(&root).expect("open workbench");
     gaugedesk_app::federation::respawn_restored_receivers(&wb);
+    gaugedesk_app::spawn_project_workflow_supervisor(wb.clone());
     {
         let guard = wb.lock_unpoisoned();
         println!(

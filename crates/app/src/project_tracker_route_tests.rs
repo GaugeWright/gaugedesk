@@ -8,7 +8,7 @@ use axum::{
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-async fn send(
+pub(super) async fn send(
     app: &Router,
     method: &str,
     path: &str,
@@ -44,7 +44,7 @@ async fn send(
         .unwrap_or_else(|_| serde_json::json!({"body":String::from_utf8_lossy(&body)}));
     (status, value)
 }
-fn auth(wb: &mut Workbench) -> (String, String) {
+pub(super) fn auth(wb: &mut Workbench) -> (String, String) {
     let token = wb
         .mint_account_session(LOCAL_AUTHORITY, "passkey", 3600)
         .unwrap();
@@ -55,7 +55,7 @@ fn auth(wb: &mut Workbench) -> (String, String) {
         .encode();
     (token, admission)
 }
-fn app(shared: &crate::SharedWorkbench, hosted: bool) -> Router {
+pub(super) fn app(shared: &crate::SharedWorkbench, hosted: bool) -> Router {
     let app = crate::open_control_plane(shared.clone());
     if hosted {
         app.layer(axum::middleware::from_fn_with_state(

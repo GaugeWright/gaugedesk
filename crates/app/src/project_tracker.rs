@@ -178,7 +178,7 @@ fn current_project(
     context: &AuthenticatedActionContext,
     project: &str,
 ) -> Result<ProjectAuthority, AdmitError> {
-    let deadline_ms = crate::identity::revalidate_action_context(store, home, context)?;
+    let deadline_ms = crate::identity::revalidate_workflow_context(store, home, context)?;
     store.retained_events(LIBRARY_SCOPE)?;
     store.retained_events(ORG_SCOPE)?;
     let library = Library::rebuild(store)?;
@@ -224,6 +224,16 @@ fn capture(
     request_id: Option<&str>,
 ) -> Result<(Snapshot, DispatchReadBasis), AdmitError> {
     let scope = registry_scope(project, queue)?;
+    // A workflow's unattended standing reads its trackers; it never declares,
+    // requests or decides access.
+    if request_id.is_some()
+        && matches!(
+            context.authentication(),
+            crate::identity::ActorAuthentication::ProjectWorkflowInvocation { .. }
+        )
+    {
+        return Err(refused("workflow authority cannot change tracker access"));
+    }
     current_project(store, home, context, project)?;
     let before = registry(store, &scope)?;
     let commands = command_scope(&scope, context.actor().as_str());

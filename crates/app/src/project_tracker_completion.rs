@@ -167,6 +167,19 @@ impl Workbench {
         request: &CompleteTrackerIssue,
         limits: ProjectWorkflowLimits,
     ) -> Result<super::super::ProjectWorkflowStep, String> {
+        let result = self.complete_project_tracker_issue_admitted(context, request, limits);
+        if result.is_ok() {
+            self.hint_project_workflows(crate::project_workflow::project_hint(&request.project));
+        }
+        result
+    }
+
+    fn complete_project_tracker_issue_admitted(
+        &mut self,
+        context: &AuthenticatedActionContext,
+        request: &CompleteTrackerIssue,
+        limits: ProjectWorkflowLimits,
+    ) -> Result<super::super::ProjectWorkflowStep, String> {
         let scope = completion_scope(request, context.actor().as_str())?;
         let prepared = self.prepare_tracker_completion(context, request, limits, &scope)?;
         let invocation = self.deliver_tracker_completion(&prepared, request, limits, &scope)?;

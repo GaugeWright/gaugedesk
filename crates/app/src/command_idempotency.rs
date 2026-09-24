@@ -127,6 +127,16 @@ fn native_tracker_command_path(path: &str) -> bool {
     )
 }
 
+// A folder-whip launch keys its retained command by the caller's header key and
+// returns the same invocation on replay (DR-0191); a second claim here would
+// answer a retry with a status instead of the run it launched.
+fn native_workflow_launch_command(method: &Method, path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    method == Method::POST
+        && matches!(parts.as_slice(),
+        ["", "projects", project, "workflows"] if !project.is_empty())
+}
+
 // This exact typed command owns its receipted outbox and replay. Wrapping it in
 // the legacy HTTP claim would hide its admitted result behind a second status
 // and reject a safe replay before the command's current authority checks run.
@@ -196,6 +206,7 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
         // and recovers its actual receipt. The generic uncertain-command cache
         // must not prevent delivery of that original result.
         || native_tracker_command_path(request.uri().path())
+        || native_workflow_launch_command(&method, request.uri().path())
         || native_file_save_command(&method, request.uri().path())
         || streamed_upload_path(&method, request.uri().path())
     {
@@ -275,6 +286,32 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_exact_workflow_launch_post_uses_its_own_idempotency() {
+        assert!(native_workflow_launch_command(
+            &Method::POST,
+            "/projects/p/workflows"
+        ));
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            assert!(!native_workflow_launch_command(
+                &method,
+                "/projects/p/workflows"
+            ));
+        }
+        for path in [
+            "/projects//workflows",
+            "/projects/p/workflows/",
+            "/projects/p/workflows/x",
+            "//projects/p/workflows",
+            "/chats/p/workflows",
+        ] {
+            assert!(
+                !native_workflow_launch_command(&Method::POST, path),
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn only_the_exact_native_save_post_uses_atomic_action_idempotency() {

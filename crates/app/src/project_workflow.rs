@@ -23,6 +23,13 @@ use std::collections::BTreeMap;
 mod authority;
 #[path = "project_workflow_launch.rs"]
 mod launch;
+#[path = "project_workflow_supervisor.rs"]
+mod supervisor;
+pub(crate) use supervisor::project_hint;
+pub use supervisor::{
+    supervise_project_workflows, ProjectWorkflowNotice, ProjectWorkflowOutcome,
+    ProjectWorkflowSupervisorConfig,
+};
 
 fn debug_error(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
@@ -47,6 +54,14 @@ pub struct ProjectWorkflowLimits {
     pub input_bytes: usize,
 }
 
+impl ProjectWorkflowLimits {
+    /// What the product's routes and supervisor admit.
+    pub const PRODUCT: Self = Self {
+        source_bytes: 256 * 1024,
+        input_bytes: 64 * 1024,
+    };
+}
+
 /// Admission evidence, not completion or an authority grant.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProjectWorkflowInvocation {
@@ -67,6 +82,23 @@ fn request_scope(project: &str, actor: &str, request: &str) -> Result<String, St
         hex::encode(actor),
         hex::encode(request)
     ))
+}
+
+/// The project, launcher and request a launch scope was keyed to, or `None`
+/// if `scope` is not exactly one [`request_scope`] produces.
+pub(crate) fn launch_scope_parts(scope: &str) -> Option<(String, String, String)> {
+    let rest = scope.strip_prefix("project::")?;
+    let (project, rest) = rest.split_once("::workflow-launch::")?;
+    let (actor, request) = rest.split_once("::")?;
+    let actor = String::from_utf8(hex::decode(actor).ok()?).ok()?;
+    let request = String::from_utf8(hex::decode(request).ok()?).ok()?;
+    (request_scope(project, &actor, &request).ok()? == scope)
+        .then(|| (project.into(), actor, request))
+}
+
+/// The launcher a launch scope was keyed to, or `None` if `scope` is not one.
+pub(crate) fn launch_scope_actor(scope: &str) -> Option<String> {
+    launch_scope_parts(scope).map(|(_, actor, _)| actor)
 }
 
 #[cfg(test)]

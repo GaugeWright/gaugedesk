@@ -104,6 +104,7 @@ pub mod project_model_selection;
 pub mod project_tracker;
 pub mod project_tracker_routes;
 pub mod project_workflow;
+pub mod project_workflow_routes;
 pub mod protected_profiles;
 pub mod publisher_routes;
 pub mod quarantine;
@@ -146,7 +147,10 @@ pub use gaugedesk_whip_runtime::{
     PolicyAdmissionError, PolicyEpoch, WhipHarnessFactory,
 };
 pub use open_route_stack::{open_control_plane, open_control_plane_with_native_saves};
-pub use open_runtime::{open_control_plane_root, open_prepare, open_serve, open_serve_workbench};
+pub use open_runtime::{
+    open_control_plane_root, open_prepare, open_serve, open_serve_workbench,
+    spawn_project_workflow_supervisor,
+};
 // The test-only reset route is this alias's only consumer (DR-0054 Phase A).
 #[cfg(debug_assertions)]
 pub(crate) use workbench_state::build_workbench;

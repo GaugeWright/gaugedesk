@@ -169,6 +169,10 @@ pub struct Workbench {
     /// Bounded grant-reference hints; retained grants remain the source.
     pub(crate) native_editor_dispatch_changed: broadcast::Sender<String>,
     pub(crate) native_editor_dispatch_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Disposable wake hints for the folder-whip supervisor (DR-0191): a
+    /// launch scope, or `project::<id>` for every launch in a project.
+    pub(crate) project_workflow_changed: broadcast::Sender<String>,
+    pub(crate) project_workflow_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub type SharedWorkbench = Arc<Mutex<Workbench>>;
@@ -427,6 +431,8 @@ impl Workbench {
             publication_changed: Arc::new(tokio::sync::Notify::new()),
             native_editor_dispatch_changed: broadcast::channel(64).0,
             native_editor_dispatch_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            project_workflow_changed: broadcast::channel(64).0,
+            project_workflow_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

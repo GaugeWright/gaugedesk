@@ -39,6 +39,13 @@ pub enum ActorAuthentication {
     MachineController {
         grant_ref: String,
     },
+    /// The launcher's standing for one retained folder-whip launch, used by
+    /// the Home when nobody is present (DR-0191). It names the launch's
+    /// product scope, carries no credential and no identity-provider claims,
+    /// and is refused everywhere except that invocation's own reads and steps.
+    ProjectWorkflowInvocation {
+        scope: String,
+    },
 }
 
 /// Source-specific request facts for action construction (ACTION-3). The Home
@@ -88,6 +95,16 @@ impl AuthenticatedActionContext {
             actor,
             authentication: ActorAuthentication::IdentityProvider,
             claims,
+        }
+    }
+
+    /// Unattended authority for one retained launch (DR-0191). Constructed
+    /// only by the Home from a committed launch command, never from a request.
+    pub(crate) fn project_workflow_invocation(actor: AuthorityId, scope: String) -> Self {
+        Self {
+            actor,
+            authentication: ActorAuthentication::ProjectWorkflowInvocation { scope },
+            claims: AuthorityAttributes::default(),
         }
     }
 
@@ -148,13 +165,41 @@ pub(crate) fn revalidate_action_context(
             }
         }
         ActorAuthentication::IdentityProvider => {}
-        ActorAuthentication::NativeEditorDispatchGrant { .. } => {
+        ActorAuthentication::NativeEditorDispatchGrant { .. }
+        | ActorAuthentication::ProjectWorkflowInvocation { .. } => {
             return Err(invalid(
                 "action-scoped authority requires its exact admitted command",
             ));
         }
     }
     Ok(valid_until_ms)
+}
+
+/// [`revalidate_action_context`] for a folder whip's own reads and steps, which
+/// additionally accept the launcher's standing for a retained launch
+/// (DR-0191). That standing has no deadline: what ends it is the project, source
+/// and tracker authority every caller re-checks, not a session. It holds only
+/// while its launch command is committed under a scope keyed to this actor.
+pub(crate) fn revalidate_workflow_context(
+    store: &gaugedesk_store::Store,
+    home: &HomeId,
+    context: &AuthenticatedActionContext,
+) -> Result<Option<u64>, gaugedesk_store::AdmitError> {
+    let ActorAuthentication::ProjectWorkflowInvocation { scope } = context.authentication() else {
+        return revalidate_action_context(store, home, context);
+    };
+    let invalid =
+        |reason| gaugedesk_store::AdmitError::Rejected(gaugedesk_core::Rejection { reason });
+    if crate::project_workflow::launch_scope_actor(scope).as_deref()
+        != Some(context.actor().as_str())
+    {
+        return Err(invalid("workflow authority belongs to another actor"));
+    }
+    store
+        .fold::<gaugedesk_whip_runtime::host_actions::ProductActionAdmission>(scope)?
+        .command
+        .ok_or_else(|| invalid("workflow authority has no retained launch"))?;
+    Ok(None)
 }
 
 impl Workbench {

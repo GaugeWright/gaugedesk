@@ -42,6 +42,7 @@ pub async fn open_serve_workbench(
     }
     let listener = open_listener(addr).await?;
     let local = listener.local_addr()?;
+    spawn_project_workflow_supervisor(wb.clone());
     tokio::spawn(supervise_home_reachability(
         wb.clone(),
         local,
@@ -57,6 +58,41 @@ pub async fn open_serve_workbench(
         open_control_plane(wb).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await
+}
+
+/// Drive this Home's launched folder whips for as long as it serves (DR-0191).
+/// Outcomes are logged; the durable record of a run is its own native history.
+/// Every composition that serves a Home calls this once, beside its router.
+pub fn spawn_project_workflow_supervisor(wb: crate::SharedWorkbench) {
+    use crate::project_workflow::{
+        supervise_project_workflows, ProjectWorkflowLimits, ProjectWorkflowOutcome,
+        ProjectWorkflowSupervisorConfig,
+    };
+    let (_stop, shutdown) = tokio::sync::watch::channel(false);
+    let (notices, mut outcomes) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        // Held for the life of the task: dropping it would read as shutdown.
+        let _stop = _stop;
+        let config = ProjectWorkflowSupervisorConfig {
+            limits: ProjectWorkflowLimits::PRODUCT,
+            discovery_page_size: std::num::NonZeroUsize::new(64).expect("nonzero"),
+            steps_per_wake: 8,
+            sweep: std::time::Duration::from_secs(60),
+        };
+        if let Err(error) = supervise_project_workflows(wb, config, shutdown, notices).await {
+            tracing::error!(%error, "project workflow supervisor stopped");
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(notice) = outcomes.recv().await {
+            match notice.outcome {
+                ProjectWorkflowOutcome::NeedsAttention { detail } => {
+                    tracing::warn!(scope = %notice.scope, %detail, "project workflow did not step")
+                }
+                outcome => tracing::debug!(scope = %notice.scope, ?outcome, "project workflow"),
+            }
+        }
+    });
 }
 
 /// One parked relay leg and the tasks that keep it current.

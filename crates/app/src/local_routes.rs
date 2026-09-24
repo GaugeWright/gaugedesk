@@ -69,6 +69,10 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             "/projects/{project}/trackers/{queue}/issues/{item_id}/complete",
             post(crate::project_tracker_routes::complete_issue),
         )
+        .route(
+            "/projects/{project}/workflows",
+            post(crate::project_workflow_routes::launch),
+        )
         .route("/roster", get(lr::get_roster))
         .route("/work-items/{item_id}/assign", post(lr::assign_work_item))
         .route("/search", get(lr::search))

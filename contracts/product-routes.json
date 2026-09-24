@@ -6872,6 +6872,42 @@
       }
     },
     {
+      "id": "home.project.workflow-launch",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/projects/:project/workflows",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "current-project-workspace-saved-source",
+      "capability": "launch-ordinary-folder-workflow",
+      "requestSchema": "rust:gaugedesk-app/project_workflow_routes/LaunchBody+Idempotency-Key",
+      "responseSchema": "rust:gaugedesk-app/project_workflow/ProjectWorkflowInvocation",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-workflow.test.ts#retains the same launch intent and request key across retries"
+        ],
+        "authority": [
+          "crates/app/src/project_workflow_route_tests.rs#the_launch_route_refuses_anonymous_keyless_and_malformed_launches"
+        ],
+        "journey": [
+          "crates/app/src/project_workflow_route_tests.rs#a_launch_over_http_is_driven_by_the_home"
+        ],
+        "deployed": [],
+        "property": [
+          "web/packages/control-plane-client/src/project-workflow.test.ts#encodes the project as one path segment and never names an actor"
+        ]
+      }
+    },
+    {
       "id": "home.navigation.tasks",
       "jurisdiction": "private-home",
       "transport": "http-json",

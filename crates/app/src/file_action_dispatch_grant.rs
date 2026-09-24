@@ -39,6 +39,9 @@ impl Source {
             ActorAuthentication::NativeEditorDispatchGrant { .. } => {
                 Err("a dispatch grant cannot authorize or renew dispatch authority".into())
             }
+            ActorAuthentication::ProjectWorkflowInvocation { .. } => {
+                Err("workflow authority cannot authorize dispatch authority".into())
+            }
         }
     }
 

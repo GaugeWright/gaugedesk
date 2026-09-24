@@ -16,7 +16,7 @@ use serde::Deserialize;
 fn problem(status: StatusCode, error: &'static str) -> Response {
     (status, Json(serde_json::json!({"error": error}))).into_response()
 }
-fn context(
+pub(crate) fn context(
     wb: &mut Workbench,
     headers: &HeaderMap,
     authenticated: Option<Extension<AuthenticatedActionContext>>,
@@ -139,14 +139,7 @@ pub async fn complete_issue(
         summary: body.summary,
         claim: body.claim,
     };
-    match wb.complete_project_tracker_issue(
-        &context,
-        &request,
-        ProjectWorkflowLimits {
-            source_bytes: 256 * 1024,
-            input_bytes: 64 * 1024,
-        },
-    ) {
+    match wb.complete_project_tracker_issue(&context, &request, ProjectWorkflowLimits::PRODUCT) {
         Ok(result) => {
             if result.executed_effect.is_some() || result.recovered_effect.is_some() {
                 // A reference wakes other clients; issue bodies stay behind their

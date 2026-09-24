@@ -2744,7 +2744,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::launch_project_workflow",
+        "callable": "impl inherent for Workbench::launch_project_workflow_admitted",
         "capability": "publish",
         "count": 1,
         "expression": "inputs . publish (& retained , | | { admission . commit_dispatch :: < ProductActionAdmission > (& scope , & request . request_id , command . clone () , & dispatch ,) . map_err (| error | { whipplescript_store :: StoreError :: Conflict (debug_error (error)) }) })",
@@ -2754,7 +2754,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::launch_project_workflow",
+        "callable": "impl inherent for Workbench::launch_project_workflow_admitted",
         "capability": "workflow_source",
         "count": 1,
         "expression": "target . workflow_source (& request . path , & request . cut , limits . source_bytes)",

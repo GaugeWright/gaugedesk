@@ -449,6 +449,9 @@ fn an_empty_input_contract_rejects_extra_values_before_product_admission() {
 #[path = "project_workflow_execution_tests.rs"]
 mod execution;
 
+#[path = "project_workflow_supervisor_tests.rs"]
+mod supervision;
+
 #[path = "project_tracker_completion_tests.rs"]
 mod completion;
 
@@ -457,3 +460,6 @@ mod backlog;
 
 #[path = "project_tracker_route_tests.rs"]
 mod tracker_routes;
+
+#[path = "project_workflow_route_tests.rs"]
+mod workflow_routes;
